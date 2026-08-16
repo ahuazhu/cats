@@ -575,13 +575,15 @@ trap 'linux_gate_signal 143' TERM
 
 main() {
   local attempt
-  local expected_focused_test="runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart: test"
+  local expected_focused_test="runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart: test"
+  local expected_root_control_inventory="$LINUX_CAPTURE_DIR/root-control.expected"
   local image_inspection=""
   local iidfile_expected=""
   local iidfile_expected_lf=""
   local listed_test=""
   local listed_test_count=0
   local listed_test_mismatch=false
+  local observed_root_control_inventory="$LINUX_CAPTURE_DIR/root-control.observed"
   local observed=""
   local status=0
   local systemd_ready=false
@@ -623,7 +625,7 @@ main() {
     -v "$LINUX_TARGET_VOLUME:/target" \
     rust:1.97.1-bookworm \
     sh -c 'apt-get update -qq &&
-           apt-get install -qy --no-install-recommends e2fsprogs jq &&
+           apt-get install -qy --no-install-recommends e2fsprogs jq zstd &&
            rustup component add clippy rustfmt &&
            ./scripts/quality.sh skills &&
            cargo fmt --all -- --check &&
@@ -694,7 +696,7 @@ main() {
       create --name "$LINUX_SYSTEMD_GATE" \
       --label "$LINUX_OWNER_LABEL" --platform "$LINUX_PLATFORM" \
       --privileged --cgroupns=private --cgroup-parent system.slice \
-      --tmpfs /run --tmpfs /run/lock -e container=docker \
+      --tmpfs /run:exec --tmpfs /run/lock -e container=docker \
       -e CARGO_BUILD_JOBS="$LINUX_JOBS" \
       -e CATS_TEST_POSTGRES_URL="postgres://postgres:cats@${LINUX_PG}:5432/postgres" \
       --network "$LINUX_NETWORK" \
@@ -733,6 +735,138 @@ main() {
     fi
   fi
   if [[ "$status" -eq 0 ]]; then
+    # Exercise the installed topology under the same real PID 1 used by the
+    # focused Runtime test. The production-named Agent service and the
+    # production-shaped per-Cat service are siblings in system.slice. A real
+    # Agent stop/restart must preserve the exact Cat PID/start/cgroup so the
+    # successor Agent can validate and adopt that physical candidate.
+    if docker_cli inherit 300 exec "$LINUX_SYSTEMD_GATE" \
+      sh -ceu 'agent_unit=cats-noded.service
+        cat_unit=cats-serving-11111111111111111111111111111111.service
+        agent_script=/run/cats-n5-agent-fixture.sh
+        agent_unit_path=/run/systemd/system/$agent_unit
+        ready=/run/cats-n5-agent-fixture.ready
+        adopted=/run/cats-n5-agent-fixture.adopted
+        expected=/run/cats-n5-cat-sibling.expected
+        cleanup_fixture() {
+          systemctl stop "$agent_unit" >/dev/null 2>&1 || true
+          systemctl stop "$cat_unit" >/dev/null 2>&1 || true
+          rm -f "$agent_unit_path" "$agent_script" "$ready" "$adopted" "$expected"
+          systemctl daemon-reload >/dev/null 2>&1 || true
+          systemctl reset-failed "$agent_unit" "$cat_unit" >/dev/null 2>&1 || true
+        }
+        trap cleanup_fixture EXIT
+        cleanup_fixture
+        {
+          printf "%s\n" "#!/bin/sh"
+          printf "%s\n" "set -eu"
+          printf "%s\n" "cat_unit=$cat_unit"
+          printf "%s\n" "ready=$ready"
+          printf "%s\n" "adopted=$adopted"
+          printf "%s\n" "expected=$expected"
+          printf "%s\n" "if systemctl is-active --quiet \"\$cat_unit\"; then"
+          printf "%s\n" "  read -r expected_pid expected_ticks expected_cgroup < \"\$expected\""
+          printf "%s\n" "  current_pid=\$(systemctl show --property=MainPID --value \"\$cat_unit\")"
+          printf "%s\n" "  test \"\$current_pid\" = \"\$expected_pid\""
+          printf "%s\n" "  current_ticks=\$(cut -d \" \" -f 22 \"/proc/\$current_pid/stat\")"
+          printf "%s\n" "  test \"\$current_ticks\" = \"\$expected_ticks\""
+          printf "%s\n" "  current_cgroup=\$(cut -d : -f 3 \"/proc/\$current_pid/cgroup\")"
+          printf "%s\n" "  test \"\$current_cgroup\" = \"\$expected_cgroup\""
+          printf "%s\n" "  test \"\$(systemctl show --property=ControlGroup --value \"\$cat_unit\")\" = \"\$expected_cgroup\""
+          printf "%s\n" "  test \"\$(systemctl show --property=KillMode --value \"\$cat_unit\")\" = control-group"
+          printf "%s\n" "  test \"\$(systemctl show --property=Restart --value \"\$cat_unit\")\" = no"
+          printf "%s\n" "  touch \"\$adopted\""
+          printf "%s\n" "else"
+          printf "%s\n" "  systemd-run --quiet --collect --unit=\"\$cat_unit\" --slice=system.slice --property=Type=exec --property=KillMode=control-group --property=Restart=no --property=UMask=0077 --property=TimeoutStopSec=2s /bin/sleep infinity"
+          printf "%s\n" "fi"
+          printf "%s\n" "touch \"\$ready\""
+          printf "%s\n" "exec /bin/sleep infinity"
+        } >"$agent_script"
+        chmod 0755 "$agent_script"
+        {
+          printf "%s\n" "[Unit]"
+          printf "%s\n" "Description=Cats node agent N5 PID1 fixture"
+          printf "%s\n" "[Service]"
+          printf "%s\n" "Type=exec"
+          printf "%s\n" "KillMode=control-group"
+          printf "%s\n" "ExecStart=$agent_script"
+          printf "%s\n" "Restart=always"
+          printf "%s\n" "RestartSec=1"
+        } >"$agent_unit_path"
+        systemctl daemon-reload
+        systemctl start "$agent_unit"
+        fixture_ready=false
+        for _ in $(seq 1 120); do
+          if test -f "$ready" \
+            && test "$(systemctl is-active "$agent_unit")" = active \
+            && test "$(systemctl is-active "$cat_unit")" = active; then
+            fixture_ready=true
+            break
+          fi
+          sleep 0.05
+        done
+        test "$fixture_ready" = true
+        test "$(systemctl show --property=KillMode --value "$agent_unit")" = control-group
+        agent_pid_before=$(systemctl show --property=MainPID --value "$agent_unit")
+        cat_pid=$(systemctl show --property=MainPID --value "$cat_unit")
+        test "$agent_pid_before" -gt 1
+        test "$cat_pid" -gt 1
+        test "$agent_pid_before" -ne "$cat_pid"
+        cat_start_ticks_before=$(cut -d " " -f 22 "/proc/$cat_pid/stat")
+        cat_control_group_before=$(cut -d : -f 3 "/proc/$cat_pid/cgroup")
+        test -n "$cat_start_ticks_before"
+        test "$cat_control_group_before" = "/system.slice/$cat_unit"
+        printf "%s %s %s\n" "$cat_pid" "$cat_start_ticks_before" "$cat_control_group_before" >"$expected"
+
+        systemctl stop "$agent_unit"
+        test "$(systemctl is-active "$agent_unit")" = inactive
+        test ! -e "/proc/$agent_pid_before/stat"
+        test -e "/proc/$cat_pid/stat"
+        cat_start_ticks_after_stop=$(cut -d " " -f 22 "/proc/$cat_pid/stat")
+        cat_control_group_after_stop=$(cut -d : -f 3 "/proc/$cat_pid/cgroup")
+        test "$cat_start_ticks_after_stop" = "$cat_start_ticks_before"
+        test "$cat_control_group_after_stop" = "$cat_control_group_before"
+
+        rm -f "$ready" "$adopted"
+        systemctl restart "$agent_unit"
+        fixture_adopted=false
+        for _ in $(seq 1 120); do
+          if test -f "$ready" && test -f "$adopted" \
+            && test "$(systemctl is-active "$agent_unit")" = active; then
+            fixture_adopted=true
+            break
+          fi
+          sleep 0.05
+        done
+        test "$fixture_adopted" = true
+        cat_pid_after_restart=$(systemctl show --property=MainPID --value "$cat_unit")
+        cat_start_ticks_after_restart=$(cut -d " " -f 22 "/proc/$cat_pid_after_restart/stat")
+        cat_control_group_after_restart=$(cut -d : -f 3 "/proc/$cat_pid_after_restart/cgroup")
+        test "$cat_pid_after_restart" = "$cat_pid"
+        test "$cat_start_ticks_after_restart" = "$cat_start_ticks_before"
+        test "$cat_control_group_after_restart" = "$cat_control_group_before"
+        test "$(systemctl show --property=ControlGroup --value "$cat_unit")" = "$cat_control_group_after_restart"
+        test "$(systemctl show --property=KillMode --value "$cat_unit")" = control-group
+        test "$(systemctl show --property=Restart --value "$cat_unit")" = no
+
+        systemctl stop "$cat_unit"
+        cat_stopped=false
+        for _ in $(seq 1 120); do
+          if test ! -e "/proc/$cat_pid/stat"; then
+            cat_stopped=true
+            break
+          fi
+          sleep 0.05
+        done
+        test "$cat_stopped" = true
+        trap - EXIT
+        cleanup_fixture'; then
+      :
+    else
+      status=$?
+    fi
+  fi
+  if [[ "$status" -eq 0 ]]; then
     if docker_cli inherit 300 exec "$LINUX_SYSTEMD_GATE" \
       sh -ceu 'source_binary="$1/debug/cats-blockd"
         target_binary=/opt/cats/bin/cats-blockd
@@ -750,6 +884,50 @@ main() {
     fi
   fi
   if [[ "$status" -eq 0 ]]; then
+    # These real-binary tests intentionally exercise the installed
+    # /run/cats/blockd-v1 namespace. The native qualification builder and the
+    # workspace-wide Linux container are unprivileged, so keep the tests
+    # ignored there and run their exact closed inventory only inside this one
+    # owner-labeled PID-1 container. Calibrate Cargo's zero-test-success
+    # behavior before trusting the privileged run.
+    printf '%s\n' \
+      'control_only_rejects_frontends_and_serves_only_the_typed_effect: test' \
+      'every_provision_publication_crash_window_recovers_by_authority_or_exact_replay: test' \
+      'first_lf_framing_enforces_prefix_crlf_and_payload_cap_before_effect: test' \
+      'receiver_responds_at_first_lf_without_waiting_for_half_close_or_running_tail: test' \
+      'stalled_connection_times_out_without_starving_the_next_request: test' \
+      >"$expected_root_control_inventory"
+    if docker_cli capture 12600 exec "$LINUX_SYSTEMD_GATE" \
+      timeout --signal=TERM --kill-after=30s 20m \
+      cargo test -p cats-blockd-daemon --test root_provision_control --locked \
+        --target-dir "$LINUX_TARGET_DIRECTORY" \
+        -- --ignored --list; then
+      : >"$observed_root_control_inventory"
+      while IFS= read -r listed_test; do
+        case "$listed_test" in
+          *": test") printf '%s\n' "$listed_test" >>"$observed_root_control_inventory" ;;
+        esac
+      done <"$LINUX_DOCKER_STDOUT"
+      if ! cmp -s "$expected_root_control_inventory" "$observed_root_control_inventory"; then
+        echo "privileged blockd root-control test inventory was not the exact known positive" >&2
+        status=1
+      fi
+    else
+      status=$?
+    fi
+  fi
+  if [[ "$status" -eq 0 ]]; then
+    if docker_cli inherit 12600 exec "$LINUX_SYSTEMD_GATE" \
+      timeout --signal=TERM --kill-after=30s 20m \
+      cargo test -p cats-blockd-daemon --test root_provision_control --locked \
+        --target-dir "$LINUX_TARGET_DIRECTORY" \
+        -- --ignored --test-threads=1 --nocapture; then
+      :
+    else
+      status=$?
+    fi
+  fi
+  if [[ "$status" -eq 0 ]]; then
     # Rust's exact test filter exits successfully even when it selects zero
     # tests. Calibrate this probe before trusting the focused run: exactly one
     # listed test entry must exist, and it must be the intended ignored E2E.
@@ -760,7 +938,7 @@ main() {
       timeout --signal=TERM --kill-after=30s 20m \
       cargo test -p cats-node-agent --lib --locked \
         --target-dir "$LINUX_TARGET_DIRECTORY" \
-        runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart \
+        runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart \
         -- --ignored --exact --list; then
       while IFS= read -r listed_test; do
         case "$listed_test" in
@@ -785,7 +963,7 @@ main() {
       timeout --signal=TERM --kill-after=30s 20m \
       cargo test -p cats-node-agent --lib --locked \
         --target-dir "$LINUX_TARGET_DIRECTORY" \
-        runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart \
+        runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart \
         -- --ignored --exact --nocapture; then
       :
     else

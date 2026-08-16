@@ -7,12 +7,16 @@ from their exact live configuration and imported before Terraform changes
 them. See
 [`terraform/README.md`](terraform/README.md) and ADR-0012.
 
+The platform-to-usage SNS destination, confirmed recipient preflight and
+controlled delivery evidence are operated through the
+[production alarm recipient runbook](alarm-recipients-runbook.md). A created
+Terraform subscription alone is not paging evidence.
+
 Production-shaped split:
 
-- EKS Pods: `cats-controld` (portal, user console, admin console and API).
-  Route Grant v2 and the machine tunnel exist in code, but public Endpoint
-  ingress remains undeployed because this stack does not install the reviewed
-  signing ring, Gateway/Node mTLS artifacts or public proxy.
+- EKS Pods: active-active `cats-controld` plus the separate active-active
+  `cats-gatewayd` Route v2 public proxy. Control's machine-only mTLS listener
+  is exposed through a distinct cluster-local Service on port 7443.
 - EC2 bare metal: only `cats-noded`, `cats-blockd`, Cloud Hypervisor and guest
   assets. It is not an EKS node.
 - RDS PostgreSQL: authoritative ChunkStore roots, leases and fencing epochs.
@@ -26,17 +30,139 @@ Production-shaped split:
   webhook endpoint. PostgreSQL stores append-only signup grants, top-ups and
   refund reversals; Stripe is collection infrastructure, not the balance or
   usage truth.
-- One EKS Auto Mode ALB: the user site at `cats.run`, the operator site at
-  `ops.cats.run` and the configured control-plane hosts. It does not advertise
-  or route the Endpoint wildcard yet.
+- One EKS Auto Mode ALB: exact configured control-plane hosts route to
+  `cats-controld`; the one configured Endpoint wildcard routes only to
+  `cats-gatewayd`. Both targets expose local `/healthz`.
 
-The Terraform application stack creates the `cats-controld` ServiceAccount,
-`cats-runtime` and `cats-rds-ca`;
+The Terraform application stack creates the `cats-controld` and
+`cats-gatewayd` ServiceAccounts, `cats-runtime` and `cats-rds-ca`;
 secrets are injected by CI and remain protected in remote state. It also
 renders the target ACM ARN and every public subnet into EKS Auto Mode ingress.
 EKS Pod Identity grants the control plane only the Kinesis/S3/DynamoDB usage
-permissions. No Gateway identity or shared Route table is provisioned. Do not
-create or patch these objects manually.
+permissions. Gateway has no ServiceAccount token, Pod Identity, shared Route
+table or Control bearer. Do not create or patch Terraform-owned objects
+manually.
+
+### Route v2 artifact delivery
+
+Private Route v2 bytes never enter Terraform variables, state, plans, process
+arguments, environment variables or logs. Before planning, the approved
+root-only credential workflow creates versioned immutable Kubernetes Secrets
+in namespace `cats` and one scoped Secrets Manager secret for the workers.
+Terraform receives only their opaque names/ARN. The deployment workflow checks
+`.immutable == true` and exact key names without decoding or persisting data.
+
+The Control Secret contains exactly seven keys:
+
+- `gateway-workload-authority.v1.json`
+- `gateway-client-ca-bundle.pem`
+- `control-machine-server-certificate.pem`
+- `control-machine-server-private-key.pem`
+- `signer.v1.json`
+- `public-key-ring.v1.json`
+- `signer-private-key.pem`
+
+The Gateway Secret contains exactly the frozen three keys:
+`node-server-ca-bundle.pem`, `gateway-machine-client-certificate.pem` and
+`gateway-machine-client-private-key.pem`. There is no fourth Gateway artifact
+and no separate Control CA file: `node-server-ca-bundle.pem` must validate both
+the Control server chain for
+`cats-controld-route-v2.cats.svc.cluster.local` and every reviewed Node server
+chain. A root init renderer copies each projected Secret into an in-memory
+emptyDir so the main process sees real, single-link, root-owned files under a
+root:root `0700` `/etc/cats/route-v2`; public material is `0644` and private
+keys are `0600`. Main containers run as uid 0 only because the frozen reader
+requires those exact owners/modes; both have a read-only root filesystem, no
+privilege escalation and all Linux capabilities dropped.
+
+The worker Secrets Manager `SecretString` is a JSON object with exactly six
+non-empty base64 fields:
+`public_key_ring_v1_json_b64`, `rotation_operator_trust_v1_json_b64`,
+`gateway_client_ca_bundle_pem_b64`,
+`node_machine_server_certificate_pem_b64` and
+`node_machine_server_private_key_pem_b64`, plus the public
+`node_server_ca_bundle_pem_b64`. The instance role can read only that
+ARN (plus its already-scoped runtime/database secrets). Terraform also pins
+the exact Secrets Manager version ID, so a later `AWSCURRENT` change cannot
+alter a fresh Host's revision-1 bytes. The SSM transaction decodes, validates
+and installs the six fixed Node files with the same owner,
+directory and mode contract through the same Rust ring/rustls validator used
+at daemon startup before starting `cats-noded`. The fixed operator trust then
+authenticates adjacent public-ring delivery without giving Node a Control
+credential; the production unit passes the
+literal Route v2 listener `0.0.0.0:7444` and removes stale environment overrides.
+A23 `node_transport_target` must therefore be the reviewed canonical
+`https://<node-private-dns>:7444`, never the signed Runtime port 7301.
+
+This wiring is initial revision 1 only. Kubernetes Secret names must end in
+`-r1`, and the worker ARN must identify the exact
+`cats-<environment>-route-v2-node-r1` secret in the expected partition,
+account and region. A fresh Pod renders a
+fresh emptyDir; a worker publishes `/etc/cats/route-v2` only when it is absent.
+An existing worker directory is accepted only when the closed set, ownership,
+modes, link counts and every byte are identical; any difference fails before
+the deployment mutates installed binaries or units. Runtime G3 successor
+delivery advances only one exact predecessor at a time through the durable
+installer; full signed inventory remains the ACK authority.
+
+The approved initial credential workflow is the offline, root-only command in
+the exact release `cats` binary. Supply every reviewed private-DNS name that
+will appear in an A23 `node_transport_target`; one Node certificate binds that
+closed set. The default `/usr/bin/openssl` is used only here to issue X.509
+certificates and is never invoked by Control, Gateway or Node at runtime.
+
+```sh
+sudo /approved/staged-worker/cats --json admin runtime-provisioner route-v2-r1 generate \
+  --output /approved/credentials/route-v2-r1 \
+  --node-server-dns "$metal_1_private_dns" \
+  --node-server-dns "$metal_2_private_dns" \
+  --control-secret-name cats-route-v2-control-r1 \
+  --gateway-secret-name cats-route-v2-gateway-r1 \
+  --node-secret-name cats-production-route-v2-node-r1 \
+  --release-commit-sha "$source_sha" \
+  --openssl /usr/bin/openssl
+
+sudo /approved/staged-worker/cats --json admin runtime-provisioner route-v2-r1 verify \
+  --input /approved/credentials/route-v2-r1 \
+  --node-server-dns "$metal_1_private_dns" \
+  --node-server-dns "$metal_2_private_dns" \
+  --control-secret-name cats-route-v2-control-r1 \
+  --gateway-secret-name cats-route-v2-gateway-r1 \
+  --node-secret-name cats-production-route-v2-node-r1 \
+  --release-commit-sha "$source_sha"
+
+sudo /approved/staged-worker/cats-route-v2-node-r1-validator \
+  --directory /approved/credentials/route-v2-r1/node
+```
+
+Generation creates no cloud resource. It writes five exact root-owned `0700`
+directories: retained CA and offline rotation private material, Control
+eight-file set, Gateway three-file set, Node six-file set, and three provider
+inputs. Before returning it
+reopens every file, checks the canonical signer/ring and Gateway policy, proves
+the CA/key pairs, passes the Node set through the production candidate reader,
+completes TLS 1.3 mutual-auth handshakes for Control and every Node DNS name,
+and byte-compares the provider inputs with those validated role files. The
+separate validator command above reuses the Node daemon's ring/rustls
+composition before any provider input is submitted. Standard output contains
+identifiers and SHA-256 receipts only.
+
+Create the two immutable Kubernetes Secrets and the one versioned Secrets
+Manager value directly from the root-only provider inputs; do not transcribe or
+decode them:
+
+```sh
+kubectl create --filename /approved/credentials/route-v2-r1/provider/control-secret.v1.json
+kubectl create --filename /approved/credentials/route-v2-r1/provider/gateway-secret.v1.json
+aws secretsmanager create-secret \
+  --cli-input-json file:///approved/credentials/route-v2-r1/provider/node-secret.v1.json
+```
+
+Record the returned worker Secret ARN and exact version ID in the infrastructure
+stack inputs. The retained `authority/route-v2-ca-private-key.pem` and all three
+provider JSON files contain secret material; keep the whole output directory on
+the approved root-only credential channel and never add it to a release bundle,
+Terraform input, shell environment or log.
 
 The worker does not hold a copy of the database password. Set
 `database_master_user_secret_arn` and the non-secret half of the DSN in
@@ -83,20 +209,16 @@ a rolling current-runtime upgrade until the gate below is green.
 The bundle carries the one CI-built, manifest-bound Guest kernel, optional
 initramfs and runtime receipt; a Host-local rebuild is not release input and
 does not qualify as rollback. `metal/install-worker.sh` remains a
-bootstrap/development helper. It requires `CATS_ROUTE_GRANT_PUBLIC_KEY_FILE` to point at the reviewed
-Ed25519 public key before it changes packages, installed files or services; for
-example, run `sudo CATS_ROUTE_GRANT_PUBLIC_KEY_FILE=/secure/path/public.pem
-deploy/aws/metal/install-worker.sh`. The helper validates and stages that key,
-then installs it as root-owned mode `0644` at
-`/etc/cats/route-grant-public.pem` before enabling `cats-worker`, whether or not
-`worker.env` already exists. Its environment example deliberately contains
-`REPLACE_WITH_UNIQUE_NODE_ID` and `PRIVATE_IPV4`; fill both before rerunning the
-helper. An existing file with either placeholder is rejected before package
-installation or compilation so a second host cannot claim another worker's
-identity. Cloud Hypervisor stays under `/opt/cats/bin` so it does not replace a
-host-wide binary used by another workload. The S3 adapter uses the EC2
-instance role and refreshes its temporary credentials; no long-lived AWS key is
-stored in `worker.env`.
+bootstrap/development helper. It requires
+`CATS_ROUTE_V2_NODE_ARTIFACT_DIR=/approved/root-only/node-route-v2` before it
+changes packages, installed files or services. The source must be one real
+directory containing exactly the fixed six Node artifacts documented above.
+The helper stages and validates the canonical ring, CA sequence and matching
+Node certificate/private key, then installs the closed set at
+`/etc/cats/route-v2` before enabling `cats-worker`. Cloud Hypervisor stays under
+`/opt/cats/bin` so it does not replace a host-wide binary used by another
+workload. The S3 adapter uses the EC2 instance role and refreshes its temporary
+credentials; no long-lived AWS key is stored in `worker.env`.
 
 The release pipeline implements the frozen
 [Agent Registration and Internal Transport v1](../../docs/specs/agent-registration-transport-v1.md) plus
@@ -108,6 +230,65 @@ that receipt. Target worker systemd `ExecStart` and Control Kubernetes container
 `--guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json`; missing or mismatched
 receipt/boot files fail closed. Rebuilding from the Host kernel is not a fallback.
 
+When GitHub Actions is unavailable, `tools/build-manual-release.sh` is the
+repository-owned artifact builder. Run it from a clean checkout of the exact
+40-hex commit on a native x86_64 Linux build Host with the Guest-image tools,
+Docker Buildx and passwordless or interactive `sudo` available:
+
+```sh
+deploy/aws/tools/build-manual-release.sh \
+  --source-sha "$(git rev-parse HEAD)" \
+  --output /approved/private-output/cats-release \
+  --image registry.example/cats/control-plane:exact-tag \
+  --gateway-image registry.example/cats/gateway:exact-tag \
+  --push
+```
+
+It exports and rechecks the exact Git tree, invokes the Guest-image generator
+once, feeds that one closed payload to the Control and worker Dockerfiles,
+builds the separate Gateway image, extracts the receipt/manifest from the final
+Control image, the `cats-gatewayd` executable from the final Gateway image and
+the complete Guest payload from the worker artifact, and verifies every closed
+set. The
+canonical `release-manifest.v1.json` binds source commit/tree/fingerprint,
+build-input fingerprints, Guest release ID, Control and Gateway OCI/config
+digests, Gateway binary digest and the worker tar SHA-256. Without `--push`,
+both images remain only in the local Docker store and the manifest records both
+registry verifications as false; that output is useful for dry-run
+qualification but is not a registry deployment receipt.
+
+To keep AWS credentials off the native build Host, replace `--push` with
+`--export-images`. The output then also contains
+`cats-control-plane-image.tar`, `cats-gateway-image.tar` and `SHA256SUMS`.
+Those files are transport only: the unchanged manifest and its independently
+recorded SHA-256 remain the authority. On an approved x86_64 operator Host with
+Docker Buildx and existing ECR credentials, publish without rebuilding:
+
+```sh
+aws ecr get-login-password --region "$AWS_REGION" \
+  | docker login --username AWS --password-stdin "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+deploy/aws/tools/publish-manual-release.sh \
+  --release /approved/private-output/cats-release \
+  --manifest-sha256 sha256:REPLACE_WITH_APPROVED_MANIFEST_SHA256 \
+  --output-manifest /approved/private-output/release-manifest.registry-verified.v1.json
+```
+
+The helper checks the transport sums, verifies each closed OCI archive against
+the existing manifest, loads and inspects linux/amd64 identity, pushes the two
+exact manifest references, verifies the registry digests and asks the existing
+manual-release verifier to produce the registry-verified manifest. It neither
+builds an artifact nor uploads the worker bundle. Pass the same
+`cats-worker.tar.zst` and its manifest `bundle_sha256` to the existing
+`production-infrastructure` Terraform inputs; that module publishes the bundle
+at `worker/<sha256>/cats-worker.tar.zst` in its existing artifact bucket.
+The builder never invokes Terraform, Kubernetes or a production service.
+The worker bundle also carries the exact
+[`old-host-positive-stop.py`](old-host-positive-stop.py) bytes bound as a
+manual-build input. That program emits the
+[Proposed E13 evidence format](../../docs/specs/old-host-positive-stop-v1.md);
+shipping it does not make the format accepted and does not remove the
+production reset's mechanical block.
+
 The application rollout also mounts the central provisioner's canonical public
 trust bundle as the root-owned regular file
 `/etc/cats/identity/runtime-provisioner-trust.v1.json` and passes exactly
@@ -115,6 +296,12 @@ trust bundle as the root-owned regular file
 The bundle checksum forces a Pod rollout; each replica pins it at startup and
 persists or exact-replays its monotonic trust revision before opening the
 administrator listener.
+
+The worker artifact also contains the exact release `cats` binary. Before the
+first worker association, an operator uses its offline
+`admin runtime-provisioner node-identity` prepare/export/activate flow and the
+official signed `admin runtime-node provision` command; the frozen crash-safe
+contract is [A23 Production Provisioner Tooling v1](../../docs/specs/a23-production-provisioner-tooling-v1.md).
 
 The same cutover provisioner installs the canonical root-only local identity at
 `/etc/cats/identity/node-identity.v1.json`, with its matching per-Node key and credential ID. `cats-noded`
@@ -128,8 +315,8 @@ The same central provisioner must put the reviewed private-DNS Node listener int
 not from worker registration, observation, IMDS, the listener source address, or legacy `nodes.agent_url`.
 Changing it uses an A23 policy revision while the Node is cordoned and has no assigned Desired runtimes; credential
 rotation preserves it, and retirement makes it unavailable to the Route Grant v2 signer.
-This contract uses the exact clean-slate Control Store authority schema version 14. An existing earlier schema is
-not altered in place and refuses startup; provision or recreate an empty version-14 schema before starting any new
+This contract uses the exact clean-slate Control Store authority schema version 15. An existing earlier schema is
+not altered in place and refuses startup; provision or recreate an empty version-15 schema before starting any new
 Control replica, with no mixed-version rolling window.
 
 Every Host-side worker mutation runs under the single
@@ -158,8 +345,9 @@ or conflicting evidence is never promoted to a complete observation. The
 shared-bearer heartbeat and
 legacy NodeJob listener are not rollout or compatibility options. Route v2
 machine ingress remains independently closed unless the
-provisioner installs its reviewed signing ring, mTLS artifacts and listener
-configuration. The exact current evidence endpoint is recorded in
+provisioner installs its reviewed signing ring and mTLS artifacts through the
+validated revision-1 transaction; the generic direct-metal unit deliberately
+does not opt into this listener. The exact current evidence endpoint is recorded in
 [`architecture-cross-review.md`](../../docs/architecture-cross-review.md#当前跨组件证据边界).
 
 The worker builds an optimized Ubuntu 24.04 Guest: direct kernel, a minimal
@@ -213,7 +401,7 @@ does not start the retired NodeJob reconciler or billing-enforcer singleton.
 Existing API-replica and advisory-lock tests do not by themselves prove a
 current public-spawn PostgreSQL-to-physical runtime takeover.
 
-The authority database carries exact clean-slate schema version 14.
+The authority database carries exact clean-slate schema version 15.
 `cats-controld` does not migrate an earlier authority schema in place and fails
 closed on any other stamp or catalog shape. The pre-cutover
 `cats-control-data` PVC is no longer part of the runtime; its final snapshot
@@ -224,7 +412,7 @@ safe-header collection, Pod-UID recheck and PDB-governed eviction are retained
 as historical V1 control-plane HA evidence. Its reconciler-owner oracle targets
 the retired singleton and therefore must not be run from `main` or cited as a
 clean-slate runtime qualification. A replacement must use the production
-public spawn, schema 14 and the signed Runtime composition, preserve the exact
+public spawn, schema 15 and the signed Runtime composition, preserve the exact
 tested SHA, and pass before this boundary is promoted.
 
 The usage ledger has the same rule for the same reason. ADR-0018 replaced the V1

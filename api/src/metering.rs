@@ -7,13 +7,24 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::runtime_reconciliation::SessionBinding;
+
+/// The one production ingestion route shared by legacy development producers
+/// and the signed runtime spine.
+pub const USAGE_CHECKPOINTS_METHOD: &str = "POST";
+pub const USAGE_CHECKPOINTS_PATH: &str = "/v1/internal/usage/checkpoints";
+
 /// Hard limit enforced by the control-plane JSON extractor. Producers should
 /// target materially less than this so headers and intermediary framing never
 /// put an otherwise valid checkpoint batch on the boundary.
 pub const MAX_USAGE_INGEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 
-/// Independent cardinality defense for a syntactically small request.
-pub const MAX_USAGE_CHECKPOINTS_PER_REQUEST: usize = 10_000;
+/// Independent cardinality defense for a syntactically small request. The
+/// durable producer drains larger backlogs as consecutive ordered batches.
+/// 256 carries one two-metric sample round for 128 active runtimes while
+/// preventing one request from monopolizing an ingestion worker with an
+/// arbitrarily large source-attribution loop.
+pub const MAX_USAGE_CHECKPOINTS_PER_REQUEST: usize = 256;
 
 /// Canonical V1 meter definitions. Their units are immutable once emitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -29,6 +40,18 @@ pub enum UsageMetric {
     StorageColdByteMillis,
     /// Public network bytes sent on behalf of a customer.
     NetworkEgressBytes,
+}
+
+/// Whether a cumulative sample keeps a source epoch open or closes it.
+///
+/// A final checkpoint is still a normal billable cumulative sample.  The
+/// marker additionally makes the source epoch terminal once the fixed metric
+/// set has been archived and projected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageEpochMarker {
+    Open,
+    Final,
 }
 
 impl UsageMetric {
@@ -71,6 +94,9 @@ pub struct CatUsageCheckpoint {
     pub cat_id: String,
     pub cat_generation: i64,
     pub metric: UsageMetric,
+    /// `final` is emitted exactly once per metric at the last shared sequence
+    /// of a source epoch. It is part of the deterministic event identifier.
+    pub epoch_marker: UsageEpochMarker,
     /// Decimal string on the wire. Byte-millisecond counters exceed `u64`
     /// for long-lived, memory-heavy runtimes.
     #[serde(with = "decimal_u128")]
@@ -79,6 +105,10 @@ pub struct CatUsageCheckpoint {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestUsageCheckpointsRequest {
+    /// The exact AgentSession which sampled these checkpoints. Ingestion
+    /// rejects a stale session even when the Node credential itself remains
+    /// valid.
+    pub session: SessionBinding,
     pub node_id: String,
     pub checkpoints: Vec<CatUsageCheckpoint>,
 }
@@ -97,6 +127,28 @@ pub struct IngestUsageCheckpointsResponse {
     /// absent on the wire, so an older producer is unaffected.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rejected: Vec<RejectedCheckpoint>,
+    /// Exact, request-ordered settlement for every submitted event.
+    ///
+    /// Aggregate counts are diagnostic only. A durable producer may remove
+    /// an outbox row only after this list names that exact event at the same
+    /// position with an accepted outcome.
+    pub results: Vec<UsageCheckpointIngestResult>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageCheckpointIngestOutcome {
+    Accepted,
+    ExactReplay,
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageCheckpointIngestResult {
+    pub event_id: String,
+    pub outcome: UsageCheckpointIngestOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// One checkpoint the ledger refused for good, with why.
@@ -220,6 +272,7 @@ mod tests {
             cat_id: "cat".to_string(),
             cat_generation: 1,
             metric: UsageMetric::MemoryByteMillis,
+            epoch_marker: UsageEpochMarker::Open,
             cumulative_quantity: u128::MAX,
         };
         let json = serde_json::to_string(&checkpoint).unwrap();
@@ -237,7 +290,7 @@ mod tests {
         let base = r#"{
             "event_id":"usage-test","source_id":"source","source_epoch":"epoch",
             "sequence":1,"observed_at_unix_ms":1,"cat_id":"cat",
-            "cat_generation":1,"metric":"memory_byte_millis",
+            "cat_generation":1,"metric":"memory_byte_millis","epoch_marker":"open",
             "cumulative_quantity":VALUE
         }"#;
         for invalid in ["1", "\"01\"", "\"-1\"", "\"1.0\""] {

@@ -21,6 +21,9 @@ concurrency:
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}
+  EXPECTED_AWS_ACCOUNT_ID: ${{ vars.EXPECTED_AWS_ACCOUNT_ID }}
+  EXPECTED_AWS_PARTITION: ${{ vars.EXPECTED_AWS_PARTITION }}
+  EXPECTED_AWS_REGION: ${{ vars.EXPECTED_AWS_REGION }}
   TF_IN_AUTOMATION: "true"
 
 jobs:
@@ -52,6 +55,12 @@ jobs:
       # Platform stack output; non-secret, but mandatory so controld cannot
       # silently point at a different object namespace than blockd.
       CHUNKSTORE_BUCKET_NAME: ${{ vars.CHUNKSTORE_BUCKET_NAME }}
+      CHUNKSTORE_PREFIX: ${{ vars.CHUNKSTORE_PREFIX }}
+      CONTROL_POSTGRES_SCHEMA: ${{ vars.CONTROL_POSTGRES_SCHEMA }}
+      # Opaque names only. The Secrets are created by the root-only Route v2
+      # credential workflow and must be immutable with closed key sets.
+      ROUTE_V2_CONTROL_ARTIFACT_SECRET_NAME: ${{ vars.ROUTE_V2_CONTROL_ARTIFACT_SECRET_NAME }}
+      ROUTE_V2_GATEWAY_ARTIFACT_SECRET_NAME: ${{ vars.ROUTE_V2_GATEWAY_ARTIFACT_SECRET_NAME }}
       # PKCS#8 Ed25519 signing key, base64-encoded so GitHub can carry the PEM
       # without line-ending changes. Only cats-controld receives the decoded
       # file; workers get its public half through the infrastructure stack.
@@ -65,13 +74,47 @@ jobs:
         with:
           ref: ${{ env.RELEASE_SHA }}
 
-      - uses: docker/setup-buildx-action@v3
+      - name: Require reviewed AWS target
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in AWS_REGION EXPECTED_AWS_ACCOUNT_ID EXPECTED_AWS_PARTITION EXPECTED_AWS_REGION; do
+            test -n "${!name:-}" || {
+              echo "::error::Missing required repository variable $name"
+              exit 1
+            }
+          done
 
       - name: Assume production deployment role
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify production AWS target
+        run: |
+          python3 deploy/aws/verify-aws-target.py \
+            --expected-account-id "$EXPECTED_AWS_ACCOUNT_ID" \
+            --expected-partition "$EXPECTED_AWS_PARTITION" \
+            --expected-region "$EXPECTED_AWS_REGION"
+
+      - name: Build the one Guest payload
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -qy busybox-static cpio zstd gzip e2fsprogs debootstrap musl-tools
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --locked --release -p cats-guest-agent --target x86_64-unknown-linux-musl
+          sudo env \
+            HOME=/root \
+            GUEST_AGENT_BIN="$PWD/target/x86_64-unknown-linux-musl/release/cats-guest-agent" \
+            OUT="$RUNNER_TEMP/guest-build" \
+            RELEASE_OUT="$PWD/guest-runtime-release.v1" \
+            deploy/metal/build-guest-image.sh
+          sudo chown -R "$USER:$USER" guest-runtime-release.v1
+          find guest-runtime-release.v1 -type f -exec sha256sum {} + | LC_ALL=C sort
+
+      - uses: docker/setup-buildx-action@v3
 
       - name: Log in to ECR
         id: ecr
@@ -95,6 +138,7 @@ jobs:
           # "control-plane" image ships the refresher ENTRYPOINT (issue #117).
           target: runtime
           platforms: linux/amd64
+          build-args: CATS_RELEASE_COMMIT_SHA=${{ env.RELEASE_SHA }}
           push: true
           tags: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
           provenance: false
@@ -113,11 +157,26 @@ jobs:
           file: deploy/aws/Dockerfile.control-plane
           target: credential-refresher
           platforms: linux/amd64
+          build-args: CATS_RELEASE_COMMIT_SHA=${{ env.RELEASE_SHA }}
           push: true
           tags: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:refresher-${{ steps.meta.outputs.tag }}
           provenance: false
           cache-from: type=gha,scope=credential-refresher
           cache-to: type=gha,mode=max,scope=credential-refresher
+
+      - name: Build and push Route v2 Gateway image
+        id: build_gateway
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/aws/Dockerfile.gateway
+          target: runtime
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:gateway-${{ steps.meta.outputs.tag }}
+          provenance: false
+          cache-from: type=gha,scope=gateway
+          cache-to: type=gha,mode=max,scope=gateway
 
       - name: Pin image digest
         id: image
@@ -125,15 +184,18 @@ jobs:
         env:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
           REFRESHER_DIGEST: ${{ steps.build_refresher.outputs.digest }}
+          GATEWAY_DIGEST: ${{ steps.build_gateway.outputs.digest }}
           ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
           ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
         run: |
           set -euo pipefail
           [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$REFRESHER_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$GATEWAY_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           image_ref="${ECR_REGISTRY}/${ECR_REPOSITORY}@${IMAGE_DIGEST}"
           echo "ref=$image_ref" >> "$GITHUB_OUTPUT"
           echo "refresher_ref=${ECR_REGISTRY}/${ECR_REPOSITORY}@${REFRESHER_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "gateway_ref=${ECR_REGISTRY}/${ECR_REPOSITORY}@${GATEWAY_DIGEST}" >> "$GITHUB_OUTPUT"
 
       - uses: hashicorp/setup-terraform@v3
         with:
@@ -146,11 +208,19 @@ jobs:
           umask 077
           for name in \
             AWS_REGION \
+            EXPECTED_AWS_ACCOUNT_ID \
+            EXPECTED_AWS_PARTITION \
+            EXPECTED_AWS_REGION \
             TF_STATE_BUCKET \
             TF_STATE_APPLICATION_KEY \
             EKS_CLUSTER_NAME \
             PRODUCTION_TFVARS_B64 \
+            CHUNKSTORE_BUCKET_NAME \
+            CHUNKSTORE_PREFIX \
+            CONTROL_POSTGRES_SCHEMA \
             RDS_MASTER_USER_SECRET_ARN \
+            ROUTE_V2_CONTROL_ARTIFACT_SECRET_NAME \
+            ROUTE_V2_GATEWAY_ARTIFACT_SECRET_NAME \
             ROUTE_GRANT_PRIVATE_KEY_PEM_B64 \
             RUNTIME_PROVISIONER_TRUST_BUNDLE_B64
           do
@@ -159,6 +229,11 @@ jobs:
               exit 1
             fi
           done
+          [[ "$CONTROL_POSTGRES_SCHEMA" =~ ^cats_[a-z0-9_]+$ ]] &&
+            (( ${#CONTROL_POSTGRES_SCHEMA} <= 63 )) || {
+              echo "::error::CONTROL_POSTGRES_SCHEMA must be one lowercase cats_* PostgreSQL identifier"
+              exit 1
+            }
 
           printf '%s' "$PRODUCTION_TFVARS_B64" \
             | base64 --decode > "$RUNNER_TEMP/production.tfvars"
@@ -190,6 +265,41 @@ jobs:
             --region "$AWS_REGION" \
             --alias "$EKS_CLUSTER_NAME" \
             --kubeconfig "$RUNNER_TEMP/kubeconfig"
+
+          # Inspect only object shape and immutable metadata. Secret data stays
+          # in the kubectl-to-jq pipe and is never printed, persisted in
+          # Terraform state, or copied into an environment variable.
+          kubectl \
+            --kubeconfig "$RUNNER_TEMP/kubeconfig" \
+            --namespace cats \
+            get secret "$ROUTE_V2_CONTROL_ARTIFACT_SECRET_NAME" \
+            --output json \
+            | jq -e '
+                .immutable == true and
+                (.data | keys) == [
+                  "control-machine-server-certificate.pem",
+                  "control-machine-server-private-key.pem",
+                  "gateway-client-ca-bundle.pem",
+                  "gateway-workload-authority.v1.json",
+                  "public-key-ring.v1.json",
+                  "rotation-operator-trust.v1.json",
+                  "signer-private-key.pem",
+                  "signer.v1.json"
+                ]
+              ' >/dev/null
+          kubectl \
+            --kubeconfig "$RUNNER_TEMP/kubeconfig" \
+            --namespace cats \
+            get secret "$ROUTE_V2_GATEWAY_ARTIFACT_SECRET_NAME" \
+            --output json \
+            | jq -e '
+                .immutable == true and
+                (.data | keys) == [
+                  "gateway-machine-client-certificate.pem",
+                  "gateway-machine-client-private-key.pem",
+                  "node-server-ca-bundle.pem"
+                ]
+              ' >/dev/null
 
           kubectl \
             --kubeconfig "$RUNNER_TEMP/kubeconfig" \
@@ -260,10 +370,14 @@ jobs:
             "$RUNNER_TEMP/live-secret.json" \
             "$RUNNER_TEMP/master-user-secret.json" \
             "${postgres_host_args[@]}" \
+            --schema "CATS_POSTGRES_URL=$CONTROL_POSTGRES_SCHEMA" \
             CATS_POSTGRES_URL \
             CATS_USAGE_POSTGRES_URL \
             > "$RUNNER_TEMP/rotated-urls.json"
           chmod 600 "$RUNNER_TEMP/rotated-urls.json"
+          jq -erj '.CATS_POSTGRES_URL' "$RUNNER_TEMP/rotated-urls.json" \
+            > "$RUNNER_TEMP/proposed-control-postgres-url"
+          chmod 600 "$RUNNER_TEMP/proposed-control-postgres-url"
 
           for key in \
             CATS_POSTGRES_URL \
@@ -320,6 +434,7 @@ jobs:
             "$RUNNER_TEMP/route-grant-private.pem" \
             "$RUNNER_TEMP/route-grant-public.pem" \
             "$RUNNER_TEMP/runtime-provisioner-trust.v1.json" \
+            "$RUNNER_TEMP/proposed-control-postgres-url" \
             "$RUNNER_TEMP/production-secrets.tfvars.json"
 
       - name: Check control database compatibility
@@ -336,20 +451,31 @@ jobs:
             exit 1
           fi
 
-          # The control store lives in PostgreSQL. Query its stamped version
-          # from inside the cluster (the runner cannot reach RDS) through a
-          # one-off pod that reads the DSN from the same Secret the control
-          # plane uses, so no credential leaves the cluster. A fresh database
-          # has no version table yet and is always compatible; anything else
-          # that prevents reading the version fails the gate closed.
+          # The control store lives in PostgreSQL. Probe the proposed fresh
+          # DSN, not the live Pod's old Secret. The
+          # runner turns the local root-only file into a short-lived Kubernetes
+          # Secret so the credential never enters argv or a Pod manifest.
           probe="control-schema-check-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          selected_schema="$(
+            deploy/aws/run-postgres-probe.sh \
+              "$RUNNER_TEMP/kubeconfig" \
+              cats \
+              "${probe}-target" \
+              "SELECT current_schema()" \
+              "$RUNNER_TEMP/proposed-control-postgres-url"
+          )"
+          if [[ "$selected_schema" != "$CONTROL_POSTGRES_SCHEMA" ]]; then
+            echo "::error::Proposed Control DSN selected schema ${selected_schema:-<none>} instead of $CONTROL_POSTGRES_SCHEMA"
+            exit 1
+          fi
           set +e
           query_output="$(
             deploy/aws/run-postgres-probe.sh \
               "$RUNNER_TEMP/kubeconfig" \
               cats \
               "$probe" \
-              "SELECT version FROM control_schema_version"
+              "SELECT version FROM ${CONTROL_POSTGRES_SCHEMA}.control_schema_version" \
+              "$RUNNER_TEMP/proposed-control-postgres-url"
           )"
           query_status=$?
           set -e
@@ -360,7 +486,9 @@ jobs:
               echo "::error::Control database schema $actual_schema does not exactly match build schema $required_schema. Recreate the database with the reviewed clean-slate cutover runbook before retrying. The deployment will not replace the live Pod or delete production data automatically."
               exit 1
             fi
-          elif (( query_status != 0 )) && [[ "$query_output" == *'relation "control_schema_version" does not exist'* ]]; then
+          elif (( query_status != 0 )) && \
+            [[ "$query_output" == *'does not exist'* ]] && \
+            [[ "$query_output" == *"${CONTROL_POSTGRES_SCHEMA}.control_schema_version"* ]]; then
             echo "Control database has no stamped schema yet; the new Pod creates version $required_schema."
           else
             echo "::error::Could not read the control database schema version (probe exit $query_status): $query_output"
@@ -412,6 +540,7 @@ jobs:
         env:
           IMAGE_REF: ${{ steps.image.outputs.ref }}
           REFRESHER_REF: ${{ steps.image.outputs.refresher_ref }}
+          GATEWAY_REF: ${{ steps.image.outputs.gateway_ref }}
         run: |
           set -euo pipefail
           terraform \
@@ -424,8 +553,16 @@ jobs:
             -var-file="$RUNNER_TEMP/production-secrets.tfvars.json" \
             -var="kubeconfig_path=$RUNNER_TEMP/kubeconfig" \
             -var="kubeconfig_context=$EKS_CLUSTER_NAME" \
+            -var="expected_account_id=$EXPECTED_AWS_ACCOUNT_ID" \
+            -var="expected_aws_partition=$EXPECTED_AWS_PARTITION" \
+            -var="aws_region=$EXPECTED_AWS_REGION" \
             -var="control_plane_image=$IMAGE_REF" \
+            -var="gateway_image=$GATEWAY_REF" \
+            -var="route_v2_control_artifact_secret_name=$ROUTE_V2_CONTROL_ARTIFACT_SECRET_NAME" \
+            -var="route_v2_gateway_artifact_secret_name=$ROUTE_V2_GATEWAY_ARTIFACT_SECRET_NAME" \
             -var="chunkstore_bucket_name=$CHUNKSTORE_BUCKET_NAME" \
+            -var="chunkstore_prefix=$CHUNKSTORE_PREFIX" \
+            -var="control_postgres_schema=$CONTROL_POSTGRES_SCHEMA" \
             -var="credential_refresher_image=$REFRESHER_REF" \
             -var="database_master_user_secret_arn=$RDS_MASTER_USER_SECRET_ARN"
 
@@ -444,10 +581,12 @@ jobs:
         shell: bash
         env:
           IMAGE_REF: ${{ steps.image.outputs.ref }}
+          GATEWAY_REF: ${{ steps.image.outputs.gateway_ref }}
         run: |
           set -euo pipefail
-          for deployment in cats-controld
-          do
+          verify_deployment() {
+            deployment=$1
+            expected_image=$2
             kubectl \
               --kubeconfig "$RUNNER_TEMP/kubeconfig" \
               --namespace cats \
@@ -460,8 +599,10 @@ jobs:
                 get "deployment/$deployment" \
                 --output jsonpath='{.spec.template.spec.containers[0].image}'
             )"
-            [[ "$observed" == "$IMAGE_REF" ]]
-          done
+            [[ "$observed" == "$expected_image" ]]
+          }
+          verify_deployment cats-controld "$IMAGE_REF"
+          verify_deployment cats-gatewayd "$GATEWAY_REF"
 
       - name: Mark deployment successful
         if: success() && steps.deployment.outputs.id != ''
@@ -497,6 +638,7 @@ jobs:
         shell: bash
         env:
           IMAGE_REF: ${{ steps.image.outputs.ref }}
+          GATEWAY_REF: ${{ steps.image.outputs.gateway_ref }}
         run: |
           {
             echo "### Production deployment"
@@ -505,5 +647,6 @@ jobs:
             echo "|---|---|"
             echo "| commit | \`$RELEASE_SHA\` |"
             echo "| image | \`$IMAGE_REF\` |"
+            echo "| gateway image | \`$GATEWAY_REF\` |"
             echo "| method | Terraform saved plan + apply |"
           } >> "$GITHUB_STEP_SUMMARY"

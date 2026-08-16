@@ -7,6 +7,11 @@
 //! locks before they can reach an authorization or Volume row.
 
 use cats_api::agent_registration::AuthenticatedNodeCredential;
+#[cfg(feature = "proposed-node-residue-reclamation")]
+use cats_api::runtime_reconciliation::{
+    encode_runtime_residue_authority_request, RuntimeResidueAuthorityRequest,
+    RuntimeResidueAuthoritySuccess,
+};
 use cats_api::runtime_reconciliation::{
     encode_runtime_volume_transition_evidence_request, encode_runtime_volume_transition_request,
     AcquireOrigin, AgentSession, AssignedPlacement, CleanupRelease, CleanupTarget, ContractError,
@@ -22,13 +27,15 @@ use cats_api::runtime_reconciliation::{
     VolumeLeaseGrant,
 };
 use cats_storage::authority::{
-    consume_disposable_root_delete, consume_takeover, normal_acquire, release,
-    replay_consumed_takeover, AuthorityError, AuthorizationRecord, AuthorizationState,
+    consume_disposable_root_delete, consume_takeover, consume_trusted_takeover_v1, normal_acquire,
+    release, replay_consumed_takeover, AuthorityError, AuthorizationRecord, AuthorizationState,
     HostFenceEvent, LastVolumeTransition, NormalAcquireRequest, ReleaseRequest, TakeoverResult,
     VolumeAuthorization, VolumeOwnerBinding, VolumeRecord,
 };
+use cats_storage::trusted_host_fence::TrustedHostFenceEventV1;
 use postgres::Transaction;
 
+use super::host_fence_commit::load_terminal_event_for_update;
 use super::product::{
     persistent_initialization_matches_mount, DiskAdminState, DiskRecord, DiskRole,
     PersistentDiskInitialization,
@@ -37,6 +44,8 @@ use super::product_rows::{
     load_any_disk_snapshot_for_update, load_cat_by_id_for_update, load_desired_for_update,
     load_disk_by_id_for_update, load_pending_operation_by_cat_for_update, update_disk,
 };
+#[cfg(feature = "proposed-node-residue-reclamation")]
+use super::residue_authority::load_runtime_residue_authority_in;
 use super::rows::{
     database_now, load_authorization_for_update, load_event_for_update,
     load_stored_volume_for_update, load_takeover_authorization_for_intent_update,
@@ -123,10 +132,74 @@ struct LockedMutationContext<'transaction, 'connection> {
 struct LockedTakeoverMutation<'transaction, 'connection> {
     transaction: &'transaction mut Transaction<'connection>,
     db_now: UnixMillis,
-    event: HostFenceEvent,
+    event: TakeoverFenceEvent,
     authorization: AuthorizationRecord,
     volume: VolumeRecord,
     owner_binding: VolumeOwnerBinding,
+}
+
+enum TakeoverFenceEvent {
+    Legacy(Box<HostFenceEvent>),
+    TrustedTerminalV1(Box<TrustedHostFenceEventV1>),
+}
+
+impl TakeoverFenceEvent {
+    fn event_id(&self) -> &Id {
+        match self {
+            Self::Legacy(event) => &event.event_id,
+            Self::TrustedTerminalV1(event) => &event.event_id,
+        }
+    }
+
+    fn node_id(&self) -> &Id {
+        match self {
+            Self::Legacy(event) => &event.node_id,
+            Self::TrustedTerminalV1(event) => &event.binding.node_id,
+        }
+    }
+
+    fn consume(
+        &self,
+        volume: &VolumeRecord,
+        authorization: &AuthorizationRecord,
+        authorization_id: &Id,
+        db_now: UnixMillis,
+    ) -> cats_storage::authority::Result<(VolumeRecord, AuthorizationRecord, TakeoverResult)> {
+        match self {
+            Self::Legacy(event) => {
+                consume_takeover(volume, event, authorization, authorization_id, db_now)
+            }
+            Self::TrustedTerminalV1(event) => {
+                consume_trusted_takeover_v1(volume, event, authorization, authorization_id, db_now)
+            }
+        }
+    }
+}
+
+fn load_takeover_fence_event_for_update(
+    transaction: &mut Transaction<'_>,
+    event_id: &Id,
+) -> AuthorityTxResult<Option<TakeoverFenceEvent>> {
+    let Some(row) = transaction.query_opt(
+        "SELECT state FROM host_fence_events WHERE event_id=$1 FOR UPDATE",
+        &[&event_id.as_str()],
+    )?
+    else {
+        return Ok(None);
+    };
+    match row.try_get::<_, String>("state")?.as_str() {
+        "active" | "rejoined" => load_event_for_update(transaction, event_id)?
+            .map(Box::new)
+            .map(TakeoverFenceEvent::Legacy)
+            .map(Some)
+            .ok_or_else(|| AuthorityError::BackendUnknown.into()),
+        "terminal_v1" => load_terminal_event_for_update(transaction, event_id)?
+            .map(Box::new)
+            .map(TakeoverFenceEvent::TrustedTerminalV1)
+            .map(Some)
+            .ok_or_else(|| AuthorityError::BackendUnknown.into()),
+        _ => Err(AuthorityError::BackendUnknown.into()),
+    }
 }
 
 struct AuthenticatedNodeTransaction {
@@ -145,6 +218,35 @@ impl<'transaction, 'connection> EvidenceTransactionContext<'transaction, 'connec
 }
 
 impl Store {
+    /// Reuses the A22 read-strength identity prefix for signed usage ingress.
+    /// This is an authentication read only: no usage row or receipt is added
+    /// to the Control store, and the configured UsageStore remains the one
+    /// ingestion boundary.
+    pub(crate) fn runtime_node_session_for_request(
+        &self,
+        authenticated: &AuthenticatedNodeCredential,
+        session: &SessionBinding,
+        active_guest_config_digest: &Sha256Digest,
+        request_context: &AuthorityRequestContext,
+    ) -> Result<VolumeTransitionStoreOutcome<Id>> {
+        self.authority_request_locking_read_snapshot(request_context, |transaction| {
+            match authenticate_evidence_context_in(
+                transaction,
+                authenticated,
+                session,
+                active_guest_config_digest,
+            )? {
+                VolumeTransitionStoreOutcome::Accepted(context) => {
+                    let (_, node_id, _) = context.into_parts();
+                    Ok(VolumeTransitionStoreOutcome::Accepted(node_id))
+                }
+                VolumeTransitionStoreOutcome::Rejected(rejection) => {
+                    Ok(VolumeTransitionStoreOutcome::Rejected(rejection))
+                }
+            }
+        })
+    }
+
     /// Executes the complete closed A22 mutation union. Every branch starts
     /// from the same mutation-strength NodeIdentity/credential/session prefix
     /// and commits its domain rows in that one request-owned transaction.
@@ -253,6 +355,63 @@ impl Store {
                 }
             };
             load_volume_transition_evidence_in(context, request)
+                .map(VolumeTransitionStoreOutcome::Accepted)
+        })
+    }
+
+    /// Qualifies one exact retained local lineage under the current signed
+    /// AgentSession and one repeatable-read PostgreSQL snapshot.
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    pub(crate) fn runtime_residue_authority(
+        &self,
+        authenticated: &AuthenticatedNodeCredential,
+        request: &RuntimeResidueAuthorityRequest,
+        active_guest_config_digest: &Sha256Digest,
+    ) -> Result<VolumeTransitionStoreOutcome<Box<RuntimeResidueAuthoritySuccess>>> {
+        if let Err(error) = encode_runtime_residue_authority_request(request) {
+            return Ok(contract_rejected(error));
+        }
+        self.authority_locking_read_snapshot(|transaction| {
+            let context = match authenticate_evidence_context_in(
+                transaction,
+                authenticated,
+                &request.session,
+                active_guest_config_digest,
+            )? {
+                VolumeTransitionStoreOutcome::Accepted(context) => context,
+                VolumeTransitionStoreOutcome::Rejected(rejection) => {
+                    return Ok(VolumeTransitionStoreOutcome::Rejected(rejection));
+                }
+            };
+            load_runtime_residue_authority_in(context, request)
+                .map(VolumeTransitionStoreOutcome::Accepted)
+        })
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    pub(crate) fn runtime_residue_authority_with_context(
+        &self,
+        authenticated: &AuthenticatedNodeCredential,
+        request: &RuntimeResidueAuthorityRequest,
+        active_guest_config_digest: &Sha256Digest,
+        request_context: &AuthorityRequestContext,
+    ) -> Result<VolumeTransitionStoreOutcome<Box<RuntimeResidueAuthoritySuccess>>> {
+        if let Err(error) = encode_runtime_residue_authority_request(request) {
+            return Ok(contract_rejected(error));
+        }
+        self.authority_request_locking_read_snapshot(request_context, |transaction| {
+            let context = match authenticate_evidence_context_in(
+                transaction,
+                authenticated,
+                &request.session,
+                active_guest_config_digest,
+            )? {
+                VolumeTransitionStoreOutcome::Accepted(context) => context,
+                VolumeTransitionStoreOutcome::Rejected(rejection) => {
+                    return Ok(VolumeTransitionStoreOutcome::Rejected(rejection));
+                }
+            };
+            load_runtime_residue_authority_in(context, request)
                 .map(VolumeTransitionStoreOutcome::Accepted)
         })
     }
@@ -717,7 +876,7 @@ fn execute_takeover(
         }
         return Err(AuthorityError::BackendUnknown.into());
     };
-    let event = load_event_for_update(context.transaction, &event_id)?
+    let event = load_takeover_fence_event_for_update(context.transaction, &event_id)?
         .ok_or(AuthorityError::BackendUnknown)?;
     let authorization = load_takeover_authorization_for_intent_update(
         context.transaction,
@@ -731,7 +890,7 @@ fn execute_takeover(
     let VolumeAuthorization::Takeover(payload) = &authorization.authorization else {
         return Err(AuthorityError::BackendUnknown.into());
     };
-    if payload.host_fence_event_id != event.event_id
+    if &payload.host_fence_event_id != event.event_id()
         || !takeover_payload_matches_desired(payload, &context.node_id, &context.desired, &intent)
     {
         return Err(AuthorityError::BackendUnknown.into());
@@ -743,7 +902,7 @@ fn execute_takeover(
         .owner_binding
         .ok_or(AuthorityError::BackendUnknown)?;
     if matches!(authorization.state, AuthorizationState::Unconsumed)
-        && owner_binding.owner_node_id != event.node_id
+        && &owner_binding.owner_node_id != event.node_id()
     {
         return Ok(authorization_rejected(
             authorization_id.clone(),
@@ -768,16 +927,11 @@ fn execute_takeover(
             result
         }
         Ok(None) => {
-            let (updated_volume, updated_authorization, result) = match consume_takeover(
-                &volume,
-                &event,
-                &authorization,
-                authorization_id,
-                context.db_now,
-            ) {
-                Ok(value) => value,
-                Err(error) => return takeover_authority_error(authorization_id, error),
-            };
+            let (updated_volume, updated_authorization, result) =
+                match event.consume(&volume, &authorization, authorization_id, context.db_now) {
+                    Ok(value) => value,
+                    Err(error) => return takeover_authority_error(authorization_id, error),
+                };
             let owner_binding = VolumeOwnerBinding {
                 volume_id: updated_volume.volume_id.clone(),
                 owner_node_id: context.node_id.clone(),
@@ -1972,8 +2126,8 @@ fn lock_takeover_mutation_context<'transaction, 'connection>(
     // VolumeRecord -> DiskRecord/current Desired.  The Desired was read above
     // only as a NodeIdentity-protected routing fact and is locked/revalidated
     // here after Volume as required by the global DAG.
-    let event =
-        load_event_for_update(transaction, &event_id)?.ok_or(AuthorityError::BackendUnknown)?;
+    let event = load_takeover_fence_event_for_update(transaction, &event_id)?
+        .ok_or(AuthorityError::BackendUnknown)?;
     let authorization = load_takeover_authorization_for_intent_update(
         transaction,
         &request.authorization_id,
@@ -1986,7 +2140,7 @@ fn lock_takeover_mutation_context<'transaction, 'connection>(
     let VolumeAuthorization::Takeover(payload) = &authorization.authorization else {
         return Err(AuthorityError::BackendUnknown.into());
     };
-    if payload.host_fence_event_id != event.event_id {
+    if &payload.host_fence_event_id != event.event_id() {
         return Err(AuthorityError::BackendUnknown.into());
     }
     if !takeover_payload_matches_current_intent(payload, &node_id, &desired, &intent, request) {
@@ -2000,7 +2154,7 @@ fn lock_takeover_mutation_context<'transaction, 'connection>(
         .owner_binding
         .ok_or(AuthorityError::BackendUnknown)?;
     if matches!(authorization.state, AuthorizationState::Unconsumed)
-        && owner_binding.owner_node_id != event.node_id
+        && &owner_binding.owner_node_id != event.node_id()
     {
         return Ok(authorization_rejected(
             request.authorization_id.clone(),
@@ -2065,7 +2219,7 @@ fn consume_locked_takeover(
     };
     let owner_node_id = payload.authorized_node_id.clone();
     let (updated_volume, updated_authorization, result) =
-        match consume_takeover(&volume, &event, &authorization, authorization_id, db_now) {
+        match event.consume(&volume, &authorization, authorization_id, db_now) {
             Ok(result) => result,
             Err(error) => return takeover_authority_error(authorization_id, error),
         };

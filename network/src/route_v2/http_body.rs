@@ -75,11 +75,12 @@ impl std::fmt::Display for ResponseReadError {
 
 impl std::error::Error for ResponseReadError {}
 
-/// Build the only production HTTP client shape this module permits.
+/// Build a strict HTTPS client for non-mTLS bounded-response consumers.
 ///
-/// The caller still has to supply the not-yet-frozen machine identity and
-/// resolve request. This client refuses plaintext URLs, environment proxies
-/// and redirects and applies both connect and whole-request deadlines.
+/// The production Route resolver uses [`super::ControlRouteResolver`] so its
+/// installed client certificate is inseparable from TLS construction. This
+/// lower-level helper still refuses plaintext URLs, environment proxies and
+/// redirects and applies both connect and whole-request deadlines.
 pub fn strict_https_client(
     connect_timeout: Duration,
     request_timeout: Duration,

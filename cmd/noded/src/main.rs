@@ -20,14 +20,6 @@ struct Args {
     listen: String,
     #[arg(long)]
     control_plane_url: String,
-    /// Retired single-key CLI retained only until the metal unit/install
-    /// transaction moves as one change. These bytes are never opened or used
-    /// as Route v2 authority.
-    #[arg(
-        long = "route-grant-public-key-file",
-        env = "CATS_ROUTE_GRANT_PUBLIC_KEY_FILE"
-    )]
-    _retired_route_grant_public_key_file: PathBuf,
     #[arg(
         long,
         env = "CATS_ROUTE_V2_PUBLIC_KEY_RING_FILE",
@@ -38,6 +30,11 @@ struct Args {
     /// Absence keeps this ingress closed and does not read its fixed artifacts.
     #[arg(long, env = "CATS_ROUTE_V2_MACHINE_LISTEN")]
     route_v2_machine_listen: Option<String>,
+    /// Server-authenticated HTTPS origin for adjacent Route v2 ring delivery.
+    /// It is mandatory with the machine listener and is independent from the
+    /// public management Control origin.
+    #[arg(long, env = "CATS_ROUTE_V2_ROTATION_ORIGIN")]
+    route_v2_rotation_origin: Option<String>,
     #[arg(
         long,
         env = "CATS_GATEWAY_CLIENT_CA_BUNDLE_FILE",
@@ -230,8 +227,11 @@ async fn main() -> anyhow::Result<()> {
         cats_node_agent::agent_registration::AgentRegistrationConfig::load_installed(
             installed_receipt.receipt(),
         )?;
-    let route_v2_machine = match args.route_v2_machine_listen {
-        Some(listen) => {
+    let route_v2_machine = match (
+        args.route_v2_machine_listen,
+        args.route_v2_rotation_origin.as_deref(),
+    ) {
+        (Some(listen), Some(rotation_origin)) => {
             let artifacts =
                 cats_api::runtime_artifacts::load_installed_node_route_v2_machine_artifacts(
                     &args.route_v2_public_key_ring_file,
@@ -243,15 +243,22 @@ async fn main() -> anyhow::Result<()> {
                 listen,
                 agent_registration.identity().node_id.clone(),
                 &artifacts,
+                rotation_origin,
             )?)
         }
-        None => None,
+        (None, None) => None,
+        _ => anyhow::bail!(
+            "--route-v2-machine-listen and --route-v2-rotation-origin must be configured together"
+        ),
     };
     let deadline_policy = RuntimeSpineDeadlinePolicy::new(
         Duration::from_millis(args.runtime_inventory_scan_timeout_ms),
         Duration::from_millis(args.runtime_effect_step_timeout_ms),
     )
     .context("validate signed Runtime scan/effect deadline policy")?;
+    let metering_cgroup_root = args
+        .metering_cgroup_root
+        .context("--metering-cgroup-root or CATS_METERING_CGROUP_ROOT is required")?;
     let handle = spawn_signed_runtime_cutover(SignedRuntimeCutoverConfig {
         listen: args.listen,
         route_v2_machine,
@@ -260,7 +267,7 @@ async fn main() -> anyhow::Result<()> {
         ch_config,
         authorized_blockd_launch,
         guest_agent_binary: args.guest_agent_bin,
-        metering_cgroup_root: args.metering_cgroup_root,
+        metering_cgroup_root: Some(metering_cgroup_root),
         volume_data_authority,
         volume_inventory_authority,
         blob_store,
@@ -333,6 +340,7 @@ mod tests {
             "ch_initramfs",
             "ch_cmdline",
             "ch_network_cidr",
+            "route_grant_public_key_file",
         ] {
             assert!(
                 !ids.contains(&forbidden),

@@ -9,8 +9,6 @@ import {
   requestWithStatus,
   resourceKind,
   setBusy,
-  sleep,
-  splitCommand,
   statusBadge,
   toast,
 } from "/ui/common.js";
@@ -22,6 +20,16 @@ import {
   listPendingCatCreateV2,
   sendDurableCatCreateV2,
 } from "/ui/cat-create-v2.mjs";
+import {
+  buildPersistentDiskCreateV1Request,
+  listPendingPersistentDiskCreateV1,
+  persistentDiskCreateV1Path,
+  sendDurablePersistentDiskCreateV1,
+} from "/ui/persistent-disk-create-v1.mjs";
+import {
+  loadAll as loadRuntimeProductReads,
+  setRuntimeProductLoadingShell,
+} from "/ui/runtime-product-load.mjs";
 
 initI18n();
 
@@ -42,8 +50,10 @@ const state = {
   selectedBillingCatId: "",
   selectedBillingCatName: "",
   activeView: "overview",
-  execCat: "",
-  loading: false,
+  runtimeProductLoadGeneration: 0,
+  runtimeProductLoad: null,
+  runtimeProductWorkspaceLoading: null,
+  runtimeProductWorkspaceGeneration: 0,
   paymentRedirecting: false,
 };
 
@@ -53,7 +63,6 @@ const loginError = document.querySelector("#login-error");
 const createCatDialog = document.querySelector("#create-cat-dialog");
 const createDiskDialog = document.querySelector("#create-disk-dialog");
 const billingCatDialog = document.querySelector("#billing-cat-dialog");
-const execDialog = document.querySelector("#exec-dialog");
 
 const switchView = initNavigation(
   {
@@ -107,23 +116,39 @@ function renderWorkspaceSwitcher() {
 
 async function switchWorkspace(workspaceId, { updateUrl = true } = {}) {
   if (!workspaceId || workspaceId === state.activeWorkspaceId) return;
-  const session = await request("/auth/workspace", {
-    method: "POST",
-    body: JSON.stringify({ workspace_id: workspaceId }),
-  });
-  applySession(session);
-  state.cats = [];
-  state.disks = [];
-  state.operations = [];
-  state.billing = null;
-  state.billingBalance = null;
-  state.billingDetail = null;
-  if (updateUrl) {
-    const workspace = activeWorkspace();
-    if (workspace) window.history.pushState(null, "", workspaceUrl(workspace));
+  cancelRuntimeProductLoad();
+  const generation = ++state.runtimeProductWorkspaceGeneration;
+  const transition = { generation, workspaceId };
+  state.runtimeProductWorkspaceLoading = transition;
+  setRuntimeProductLoadingShell(document, true);
+  let switched = false;
+  try {
+    const session = await request("/auth/workspace", {
+      method: "POST",
+      body: JSON.stringify({ workspace_id: workspaceId }),
+    });
+    if (state.runtimeProductWorkspaceLoading !== transition) return;
+    applySession(session);
+    state.cats = [];
+    state.disks = [];
+    state.operations = [];
+    state.billing = null;
+    state.billingBalance = null;
+    state.billingDetail = null;
+    if (updateUrl) {
+      const workspace = activeWorkspace();
+      if (workspace) window.history.pushState(null, "", workspaceUrl(workspace));
+    }
+    render();
+    switched = true;
+    await loadAll({ quiet: true });
+  } finally {
+    if (state.runtimeProductWorkspaceLoading === transition) {
+      state.runtimeProductWorkspaceLoading = null;
+      render();
+    }
   }
-  await loadAll({ quiet: true });
-  await resumePendingCatCreates();
+  if (switched) await resumePendingProductCreates();
 }
 
 async function authenticatedRequestWithStatus(path, options = {}) {
@@ -192,6 +217,56 @@ async function resumePendingCatCreates() {
   }
 }
 
+async function sendPendingPersistentDiskCreate(
+  workspaceId,
+  path,
+  requestBody,
+  onCreated,
+  expectedPending,
+) {
+  return sendDurablePersistentDiskCreateV1({
+    workspaceId,
+    path,
+    requestBody,
+    send: authenticatedRequestWithStatus,
+    onCreated,
+    ...(expectedPending ? { expectedPending } : {}),
+  });
+}
+
+async function resumePendingPersistentDiskCreates() {
+  if (!state.activeWorkspaceId) return;
+  let pending;
+  try {
+    pending = await listPendingPersistentDiskCreateV1({
+      workspaceId: state.activeWorkspaceId,
+    });
+  } catch (error) {
+    toast(t("common.error"), error.message, "error");
+    return;
+  }
+  for (const request of pending) {
+    try {
+      await sendPendingPersistentDiskCreate(
+        state.activeWorkspaceId,
+        request.path,
+        request.requestBody,
+        (disk) => toast(t("user.disk.created"), `${disk.name} · ${formatBytes(disk.size_bytes)}`),
+        request.expectedPending,
+      );
+    } catch (error) {
+      toast(t("common.error"), error.message, "error");
+    }
+  }
+}
+
+async function resumePendingProductCreates() {
+  await Promise.all([
+    resumePendingCatCreates(),
+    resumePendingPersistentDiskCreates(),
+  ]);
+}
+
 function showApp() {
   loginScreen.classList.add("is-hidden");
   appShell.classList.remove("is-hidden");
@@ -225,18 +300,34 @@ function consumeTopupStatus() {
 }
 
 async function loadAll({ quiet = false } = {}) {
-  if (state.loading) return;
-  state.loading = true;
+  const workspaceId = state.activeWorkspaceId;
+  if (!workspaceId) return;
+  cancelRuntimeProductLoad();
+  const generation = ++state.runtimeProductLoadGeneration;
+  const controller = new AbortController();
   const button = document.querySelector("#refresh-button");
   if (!quiet) setBusy(button, true, t("common.refreshing"));
+  state.runtimeProductLoad = { generation, workspaceId, controller, button, quiet };
   try {
-    // Read projections remain closed in production. Preserve an honest empty
-    // local view instead of probing retired authority routes on every refresh.
-    state.cats = [];
-    state.disks = [];
+    const result = await loadRuntimeProductReads({
+      workspaceId,
+      signal: controller.signal,
+      requestPage: authenticatedRequest,
+    });
+    if (controller.signal.aborted
+      || generation !== state.runtimeProductLoadGeneration
+      || state.activeWorkspaceId !== workspaceId
+      || result.workspaceId !== workspaceId) return;
+    state.cats = result.cats.map(runtimeCatView);
+    state.disks = result.disks.map(runtimeDiskView);
+    // The frozen runtime contract intentionally has no Operation collection.
     state.operations = [];
     render();
   } catch (error) {
+    if (controller.signal.aborted
+      || generation !== state.runtimeProductLoadGeneration
+      || state.activeWorkspaceId !== workspaceId
+      || error.name === "AbortError") return;
     if (error.status === 401 || error.status === 403) {
       showLogin(error.message);
     } else if (!quiet) {
@@ -244,9 +335,43 @@ async function loadAll({ quiet = false } = {}) {
     }
     throw error;
   } finally {
-    state.loading = false;
-    if (!quiet) setBusy(button, false);
+    if (state.runtimeProductLoad?.generation === generation) {
+      state.runtimeProductLoad = null;
+      if (!quiet) setBusy(button, false);
+    }
   }
+}
+
+function cancelRuntimeProductLoad() {
+  const active = state.runtimeProductLoad;
+  ++state.runtimeProductLoadGeneration;
+  state.runtimeProductLoad = null;
+  if (!active) return;
+  active.controller.abort();
+  if (!active.quiet) setBusy(active.button, false);
+}
+
+function runtimeCatView(cat) {
+  return {
+    ...cat,
+    spec: { cpus: cat.desired.vcpus, memory_mib: Math.floor(cat.desired.memory_bytes / 1048576) },
+    desired_state: cat.desired.target,
+    observed_state: cat.observed?.stable_state || "unknown",
+    node_id: cat.desired.node_id,
+    created_at_unix: Math.floor(Number(cat.created_at_unix_ms) / 1000),
+    auto_suspend: false,
+    expires_at_unix: null,
+  };
+}
+
+function runtimeDiskView(disk) {
+  return {
+    ...disk,
+    kind: disk.kind.kind,
+    state: disk.admin_state === "deleting" ? "deleting" : (disk.binding ? "bound" : "available"),
+    bound_cat_id: disk.binding?.cat_id || null,
+    created_at_unix: Math.floor(Number(disk.created_at_unix_ms) / 1000),
+  };
 }
 
 function render() {
@@ -256,6 +381,7 @@ function render() {
   renderBillingBalance();
   renderBilling();
   renderOperations();
+  setRuntimeProductLoadingShell(document, Boolean(state.runtimeProductWorkspaceLoading));
 }
 
 function renderOverview() {
@@ -283,24 +409,6 @@ function renderOverview() {
     : `<div class="mini-empty">${escapeHtml(t("user.empty.recentOperations"))}</div>`;
 }
 
-function catActions(cat) {
-  const stateActions = {
-    running: ["exec", "suspend", "warm", "stop"],
-    suspended: ["resume", "warm", "stop"],
-    warm: ["resume", "stop"],
-    cold: ["start"],
-    failed: ["start"],
-    unknown: ["start"],
-  };
-  const actions = stateActions[cat.observed_state] || [];
-  const buttons = actions.map((action) => `<button class="mini-button" data-cat-action="${action}" data-cat="${escapeHtml(cat.name)}">${escapeHtml(t(`user.action.${action}`))}</button>`);
-  if (cat.observed_state === "running") {
-    buttons.push(`<button class="mini-button" data-cat-action="expose" data-cat="${escapeHtml(cat.name)}">${escapeHtml(t("user.action.expose"))}</button>`);
-  }
-  buttons.push(`<button class="mini-button danger" data-cat-action="destroy" data-cat="${escapeHtml(cat.name)}">${escapeHtml(t("user.action.destroy"))}</button>`);
-  return buttons.join("");
-}
-
 function renderCats() {
   const body = document.querySelector("#cats-table");
   const empty = document.querySelector("#cats-empty");
@@ -313,22 +421,7 @@ function renderCats() {
     <td>${escapeHtml(cat.spec.cpus)} CPU · ${escapeHtml(cat.spec.memory_mib)} MiB</td>
     <td>${escapeHtml(cat.node_id || "—")}</td>
     <td>${formatTime(cat.created_at_unix)}</td>
-    <td><div class="row-actions">${catActions(cat)}</div></td>
   </tr>`).join("");
-}
-
-function diskActions(disk) {
-  const buttons = [`<button class="mini-button" data-disk-action="snapshot" data-disk="${escapeHtml(disk.name)}">${escapeHtml(t("user.action.snapshot"))}</button>`];
-  if (disk.kind === "persistent") {
-    if (disk.state === "bound") {
-      buttons.push(`<button class="mini-button" data-disk-action="unmount" data-disk="${escapeHtml(disk.name)}">${escapeHtml(t("user.action.unmount"))}</button>`);
-    } else if (disk.state === "available") {
-      buttons.push(`<button class="mini-button" data-disk-action="mount" data-disk="${escapeHtml(disk.name)}">${escapeHtml(t("user.action.mount"))}</button>`);
-      buttons.push(`<button class="mini-button" data-disk-action="resize" data-disk="${escapeHtml(disk.name)}">${escapeHtml(t("user.action.resize"))}</button>`);
-      buttons.push(`<button class="mini-button danger" data-disk-action="delete" data-disk="${escapeHtml(disk.name)}">${escapeHtml(t("user.action.delete"))}</button>`);
-    }
-  }
-  return buttons.join("");
 }
 
 function renderDisks() {
@@ -342,7 +435,6 @@ function renderDisks() {
     <td><div class="resource-name"><span class="resource-avatar">D</span><span><strong>${escapeHtml(disk.name)}</strong><small>${escapeHtml(disk.id)}</small></span></div></td>
     <td>${escapeHtml(resourceKind(disk.kind))}</td><td>${formatBytes(disk.size_bytes)}</td><td>${statusBadge(disk.state)}</td>
     <td>${escapeHtml(catNames.get(disk.bound_cat_id) || disk.bound_cat_id || "—")}</td>
-    <td><div class="row-actions">${diskActions(disk)}</div></td>
   </tr>`).join("");
 }
 
@@ -877,104 +969,6 @@ async function redirectForPayment() {
   await beginTopup(Math.min(...amounts.map(Number)));
 }
 
-async function waitForOperation(operation) {
-  if (!operation?.id) return;
-  const deadline = Date.now() + 120_000;
-  while (Date.now() < deadline) {
-    const current = await authenticatedRequest(`/v1/operations/${encodeURIComponent(operation.id)}`);
-    if (current.phase === "succeeded") return current;
-    if (current.phase === "failed") throw new Error(current.error ? localizedApiMessage(current.error.code, current.error.message) : t("user.operationFailed", { id: current.id }));
-    await sleep(300);
-  }
-  throw new Error(t("user.operationTimeout", { id: operation.id }));
-}
-
-async function mutateCat(name, action, button) {
-  if (action === "exec") {
-    state.execCat = name;
-    document.querySelector("#exec-cat-name").textContent = name;
-    const output = document.querySelector("#exec-output");
-    output.classList.remove("is-error");
-    output.textContent = t("user.execDialog.waiting");
-    execDialog.showModal();
-    return;
-  }
-  if (action === "expose") {
-    const port = window.prompt(t("user.expose.portPrompt", { name }), "8080");
-    if (port === null) return;
-    const endpointName = window.prompt(t("user.expose.namePrompt"), "web");
-    if (endpointName === null) return;
-    setBusy(button, true);
-    try {
-      const response = await authenticatedRequest(workspacePath(`/cats/${encodeURIComponent(name)}/endpoints`), {
-        method: "POST",
-        body: JSON.stringify({ name: endpointName, target_port: Number(port), protocol: "http", wake_policy: "wake_on_request" }),
-      });
-      toast(t("user.expose.created"), response.endpoint.hostname);
-    } finally {
-      setBusy(button, false);
-    }
-    return;
-  }
-  if (action === "destroy" && !window.confirm(t("user.destroy.confirm", { name }))) return;
-  setBusy(button, true);
-  try {
-    const path = action === "destroy"
-      ? workspacePath(`/cats/${encodeURIComponent(name)}`)
-      : workspacePath(`/cats/${encodeURIComponent(name)}/actions/${action}`);
-    const response = await authenticatedRequest(path, {
-      method: action === "destroy" ? "DELETE" : "POST",
-      headers: idempotencyHeaders(),
-    });
-    toast(t("user.operation.accepted"), `${name} · ${t(`user.action.${action}`)}`);
-    await waitForOperation(response.operation);
-    await loadAll({ quiet: true });
-    toast(t("user.operation.completed"), `${name} · ${t(`user.action.${action}`)}`);
-  } finally {
-    setBusy(button, false);
-  }
-}
-
-async function mutateDisk(name, action, button) {
-  const disk = state.disks.find((item) => item.name === name);
-  if (!disk) return;
-  let method = "POST";
-  let path = workspacePath(`/disks/${encodeURIComponent(name)}/actions/${action}`);
-  let body;
-  if (action === "mount") {
-    if (!state.cats.length) throw new Error(t("user.mount.noCats"));
-    const cat = window.prompt(t("user.mount.catPrompt"), state.cats[0].name);
-    if (cat === null) return;
-    const mountAt = window.prompt(t("user.mount.pathPrompt"), "/data");
-    if (mountAt === null) return;
-    body = { cat_id: cat, mount_at: mountAt };
-  } else if (action === "resize") {
-    const currentGiB = disk.size_bytes / (1024 ** 3);
-    const size = window.prompt(t("user.resize.prompt"), String(currentGiB));
-    if (size === null) return;
-    body = { size_bytes: Math.round(Number(size) * (1024 ** 3)) };
-  } else if (action === "unmount") {
-    body = {};
-  } else if (action === "snapshot") {
-    path = workspacePath(`/disks/${encodeURIComponent(name)}/snapshots`);
-  } else if (action === "delete") {
-    if (!window.confirm(t("user.disk.deleteConfirm", { name }))) return;
-    method = "DELETE";
-    path = workspacePath(`/disks/${encodeURIComponent(name)}`);
-  }
-  setBusy(button, true);
-  try {
-    const response = await authenticatedRequest(path, {
-      method,
-      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-    });
-    await loadAll({ quiet: true });
-    toast(action === "snapshot" ? t("user.disk.snapshotCreated") : t("user.disk.operationCompleted"), response?.id || `${name} · ${t(`user.action.${action}`)}`);
-  } finally {
-    setBusy(button, false);
-  }
-}
-
 function startWorkOsLogin() {
   const query = new URLSearchParams({ site: "user" });
   window.location.assign(`/auth/login?${query}`);
@@ -986,7 +980,7 @@ document.querySelector("#logout-button").addEventListener("click", () => {
   window.location.assign("/auth/logout?site=user");
 });
 document.querySelector("#refresh-button").addEventListener("click", () => {
-  const requests = [loadAll(), resumePendingCatCreates()];
+  const requests = [loadAll(), resumePendingProductCreates()];
   if (state.activeView === "billing") requests.push(loadBilling());
   Promise.all(requests).catch(() => {});
 });
@@ -1062,57 +1056,28 @@ document.querySelector("#create-disk-form").addEventListener("submit", async (ev
   error.textContent = "";
   setBusy(button, true);
   try {
-    const disk = await authenticatedRequest(workspacePath("/disks"), {
-      method: "POST",
-      body: JSON.stringify({ name: String(values.get("name")).trim(), size_bytes: Math.round(Number(values.get("size_gib")) * (1024 ** 3)) }),
+    const workspaceId = state.activeWorkspaceId;
+    const body = buildPersistentDiskCreateV1Request({
+      name: values.get("name"),
+      sizeGib: values.get("size_gib"),
+      durability: values.get("durability"),
     });
-    createDiskDialog.close();
-    form.reset();
-    await loadAll({ quiet: true });
-    toast(t("user.disk.created"), `${disk.name} · ${formatBytes(disk.size_bytes)}`);
+    await sendPendingPersistentDiskCreate(
+      workspaceId,
+      persistentDiskCreateV1Path(workspaceId),
+      JSON.stringify(body),
+      async (disk) => {
+        createDiskDialog.close();
+        form.reset();
+        if (workspaceId === state.activeWorkspaceId) await loadAll({ quiet: true });
+        toast(t("user.disk.created"), `${disk.name} · ${formatBytes(disk.size_bytes)}`);
+      },
+    );
   } catch (caught) {
     error.textContent = caught.message;
   } finally {
     setBusy(button, false);
   }
-});
-
-document.querySelector("#exec-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  if (event.submitter?.value === "cancel") {
-    execDialog.close();
-    return;
-  }
-  const form = event.currentTarget;
-  const button = form.querySelector('button[value="default"]');
-  const output = document.querySelector("#exec-output");
-  output.classList.remove("is-error");
-  setBusy(button, true, t("user.execDialog.running"));
-  try {
-    const command = splitCommand(new FormData(form).get("command"));
-    const result = await authenticatedRequest(workspacePath(`/cats/${encodeURIComponent(state.execCat)}/exec`), {
-      method: "POST",
-      body: JSON.stringify({ command }),
-    });
-    output.classList.toggle("is-error", result.exit_code !== 0);
-    output.textContent = `${result.stdout || ""}${result.stderr ? `\n[stderr]\n${result.stderr}` : ""}\n\n[exit ${result.exit_code}]`;
-  } catch (caught) {
-    output.classList.add("is-error");
-    output.textContent = t("user.execDialog.failed", { message: caught.message });
-  } finally {
-    setBusy(button, false);
-  }
-});
-
-document.querySelector("#cats-table").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-cat-action]");
-  if (!button) return;
-  mutateCat(button.dataset.cat, button.dataset.catAction, button).catch((error) => toast(t("user.cat.actionFailed"), error.message, "error"));
-});
-document.querySelector("#disks-table").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-disk-action]");
-  if (!button) return;
-  mutateDisk(button.dataset.disk, button.dataset.diskAction, button).catch((error) => toast(t("user.disk.actionFailed"), error.message, "error"));
 });
 document.querySelector("#billing-cats-table").addEventListener("click", (event) => {
   const button = event.target.closest("[data-billing-cat-detail]");
@@ -1172,7 +1137,7 @@ async function initializeAuth() {
         }
         showApp();
         await loadAll({ quiet: true });
-        await resumePendingCatCreates();
+        await resumePendingProductCreates();
         if (topupStatus) {
           switchView("billing");
           await loadBilling({ quiet: true }).catch(() => {});

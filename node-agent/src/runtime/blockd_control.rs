@@ -233,6 +233,12 @@ impl NodeRuntime {
             vhost_user_queues,
             seed_image_id,
         });
+        #[cfg(test)]
+        cmd.env(
+            "CATS_TEST_BLOCKD_VOLUME_SIZE_BYTES",
+            grant.size_bytes.to_string(),
+        )
+        .env("CATS_TEST_BLOCKD_ATTACHMENT_EPOCH", grant.epoch.to_string());
         let log_path = blockd_log_path(cat_dir, &grant.disk_id);
         let log = std::fs::File::create(&log_path).context("create blockd log")?;
         let child = cmd
@@ -292,8 +298,6 @@ fn legacy_blockd_command(spec: LegacyBlockdCommand<'_>) -> Command {
         .arg(&spec.config.object_store.name)
         .arg("--listen-unix")
         .arg(spec.nbd_socket)
-        .arg("--create-volume-size")
-        .arg(spec.grant.size_bytes.to_string())
         .arg("--lease-ttl-ms")
         .arg(spec.config.blockd_lease_ttl_ms.to_string())
         .arg("--max-staged-bytes")
@@ -456,8 +460,6 @@ mod failure_reason_tests {
                 "file",
                 "--listen-unix",
                 "/run/cats/nbd.sock",
-                "--create-volume-size",
-                "4294967296",
                 "--lease-ttl-ms",
                 "1500",
                 "--max-staged-bytes",
@@ -478,6 +480,9 @@ mod failure_reason_tests {
                 "root=/var/lib/cats/objects",
             ]
         );
+        assert!(command
+            .get_args()
+            .all(|argument| argument != "--create-volume-size"));
         assert!(command
             .get_envs()
             .any(|(name, value)| name == "CATS_CRASH_POINT" && value.is_none()));

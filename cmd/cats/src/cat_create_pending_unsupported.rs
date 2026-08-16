@@ -1,4 +1,4 @@
-//! Non-Unix compile boundary for durable Cat-create recovery.
+//! Non-Unix compile boundary for durable covered-mutation recovery.
 //!
 //! The shipped implementation requires descriptor-relative `openat`, nofollow,
 //! durable directory barriers, and a process-wide file lock. Fail before any
@@ -12,8 +12,35 @@ pub(crate) enum PreparedCatCreate {}
 
 pub(crate) enum PreparedPersistentDiskCreate {}
 
+pub(crate) enum PreparedPersistentDiskBinding {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PersistentDiskBindingAction {
+    Attach,
+    Detach,
+}
+
+impl PersistentDiskBindingAction {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Attach => "attach",
+            Self::Detach => "detach",
+        }
+    }
+}
+
 impl PreparedCatCreate {
     pub(crate) fn prepare(_origin: &str, _workspace_id: &str, _body: &[u8]) -> Result<Self> {
+        bail!(
+            "durable Cat-create recovery is unavailable on this platform; no HTTP request was sent"
+        )
+    }
+
+    pub(crate) fn prepare_existing(
+        _origin: &str,
+        _workspace_id: &str,
+        _body: &[u8],
+    ) -> Result<Option<Self>> {
         bail!(
             "durable Cat-create recovery is unavailable on this platform; no HTTP request was sent"
         )
@@ -102,6 +129,70 @@ impl PreparedPersistentDiskCreate {
     }
 }
 
+impl PreparedPersistentDiskBinding {
+    pub(crate) fn prepare(
+        _origin: &str,
+        _workspace_id: &str,
+        _disk_id: &str,
+        _action: PersistentDiskBindingAction,
+        _body: &[u8],
+    ) -> Result<Self> {
+        bail!(
+            "durable PersistentDisk-binding recovery is unavailable on this platform; no HTTP request was sent"
+        )
+    }
+
+    pub(crate) fn origin(&self) -> &str {
+        match *self {}
+    }
+
+    pub(crate) fn target(&self) -> &str {
+        match *self {}
+    }
+
+    pub(crate) fn content_type(&self) -> &str {
+        match *self {}
+    }
+
+    pub(crate) fn idempotency_key(&self) -> &str {
+        match *self {}
+    }
+
+    pub(crate) fn workspace_id(&self) -> &str {
+        match *self {}
+    }
+
+    pub(crate) fn disk_id(&self) -> &cats_api::runtime_reconciliation::Id {
+        match *self {}
+    }
+
+    pub(crate) fn action(&self) -> PersistentDiskBindingAction {
+        match *self {}
+    }
+
+    pub(crate) fn request(
+        &self,
+    ) -> Result<cats_api::persistent_disk::PersistentDiskBindingV2Request> {
+        match *self {}
+    }
+
+    pub(crate) fn body(&self) -> Result<Vec<u8>> {
+        match *self {}
+    }
+
+    pub(crate) fn assert_current(&self) -> Result<()> {
+        match *self {}
+    }
+
+    pub(crate) fn pending_path(&self) -> PathBuf {
+        match *self {}
+    }
+
+    pub(crate) fn clear(&self) -> Result<()> {
+        match *self {}
+    }
+}
+
 pub(crate) fn canonical_api_origin(value: &str) -> Result<String> {
     let parsed = reqwest::Url::parse(value).map_err(anyhow::Error::from)?;
     let has_userinfo = value.split_once("://").is_some_and(|(_, remainder)| {
@@ -139,6 +230,18 @@ mod tests {
             .err()
             .unwrap()
             .to_string();
+        assert!(error.contains("no HTTP request was sent"));
+
+        let error = PreparedPersistentDiskBinding::prepare(
+            "https://cats.run",
+            "ws_01",
+            "disk_01",
+            PersistentDiskBindingAction::Attach,
+            b"{}",
+        )
+        .err()
+        .unwrap()
+        .to_string();
         assert!(error.contains("no HTTP request was sent"));
     }
 }

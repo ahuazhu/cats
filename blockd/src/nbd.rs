@@ -344,8 +344,12 @@ mod tests {
         let meta = Arc::new(SqliteMetadataStore::open(&dir.join("meta.db")).unwrap());
         meta.create_volume("vol_nbd", 4 * cats_api::chunk::CHUNK_SIZE as u64)
             .unwrap();
-        ChunkEngine::attach(
+        let epoch = 1;
+        cats_test_support::install_sqlite_grant(&dir.join("meta.db"), "vol_nbd", "att1", epoch)
+            .unwrap();
+        ChunkEngine::attach_granted_epoch(
             EngineConfig::new("vol_nbd", dir.join("data"), "att1"),
+            epoch,
             blob,
             meta,
         )

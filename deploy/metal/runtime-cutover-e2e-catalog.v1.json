@@ -1,0 +1,282 @@
+{
+  "cases": [
+    {
+      "case_id": "control-startup-schema",
+      "cleanup_deadline_seconds": 60,
+      "deadline_seconds": 120,
+      "expected_outcome": {
+        "kind": "passed"
+      },
+      "required_evidence": [
+        {
+          "filename": "health-release-receipt.json",
+          "kind": "json"
+        },
+        {
+          "filename": "fleet-verification-receipt.json",
+          "kind": "json"
+        }
+      ]
+    },
+    {
+      "case_id": "node-registration-full-inventory",
+      "cleanup_deadline_seconds": 60,
+      "deadline_seconds": 180,
+      "expected_outcome": {
+        "kind": "passed"
+      },
+      "required_evidence": [
+        {
+          "filename": "fleet-verification-receipt.json",
+          "kind": "json"
+        }
+      ]
+    },
+    {
+      "case_id": "cat-create-running",
+      "cleanup_deadline_seconds": 60,
+      "deadline_seconds": 600,
+      "expected_outcome": {
+        "kind": "passed"
+      },
+      "required_evidence": [
+        {
+          "filename": "operation-receipt.json",
+          "kind": "json"
+        },
+        {
+          "filename": "cat-running-receipt.json",
+          "kind": "json"
+        },
+        {
+          "filename": "create-placement-receipt.json",
+          "kind": "json"
+        }
+      ]
+    },
+    {
+      "case_id": "durable-write-flush",
+      "cleanup_deadline_seconds": 60,
+      "deadline_seconds": 300,
+      "expected_outcome": {
+        "kind": "passed"
+      },
+      "required_evidence": [
+        {
+          "filename": "durable-write-flush-receipt.json",
+          "kind": "json"
+        }
+      ]
+    },
+    {
+      "case_id": "route-http-ws",
+      "cleanup_deadline_seconds": 60,
+      "deadline_seconds": 300,
+      "expected_outcome": {
+        "kind": "passed"
+      },
+      "required_evidence": [
+        {
+          "filename": "workload-install-receipt.json",
+          "kind": "json"
+        },
+        {
+          "filename": "mutation-receipt.json",
+          "kind": "json"
+        },
+        {
+          "filename": "idempotent-replay-receipt.json",
+          "kind": "json"
+        },
+        {
+          "filename": "operation-receipt.json",
+          "kind": "json"
+        },
+        {
+          "filename": "public-route-receipt.json",
+          "kind": "json"
+        }
+      ]
+    },
+    {
+      "case_id": "route-v2-rotation-disable-live-delivery",
+      "cleanup_deadline_seconds": 1800,
+      "deadline_seconds": 1800,
+      "expected_outcome": {
+        "kind": "passed"
+      },
+      "required_evidence": [
+        {
+          "filename": "route-v2-rotation-disable-live-delivery.receipt.json",
+          "kind": "json"
+        },
+        {
+          "filename": "route-v2-rotation-disable-live-delivery.node-acks.json",
+          "kind": "json"
+        },
+        {
+          "filename": "route-v2-rotation-disable-live-delivery.transcript.log",
+          "kind": "text"
+        }
+      ]
+    },
+    {
+      "case_id": "agent-restart-adoption",
+      "cleanup_deadline_seconds": 60,
+      "deadline_seconds": 600,
+      "expected_outcome": {
+        "kind": "passed"
+      },
+      "required_evidence": [
+        {
+          "filename": "restart-fleet-before-receipt.json",
+          "kind": "json"
+        },
+        {
+          "filename": "restart-fleet-after-receipt.json",
+          "kind": "json"
+        },
+        {
+          "filename": "restart-guest-sync-receipt.json",
+          "kind": "json"
+        },
+        {
+          "filename": "public-route-receipt.json",
+          "kind": "json"
+        },
+        {
+          "filename": "restart-adoption-receipt.json",
+          "kind": "json"
+        },
+        {
+          "filename": "workload-remove-receipt.json",
+          "kind": "json"
+        }
+      ]
+    },
+    {
+      "case_id": "volume-init-matrix",
+      "cleanup_deadline_seconds": 60,
+      "deadline_seconds": 900,
+      "expected_outcome": {
+        "kind": "passed"
+      },
+      "required_evidence": [
+        {
+          "filename": "persistent-disk-receipt.json",
+          "kind": "json"
+        }
+      ]
+    },
+    {
+      "case_id": "v3-aws-host-fence-authority",
+      "cleanup_deadline_seconds": 60,
+      "deadline_seconds": 600,
+      "expected_outcome": {
+        "kind": "passed"
+      },
+      "required_evidence": [
+        {
+          "filename": "v3-aws-put-ambiguity-receipt.v1.json",
+          "kind": "json"
+        },
+        {
+          "filename": "v3-object-write-cutoff-drain-receipt.v1.json",
+          "kind": "json"
+        },
+        {
+          "filename": "v3-aws-secondary-isolation-receipt.v1.json",
+          "kind": "json"
+        },
+        {
+          "filename": "v3-aws-host-fence-authority-receipt.v1.json",
+          "kind": "json"
+        }
+      ]
+    },
+    {
+      "case_id": "delete-cleanup",
+      "cleanup_deadline_seconds": 60,
+      "deadline_seconds": 600,
+      "expected_outcome": {
+        "kind": "passed"
+      },
+      "required_evidence": [
+        {
+          "filename": "mutation-receipt.json",
+          "kind": "json"
+        },
+        {
+          "filename": "idempotent-replay-receipt.json",
+          "kind": "json"
+        },
+        {
+          "filename": "operation-receipt.json",
+          "kind": "json"
+        },
+        {
+          "filename": "fleet-verification-receipt.json",
+          "kind": "json"
+        }
+      ]
+    },
+    {
+      "case_id": "usage-source-terminal-receipts",
+      "cleanup_deadline_seconds": 60,
+      "deadline_seconds": 600,
+      "expected_outcome": {
+        "kind": "passed"
+      },
+      "required_evidence": [
+        {
+          "filename": "usage-live-delivery-receipt.json",
+          "kind": "json"
+        },
+        {
+          "filename": "usage-source-terminal-receipts.json",
+          "kind": "json"
+        }
+      ]
+    }
+  ],
+  "framework_required_evidence": [
+    {
+      "filename": "cleanup-receipt.json",
+      "kind": "json"
+    }
+  ],
+  "post_block_path_cases": [
+    {
+      "case_id": "usage-target-terminal-receipt",
+      "deadline_seconds": 600,
+      "expected_outcome": {
+        "kind": "passed"
+      },
+      "required_evidence": [
+        {
+          "filename": "usage-target-terminal-request.json",
+          "kind": "json"
+        },
+        {
+          "filename": "usage-target-terminal-receipt.json",
+          "kind": "json"
+        },
+        {
+          "filename": "usage-target-terminal-verification.receipt.json",
+          "kind": "json"
+        }
+      ]
+    }
+  ],
+  "qualification_admission_required_evidence": [
+    {
+      "filename": "production-mutation-qualification-begin.receipt.json",
+      "kind": "json"
+    },
+    {
+      "filename": "production-mutation-qualification-terminal.receipt.json",
+      "kind": "json"
+    }
+  ],
+  "version": 1
+}

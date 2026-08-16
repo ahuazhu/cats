@@ -1,7 +1,44 @@
 variable "aws_region" {
   type        = string
-  description = "Region for the whole platform."
+  description = "Exact AWS region for the whole platform."
   default     = "us-east-1"
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+$", var.aws_region))
+    error_message = "aws_region must be an explicit AWS region name."
+  }
+}
+
+variable "expected_account_id" {
+  type        = string
+  description = "Exact AWS account allowed to contain the production platform."
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[0-9]{12}$", var.expected_account_id))
+    error_message = "expected_account_id must be an explicit 12-digit AWS account ID."
+  }
+}
+
+variable "expected_aws_partition" {
+  type        = string
+  description = "Exact AWS partition allowed to contain the production platform."
+  default     = "aws"
+  nullable    = false
+
+  validation {
+    condition = contains([
+      "aws",
+      "aws-cn",
+      "aws-iso",
+      "aws-iso-b",
+      "aws-iso-e",
+      "aws-iso-f",
+      "aws-us-gov",
+    ], var.expected_aws_partition)
+    error_message = "expected_aws_partition must name one supported AWS partition."
+  }
 }
 
 variable "name_prefix" {
@@ -66,6 +103,12 @@ variable "cluster_admin_principal_arns" {
   default     = []
 }
 
+variable "efs_csi_addon_version" {
+  type        = string
+  description = "Pinned aws-efs-csi-driver EKS add-on version; null selects the cluster default."
+  default     = null
+}
+
 # Database ------------------------------------------------------------------
 
 variable "database_engine_version" {
@@ -118,10 +161,40 @@ variable "database_log_retention_days" {
 
 # Alerting -------------------------------------------------------------------
 
-variable "alert_email_addresses" {
-  type        = list(string)
-  description = "Addresses subscribed to the platform alert topic. Each recipient must confirm the AWS subscription mail before the topic reaches them."
-  default     = []
+variable "alert_email_recipients" {
+  type        = map(string)
+  description = "Email recipients keyed by opaque, stable operator IDs. Values are sensitive and each recipient must confirm the AWS subscription mail."
+  sensitive   = true
+  nullable    = false
+
+  validation {
+    condition = (
+      alltrue([
+        for recipient_id in keys(var.alert_email_recipients) :
+        can(regex("^[a-z][a-z0-9_-]{0,63}$", recipient_id))
+      ]) &&
+      alltrue([
+        for address in values(var.alert_email_recipients) :
+        address == trimspace(address) && can(regex("^[^@[:space:]]+@[^@[:space:]]+$", address))
+      ])
+    )
+    error_message = "alert_email_recipients must use opaque lowercase IDs and non-empty email values without surrounding whitespace. Terraform cannot prove confirmation; run the alarm-recipient preflight after confirmation."
+  }
+
+  validation {
+    condition = (
+      var.environment != "production" || length(var.alert_email_recipients) > 0
+    )
+    error_message = "alert_email_recipients must contain at least one recipient in production; an empty map is allowed only outside production."
+  }
+
+  validation {
+    condition = (
+      length(distinct(values(var.alert_email_recipients))) ==
+      length(var.alert_email_recipients)
+    )
+    error_message = "alert_email_recipients must not contain duplicate email values."
+  }
 }
 
 # DNS -----------------------------------------------------------------------
@@ -231,6 +304,23 @@ variable "chunkstore_bucket_name" {
   type        = string
 }
 
+variable "chunkstore_prefix" {
+  description = "Exact production object-key prefix mediated by the ObjectWrite Gateway."
+  type        = string
+
+  validation {
+    condition = (
+      var.chunkstore_prefix != "" &&
+      !startswith(var.chunkstore_prefix, "/") &&
+      !endswith(var.chunkstore_prefix, "/") &&
+      !strcontains(var.chunkstore_prefix, "..") &&
+      !strcontains(var.chunkstore_prefix, "//") &&
+      can(regex("^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$", var.chunkstore_prefix))
+    )
+    error_message = "chunkstore_prefix must be one non-empty relative canonical prefix."
+  }
+}
+
 variable "chunkstore_versioning_enabled" {
   description = "Versioning on the ChunkStore bucket. Objects are immutable by construction; this only guards against an erroneous delete."
   type        = bool
@@ -243,34 +333,68 @@ variable "metal_worker_ssh_from_instance_connect" {
   default     = true
 }
 
-variable "metal_worker_instance_count" {
-  description = "Bare-metal workers managed by this stack."
-  type        = number
-  default     = 1
+variable "host_fence_provider_namespace" {
+  description = "Kubernetes namespace containing the AWS HostFence provider."
+  type        = string
+  default     = "cats"
 
   validation {
-    condition     = var.metal_worker_instance_count >= 1 && floor(var.metal_worker_instance_count) == var.metal_worker_instance_count
-    error_message = "metal_worker_instance_count must be a positive integer."
+    condition     = can(regex("^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$", var.host_fence_provider_namespace))
+    error_message = "host_fence_provider_namespace must be a DNS-label Kubernetes namespace."
   }
 }
 
-variable "metal_worker_names" {
-  description = <<-EOT
-    Name tags for the workers, by index; indices past the end of the list fall
-    back to cats-metal-<index+1>. Exists because worker names follow node
-    identity, not slot position: the imported cats-metal-2 occupies index 0
-    after metal-1 was decommissioned, and a positional name would silently
-    relabel it on the next apply.
-  EOT
-  type        = list(string)
-  default     = []
+variable "host_fence_provider_service_account" {
+  description = "Dedicated Kubernetes ServiceAccount allowed to stop only Cats workers and quarantine only their primary ENIs."
+  type        = string
+  default     = "cats-host-fence-provider"
 
   validation {
-    condition = (
-      length(var.metal_worker_names) == length(distinct(var.metal_worker_names)) &&
-      alltrue([for name in var.metal_worker_names : length(trimspace(name)) > 0])
-    )
-    error_message = "metal_worker_names must contain only non-empty, unique names."
+    condition     = can(regex("^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$", var.host_fence_provider_service_account))
+    error_message = "host_fence_provider_service_account must be a DNS-label Kubernetes ServiceAccount name."
+  }
+}
+
+variable "metal_workers" {
+  description = <<-EOT
+    Bare-metal workers keyed by their stable Node name. subnet_index pins the
+    existing Host to one private subnet without making list position an
+    identity. root_volume_encrypted records the live root contract: only the
+    legacy metal-2 may temporarily be false, and changing it to true is the
+    explicit forward-only replacement requested for the maintenance window.
+  EOT
+  type = map(object({
+    subnet_index          = number
+    root_volume_encrypted = bool
+  }))
+  default = {
+    metal-1 = {
+      subnet_index          = 0
+      root_volume_encrypted = true
+    }
+  }
+
+  validation {
+    condition     = length(var.metal_workers) > 0
+    error_message = "metal_workers must contain at least one worker."
+  }
+
+  validation {
+    condition = alltrue([
+      for name, worker in var.metal_workers :
+      can(regex("^metal-[1-9][0-9]*$", name)) &&
+      worker.subnet_index >= 0 &&
+      floor(worker.subnet_index) == worker.subnet_index
+    ])
+    error_message = "metal_workers keys must be stable metal-<positive integer> names with non-negative integer subnet_index values."
+  }
+
+  validation {
+    condition = alltrue([
+      for name, worker in var.metal_workers :
+      worker.root_volume_encrypted || name == "metal-2"
+    ])
+    error_message = "Only the known legacy metal-2 root may temporarily remain unencrypted."
   }
 }
 

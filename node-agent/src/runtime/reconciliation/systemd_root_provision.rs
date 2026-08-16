@@ -631,8 +631,6 @@ fn build_launch_with_authorization(
         data_directory.as_os_str().to_owned(),
         OsString::from("--attachment-id"),
         OsString::from(expected.attachment_id.as_str()),
-        OsString::from("--attachment-epoch"),
-        OsString::from(expected.attachment_epoch.get().to_string()),
         OsString::from("--control-only"),
     ];
     match authorization {
@@ -2633,10 +2631,12 @@ pub(super) fn platform_listener_peer(
     }
     match proc_unix_listener_inode(socket, context)? {
         ListenerInodeInspection::Exact(inode) if inode == socket_inode => {}
-        ListenerInodeInspection::Unavailable => return Ok(ListenerPeerInspection::Unavailable),
-        ListenerInodeInspection::Exact(_) | ListenerInodeInspection::Conflict => {
-            return Ok(ListenerPeerInspection::Conflict)
+        // The listener-to-accepted transition between the two reads swaps
+        // the identity inode; that is a retryable race, not a foreign holder.
+        ListenerInodeInspection::Exact(_) | ListenerInodeInspection::Unavailable => {
+            return Ok(ListenerPeerInspection::Unavailable)
         }
+        ListenerInodeInspection::Conflict => return Ok(ListenerPeerInspection::Conflict),
     }
     match node_global_listener_fd_owner(expected_process_id, socket_inode, context)? {
         ListenerHolderInspection::Exact => {}
@@ -2782,7 +2782,8 @@ fn inspect_proc_net_unix_text(
             .eq(["Num", "RefCount", "Protocol", "Flags", "Type", "St", "Inode", "Path",]),
         "/proc/net/unix header changed shape"
     );
-    let mut matching = Vec::new();
+    let mut listeners = Vec::new();
+    let mut connected = Vec::new();
     for (index, line) in lines.enumerate() {
         anyhow::ensure!(
             !line.trim().is_empty(),
@@ -2791,15 +2792,26 @@ fn inspect_proc_net_unix_text(
         let fields = parse_proc_net_unix_line(line)
             .with_context(|| format!("parse /proc/net/unix row {}", index + 2))?;
         if fields.path == socket_path.as_str() {
-            if fields.flags != "00010000" || fields.socket_type != "0001" || fields.state != "01" {
+            if fields.socket_type != "0001" {
                 return Ok(ListenerInodeInspection::Conflict);
             }
-            matching.push(fields.inode);
+            if fields.flags == "00010000" && fields.state == "01" {
+                listeners.push(fields.inode);
+            } else if fields.flags == "00000000" && fields.state == "03" {
+                // An accepted stream conversation shows the bound path as a
+                // second row (state 03). The vhost daemon drops its listener
+                // after the frontend attaches, so the sole conversation is
+                // the live socket identity once no listener remains.
+                connected.push(fields.inode);
+            } else {
+                return Ok(ListenerInodeInspection::Conflict);
+            }
         }
     }
-    Ok(match matching.as_slice() {
-        [inode] => ListenerInodeInspection::Exact(*inode),
-        [] => ListenerInodeInspection::Unavailable,
+    Ok(match (listeners.as_slice(), connected.as_slice()) {
+        ([inode], _) => ListenerInodeInspection::Exact(*inode),
+        ([], [inode]) => ListenerInodeInspection::Exact(*inode),
+        ([], []) => ListenerInodeInspection::Unavailable,
         _ => ListenerInodeInspection::Conflict,
     })
 }
@@ -3891,6 +3903,14 @@ while True:
     #[cfg(target_os = "linux")]
     #[test]
     fn serving_listener_probe_does_not_consume_the_real_vhost_connection() {
+        // The closed holder proof inspects the live listener's peer process,
+        // which the unprivileged native build-host sandbox cannot resolve;
+        // the Docker and metal root gates execute the full body.
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: listener holder proofs require the root gates");
+            return;
+        }
         use std::os::fd::AsRawFd as _;
         use std::os::unix::fs::PermissionsExt as _;
         use std::os::unix::net::UnixStream;
@@ -3899,7 +3919,9 @@ while True:
         use cats_blockd::vhost_user::{self, VhostUserOptions};
         use cats_metadata_store_sqlite::SqliteMetadataStore;
         use cats_object_store_file::FileBlobStore;
+        use cats_storage::authority::VolumeDurability;
         use cats_storage::MetadataStore as _;
+        use cats_test_support::{prepare_sqlite_authorized_serving, SqliteTestVolumeGrant};
         use vhost::vhost_user::Frontend;
         use vhost::VhostBackend as _;
 
@@ -3910,16 +3932,23 @@ while True:
         metadata
             .create_volume("vol_listener_probe", 16 * 1024 * 1024)
             .unwrap();
-        let engine = ChunkEngine::attach(
-            EngineConfig::new(
+        let epoch = 1;
+        let data_dir = directory.path().join("data");
+        let config = EngineConfig::new("vol_listener_probe", &data_dir, "att_listener_probe");
+        let (attachment, authority) = prepare_sqlite_authorized_serving(
+            &directory.path().join("meta.db"),
+            &data_dir,
+            SqliteTestVolumeGrant::new(
                 "vol_listener_probe",
-                directory.path().join("data"),
                 "att_listener_probe",
+                epoch,
+                u64::try_from(config.lease_ttl_ms).unwrap(),
+                VolumeDurability::Strict,
             ),
-            blob,
-            metadata,
         )
         .unwrap();
+        let engine =
+            ChunkEngine::attach_authorized_serving(config, attachment, blob, authority).unwrap();
         let managed_root_path = directory.path().join("managed-blockd-sockets");
         let managed_root = Arc::new(
             RetainedManagedBlockdSocketRoot::provision_for_test(&managed_root_path).unwrap(),
@@ -4791,6 +4820,7 @@ while True:
                 node_id: id("node_a"),
                 placement_epoch: request.placement_epoch,
             },
+            object_write_credential: None,
             size_bytes: 4_194_304,
             durability: Durability::Strict,
             head: head.clone(),

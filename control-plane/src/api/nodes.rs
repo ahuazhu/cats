@@ -1,6 +1,7 @@
 use super::*;
 use std::sync::Arc;
 
+#[cfg(debug_assertions)]
 pub(super) async fn acquire_work(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -25,6 +26,7 @@ pub(super) async fn acquire_work(
     Ok(Json(AcquireWorkResponse { lease }))
 }
 
+#[cfg(debug_assertions)]
 pub(super) async fn release_work(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -41,6 +43,7 @@ pub(super) async fn release_work(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[cfg(debug_assertions)]
 pub(super) async fn cordon_node(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -51,6 +54,7 @@ pub(super) async fn cordon_node(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[cfg(debug_assertions)]
 pub(super) async fn list_nodes(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -60,6 +64,7 @@ pub(super) async fn list_nodes(
     Ok(Json(ListResponse { items }))
 }
 
+#[cfg(debug_assertions)]
 pub(super) async fn admin_list_nodes(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -87,6 +92,7 @@ pub(super) async fn admin_list_workspaces(
     Ok(Json(ListResponse { items }))
 }
 
+#[cfg(debug_assertions)]
 pub(super) async fn admin_get_node(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -100,6 +106,7 @@ pub(super) async fn admin_get_node(
     Ok(Json(summary))
 }
 
+#[cfg(debug_assertions)]
 pub(super) async fn admin_node_cats(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -113,6 +120,7 @@ pub(super) async fn admin_node_cats(
     Ok(Json(ListResponse { items }))
 }
 
+#[cfg(debug_assertions)]
 pub(super) async fn admin_node_action(
     State(state): State<AppState>,
     Path((id, verb)): Path<(String, String)>,
@@ -186,6 +194,7 @@ pub(super) async fn admin_node_action(
     Ok((status, Json(summary)).into_response())
 }
 
+#[cfg(debug_assertions)]
 pub(super) async fn admin_delete_node(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -308,6 +317,7 @@ fn monitoring_snapshot(store: &crate::store::Store) -> crate::store::Result<Moni
     })
 }
 
+#[cfg(debug_assertions)]
 pub(super) async fn admin_monitoring(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -337,7 +347,7 @@ pub(super) async fn prometheus_metrics(
             body.push_str(&format!("{} {}\n", $name, $value));
         };
     }
-    if !state.retired_product_authority_for_tests {
+    if !state.retired_product_authority_for_tests() {
         // Production has no authoritative projection for the retired fleet
         // rows. Preserve the DB-independent executor and signed observation
         // diagnostics above, but never query or expose the legacy Cat/Node

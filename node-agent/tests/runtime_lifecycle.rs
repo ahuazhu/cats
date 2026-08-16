@@ -19,7 +19,10 @@ use cats_api::nodejob::{
 use cats_api::resources::ObservedState;
 use cats_node_agent::guest_client::GuestClient;
 use cats_node_agent::runtime::NodeRuntime;
-use cats_test_support::{fake_node_config, workspace_bin, NodeConfigBuilder, TempDirFixture};
+use cats_test_support::{
+    fake_node_config, sqlite_node_runtime_blockd_fixture, workspace_bin, NodeConfigBuilder,
+    TempDirFixture,
+};
 
 const CAT: &str = "cat_rt";
 const SIZE: u64 = 2 * cats_api::chunk::CHUNK_SIZE as u64;
@@ -34,7 +37,9 @@ fn env() -> Env {
     let dir = TempDirFixture::new();
     let builder = dir.node_config("node_test");
     let state_dir = builder.state_dir().to_path_buf();
-    let runtime = NodeRuntime::new(fake_node_config!(builder)).unwrap();
+    let mut config = fake_node_config!(builder);
+    config.blockd_bin = sqlite_node_runtime_blockd_fixture(dir.path(), SIZE, 1);
+    let runtime = NodeRuntime::new(config).unwrap();
     Env {
         _dir: dir,
         runtime,
@@ -47,7 +52,7 @@ fn grant(disk: &str, attempt: i64) -> VolumeGrant {
         disk_id: disk.to_string(),
         volume_id: format!("vol_{disk}"),
         attachment_id: format!("att_{disk}_{attempt}"),
-        epoch: 0,
+        epoch: 1,
         size_bytes: SIZE,
         mount_path: if disk.starts_with("root") {
             "/".into()
@@ -981,7 +986,9 @@ fn a_failed_job_is_retried_not_replayed() {
     let flaky_guest_bin = dir.path().join("flaky-guest-agent");
     let builder =
         NodeConfigBuilder::new(dir.path(), "node_test").with_guest_agent_bin(&flaky_guest_bin);
-    let runtime = NodeRuntime::new(fake_node_config!(builder)).unwrap();
+    let mut config = fake_node_config!(builder);
+    config.blockd_bin = sqlite_node_runtime_blockd_fixture(dir.path(), SIZE, 1);
+    let runtime = NodeRuntime::new(config).unwrap();
 
     // The guest agent binary does not exist yet: the start fails for real.
     let first = runtime.execute(start_job(1));

@@ -84,6 +84,19 @@ impl CurrentBlockdSocketBoot {
 pub(crate) fn serving_socket_owner_authority_digest(
     prepared: &PreparedDeviceInput,
 ) -> anyhow::Result<Sha256Digest> {
+    // The socket owner digest binds the immutable owner identity. The
+    // expected head evolves with every published generation under this same
+    // grant, so it is normalized to the blank sentinel before hashing; the
+    // receipt written at spawn must keep naming the same owner after later
+    // durable writes advance the head.
+    let mut prepared = prepared.clone();
+    prepared.expected_head = cats_api::runtime_reconciliation::RemoteHead {
+        generation: cats_api::runtime_reconciliation::Generation::new(0)
+            .context("blank sentinel generation")?,
+        root_hash: None,
+        root_object_id: None,
+    };
+    let prepared = &prepared;
     let value = serde_json::to_value(prepared).context("encode Serving socket owner authority")?;
     let bytes = canonical_json_bytes(&value);
     let decoded: PreparedDeviceInput =
@@ -1848,6 +1861,45 @@ struct ManagedBlockdSocketWholeOwnerSnapshot {
 }
 
 impl ManagedBlockdSocketWholeRootSnapshot {
+    /// Whether this closed scan retained an exact durable receipt or owner
+    /// directory for one expected owner generation.  Absence is also exact,
+    /// but only a retained generation needs the retirement edge.
+    fn retains_owner(&self, expected: &BlockdSocketOwnershipIntentV1) -> anyhow::Result<bool> {
+        let paths = expected.derived_paths(&self.root)?;
+        let owner = self
+            .owner_snapshots
+            .get(&paths.public_name)
+            .context("managed blockd owner is outside the closed whole-root snapshot")?;
+        anyhow::ensure!(
+            owner.intent == *expected,
+            "managed blockd owner snapshot names another generation"
+        );
+        Ok(owner.receipt.is_some() || owner.directory.is_some())
+    }
+
+    pub(crate) fn retains_serving_owner(
+        &self,
+        device_ownership_token: &RandomId128,
+        owner_authority_digest: &Sha256Digest,
+    ) -> anyhow::Result<bool> {
+        let mut matching = self.expected.iter().filter(|intent| {
+            matches!(
+                intent.owner(),
+                BlockdSocketOwnerV1::Serving {
+                    device_ownership_token: token,
+                } if token == device_ownership_token
+            ) && intent.owner_authority_digest() == owner_authority_digest
+        });
+        let Some(expected) = matching.next() else {
+            return Ok(false);
+        };
+        anyhow::ensure!(
+            matching.next().is_none(),
+            "closed blockd snapshot duplicated one serving owner generation"
+        );
+        self.retains_owner(expected)
+    }
+
     pub(crate) fn socket_paths(&self) -> BTreeSet<HostPath> {
         self.owner_snapshots
             .values()
@@ -3180,13 +3232,13 @@ fn stat_device_number(device: libc::dev_t) -> anyhow::Result<u64> {
     u64::try_from(device).context("socket device number is negative")
 }
 
-#[cfg(target_os = "linux")]
-fn stat_link_count(links: libc::nlink_t) -> u64 {
-    links
-}
-
-#[cfg(not(target_os = "linux"))]
-fn stat_link_count(links: libc::nlink_t) -> u64 {
+// libc exposes `nlink_t` at different unsigned widths on supported targets.
+// The generic bound keeps the conversion lossless without making an identity
+// conversion visible to Clippy on targets where the alias is already `u64`.
+fn stat_link_count<T>(links: T) -> u64
+where
+    u64: From<T>,
+{
     u64::from(links)
 }
 

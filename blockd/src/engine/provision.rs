@@ -128,7 +128,7 @@ impl ChunkEngine {
                     ));
                 }
             }
-            Err(MetaError::Fenced | MetaError::LeaseHeld) => {
+            Err(MetaError::Fenced) => {
                 self.fenced.store(true, Ordering::SeqCst);
                 return Err(ProvisionRootImageEffectError::ResultUnknown(
                     "authority rejected the owner or epoch",

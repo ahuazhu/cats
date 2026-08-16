@@ -109,9 +109,7 @@ mod tests {
     use std::time::Duration;
 
     use axum::http::{header, HeaderValue};
-    use cats_metadata_store_sqlite::SqliteMetadataStore;
     use cats_metering::SqliteUsageStore;
-    use cats_storage::MetadataStore;
 
     use super::*;
     use crate::controller::AutoTierPolicy;
@@ -123,9 +121,6 @@ mod tests {
         let usage = Arc::new(
             SqliteUsageStore::open(&dir.path().join("usage.db")).expect("open usage store"),
         );
-        let storage_meta: Arc<dyn MetadataStore> = Arc::new(
-            SqliteMetadataStore::open(&dir.path().join("storage.db")).expect("open metadata store"),
-        );
         let dsn = crate::testsupport::isolated_control_store_url();
         let handle = crate::server::spawn(Config {
             listen: "127.0.0.1:0".into(),
@@ -133,11 +128,14 @@ mod tests {
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: usage,
-            storage_meta,
+            #[cfg(debug_assertions)]
+            retired_storage_meta_for_tests: None,
             image_blob: crate::testsupport::unavailable_image_blob(),
             guest_runtime_profile_receipt: crate::testsupport::test_guest_runtime_profile_receipt(),
             runtime_provisioner_trust_bundle:
                 crate::testsupport::test_runtime_provisioner_trust_bundle(),
+            production_cutover_operator_trust_bundle:
+                crate::testsupport::test_production_cutover_operator_trust_bundle(),
             auth_token: "service-token".into(),
             route_grant_signer: crate::testsupport::route_grant_signer(),
             admin_token: "admin-token".into(),
@@ -164,6 +162,10 @@ mod tests {
             Id::new(workspace).unwrap()
         });
         let operation_id = tokio::task::block_in_place(|| {
+            crate::testsupport::begin_production_qualification_for_product_test(
+                handle.state.store.as_ref(),
+                &workspace_id,
+            );
             crate::store::runtime_authority::product_tests::create_runtime_operation_for_api_test(
                 handle.state.store.as_ref(),
                 &workspace_id,
@@ -211,7 +213,11 @@ mod tests {
         assert!(handler.await.unwrap_err().is_cancelled());
         table_lock.release();
 
-        tokio::time::timeout(Duration::from_secs(2), async {
+        // Pure poll upper bound: the store worker settles the cancelled
+        // read before poisoning, which can take far longer on a saturated
+        // gate host than on an idle one; the poll exits as soon as
+        // readiness closes.
+        tokio::time::timeout(Duration::from_secs(30), async {
             while handle.state.readiness.is_ready() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }

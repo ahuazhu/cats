@@ -18,9 +18,14 @@ use cats_api::agent_registration::{
 use cats_api::cat_create::decode_cat_create_v2_accepted_response;
 use cats_api::requests::ListResponse;
 use cats_api::resources::Disk;
+use cats_api::route_grant_v2::RouteGrantV2PublicKeyRingArtifact;
 use cats_api::runtime_node_authority::{
     runtime_node_authority_signed_request, PROVISIONER_CREDENTIAL_ID_HEADER,
     PROVISIONER_SIGNATURE_HEADER, RUNTIME_NODE_AUTHORITY_PATH,
+};
+use cats_api::runtime_product_reads::{
+    CatReadV2, DiskReadAdminState, DiskReadV2, EndpointCollectionReadV2, EndpointReadWakePolicy,
+    ProductReadPage,
 };
 use cats_api::runtime_reconciliation::{
     decode_agent_session, decode_desired_read_snapshot, decode_observation_acceptance,
@@ -38,21 +43,18 @@ use cats_api::runtime_reconciliation::{
     UnixMillis, DESIRED_READ_PATH, OBSERVATION_PATH,
 };
 use cats_control_plane::controller::AutoTierPolicy;
-use cats_control_plane::server::{
-    spawn, spawn_runtime_authority_with_billing_for_tests, Config, Handle,
-};
+use cats_control_plane::server::{spawn, spawn_with_gateway_machine, Config, Handle};
 use cats_control_plane::store::DsnSource;
 use cats_control_plane::testsupport::{
     RuntimeCutoverAcceptanceFacts, RuntimeOperationsTableLockForTest,
 };
-use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_metering::{
     CheckoutIntent, CheckoutPayment, CheckoutRefund, CreditApplyOutcome, CreditStore,
     CreditStoreFuture, CreditSummary, SqliteUsageStore,
 };
 use cats_storage::{
     encode_image_manifest, image_manifest_key, BlobError, BlobStore, ImageManifestV1,
-    LowerHexSha256, MetadataStore, IMAGE_MANIFEST_MAX_BYTES,
+    LowerHexSha256, IMAGE_MANIFEST_MAX_BYTES,
 };
 use reqwest::{RequestBuilder, Response, StatusCode};
 use ring::signature::Ed25519KeyPair;
@@ -231,6 +233,7 @@ struct Context {
     node_signer: Ed25519RequestSigner,
     provisioner_signer: Ed25519KeyPair,
     release: cats_api::runtime_reconciliation::GuestRuntimeProfileReceipt,
+    route_v2_ring: RouteGrantV2PublicKeyRingArtifact,
     image_blob: Arc<FixedImageBlob>,
     config: Config,
     credits: Arc<ToggleCreditStore>,
@@ -241,8 +244,6 @@ impl Context {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let usage = Arc::new(SqliteUsageStore::open(&dir.path().join("usage.db")).unwrap());
-        let storage_meta: Arc<dyn MetadataStore> =
-            Arc::new(SqliteMetadataStore::open(&dir.path().join("storage.db")).unwrap());
         let release = cats_control_plane::testsupport::test_guest_runtime_profile_receipt();
         let digest = Sha256Digest::new(IMAGE_DIGEST).unwrap();
         let manifest = ImageManifestV1 {
@@ -264,12 +265,15 @@ impl Context {
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: credits.clone(),
-            storage_meta,
+            #[cfg(debug_assertions)]
+            retired_storage_meta_for_tests: None,
             image_blob: image_blob.clone(),
             auth_token: SERVICE_TOKEN.into(),
             guest_runtime_profile_receipt: release.clone(),
             runtime_provisioner_trust_bundle:
                 cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
+            production_cutover_operator_trust_bundle:
+                cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
             route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
             admin_token: ADMIN_TOKEN.into(),
             workos: None,
@@ -280,7 +284,12 @@ impl Context {
             auto_tier_policy: AutoTierPolicy::default(),
             oci_deploy_sync_wait_ms: 5_000,
         };
-        let first = spawn(config.clone()).await.unwrap();
+        let (gateway_machine, route_v2_ring) =
+            cats_control_plane::testsupport::route_v2_gateway_machine_fixture("127.0.0.1:0")
+                .unwrap();
+        let first = spawn_with_gateway_machine(config.clone(), gateway_machine)
+            .await
+            .unwrap();
         let second = spawn(config.clone()).await.unwrap();
         let node_signer = Ed25519RequestSigner::from_pkcs8_pem(
             id("credential_cutover_a"),
@@ -299,6 +308,7 @@ impl Context {
             node_signer,
             provisioner_signer,
             release,
+            route_v2_ring,
             image_blob,
             config,
             credits,
@@ -405,6 +415,12 @@ fn node_identity(signer: &Ed25519RequestSigner) -> NodeIdentity {
     NodeIdentity {
         version: ContractVersion::V1,
         node_id: id("node_cutover_a"),
+        provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+            provider: id("test_provider"),
+            partition: id("test_partition"),
+            account_id: id("test_account"),
+            region: id("test_region"),
+        },
         immutable_host_id: id("host_cutover_a"),
         credential_id: signer.credential_id().clone(),
         credential_binding: CredentialBinding::PublicKey {
@@ -489,6 +505,7 @@ fn session_binding(session: &cats_api::runtime_reconciliation::AgentSession) -> 
 fn full_observation(
     session: &cats_api::runtime_reconciliation::AgentSession,
     read_position: Sequence,
+    route_v2_ring: &RouteGrantV2PublicKeyRingArtifact,
 ) -> NodeObservation {
     let mut observation = NodeObservation {
         version: ContractVersion::V1,
@@ -503,9 +520,13 @@ fn full_observation(
         inventory_epoch: Epoch::new(1).unwrap(),
         inventory_digest: None,
         inventory_read_position: Some(read_position),
-        key_ring_version: None,
-        key_ring_digest: None,
-        loaded_kids: Vec::new(),
+        key_ring_version: Some(route_v2_ring.ring_version),
+        key_ring_digest: Some(route_v2_ring.digest().unwrap()),
+        loaded_kids: route_v2_ring
+            .keys
+            .iter()
+            .map(|entry| entry.kid.clone())
+            .collect(),
         runtimes: Vec::new(),
         residue: Vec::new(),
     };
@@ -625,7 +646,11 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
     // Make a strict current-vs-immutable lease assertion deterministic even
     // on a PostgreSQL clock whose visible precision is one millisecond.
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    let observation = full_observation(&session, empty_snapshot.read_position);
+    let observation = full_observation(
+        &session,
+        empty_snapshot.read_position,
+        &context.route_v2_ring,
+    );
     let observation_body = encode_node_observation(&observation).unwrap();
     let (first_observation, second_observation) = send_through_replica_barrier(
         context.node_request(&context.first, OBSERVATION_PATH, observation_body.clone()),
@@ -678,6 +703,13 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
         .expect("bootstrap account has one default Workspace");
     let workspace_id = workspace.id;
     let account_id = workspace.account_id;
+    let admission_workspace = id(&workspace_id);
+    tokio::task::block_in_place(|| {
+        cats_control_plane::testsupport::begin_production_qualification_for_product_test(
+            &context.first.state.store,
+            &admission_workspace,
+        );
+    });
     let idempotency_key = "two-replica-cat-create";
     let (first_create, second_create) = send_through_replica_barrier(
         context.cat_create_request(&context.first, &workspace_id, idempotency_key),
@@ -726,6 +758,293 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
         reads_after_commit,
         "PersistentDisk create must not read the Root image manifest"
     );
+
+    let cat_list = context
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{workspace_id}/cats?limit=1",
+            context.second.base_url()
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    let cat_page: ProductReadPage<CatReadV2> =
+        serde_json::from_slice(&json_body(cat_list, StatusCode::OK).await).unwrap();
+    assert_eq!(cat_page.items.len(), 1);
+    assert_eq!(cat_page.items[0].id, created.cat_id);
+    assert_eq!(cat_page.items[0].workspace_id.as_str(), workspace_id);
+    assert_eq!(cat_page.items[0].name.as_str(), "app");
+    let desired_root_disk_id = cat_page.items[0].desired.root_disk_id.clone();
+    assert_eq!(
+        cat_page.items[0].desired.target,
+        cats_api::runtime_reconciliation::RuntimeTarget::Running
+    );
+    assert!(cat_page.items[0].observed.is_none());
+    assert!(cat_page.next_cursor.is_none());
+
+    let exact_cat: CatReadV2 = serde_json::from_slice(
+        &json_body(
+            context
+                .http
+                .get(format!(
+                    "{}/v1/workspaces/{workspace_id}/cats/{}",
+                    context.first.base_url(),
+                    created.cat_id
+                ))
+                .bearer_auth(ADMIN_TOKEN)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::OK,
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(exact_cat, cat_page.items[0]);
+
+    let endpoint_url = format!(
+        "{}/v1/workspaces/{workspace_id}/cats/{}/endpoints",
+        context.first.base_url(),
+        created.cat_id
+    );
+    let unauthenticated_endpoint_query = context
+        .http
+        .get(format!("{endpoint_url}?limit=1"))
+        .body("not-allowed")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        unauthenticated_endpoint_query.status(),
+        StatusCode::UNAUTHORIZED,
+        "workspace authorization must precede Endpoint query/body validation"
+    );
+    let endpoint_query = context
+        .http
+        .get(format!("{endpoint_url}?limit=1"))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(endpoint_query.status(), StatusCode::BAD_REQUEST);
+    let endpoint_body = context
+        .http
+        .get(&endpoint_url)
+        .bearer_auth(ADMIN_TOKEN)
+        .body("not-allowed")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(endpoint_body.status(), StatusCode::BAD_REQUEST);
+    let endpoint_response = context
+        .http
+        .get(&endpoint_url)
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        endpoint_response.headers()[reqwest::header::CACHE_CONTROL],
+        "no-store"
+    );
+    let endpoint_collection: EndpointCollectionReadV2 =
+        serde_json::from_slice(&json_body(endpoint_response, StatusCode::OK).await).unwrap();
+    assert_eq!(endpoint_collection.cat_id, created.cat_id);
+    assert_eq!(endpoint_collection.desired_revision.get(), 1);
+    assert!(endpoint_collection.complete);
+    assert_eq!(endpoint_collection.items.len(), 1);
+    let endpoint = &endpoint_collection.items[0];
+    assert_eq!(endpoint.name.as_str(), "web");
+    assert_eq!(endpoint.target_port, 8080);
+    assert_eq!(
+        endpoint.protocol,
+        cats_api::runtime_reconciliation::HttpProtocol::Http
+    );
+    assert_eq!(endpoint.wake_policy, EndpointReadWakePolicy::Disabled);
+    assert_eq!(endpoint.route_epoch.get(), 1);
+
+    let name_is_not_an_item_key = context
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{workspace_id}/cats/app",
+            context.first.base_url()
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(name_is_not_an_item_key.status(), StatusCode::NOT_FOUND);
+
+    let unauthenticated_malformed_cat = context
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{workspace_id}/cats/%FF",
+            context.first.base_url()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        unauthenticated_malformed_cat.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let authenticated_malformed_cat = context
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{workspace_id}/cats/%FF",
+            context.first.base_url()
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authenticated_malformed_cat.status(), StatusCode::NOT_FOUND);
+
+    let invalid_page_queries = [
+        "limit=0",
+        "limit=01",
+        "limit=101",
+        "limit=1&limit=2",
+        "cursor=not-base64!",
+        "unknown=1",
+    ];
+    let unauthenticated_invalid_query = context
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{workspace_id}/cats?cursor=not-base64!",
+            context.second.base_url()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        unauthenticated_invalid_query.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    for query in invalid_page_queries {
+        let response = context
+            .http
+            .get(format!(
+                "{}/v1/workspaces/{workspace_id}/cats?{query}",
+                context.second.base_url()
+            ))
+            .bearer_auth(ADMIN_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+    }
+    let wrong_resource_cursor = cats_api::runtime_product_reads::encode_product_read_cursor(
+        cats_api::runtime_product_reads::ProductReadResource::Disks,
+        &id("disk_cursor_probe"),
+    );
+    let response = context
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{workspace_id}/cats?cursor={wrong_resource_cursor}",
+            context.second.base_url()
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let first_disk_page: ProductReadPage<DiskReadV2> = serde_json::from_slice(
+        &json_body(
+            context
+                .http
+                .get(format!(
+                    "{}/v1/workspaces/{workspace_id}/disks?limit=1",
+                    context.second.base_url()
+                ))
+                .bearer_auth(ADMIN_TOKEN)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::OK,
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(first_disk_page.items.len(), 1);
+    let cursor = first_disk_page.next_cursor.as_deref().unwrap();
+    let second_disk_page: ProductReadPage<DiskReadV2> = serde_json::from_slice(
+        &json_body(
+            context
+                .http
+                .get(format!(
+                    "{}/v1/workspaces/{workspace_id}/disks?limit=1&cursor={cursor}",
+                    context.first.base_url()
+                ))
+                .bearer_auth(ADMIN_TOKEN)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::OK,
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(second_disk_page.items.len(), 1);
+    assert!(second_disk_page.next_cursor.is_none());
+    let mut paged_disk_ids = vec![
+        first_disk_page.items[0].id.clone(),
+        second_disk_page.items[0].id.clone(),
+    ];
+    paged_disk_ids.sort();
+    let mut expected_disk_ids = vec![desired_root_disk_id.clone(), id(&disk.id)];
+    expected_disk_ids.sort();
+    assert_eq!(paged_disk_ids, expected_disk_ids);
+
+    let exact_disk: DiskReadV2 = serde_json::from_slice(
+        &json_body(
+            context
+                .http
+                .get(format!(
+                    "{}/v1/workspaces/{workspace_id}/disks/{}",
+                    context.first.base_url(),
+                    disk.id
+                ))
+                .bearer_auth(ADMIN_TOKEN)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::OK,
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(exact_disk.name.as_str(), "data");
+    assert!(exact_disk.binding.is_none());
+    let disk_name_is_not_an_item_key = context
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{workspace_id}/disks/data",
+            context.first.base_url()
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(disk_name_is_not_an_item_key.status(), StatusCode::NOT_FOUND);
+
+    let retired_operation_collection = context
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{workspace_id}/operations",
+            context.first.base_url()
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        retired_operation_collection.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
     let disk_replay = context
         .persistent_disk_create_request(&context.first, &workspace_id, disk_key)
         .send()
@@ -841,6 +1160,40 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
         .execute(move |store| store.create_workspace(&account_id, "sibling", "Sibling"))
         .await
         .unwrap();
+    for path in [
+        format!("cats/{}", created.cat_id),
+        format!("disks/{}", disk.id),
+    ] {
+        let hidden = context
+            .http
+            .get(format!(
+                "{}/v1/workspaces/{}/{path}",
+                context.second.base_url(),
+                sibling_workspace.id
+            ))
+            .bearer_auth(ADMIN_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(hidden.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    for collection in ["cats", "disks"] {
+        let page = context
+            .http
+            .get(format!(
+                "{}/v1/workspaces/{}/{collection}",
+                context.second.base_url(),
+                sibling_workspace.id
+            ))
+            .bearer_auth(ADMIN_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        let page: serde_json::Value =
+            serde_json::from_slice(&json_body(page, StatusCode::OK).await).unwrap();
+        assert_eq!(page["items"], serde_json::json!([]), "{collection}");
+        assert!(page["next_cursor"].is_null(), "{collection}");
+    }
     let wrong_workspace = context
         .operation_request(
             &context.second,
@@ -927,6 +1280,54 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
         assert_exact_operation_response(response, &terminal).await;
     }
 
+    cats_control_plane::testsupport::set_runtime_product_read_states_for_test(
+        &context.first.state.store,
+        created.cat_id.clone(),
+        id(&disk.id),
+    )
+    .await;
+    let deleted_cat: CatReadV2 = serde_json::from_slice(
+        &json_body(
+            context
+                .http
+                .get(format!(
+                    "{}/v1/workspaces/{workspace_id}/cats/{}",
+                    context.second.base_url(),
+                    created.cat_id
+                ))
+                .bearer_auth(ADMIN_TOKEN)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::OK,
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(
+        deleted_cat.desired.target,
+        cats_api::runtime_reconciliation::RuntimeTarget::Deleted
+    );
+    let deleting_disk: DiskReadV2 = serde_json::from_slice(
+        &json_body(
+            context
+                .http
+                .get(format!(
+                    "{}/v1/workspaces/{workspace_id}/disks/{}",
+                    context.first.base_url(),
+                    disk.id
+                ))
+                .bearer_auth(ADMIN_TOKEN)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::OK,
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(deleting_disk.admin_state, DiskReadAdminState::Deleting);
+
     let facts = cats_control_plane::testsupport::runtime_cutover_acceptance_facts(
         &context.first.state.store,
         session.node_id.clone(),
@@ -946,8 +1347,8 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
             admission_inventory_state_count: 1,
             current_cat_observation_count: 0,
             cat_record_count: 1,
-            disk_record_count: 2,
-            volume_record_count: 2,
+            disk_record_count: 1,
+            volume_record_count: 1,
             desired_spec_count: 1,
             endpoint_record_count: 1,
             hostname_lookup_count: 1,
@@ -965,6 +1366,108 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
             stored_api_response_body: Some(first_create_body),
             stored_persistent_disk_response_body: Some(first_disk_body),
         }
+    );
+
+    let residual_reader = spawn(context.config.clone()).await.unwrap();
+    cats_control_plane::testsupport::corrupt_deleted_root_volume_residual_for_test(
+        &context.first.state.store,
+        id(&disk.id),
+    )
+    .await;
+    let residual_deleted_cat = context
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{workspace_id}/cats/{}",
+            residual_reader.base_url(),
+            created.cat_id,
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        residual_deleted_cat.status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        context
+            .http
+            .get(format!("{}/healthz", residual_reader.base_url()))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    residual_reader.shutdown().await.unwrap();
+    cats_control_plane::testsupport::remove_deleted_root_volume_residual_for_test(
+        &context.first.state.store,
+    )
+    .await;
+
+    let graph_reader = spawn(context.config.clone()).await.unwrap();
+    cats_control_plane::testsupport::corrupt_deleted_root_authorization_projection_for_test(
+        &context.first.state.store,
+    )
+    .await;
+    let corrupt_deleted_cat = context
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{workspace_id}/cats/{}",
+            graph_reader.base_url(),
+            created.cat_id,
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        corrupt_deleted_cat.status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        context
+            .http
+            .get(format!("{}/healthz", graph_reader.base_url()))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    graph_reader.shutdown().await.unwrap();
+
+    cats_control_plane::testsupport::corrupt_runtime_cat_list_boundary_for_test(
+        &context.first.state.store,
+        created.cat_id.clone(),
+        id(&sibling_workspace.id),
+    )
+    .await;
+    let boundary_cursor = cats_api::runtime_product_reads::encode_product_read_cursor(
+        cats_api::runtime_product_reads::ProductReadResource::Cats,
+        &id("cat_zy"),
+    );
+    let corrupt_cat = context
+        .http
+        .get(format!(
+            "{}/v1/workspaces/{}/cats?limit=1&cursor={boundary_cursor}",
+            context.second.base_url(),
+            sibling_workspace.id,
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(corrupt_cat.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        context
+            .http
+            .get(format!("{}/healthz", context.second.base_url()))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
     );
 
     // A transient PostgreSQL lock timeout is an ordinary unavailable read and
@@ -1051,9 +1554,10 @@ async fn persistent_disk_exact_replay_precedes_mutable_funding_admission() {
     let context = Context::new().await;
     let mut billed_config = context.config.clone();
     billed_config.billing_enforcement_enabled = true;
-    let billed = spawn_runtime_authority_with_billing_for_tests(billed_config)
-        .await
-        .unwrap();
+    // Production composition must accept the rollout gate and run the
+    // elected BillingEnforcer. A test-only spawn path would hide the exact
+    // cutover regression this test characterizes.
+    let billed = spawn(billed_config).await.unwrap();
     let workspaces = context
         .http
         .get(format!("{}/v1/admin/workspaces", billed.base_url()))
@@ -1070,6 +1574,13 @@ async fn persistent_disk_exact_replay_precedes_mutable_funding_admission() {
         .find(|workspace| workspace.is_default)
         .expect("bootstrap account has one default Workspace")
         .id;
+    let admission_workspace = id(&workspace_id);
+    tokio::task::block_in_place(|| {
+        cats_control_plane::testsupport::begin_production_qualification_for_product_test(
+            &billed.state.store,
+            &admission_workspace,
+        );
+    });
 
     let key = "funding-change-replay";
     let first = context
@@ -1106,6 +1617,144 @@ async fn persistent_disk_exact_replay_precedes_mutable_funding_admission() {
         ),
         (1, 1, 1)
     );
+
+    billed.shutdown().await.unwrap();
+    context.first.shutdown().await.unwrap();
+    context.second.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cat_exact_replay_precedes_mutable_funding_admission() {
+    let context = Context::new().await;
+
+    let provision_body = encode_runtime_node_authority_apply(&provision_apply(&context)).unwrap();
+    let provisioned = context
+        .node_authority_request(&context.first, provision_body)
+        .send()
+        .await
+        .unwrap();
+    json_body(provisioned, StatusCode::OK).await;
+
+    let attempt = AgentRegistrationAttempt {
+        version: ContractVersion::V1,
+        node_id: id("node_cutover_a"),
+        immutable_host_id: id("host_cutover_a"),
+        node_boot_id: NodeBootId::new("11111111111111111111111111111111").unwrap(),
+        agent_instance_id: random("22222222222222222222222222222222"),
+        registration_attempt_id: random("33333333333333333333333333333333"),
+        guest_config_digest: guest_config_digest(&context.release).unwrap(),
+        expected_agent_session_epoch: None,
+    };
+    let registered = context
+        .registration_request(
+            &context.first,
+            encode_agent_registration_attempt(&attempt).unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let session = decode_agent_session(&json_body(registered, StatusCode::OK).await).unwrap();
+
+    let desired_read = DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: session_binding(&session),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    let desired = context
+        .node_request(
+            &context.first,
+            DESIRED_READ_PATH,
+            encode_desired_read_request(&desired_read).unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let snapshot = decode_desired_read_snapshot(&json_body(desired, StatusCode::OK).await).unwrap();
+
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let observed = context
+        .node_request(
+            &context.first,
+            OBSERVATION_PATH,
+            encode_node_observation(&full_observation(
+                &session,
+                snapshot.read_position,
+                &context.route_v2_ring,
+            ))
+            .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    json_body(observed, StatusCode::OK).await;
+
+    let schedulable = context
+        .node_authority_request(
+            &context.first,
+            encode_runtime_node_authority_apply(&schedulable_apply(&context)).unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    json_body(schedulable, StatusCode::OK).await;
+
+    let mut billed_config = context.config.clone();
+    billed_config.billing_enforcement_enabled = true;
+    // Exercise the exact production BillingEnforcer composition; the old
+    // test-only spawn path would bypass the singleton authority being gated.
+    let billed = spawn(billed_config).await.unwrap();
+    let workspaces = context
+        .http
+        .get(format!("{}/v1/admin/workspaces", billed.base_url()))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(workspaces.status(), StatusCode::OK);
+    let workspaces: ListResponse<cats_api::auth::Workspace> =
+        serde_json::from_slice(&workspaces.bytes().await.unwrap()).unwrap();
+    let workspace_id = workspaces
+        .items
+        .into_iter()
+        .find(|workspace| workspace.is_default)
+        .expect("bootstrap account has one default Workspace")
+        .id;
+    let admission_workspace = id(&workspace_id);
+    tokio::task::block_in_place(|| {
+        cats_control_plane::testsupport::begin_production_qualification_for_product_test(
+            &billed.state.store,
+            &admission_workspace,
+        );
+    });
+
+    let key = "cat-funding-change-replay";
+    let first = context
+        .cat_create_request(&billed, &workspace_id, key)
+        .send()
+        .await
+        .unwrap();
+    let first_body = json_body(first, StatusCode::ACCEPTED).await;
+    let reads_after_commit = context.image_blob.reads.load(Ordering::SeqCst);
+    context.credits.set_funded(false);
+
+    let replay = context
+        .cat_create_request(&billed, &workspace_id, key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(json_body(replay, StatusCode::ACCEPTED).await, first_body);
+    assert_eq!(
+        context.image_blob.reads.load(Ordering::SeqCst),
+        reads_after_commit,
+        "settled replay must not re-read the immutable manifest"
+    );
+
+    let fresh = context
+        .cat_create_request(&billed, &workspace_id, "unfunded-fresh-cat-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fresh.status(), StatusCode::PAYMENT_REQUIRED);
 
     billed.shutdown().await.unwrap();
     context.first.shutdown().await.unwrap();

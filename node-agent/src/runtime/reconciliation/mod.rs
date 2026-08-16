@@ -47,10 +47,13 @@ mod inventory;
     )
 )]
 mod kernel_nbd;
+mod lifecycle_steps;
 mod network;
 mod normal_acquire;
 mod persistent_filesystem;
 mod prepare_device_retirement;
+#[cfg(feature = "proposed-node-residue-reclamation")]
+mod residue_reclaim;
 mod retained_runtime_launch;
 mod root_provision;
 mod route_retirement;
@@ -153,6 +156,8 @@ pub use authorized_blockd::{
     AuthorizedBlockdCheckpoint, AuthorizedBlockdLaunchConfig, AuthorizedBlockdStore,
     PreparedAuthorizedBlockd,
 };
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use authorized_blockd::{AUTHORIZED_SERVING_FILE, IDENTITY_FILE};
 pub use checkpoint::{
     runtime_checkpoint_path, CheckpointStoreError, FileCheckpointStore, StoredCheckpoint,
 };
@@ -184,16 +189,26 @@ pub(crate) use kernel_nbd::{
     KernelNbdClientCleanupOwner, KernelNbdInventoryConfig, KernelNbdPoolAdmission,
     KernelNbdPoolScanAdmission,
 };
+pub(crate) use lifecycle_steps::LifecycleStepEffect;
 pub(crate) use network::{NodeGlobalNetworkAdmission, NodeGlobalNetworkScanAdmission};
+#[cfg(feature = "proposed-node-residue-reclamation")]
+pub use normal_acquire::RuntimeVolumeTransitionHttpClient as ResidueAuthorityHttpClient;
 pub use normal_acquire::{
-    recover_normal_acquire_from_authority, recover_normal_release_from_authority,
-    A19SignedVolumeTransitionTransport, CommitInitializedAttempt, ControlSignedNormalAcquireClient,
+    recover_lifecycle_release_from_authority, recover_normal_acquire_from_authority,
+    recover_normal_release_from_authority, A19SignedVolumeTransitionTransport,
+    CommitInitializedAttempt, ControlSignedNormalAcquireClient, DisposableRootDeleteAttempt,
     NormalAcquireAcceptedContext, NormalAcquireAttempt, NormalAcquireAuthorityRecovery,
     NormalAcquireClientError, NormalReleaseAttempt, NormalReleaseAuthorityRecovery,
     RuntimeVolumeTransitionHttpClient, SignedVolumeTransitionResponse, TakeoverAcquireAttempt,
     VolumeTransitionTransportFailure,
 };
+#[cfg(feature = "proposed-node-residue-reclamation")]
+pub use normal_acquire::{residue_authority_request_from_observed, RuntimeResidueAuthorityAttempt};
 pub(crate) use persistent_filesystem::PersistentFilesystemEffect;
+#[cfg(feature = "proposed-node-residue-reclamation")]
+pub(crate) use residue_reclaim::{
+    DataDirectoryReclaimAdmission, DataDirectoryReclaimEffect, DataDirectoryReclaimScanAdmission,
+};
 pub(crate) use root_provision::PlatformRootProvisionProcessIdentityPort;
 pub use root_provision::{
     AuthorityRereadRequired, RootProvisionClientError, RootProvisionControlPort,
@@ -219,10 +234,12 @@ pub(crate) use signed_running::{SignedRunningAcquireEffect, SignedRunningPublica
 pub(crate) use vmm_cid::PlatformExactVmmCidInventoryPort;
 pub(crate) use vmm_cid::{VmmCidAllocationPort, VmmCidInventoryPort};
 pub(crate) use vmm_launch_artifacts::VmmLaunchArtifactPaths;
+#[cfg(test)]
+pub(crate) use vmm_process::VmmProcessExpectation;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use vmm_process::{
     stale_boot_recovery_global_sealed, ExactVmmProcessAbsenceProof,
-    StaleBootVmmProcessGlobalInspection, StaleBootVmmProcessGlobalPort, VmmProcessExpectation,
+    StaleBootVmmProcessGlobalInspection, StaleBootVmmProcessGlobalPort,
 };
 #[allow(unused_imports)]
 pub(crate) use vmm_runtime_paths::ManagedVmmLaunchFilePaths;
@@ -242,6 +259,8 @@ pub(crate) use vmm_socket_namespace::{
 // This crate-private seam is landed before the systemd composition that
 // consumes it; keeping the re-export here prevents feature code from reaching
 // through the module path while preserving the sealed boundary.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use clean_slate_probes::retire_absent_serving_socket_owner_for_test;
 #[allow(unused_imports)]
 pub(crate) use root_provision_process::{
     ensure_root_provision_process_after_checkpoint,

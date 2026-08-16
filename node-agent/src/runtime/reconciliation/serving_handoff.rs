@@ -56,7 +56,8 @@ use cats_blockd::target_control::{
     TARGET_CONTROL_AUTHORIZATION_MAX_BYTES as TARGET_AUTHORIZED_SERVING_MAX_BYTES,
 };
 use cats_storage::authority::{
-    validate_authorized_serving_record, AttachmentLineageIdentity, AuthorizedServingAttachment,
+    remote_head_is_same_or_later, validate_authorized_serving_record, AttachmentLineageIdentity,
+    AuthorizedServingAttachment,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -2689,8 +2690,11 @@ pub(crate) fn validate_scanned_serving_handoff_artifacts(
                     && decoded.attachment_id == device.attachment_id
                     && decoded.attachment_epoch == device.attachment_epoch
                     && decoded.acquire_origin == device.acquire_origin
-                    && decoded.expected_provisioned_head == device.expected_head
                     && decoded.expected_provisioned_head == target_artifact.attachment.head
+                    && remote_head_is_same_or_later(
+                        &device.expected_head,
+                        &decoded.expected_provisioned_head,
+                    )
                     && target_artifact.attachment.identity == acquired.attachment.identity
                     && target_artifact.attachment.acquire == acquired.attachment.acquire
                     && target_artifact.attachment.size_bytes
@@ -4642,6 +4646,19 @@ mod tests {
             let node_global_effect = context.lock_node_global_effect()?;
             let listeners = self.listeners.take();
             drop(listeners);
+            // Same closing-window hazard the Root owner awaits: a loaded
+            // kernel can briefly keep the dropped listener connectable, so
+            // wait for refusal before treating a connect as a live listener.
+            for socket in self.socket_paths() {
+                let deadline = Instant::now() + Duration::from_secs(6);
+                while UnixStream::connect(socket).is_ok() {
+                    anyhow::ensure!(
+                        Instant::now() < deadline,
+                        "isolated managed Serving listener still accepted connects after drop"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
             self.assert_listeners_absent("before the absence sweep")?;
             let capture =
                 self.root
@@ -7129,6 +7146,7 @@ mod tests {
                 node_id: desired.placement.node_id.clone(),
                 placement_epoch,
             },
+            object_write_credential: None,
             size_bytes: volume.size_bytes,
             durability: volume.durability,
             head: blank_head(),

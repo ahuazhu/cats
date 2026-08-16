@@ -1,22 +1,46 @@
 //! Real PostgreSQL acceptance for the startup-pinned Route v2 signer binding.
 
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::{mpsc, Arc, Barrier};
+use std::time::{Duration, Instant};
 
 use cats_api::route_grant_v2::{
     decode_route_grant_v2_public_key_ring, decode_route_grant_v2_signer_reference,
-    encode_route_grant_v2_signer_reference, RouteGrantV2SignerExpectedPrevious,
-    RouteGrantV2SignerSelection,
+    encode_route_grant_v2_signer_reference, RouteGrantV2PublicKey, RouteGrantV2PublicKeyEntry,
+    RouteGrantV2PublicKeyRingArtifact, RouteGrantV2PublicKeyRingExpectedPrevious,
+    RouteGrantV2SignerExpectedPrevious, RouteGrantV2SignerReference, RouteGrantV2SignerSelection,
 };
-use cats_api::runtime_reconciliation::Epoch;
+use cats_api::runtime_reconciliation::{
+    AllocatableMemoryBytes, AllocatableVcpus, AsciiText, Base64UrlNoPad, ContractVersion, Epoch,
+    GuestIpv4Pool, GuestIpv4PoolKind, GuestRuntimeProfileReceipt, HostPath, Id, Ipv4Address, KeyId,
+    NodePlacementPolicy, NodeResidue, NodeTransportTarget, OwnershipTokenEvidence,
+    RuntimePlacementBlockFrontend, RuntimePlacementCapabilities, RuntimePlacementGuestNetwork,
+    RuntimePlacementGuestTransport, RuntimePlacementVmm, RuntimeSchedulingState, Sha256Digest,
+    UnixMillis,
+};
 
 use crate::route_grant_v2::InstalledRouteGrantV2SigningAuthority;
+use crate::store::runtime_authority::placement_policy::insert_policy_on_store_for_test;
+use crate::store::runtime_authority::route_signing_authority::{
+    strictly_after_retention, RouteGrantV2SigningAuthorityCommand,
+    RouteGrantV2SigningAuthorityCommandKind, RouteGrantV2SigningAuthorityCommandResult,
+    RouteGrantV2SigningAuthorityStoreOutcome, RETENTION_MILLIS,
+};
+use crate::store::runtime_authority::runtime_spine::PlacementAdmissionSnapshot;
+use crate::store::runtime_authority::runtime_spine_tests::{
+    accept_partial_heartbeat_for_test, accept_ring_admission_for_test,
+    establish_empty_admission_for, refresh_assigned_admission_for_test,
+    refresh_assigned_admission_with_residue_for_test, replace_agent_session_for_test,
+};
+use crate::store::AuthorityRequestContext;
 use crate::store::Store;
 
 const RING: &[u8] = br#"{"version":1,"ring_version":1,"expected_previous":null,"keys":[{"kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","public_key_spki":"MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To"}]}"#;
 const SIGNER: &[u8] = br#"{"version":1,"deployment_id":"route_deployment_a","signer_revision":1,"expected_previous":null,"signer":{"state":"active","active_kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","secret_reference_id":"route_secret_a"},"public_key_ring_version":1,"public_key_ring_digest":"sha256:7c7e324d7be6c6ee71735c900ce1041de63af7cc08fb39b6800853f966e81e34"}"#;
 const PRIVATE_KEY: &[u8] =
     include_bytes!("../../../../tests/fixtures/route_grant_v2_private_ed25519.pem");
+const OTHER_KID: &str = "47ff3f28dd2cc185ac432f34ecc346a121c52934b16993ab9fb7fcb92a3406f8";
+const OTHER_SPKI: &str = "MCowBQYDK2VwAyEAJJHj__Po94RauBD2QsCa8LKrwcrVFdomZbKbCGBbvuk";
+const THIRD_SPKI: &str = "MCowBQYDK2VwAyEA11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
 
 fn installation(bytes: &[u8]) -> InstalledRouteGrantV2SigningAuthority {
     let reference = decode_route_grant_v2_signer_reference(bytes).unwrap();
@@ -50,6 +74,12 @@ fn row_versions(store: &Store) -> Vec<String> {
                          UNION ALL
                          SELECT 'key:' || kid, xmin::TEXT
                            FROM route_v2_signer_key_lineage
+                         UNION ALL
+                         SELECT 'ring:' || ring_version, xmin::TEXT
+                           FROM route_v2_public_key_ring_revisions
+                         UNION ALL
+                         SELECT 'retirement:' || kid, xmin::TEXT
+                           FROM route_v2_signer_retirements
                        ) rows
                       ORDER BY row_name",
                     &[],
@@ -65,6 +95,140 @@ fn row_versions(store: &Store) -> Vec<String> {
                 .collect()
         })
         .unwrap()
+}
+
+fn id(value: &str) -> Id {
+    Id::new(value).unwrap()
+}
+
+fn initial_ring() -> RouteGrantV2PublicKeyRingArtifact {
+    decode_route_grant_v2_public_key_ring(RING).unwrap()
+}
+
+pub(super) fn install_initial_signer_for_test(store: &Store) -> RouteGrantV2PublicKeyRingArtifact {
+    store
+        .install_route_grant_v2_signer_authority(&installation(SIGNER))
+        .unwrap();
+    initial_ring()
+}
+
+fn other_entry() -> RouteGrantV2PublicKeyEntry {
+    RouteGrantV2PublicKeyEntry {
+        kid: KeyId::new(OTHER_KID).unwrap(),
+        public_key_spki: Base64UrlNoPad::new(OTHER_SPKI).unwrap(),
+    }
+}
+
+fn third_entry() -> RouteGrantV2PublicKeyEntry {
+    let public_key_spki = Base64UrlNoPad::new(THIRD_SPKI).unwrap();
+    let public = RouteGrantV2PublicKey::from_base64url_spki(&public_key_spki).unwrap();
+    RouteGrantV2PublicKeyEntry {
+        kid: public.kid().clone(),
+        public_key_spki,
+    }
+}
+
+fn successor_ring(
+    current: &RouteGrantV2PublicKeyRingArtifact,
+    keys: Vec<RouteGrantV2PublicKeyEntry>,
+) -> RouteGrantV2PublicKeyRingArtifact {
+    let mut keys = keys;
+    keys.sort_by(|left, right| left.kid.cmp(&right.kid));
+    RouteGrantV2PublicKeyRingArtifact {
+        version: ContractVersion::V1,
+        ring_version: Epoch::new(current.ring_version.get() + 1).unwrap(),
+        expected_previous: Some(RouteGrantV2PublicKeyRingExpectedPrevious {
+            ring_version: current.ring_version,
+            key_ring_digest: current.digest().unwrap(),
+        }),
+        keys,
+    }
+}
+
+fn successor_reference(
+    current: &RouteGrantV2SignerReference,
+    signer: RouteGrantV2SignerSelection,
+    ring: &RouteGrantV2PublicKeyRingArtifact,
+) -> RouteGrantV2SignerReference {
+    RouteGrantV2SignerReference {
+        version: ContractVersion::V1,
+        deployment_id: current.deployment_id.clone(),
+        signer_revision: Epoch::new(current.signer_revision.get() + 1).unwrap(),
+        expected_previous: Some(RouteGrantV2SignerExpectedPrevious {
+            signer_revision: current.signer_revision,
+            signer_reference_sha256: current.digest().unwrap(),
+        }),
+        signer,
+        public_key_ring_version: ring.ring_version,
+        public_key_ring_digest: ring.digest().unwrap(),
+    }
+}
+
+fn apply(
+    store: &Store,
+    command: &RouteGrantV2SigningAuthorityCommand,
+) -> RouteGrantV2SigningAuthorityStoreOutcome {
+    store
+        .apply_route_grant_v2_signing_authority_command(
+            command,
+            &AuthorityRequestContext::new(Instant::now() + Duration::from_secs(5)),
+        )
+        .unwrap()
+}
+
+fn assert_applied(
+    outcome: RouteGrantV2SigningAuthorityStoreOutcome,
+) -> RouteGrantV2SigningAuthorityCommandResult {
+    let RouteGrantV2SigningAuthorityStoreOutcome::Committed(result) = outcome else {
+        panic!("expected committed Route v2 authority transition")
+    };
+    assert!(matches!(
+        result,
+        RouteGrantV2SigningAuthorityCommandResult::Applied { .. }
+    ));
+    result
+}
+
+fn assert_precondition_failed(outcome: RouteGrantV2SigningAuthorityStoreOutcome) {
+    assert_eq!(
+        outcome,
+        RouteGrantV2SigningAuthorityStoreOutcome::PreconditionFailed
+    );
+}
+
+fn release() -> GuestRuntimeProfileReceipt {
+    GuestRuntimeProfileReceipt {
+        version: ContractVersion::V1,
+        kernel_digest: Sha256Digest::from_bytes([1; 32]),
+        initramfs_digest: Some(Sha256Digest::from_bytes([2; 32])),
+        kernel_cmdline: AsciiText::new("console=hvc0 root=/dev/vda").unwrap(),
+        guest_agent_protocol_version: ContractVersion::V1,
+    }
+}
+
+fn schedulable_policy(admission: &PlacementAdmissionSnapshot) -> NodePlacementPolicy {
+    NodePlacementPolicy {
+        version: ContractVersion::V1,
+        node_id: admission.node_identity.node_id.clone(),
+        policy_revision: Epoch::new(1).unwrap(),
+        scheduling_state: RuntimeSchedulingState::Schedulable,
+        allocatable_vcpus: AllocatableVcpus::new(8).unwrap(),
+        allocatable_memory_bytes: AllocatableMemoryBytes::new(16 << 30).unwrap(),
+        capabilities: RuntimePlacementCapabilities {
+            vmm: RuntimePlacementVmm::CloudHypervisor,
+            block_frontend: RuntimePlacementBlockFrontend::KernelNbd,
+            guest_network: RuntimePlacementGuestNetwork::IsolatedIpv4,
+            guest_transport: RuntimePlacementGuestTransport::Vsock,
+            guest_agent_protocol_version: ContractVersion::V1,
+            guest_config_digest: admission.agent_session.guest_config_digest.clone(),
+        },
+        guest_ipv4_pool: GuestIpv4Pool {
+            kind: GuestIpv4PoolKind::PrivateIpv4_16,
+            network_address: Ipv4Address::new("10.240.0.0").unwrap(),
+            prefix_length: 16,
+        },
+        node_transport_target: NodeTransportTarget::new("https://node-a.internal:7301").unwrap(),
+    }
 }
 
 #[test]
@@ -183,6 +347,49 @@ fn disabled_initial_authority_persists_without_a_key_lineage() {
 }
 
 #[test]
+fn disabled_empty_ring_can_publish_fresh_ring_with_zero_provisioned_nodes() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let empty_ring = RouteGrantV2PublicKeyRingArtifact {
+        version: ContractVersion::V1,
+        ring_version: Epoch::new(1).unwrap(),
+        expected_previous: None,
+        keys: Vec::new(),
+    };
+    let mut reference = decode_route_grant_v2_signer_reference(SIGNER).unwrap();
+    reference.signer = RouteGrantV2SignerSelection::Disabled;
+    reference.public_key_ring_digest = empty_ring.digest().unwrap();
+    let exact_reference_bytes = encode_route_grant_v2_signer_reference(&reference).unwrap();
+    let disabled = InstalledRouteGrantV2SigningAuthority::from_authority_artifacts(
+        &reference,
+        &exact_reference_bytes,
+        &empty_ring,
+        None,
+        120,
+    )
+    .unwrap();
+    store
+        .install_route_grant_v2_signer_authority(&disabled)
+        .unwrap();
+
+    let fresh_ring = successor_ring(&empty_ring, vec![third_entry()]);
+    let fresh_reference = successor_reference(
+        &reference,
+        RouteGrantV2SignerSelection::Disabled,
+        &fresh_ring,
+    );
+    assert_applied(apply(
+        &store,
+        &RouteGrantV2SigningAuthorityCommand {
+            successor: fresh_reference,
+            kind: RouteGrantV2SigningAuthorityCommandKind::PublishOverlap {
+                successor_ring: fresh_ring,
+                new_secret_reference_id: id("route_secret_bootstrap"),
+            },
+        },
+    ));
+}
+
+#[test]
 fn immutable_rows_and_projection_drift_fail_closed() {
     let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
     let installed = installation(SIGNER);
@@ -249,6 +456,521 @@ fn shared_route_authority_lock_orders_initial_signer_install() {
         .unwrap()
         .unwrap();
     writer.join().unwrap();
+}
+
+#[test]
+fn normal_rotation_requires_exact_full_session_ring_acks_and_retires_lineage() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let initial = installation(SIGNER);
+    store
+        .install_route_grant_v2_signer_authority(&initial)
+        .unwrap();
+    let mut admission = establish_empty_admission_for(&store, &release(), "rotation", 31);
+    insert_policy_on_store_for_test(&store, &schedulable_policy(&admission)).unwrap();
+
+    let ring_one = initial_ring();
+    let ring_two = successor_ring(&ring_one, vec![ring_one.keys[0].clone(), other_entry()]);
+    let reference_one = initial.binding().reference().clone();
+    let reference_two =
+        successor_reference(&reference_one, reference_one.signer.clone(), &ring_two);
+    let overlap = RouteGrantV2SigningAuthorityCommand {
+        successor: reference_two.clone(),
+        kind: RouteGrantV2SigningAuthorityCommandKind::PublishOverlap {
+            successor_ring: ring_two.clone(),
+            new_secret_reference_id: id("route_secret_b"),
+        },
+    };
+    assert_applied(apply(&store, &overlap));
+
+    let reference_three = successor_reference(
+        &reference_two,
+        RouteGrantV2SignerSelection::Active {
+            active_kid: other_entry().kid,
+            secret_reference_id: id("route_secret_b"),
+        },
+        &ring_two,
+    );
+    let switch = RouteGrantV2SigningAuthorityCommand {
+        successor: reference_three.clone(),
+        kind: RouteGrantV2SigningAuthorityCommandKind::SwitchActive,
+    };
+
+    assert_precondition_failed(apply(&store, &switch));
+    admission = accept_ring_admission_for_test(&store, &admission, &ring_one, 2, 2);
+    assert_precondition_failed(apply(&store, &switch));
+    accept_partial_heartbeat_for_test(&store, &admission);
+    assert_precondition_failed(apply(&store, &switch));
+    admission = accept_ring_admission_for_test(&store, &admission, &ring_two, 3, 4);
+    replace_agent_session_for_test(&store, &admission, &release(), 32);
+    assert_precondition_failed(apply(&store, &switch));
+    admission =
+        refresh_assigned_admission_for_test(&store, &admission.node_identity, &release(), 33);
+    admission = accept_ring_admission_for_test(&store, &admission, &ring_two, 2, 2);
+    let second_admission = establish_empty_admission_for(&store, &release(), "rotation_b", 34);
+    insert_policy_on_store_for_test(&store, &schedulable_policy(&second_admission)).unwrap();
+    assert_precondition_failed(apply(&store, &switch));
+    let second_admission =
+        accept_ring_admission_for_test(&store, &second_admission, &ring_two, 2, 2);
+    assert_applied(apply(&store, &switch));
+
+    let pipelined_ring = successor_ring(
+        &ring_two,
+        vec![
+            ring_two.keys[0].clone(),
+            ring_two.keys[1].clone(),
+            third_entry(),
+        ],
+    );
+    let pipelined_reference = successor_reference(
+        &reference_three,
+        reference_three.signer.clone(),
+        &pipelined_ring,
+    );
+    assert_precondition_failed(apply(
+        &store,
+        &RouteGrantV2SigningAuthorityCommand {
+            successor: pipelined_reference,
+            kind: RouteGrantV2SigningAuthorityCommandKind::PublishOverlap {
+                successor_ring: pipelined_ring,
+                new_secret_reference_id: id("route_secret_c"),
+            },
+        },
+    ));
+
+    store
+        .with(|client| {
+            client.batch_execute(
+                "ALTER TABLE route_v2_signer_retirements
+                     DISABLE TRIGGER route_v2_signer_retirement_update;
+                 DO $$
+                 DECLARE changed BIGINT;
+                 BEGIN
+                   UPDATE route_v2_signer_retirements
+                      SET last_old_issue_at_unix_ms =
+                          floor(extract(epoch FROM clock_timestamp()) * 1000)::BIGINT - 305001
+                    WHERE deployment_id='route_deployment_a' AND source='normal';
+                   GET DIAGNOSTICS changed = ROW_COUNT;
+                   IF changed <> 1 THEN
+                     RAISE EXCEPTION 'test retirement fixture changed % rows', changed;
+                   END IF;
+                 END
+                 $$;
+                 ALTER TABLE route_v2_signer_retirements
+                     ENABLE TRIGGER route_v2_signer_retirement_update;",
+            )
+        })
+        .unwrap();
+
+    let ring_three = successor_ring(&ring_two, vec![other_entry()]);
+    let reference_four = successor_reference(
+        &reference_three,
+        reference_three.signer.clone(),
+        &ring_three,
+    );
+    let publish_new_only = RouteGrantV2SigningAuthorityCommand {
+        successor: reference_four.clone(),
+        kind: RouteGrantV2SigningAuthorityCommandKind::PublishNewOnly {
+            successor_ring: ring_three.clone(),
+        },
+    };
+    assert_applied(apply(&store, &publish_new_only));
+
+    let reference_five =
+        successor_reference(&reference_four, reference_four.signer.clone(), &ring_three);
+    let retire = RouteGrantV2SigningAuthorityCommand {
+        successor: reference_five.clone(),
+        kind: RouteGrantV2SigningAuthorityCommandKind::Retire,
+    };
+    assert_precondition_failed(apply(&store, &retire));
+    let _new_only_admission = accept_ring_admission_for_test(&store, &admission, &ring_three, 3, 3);
+    let _second_new_only_admission =
+        accept_ring_admission_for_test(&store, &second_admission, &ring_three, 3, 3);
+    assert_eq!(
+        assert_applied(apply(&store, &retire)),
+        RouteGrantV2SigningAuthorityCommandResult::Applied {
+            signer_revision: reference_five.signer_revision,
+            public_key_ring_version: ring_three.ring_version,
+        }
+    );
+
+    let before_replay = row_versions(&store);
+    assert_precondition_failed(apply(&store, &retire));
+    assert_eq!(
+        row_versions(&store),
+        before_replay,
+        "stale successor retry wrote rows"
+    );
+
+    let reused_key_ring =
+        successor_ring(&ring_three, vec![ring_one.keys[0].clone(), other_entry()]);
+    assert_precondition_failed(apply(
+        &store,
+        &RouteGrantV2SigningAuthorityCommand {
+            successor: successor_reference(
+                &reference_five,
+                reference_five.signer.clone(),
+                &reused_key_ring,
+            ),
+            kind: RouteGrantV2SigningAuthorityCommandKind::PublishOverlap {
+                successor_ring: reused_key_ring,
+                new_secret_reference_id: id("route_secret_c"),
+            },
+        },
+    ));
+    let reused_secret_ring = successor_ring(&ring_three, vec![other_entry(), third_entry()]);
+    assert_precondition_failed(apply(
+        &store,
+        &RouteGrantV2SigningAuthorityCommand {
+            successor: successor_reference(
+                &reference_five,
+                reference_five.signer.clone(),
+                &reused_secret_ring,
+            ),
+            kind: RouteGrantV2SigningAuthorityCommandKind::PublishOverlap {
+                successor_ring: reused_secret_ring,
+                new_secret_reference_id: id("route_secret_a"),
+            },
+        },
+    ));
+    assert_eq!(row_versions(&store), before_replay, "ABA retry wrote rows");
+
+    let mut conflicting = retire.clone();
+    conflicting.kind = RouteGrantV2SigningAuthorityCommandKind::Activate;
+    assert_precondition_failed(apply(&store, &conflicting));
+    let mut different_successor = retire.clone();
+    different_successor.successor.deployment_id = id("route_deployment_conflict");
+    assert_precondition_failed(apply(&store, &different_successor));
+    assert_eq!(row_versions(&store), before_replay);
+
+    store
+        .with(|client| {
+            assert!(client
+                .execute(
+                    "UPDATE route_v2_signer_retirements
+                        SET last_old_issue_at_unix_ms=last_old_issue_at_unix_ms + 1",
+                    &[],
+                )
+                .is_err());
+            let row = client
+                .query_one(
+                    "SELECT lineage.state, retirement.state,
+                        retirement.secret_reference_id,
+                        retirement.retired_signer_revision
+                   FROM route_v2_signer_key_lineage lineage
+                   JOIN route_v2_signer_retirements retirement
+                     ON retirement.deployment_id=lineage.deployment_id
+                    AND retirement.kid=lineage.kid
+                  WHERE lineage.kid=$1",
+                    &[&ring_one.keys[0].kid.as_str()],
+                )
+                .unwrap();
+            assert_eq!(row.get::<_, String>(0), "retired");
+            assert_eq!(row.get::<_, String>(1), "retired");
+            assert_eq!(row.get::<_, String>(2), "route_secret_a");
+            assert_eq!(row.get::<_, i64>(3), 5);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn emergency_disable_is_immediate_and_reactivation_retires_only_after_fresh_ring() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let initial = installation(SIGNER);
+    store
+        .install_route_grant_v2_signer_authority(&initial)
+        .unwrap();
+    let ring_one = initial_ring();
+    let reference_one = initial.binding().reference().clone();
+
+    let overlap_ring = successor_ring(&ring_one, vec![ring_one.keys[0].clone(), other_entry()]);
+    let overlap_reference =
+        successor_reference(&reference_one, reference_one.signer.clone(), &overlap_ring);
+    assert_applied(apply(
+        &store,
+        &RouteGrantV2SigningAuthorityCommand {
+            successor: overlap_reference.clone(),
+            kind: RouteGrantV2SigningAuthorityCommandKind::PublishOverlap {
+                successor_ring: overlap_ring.clone(),
+                new_secret_reference_id: id("route_secret_b"),
+            },
+        },
+    ));
+
+    let disabled_ring = successor_ring(&overlap_ring, Vec::new());
+    let disabled_reference = successor_reference(
+        &overlap_reference,
+        RouteGrantV2SignerSelection::Disabled,
+        &disabled_ring,
+    );
+    let disable = RouteGrantV2SigningAuthorityCommand {
+        successor: disabled_reference.clone(),
+        kind: RouteGrantV2SigningAuthorityCommandKind::Disable {
+            successor_ring: disabled_ring.clone(),
+        },
+    };
+    assert_applied(apply(&store, &disable));
+    assert!(!store
+        .route_grant_v2_signer_is_current_for_test(initial.binding())
+        .unwrap());
+    store
+        .with(|client| {
+            let disabled = client.query_one(
+                "SELECT signer_state, public_key_ring_version,
+                        (SELECT count(*) FROM route_v2_signer_retirements
+                          WHERE state='ring_removed' AND ring_removed_version=3)
+                   FROM route_v2_signing_authority WHERE singleton",
+                &[],
+            )?;
+            assert_eq!(disabled.get::<_, String>(0), "disabled");
+            assert_eq!(disabled.get::<_, i64>(1), 3);
+            assert_eq!(disabled.get::<_, i64>(2), 2);
+            Ok(())
+        })
+        .unwrap();
+
+    let fresh_ring = successor_ring(&disabled_ring, vec![third_entry()]);
+    let fresh_disabled = successor_reference(
+        &disabled_reference,
+        RouteGrantV2SignerSelection::Disabled,
+        &fresh_ring,
+    );
+    let publish_fresh = RouteGrantV2SigningAuthorityCommand {
+        successor: fresh_disabled.clone(),
+        kind: RouteGrantV2SigningAuthorityCommandKind::PublishOverlap {
+            successor_ring: fresh_ring.clone(),
+            new_secret_reference_id: id("route_secret_c"),
+        },
+    };
+    let admission = establish_empty_admission_for(&store, &release(), "emergency", 61);
+    let mut cordoned = schedulable_policy(&admission);
+    cordoned.scheduling_state = RuntimeSchedulingState::Cordoned;
+    insert_policy_on_store_for_test(&store, &cordoned).unwrap();
+    let admission = refresh_assigned_admission_with_residue_for_test(
+        &store,
+        &admission.node_identity,
+        &release(),
+        62,
+        vec![NodeResidue::ControlSocket {
+            socket_path: HostPath::new("/run/cats/orphan-route.sock").unwrap(),
+            role_hint: None,
+            ownership_token: OwnershipTokenEvidence::Missing,
+        }],
+    );
+    assert_precondition_failed(apply(&store, &publish_fresh));
+    let admission =
+        refresh_assigned_admission_for_test(&store, &admission.node_identity, &release(), 63);
+    assert_applied(apply(&store, &publish_fresh));
+
+    let active_reference = successor_reference(
+        &fresh_disabled,
+        RouteGrantV2SignerSelection::Active {
+            active_kid: third_entry().kid,
+            secret_reference_id: id("route_secret_c"),
+        },
+        &fresh_ring,
+    );
+    let activate = RouteGrantV2SigningAuthorityCommand {
+        successor: active_reference,
+        kind: RouteGrantV2SigningAuthorityCommandKind::Activate,
+    };
+    assert_precondition_failed(apply(&store, &activate));
+    let _fresh_ack = accept_ring_admission_for_test(&store, &admission, &fresh_ring, 2, 2);
+    assert_eq!(
+        assert_applied(apply(&store, &activate)),
+        RouteGrantV2SigningAuthorityCommandResult::Applied {
+            signer_revision: Epoch::new(5).unwrap(),
+            public_key_ring_version: fresh_ring.ring_version,
+        }
+    );
+    store
+        .with(|client| {
+            let pointer = client.query_one(
+                "SELECT signer_state, active_kid, public_key_ring_version
+                   FROM route_v2_signing_authority WHERE singleton",
+                &[],
+            )?;
+            assert_eq!(pointer.get::<_, String>(0), "active");
+            assert_eq!(pointer.get::<_, String>(1), third_entry().kid.as_str());
+            assert_eq!(pointer.get::<_, i64>(2), 4);
+            let retired = client
+                .query(
+                    "SELECT kid, secret_reference_id
+                       FROM route_v2_signer_retirements
+                      WHERE state='retired' AND retired_signer_revision=5
+                      ORDER BY kid",
+                    &[],
+                )?
+                .into_iter()
+                .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                retired,
+                std::collections::BTreeSet::from([
+                    (
+                        ring_one.keys[0].kid.as_str().to_owned(),
+                        "route_secret_a".to_owned()
+                    ),
+                    (
+                        other_entry().kid.as_str().to_owned(),
+                        "route_secret_b".to_owned()
+                    ),
+                ])
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn cancelled_transition_is_zero_write_and_response_loss_requires_state_discovery() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let initial = installation(SIGNER);
+    store
+        .install_route_grant_v2_signer_authority(&initial)
+        .unwrap();
+    let ring_one = initial_ring();
+    let ring_two = successor_ring(&ring_one, vec![ring_one.keys[0].clone(), other_entry()]);
+    let reference_two = successor_reference(
+        initial.binding().reference(),
+        initial.binding().reference().signer.clone(),
+        &ring_two,
+    );
+    let overlap = RouteGrantV2SigningAuthorityCommand {
+        successor: reference_two.clone(),
+        kind: RouteGrantV2SigningAuthorityCommandKind::PublishOverlap {
+            successor_ring: ring_two.clone(),
+            new_secret_reference_id: id("route_secret_b"),
+        },
+    };
+    let before = row_versions(&store);
+    let cancelled = AuthorityRequestContext::new(Instant::now() + Duration::from_secs(5));
+    cancelled.cancel();
+    assert!(store
+        .apply_route_grant_v2_signing_authority_command(&overlap, &cancelled)
+        .is_err());
+    assert_eq!(row_versions(&store), before);
+
+    store.inject_committed_response_loss_once();
+    assert!(store
+        .apply_route_grant_v2_signing_authority_command(
+            &overlap,
+            &AuthorityRequestContext::new(Instant::now() + Duration::from_secs(5)),
+        )
+        .is_err());
+    let committed = row_versions(&store);
+    assert_ne!(committed, before);
+    assert_precondition_failed(apply(&store, &overlap));
+    assert_eq!(row_versions(&store), committed);
+    store
+        .with(|client| {
+            let pointer = client.query_one(
+                "SELECT current_signer_revision, current_signer_reference_sha256,
+                        public_key_ring_version, public_key_ring_digest
+                   FROM route_v2_signing_authority WHERE singleton",
+                &[],
+            )?;
+            assert_eq!(pointer.get::<_, i64>(0), 2);
+            assert_eq!(
+                pointer.get::<_, String>(1),
+                reference_two.digest().unwrap().as_str()
+            );
+            assert_eq!(pointer.get::<_, i64>(2), 2);
+            assert_eq!(
+                pointer.get::<_, String>(3),
+                ring_two.digest().unwrap().as_str()
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn concurrent_control_replicas_commit_one_exact_successor() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let setup = Store::connect(&url, None).unwrap();
+    let initial = installation(SIGNER);
+    setup
+        .install_route_grant_v2_signer_authority(&initial)
+        .unwrap();
+    let ring_one = initial_ring();
+    let ring_two = successor_ring(&ring_one, vec![ring_one.keys[0].clone(), other_entry()]);
+    let command = Arc::new(RouteGrantV2SigningAuthorityCommand {
+        successor: successor_reference(
+            initial.binding().reference(),
+            initial.binding().reference().signer.clone(),
+            &ring_two,
+        ),
+        kind: RouteGrantV2SigningAuthorityCommandKind::PublishOverlap {
+            successor_ring: ring_two,
+            new_secret_reference_id: id("route_secret_b"),
+        },
+    });
+    let barrier = Arc::new(Barrier::new(3));
+    let workers = (0..2)
+        .map(|_| {
+            let url = url.clone();
+            let command = Arc::clone(&command);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let store = Store::connect(&url, None).unwrap();
+                barrier.wait();
+                apply(&store, &command)
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let outcomes = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(
+                outcome,
+                RouteGrantV2SigningAuthorityStoreOutcome::Committed(_)
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(
+                outcome,
+                RouteGrantV2SigningAuthorityStoreOutcome::PreconditionFailed
+            ))
+            .count(),
+        1
+    );
+    setup
+        .with(|client| {
+            let row = client.query_one(
+                "SELECT
+                    (SELECT count(*) FROM route_v2_signer_revisions),
+                    (SELECT count(*) FROM route_v2_public_key_ring_revisions),
+                    (SELECT count(*) FROM route_v2_signer_key_lineage)",
+                &[],
+            )?;
+            assert_eq!(row.get::<_, i64>(0), 2);
+            assert_eq!(row.get::<_, i64>(1), 2);
+            assert_eq!(row.get::<_, i64>(2), 2);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn retention_boundary_is_strict() {
+    let issue = UnixMillis::new(10).unwrap();
+    let equality = UnixMillis::new(10 + RETENTION_MILLIS).unwrap();
+    let after = UnixMillis::new(11 + RETENTION_MILLIS).unwrap();
+    assert!(matches!(
+        strictly_after_retention(equality, issue),
+        Ok(false)
+    ));
+    assert!(matches!(strictly_after_retention(after, issue), Ok(true)));
 }
 
 trait ActiveKidForTest {

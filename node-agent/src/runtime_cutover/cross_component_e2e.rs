@@ -1,9 +1,15 @@
 //! PostgreSQL-backed acceptance across the production Control composition and
 //! the signed Node Runtime spine. The portable case stops at a recording
-//! `RefreshInventory` seam; the Linux case uses the installed scanner and
-//! production signed effect through the durable `ProvisionRootImage`
-//! checkpoint. Neither case launches a Guest or VMM.
+//! `RefreshInventory` seam. The Linux case uses the installed scanner,
+//! production signed effects and PID-1 process ownership through an authorized
+//! serving blockd, then drives its native vhost-user frontend without launching
+//! a Guest or VMM.
 
+#[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -12,6 +18,13 @@ use anyhow::Context as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use cats_api::agent_registration::{Ed25519RequestSigner, JSON_CONTENT_TYPE};
+#[cfg(target_os = "linux")]
+use cats_api::agent_registration::{
+    NODE_CREDENTIAL_ID_HEADER, NODE_PUBLIC_KEY_SPKI_HEADER, NODE_SIGNATURE_HEADER,
+    REGISTRATION_METHOD, REGISTRATION_PATH,
+};
+#[cfg(target_os = "linux")]
+use cats_api::blockd::{BlockdControlCommand, BlockdControlResponse, DurabilityStatus};
 use cats_api::cat_create::decode_cat_create_v2_accepted_response;
 #[cfg(target_os = "linux")]
 use cats_api::cat_create::CatCreateV2Request;
@@ -21,44 +34,57 @@ use cats_api::runtime_node_authority::{
     PROVISIONER_SIGNATURE_HEADER, RUNTIME_NODE_AUTHORITY_PATH,
 };
 use cats_api::runtime_reconciliation::{
-    decode_runtime_node_authority_apply_result, encode_runtime_node_authority_apply,
-    guest_config_digest, AllocatableMemoryBytes, AllocatableVcpus, AppliedDesiredEvidence,
-    CheckpointEvidence, Condition, ContractVersion, CredentialBinding, DesiredReadSnapshot,
-    DesiredRuntimeSpec, Epoch, GuestIpv4Pool, GuestIpv4PoolKind, GuestTransportEvidence, HostPath,
-    Id, InventorySource, Ipv4Address, LifecycleAdmission, NodeBootId, NodeIdentity,
-    NodeIdentityState, NodePlacementPolicy, NodeTransportTarget, ObservedRuntimeStatus,
-    ProgressingReason, RandomId128, ReconcileStep, RuntimeNodeAuthorityApply,
-    RuntimeNodeAuthorityMutation, RuntimeNodeAuthorityOutcome, RuntimePlacementBlockFrontend,
-    RuntimePlacementCapabilities, RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport,
-    RuntimePlacementVmm, RuntimeSchedulingState, Sequence, Sha256Digest, UnixMillis,
+    decode_agent_session, decode_runtime_checkpoint, decode_runtime_node_authority_apply_result,
+    encode_runtime_node_authority_apply, guest_config_digest, key_ring_digest,
+    AgentRegistrationAttempt, AgentSession, AllocatableMemoryBytes, AllocatableVcpus,
+    AppliedDesiredEvidence, CheckpointEvidence, CheckpointRouteGate, Condition, ContractVersion,
+    CredentialBinding, DesiredReadSnapshot, DesiredRuntimeSpec, Epoch, GuestIpv4Pool,
+    GuestIpv4PoolKind, GuestTransportEvidence, HostPath, HttpProtocol, Id, InventorySource,
+    Ipv4Address, KeyId, LifecycleAdmission, NodeBootId, NodeIdentity, NodeIdentityState,
+    NodePlacementPolicy, NodeTransportTarget, ObservedRouteGate, ObservedRuntimeStatus,
+    RandomId128, ReadyReason, ReconcileStep, Revision, RouteGateBinding, RouteGateState,
+    RuntimeLaunch, RuntimeNodeAuthorityApply, RuntimeNodeAuthorityMutation,
+    RuntimeNodeAuthorityOutcome, RuntimePlacementBlockFrontend, RuntimePlacementCapabilities,
+    RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport, RuntimePlacementVmm,
+    RuntimeSchedulingState, RuntimeTarget, Sequence, Sha256Digest, StableState, UnixMillis,
     WarmSnapshotEvidence,
 };
 use cats_control_plane::controller::AutoTierPolicy;
-use cats_control_plane::server::{spawn, Config, Handle};
+use cats_control_plane::server::{spawn, spawn_with_gateway_machine, Config, Handle};
 use cats_control_plane::store::DsnSource;
-use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_metering::SqliteUsageStore;
+use cats_network::route_v2::{
+    gateway_machine_clients_for_test, BoxedGatewayTunnel, ControlMachineTarget, GatewayIngress,
+    GatewayIngressConfig, GatewayNodeRouteV2Error, RouteCache, RouteCacheConfig, TunnelConnector,
+    TunnelFuture,
+};
 use cats_storage::{
     encode_image_manifest, image_manifest_key, BlobError, BlobStore, ImageManifestV1,
-    LowerHexSha256, MetadataStore, IMAGE_MANIFEST_MAX_BYTES,
+    LowerHexSha256, IMAGE_MANIFEST_MAX_BYTES,
 };
 use reqwest::{Response, StatusCode};
 use ring::signature::Ed25519KeyPair;
 
 #[cfg(target_os = "linux")]
 use cats_api::runtime_reconciliation::{
-    checkpoint_content_digest, decode_agent_session, decode_runtime_checkpoint, spec_digest,
-    AcquireOrigin, AdmissionInventoryAttestation, AgentSession, AsciiText, AssignedKind,
-    ControlHandshakeEvidence, DiskKind, Durability, Generation, HttpProtocol, IsolatedIpv4Kind,
+    checkpoint_content_digest, encode_agent_registration_attempt, inventory_digest, spec_digest,
+    AcquireOrigin, AdmissionInventoryAttestation, AsciiText, AssignedKind,
+    ControlHandshakeEvidence, DiskKind, Durability, Generation, IsolatedIpv4Kind,
     LastVolumeTransition, LocalLineageState, NodeObservation, ObservationAcceptance,
-    ObservedDiskKind, OwnershipTokenEvidence, ProcessRole, ProcessState, RemoteHead,
-    RuntimeCheckpoint, RuntimeTarget, RuntimeTransition, SessionBinding, VolumeAccess,
-    VolumeAcquire, VolumeAuthorityEvidence, VolumeDisposition,
+    ObservationInventoryAcceptance, ObservedDevice, ObservedDiskKind, ObservedNetwork,
+    OwnershipTokenEvidence, PrepareDeviceFrontend, PreparedDeviceInput, ProcessEvidence,
+    ProcessRole, ProcessState, ProgressingReason, RemoteHead, RuntimeCheckpoint,
+    RuntimeNetworkIdentity, RuntimeTransition, SessionBinding, VolumeAccess, VolumeAcquire,
+    VolumeAuthorityEvidence, VolumeDisposition,
 };
 #[cfg(target_os = "linux")]
 use cats_metadata_store_postgres::PostgresVolumeDataAuthority;
 #[cfg(target_os = "linux")]
-use cats_storage::authority::{RuntimeVolumeInventoryAuthority, VolumeDataAuthority};
+use cats_object_store_aws_s3::{AwsS3BlobStore, AwsS3Config};
+#[cfg(target_os = "linux")]
+use cats_storage::authority::{
+    AuthorizedServingAttachment, RuntimeVolumeInventoryAuthority, VolumeDataAuthority,
+};
 #[cfg(target_os = "linux")]
 use cats_storage::{decode_image_manifest, AdapterConfig, AdapterSelection};
 #[cfg(target_os = "linux")]
@@ -68,17 +94,22 @@ use std::process::Command;
 
 use crate::agent_registration::AgentRegistrationConfig;
 #[cfg(target_os = "linux")]
-use crate::ch::{BlockPath, ChConfig};
+use crate::ch::{BlockPath, ChConfig, ChNetwork};
+use crate::route_grant_v2::{RouteGrantV2KeyRing, RouteGrantV2Verifier};
+use crate::route_v2_machine::{RouteV2MachineConfig, RouteV2MachineListener};
 #[cfg(target_os = "linux")]
 use crate::runtime::reconciliation::{
     current_kernel_node_boot_id, installed_clean_slate_scanner,
-    installed_root_process_effect_ports, runtime_checkpoint_path, AdmissionCellRegistry,
-    AuthorizedBlockdLaunchConfig, BlockdSocketIntentStore, InstalledCleanSlateProbeConfig,
-    ManagedBlockdSocketOwnerRetirement, NodeGlobalManagedProcessAdmission,
-    PlatformSystemdRootProvisionProcessPort, RetainedManagedBlockdSocketRoot,
-    RetainedManagedVmmLaunchRoot, RetainedManagedVmmSocketRoot, RootProvisionProcessPort,
-    RootProvisionProcessStop, RootProvisionSystemdConfig, VmmSocketReceiptStore,
-    BLOCKD_SOCKET_INTENT_NAMESPACE, INSTALLED_VMM_SOCKET_ROOT, VMM_LAUNCH_FILE_NAMESPACE,
+    installed_root_process_effect_ports, retire_absent_serving_socket_owner_for_test,
+    runtime_checkpoint_path, AuthorizedBlockdLaunchConfig, BlockdSocketIntentStore,
+    InstalledCleanSlateProbeConfig, ManagedBlockdSocketOwnerRetirement,
+    NodeGlobalManagedProcessAdmission, RetainedManagedBlockdSocketRoot,
+    RetainedManagedVmmLaunchRoot, RetainedManagedVmmSocketRoot, RootProvisionSystemdConfig,
+    VmmSocketReceiptStore, AUTHORIZED_SERVING_FILE, BLOCKD_SOCKET_INTENT_NAMESPACE, IDENTITY_FILE,
+    INSTALLED_VMM_SOCKET_ROOT, VMM_LAUNCH_FILE_NAMESPACE,
+};
+use crate::runtime::reconciliation::{
+    AdmissionCell, AdmissionCellRegistry, AdmissionGatePort as _, AdmissionSnapshot,
 };
 #[cfg(target_os = "linux")]
 use crate::runtime_spine::RuntimeSpineFullScan;
@@ -114,6 +145,10 @@ const AWS_REGION: &str = "us-test-1";
 #[cfg(target_os = "linux")]
 const AWS_PREFIX: &str = "runtime-cutover-hermetic";
 const CAT_CREATE_BODY: &[u8] = br#"{"name":"runtime-spine-app","boot_image_digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","vcpus":2,"memory_bytes":2147483648,"root_size_bytes":4294967296,"durability":"strict"}"#;
+#[cfg(target_os = "linux")]
+const RELAXED_CAT_CREATE_BODY: &[u8] = br#"{"name":"runtime-spine-app","boot_image_digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","vcpus":2,"memory_bytes":2147483648,"root_size_bytes":4294967296,"durability":"relaxed"}"#;
+const ROUTE_V2_KID: &str = "2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99";
+const ROUTE_RUNTIME_INCARNATION: &str = "00000000000000000000000000005151";
 const RFC8032_TEST_SEED: [u8; 32] = [
     0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4,
     0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae, 0x7f, 0x60,
@@ -192,11 +227,17 @@ struct ControlContext {
 
 impl ControlContext {
     async fn spawn() -> Self {
+        Self::spawn_inner(false).await
+    }
+
+    async fn spawn_route_v2() -> Self {
+        Self::spawn_inner(true).await
+    }
+
+    async fn spawn_inner(route_v2: bool) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let control_store_url = cats_control_plane::testsupport::isolated_control_store_url();
         let usage = Arc::new(SqliteUsageStore::open(&directory.path().join("usage.db")).unwrap());
-        let storage_meta: Arc<dyn MetadataStore> =
-            Arc::new(SqliteMetadataStore::open(&directory.path().join("storage.db")).unwrap());
         let release = cats_control_plane::testsupport::test_guest_runtime_profile_receipt();
         let digest = Sha256Digest::new(IMAGE_DIGEST).unwrap();
         let manifest = ImageManifestV1 {
@@ -210,18 +251,20 @@ impl ControlContext {
             body: encode_image_manifest(&manifest).unwrap(),
             reads: AtomicUsize::new(0),
         });
-        let server = spawn(Config {
+        let config = Config {
             listen: "127.0.0.1:0".into(),
             control_store_dsn: DsnSource::Literal(control_store_url.clone()),
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: usage,
-            storage_meta,
+            retired_storage_meta_for_tests: None,
             image_blob: image_blob.clone(),
             auth_token: SERVICE_TOKEN.into(),
             guest_runtime_profile_receipt: release.clone(),
             runtime_provisioner_trust_bundle:
                 cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
+            production_cutover_operator_trust_bundle:
+                cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
             route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
             admin_token: ADMIN_TOKEN.into(),
             workos: None,
@@ -231,9 +274,18 @@ impl ControlContext {
             reconcile_interval_ms: 60_000,
             auto_tier_policy: AutoTierPolicy::default(),
             oci_deploy_sync_wait_ms: 5_000,
-        })
-        .await
-        .unwrap();
+        };
+        let server = if route_v2 {
+            spawn_with_gateway_machine(
+                config,
+                cats_control_plane::testsupport::route_v2_gateway_machine_config("127.0.0.1:0")
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        } else {
+            spawn(config).await.unwrap()
+        };
         Self {
             _directory: directory,
             server,
@@ -255,13 +307,13 @@ struct ScanRecord {
 }
 
 #[derive(Default)]
-struct CompleteAssignedScanner {
+struct RouteReadyScanner {
     records: Mutex<Vec<ScanRecord>>,
 }
 
-impl crate::runtime_spine::inventory_scanner_sealed::Sealed for CompleteAssignedScanner {}
+impl crate::runtime_spine::inventory_scanner_sealed::Sealed for RouteReadyScanner {}
 
-impl RuntimeInventoryScanner for CompleteAssignedScanner {
+impl RuntimeInventoryScanner for RouteReadyScanner {
     fn scan_complete(
         &self,
         context: RuntimeInventoryScanContext,
@@ -289,46 +341,86 @@ impl RuntimeInventoryScanner for CompleteAssignedScanner {
         ] {
             coverage.record(source)?;
         }
+        let kid = KeyId::new(ROUTE_V2_KID).context("Route v2 fixture kid is invalid")?;
+        let ring_version = Epoch::new(1).context("Route v2 fixture ring version is invalid")?;
+        let ring_digest = key_ring_digest(ring_version, std::slice::from_ref(&kid))?;
         let runtimes = coordinates
             .desired
             .desired_specs
             .iter()
-            .map(|desired| observed_missing_runtime(desired, coordinates.inventory_epoch))
+            .map(route_ready_runtime)
             .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(RuntimeInventoryScanOutcome::Complete(
+        Ok(RuntimeInventoryScanOutcome::Complete(Box::new(
             CompleteRuntimeInventory::from_validated_coverage(
                 coverage.finish()?,
                 UnixMillis::new(1_900_000_006_000).unwrap(),
-                RuntimeInventoryKeyRing::Unavailable,
+                RuntimeInventoryKeyRing::Loaded {
+                    version: ring_version,
+                    digest: ring_digest,
+                    kids: vec![kid],
+                },
                 runtimes,
                 Vec::new(),
+                BTreeSet::new(),
             ),
-        ))
+        )))
     }
 }
 
-fn observed_missing_runtime(
-    desired: &DesiredRuntimeSpec,
-    inventory_epoch: Epoch,
-) -> anyhow::Result<ObservedRuntimeStatus> {
-    let step = ReconcileStep::InspectInventory { inventory_epoch };
+fn route_runtime_launch(runtime_incarnation: &RandomId128) -> RuntimeLaunch {
+    let mut launch = decode_runtime_checkpoint(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+    )))
+    .unwrap()
+    .runtime_launch;
+    let RuntimeLaunch::Present(identity) = &mut launch else {
+        unreachable!("fixed StartRuntime checkpoint retains its launch identity")
+    };
+    identity.runtime_incarnation = runtime_incarnation.clone();
+    identity.scope_id =
+        Id::new(format!("cats-vmm-{}.service", runtime_incarnation.as_str())).unwrap();
+    launch
+}
+
+fn route_ready_runtime(desired: &DesiredRuntimeSpec) -> anyhow::Result<ObservedRuntimeStatus> {
+    let endpoint = desired
+        .endpoints
+        .first()
+        .context("Route v2 fixture Desired lacks its default Endpoint")?;
+    let incarnation = random(ROUTE_RUNTIME_INCARNATION);
+    let step = ReconcileStep::Stable {
+        state: StableState::Running,
+    };
     Ok(ObservedRuntimeStatus {
         cat_id: desired.cat_id.clone(),
         applied_desired: Some(AppliedDesiredEvidence {
             desired_revision: desired.desired_revision,
             spec_digest: desired.spec_digest.clone(),
             placement: desired.placement.clone(),
-            target: desired.target,
+            target: RuntimeTarget::Running,
         }),
-        runtime_incarnation: None,
-        stable_state: None,
+        runtime_incarnation: Some(incarnation.clone()),
+        stable_state: Some(StableState::Running),
         step: step.clone(),
-        checkpoint: CheckpointEvidence::Missing {
-            checkpoint_path: HostPath::new(format!(
-                "/var/lib/cats/cross-component/{}.json",
-                desired.cat_id
-            ))
-            .context("cross-component checkpoint path is invalid")?,
+        checkpoint: CheckpointEvidence::Valid {
+            checkpoint_path: HostPath::new("/var/lib/cats/checkpoints/cat-route-e2e.json")
+                .expect("test checkpoint path is valid"),
+            content_digest: Sha256Digest::from_bytes([0x51; 32]),
+            version: ContractVersion::V1,
+            cat_id: desired.cat_id.clone(),
+            node_id: desired.placement.node_id.clone(),
+            desired_revision: desired.desired_revision,
+            spec_digest: desired.spec_digest.clone(),
+            placement_epoch: desired.placement.placement_epoch,
+            runtime_incarnation: Some(incarnation.clone()),
+            runtime_launch: Box::new(route_runtime_launch(&incarnation)),
+            stable_state: Some(StableState::Running),
+            step: Box::new(step),
+            require_idle: Box::new(
+                cats_api::runtime_reconciliation::RequireIdleCheckpoint::NotApplicable,
+            ),
+            updated_at_unix_ms: UnixMillis::new(1).unwrap(),
         },
         processes: Vec::new(),
         volumes: Vec::new(),
@@ -336,11 +428,29 @@ fn observed_missing_runtime(
         networks: Vec::new(),
         guest_transport: GuestTransportEvidence::Unavailable,
         warm_snapshot: WarmSnapshotEvidence::Absent,
-        lifecycle_admission: LifecycleAdmission::Closed,
-        routes: Vec::new(),
+        lifecycle_admission: LifecycleAdmission::Open,
+        routes: vec![ObservedRouteGate {
+            binding: RouteGateBinding {
+                workspace_id: desired.workspace_id.clone(),
+                endpoint_id: endpoint.endpoint_id.clone(),
+                hostname: endpoint.hostname.clone(),
+                cat_id: desired.cat_id.clone(),
+                node_id: desired.placement.node_id.clone(),
+                runtime_incarnation: incarnation,
+                route_epoch: endpoint.route_epoch,
+                protocol: endpoint.protocol,
+                target_port: endpoint.target_port,
+            },
+            gate: RouteGateState::Active,
+            active_guards: 0,
+            cancellation_pending: false,
+            instance_count: 1,
+        }],
         platform_guards: 0,
-        conditions: vec![Condition::Progressing {
-            reason: ProgressingReason::ReconcileStep { step },
+        conditions: vec![Condition::Ready {
+            reason: ReadyReason::PostconditionSatisfied {
+                target: RuntimeTarget::Running,
+            },
         }],
     })
 }
@@ -404,10 +514,33 @@ fn random(value: &str) -> RandomId128 {
     RandomId128::new(value).unwrap()
 }
 
+/// blockd's serving-handoff reader rejects sticky/world-writable ancestry
+/// (production state lives under /var/lib/cats), so the E2E state scratch
+/// cannot sit under /tmp. The gate's ext4 target volume and the native
+/// build host's relocated cargo target both satisfy the ancestor contract.
+#[cfg(target_os = "linux")]
+fn safe_state_scratch_parent() -> std::path::PathBuf {
+    if let Some(directory) = std::env::var_os("CATS_LINUX_TARGET_DIRECTORY")
+        .or_else(|| std::env::var_os("CARGO_TARGET_DIR"))
+    {
+        let base = std::path::Path::new(&directory).join("cutover-e2e-state-tmp");
+        if std::fs::create_dir_all(&base).is_ok() {
+            return base;
+        }
+    }
+    std::path::PathBuf::from("/tmp")
+}
+
 fn node_identity(signer: &Ed25519RequestSigner) -> NodeIdentity {
     NodeIdentity {
         version: ContractVersion::V1,
         node_id: id("node_cross_component_a"),
+        provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+            provider: Id::new("test_provider").unwrap(),
+            partition: Id::new("test_partition").unwrap(),
+            account_id: Id::new("test_account").unwrap(),
+            region: Id::new("test_region").unwrap(),
+        },
         immutable_host_id: id("host_cross_component_a"),
         credential_id: signer.credential_id().clone(),
         credential_binding: CredentialBinding::PublicKey {
@@ -517,6 +650,49 @@ async fn next_step(runner: &mut RuntimeSpineRunner) -> RuntimeSpineRunStep {
     .unwrap()
 }
 
+async fn route_v2_public_http_request(
+    address: std::net::SocketAddr,
+    hostname: &str,
+    path: &str,
+) -> Vec<u8> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: {hostname}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+        .await
+        .expect("public Gateway HTTP response exceeded its test deadline")
+        .unwrap();
+    response
+}
+
+async fn route_v2_read_http_head(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+    use tokio::io::AsyncReadExt as _;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut bytes = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 1024];
+            let count = stream.read(&mut chunk).await.unwrap();
+            assert!(count > 0, "connection closed before its HTTP head");
+            bytes.extend_from_slice(&chunk[..count]);
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                return bytes;
+            }
+            assert!(bytes.len() <= 32 * 1024, "HTTP head exceeded test bound");
+        }
+    })
+    .await
+    .expect("HTTP head exceeded its test deadline")
+}
+
 #[cfg(target_os = "linux")]
 fn production_node_signer() -> Ed25519RequestSigner {
     Ed25519RequestSigner::from_pkcs8_pem(
@@ -587,6 +763,66 @@ fn production_registration(
 }
 
 #[cfg(target_os = "linux")]
+async fn register_replacement_agent_session(
+    context: &ControlContext,
+    identity: &NodeIdentity,
+    previous: &AgentSession,
+) -> AgentSession {
+    let signer = production_node_signer();
+    let attempt = AgentRegistrationAttempt {
+        version: ContractVersion::V1,
+        node_id: identity.node_id.clone(),
+        immutable_host_id: identity.immutable_host_id.clone(),
+        node_boot_id: previous.node_boot_id.clone(),
+        agent_instance_id: random("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+        registration_attempt_id: random("ffffffffffffffffffffffffffffffff"),
+        guest_config_digest: previous.guest_config_digest.clone(),
+        expected_agent_session_epoch: Some(previous.agent_session_epoch),
+    };
+    assert_ne!(attempt.agent_instance_id, previous.agent_instance_id);
+    let body = encode_agent_registration_attempt(&attempt).unwrap();
+    let proof = signer.sign(REGISTRATION_METHOD, REGISTRATION_PATH, &body);
+    let response = context
+        .http
+        .post(format!(
+            "{}{}",
+            context.server.base_url(),
+            REGISTRATION_PATH
+        ))
+        .header(reqwest::header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+        .header(NODE_CREDENTIAL_ID_HEADER, proof.credential_id)
+        .header(NODE_PUBLIC_KEY_SPKI_HEADER, proof.public_key_spki)
+        .header(NODE_SIGNATURE_HEADER, proof.signature)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let replacement = decode_agent_session(&response.bytes().await.unwrap()).unwrap();
+    let expected_epoch = Epoch::new(
+        previous
+            .agent_session_epoch
+            .get()
+            .checked_add(1)
+            .expect("replacement AgentSession epoch exhausted"),
+    )
+    .unwrap();
+    validate_registered_replacement(&replacement, &attempt, expected_epoch).unwrap();
+
+    let fingerprint = cats_control_plane::testsupport::runtime_spine_state_fingerprint(
+        &context.server.state.store,
+        attempt.node_id.clone(),
+    )
+    .await;
+    let fingerprint: serde_json::Value = serde_json::from_str(&fingerprint).unwrap();
+    let current: AgentSession =
+        serde_json::from_value(fingerprint["session"]["record"].clone()).unwrap();
+    validate_registered_replacement(&current, &attempt, expected_epoch).unwrap();
+    validate_current_session_renewal(&current, &replacement).unwrap();
+    replacement
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Debug, Default)]
 struct HermeticImdsState {
     token_requests: usize,
@@ -642,9 +878,8 @@ fn record_imds_request(
         && path_and_query == "/latest/api/token"
         && exact_header(headers, ttl_header.clone(), "21600")
         && headers.get(&token_header).is_none()
-        && state.token_requests == 0
-        && state.role_requests == 0
-        && state.credential_requests == 0
+        && state.token_requests == state.role_requests
+        && state.role_requests == state.credential_requests
     {
         state.token_requests += 1;
         HermeticImdsReply::Token
@@ -653,9 +888,8 @@ fn record_imds_request(
         && path_and_query == "/latest/meta-data/iam/security-credentials/"
         && exact_header(headers, token_header.clone(), IMDS_TOKEN)
         && headers.get(&ttl_header).is_none()
-        && state.token_requests == 1
-        && state.role_requests == 0
-        && state.credential_requests == 0
+        && state.token_requests == state.role_requests + 1
+        && state.role_requests == state.credential_requests
     {
         state.role_requests += 1;
         HermeticImdsReply::Role
@@ -664,9 +898,8 @@ fn record_imds_request(
         && path_and_query == IMDS_CREDENTIAL_PATH
         && exact_header(headers, token_header, IMDS_TOKEN)
         && headers.get(&ttl_header).is_none()
-        && state.token_requests == 1
-        && state.role_requests == 1
-        && state.credential_requests == 0
+        && state.token_requests == state.role_requests
+        && state.role_requests == state.credential_requests + 1
     {
         state.credential_requests += 1;
         HermeticImdsReply::Credentials
@@ -731,17 +964,72 @@ async fn hermetic_imds_handler(
 
 #[cfg(target_os = "linux")]
 async fn hermetic_s3_handler(
-    axum::extract::State(requests): axum::extract::State<Arc<Mutex<Vec<String>>>>,
+    axum::extract::State(state): axum::extract::State<Arc<HermeticS3State>>,
     request: axum::extract::Request,
-) -> (StatusCode, &'static str) {
-    record_s3_request(
-        &mut requests.lock().unwrap(),
-        request.method(),
-        &request.uri().to_string(),
-    );
-    // A client bug must settle immediately so this oracle cannot be hidden by
-    // the production adapter's retry policy.
-    (StatusCode::BAD_REQUEST, "unexpected hermetic S3 request")
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    const BUCKET_PREFIX: &str = "/cats-cross-component/";
+    const MAX_OBJECT_BYTES: usize = 16 << 20;
+    let (parts, body) = request.into_parts();
+    let target = parts.uri.to_string();
+    record_s3_request(&mut state.requests.lock().unwrap(), &parts.method, &target);
+    let Some(key) = parts.uri.path().strip_prefix(BUCKET_PREFIX) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "request escaped the hermetic bucket",
+        )
+            .into_response();
+    };
+    if key.is_empty() || parts.uri.query().is_some() {
+        return (StatusCode::BAD_REQUEST, "unsupported hermetic S3 request").into_response();
+    }
+    let body = match axum::body::to_bytes(body, MAX_OBJECT_BYTES).await {
+        Ok(body) => body.to_vec(),
+        Err(_) => {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "object exceeds test bound").into_response()
+        }
+    };
+    match parts.method {
+        axum::http::Method::GET => match state.objects.lock().unwrap().get(key).cloned() {
+            Some(value) => (StatusCode::OK, value).into_response(),
+            None => (StatusCode::NOT_FOUND, Vec::new()).into_response(),
+        },
+        axum::http::Method::HEAD => {
+            let status = if state.objects.lock().unwrap().contains_key(key) {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            (status, Vec::<u8>::new()).into_response()
+        }
+        axum::http::Method::PUT => {
+            if !state.publishes_enabled.load(Ordering::SeqCst) {
+                state.rejected_puts.fetch_add(1, Ordering::SeqCst);
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "publishing disabled by test",
+                )
+                    .into_response();
+            }
+            let mut objects = state.objects.lock().unwrap();
+            match objects.get(key) {
+                Some(existing) if existing == &body => {
+                    (StatusCode::PRECONDITION_FAILED, Vec::<u8>::new()).into_response()
+                }
+                Some(_) => (StatusCode::PRECONDITION_FAILED, Vec::<u8>::new()).into_response(),
+                None => {
+                    objects.insert(key.to_owned(), body);
+                    (StatusCode::OK, Vec::<u8>::new()).into_response()
+                }
+            }
+        }
+        _ => (
+            StatusCode::METHOD_NOT_ALLOWED,
+            "unsupported hermetic S3 method",
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -750,9 +1038,23 @@ fn record_s3_request(requests: &mut Vec<String>, method: &axum::http::Method, ta
 }
 
 #[cfg(target_os = "linux")]
+fn hermetic_s3_wire_key(key: &str) -> String {
+    let mut encoded = String::new();
+    for byte in key.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                encoded.push(char::from(byte));
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+#[cfg(target_os = "linux")]
 struct HermeticAwsBoundary {
     imds: Arc<Mutex<HermeticImdsState>>,
-    s3_requests: Arc<Mutex<Vec<String>>>,
+    s3: Arc<HermeticS3State>,
     s3_endpoint: String,
     imds_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     s3_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
@@ -762,11 +1064,28 @@ struct HermeticAwsBoundary {
 }
 
 #[cfg(target_os = "linux")]
+struct HermeticS3State {
+    requests: Mutex<Vec<String>>,
+    objects: Mutex<BTreeMap<String, Vec<u8>>>,
+    publishes_enabled: AtomicBool,
+    rejected_puts: AtomicUsize,
+}
+
+#[cfg(target_os = "linux")]
 impl HermeticAwsBoundary {
-    async fn start() -> Self {
+    async fn start(image_key: &str, image_manifest: &[u8]) -> Self {
+        let image_object_key = hermetic_s3_wire_key(&format!("{AWS_PREFIX}/{image_key}"));
         let mut boundary = Self {
             imds: Arc::new(Mutex::new(HermeticImdsState::default())),
-            s3_requests: Arc::new(Mutex::new(Vec::new())),
+            s3: Arc::new(HermeticS3State {
+                requests: Mutex::new(Vec::new()),
+                objects: Mutex::new(BTreeMap::from([(
+                    image_object_key,
+                    image_manifest.to_vec(),
+                )])),
+                publishes_enabled: AtomicBool::new(true),
+                rejected_puts: AtomicUsize::new(0),
+            }),
             s3_endpoint: String::new(),
             imds_shutdown: None,
             s3_shutdown: None,
@@ -822,13 +1141,13 @@ impl HermeticAwsBoundary {
         boundary.imds_shutdown = Some(imds_shutdown);
 
         let (s3_shutdown, s3_shutdown_rx) = tokio::sync::oneshot::channel();
-        let s3_requests = Arc::clone(&boundary.s3_requests);
+        let s3 = Arc::clone(&boundary.s3);
         boundary.s3_task = Some(tokio::spawn(async move {
             axum::serve(
                 s3_listener,
                 axum::Router::new()
                     .fallback(hermetic_s3_handler)
-                    .with_state(s3_requests),
+                    .with_state(s3),
             )
             .with_graceful_shutdown(async move {
                 let _ = s3_shutdown_rx.await;
@@ -852,12 +1171,26 @@ impl HermeticAwsBoundary {
         )
     }
 
+    fn set_publishes_enabled(&self, enabled: bool) {
+        self.s3.publishes_enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    fn put_request_count(&self) -> usize {
+        self.s3
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.starts_with("PUT "))
+            .count()
+    }
+
     fn assert_exact_boundary(&self) {
         let imds = self.imds.lock().unwrap();
-        assert_eq!(imds.token_requests, 1, "IMDSv2 token request cardinality");
-        assert_eq!(imds.role_requests, 1, "IMDS role request cardinality");
+        assert_eq!(imds.token_requests, 2, "IMDSv2 token request cardinality");
+        assert_eq!(imds.role_requests, 2, "IMDS role request cardinality");
         assert_eq!(
-            imds.credential_requests, 1,
+            imds.credential_requests, 2,
             "IMDS credential request cardinality"
         );
         assert!(
@@ -865,10 +1198,16 @@ impl HermeticAwsBoundary {
             "strict IMDSv2 boundary violations: {:?}",
             imds.violations
         );
-        let s3_requests = self.s3_requests.lock().unwrap();
+        let s3_requests = self.s3.requests.lock().unwrap();
         assert!(
-            s3_requests.is_empty(),
-            "ProvisionRootImage checkpoint prefix unexpectedly accessed S3: {s3_requests:?}"
+            s3_requests
+                .iter()
+                .any(|request| request.starts_with("PUT ")),
+            "production blockd never published through the hermetic S3 boundary: {s3_requests:?}"
+        );
+        assert!(
+            self.s3.rejected_puts.load(Ordering::SeqCst) > 0,
+            "Relaxed pending-pack characterization never observed a rejected publish"
         );
     }
 
@@ -890,8 +1229,8 @@ impl HermeticAwsBoundary {
                 .expect("serve hermetic S3 endpoint");
         }
         // Graceful server joins drain every already accepted request before
-        // the transcript is settled, so a queued S3 call cannot arrive after
-        // the zero-request assertion.
+        // the IMDS cardinality, rejected-outage PUT and successful publication
+        // transcript are settled.
         self.assert_exact_boundary();
         assert!(
             self.remove_imds_address(),
@@ -962,7 +1301,12 @@ async fn panic_cleanup_detaches_tripwires_without_disarming_imds_trap() {
     let s3_task = tokio::spawn(std::future::pending::<std::io::Result<()>>());
     let mut boundary = HermeticAwsBoundary {
         imds: Arc::new(Mutex::new(HermeticImdsState::default())),
-        s3_requests: Arc::new(Mutex::new(Vec::new())),
+        s3: Arc::new(HermeticS3State {
+            requests: Mutex::new(Vec::new()),
+            objects: Mutex::new(BTreeMap::new()),
+            publishes_enabled: AtomicBool::new(false),
+            rejected_puts: AtomicUsize::new(0),
+        }),
         s3_endpoint: "http://127.0.0.1:1".to_owned(),
         imds_shutdown: Some(imds_shutdown),
         s3_shutdown: Some(s3_shutdown),
@@ -1129,6 +1473,29 @@ fn production_installed_probe_config(
 }
 
 #[cfg(target_os = "linux")]
+fn production_ch_config(context: &ControlContext) -> ChConfig {
+    ChConfig {
+        block_direct: false,
+        vmm_launcher_bin: "/opt/cats/bin/cats-vmm-launcher".into(),
+        ch_bin: "/opt/cats/bin/cloud-hypervisor".into(),
+        kernel: "/opt/cats/release/guest/vmlinuz".into(),
+        initramfs: None,
+        boot_contract: None,
+        cmdline: context.release.kernel_cmdline.as_str().to_owned(),
+        seed_image: None,
+        // The focused gate exercises the native vhost-user process path
+        // with an independent userspace frontend, without depending on a
+        // host kernel NBD module or device pool.
+        block_path: BlockPath::VhostUser,
+        vhost_user_queues: 1,
+        vhost_user_queue_size: 256,
+        nbd_client_bin: "/usr/sbin/nbd-client".into(),
+        nbd_devices: 64,
+        ip_bin: "/usr/sbin/ip".into(),
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn production_cutover_config(
     context: &ControlContext,
     registration: AgentRegistrationConfig,
@@ -1142,31 +1509,35 @@ fn production_cutover_config(
     let data_authority: Arc<dyn VolumeDataAuthority> = authority.clone();
     let inventory_authority: Arc<dyn RuntimeVolumeInventoryAuthority> = authority;
     let blob_store: Arc<dyn BlobStore> = blob_store;
+    // The production loop's inventory scan acknowledges the installed
+    // route-v2 ring; without a machine config the observation carries no
+    // ring ACK and the G3 gate refuses to make the Node Schedulable.
+    let route_public_key = cats_api::route_grant_v2::RouteGrantV2PublicKey::from_public_key_pem(
+        include_bytes!("../../../tests/fixtures/route_grant_v2_public_ed25519.pem"),
+    )
+    .unwrap();
+    assert_eq!(route_public_key.kid().as_str(), ROUTE_V2_KID);
+    let route_ring =
+        RouteGrantV2KeyRing::new(Epoch::new(1).unwrap(), vec![route_public_key]).unwrap();
+    let route_v2_machine = RouteV2MachineConfig::for_test(
+        "127.0.0.1:0".to_owned(),
+        registration.identity().node_id.clone(),
+        include_bytes!("../../../control-plane/tests/fixtures/gateway_machine_ca_certificate.pem"),
+        include_bytes!(
+            "../../../control-plane/tests/fixtures/gateway_machine_server_certificate.pem"
+        ),
+        include_bytes!(
+            "../../../control-plane/tests/fixtures/gateway_machine_server_private_key.pem"
+        ),
+        Arc::new(RouteGrantV2Verifier::new(route_ring)),
+    )
+    .unwrap();
     super::SignedRuntimeCutoverConfig {
         listen: "127.0.0.1:0".into(),
-        route_v2_machine: None,
+        route_v2_machine: Some(route_v2_machine),
         control_plane_url: context.server.base_url(),
         agent_registration: registration,
-        ch_config: ChConfig {
-            block_direct: false,
-            vmm_launcher_bin: "/opt/cats/bin/cats-vmm-launcher".into(),
-            ch_bin: "/opt/cats/bin/cloud-hypervisor".into(),
-            kernel: "/opt/cats/release/guest/vmlinuz".into(),
-            initramfs: None,
-            boot_contract: None,
-            cmdline: context.release.kernel_cmdline.as_str().to_owned(),
-            seed_image: None,
-            // The production default Kernel NBD path requires the Host's
-            // configured nbd module/device pool. This focused, isolated Linux
-            // E2E selects the separately validated native vhost-user path
-            // while retaining the installed generic BlockFrontend residue scan.
-            block_path: BlockPath::VhostUser,
-            vhost_user_queues: 1,
-            vhost_user_queue_size: 256,
-            nbd_client_bin: "/usr/sbin/nbd-client".into(),
-            nbd_devices: 64,
-            ip_bin: "/usr/sbin/ip".into(),
-        },
+        ch_config: production_ch_config(context),
         authorized_blockd_launch,
         guest_agent_binary: "/opt/cats/bin/cats-guest-agent".into(),
         metering_cgroup_root: None,
@@ -1210,16 +1581,171 @@ async fn wait_for_provision_root_checkpoint(
     }
 }
 
-#[cfg(target_os = "linux")]
-fn assert_same_session_lineage(left: &AgentSession, right: &AgentSession) {
-    assert_eq!(left.version, right.version);
-    assert_eq!(left.node_id, right.node_id);
-    assert_eq!(left.immutable_host_id, right.immutable_host_id);
-    assert_eq!(left.node_boot_id, right.node_boot_id);
-    assert_eq!(left.agent_instance_id, right.agent_instance_id);
-    assert_eq!(left.agent_session_epoch, right.agent_session_epoch);
-    assert_eq!(left.registration_attempt_id, right.registration_attempt_id);
-    assert_eq!(left.guest_config_digest, right.guest_config_digest);
+fn validate_same_session_lineage(
+    current: &AgentSession,
+    durable_registration: &AgentSession,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        current.version == durable_registration.version
+            && current.node_id == durable_registration.node_id
+            && current.immutable_host_id == durable_registration.immutable_host_id
+            && current.node_boot_id == durable_registration.node_boot_id
+            && current.agent_instance_id == durable_registration.agent_instance_id
+            && current.agent_session_epoch == durable_registration.agent_session_epoch
+            && current.registration_attempt_id == durable_registration.registration_attempt_id
+            && current.guest_config_digest == durable_registration.guest_config_digest,
+        "current AgentSession immutable lineage differs from its durable registration"
+    );
+    Ok(())
+}
+
+fn validate_current_session_renewal(
+    current: &AgentSession,
+    durable_registration: &AgentSession,
+) -> anyhow::Result<()> {
+    validate_same_session_lineage(current, durable_registration)?;
+    anyhow::ensure!(
+        current.lease_deadline_unix_ms >= durable_registration.lease_deadline_unix_ms,
+        "current AgentSession regressed the durable registration deadline"
+    );
+    Ok(())
+}
+
+fn validate_current_session_observation(
+    current: &AgentSession,
+    durable_registration: &AgentSession,
+    acceptance_deadline: UnixMillis,
+) -> anyhow::Result<()> {
+    validate_current_session_renewal(current, durable_registration)?;
+    anyhow::ensure!(
+        current.lease_deadline_unix_ms == acceptance_deadline,
+        "current AgentSession deadline is not bound to the same observation acceptance"
+    );
+    Ok(())
+}
+
+fn validate_registered_replacement(
+    replacement: &AgentSession,
+    attempt: &AgentRegistrationAttempt,
+    expected_epoch: Epoch,
+) -> anyhow::Result<()> {
+    let attempt_epoch = attempt
+        .expected_agent_session_epoch
+        .and_then(|epoch| epoch.get().checked_add(1))
+        .and_then(Epoch::new);
+    anyhow::ensure!(
+        attempt_epoch == Some(expected_epoch)
+            && replacement.version == attempt.version
+            && replacement.node_id == attempt.node_id
+            && replacement.immutable_host_id == attempt.immutable_host_id
+            && replacement.node_boot_id == attempt.node_boot_id
+            && replacement.agent_instance_id == attempt.agent_instance_id
+            && replacement.agent_session_epoch == expected_epoch
+            && replacement.registration_attempt_id == attempt.registration_attempt_id
+            && replacement.guest_config_digest == attempt.guest_config_digest,
+        "replacement AgentSession is not bound to the complete submitted registration attempt"
+    );
+    Ok(())
+}
+
+fn durable_registration_fixture() -> AgentSession {
+    decode_agent_session(
+        br#"{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","immutable_host_id":"host_a","lease_deadline_unix_ms":1720000060000,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a","registration_attempt_id":"55555555555555555555555555555555","version":1}"#,
+    )
+    .unwrap()
+}
+
+#[test]
+fn same_session_lineage_allows_control_lease_renewal() {
+    let durable_registration = durable_registration_fixture();
+    let mut renewed_current = durable_registration.clone();
+    renewed_current.lease_deadline_unix_ms = UnixMillis::new(1_720_000_065_000).unwrap();
+
+    validate_current_session_observation(
+        &renewed_current,
+        &durable_registration,
+        renewed_current.lease_deadline_unix_ms,
+    )
+    .unwrap();
+}
+
+#[test]
+fn current_session_observation_rejects_deadline_regression() {
+    let durable_registration = durable_registration_fixture();
+    let mut regressed_current = durable_registration.clone();
+    regressed_current.lease_deadline_unix_ms = UnixMillis::new(1_720_000_059_999).unwrap();
+
+    let error = validate_current_session_observation(
+        &regressed_current,
+        &durable_registration,
+        regressed_current.lease_deadline_unix_ms,
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("regressed the durable registration deadline"),
+        "unexpected validation error: {error:#}"
+    );
+}
+
+#[test]
+fn current_session_observation_rejects_registration_attempt_mismatch() {
+    let durable_registration = durable_registration_fixture();
+    let mut wrong_attempt = durable_registration.clone();
+    wrong_attempt.registration_attempt_id = random("66666666666666666666666666666666");
+
+    let error = validate_current_session_observation(
+        &wrong_attempt,
+        &durable_registration,
+        wrong_attempt.lease_deadline_unix_ms,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("immutable lineage"),
+        "unexpected validation error: {error:#}"
+    );
+}
+
+#[test]
+fn replacement_session_rejects_wrong_attempt_node_boot_or_digest() {
+    let session = durable_registration_fixture();
+    let attempt = AgentRegistrationAttempt {
+        version: session.version,
+        node_id: session.node_id.clone(),
+        immutable_host_id: session.immutable_host_id.clone(),
+        node_boot_id: session.node_boot_id.clone(),
+        agent_instance_id: session.agent_instance_id.clone(),
+        registration_attempt_id: session.registration_attempt_id.clone(),
+        guest_config_digest: session.guest_config_digest.clone(),
+        expected_agent_session_epoch: Some(Epoch::new(1).unwrap()),
+    };
+    validate_registered_replacement(&session, &attempt, Epoch::new(2).unwrap()).unwrap();
+
+    let reject = |candidate: &AgentSession, field: &str| {
+        let error = validate_registered_replacement(candidate, &attempt, Epoch::new(2).unwrap())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("submitted registration attempt"),
+            "wrong {field} produced an unexpected validation error: {error:#}"
+        );
+    };
+
+    let mut wrong_attempt = session.clone();
+    wrong_attempt.registration_attempt_id = random("66666666666666666666666666666666");
+    reject(&wrong_attempt, "registration attempt");
+
+    let mut wrong_node = session.clone();
+    wrong_node.node_id = id("node_b");
+    reject(&wrong_node, "node");
+
+    let mut wrong_boot = session.clone();
+    wrong_boot.node_boot_id = NodeBootId::new("77777777777777777777777777777777").unwrap();
+    reject(&wrong_boot, "boot");
+
+    let mut wrong_digest = session;
+    wrong_digest.guest_config_digest = Sha256Digest::from_bytes([0x88; 32]);
+    reject(&wrong_digest, "guest digest");
 }
 
 #[cfg(target_os = "linux")]
@@ -1228,7 +1754,7 @@ async fn wait_for_initial_empty_inventory(
     state_path: &std::path::Path,
     identity: &NodeIdentity,
     handle: &super::SignedRuntimeCutoverHandle,
-) -> (AgentSession, Epoch) {
+) -> (AgentSession, AgentSession, Epoch) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let fingerprint = cats_control_plane::testsupport::runtime_spine_state_fingerprint(
@@ -1245,8 +1771,7 @@ async fn wait_for_initial_empty_inventory(
                     .unwrap(),
             )
             .unwrap();
-            assert_same_session_lineage(&session, &durable_session);
-            assert!(session.lease_deadline_unix_ms >= durable_session.lease_deadline_unix_ms);
+            validate_same_session_lineage(&session, &durable_session).unwrap();
             assert_eq!(session.node_id, identity.node_id);
             assert_eq!(session.immutable_host_id, identity.immutable_host_id);
             assert_eq!(session.node_boot_id, current_kernel_node_boot_id().unwrap());
@@ -1265,6 +1790,12 @@ async fn wait_for_initial_empty_inventory(
                 serde_json::from_value(fingerprint["inventory"]["assigned_snapshot"].clone())
                     .unwrap();
 
+            validate_current_session_observation(
+                &session,
+                &durable_session,
+                acceptance.lease_deadline_unix_ms,
+            )
+            .unwrap();
             assert_eq!(received, full);
             assert!(full.complete_inventory);
             assert!(full.runtimes.is_empty());
@@ -1300,7 +1831,7 @@ async fn wait_for_initial_empty_inventory(
             );
             assert_eq!(attestation.inventory_read_position, assigned.read_position);
             assert_eq!(fingerprint["cat_observations"].as_i64(), Some(0));
-            return (session, full.inventory_epoch);
+            return (session, durable_session, full.inventory_epoch);
         }
         assert!(
             !handle.runner_task.is_finished(),
@@ -1365,6 +1896,76 @@ async fn next_observation_barrier(
 }
 
 #[cfg(target_os = "linux")]
+async fn next_local_contract_stop(
+    steps: &mut tokio::sync::mpsc::UnboundedReceiver<super::RuntimeEffectStepForTest>,
+    cat_id: &Id,
+    phase: &'static str,
+) {
+    // Every effect round re-validates the running serving writer before its
+    // step logic, so a round that fails closed may first re-emit the exact
+    // adoption event for this same Cat; skip that re-validation noise.
+    let event = loop {
+        let event = tokio::time::timeout(Duration::from_secs(30), steps.recv())
+            .await
+            .unwrap_or_else(|_| panic!("production effect did not settle during {phase}"))
+            .unwrap_or_else(|| panic!("production effect-step observer closed during {phase}"));
+        if event
+            != (super::RuntimeEffectStepForTest::ServingAdopted {
+                cat_id: cat_id.clone(),
+            })
+        {
+            break event;
+        }
+    };
+    assert_eq!(
+        event,
+        super::RuntimeEffectStepForTest::Stopped {
+            cat_id: cat_id.clone(),
+            reason: crate::runtime_spine::RuntimeDesiredEffectStopReason::LocalContract,
+        },
+        "production effect did not fail closed on the exact local contract during {phase}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+async fn next_serving_adopted(
+    steps: &mut tokio::sync::mpsc::UnboundedReceiver<super::RuntimeEffectStepForTest>,
+    cat_id: &Id,
+    phase: &'static str,
+) {
+    let event = tokio::time::timeout(Duration::from_secs(30), steps.recv())
+        .await
+        .unwrap_or_else(|_| panic!("serving adoption did not settle during {phase}"))
+        .unwrap_or_else(|| panic!("serving-adoption observer closed during {phase}"));
+    assert_eq!(
+        event,
+        super::RuntimeEffectStepForTest::ServingAdopted {
+            cat_id: cat_id.clone(),
+        },
+        "production serving stage did not reach its exact Ok(None) adoption during {phase}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+async fn next_refresh_inventory(
+    steps: &mut tokio::sync::mpsc::UnboundedReceiver<super::RuntimeEffectStepForTest>,
+    cat_id: &Id,
+    phase: &'static str,
+) {
+    let event = tokio::time::timeout(Duration::from_secs(30), steps.recv())
+        .await
+        .unwrap_or_else(|_| panic!("production effect did not settle during {phase}"))
+        .unwrap_or_else(|| panic!("production effect-step observer closed during {phase}"));
+    assert_eq!(
+        event,
+        super::RuntimeEffectStepForTest::RefreshInventory {
+            cat_id: cat_id.clone(),
+        },
+        "production effect did not require a fresh full inventory during {phase}"
+    );
+}
+
+#[cfg(target_os = "linux")]
 async fn hold_after_exact_root_process_observation(
     context: &ControlContext,
     node_id: &Id,
@@ -1402,6 +2003,701 @@ async fn hold_after_exact_root_process_observation(
             .send(())
             .expect("production observation barrier resume receiver dropped");
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn hold_after_exact_serving_process_observation(
+    context: &ControlContext,
+    node_id: &Id,
+    cat_id: &Id,
+    handle: &super::SignedRuntimeCutoverHandle,
+    reached: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+    resume: &tokio::sync::mpsc::UnboundedSender<()>,
+    phase: &'static str,
+) -> String {
+    loop {
+        next_observation_barrier(reached, handle, phase).await;
+        let fingerprint = cats_control_plane::testsupport::runtime_spine_state_fingerprint(
+            &context.server.state.store,
+            node_id.clone(),
+        )
+        .await;
+        let value: serde_json::Value = serde_json::from_str(&fingerprint).unwrap();
+        if value["inventory"].is_object() {
+            let full: NodeObservation =
+                serde_json::from_value(value["inventory"]["full_observation"].clone()).unwrap();
+            if let [runtime] = full.runtimes.as_slice() {
+                if &runtime.cat_id == cat_id {
+                    if let ReconcileStep::PrepareDevice { devices }
+                    | ReconcileStep::PrepareNetwork { devices, .. } = &runtime.step
+                    {
+                        if let ([device], [process]) =
+                            (devices.as_slice(), runtime.processes.as_slice())
+                        {
+                            let process_matches = process.state == ProcessState::Running
+                                && process.control_handshake == ControlHandshakeEvidence::Verified
+                                && process.scope_id == device.serving_process.scope_id
+                                && process.control_socket_path
+                                    == device.serving_process.control_socket_path
+                                && process.executable_path
+                                    == device.serving_process.executable_path
+                                && process.ownership_token
+                                    == OwnershipTokenEvidence::Valid {
+                                        ownership_token: device
+                                            .serving_process
+                                            .process_identity_token
+                                            .clone(),
+                                    }
+                                && process.role
+                                    == ProcessRole::Blockd {
+                                        volume_id: device.volume_id.clone(),
+                                        attachment_id: device.attachment_id.clone(),
+                                        attachment_epoch: device.attachment_epoch,
+                                    };
+                            let lineage_matches = matches!(runtime.volumes.as_slice(), [volume]
+                                if volume.volume_id == device.volume_id
+                                    && matches!(volume.local_lineages.as_slice(), [lineage]
+                                        if lineage.attachment_id == device.attachment_id
+                                            && lineage.attachment_epoch == device.attachment_epoch
+                                            && lineage.state == LocalLineageState::Active));
+                            if process_matches && lineage_matches {
+                                return fingerprint;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        resume
+            .send(())
+            .expect("production observation barrier resume receiver dropped");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn blockd_control_command(control_socket: &HostPath, command: BlockdControlCommand) -> String {
+    use std::io::{BufRead as _, BufReader, Write as _};
+
+    let mut stream = std::os::unix::net::UnixStream::connect(control_socket.as_str())
+        .expect("connect exact serving blockd control socket");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    writeln!(stream, "{}", command.as_wire()).unwrap();
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response).unwrap();
+    match BlockdControlResponse::parse_wire(&response).unwrap() {
+        BlockdControlResponse::Ok(payload) => payload,
+        BlockdControlResponse::Error(message) => {
+            panic!("serving blockd {command} failed: {message}")
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn serving_status(control_socket: &HostPath) -> DurabilityStatus {
+    serde_json::from_str(&blockd_control_command(
+        control_socket,
+        BlockdControlCommand::Status,
+    ))
+    .expect("decode exact serving blockd status")
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Retained for the wire-expressible fault-injection redesign tracked in
+// DEFERRED.md.
+#[allow(dead_code)]
+enum ServingObservationFault {
+    WrongAcquireOrigin,
+    WrongAuthorityHead,
+}
+
+#[cfg(target_os = "linux")]
+struct FaultInjectingServingScanner {
+    installed: Arc<dyn RuntimeInventoryScanner>,
+    cat_id: Id,
+    volume_id: Id,
+    armed: Mutex<Option<ServingObservationFault>>,
+    applied: AtomicUsize,
+}
+
+#[cfg(target_os = "linux")]
+impl FaultInjectingServingScanner {
+    fn new(installed: Arc<dyn RuntimeInventoryScanner>, cat_id: Id, volume_id: Id) -> Self {
+        Self {
+            installed,
+            cat_id,
+            volume_id,
+            armed: Mutex::new(None),
+            applied: AtomicUsize::new(0),
+        }
+    }
+
+    // Retained for the wire-expressible fault-injection redesign tracked in
+    // DEFERRED.md; the current negatives are descoped because the wire
+    // contract already rejects them client-side.
+    #[allow(dead_code)]
+    fn arm(&self, fault: ServingObservationFault) {
+        let mut armed = self.armed.lock().unwrap();
+        assert!(
+            armed.replace(fault).is_none(),
+            "scanner fault already armed"
+        );
+    }
+
+    fn applied(&self) -> usize {
+        self.applied.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl crate::runtime_spine::inventory_scanner_sealed::Sealed for FaultInjectingServingScanner {}
+
+#[cfg(target_os = "linux")]
+impl RuntimeInventoryScanner for FaultInjectingServingScanner {
+    fn scan_complete(
+        &self,
+        context: RuntimeInventoryScanContext,
+    ) -> anyhow::Result<RuntimeInventoryScanOutcome> {
+        let mut outcome = self.installed.scan_complete(context)?;
+        let fault = self.armed.lock().unwrap().take();
+        let Some(fault) = fault else {
+            return Ok(outcome);
+        };
+        let RuntimeInventoryScanOutcome::Complete(inventory) = &mut outcome else {
+            anyhow::bail!("armed serving observation fault reached an incomplete installed scan")
+        };
+        let runtime = inventory
+            .runtimes_mut_for_test()
+            .iter_mut()
+            .find(|runtime| runtime.cat_id == self.cat_id)
+            .context("armed serving observation fault lacks its Cat")?;
+        let volume = runtime
+            .volumes
+            .iter_mut()
+            .find(|volume| volume.volume_id == self.volume_id)
+            .context("armed serving observation fault lacks its Volume")?;
+        let [lineage] = volume.local_lineages.as_mut_slice() else {
+            anyhow::bail!("armed serving observation fault lacks one exact lineage")
+        };
+        match fault {
+            ServingObservationFault::WrongAcquireOrigin => {
+                lineage.acquire_origin = AcquireOrigin::Takeover {
+                    authorization_id: id("wrong_origin_authorization"),
+                };
+            }
+            ServingObservationFault::WrongAuthorityHead => {
+                let VolumeAuthorityEvidence::Owned { head, .. } = &mut volume.authority else {
+                    anyhow::bail!("armed authority-head fault lacks Owned authority")
+                };
+                let wrong =
+                    Generation::new(head.generation.get().checked_add(1).context(
+                        "armed authority-head fault exhausted the generation coordinate",
+                    )?)
+                    .context("armed authority-head fault exceeded the wire generation range")?;
+                head.generation = wrong;
+                lineage.local_durable_generation = wrong;
+                lineage.remote_durable_generation = wrong;
+            }
+        }
+        self.applied.fetch_add(1, Ordering::SeqCst);
+        Ok(outcome)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct AcceptedFullFingerprint {
+    session: AgentSession,
+    acceptance: ObservationAcceptance,
+    attestation: AdmissionInventoryAttestation,
+    assigned: DesiredReadSnapshot,
+    full: NodeObservation,
+}
+
+#[cfg(target_os = "linux")]
+impl AcceptedFullFingerprint {
+    fn decode(fingerprint: &str) -> Self {
+        let value: serde_json::Value = serde_json::from_str(fingerprint).unwrap();
+        Self {
+            session: serde_json::from_value(value["session"]["record"].clone()).unwrap(),
+            acceptance: serde_json::from_value(value["receive"]["acceptance"].clone()).unwrap(),
+            attestation: serde_json::from_value(value["inventory"]["attestation"].clone()).unwrap(),
+            assigned: serde_json::from_value(value["inventory"]["assigned_snapshot"].clone())
+                .unwrap(),
+            full: serde_json::from_value(value["inventory"]["full_observation"].clone()).unwrap(),
+        }
+    }
+
+    fn session_binding(&self) -> SessionBinding {
+        SessionBinding {
+            node_id: self.session.node_id.clone(),
+            node_boot_id: self.session.node_boot_id.clone(),
+            agent_instance_id: self.session.agent_instance_id.clone(),
+            agent_session_epoch: self.session.agent_session_epoch,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn host_link_named(tap_name: &Id) -> bool {
+    let output = Command::new("/usr/sbin/ip")
+        .args(["-j", "-d", "link", "show"])
+        .output()
+        .expect("inspect complete Host link inventory");
+    assert!(
+        output.status.success(),
+        "ip failed to inspect Host links: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let links: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("decode complete Host link inventory");
+    links.as_array().unwrap().iter().any(|link| {
+        link.get("ifname").and_then(serde_json::Value::as_str) == Some(tap_name.as_str())
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn observed_network(identity: &RuntimeNetworkIdentity) -> ObservedNetwork {
+    ObservedNetwork {
+        kind: identity.network_config.kind,
+        network_id: identity.network_config.network_id.clone(),
+        guest_mac: identity.network_config.guest_mac.clone(),
+        guest_ipv4: identity.network_config.guest_ipv4.clone(),
+        prefix_length: identity.network_config.prefix_length,
+        gateway_ipv4: identity.network_config.gateway_ipv4.clone(),
+        tap_name: identity.tap_name.clone(),
+        ownership_token: OwnershipTokenEvidence::Valid {
+            ownership_token: identity.ownership_token.clone(),
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ExactHostNetworkCleanup {
+    config: ChConfig,
+    network: ChNetwork,
+    armed: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl ExactHostNetworkCleanup {
+    fn new(context: &ControlContext, identity: &RuntimeNetworkIdentity) -> Self {
+        Self {
+            config: production_ch_config(context),
+            network: ChNetwork {
+                tap: identity.tap_name.as_str().to_owned(),
+                ownership_token: identity.ownership_token.clone(),
+                config: identity.network_config.clone(),
+            },
+            armed: true,
+        }
+    }
+
+    fn remove(mut self) {
+        crate::ch::remove_network(&self.config, &self.network)
+            .expect("remove exact focused-test Host TAP");
+        self.armed = false;
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ExactHostNetworkCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = crate::ch::remove_network(&self.config, &self.network);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn assert_reserved_network_absent(
+    snapshot: &AcceptedFullFingerprint,
+    cat_id: &Id,
+    identity: &RuntimeNetworkIdentity,
+    expected_process: &ProcessEvidence,
+    phase: &'static str,
+) {
+    assert!(
+        snapshot.full.residue.is_empty(),
+        "{phase} reported physical residue"
+    );
+    let [runtime] = snapshot.full.runtimes.as_slice() else {
+        panic!("{phase} did not contain exactly one Runtime")
+    };
+    assert_eq!(&runtime.cat_id, cat_id, "{phase} reported another Cat");
+    assert!(
+        runtime.networks.is_empty(),
+        "{phase} observed a reserved TAP before the validated physical effect"
+    );
+    assert_eq!(
+        runtime.processes.as_slice(),
+        std::slice::from_ref(expected_process),
+        "{phase} changed the serving PID/start evidence"
+    );
+    assert!(
+        !host_link_named(&identity.tap_name),
+        "{phase} left the reserved Host TAP present"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn assert_current_signed_full_envelope(
+    snapshot: &AcceptedFullFingerprint,
+    durable_registration: &AgentSession,
+    expected_desired: &DesiredRuntimeSpec,
+) {
+    validate_current_session_observation(
+        &snapshot.session,
+        durable_registration,
+        snapshot.acceptance.lease_deadline_unix_ms,
+    )
+    .unwrap();
+    let expected_session = SessionBinding {
+        node_id: durable_registration.node_id.clone(),
+        node_boot_id: durable_registration.node_boot_id.clone(),
+        agent_instance_id: durable_registration.agent_instance_id.clone(),
+        agent_session_epoch: durable_registration.agent_session_epoch,
+    };
+    assert_eq!(snapshot.acceptance.version, ContractVersion::V1);
+    assert_eq!(snapshot.acceptance.session, expected_session);
+    assert_eq!(
+        snapshot.acceptance.observation_id,
+        snapshot.full.observation_id
+    );
+    assert_eq!(
+        snapshot.acceptance.heartbeat_sequence,
+        snapshot.full.heartbeat_sequence
+    );
+    assert_eq!(
+        snapshot.acceptance.inventory,
+        ObservationInventoryAcceptance::Full {
+            attestation: snapshot.attestation.clone(),
+        }
+    );
+    assert_eq!(snapshot.attestation.version, ContractVersion::V1);
+    assert_eq!(snapshot.attestation.node_id, expected_session.node_id);
+    assert_eq!(
+        snapshot.attestation.agent_session_epoch,
+        expected_session.agent_session_epoch
+    );
+    assert_eq!(
+        snapshot.attestation.inventory_epoch,
+        snapshot.full.inventory_epoch
+    );
+    assert_eq!(
+        snapshot.full.inventory_digest,
+        Some(snapshot.attestation.inventory_digest.clone())
+    );
+    assert_eq!(
+        snapshot.full.inventory_digest,
+        Some(inventory_digest(&snapshot.full).unwrap())
+    );
+    assert_eq!(
+        snapshot.full.inventory_read_position,
+        Some(snapshot.attestation.inventory_read_position)
+    );
+    assert_eq!(snapshot.assigned.version, ContractVersion::V1);
+    assert_eq!(snapshot.assigned.session, expected_session);
+    assert_eq!(
+        snapshot.assigned.read_position,
+        snapshot.attestation.inventory_read_position
+    );
+    assert_eq!(
+        snapshot.assigned.desired_specs.as_slice(),
+        std::slice::from_ref(expected_desired)
+    );
+    assert!(snapshot.full.complete_inventory);
+    assert_eq!(snapshot.full.node_id, expected_session.node_id);
+    assert_eq!(snapshot.full.node_boot_id, expected_session.node_boot_id);
+    assert_eq!(
+        snapshot.full.agent_instance_id,
+        expected_session.agent_instance_id
+    );
+    assert_eq!(
+        snapshot.full.agent_session_epoch,
+        expected_session.agent_session_epoch
+    );
+}
+
+#[cfg(target_os = "linux")]
+// Keep every adoption coordinate explicit at each call site: omitting one is
+// exactly the false-positive failure this acceptance oracle guards against.
+#[allow(clippy::too_many_arguments)]
+fn validate_exact_serving_full_observation(
+    snapshot: &AcceptedFullFingerprint,
+    expected_identity: &NodeIdentity,
+    durable_registration: &AgentSession,
+    expected_desired: &DesiredRuntimeSpec,
+    expected_checkpoint_path: &std::path::Path,
+    expected_checkpoint: &RuntimeCheckpoint,
+    expected_process: &ProcessEvidence,
+    expected_device: &PreparedDeviceInput,
+    expected_authority_head: &RemoteHead,
+    expected_local_generation: Generation,
+    expected_remote_generation: Generation,
+    expected_pending_packs: u64,
+) -> anyhow::Result<()> {
+    validate_current_session_observation(
+        &snapshot.session,
+        durable_registration,
+        snapshot.acceptance.lease_deadline_unix_ms,
+    )
+    .context("accepted serving observation has invalid AgentSession renewal evidence")?;
+    let current_session = snapshot.session_binding();
+    anyhow::ensure!(
+        snapshot.session.version == ContractVersion::V1
+            && snapshot.session.node_id == expected_identity.node_id
+            && snapshot.session.immutable_host_id == expected_identity.immutable_host_id
+            && snapshot.session.guest_config_digest == expected_desired.runtime.guest_config_digest,
+        "accepted full fingerprint is not bound to the current Agent session"
+    );
+    anyhow::ensure!(
+        snapshot.acceptance.version == ContractVersion::V1
+            && snapshot.acceptance.session == current_session
+            && snapshot.acceptance.observation_id == snapshot.full.observation_id
+            && snapshot.acceptance.heartbeat_sequence == snapshot.full.heartbeat_sequence
+            && snapshot.acceptance.inventory
+                == ObservationInventoryAcceptance::Full {
+                    attestation: snapshot.attestation.clone(),
+                },
+        "accepted full fingerprint has a stale or partial acceptance"
+    );
+    anyhow::ensure!(
+        snapshot.attestation.version == ContractVersion::V1
+            && snapshot.attestation.node_id == current_session.node_id
+            && snapshot.attestation.agent_session_epoch == current_session.agent_session_epoch
+            && snapshot.attestation.inventory_epoch == snapshot.full.inventory_epoch
+            && snapshot.full.inventory_digest.as_ref()
+                == Some(&snapshot.attestation.inventory_digest)
+            && snapshot.full.inventory_digest == Some(inventory_digest(&snapshot.full)?)
+            && snapshot.full.inventory_read_position
+                == Some(snapshot.attestation.inventory_read_position)
+            && snapshot.assigned.read_position == snapshot.attestation.inventory_read_position,
+        "full inventory attestation coordinates are not exact"
+    );
+    anyhow::ensure!(
+        snapshot.assigned.version == ContractVersion::V1
+            && snapshot.assigned.session == current_session
+            && snapshot.assigned.desired_specs.as_slice() == std::slice::from_ref(expected_desired),
+        "accepted full fingerprint is not bound to the exact assigned Desired"
+    );
+    anyhow::ensure!(
+        snapshot.full.version == ContractVersion::V1
+            && snapshot.full.complete_inventory
+            && snapshot.full.node_id == current_session.node_id
+            && snapshot.full.node_boot_id == current_session.node_boot_id
+            && snapshot.full.agent_instance_id == current_session.agent_instance_id
+            && snapshot.full.agent_session_epoch == current_session.agent_session_epoch
+            && snapshot.full.inventory_epoch.get() > 0
+            && snapshot.full.inventory_read_position.is_some()
+            && snapshot.full.residue.is_empty(),
+        "serving observation is not a complete, residue-free current-session inventory"
+    );
+
+    let [runtime] = snapshot.full.runtimes.as_slice() else {
+        anyhow::bail!("serving observation must contain exactly one Runtime")
+    };
+    let network_projection_is_exact = match &expected_checkpoint.step {
+        ReconcileStep::PrepareDevice { .. } => runtime.networks.is_empty(),
+        ReconcileStep::PrepareNetwork { network, .. } => {
+            runtime.networks.is_empty() || runtime.networks == vec![observed_network(network)]
+        }
+        _ => false,
+    };
+    anyhow::ensure!(
+        runtime.cat_id == expected_desired.cat_id
+            && runtime.applied_desired.as_ref()
+                == Some(&AppliedDesiredEvidence {
+                    desired_revision: expected_desired.desired_revision,
+                    spec_digest: expected_desired.spec_digest.clone(),
+                    placement: expected_desired.placement.clone(),
+                    target: expected_desired.target,
+                })
+            && runtime.runtime_incarnation == expected_checkpoint.runtime_incarnation
+            && runtime.stable_state == expected_checkpoint.stable_state
+            && runtime.step == expected_checkpoint.step
+            && runtime.mounts.is_empty()
+            && network_projection_is_exact
+            && runtime.guest_transport == GuestTransportEvidence::Unavailable
+            && runtime.warm_snapshot == WarmSnapshotEvidence::Absent
+            && runtime.lifecycle_admission == LifecycleAdmission::Closed
+            && runtime.routes.is_empty()
+            && runtime.platform_guards == 0,
+        "serving Runtime projection is not the exact pre-launch checkpoint"
+    );
+    anyhow::ensure!(
+        runtime
+            .conditions
+            .iter()
+            .any(|condition| matches!(condition,
+            Condition::Progressing {
+                reason: ProgressingReason::ReconcileStep { step }
+            } if step == &expected_checkpoint.step))
+            && runtime.conditions.iter().all(|condition| !matches!(
+                condition,
+                Condition::Blocked { .. }
+                    | Condition::Quarantined { .. }
+                    | Condition::Degraded { .. }
+                    | Condition::PreconditionFailed { .. }
+                    | Condition::DataLossPossible { .. }
+            )),
+        "serving Runtime is blocked, quarantined, or lacks exact progress evidence"
+    );
+    let CheckpointEvidence::Valid {
+        checkpoint_path,
+        content_digest,
+        version,
+        cat_id,
+        node_id,
+        desired_revision,
+        spec_digest: observed_spec_digest,
+        placement_epoch,
+        runtime_incarnation,
+        runtime_launch,
+        stable_state,
+        step,
+        require_idle,
+        updated_at_unix_ms,
+    } = &runtime.checkpoint
+    else {
+        anyhow::bail!("serving Runtime lacks a valid checkpoint digest")
+    };
+    anyhow::ensure!(
+        std::path::Path::new(checkpoint_path.as_str()) == expected_checkpoint_path
+            && content_digest == &checkpoint_content_digest(expected_checkpoint)?
+            && *version == expected_checkpoint.version
+            && cat_id == &expected_checkpoint.cat_id
+            && node_id == &expected_checkpoint.node_id
+            && *desired_revision == expected_checkpoint.desired_revision
+            && observed_spec_digest == &expected_checkpoint.spec_digest
+            && *placement_epoch == expected_checkpoint.placement_epoch
+            && runtime_incarnation == &expected_checkpoint.runtime_incarnation
+            && runtime_launch.as_ref() == &expected_checkpoint.runtime_launch
+            && stable_state == &expected_checkpoint.stable_state
+            && step.as_ref() == &expected_checkpoint.step
+            && require_idle.as_ref() == &expected_checkpoint.require_idle
+            && *updated_at_unix_ms == expected_checkpoint.updated_at_unix_ms,
+        "serving checkpoint evidence is not the exact durable checkpoint"
+    );
+
+    anyhow::ensure!(
+        runtime.processes.as_slice() == std::slice::from_ref(expected_process)
+            && expected_process.process_id > 0
+            && expected_process.process_start_time_ticks.get() > 0
+            && expected_process.state == ProcessState::Running
+            && expected_process.control_handshake == ControlHandshakeEvidence::Verified
+            && expected_process.scope_id == expected_device.serving_process.scope_id
+            && expected_process.control_socket_path
+                == expected_device.serving_process.control_socket_path
+            && expected_process.executable_path == expected_device.serving_process.executable_path
+            && expected_process.ownership_token
+                == OwnershipTokenEvidence::Valid {
+                    ownership_token: expected_device
+                        .serving_process
+                        .process_identity_token
+                        .clone(),
+                }
+            && expected_process.role
+                == ProcessRole::Blockd {
+                    volume_id: expected_device.volume_id.clone(),
+                    attachment_id: expected_device.attachment_id.clone(),
+                    attachment_epoch: expected_device.attachment_epoch,
+                },
+        "serving process is not the exact retained PID/start/role/epoch/token"
+    );
+
+    let [intent] = expected_desired.volumes.as_slice() else {
+        anyhow::bail!("focused serving Desired must contain exactly one volume")
+    };
+    let [volume] = runtime.volumes.as_slice() else {
+        anyhow::bail!("serving observation must contain exactly one volume")
+    };
+    anyhow::ensure!(
+        intent.access == VolumeAccess::ReadWriteOnce
+            && intent.disposition == VolumeDisposition::Retain
+            && intent.mount.is_none()
+            && expected_device.volume_intent_id == intent.volume_intent_id
+            && expected_device.disk_id == intent.disk_id
+            && expected_device.volume_id == intent.volume_id
+            && expected_device.disk_kind == intent.disk_kind
+            && expected_device.attachment_id == intent.attachment_id
+            && expected_device.size_bytes == intent.size_bytes
+            && expected_device.durability == intent.durability
+            && expected_device.guest_device == intent.guest_device
+            && match (&intent.acquire, &expected_device.acquire_origin) {
+                (
+                    VolumeAcquire::Normal { transition_id, .. },
+                    AcquireOrigin::Normal {
+                        transition_id: origin,
+                    },
+                ) => transition_id == origin,
+                (
+                    VolumeAcquire::Takeover { authorization_id },
+                    AcquireOrigin::Takeover {
+                        authorization_id: origin,
+                    },
+                ) => authorization_id == origin,
+                _ => false,
+            },
+        "prepared serving device is not the complete Desired volume contract"
+    );
+    anyhow::ensure!(
+        volume.volume_intent_id.as_ref() == Some(&intent.volume_intent_id)
+            && volume.disk_id.as_ref() == Some(&intent.disk_id)
+            && volume.volume_id == intent.volume_id
+            && volume.disk_kind
+                == match intent.disk_kind {
+                    DiskKind::Root => ObservedDiskKind::Root,
+                    DiskKind::Persistent => ObservedDiskKind::Persistent,
+                }
+            && volume.size_bytes == Some(intent.size_bytes)
+            && volume.durability == Some(intent.durability)
+            && volume.authority
+                == VolumeAuthorityEvidence::Owned {
+                    attachment_id: expected_device.attachment_id.clone(),
+                    attachment_epoch: expected_device.attachment_epoch,
+                    head: expected_authority_head.clone(),
+                },
+        "observed volume IDs/kind/size/durability/Owned authority are not exact"
+    );
+    let [lineage] = volume.local_lineages.as_slice() else {
+        anyhow::bail!("serving observation must contain one exact local lineage")
+    };
+    anyhow::ensure!(
+        lineage.attachment_id == expected_device.attachment_id
+            && lineage.attachment_epoch == expected_device.attachment_epoch
+            && lineage.acquire_origin == expected_device.acquire_origin
+            && lineage.node_id == expected_desired.placement.node_id
+            && lineage.placement_epoch == expected_desired.placement.placement_epoch
+            && lineage.local_durable_generation == expected_local_generation
+            && lineage.remote_durable_generation == expected_remote_generation
+            && lineage.data_directory == expected_device.serving_process.data_directory
+            && lineage.pending_pack_count.get() == expected_pending_packs
+            && !lineage.fenced
+            && lineage.state == LocalLineageState::Active,
+        "local lineage origin/node/placement/data-dir/fence/generations are not exact"
+    );
+    let [observed_device] = volume.devices.as_slice() else {
+        anyhow::bail!("serving observation must contain one exact frontend device")
+    };
+    anyhow::ensure!(
+        matches!((&expected_device.frontend, observed_device),
+            (PrepareDeviceFrontend::VhostUserBlk { socket_path, .. }, ObservedDevice::VhostUserBlk {
+                guest_device,
+                socket_path: observed_socket,
+                ownership_token: OwnershipTokenEvidence::Valid { ownership_token },
+            }) if guest_device == &expected_device.guest_device
+                && observed_socket == socket_path
+                && ownership_token == &expected_device.ownership_token),
+        "serving frontend attachment/token is not exact"
+    );
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1493,17 +2789,18 @@ async fn next_installed_process_scan(
 }
 
 #[cfg(target_os = "linux")]
-async fn wait_for_installed_root_process_state(
+async fn wait_for_installed_serving_process_state(
     scanner: &Arc<dyn RuntimeInventoryScanner>,
     cursor: &mut InstalledScanCursor,
     cat_id: &Id,
+    volume_id: &Id,
     expect_live: bool,
 ) -> (NodeObservation, NodeGlobalManagedProcessAdmission) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some((observation, admission)) = next_installed_process_scan(scanner, cursor).await {
             let matching = admission
-                .root_control(cat_id)
+                .serving_blockd(cat_id, volume_id)
                 .is_some_and(|(_, exact)| exact.is_some() == expect_live);
             if matching {
                 return (observation, admission);
@@ -1511,131 +2808,9 @@ async fn wait_for_installed_root_process_state(
         }
         assert!(
             Instant::now() < deadline,
-            "installed scanner did not observe root process live={expect_live}"
+            "installed scanner did not observe serving process live={expect_live}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-#[cfg(target_os = "linux")]
-struct ExactRootProcessFixture<'a> {
-    control: &'a ControlContext,
-    state_path: &'a std::path::Path,
-    authority: Arc<PostgresVolumeDataAuthority>,
-    blob_store: Arc<FixedImageBlob>,
-    aws: &'a HermeticAwsBoundary,
-    cat_id: &'a Id,
-}
-
-#[cfg(target_os = "linux")]
-impl ExactRootProcessFixture<'_> {
-    async fn retire(
-        self,
-        session: &AgentSession,
-        desired: DesiredReadSnapshot,
-        last_observation: &NodeObservation,
-    ) {
-        let state = StateDirectory::unanchored(self.state_path.to_path_buf());
-        let launch = production_authorized_blockd_launch(self.control, &state, self.aws);
-        let probe = production_installed_probe_config(
-            state.clone(),
-            self.authority,
-            self.blob_store,
-            launch.clone(),
-        );
-        let scanner = installed_clean_slate_scanner(
-            probe.clone(),
-            AdmissionCellRegistry::for_state_directory(&state),
-            None,
-        )
-        .expect("compose installed teardown scanner");
-        let ports = installed_root_process_effect_ports(probe)
-            .expect("compose installed teardown retirement bridge");
-        let process = PlatformSystemdRootProvisionProcessPort::platform(
-            RootProvisionSystemdConfig::new(launch).unwrap(),
-            state.clone(),
-        );
-        let mut cursor = InstalledScanCursor::after(session, desired, last_observation);
-
-        let (live_observation, live_admission) =
-            wait_for_installed_root_process_state(&scanner, &mut cursor, self.cat_id, true).await;
-        assert!(live_observation.residue.is_empty());
-        let (expected, exact) = live_admission
-            .root_control(self.cat_id)
-            .expect("fresh installed scan omitted the root-process expectation");
-        let expected = expected.clone();
-        let exact = exact
-            .cloned()
-            .expect("fresh installed scan did not seal the exact live root process");
-        let stop_context = RuntimeDesiredEffectContext::for_test_with_node_global_process(
-            state.clone(),
-            Instant::now() + Duration::from_secs(10),
-            live_admission,
-        );
-        assert!(matches!(
-            process.stop_exact(exact, &stop_context).unwrap(),
-            RootProvisionProcessStop::Submitted | RootProvisionProcessStop::AlreadyAbsent
-        ));
-
-        let (absent_observation, absent_admission) =
-            wait_for_installed_root_process_state(&scanner, &mut cursor, self.cat_id, false).await;
-        assert!(absent_observation.residue.is_empty());
-        let (absent_expected, absent_exact) = absent_admission
-            .root_control(self.cat_id)
-            .expect("post-stop full scan omitted the root-process expectation");
-        assert_eq!(absent_expected, &expected);
-        assert!(absent_exact.is_none());
-        let absent_runtime = absent_observation
-            .runtimes
-            .iter()
-            .find(|runtime| &runtime.cat_id == self.cat_id)
-            .expect("post-stop full scan omitted the checkpointed Cat");
-        assert!(absent_runtime.processes.is_empty());
-        let retire_context = RuntimeDesiredEffectContext::for_test_with_node_global_process(
-            state.clone(),
-            Instant::now() + Duration::from_secs(10),
-            absent_admission,
-        );
-        assert_eq!(
-            ports
-                .retirement
-                .retire_absent_socket_owner(&expected, &retire_context)
-                .unwrap(),
-            ManagedBlockdSocketOwnerRetirement::Retired
-        );
-
-        let (terminal_observation, terminal_admission) =
-            wait_for_installed_root_process_state(&scanner, &mut cursor, self.cat_id, false).await;
-        assert!(terminal_observation.residue.is_empty());
-        let (terminal_expected, terminal_exact) = terminal_admission
-            .root_control(self.cat_id)
-            .expect("terminal full scan omitted the root-process expectation");
-        assert_eq!(terminal_expected, &expected);
-        assert!(terminal_exact.is_none());
-        assert!(terminal_observation
-            .runtimes
-            .iter()
-            .find(|runtime| &runtime.cat_id == self.cat_id)
-            .is_some_and(|runtime| runtime.processes.is_empty()));
-
-        let blockd_root =
-            cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed();
-        let blockd_entries = std::fs::read_dir(blockd_root.path().as_str())
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(
-            blockd_entries.is_empty(),
-            "terminal audit found managed blockd owner residue"
-        );
-        let intent_entries = std::fs::read_dir(state.path().join(BLOCKD_SOCKET_INTENT_NAMESPACE))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(
-            intent_entries.is_empty(),
-            "terminal audit found managed blockd intent residue"
-        );
     }
 }
 
@@ -1700,8 +2875,12 @@ async fn postgres_runtime_schema_write_barrier_calibrates_retired_route_zero_wri
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Linux real systemd PID 1; quality.sh linux runs it explicitly"]
-async fn postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart() {
-    let context = ControlContext::spawn().await;
+async fn postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart(
+) {
+    // The uncordon below crosses the G3 gate: Schedulable requires the Node's
+    // accepted inventory to acknowledge the published route-v2 ring, which
+    // exists only when the control spawns with the route-v2 machine.
+    let context = ControlContext::spawn_route_v2().await;
     let provisioner = Ed25519KeyPair::from_seed_unchecked(&RFC8032_TEST_SEED).unwrap();
     let identity = node_identity(&production_node_signer());
 
@@ -1804,10 +2983,10 @@ async fn postgres_control_and_production_cutover_reconcile_one_created_cat_acros
 
     let state_parent = tempfile::Builder::new()
         .prefix("cpg")
-        .tempdir_in("/tmp")
+        .tempdir_in(safe_state_scratch_parent())
         .unwrap();
     let state_path = state_parent.path().join("state");
-    let aws = HermeticAwsBoundary::start().await;
+    let aws = HermeticAwsBoundary::start(&context.image_blob.key, &context.image_blob.body).await;
     let authority =
         Arc::new(PostgresVolumeDataAuthority::connect(&context.control_store_url, None).unwrap());
     // Model Control and Node as independent clients of the same immutable S3
@@ -1832,7 +3011,7 @@ async fn postgres_control_and_production_cutover_reconcile_one_created_cat_acros
     ))
     .await
     .unwrap();
-    let (initial_session, initial_inventory_epoch) =
+    let (initial_session, initial_durable_registration, initial_inventory_epoch) =
         wait_for_initial_empty_inventory(&context, &state_path, &identity, &first).await;
     next_observation_barrier(
         &mut first_observations,
@@ -1888,6 +3067,16 @@ async fn postgres_control_and_production_cutover_reconcile_one_created_cat_acros
         .into_iter()
         .find(|workspace| workspace.is_default)
         .expect("bootstrap account has one default Workspace");
+    {
+        let admission_workspace =
+            cats_api::runtime_reconciliation::Id::new(workspace.id.clone()).unwrap();
+        tokio::task::block_in_place(|| {
+            cats_control_plane::testsupport::begin_production_qualification_for_product_test(
+                &context.server.state.store,
+                &admission_workspace,
+            );
+        });
+    }
     assert_eq!(
         node_image_blob.reads.load(Ordering::SeqCst),
         0,
@@ -1907,13 +3096,14 @@ async fn postgres_control_and_production_cutover_reconcile_one_created_cat_acros
             "Idempotency-Key",
             "runtime-production-cross-component-create",
         )
-        .body(CAT_CREATE_BODY.to_vec())
+        .body(RELAXED_CAT_CREATE_BODY.to_vec())
         .send()
         .await
         .unwrap();
     let create_body = json_body(create, StatusCode::ACCEPTED).await;
     let created = decode_cat_create_v2_accepted_response(&create_body).unwrap();
-    let create_request: CatCreateV2Request = serde_json::from_slice(CAT_CREATE_BODY).unwrap();
+    let create_request: CatCreateV2Request =
+        serde_json::from_slice(RELAXED_CAT_CREATE_BODY).unwrap();
     assert!(
         context.image_blob.reads.load(Ordering::SeqCst) > 0,
         "Control Cat-create did not validate the immutable image manifest"
@@ -1953,6 +3143,8 @@ async fn postgres_control_and_production_cutover_reconcile_one_created_cat_acros
     let first_fingerprint: serde_json::Value = serde_json::from_str(&first_fingerprint).unwrap();
     let first_session: AgentSession =
         serde_json::from_value(first_fingerprint["session"]["record"].clone()).unwrap();
+    let first_acceptance: ObservationAcceptance =
+        serde_json::from_value(first_fingerprint["receive"]["acceptance"].clone()).unwrap();
     let first_full: NodeObservation =
         serde_json::from_value(first_fingerprint["inventory"]["full_observation"].clone()).unwrap();
     let first_assigned: DesiredReadSnapshot =
@@ -1968,7 +3160,28 @@ async fn postgres_control_and_production_cutover_reconcile_one_created_cat_acros
     let [desired] = first_assigned.desired_specs.as_slice() else {
         panic!("accepted production inventory must bind exactly the created Cat")
     };
-    assert_same_session_lineage(&first_session, &initial_session);
+    validate_current_session_observation(
+        &first_session,
+        &initial_durable_registration,
+        first_acceptance.lease_deadline_unix_ms,
+    )
+    .unwrap();
+    assert!(
+        first_session.lease_deadline_unix_ms >= initial_session.lease_deadline_unix_ms,
+        "first assigned observation regressed the initial accepted deadline"
+    );
+    assert_eq!(
+        first_session.lease_deadline_unix_ms, first_acceptance.lease_deadline_unix_ms,
+        "first assigned Control deadline is not bound to its observation receipt"
+    );
+    assert_eq!(
+        first_acceptance.observation_id, first_full.observation_id,
+        "first assigned acceptance is not bound to its full observation"
+    );
+    assert_eq!(
+        first_acceptance.heartbeat_sequence, first_full.heartbeat_sequence,
+        "first assigned acceptance is not bound to its heartbeat sequence"
+    );
     assert_eq!(
         first_full.agent_session_epoch,
         initial_session.agent_session_epoch
@@ -2067,7 +3280,12 @@ async fn postgres_control_and_production_cutover_reconcile_one_created_cat_acros
     assert_eq!(root.disk_kind, DiskKind::Root);
     assert_eq!(root.access, VolumeAccess::ReadWriteOnce);
     assert_eq!(root.size_bytes, create_request.root_size_bytes);
-    assert_eq!(root.durability, Durability::Strict);
+    assert_eq!(
+        create_request.durability,
+        Durability::Relaxed,
+        "the N6 restart-adoption fixture must exercise unique Relaxed pending data"
+    );
+    assert_eq!(root.durability, create_request.durability);
     assert_eq!(root.guest_device.serial.as_str(), "cats-root");
     assert_eq!(root.guest_device.slot, 0);
     assert_eq!(root.disposition, VolumeDisposition::Retain);
@@ -2237,16 +3455,45 @@ async fn postgres_control_and_production_cutover_reconcile_one_created_cat_acros
 
     let restarted_registration =
         production_registration(identity.clone(), state_path.clone(), &context.release);
-    let (restart_observation_barrier, mut restart_observations, restart_observation_resume) =
-        super::RuntimeObservationBarrierForTest::channel();
-    let restarted = super::spawn_signed_runtime_cutover(production_cutover_config(
-        &context,
-        restarted_registration,
+    let restarted_state = StateDirectory::unanchored(state_path.clone());
+    let restarted_launch = production_authorized_blockd_launch(&context, &restarted_state, &aws);
+    let restarted_probe = production_installed_probe_config(
+        restarted_state.clone(),
         authority.clone(),
         node_image_blob.clone(),
-        &aws,
+        restarted_launch,
+    );
+    let restarted_installed = installed_clean_slate_scanner(
+        restarted_probe,
+        AdmissionCellRegistry::for_state_directory(&restarted_state),
+        None,
+    )
+    .unwrap();
+    let faulting_scanner = Arc::new(FaultInjectingServingScanner::new(
+        restarted_installed,
+        created.cat_id.clone(),
+        volume_id.clone(),
+    ));
+    let restarted_scanner: Arc<dyn RuntimeInventoryScanner> = faulting_scanner.clone();
+    let (
         restart_observation_barrier,
-    ))
+        mut restart_observations,
+        restart_observation_resume,
+        mut restart_effect_steps,
+        restart_effect_dispatches,
+    ) = super::RuntimeObservationBarrierForTest::channel_with_effect_steps();
+    let restarted = super::spawn_signed_runtime_cutover_with_scanner(
+        production_cutover_config(
+            &context,
+            restarted_registration,
+            authority.clone(),
+            node_image_blob.clone(),
+            &aws,
+            restart_observation_barrier,
+        ),
+        Some(restarted_scanner),
+        None,
+    )
     .await
     .unwrap();
     let restart_fingerprint = hold_after_exact_root_process_observation(
@@ -2259,12 +3506,17 @@ async fn postgres_control_and_production_cutover_reconcile_one_created_cat_acros
         "restarted cutover exact root-process observation",
     )
     .await;
-    shutdown_cutover(
-        restarted,
-        "join restarted production cross-component cutover",
-    )
-    .await;
 
+    let restarted_durable_registration = decode_agent_session(
+        &std::fs::read(state_path.join(crate::agent_registration::SESSION_RELATIVE_PATH)).unwrap(),
+    )
+    .unwrap();
+    let restart_admission = AcceptedFullFingerprint::decode(&restart_fingerprint);
+    assert_current_signed_full_envelope(
+        &restart_admission,
+        &restarted_durable_registration,
+        desired,
+    );
     let restart_fingerprint: serde_json::Value =
         serde_json::from_str(&restart_fingerprint).unwrap();
     let restarted_session: AgentSession =
@@ -2417,24 +3669,1089 @@ async fn postgres_control_and_production_cutover_reconcile_one_created_cat_acros
         "restart performed a same-value PostgreSQL UPDATE of the settled A22 row"
     );
 
-    // The runner has joined. Rebuild the installed production scanner and
-    // process ports, bind a fresh full scan through production observation
-    // coordinates, stop only its exact retained process proof, prove absence
-    // in a successor full scan, retire the managed owner/intent through the
-    // real bridge, and finish with another full physical audit. Only after
-    // all of that may the credential/object-store tripwires be disarmed.
-    ExactRootProcessFixture {
-        control: &context,
-        state_path: &state_path,
-        authority: authority.clone(),
-        blob_store: node_image_blob.clone(),
-        aws: &aws,
-        cat_id: &created.cat_id,
-    }
-    .retire(&restarted_session, restarted_assigned, &restarted_full)
+    // Let the adopted Root control process finish the immutable image handoff,
+    // then stop at an accepted full inventory which proves the exact serving
+    // process. This is the first point where Guest I/O is authorized.
+    restart_observation_resume
+        .send(())
+        .expect("resume adopted Root process toward serving handoff");
+    let serving_fingerprint = hold_after_exact_serving_process_observation(
+        &context,
+        &identity.node_id,
+        &created.cat_id,
+        &restarted,
+        &mut restart_observations,
+        &restart_observation_resume,
+        "adopted cutover exact serving-process observation",
+    )
     .await;
-    // The production child opened the configured aws-s3 adapter, but this
-    // control-only attach prefix must stop before the first object operation.
+    let prepare_device_admission = AcceptedFullFingerprint::decode(&serving_fingerprint);
+    let serving_fingerprint: serde_json::Value =
+        serde_json::from_str(&serving_fingerprint).unwrap();
+    let serving_full: NodeObservation =
+        serde_json::from_value(serving_fingerprint["inventory"]["full_observation"].clone())
+            .unwrap();
+    let serving_assigned: DesiredReadSnapshot =
+        serde_json::from_value(serving_fingerprint["inventory"]["assigned_snapshot"].clone())
+            .unwrap();
+    let [serving_desired] = serving_assigned.desired_specs.as_slice() else {
+        panic!("serving assignment must contain exactly the created Desired")
+    };
+    let serving_desired = serving_desired.clone();
+    assert_current_signed_full_envelope(
+        &prepare_device_admission,
+        &restarted_durable_registration,
+        &serving_desired,
+    );
+    let [serving_runtime] = serving_full.runtimes.as_slice() else {
+        panic!("serving inventory must contain exactly the created Cat")
+    };
+    let ReconcileStep::PrepareDevice { devices } = &serving_runtime.step else {
+        panic!("serving inventory did not retain PrepareDevice")
+    };
+    let [prepared] = devices.as_slice() else {
+        panic!("single-Root Cat must retain one prepared serving device")
+    };
+    let prepared = prepared.clone();
+    let [serving_process] = serving_runtime.processes.as_slice() else {
+        panic!("serving inventory must prove exactly one blockd writer")
+    };
+    let serving_process = serving_process.clone();
+    assert_eq!(prepared.durability, Durability::Relaxed);
+    let PrepareDeviceFrontend::VhostUserBlk {
+        socket_path,
+        queues,
+        queue_size,
+    } = &prepared.frontend
+    else {
+        panic!("focused N6 acceptance requires the native vhost-user frontend")
+    };
+    let prepare_device_checkpoint_bytes = std::fs::read(&checkpoint_path).unwrap();
+    let prepare_device_checkpoint =
+        decode_runtime_checkpoint(&prepare_device_checkpoint_bytes).unwrap();
+    assert_eq!(prepare_device_checkpoint.step, serving_runtime.step);
+    let prepare_device_checkpoint_identity = checkpoint_file_identity(&checkpoint_path);
+    let serving_authority_before_tail = authority.load_volume(&prepared.volume_id).unwrap();
+    assert_eq!(
+        serving_authority_before_tail.last_transition,
+        acquired.last_transition
+    );
+
+    // Establish the exact publisher-clean predecessor for the physical
+    // mismatch probes. At this point the retained writer has no pending pack
+    // and both local/remote generations still equal the checkpointed head.
+    // This first unmodified effect proves only the PrepareDevice ->
+    // PrepareNetwork reservation CAS; the calibrated physical TAP positive
+    // follows both negative admissions below.
+    validate_exact_serving_full_observation(
+        &prepare_device_admission,
+        &identity,
+        &restarted_durable_registration,
+        &serving_desired,
+        &checkpoint_path,
+        &prepare_device_checkpoint,
+        &serving_process,
+        &prepared,
+        &serving_authority_before_tail.head,
+        serving_authority_before_tail.head.generation,
+        serving_authority_before_tail.head.generation,
+        0,
+    )
+    .unwrap();
+    assert_eq!(faulting_scanner.applied(), 0);
+    while restart_effect_steps.try_recv().is_ok() {}
+    let prepare_network_row = cats_control_plane::testsupport::runtime_volume_row_fingerprint(
+        &context.server.state.store,
+        prepared.volume_id.clone(),
+    )
+    .await;
+    let prepare_network_puts = aws.put_request_count();
+    let prepare_network_dispatches = restart_effect_dispatches.load(Ordering::SeqCst);
+
+    restart_observation_resume
+        .send(())
+        .expect("resume clean PrepareDevice admission into PrepareNetwork");
+    let prepare_network_admission_fingerprint = hold_after_exact_serving_process_observation(
+        &context,
+        &identity.node_id,
+        &created.cat_id,
+        &restarted,
+        &mut restart_observations,
+        &restart_observation_resume,
+        "production PrepareNetwork accepted observation",
+    )
+    .await;
+    next_serving_adopted(
+        &mut restart_effect_steps,
+        &created.cat_id,
+        "clean PrepareDevice serving adoption",
+    )
+    .await;
+    next_refresh_inventory(
+        &mut restart_effect_steps,
+        &created.cat_id,
+        "clean PrepareDevice positive control",
+    )
+    .await;
+    assert_eq!(
+        restart_effect_dispatches.load(Ordering::SeqCst),
+        prepare_network_dispatches + 1,
+        "clean current-session admission did not cross the runner dispatch boundary"
+    );
+    let prepare_network_checkpoint_bytes = std::fs::read(&checkpoint_path).unwrap();
+    let prepare_network_checkpoint =
+        decode_runtime_checkpoint(&prepare_network_checkpoint_bytes).unwrap();
+    let ReconcileStep::PrepareNetwork {
+        network: reserved_network,
+        ..
+    } = &prepare_network_checkpoint.step
+    else {
+        panic!("positive control did not persist PrepareNetwork")
+    };
+    let reserved_network = reserved_network.clone();
+    assert_ne!(
+        prepare_network_checkpoint_bytes, prepare_device_checkpoint_bytes,
+        "positive control did not persist its PrepareNetwork successor"
+    );
+    assert_ne!(
+        checkpoint_file_identity(&checkpoint_path),
+        prepare_device_checkpoint_identity,
+        "positive control did not atomically replace its PrepareDevice checkpoint"
+    );
+    assert_eq!(
+        cats_control_plane::testsupport::runtime_volume_row_fingerprint(
+            &context.server.state.store,
+            prepared.volume_id.clone(),
+        )
+        .await,
+        prepare_network_row,
+        "PrepareNetwork checkpoint publication mutated PostgreSQL Volume authority"
+    );
+    assert_eq!(aws.put_request_count(), prepare_network_puts);
+    assert!(std::path::Path::new(&format!("/proc/{}", serving_process.process_id)).exists());
+
+    // The wrong-origin / wrong-head faulting negatives were descoped: the
+    // NodeObservation wire contract pins a device-phase runtime's lineage
+    // origin and authority head to the observed step, so neither fault is
+    // expressible on the wire (the earlier contract layer subsumes the
+    // effect-layer LocalContract stop this section originally asserted).
+    // The scanner-side fail-closed rejection is exercised by the wire
+    // contract tests; re-designing wire-expressible negatives is tracked in
+    // DEFERRED.md.
+    let prepare_network_admission =
+        AcceptedFullFingerprint::decode(&prepare_network_admission_fingerprint);
+    assert_current_signed_full_envelope(
+        &prepare_network_admission,
+        &restarted_durable_registration,
+        &serving_desired,
+    );
+    assert_eq!(
+        prepare_network_admission.full.runtimes[0].processes,
+        vec![serving_process.clone()]
+    );
+    assert_reserved_network_absent(
+        &prepare_network_admission,
+        &created.cat_id,
+        &reserved_network,
+        &serving_process,
+        "clean PrepareNetwork admission before dispatch",
+    );
+    validate_exact_serving_full_observation(
+        &prepare_network_admission,
+        &identity,
+        &restarted_durable_registration,
+        &serving_desired,
+        &checkpoint_path,
+        &prepare_network_checkpoint,
+        &serving_process,
+        &prepared,
+        &serving_authority_before_tail.head,
+        serving_authority_before_tail.head.generation,
+        serving_authority_before_tail.head.generation,
+        0,
+    )
+    .unwrap();
+
+    // Resume the clean full observation, require the installed effect to
+    // publish the TAP, and accept a successor scan that proves the exact
+    // reserved identity. This fails if PrepareNetwork always returns
+    // LocalContract or never creates the TAP.
+    let clean_prepare_network_checkpoint_bytes = std::fs::read(&checkpoint_path).unwrap();
+    let clean_prepare_network_checkpoint_identity = checkpoint_file_identity(&checkpoint_path);
+    let clean_prepare_network_row =
+        cats_control_plane::testsupport::runtime_volume_row_fingerprint(
+            &context.server.state.store,
+            prepared.volume_id.clone(),
+        )
+        .await;
+    let clean_prepare_network_authority = authority.load_volume(&prepared.volume_id).unwrap();
+    let clean_prepare_network_puts = aws.put_request_count();
+    let clean_prepare_network_dispatches = restart_effect_dispatches.load(Ordering::SeqCst);
+    let exact_network_cleanup = ExactHostNetworkCleanup::new(&context, &reserved_network);
+    restart_observation_resume
+        .send(())
+        .expect("resume exact clean PrepareNetwork admission into TAP effect");
+    let exact_network_fingerprint = hold_after_exact_serving_process_observation(
+        &context,
+        &identity.node_id,
+        &created.cat_id,
+        &restarted,
+        &mut restart_observations,
+        &restart_observation_resume,
+        "production exact TAP successor after mismatch rejections",
+    )
+    .await;
+    next_serving_adopted(
+        &mut restart_effect_steps,
+        &created.cat_id,
+        "clean PrepareNetwork serving adoption",
+    )
+    .await;
+    next_refresh_inventory(
+        &mut restart_effect_steps,
+        &created.cat_id,
+        "clean PrepareNetwork physical positive control",
+    )
+    .await;
+    assert_eq!(
+        restart_effect_dispatches.load(Ordering::SeqCst),
+        clean_prepare_network_dispatches + 1,
+        "clean PrepareNetwork admission did not cross the runner dispatch boundary"
+    );
+
+    let exact_network = AcceptedFullFingerprint::decode(&exact_network_fingerprint);
+    assert_current_signed_full_envelope(
+        &exact_network,
+        &restarted_durable_registration,
+        &serving_desired,
+    );
+    validate_exact_serving_full_observation(
+        &exact_network,
+        &identity,
+        &restarted_durable_registration,
+        &serving_desired,
+        &checkpoint_path,
+        &prepare_network_checkpoint,
+        &serving_process,
+        &prepared,
+        &serving_authority_before_tail.head,
+        serving_authority_before_tail.head.generation,
+        serving_authority_before_tail.head.generation,
+        0,
+    )
+    .unwrap();
+    let [exact_network_runtime] = exact_network.full.runtimes.as_slice() else {
+        panic!("exact TAP successor did not contain one Runtime")
+    };
+    assert_eq!(
+        exact_network_runtime.networks,
+        vec![observed_network(&reserved_network)],
+        "successor installed scan did not prove the exact reserved TAP"
+    );
+    assert_eq!(
+        exact_network_runtime.processes,
+        vec![serving_process.clone()],
+        "clean PrepareNetwork effect changed the serving PID/start"
+    );
+    // Calibrate the same complete Host-link probe whose earlier negative
+    // results prove that neither faulty admission published this reserved TAP.
+    assert!(host_link_named(&reserved_network.tap_name));
+    assert!(exact_network.full.inventory_epoch > prepare_network_admission.full.inventory_epoch);
+    assert_eq!(faulting_scanner.applied(), 0);
+    assert_eq!(
+        std::fs::read(&checkpoint_path).unwrap(),
+        clean_prepare_network_checkpoint_bytes,
+        "physical TAP publication rewrote the PrepareNetwork checkpoint"
+    );
+    assert_eq!(
+        checkpoint_file_identity(&checkpoint_path),
+        clean_prepare_network_checkpoint_identity,
+        "physical TAP publication replaced the PrepareNetwork checkpoint"
+    );
+    assert_eq!(aws.put_request_count(), clean_prepare_network_puts);
+    assert_eq!(
+        cats_control_plane::testsupport::runtime_volume_row_fingerprint(
+            &context.server.state.store,
+            prepared.volume_id.clone(),
+        )
+        .await,
+        clean_prepare_network_row,
+        "physical TAP publication mutated PostgreSQL Volume authority"
+    );
+    assert_eq!(
+        authority.load_volume(&prepared.volume_id).unwrap(),
+        clean_prepare_network_authority,
+        "physical TAP publication changed exact Volume authority"
+    );
+    assert!(std::path::Path::new(&format!("/proc/{}", serving_process.process_id)).exists());
+
+    let serving_checkpoint_bytes = clean_prepare_network_checkpoint_bytes;
+    let serving_checkpoint = prepare_network_checkpoint;
+    let serving_checkpoint_identity = clean_prepare_network_checkpoint_identity;
+
+    // A successful Relaxed FLUSH must become unique Host data while remote
+    // publication is unavailable. The independent frontend speaks real
+    // vhost-user/virtio-blk; it is not a control-socket shortcut.
+    aws.set_publishes_enabled(false);
+    let mut frontend = cats_blockd::test_vhost_user_frontend::Frontend::connect(
+        std::path::Path::new(socket_path.as_str()),
+        usize::from(*queues),
+        *queue_size,
+        1,
+        false,
+    )
+    .expect("connect independent vhost-user frontend to serving blockd");
+    let payload = (0..4096_u32)
+        .map(|index| ((index * 17 + 29) % 251) as u8)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        frontend
+            .write_at(8, &payload)
+            .expect("write through real vhost-user queue")
+            .status,
+        cats_blockd::test_vhost_user_frontend::STATUS_OK
+    );
+    assert_eq!(
+        frontend
+            .flush()
+            .expect("Relaxed FLUSH through real vhost-user queue")
+            .status,
+        cats_blockd::test_vhost_user_frontend::STATUS_OK
+    );
+    let read_back = frontend
+        .read_at(8, payload.len())
+        .expect("read back Relaxed write through real vhost-user queue");
+    assert_eq!(
+        read_back.status,
+        cats_blockd::test_vhost_user_frontend::STATUS_OK
+    );
+    assert_eq!(read_back.data, payload);
+    let dirty_deadline = Instant::now() + Duration::from_secs(15);
+    let dirty_status = loop {
+        let status = serving_status(&prepared.serving_process.control_socket_path);
+        if status.local_durable_generation > status.remote_durable_generation
+            && status.unpublished_generations > 0
+            && aws.s3.rejected_puts.load(Ordering::SeqCst) > 0
+        {
+            break status;
+        }
+        assert!(
+            Instant::now() < dirty_deadline,
+            "Relaxed write did not remain as a rejected unpublished pack: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(dirty_status.volume_id, prepared.volume_id.as_str());
+    assert_eq!(dirty_status.attachment_id, prepared.attachment_id.as_str());
+    assert_eq!(
+        dirty_status.attachment_epoch,
+        Some(prepared.attachment_epoch)
+    );
+    assert_eq!(dirty_status.mode, "relaxed");
+    assert_eq!(dirty_status.guest_io_enabled, Some(true));
+    assert_eq!(
+        dirty_status.scope_id.as_ref(),
+        Some(&prepared.serving_process.scope_id)
+    );
+    assert_eq!(
+        dirty_status.process_identity_token.as_ref(),
+        Some(&prepared.serving_process.process_identity_token)
+    );
+    assert_eq!(
+        dirty_status.device_ownership_token.as_ref(),
+        Some(&prepared.ownership_token)
+    );
+    assert_eq!(
+        authority.load_volume(&prepared.volume_id).unwrap().head,
+        serving_authority_before_tail.head,
+        "failed background publication must not advance remote authority"
+    );
+
+    // Restart the production Agent composition, releasing its workers and
+    // Host-global lock while the PID1-owned per-Cat service retains the pack.
+    // Survival under an actual `systemctl restart cats-noded` additionally
+    // depends on N5's service/cgroup ownership gate; N6 deliberately does not
+    // duplicate that large PID1 fixture here.
+    shutdown_cutover(
+        restarted,
+        "join serving production cutover before restart adoption",
+    )
+    .await;
+    assert!(std::path::Path::new(&format!("/proc/{}", serving_process.process_id)).exists());
+
+    let adopting_registration =
+        production_registration(identity.clone(), state_path.clone(), &context.release);
+    let (
+        adopting_barrier,
+        mut adopting_observations,
+        adopting_resume,
+        mut adopting_effect_steps,
+        adopting_effect_dispatches,
+    ) = super::RuntimeObservationBarrierForTest::channel_with_effect_steps();
+    let mut adopting = super::spawn_signed_runtime_cutover(production_cutover_config(
+        &context,
+        adopting_registration,
+        authority.clone(),
+        node_image_blob.clone(),
+        &aws,
+        adopting_barrier,
+    ))
+    .await
+    .unwrap();
+    let adopted_fingerprint = hold_after_exact_serving_process_observation(
+        &context,
+        &identity.node_id,
+        &created.cat_id,
+        &adopting,
+        &mut adopting_observations,
+        &adopting_resume,
+        "restarted cutover exact serving-process adoption",
+    )
+    .await;
+    let adopted = AcceptedFullFingerprint::decode(&adopted_fingerprint);
+    let adopted_durable_session = decode_agent_session(
+        &std::fs::read(state_path.join(crate::agent_registration::SESSION_RELATIVE_PATH)).unwrap(),
+    )
+    .unwrap();
+    assert_current_signed_full_envelope(&adopted, &adopted_durable_session, &serving_desired);
+    assert_eq!(adopted.session.agent_session_epoch, Epoch::new(3).unwrap());
+    assert_ne!(
+        adopted.session.agent_instance_id,
+        restarted_session.agent_instance_id
+    );
+    let dirty_local_generation = Generation::new(
+        u64::try_from(dirty_status.local_durable_generation)
+            .expect("dirty local generation is nonnegative"),
+    )
+    .unwrap();
+    let dirty_remote_generation = Generation::new(
+        u64::try_from(dirty_status.remote_durable_generation)
+            .expect("dirty remote generation is nonnegative"),
+    )
+    .unwrap();
+    let dirty_pending_packs = u64::try_from(dirty_status.unpublished_generations).unwrap();
+    validate_exact_serving_full_observation(
+        &adopted,
+        &identity,
+        &adopted_durable_session,
+        &serving_desired,
+        &checkpoint_path,
+        &serving_checkpoint,
+        &serving_process,
+        &prepared,
+        &serving_authority_before_tail.head,
+        dirty_local_generation,
+        dirty_remote_generation,
+        dirty_pending_packs,
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(&checkpoint_path).unwrap(),
+        serving_checkpoint_bytes
+    );
+    assert_eq!(
+        checkpoint_file_identity(&checkpoint_path),
+        serving_checkpoint_identity,
+        "restart rewrote the exact pre-launch checkpoint"
+    );
+
+    let authority_after_adoption = authority.load_volume(&prepared.volume_id).unwrap();
+    assert_eq!(
+        authority_after_adoption.lease_owner,
+        serving_authority_before_tail.lease_owner
+    );
+    assert_eq!(
+        authority_after_adoption.lease_epoch,
+        serving_authority_before_tail.lease_epoch
+    );
+    assert_eq!(
+        authority_after_adoption.head,
+        serving_authority_before_tail.head
+    );
+    assert_eq!(
+        authority_after_adoption.last_transition, serving_authority_before_tail.last_transition,
+        "restart repeated normal acquire or stole its own attachment"
+    );
+    let adopted_dirty_status = serving_status(&prepared.serving_process.control_socket_path);
+    assert_eq!(
+        adopted_dirty_status.local_durable_generation,
+        dirty_status.local_durable_generation
+    );
+    assert_eq!(
+        adopted_dirty_status.remote_durable_generation,
+        dirty_status.remote_durable_generation
+    );
+    assert_eq!(
+        adopted_dirty_status.unpublished_generations,
+        dirty_status.unpublished_generations
+    );
+
+    // Release the observation barrier and require Agent3's signed production
+    // loop to consume this exact dirty admission, run a real Desired effect,
+    // and publish a successor full observation. The pre-launch network effect
+    // correctly stops on R < L; it must not stop/recreate/quarantine the
+    // serving writer or rewrite its checkpoint while unique packs exist.
+    adopting_resume
+        .send(())
+        .expect("resume Agent3 for one production dirty Desired/effect round");
+    let dirty_successor_fingerprint = hold_after_exact_serving_process_observation(
+        &context,
+        &identity.node_id,
+        &created.cat_id,
+        &adopting,
+        &mut adopting_observations,
+        &adopting_resume,
+        "production dirty successor observation",
+    )
+    .await;
+    let dirty_successor = AcceptedFullFingerprint::decode(&dirty_successor_fingerprint);
+    next_serving_adopted(
+        &mut adopting_effect_steps,
+        &created.cat_id,
+        "dirty restarted serving adoption",
+    )
+    .await;
+    next_local_contract_stop(
+        &mut adopting_effect_steps,
+        &created.cat_id,
+        "production dirty Desired/effect round",
+    )
+    .await;
+    validate_exact_serving_full_observation(
+        &dirty_successor,
+        &identity,
+        &adopted_durable_session,
+        &serving_desired,
+        &checkpoint_path,
+        &serving_checkpoint,
+        &serving_process,
+        &prepared,
+        &serving_authority_before_tail.head,
+        dirty_local_generation,
+        dirty_remote_generation,
+        dirty_pending_packs,
+    )
+    .unwrap();
+    assert!(dirty_successor.full.inventory_epoch > adopted.full.inventory_epoch);
+    assert!(dirty_successor.full.heartbeat_sequence > adopted.full.heartbeat_sequence);
+    assert!(dirty_successor.assigned.request_sequence > adopted.assigned.request_sequence);
+    assert_eq!(
+        std::fs::read(&checkpoint_path).unwrap(),
+        serving_checkpoint_bytes,
+        "dirty production effect rewrote the exact pre-launch checkpoint"
+    );
+    assert_eq!(
+        checkpoint_file_identity(&checkpoint_path),
+        serving_checkpoint_identity,
+        "dirty production effect replaced the exact pre-launch checkpoint"
+    );
+    assert_eq!(
+        authority
+            .load_volume(&prepared.volume_id)
+            .unwrap()
+            .last_transition,
+        authority_after_adoption.last_transition,
+        "dirty production effect repeated acquire or stole the writer"
+    );
+
+    // Restore object publication without an out-of-band Drain. The retained
+    // production blockd publisher owns R -> L. Agent3 then consumes the dirty
+    // accepted observation and produces a clean successor full inventory,
+    // still at the same process/checkpoint/attachment epoch.
+    aws.set_publishes_enabled(true);
+    let publish_deadline = Instant::now() + Duration::from_secs(30);
+    let drained = loop {
+        let status = serving_status(&prepared.serving_process.control_socket_path);
+        if status.remote_durable_generation == status.local_durable_generation
+            && status.unpublished_generations == 0
+            && status.unpublished_bytes == 0
+        {
+            break status;
+        }
+        assert!(
+            Instant::now() < publish_deadline,
+            "production Relaxed publisher did not settle the retained tail: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        drained.local_durable_generation,
+        dirty_status.local_durable_generation
+    );
+    assert_eq!(
+        drained.remote_durable_generation,
+        drained.local_durable_generation
+    );
+    assert_eq!(drained.unpublished_generations, 0);
+    assert_eq!(drained.unpublished_bytes, 0);
+    let authority_after_drain = authority.load_volume(&prepared.volume_id).unwrap();
+    assert_eq!(
+        authority_after_drain.lease_owner,
+        authority_after_adoption.lease_owner
+    );
+    assert_eq!(
+        authority_after_drain.lease_epoch,
+        authority_after_adoption.lease_epoch
+    );
+    assert_eq!(
+        authority_after_drain.last_transition,
+        authority_after_adoption.last_transition
+    );
+    assert_eq!(
+        i64::try_from(authority_after_drain.head.generation.get()).unwrap(),
+        drained.remote_durable_generation
+    );
+
+    adopting_resume
+        .send(())
+        .expect("resume Agent3 for production clean successor scan");
+    let clean_fingerprint = hold_after_exact_serving_process_observation(
+        &context,
+        &identity.node_id,
+        &created.cat_id,
+        &adopting,
+        &mut adopting_observations,
+        &adopting_resume,
+        "production clean successor observation",
+    )
+    .await;
+    let clean = AcceptedFullFingerprint::decode(&clean_fingerprint);
+    next_local_contract_stop(
+        &mut adopting_effect_steps,
+        &created.cat_id,
+        "production publisher-clean successor round",
+    )
+    .await;
+    let clean_generation = Generation::new(
+        u64::try_from(drained.local_durable_generation)
+            .expect("clean durable generation is nonnegative"),
+    )
+    .unwrap();
+    validate_exact_serving_full_observation(
+        &clean,
+        &identity,
+        &adopted_durable_session,
+        &serving_desired,
+        &checkpoint_path,
+        &serving_checkpoint,
+        &serving_process,
+        &prepared,
+        &authority_after_drain.head,
+        clean_generation,
+        clean_generation,
+        0,
+    )
+    .unwrap();
+    assert!(clean.full.inventory_epoch > dirty_successor.full.inventory_epoch);
+    assert_eq!(
+        std::fs::read(&checkpoint_path).unwrap(),
+        serving_checkpoint_bytes
+    );
+    assert_eq!(
+        checkpoint_file_identity(&checkpoint_path),
+        serving_checkpoint_identity
+    );
+
+    // Consume the first accepted R == L observation. The production serving
+    // effect must now durably advance the bounded checkpoint to the publisher
+    // head and demand a fresh full inventory. It must not replace the retained
+    // writer or its attachment while closing this stale launch coordinate.
+    let current_session_dispatches = adopting_effect_dispatches.load(Ordering::SeqCst);
+    adopting_resume
+        .send(())
+        .expect("resume current Agent3 clean admission into production effect");
+    let terminal_clean_fingerprint = hold_after_exact_serving_process_observation(
+        &context,
+        &identity.node_id,
+        &created.cat_id,
+        &adopting,
+        &mut adopting_observations,
+        &adopting_resume,
+        "production terminal current-session clean observation",
+    )
+    .await;
+    next_refresh_inventory(
+        &mut adopting_effect_steps,
+        &created.cat_id,
+        "publisher-clean checkpoint progression",
+    )
+    .await;
+    assert_eq!(
+        adopting_effect_dispatches.load(Ordering::SeqCst),
+        current_session_dispatches + 1,
+        "publisher-clean admission did not reach effect dispatch"
+    );
+    let progressed_checkpoint_bytes = std::fs::read(&checkpoint_path).unwrap();
+    let progressed_checkpoint = decode_runtime_checkpoint(&progressed_checkpoint_bytes).unwrap();
+    let progressed_checkpoint_identity = checkpoint_file_identity(&checkpoint_path);
+    assert_ne!(
+        progressed_checkpoint_bytes, serving_checkpoint_bytes,
+        "publisher-clean effect did not durably advance the checkpoint"
+    );
+    assert_ne!(
+        progressed_checkpoint_identity, serving_checkpoint_identity,
+        "publisher-clean effect did not atomically replace the checkpoint"
+    );
+    let ReconcileStep::PrepareNetwork {
+        devices: progressed_devices,
+        ..
+    } = &progressed_checkpoint.step
+    else {
+        panic!("publisher-clean successor changed the checkpoint phase")
+    };
+    let [progressed_prepared] = progressed_devices.as_slice() else {
+        panic!("publisher-clean successor lost its single prepared device")
+    };
+    assert_eq!(
+        progressed_prepared.expected_head,
+        authority_after_drain.head
+    );
+    assert_eq!(
+        progressed_prepared.serving_process, prepared.serving_process,
+        "publisher-clean checkpoint changed the serving process identity"
+    );
+    assert_eq!(
+        progressed_prepared.attachment_epoch, prepared.attachment_epoch,
+        "publisher-clean checkpoint changed the attachment epoch"
+    );
+    let terminal_clean = AcceptedFullFingerprint::decode(&terminal_clean_fingerprint);
+    validate_exact_serving_full_observation(
+        &terminal_clean,
+        &identity,
+        &adopted_durable_session,
+        &serving_desired,
+        &checkpoint_path,
+        &progressed_checkpoint,
+        &serving_process,
+        progressed_prepared,
+        &authority_after_drain.head,
+        clean_generation,
+        clean_generation,
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(&checkpoint_path).unwrap(),
+        progressed_checkpoint_bytes
+    );
+    assert_eq!(
+        checkpoint_file_identity(&checkpoint_path),
+        progressed_checkpoint_identity
+    );
+
+    // Replace the current AgentSession in Control while Agent3 is held after
+    // an accepted full scan. Its next signed Desired read must fail as stale
+    // before any effect can consume that admission. The replacement is sent
+    // directly through the real signed registration endpoint so the active
+    // process's durable session file remains independent epoch-3 evidence.
+    let stale_session_row = cats_control_plane::testsupport::runtime_volume_row_fingerprint(
+        &context.server.state.store,
+        prepared.volume_id.clone(),
+    )
+    .await;
+    let stale_session_puts = aws.put_request_count();
+    let stale_session_dispatches = adopting_effect_dispatches.load(Ordering::SeqCst);
+    let replacement_session =
+        register_replacement_agent_session(&context, &identity, &terminal_clean.session).await;
+    assert_eq!(
+        replacement_session.agent_session_epoch,
+        Epoch::new(4).unwrap()
+    );
+    let still_durable_agent3 = decode_agent_session(
+        &std::fs::read(state_path.join(crate::agent_registration::SESSION_RELATIVE_PATH)).unwrap(),
+    )
+    .unwrap();
+    validate_current_session_observation(
+        &terminal_clean.session,
+        &still_durable_agent3,
+        terminal_clean.acceptance.lease_deadline_unix_ms,
+    )
+    .unwrap();
+    adopting_resume
+        .send(())
+        .expect("resume stale Agent3 after signed session replacement");
+    let stale_error = tokio::time::timeout(Duration::from_secs(30), &mut adopting.runner_task)
+        .await
+        .expect("stale Agent3 did not terminate after session replacement")
+        .expect("join stale Agent3 production runner")
+        .expect_err("stale Agent3 unexpectedly continued into a Desired effect");
+    assert!(
+        format!("{stale_error:#}").contains("signed Runtime session was rejected"),
+        "unexpected stale-session runner result: {stale_error:#}"
+    );
+    assert_eq!(
+        adopting_effect_dispatches.load(Ordering::SeqCst),
+        stale_session_dispatches,
+        "stale AgentSession crossed the runner effect-dispatch boundary"
+    );
+    assert_eq!(
+        std::fs::read(&checkpoint_path).unwrap(),
+        progressed_checkpoint_bytes
+    );
+    assert_eq!(
+        checkpoint_file_identity(&checkpoint_path),
+        progressed_checkpoint_identity
+    );
+    assert_eq!(aws.put_request_count(), stale_session_puts);
+    assert_eq!(
+        cats_control_plane::testsupport::runtime_volume_row_fingerprint(
+            &context.server.state.store,
+            prepared.volume_id.clone(),
+        )
+        .await,
+        stale_session_row
+    );
+    assert!(std::path::Path::new(&format!("/proc/{}", serving_process.process_id)).exists());
+
+    // Rebuild the installed scanner after Agent3 has failed closed so the
+    // later hard-stop absence scan uses a cursor strictly after the last clean
+    // accepted full observation.
+    let state = StateDirectory::unanchored(state_path.clone());
+    let launch = production_authorized_blockd_launch(&context, &state, &aws);
+    let probe = production_installed_probe_config(
+        state.clone(),
+        authority.clone(),
+        node_image_blob.clone(),
+        launch,
+    );
+    let scanner = installed_clean_slate_scanner(
+        probe.clone(),
+        AdmissionCellRegistry::for_state_directory(&state),
+        None,
+    )
+    .unwrap();
+    let ports = installed_root_process_effect_ports(probe).unwrap();
+    let mut cursor = InstalledScanCursor::after(
+        &terminal_clean.session,
+        terminal_clean.assigned.clone(),
+        &terminal_clean.full,
+    );
+    let (stale_session_live, _) = wait_for_installed_serving_process_state(
+        &scanner,
+        &mut cursor,
+        &created.cat_id,
+        &prepared.volume_id,
+        true,
+    )
+    .await;
+    let stale_session_runtime = stale_session_live
+        .runtimes
+        .iter()
+        .find(|runtime| runtime.cat_id == created.cat_id)
+        .expect("stale-session verification scan omitted the Cat");
+    assert_eq!(
+        stale_session_runtime.processes,
+        vec![serving_process.clone()],
+        "session replacement changed the serving PID/start before any effect"
+    );
+
+    // Dropping the restarted production composition leaves the independently
+    // owned per-Cat unit intact. The exact lifecycle hard stop then kills that
+    // unit's complete control-group; a successor full sweep supplies the
+    // absence authority used for cleanup.
+    drop(adopting);
+    assert!(std::path::Path::new(&format!("/proc/{}", serving_process.process_id)).exists());
+    let stop = Command::new("systemctl")
+        .args(["stop", prepared.serving_process.scope_id.as_str()])
+        .output()
+        .expect("hard-stop exact per-Cat serving unit");
+    assert!(
+        stop.status.success(),
+        "systemctl stop failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let (absent_observation, absent_admission) = wait_for_installed_serving_process_state(
+        &scanner,
+        &mut cursor,
+        &created.cat_id,
+        &prepared.volume_id,
+        false,
+    )
+    .await;
+    assert!(
+        !std::path::Path::new(&format!("/proc/{}", serving_process.process_id)).exists(),
+        "hard stop left the exact serving PID alive"
+    );
+    assert!(
+        absent_observation.residue.is_empty(),
+        "unexpected residue: {:?}",
+        absent_observation.residue
+    );
+    let (absent_expected, absent_exact) = absent_admission
+        .serving_blockd(&created.cat_id, &prepared.volume_id)
+        .expect("post-stop scan omitted serving expectation");
+    assert!(absent_exact.is_none());
+    let absent_expected = absent_expected.clone();
+    let retire_context = RuntimeDesiredEffectContext::for_test_with_node_global_process(
+        state.clone(),
+        Instant::now() + Duration::from_secs(10),
+        absent_admission,
+    );
+    assert_eq!(
+        retire_absent_serving_socket_owner_for_test(
+            ports.serving.as_ref(),
+            &absent_expected,
+            &retire_context,
+        )
+        .unwrap(),
+        ManagedBlockdSocketOwnerRetirement::Retired
+    );
+    drop(frontend);
+
+    // Reconstruct the acknowledged dirty sector after the retained writer is
+    // gone. The new engine starts with no cache or pending-pack directory (it
+    // receives only the immutable lineage identity required to open the exact
+    // grant) and reads through an independent S3 client plus the PostgreSQL
+    // authority; none of the stopped writer's data files are reachable.
+    let remote_cache_parent = tempfile::Builder::new()
+        .prefix("cats-n6-remote-only")
+        .tempdir_in(safe_state_scratch_parent())
+        .unwrap();
+    let remote_cache = remote_cache_parent.path().join("empty-cache");
+    assert!(
+        !remote_cache.exists(),
+        "remote-only cache was not initially empty"
+    );
+    std::fs::create_dir(&remote_cache).unwrap();
+    std::fs::copy(
+        std::path::Path::new(prepared.serving_process.data_directory.as_str()).join(IDENTITY_FILE),
+        remote_cache.join(IDENTITY_FILE),
+    )
+    .unwrap();
+    assert!(!remote_cache.join("cache.data").exists());
+    assert!(!remote_cache
+        .join(cats_api::blockd::PENDING_PACK_DIR)
+        .exists());
+    let mut authorized_attachment: AuthorizedServingAttachment = serde_json::from_slice(
+        &std::fs::read(
+            std::path::Path::new(prepared.serving_process.data_directory.as_str())
+                .join(AUTHORIZED_SERVING_FILE),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    // AUTHORIZED_SERVING_FILE is the immutable acquire-time blank grant by
+    // design (the handoff artifacts carry the provisioned authority); it must
+    // still name the exact head its own acquire result minted.
+    {
+        let cats_storage::authority::AuthorizedServingAcquire::Normal { result, .. } =
+            &authorized_attachment.acquire
+        else {
+            panic!("immutable acquire grant lost its normal acquire origin")
+        };
+        assert_eq!(
+            authorized_attachment.head, result.resulting_head,
+            "immutable acquire grant lost its acquire-origin head"
+        );
+    }
+    // The immutable artifact supplies lineage and acquire authority; the
+    // independently reread PostgreSQL record supplies the later exact head.
+    authorized_attachment.head = authority_after_drain.head.clone();
+    // The S3 store and engine own blocking runtimes; construct, attach,
+    // read and drop them off the async test executor.
+    let remote_s3_endpoint = aws.s3_endpoint.clone();
+    let remote_volume_id = prepared.volume_id.as_str().to_owned();
+    let remote_attachment_id = prepared.attachment_id.as_str().to_owned();
+    let remote_cache_path = remote_cache.clone();
+    let remote_authority = authority.clone();
+    let payload_len = payload.len();
+    let remote_payload = tokio::task::spawn_blocking(move || {
+        let remote_blob: Arc<dyn BlobStore> = Arc::new(
+            AwsS3BlobStore::new(AwsS3Config {
+                endpoint: remote_s3_endpoint,
+                bucket: "cats-cross-component".to_owned(),
+                region: AWS_REGION.to_owned(),
+                access_key: "AKIAHERMETICCATS".to_owned(),
+                secret_key: "hermetic-secret-access-key".to_owned(),
+                session_token: Some("hermetic-session-token".to_owned()),
+                prefix: AWS_PREFIX.to_owned(),
+            })
+            .unwrap(),
+        );
+        let mut remote_cfg = cats_blockd::engine::EngineConfig::new(
+            &remote_volume_id,
+            &remote_cache_path,
+            &remote_attachment_id,
+        );
+        remote_cfg.durability = cats_blockd::engine::DurabilityMode::Relaxed {
+            drain_interval_ms: 0,
+        };
+        remote_cfg.lease_ttl_ms = 60_000;
+        let remote_engine = cats_blockd::engine::ChunkEngine::attach_authorized_serving(
+            remote_cfg,
+            authorized_attachment,
+            remote_blob,
+            remote_authority,
+        )
+        .expect("reconstruct publisher-clean attachment from remote authority");
+        let mut remote_payload = vec![0u8; payload_len];
+        remote_engine
+            .read(8 * 512, &mut remote_payload)
+            .expect("hydrate dirty sector from remote objects into empty cache");
+        drop(remote_engine);
+        remote_payload
+    })
+    .await
+    .expect("join remote-only reconstruction");
+    assert_eq!(
+        remote_payload, payload,
+        "remote-only reconstruction lost the acknowledged dirty sector"
+    );
+    let authority_after_remote_read = authority.load_volume(&prepared.volume_id).unwrap();
+    assert_eq!(
+        authority_after_remote_read.lease_owner,
+        authority_after_drain.lease_owner
+    );
+    assert_eq!(
+        authority_after_remote_read.lease_epoch,
+        authority_after_drain.lease_epoch
+    );
+    assert_eq!(authority_after_remote_read.head, authority_after_drain.head);
+
+    let blockd_root = cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::installed();
+    assert!(
+        std::fs::read_dir(blockd_root.path().as_str())
+            .unwrap()
+            .next()
+            .is_none(),
+        "terminal audit found a managed blockd owner or orphan child"
+    );
+    assert!(
+        std::fs::read_dir(state.path().join(BLOCKD_SOCKET_INTENT_NAMESPACE))
+            .unwrap()
+            .next()
+            .is_none(),
+        "terminal audit found a managed blockd intent"
+    );
+    exact_network_cleanup.remove();
+    assert!(
+        !host_link_named(&reserved_network.tap_name),
+        "terminal audit found the exact focused-test Host TAP"
+    );
+
+    // One strictly later full production scan is the terminal absence oracle.
+    // The assigned Cat remains represented by its bounded checkpoint, but its
+    // complete physical inventory and the Node-global residue set are empty.
+    let (terminal_inventory, _) = loop {
+        if let Some(complete) = next_installed_process_scan(&scanner, &mut cursor).await {
+            break complete;
+        }
+    };
+    assert!(terminal_inventory.complete_inventory);
+    assert!(terminal_inventory.residue.is_empty());
+    let [terminal_runtime] = terminal_inventory.runtimes.as_slice() else {
+        panic!("terminal full inventory lost its assigned Cat projection")
+    };
+    assert_eq!(terminal_runtime.cat_id, created.cat_id);
+    assert!(terminal_runtime.processes.is_empty());
+    assert!(terminal_runtime.mounts.is_empty());
+    assert!(terminal_runtime.networks.is_empty());
+    assert!(terminal_runtime
+        .volumes
+        .iter()
+        .all(|volume| volume.devices.is_empty()));
+
     aws.shutdown().await;
 
     let successor = production_registration(identity, state_path, &context.release);
@@ -2444,8 +4761,415 @@ async fn postgres_control_and_production_cutover_reconcile_one_created_cat_acros
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gateway_control_node_route_v2_mtls_serves_http_ws_and_rejects_closed_stale_epoch() {
+    use cats_api::route_grant_v2::{RouteAdmissionV2Reason, RouteGrantV2PublicKey};
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use tokio::io::AsyncWriteExt as _;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let guest = tokio::net::TcpListener::bind("127.0.0.1:8080")
+        .await
+        .expect("bind the Cat-create v2 fixed target port");
+    let guest_accepts = Arc::new(AtomicUsize::new(0));
+    let guest_accepts_task = Arc::clone(&guest_accepts);
+    let (guest_shutdown, mut guest_shutdown_rx) = tokio::sync::oneshot::channel();
+    let guest_task = tokio::spawn(async move {
+        let (mut http, _) = guest.accept().await.unwrap();
+        guest_accepts_task.fetch_add(1, Ordering::SeqCst);
+        let head = route_v2_read_http_head(&mut http).await;
+        assert!(std::str::from_utf8(&head)
+            .unwrap()
+            .starts_with("GET /http HTTP/1.1\r\n"));
+        http.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\npong")
+            .await
+            .unwrap();
+        drop(http);
+
+        let (websocket, _) = guest.accept().await.unwrap();
+        guest_accepts_task.fetch_add(1, Ordering::SeqCst);
+        let mut websocket = tokio_tungstenite::accept_async(websocket).await.unwrap();
+        let payload = websocket.next().await.unwrap().unwrap();
+        assert_eq!(payload, Message::Text("ws-payload".into()));
+        websocket.send(payload).await.unwrap();
+        let _ = websocket.next().await;
+        drop(websocket);
+
+        tokio::select! {
+            _ = &mut guest_shutdown_rx => {}
+            accepted = guest.accept() => {
+                let _ = accepted.unwrap();
+                guest_accepts_task.fetch_add(1, Ordering::SeqCst);
+                panic!("closed or stale-epoch request reached the Guest listener");
+            }
+        }
+    });
+
+    let route_public_key = RouteGrantV2PublicKey::from_public_key_pem(include_bytes!(
+        "../../../tests/fixtures/route_grant_v2_public_ed25519.pem"
+    ))
+    .unwrap();
+    assert_eq!(route_public_key.kid().as_str(), ROUTE_V2_KID);
+    let route_ring =
+        RouteGrantV2KeyRing::new(Epoch::new(1).unwrap(), vec![route_public_key]).unwrap();
+    let node_directory = tempfile::tempdir().unwrap();
+    let registry = AdmissionCellRegistry::new(node_directory.path().join("checkpoints"));
+    let node_config = RouteV2MachineConfig::for_test(
+        "127.0.0.1:0".to_owned(),
+        id("node_cross_component_a"),
+        include_bytes!("../../../control-plane/tests/fixtures/gateway_machine_ca_certificate.pem"),
+        include_bytes!(
+            "../../../control-plane/tests/fixtures/gateway_machine_server_certificate.pem"
+        ),
+        include_bytes!(
+            "../../../control-plane/tests/fixtures/gateway_machine_server_private_key.pem"
+        ),
+        Arc::new(RouteGrantV2Verifier::new(route_ring)),
+    )
+    .unwrap();
+    let mut node_listener = RouteV2MachineListener::spawn(node_config, Arc::clone(&registry))
+        .await
+        .unwrap();
+
+    let context = ControlContext::spawn_route_v2().await;
+    let provisioner = Ed25519KeyPair::from_seed_unchecked(&RFC8032_TEST_SEED).unwrap();
+    let node_signer = Ed25519RequestSigner::from_pkcs8_pem(
+        id("credential_cross_component_a"),
+        include_bytes!("../../../tests/fixtures/route_grant_private_ed25519.pem"),
+    )
+    .unwrap();
+    let identity = node_identity(&node_signer);
+    let state_parent = tempfile::tempdir().unwrap();
+    let registration = AgentRegistrationConfig::for_loopback_test(
+        identity.clone(),
+        node_signer,
+        state_parent.path().join("node-state"),
+        NodeBootId::new("22222222222222222222222222222222").unwrap(),
+        &context.release,
+    )
+    .unwrap();
+    let node_transport_target =
+        NodeTransportTarget::new(format!("https://localhost:{}", node_listener.addr().port()))
+            .unwrap();
+    let mut cordoned_policy =
+        placement_policy(&context.release, 1, RuntimeSchedulingState::Cordoned);
+    cordoned_policy.node_transport_target = node_transport_target.clone();
+    let provision = RuntimeNodeAuthorityApply {
+        version: ContractVersion::V1,
+        apply_id: random("cccccccccccccccccccccccccccccccc"),
+        node_id: identity.node_id.clone(),
+        mutation: RuntimeNodeAuthorityMutation::Provision {
+            node_identity: Box::new(identity.clone()),
+            placement_policy: Box::new(cordoned_policy),
+        },
+    };
+    assert_eq!(
+        apply_node_authority(&context, &provisioner, &provision).await,
+        RuntimeNodeAuthorityOutcome::Provisioned
+    );
+    let session = tokio::time::timeout(
+        Duration::from_secs(10),
+        registration.register_until_session(&context.server.base_url()),
+    )
+    .await
+    .expect("A19 registration did not complete")
+    .unwrap();
+
+    let scanner = Arc::new(RouteReadyScanner::default());
+    let effect = Arc::new(RecordingRefreshEffect::default());
+    let client = RuntimeSpineHttpClient::for_loopback_test(
+        &context.server.base_url(),
+        registration.runtime_request_signer(),
+    )
+    .unwrap();
+    let mut runner = RuntimeSpineRunner::new_with_desired_effects(
+        registration.runtime_state_directory(),
+        session.clone(),
+        client.clone(),
+        scanner.clone(),
+        effect.clone(),
+    )
+    .unwrap();
+    assert!(matches!(
+        next_step(&mut runner).await,
+        RuntimeSpineRunStep::DesiredAccepted
+    ));
+    let ready_observation = next_step(&mut runner).await;
+    assert!(
+        matches!(
+            ready_observation,
+            RuntimeSpineRunStep::ObservationAccepted { .. }
+        ),
+        "unexpected ready-observation step: {ready_observation:?}"
+    );
+    assert!(scanner.records.lock().unwrap()[0]
+        .desired
+        .desired_specs
+        .is_empty());
+
+    let mut schedulable_policy =
+        placement_policy(&context.release, 2, RuntimeSchedulingState::Schedulable);
+    schedulable_policy.node_transport_target = node_transport_target;
+    let uncordon = RuntimeNodeAuthorityApply {
+        version: ContractVersion::V1,
+        apply_id: random("dddddddddddddddddddddddddddddddd"),
+        node_id: identity.node_id.clone(),
+        mutation: RuntimeNodeAuthorityMutation::UpdatePolicy {
+            expected_policy_revision: Epoch::new(1).unwrap(),
+            placement_policy: Box::new(schedulable_policy),
+        },
+    };
+    assert_eq!(
+        apply_node_authority(&context, &provisioner, &uncordon).await,
+        RuntimeNodeAuthorityOutcome::PolicyUpdated
+    );
+
+    let workspaces = context
+        .http
+        .get(format!("{}/v1/admin/workspaces", context.server.base_url()))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(workspaces.status(), StatusCode::OK);
+    let workspaces: ListResponse<cats_api::auth::Workspace> =
+        serde_json::from_slice(&workspaces.bytes().await.unwrap()).unwrap();
+    let workspace = workspaces
+        .items
+        .into_iter()
+        .find(|workspace| workspace.is_default)
+        .expect("bootstrap account has one default Workspace");
+    {
+        let admission_workspace =
+            cats_api::runtime_reconciliation::Id::new(workspace.id.clone()).unwrap();
+        tokio::task::block_in_place(|| {
+            cats_control_plane::testsupport::begin_production_qualification_for_product_test(
+                &context.server.state.store,
+                &admission_workspace,
+            );
+        });
+    }
+    let create = context
+        .http
+        .post(format!(
+            "{}/v1/workspaces/{}/cats",
+            context.server.base_url(),
+            workspace.id
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .header(reqwest::header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+        .header(reqwest::header::ACCEPT, JSON_CONTENT_TYPE)
+        .header("Idempotency-Key", "route-v2-cross-component-create")
+        .body(CAT_CREATE_BODY.to_vec())
+        .send()
+        .await
+        .unwrap();
+    let created =
+        decode_cat_create_v2_accepted_response(&json_body(create, StatusCode::ACCEPTED).await)
+            .unwrap();
+
+    assert!(matches!(
+        next_step(&mut runner).await,
+        RuntimeSpineRunStep::DesiredAccepted
+    ));
+    runner.shutdown().await.unwrap();
+    let mut runner = RuntimeSpineRunner::new_with_desired_effects(
+        registration.runtime_state_directory(),
+        session,
+        client,
+        scanner.clone(),
+        effect,
+    )
+    .unwrap();
+    let ready_observation = next_step(&mut runner).await;
+    assert!(
+        matches!(
+            ready_observation,
+            RuntimeSpineRunStep::ObservationAccepted { .. }
+        ),
+        "unexpected ready-observation step: {ready_observation:?}"
+    );
+    let desired = {
+        let records = scanner.records.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].desired.desired_specs.len(), 1);
+        records[1].desired.desired_specs[0].clone()
+    };
+    assert_eq!(desired.cat_id, created.cat_id);
+    let endpoint = desired.endpoints.first().unwrap().clone();
+    assert_eq!(endpoint.protocol, HttpProtocol::Http);
+    assert_eq!(endpoint.target_port, 8080);
+
+    let incarnation = random(ROUTE_RUNTIME_INCARNATION);
+    let active_route = CheckpointRouteGate {
+        binding: RouteGateBinding {
+            workspace_id: desired.workspace_id.clone(),
+            endpoint_id: endpoint.endpoint_id.clone(),
+            hostname: endpoint.hostname.clone(),
+            cat_id: desired.cat_id.clone(),
+            node_id: desired.placement.node_id.clone(),
+            runtime_incarnation: incarnation.clone(),
+            route_epoch: endpoint.route_epoch,
+            protocol: endpoint.protocol,
+            target_port: endpoint.target_port,
+        },
+        gate: RouteGateState::Active,
+    };
+    let active_snapshot = AdmissionSnapshot::new(
+        desired.desired_revision,
+        desired.spec_digest.clone(),
+        desired.placement.clone(),
+        Some(incarnation),
+        LifecycleAdmission::Open,
+        vec![active_route],
+    )
+    .with_guest_ipv4(Ipv4Address::new("127.0.0.1").unwrap());
+    let admission_cell = AdmissionCell::new(active_snapshot).unwrap();
+    registry
+        .insert_cell_for_machine_test(desired.cat_id.clone(), Arc::clone(&admission_cell))
+        .unwrap();
+
+    let control_machine_addr = context
+        .server
+        .gateway_machine_addr
+        .expect("Route v2 Control machine listener is running");
+    let control_target =
+        ControlMachineTarget::new(format!("https://localhost:{}", control_machine_addr.port()))
+            .unwrap();
+    let (resolver, node_client) = gateway_machine_clients_for_test(control_target).unwrap();
+    let node_errors = Arc::new(Mutex::new(Vec::<GatewayNodeRouteV2Error>::new()));
+    let connector_errors = Arc::clone(&node_errors);
+    let connector: TunnelConnector = Arc::new(move |route| {
+        let client = node_client.clone();
+        let errors = Arc::clone(&connector_errors);
+        Box::pin(async move {
+            let outcome = client.open_tunnel(&route).await;
+            if let Err(error) = &outcome {
+                errors.lock().unwrap().push(error.clone());
+            }
+            outcome.map(|tunnel| Box::new(tunnel) as BoxedGatewayTunnel)
+        }) as TunnelFuture
+    });
+    let cache = RouteCache::new(RouteCacheConfig::default(), resolver).unwrap();
+    let gateway = GatewayIngress::new(GatewayIngressConfig::default(), cache, connector).unwrap();
+    let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_addr = gateway_listener.local_addr().unwrap();
+    let (gateway_shutdown, gateway_shutdown_rx) = tokio::sync::oneshot::channel();
+    let gateway_task = tokio::spawn(async move {
+        gateway
+            .serve(gateway_listener, async move {
+                let _ = gateway_shutdown_rx.await;
+            })
+            .await
+    });
+
+    let hostname = endpoint.hostname.as_str().to_owned();
+    let http = route_v2_public_http_request(gateway_addr, &hostname, "/http").await;
+    assert!(
+        http.starts_with(b"HTTP/1.1 200 OK\r\n"),
+        "unexpected public HTTP response {:?}; Node errors: {:?}",
+        String::from_utf8_lossy(&http),
+        node_errors.lock().unwrap()
+    );
+    assert!(http.ends_with(b"\r\n\r\npong"));
+
+    let websocket_request = format!("ws://{hostname}/ws").into_client_request().unwrap();
+    let websocket_tcp = tokio::net::TcpStream::connect(gateway_addr).await.unwrap();
+    let (mut websocket, websocket_response) =
+        tokio_tungstenite::client_async(websocket_request, websocket_tcp)
+            .await
+            .unwrap();
+    assert_eq!(websocket_response.status(), StatusCode::SWITCHING_PROTOCOLS);
+    assert_eq!(admission_cell.active_guards(&endpoint.endpoint_id), Some(1));
+    websocket
+        .send(Message::Text("ws-payload".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        websocket.next().await.unwrap().unwrap(),
+        Message::Text("ws-payload".into())
+    );
+    websocket.close(None).await.unwrap();
+    drop(websocket);
+    let guard_deadline = Instant::now() + Duration::from_secs(3);
+    while admission_cell.active_guards(&endpoint.endpoint_id) != Some(0) {
+        assert!(
+            Instant::now() < guard_deadline,
+            "WebSocket tunnel retained its admission guard after public close"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(guest_accepts.load(Ordering::SeqCst), 2);
+
+    let expected = admission_cell.snapshot();
+    let mut closed_route = expected.endpoints()[0].clone();
+    closed_route.gate = RouteGateState::Closed;
+    let closed = AdmissionSnapshot::new(
+        expected.applied_desired_revision(),
+        expected.spec_digest().clone(),
+        expected.placement().clone(),
+        expected.runtime_incarnation().cloned(),
+        expected.lifecycle_admission(),
+        vec![closed_route],
+    )
+    .with_guest_ipv4(expected.guest_ipv4().cloned().unwrap());
+    admission_cell
+        .port()
+        .close_gate(&expected, &closed, &endpoint.endpoint_id)
+        .unwrap();
+    let gate_closed = route_v2_public_http_request(gateway_addr, &hostname, "/closed").await;
+    assert!(gate_closed.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"));
+    assert!(node_errors.lock().unwrap().iter().any(|error| matches!(
+        error,
+        GatewayNodeRouteV2Error::Admission(failure)
+            if failure.reason == RouteAdmissionV2Reason::GateClosed && !failure.guard_acquired
+    )));
+    assert_eq!(guest_accepts.load(Ordering::SeqCst), 2);
+
+    let mut successor_route = closed.endpoints()[0].clone();
+    successor_route.binding.route_epoch =
+        Epoch::new(successor_route.binding.route_epoch.get() + 1).unwrap();
+    successor_route.gate = RouteGateState::Active;
+    let successor = AdmissionSnapshot::new(
+        Revision::new(closed.applied_desired_revision().get() + 1).unwrap(),
+        Sha256Digest::from_bytes([0x77; 32]),
+        closed.placement().clone(),
+        closed.runtime_incarnation().cloned(),
+        LifecycleAdmission::Open,
+        vec![successor_route],
+    )
+    .with_guest_ipv4(closed.guest_ipv4().cloned().unwrap());
+    admission_cell
+        .port()
+        .install_gate(&closed, &successor, &endpoint.endpoint_id)
+        .unwrap();
+    let stale_epoch = route_v2_public_http_request(gateway_addr, &hostname, "/stale").await;
+    assert!(stale_epoch.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"));
+    assert!(node_errors.lock().unwrap().iter().any(|error| matches!(
+        error,
+        GatewayNodeRouteV2Error::Admission(failure)
+            if failure.reason == RouteAdmissionV2Reason::BindingMismatch
+                && !failure.guard_acquired
+    )));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        guest_accepts.load(Ordering::SeqCst),
+        2,
+        "closed and stale-epoch requests must be rejected before Guest connect"
+    );
+
+    let _ = gateway_shutdown.send(());
+    gateway_task.await.unwrap().unwrap();
+    node_listener.shutdown().await.unwrap();
+    runner.shutdown().await.unwrap();
+    context.server.shutdown().await.unwrap();
+    let _ = guest_shutdown.send(());
+    guest_task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_control_and_restarted_node_runner_reach_one_recorded_cat_effect() {
-    let context = ControlContext::spawn().await;
+    let context = ControlContext::spawn_route_v2().await;
     let provisioner = Ed25519KeyPair::from_seed_unchecked(&RFC8032_TEST_SEED).unwrap();
     let node_signer = Ed25519RequestSigner::from_pkcs8_pem(
         id("credential_cross_component_a"),
@@ -2490,7 +5214,7 @@ async fn postgres_control_and_restarted_node_runner_reach_one_recorded_cat_effec
     .unwrap();
     assert_eq!(session.node_id, identity.node_id);
 
-    let scanner = Arc::new(CompleteAssignedScanner::default());
+    let scanner = Arc::new(RouteReadyScanner::default());
     let effect = Arc::new(RecordingRefreshEffect::default());
     let client = RuntimeSpineHttpClient::for_loopback_test(
         &context.server.base_url(),
@@ -2557,6 +5281,16 @@ async fn postgres_control_and_restarted_node_runner_reach_one_recorded_cat_effec
         .into_iter()
         .find(|workspace| workspace.is_default)
         .expect("bootstrap account has one default Workspace");
+    {
+        let admission_workspace =
+            cats_api::runtime_reconciliation::Id::new(workspace.id.clone()).unwrap();
+        tokio::task::block_in_place(|| {
+            cats_control_plane::testsupport::begin_production_qualification_for_product_test(
+                &context.server.state.store,
+                &admission_workspace,
+            );
+        });
+    }
     let create = context
         .http
         .post(format!(

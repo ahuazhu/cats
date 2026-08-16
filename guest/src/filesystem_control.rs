@@ -113,7 +113,21 @@ impl FilesystemController {
                 match classify_unmounted_expected_or_blank(&request, &initial) {
                     FormatAdmission::Adopt => FilesystemControlOutcomeV1::Exact,
                     FormatAdmission::Blank => {
+                        if let Err(error) =
+                            super::qualification_fault::record_format_invocation(&request)
+                        {
+                            tracing::warn!(
+                                error = %format!("{error:#}"),
+                                "qualification mkfs invocation marker was not recorded"
+                            );
+                        }
                         self.format_ext4(&retained, &request.filesystem.filesystem_uuid, guard)?;
+                        ensure_active(guard)?;
+                        retained
+                            .file
+                            .sync_all()
+                            .context("sync formatted Persistent block device")?;
+                        ensure_active(guard)?;
                         FilesystemControlOutcomeV1::Exact
                     }
                     FormatAdmission::Conflict => FilesystemControlOutcomeV1::Conflict,
@@ -793,7 +807,74 @@ fn ensure_active(guard: EffectGuard) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use cats_api::runtime_reconciliation::{
+        FenceEpoch, FilesystemInitialization, Generation, PersistentFilesystemBinding, RemoteHead,
+    };
+
     use super::*;
+
+    fn initialize_request() -> FilesystemControlRequestV1 {
+        let expected_blank_head = RemoteHead {
+            generation: Generation::new(0).unwrap(),
+            root_hash: None,
+            root_object_id: None,
+        };
+        FilesystemControlRequestV1 {
+            version: GUEST_HOST_CONTROL_PROTOCOL_VERSION_V1,
+            challenge: RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+            timeout_ms: 30_000,
+            operation: FilesystemControlOperationV1::FormatExt4,
+            filesystem: Box::new(PersistentFilesystemBinding {
+                runtime_incarnation: RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+                volume_intent_id: Id::new("intent_data").unwrap(),
+                disk_id: Id::new("disk_data").unwrap(),
+                volume_id: Id::new("volume_data").unwrap(),
+                attachment_id: Id::new("attachment_data").unwrap(),
+                attachment_epoch: FenceEpoch::new(7).unwrap(),
+                size_bytes: 4_096,
+                guest_device: GuestDeviceIdentity {
+                    serial: Id::new("cats-data").unwrap(),
+                    slot: 1,
+                },
+                filesystem_uuid: RandomId128::new("cccccccccccccccccccccccccccccccc").unwrap(),
+                mount_path: HostPath::new("/data").unwrap(),
+                initialization: FilesystemInitialization::Initialize {
+                    initialization_token: RandomId128::new("dddddddddddddddddddddddddddddddd")
+                        .unwrap(),
+                    expected_blank_head: expected_blank_head.clone(),
+                },
+            }),
+            expected_head: expected_blank_head,
+        }
+    }
+
+    fn observation(
+        request: &FilesystemControlRequestV1,
+        filesystem: FilesystemIdentityV1,
+        mounts: Vec<PersistentFilesystemMountV1>,
+    ) -> PersistentFilesystemObservationV1 {
+        PersistentFilesystemObservationV1 {
+            guest_device: request.filesystem.guest_device.clone(),
+            device_path: HostPath::new("/dev/vdb").unwrap(),
+            device_major: 252,
+            device_minor: 16,
+            size_bytes: request.filesystem.size_bytes,
+            filesystem,
+            mounts,
+        }
+    }
+
+    fn expected_mount() -> PersistentFilesystemMountV1 {
+        PersistentFilesystemMountV1 {
+            device_major: 252,
+            device_minor: 16,
+            source_path: HostPath::new("/dev/vdb").unwrap(),
+            mount_root: HostPath::new("/").unwrap(),
+            mount_path: HostPath::new("/data").unwrap(),
+            filesystem_type: Id::new("ext4").unwrap(),
+            access: MountAccess::ReadWrite,
+        }
+    }
 
     #[test]
     fn virtio_slot_and_uuid_rendering_are_exact() {
@@ -860,5 +941,58 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("not a block device"));
+    }
+
+    #[test]
+    fn ambiguous_format_discovery_adopts_only_the_exact_unmounted_uuid() {
+        let request = initialize_request();
+        request.validate().unwrap();
+        let expected_uuid = request.filesystem.filesystem_uuid.clone();
+
+        assert_eq!(
+            classify_unmounted_expected_or_blank(
+                &request,
+                &observation(&request, FilesystemIdentityV1::Blank, Vec::new())
+            ),
+            FormatAdmission::Blank
+        );
+        assert_eq!(
+            classify_unmounted_expected_or_blank(
+                &request,
+                &observation(
+                    &request,
+                    FilesystemIdentityV1::Ext4 {
+                        filesystem_uuid: expected_uuid.clone(),
+                    },
+                    Vec::new(),
+                )
+            ),
+            FormatAdmission::Adopt,
+            "a lost mkfs response must be discovered without formatting twice"
+        );
+
+        for conflicting in [
+            observation(
+                &request,
+                FilesystemIdentityV1::Ext4 {
+                    filesystem_uuid: RandomId128::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap(),
+                },
+                Vec::new(),
+            ),
+            observation(&request, FilesystemIdentityV1::Foreign, Vec::new()),
+            observation(
+                &request,
+                FilesystemIdentityV1::Ext4 {
+                    filesystem_uuid: expected_uuid,
+                },
+                vec![expected_mount()],
+            ),
+        ] {
+            assert_eq!(
+                classify_unmounted_expected_or_blank(&request, &conflicting),
+                FormatAdmission::Conflict,
+                "an unknown, foreign, or already-mounted disk must never be formatted"
+            );
+        }
     }
 }

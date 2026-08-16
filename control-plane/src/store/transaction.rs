@@ -28,6 +28,7 @@ static RETRY_JITTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub(crate) struct AuthorityRequestContext {
     deadline: Instant,
     phase: Arc<AtomicU8>,
+    cancelled: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     before_commit_claim: Arc<std::sync::Mutex<Option<CommitClaimBarrier>>>,
     #[cfg(test)]
@@ -181,6 +182,7 @@ impl AuthorityRequestContext {
         Self {
             deadline,
             phase: Arc::new(AtomicU8::new(AuthorityRequestPhase::Open.raw())),
+            cancelled: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             before_commit_claim: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -192,6 +194,23 @@ impl AuthorityRequestContext {
 
     pub(crate) fn cancel(&self) {
         request_cancel(self.phase.as_ref());
+        self.cancelled.notify_waiters();
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        loop {
+            let notified = self.cancelled.notified();
+            if self.is_cancelled_or_expired() {
+                return;
+            }
+            tokio::select! {
+                biased;
+                () = notified => {}
+                () = tokio::time::sleep_until(tokio::time::Instant::from_std(self.deadline)) => {
+                    return;
+                }
+            }
+        }
     }
 
     pub(crate) fn is_cancelled_or_expired(&self) -> bool {
@@ -212,6 +231,32 @@ impl AuthorityRequestContext {
         let remaining = self.deadline.checked_duration_since(Instant::now())?;
         let millis = remaining.as_millis().min(i32::MAX as u128) as u64;
         (millis > 0).then_some(millis)
+    }
+
+    /// Cancellation checkpoint for a bounded multi-page PostgreSQL request.
+    ///
+    /// Each page shortens both transaction-local timeouts to the request's
+    /// current remaining budget. This prevents a page submitted late in the
+    /// request from inheriting the larger timeout installed at `BEGIN`, and a
+    /// dropped HTTP request is observed before the next page is issued.
+    pub(super) fn refresh_transaction_deadline(
+        &self,
+        transaction: &mut postgres::Transaction<'_>,
+    ) -> AuthorityTxResult<()> {
+        let Some(timeout_ms) = self.remaining_timeout_millis() else {
+            return Err(AuthorityTransactionError::Application(
+                ApiError::unavailable(
+                    "runtime authority request was cancelled or exceeded its deadline",
+                ),
+            ));
+        };
+        let lock_timeout_ms = timeout_ms.min(2_000);
+        transaction
+            .batch_execute(&format!(
+                "SET LOCAL statement_timeout = '{timeout_ms}ms'; \
+                 SET LOCAL lock_timeout = '{lock_timeout_ms}ms'"
+            ))
+            .map_err(AuthorityTransactionError::Postgres)
     }
 
     /// Atomically choose the pre-COMMIT winner. `Open -> CommitOwned` is the
@@ -320,6 +365,7 @@ pub(super) enum AuthorityRequestDisposition<T> {
     Reject(T),
 }
 
+#[derive(Debug)]
 pub(super) enum AuthorityTransactionError {
     Domain(AuthorityError),
     Application(ApiError),
@@ -474,6 +520,32 @@ impl Store {
             )),
             Err(AuthorityExecutionError::PlacementStale) => Err(internal(
                 "unexpected placement-stale marker in an authority read snapshot",
+            )),
+        }
+    }
+
+    /// Runs an HTTP-request-scoped authority facts loader in one read-only
+    /// repeatable-read snapshot. The explicit rollback disposition prevents a
+    /// read from entering commit ambiguity, while the request context applies
+    /// one absolute deadline to queue admission and PostgreSQL statements.
+    pub(super) fn authority_request_read_snapshot<T: Send>(
+        &self,
+        request: &AuthorityRequestContext,
+        mut operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
+    ) -> Result<T> {
+        match self.authority_transaction_outcome_with_hook(
+            move |transaction| operation(transaction).map(AuthorityRequestDisposition::Reject),
+            AuthorityTransactionMode::RepeatableReadOnly,
+            Some(request),
+            || {},
+        ) {
+            Ok(value) => Ok(value),
+            Err(AuthorityExecutionError::Store(error)) => Err(error),
+            Err(AuthorityExecutionError::CandidateCollision) => Err(internal(
+                "unexpected candidate-collision marker in an authority request read snapshot",
+            )),
+            Err(AuthorityExecutionError::PlacementStale) => Err(internal(
+                "unexpected placement-stale marker in an authority request read snapshot",
             )),
         }
     }
@@ -849,17 +921,19 @@ fn run_authority_transaction_attempt<T: Send>(
     }
     .map_err(AttemptFailure::Postgres)?;
     if let Some(request) = request {
-        let Some(timeout_ms) = request.remaining_timeout_millis() else {
-            transaction.rollback().map_err(AttemptFailure::Rollback)?;
-            return Err(AttemptFailure::Application(ApiError::unavailable(
-                "runtime authority request was cancelled or exceeded its deadline",
-            )));
-        };
-        let lock_timeout_ms = timeout_ms.min(2_000);
-        if let Err(error) = transaction.batch_execute(&format!(
-            "SET LOCAL statement_timeout = '{timeout_ms}ms'; \
-                         SET LOCAL lock_timeout = '{lock_timeout_ms}ms'"
-        )) {
+        if let Err(error) = request.refresh_transaction_deadline(&mut transaction) {
+            let error = match error {
+                AuthorityTransactionError::Application(error) => {
+                    transaction.rollback().map_err(AttemptFailure::Rollback)?;
+                    return Err(AttemptFailure::Application(error));
+                }
+                AuthorityTransactionError::Postgres(error) => error,
+                AuthorityTransactionError::Domain(_)
+                | AuthorityTransactionError::CandidateCollision
+                | AuthorityTransactionError::PlacementStale => {
+                    unreachable!("request deadline refresh has only application/PostgreSQL errors")
+                }
+            };
             if let Err(rollback_error) = transaction.rollback() {
                 if client.is_closed() && authority_retry_reason(&error).is_some() {
                     return Err(AttemptFailure::Postgres(error));
@@ -1076,6 +1150,15 @@ pub(super) const fn authority_transaction_attempts() -> usize {
 #[cfg(test)]
 mod request_context_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancellation_waiter_wakes_at_the_absolute_request_deadline() {
+        let context = AuthorityRequestContext::new(Instant::now() + Duration::from_millis(20));
+        tokio::time::timeout(Duration::from_secs(1), context.cancelled())
+            .await
+            .expect("request deadline did not wake its cancellation waiter");
+        assert!(context.is_cancelled_or_expired());
+    }
 
     #[test]
     fn commit_attempt_stays_visible_to_a_racing_http_deadline() {

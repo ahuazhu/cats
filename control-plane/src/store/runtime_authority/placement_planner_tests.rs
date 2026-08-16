@@ -441,6 +441,12 @@ fn first_fit_stops_before_a_larger_corrupt_identity_in_the_same_page() {
         let identity = NodeIdentity {
             version: ContractVersion::V1,
             node_id: id(&format!("node_b{index:03}")),
+            provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+                provider: id("test_provider"),
+                partition: id("test_partition"),
+                account_id: id("test_account"),
+                region: id("test_region"),
+            },
             immutable_host_id: id(&format!("host_b{index:03}")),
             credential_id: id(&format!("credential_b{index:03}")),
             credential_binding: CredentialBinding::PublicKey {

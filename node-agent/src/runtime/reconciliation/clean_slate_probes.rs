@@ -24,16 +24,25 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _};
-use cats_api::blockd::PENDING_PACK_DIR;
+use cats_api::blockd::{PACK_FILE_SUFFIX, PENDING_PACK_DIR};
 use cats_api::chunk;
 use cats_api::runtime_reconciliation::{
     checkpoint_content_digest, decode_runtime_checkpoint, encode_desired_runtime_spec,
-    DesiredRuntimeSpec, DiskKind, HostPath, Id, InventorySource, ObservedDiskKind, ObservedVolume,
-    ReconcileStep, RuntimeCheckpoint, Sequence, Sha256Digest, VolumeAccess, VolumeAcquire,
-    VolumeAdminState, VolumeAuthorityEvidence, VolumeDisposition, VolumeIntent, WireU64,
+    ControlHandshakeEvidence, DesiredRuntimeSpec, DiskKind, Generation, HostPath, Id,
+    InventorySource, NodeResidue, ObservedDiskKind, ObservedVolume, OwnershipTokenEvidence,
+    ProcessState, ReconcileStep, ResidueCheckpointFileEvidence, ResidueLineageEvidence,
+    RuntimeCheckpoint, Sequence, Sha256Digest, VolumeAccess, VolumeAcquire, VolumeAdminState,
+    VolumeAuthorityEvidence, VolumeIntent, WireU64, NODE_OBSERVATION_MAX_RESIDUE_ITEMS,
     RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
 };
-use cats_blockd::format::{decode_bitmap_header, BITMAP_HEADER_LEN};
+#[cfg(feature = "proposed-node-residue-reclamation")]
+use cats_api::runtime_reconciliation::{
+    residue_acquisition_digest, DataDirectoryRetentionReason, ResidueDataDirectoryLineage,
+};
+use cats_blockd::format::{
+    decode_bitmap_header, decode_pack_header, encoded_pack_header_len, PackHeader,
+    BITMAP_HEADER_LEN, ENCODED_PACK_PREFIX_LEN,
+};
 use cats_blockd::target_control::TARGET_CONTROL_AUTHORIZATION_MAX_BYTES;
 #[cfg(test)]
 use cats_storage::authority::VolumeDataAuthority;
@@ -168,6 +177,56 @@ const DEFAULT_SYSTEMD_CGROUP_ROOT: &str = "/sys/fs/cgroup/system.slice";
 const DEFAULT_PROC_ROOT: &str = "/proc";
 const DEFAULT_BLOCK_CLASS_ROOT: &str = "/sys/class/block";
 const DEFAULT_NETWORK_CLASS_ROOT: &str = "/sys/class/net";
+const STATIC_SERVICE_CGROUP_MAX_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StaticServiceIdentity {
+    process_id: u32,
+    executable: PathBuf,
+    control_group: String,
+    expected_units: BTreeSet<Id>,
+}
+
+impl StaticServiceIdentity {
+    fn from_process_facts(process_id: u32, executable: PathBuf, cgroup: &[u8]) -> Option<Self> {
+        let text = std::str::from_utf8(cgroup).ok()?;
+        let mut unified = text.lines().filter_map(|line| line.strip_prefix("0::"));
+        let control_group = unified.next()?;
+        if unified.next().is_some() {
+            return None;
+        }
+        let agent_unit = control_group.strip_prefix("/system.slice/")?;
+        if agent_unit.contains('/') {
+            return None;
+        }
+        let expected_names = match agent_unit {
+            "cats-noded.service" => ["cats-noded.service", "cats-controld.service"],
+            "cats-worker.service" => ["cats-worker.service", "cats-postgres-url.service"],
+            _ => return None,
+        };
+        let expected_units = expected_names
+            .into_iter()
+            .map(Id::new)
+            .collect::<Option<BTreeSet<_>>>()?;
+        Some(Self {
+            process_id,
+            executable,
+            control_group: control_group.to_owned(),
+            expected_units,
+        })
+    }
+
+    fn discover(proc_root: &Path) -> Option<Self> {
+        let process_id = std::process::id();
+        let process = proc_root.join(process_id.to_string());
+        let executable = std::fs::read_link(process.join("exe")).ok()?;
+        let cgroup = std::fs::read(process.join("cgroup")).ok()?;
+        if cgroup.len() > STATIC_SERVICE_CGROUP_MAX_BYTES {
+            return None;
+        }
+        Self::from_process_facts(process_id, executable, &cgroup)
+    }
+}
 
 /// Read-only classification consumed by the serialized pre-scan mutation
 /// lane. Classification never repairs, removes, or rewrites an entry.
@@ -184,6 +243,11 @@ pub(crate) enum LocalPublicationRecoveryEvidence {
     },
     AuthorizedBlockd {
         cat_id: Id,
+    },
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    ReleasedDataDirectoryPrefix {
+        cat_id: Id,
+        retained: Arc<super::residue_reclaim::RetainedEmptyDataDirectoryPrefix>,
     },
     /// The current Takeover target artifact is already the one exact extra
     /// member beyond the checkpoint's prepared set. The checkpoint CAS may
@@ -237,6 +301,10 @@ const METADATA_AUTHORITY_PAGE_LIMIT: usize = 256;
 // volumes. The authority adapter reads at most this closed set plus one row to
 // prove overflow; Node-side publication never accepts the +1 row.
 const METADATA_AUTHORITY_MAX_RECORDS: usize = 65_536;
+// Inventory needs only the immutable lineage header. A larger header remains
+// retained but cannot become exact reclaim evidence; the scanner never reads
+// an unbounded payload merely to classify residue.
+const RESIDUE_PACK_HEADER_MAX_BYTES: usize = 1024 * 1024;
 
 /// One page of the future provider-neutral Node-owner index. The persisted
 /// authority must bind every live writer to `owner_node_id` in the same
@@ -1018,6 +1086,7 @@ struct ProbeConfig {
     cloud_hypervisor_binary: PathBuf,
     blockd_binary: PathBuf,
     guest_agent_binary: PathBuf,
+    static_service_identity: Option<StaticServiceIdentity>,
     linux_sources_supported: bool,
     limits: ProbeLimits,
     root_process_port: Option<Arc<dyn RootProvisionProcessPort>>,
@@ -1050,6 +1119,8 @@ impl ProbeConfig {
             );
         }
         let checkpoint_directory = config.state_directory.path().join(CHECKPOINT_NAMESPACE);
+        let proc_root = PathBuf::from(DEFAULT_PROC_ROOT);
+        let static_service_identity = StaticServiceIdentity::discover(&proc_root);
         let managed_blockd_socket_root =
             Arc::new(RetainedManagedBlockdSocketRoot::open_installed()?);
         let blockd_socket_intents = Arc::new(BlockdSocketIntentStore::open_existing(
@@ -1084,7 +1155,7 @@ impl ProbeConfig {
         Ok(Self {
             state_directory: config.state_directory.clone(),
             checkpoint_directory,
-            proc_root: PathBuf::from(DEFAULT_PROC_ROOT),
+            proc_root,
             systemd_cgroup_root: PathBuf::from(DEFAULT_SYSTEMD_CGROUP_ROOT),
             metering_cgroup_root: config.metering_cgroup_root,
             block_class_root: PathBuf::from(DEFAULT_BLOCK_CLASS_ROOT),
@@ -1093,6 +1164,7 @@ impl ProbeConfig {
             cloud_hypervisor_binary: config.cloud_hypervisor_binary,
             blockd_binary: config.blockd_binary,
             guest_agent_binary: config.guest_agent_binary,
+            static_service_identity,
             linux_sources_supported: cfg!(target_os = "linux"),
             limits: ProbeLimits::default(),
             root_process_port: Some(Arc::new(PlatformSystemdRootProvisionProcessPort::platform(
@@ -1172,11 +1244,8 @@ pub(crate) fn installed_root_process_effect_ports(
     let config = ProbeConfig::installed(config)?;
     let process_paths = ProcessPaths {
         root: config.proc_root.clone(),
-        binaries: vec![
-            config.cloud_hypervisor_binary.clone(),
-            config.blockd_binary.clone(),
-            config.guest_agent_binary.clone(),
-        ],
+        binaries: managed_process_binaries(&config),
+        current_static_service: config.static_service_identity.clone(),
         supported: config.linux_sources_supported,
         limits: config.limits,
     };
@@ -1206,6 +1275,18 @@ pub(crate) fn installed_root_process_effect_ports(
         #[cfg(target_os = "linux")]
         stale_boot_vmm,
     })
+}
+
+fn managed_process_binaries(config: &ProbeConfig) -> Vec<PathBuf> {
+    let mut binaries = vec![
+        config.cloud_hypervisor_binary.clone(),
+        config.blockd_binary.clone(),
+        config.guest_agent_binary.clone(),
+    ];
+    if let Some(identity) = &config.static_service_identity {
+        binaries.push(identity.executable.clone());
+    }
+    binaries
 }
 
 #[cfg(test)]
@@ -1277,6 +1358,7 @@ fn clean_slate_scanner_with_metadata_for_test(
             cloud_hypervisor_binary: config.cloud_hypervisor_binary,
             blockd_binary: config.blockd_binary,
             guest_agent_binary: config.guest_agent_binary,
+            static_service_identity: None,
             linux_sources_supported: true,
             limits: ProbeLimits::default(),
             root_process_port: None,
@@ -1321,11 +1403,8 @@ fn scanner_with_metadata_authority_and_blob(
     let state = config.state_directory.clone();
     let process_paths = ProcessPaths {
         root: config.proc_root.clone(),
-        binaries: vec![
-            config.cloud_hypervisor_binary.clone(),
-            config.blockd_binary.clone(),
-            config.guest_agent_binary.clone(),
-        ],
+        binaries: managed_process_binaries(&config),
+        current_static_service: config.static_service_identity.clone(),
         supported: config.linux_sources_supported,
         limits: config.limits,
     };
@@ -1338,6 +1417,7 @@ fn scanner_with_metadata_authority_and_blob(
         Arc::new(SystemdProbe {
             systemd_root: config.systemd_cgroup_root.clone(),
             metering_root: config.metering_cgroup_root.clone(),
+            static_service_identity: config.static_service_identity.clone(),
             supported: config.linux_sources_supported,
             limits: config.limits,
         }),
@@ -1392,13 +1472,6 @@ fn scanner_with_metadata_authority_and_blob(
         }),
         Arc::new(GuestMountProbe {
             state_directory: state,
-            legacy_socket_root: config.legacy_socket_root.clone(),
-            guest_process_paths: ProcessPaths {
-                root: config.proc_root.clone(),
-                binaries: vec![config.guest_agent_binary.clone()],
-                supported: config.linux_sources_supported,
-                limits: config.limits,
-            },
             limits: config.limits,
         }),
     ];
@@ -1471,6 +1544,7 @@ fn platform_root_process_inventory_bridge(
         state_directory: config.state_directory.clone(),
         process_paths,
         systemd_root: config.systemd_cgroup_root.clone(),
+        static_service_identity: config.static_service_identity.clone(),
         metering_root: config.metering_cgroup_root.clone(),
         legacy_socket_root: config.legacy_socket_root.clone(),
         limits: config.limits,
@@ -1538,13 +1612,10 @@ enum ProbeFact {
 }
 
 fn finish_absence(
-    source: InventorySource,
+    _source: InventorySource,
     facts: &[ProbeFact],
 ) -> anyhow::Result<InventoryAbsence> {
-    if facts.contains(&ProbeFact::Present) {
-        bail!("clean-slate {source:?} residue is present");
-    }
-    if facts.contains(&ProbeFact::Unavailable) {
+    if facts.contains(&ProbeFact::Unavailable) || facts.contains(&ProbeFact::Present) {
         Ok(InventoryAbsence::Unavailable)
     } else {
         Ok(InventoryAbsence::Empty)
@@ -1582,12 +1653,13 @@ impl InventoryAbsenceProbe for RuntimeCheckpointProbe {
                 _ => unreachable!("legacy facts only project empty or unavailable"),
             }
         }
-        scan_runtime_checkpoints(&root, context, self.limits)
+        scan_runtime_checkpoints(&root, self.state_directory.path(), context, self.limits)
     }
 }
 
 fn scan_runtime_checkpoints(
     root: &File,
+    state_path: &Path,
     context: &RuntimeInventoryScanContext,
     limits: ProbeLimits,
 ) -> anyhow::Result<InventoryAbsence> {
@@ -1652,6 +1724,8 @@ fn scan_runtime_checkpoints(
         .collect::<BTreeMap<_, _>>();
 
     let mut checkpoints = BTreeMap::new();
+    let mut corrupt_checkpoints = BTreeMap::new();
+    let mut residue = Vec::new();
     let mut release_rejections = BTreeMap::<Id, (DefiniteReleaseRejection, PathBuf)>::new();
     for entry in entries {
         let Some(name) = entry.name.to_str() else {
@@ -1703,10 +1777,19 @@ fn scan_runtime_checkpoints(
             continue;
         }
         let Some(desired) = desired_by_target.get(name) else {
-            if is_release_rejection_entry(name) {
+            let path = state_path.join(CHECKPOINT_NAMESPACE).join(name);
+            let Some(bytes) = read_residue_regular_at(
+                &directory,
+                &entry,
+                root,
+                RUNTIME_CHECKPOINT_MAX_WIRE_BYTES,
+                context,
+            )?
+            else {
                 return Ok(InventoryAbsence::Unavailable);
-            }
-            bail!("checkpoint namespace retains foreign entry {name}")
+            };
+            residue.push(checkpoint_file_residue(&path, &bytes)?);
+            continue;
         };
         let Some(bytes) = read_strict_regular_at(
             &directory,
@@ -1718,13 +1801,33 @@ fn scan_runtime_checkpoints(
         else {
             return Ok(InventoryAbsence::Unavailable);
         };
-        let checkpoint =
-            decode_runtime_checkpoint(&bytes).context("decode scanned Runtime checkpoint")?;
-        anyhow::ensure!(
-            checkpoint.cat_id == desired.cat_id,
-            "checkpoint filename and Cat identity disagree"
-        );
-        let binding = checkpoint_binding(desired, &checkpoint)?;
+        let checkpoint = match decode_runtime_checkpoint(&bytes) {
+            Ok(checkpoint) => checkpoint,
+            Err(_) => {
+                anyhow::ensure!(
+                    corrupt_checkpoints
+                        .insert(
+                            desired.cat_id.clone(),
+                            Sha256Digest::from_bytes(Sha256::digest(&bytes).into()),
+                        )
+                        .is_none(),
+                    "checkpoint inventory duplicated one Cat"
+                );
+                continue;
+            }
+        };
+        let Ok(binding) = checkpoint_binding(desired, &checkpoint) else {
+            anyhow::ensure!(
+                corrupt_checkpoints
+                    .insert(
+                        desired.cat_id.clone(),
+                        Sha256Digest::from_bytes(Sha256::digest(&bytes).into()),
+                    )
+                    .is_none(),
+                "checkpoint inventory duplicated one Cat"
+            );
+            continue;
+        };
         anyhow::ensure!(
             checkpoints
                 .insert(
@@ -1740,16 +1843,30 @@ fn scan_runtime_checkpoints(
         );
     }
     for (cat_id, (marker, path)) in release_rejections {
-        let evidence = checkpoints
-            .get_mut(&cat_id)
-            .context("definite release rejection lacks its Runtime checkpoint")?;
+        if corrupt_checkpoints.contains_key(&cat_id) {
+            return Ok(InventoryAbsence::Unavailable);
+        }
+        let Some(evidence) = checkpoints.get_mut(&cat_id) else {
+            return Ok(InventoryAbsence::Unavailable);
+        };
         validate_definite_release_rejection(&marker, &evidence.checkpoint, &path)?;
         evidence.definite_release_rejected = true;
     }
-    if checkpoints.is_empty() {
+    if checkpoints.is_empty() && corrupt_checkpoints.is_empty() && residue.is_empty() {
         Ok(InventoryAbsence::Empty)
-    } else {
+    } else if corrupt_checkpoints.is_empty() && residue.is_empty() {
         Ok(InventoryAbsence::RuntimeCheckpoints(checkpoints))
+    } else if corrupt_checkpoints.is_empty() {
+        Ok(InventoryAbsence::RuntimeCheckpointsWithResidue {
+            checkpoints,
+            residue,
+        })
+    } else {
+        Ok(InventoryAbsence::RuntimeCheckpointsWithCorrupt {
+            checkpoints,
+            corrupt_checkpoints,
+            residue,
+        })
     }
 }
 
@@ -1775,6 +1892,37 @@ fn checkpoint_binding(
         "checkpoint revision or placement is ahead of current Desired"
     );
     Ok(DesiredCheckpointBinding::Superseded)
+}
+
+fn checkpoint_file_residue(path: &Path, bytes: &[u8]) -> anyhow::Result<NodeResidue> {
+    match decode_runtime_checkpoint(bytes) {
+        Ok(checkpoint) => valid_checkpoint_file_residue(path, &checkpoint),
+        Err(_) => Ok(NodeResidue::CheckpointFile {
+            checkpoint_path: host_path(path)?,
+            evidence: ResidueCheckpointFileEvidence::Corrupt {
+                raw_content_digest: Sha256Digest::from_bytes(Sha256::digest(bytes).into()),
+            },
+        }),
+    }
+}
+
+fn valid_checkpoint_file_residue(
+    path: &Path,
+    checkpoint: &RuntimeCheckpoint,
+) -> anyhow::Result<NodeResidue> {
+    Ok(NodeResidue::CheckpointFile {
+        checkpoint_path: host_path(path)?,
+        evidence: ResidueCheckpointFileEvidence::Valid {
+            content_digest: checkpoint_content_digest(checkpoint)?,
+            version: checkpoint.version,
+            cat_id: checkpoint.cat_id.clone(),
+            node_id: checkpoint.node_id.clone(),
+            placement_epoch: checkpoint.placement_epoch,
+            desired_revision: checkpoint.desired_revision,
+            spec_digest: checkpoint.spec_digest.clone(),
+            runtime_incarnation: checkpoint.runtime_incarnation.clone(),
+        },
+    })
 }
 
 /// Classify one publication or superseded-checkpoint recovery candidate
@@ -1985,6 +2133,62 @@ pub(crate) fn classify_local_publication_recovery(
         &scan_context,
         ProbeLimits::default(),
     )?;
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    if !data.unattributed_incomplete
+        && data.residue.is_empty()
+        && data.handoff_temps.is_empty()
+        && data.stable_stop_receipts.is_empty()
+        && data.recoverable_stop_receipts.is_empty()
+        && !data.recoverable_cleanup_prefixes.is_empty()
+        && data.recoverable_publication_prefixes.len() == data.recoverable_cleanup_prefixes.len()
+    {
+        let prefix_leaf_count = data
+            .recoverable_cleanup_prefixes
+            .keys()
+            .filter(|prefix| !matches!(prefix, RecoverableAuthorizedBlockdPrefix::Cat { .. }))
+            .count();
+        if data.evidence_count() + prefix_leaf_count == data.leaf_count
+            && data
+                .recoverable_cleanup_prefixes
+                .keys()
+                .all(|prefix| data.recoverable_publication_prefixes.contains(prefix))
+        {
+            for (prefix, retained) in &data.recoverable_cleanup_prefixes {
+                if let Some((cat_id, _)) = checkpoints
+                    .iter()
+                    .find(|(_, checkpoint)| released_cleanup_prefix_matches(checkpoint, prefix))
+                {
+                    return Ok(
+                        LocalPublicationRecoveryEvidence::ReleasedDataDirectoryPrefix {
+                            cat_id: cat_id.clone(),
+                            retained: Arc::clone(retained),
+                        },
+                    );
+                }
+                if let Some((cat_id, _)) = all_checkpoints.iter().find(|(cat_id, checkpoint)| {
+                    context
+                        .coordinates()
+                        .desired
+                        .desired_specs
+                        .iter()
+                        .find(|desired| &desired.cat_id == *cat_id)
+                        .is_some_and(|desired| {
+                            super::lifecycle_steps::cold_membership_detach_cleanup_checkpoint_is_supported(
+                                desired,
+                                checkpoint,
+                            ) && released_cleanup_prefix_matches(checkpoint, prefix)
+                        })
+                }) {
+                    return Ok(
+                        LocalPublicationRecoveryEvidence::ReleasedDataDirectoryPrefix {
+                            cat_id: cat_id.clone(),
+                            retained: Arc::clone(retained),
+                        },
+                    );
+                }
+            }
+        }
+    }
     if data.handoff_temps.len() == 1
         && data.evidence_count() + data.handoff_temps.len() == data.leaf_count
     {
@@ -2122,19 +2326,30 @@ impl InventoryAbsenceProbe for AuthorizedBlockdDataProbe {
         if !scan.complete {
             return Ok(InventoryAbsence::Unavailable);
         }
-        if scan.evidence.is_empty() {
+        if scan.evidence.is_empty() && scan.residue.is_empty() {
             Ok(InventoryAbsence::Empty)
-        } else {
+        } else if scan.residue.is_empty() {
             Ok(InventoryAbsence::AuthorizedBlockd(scan.evidence))
+        } else {
+            Ok(InventoryAbsence::AuthorizedBlockdWithResidue {
+                blockds: scan.evidence,
+                residue: scan.residue,
+            })
         }
     }
 }
 
 struct AuthorizedBlockdDataScan {
     evidence: BTreeMap<Id, BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
+    residue: Vec<NodeResidue>,
     candidate_volume_ids: BTreeSet<Id>,
     observed_volume_paths: BTreeSet<(Id, Id)>,
     recoverable_publication_prefixes: BTreeSet<RecoverableAuthorizedBlockdPrefix>,
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    recoverable_cleanup_prefixes: BTreeMap<
+        RecoverableAuthorizedBlockdPrefix,
+        Arc<super::residue_reclaim::RetainedEmptyDataDirectoryPrefix>,
+    >,
     unattributed_incomplete: bool,
     leaf_count: usize,
     complete: bool,
@@ -2153,6 +2368,13 @@ impl AuthorizedBlockdDataScan {
         checkpoint: &RuntimeCheckpoint,
         target: &VolumeIntent,
     ) -> bool {
+        // Stable residue is reportable physical evidence, but it is never
+        // publication authority. In particular, a target prefix moved under
+        // a foreign Cat/Volume/attachment/epoch name must not look like the
+        // expected target is merely absent and authorize recreating it.
+        if !self.residue.is_empty() {
+            return false;
+        }
         if self.complete {
             return true;
         }
@@ -2240,6 +2462,56 @@ enum RecoverableAuthorizedBlockdPrefix {
         attachment_name: String,
         epoch_name: String,
     },
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+fn released_cleanup_prefix_matches(
+    checkpoint: &RuntimeCheckpoint,
+    prefix: &RecoverableAuthorizedBlockdPrefix,
+) -> bool {
+    let ReconcileStep::CleanupRelease { cleanup } = &checkpoint.step else {
+        return false;
+    };
+    let cats_api::runtime_reconciliation::CleanupTarget::Volume {
+        volume_id,
+        attachment_id,
+        attachment_epoch,
+    } = &cleanup.target
+    else {
+        return false;
+    };
+    if cleanup.volume_release.is_none() {
+        return false;
+    }
+    let attachment_name = format!("attachment-{attachment_id}");
+    let epoch_name = format!("epoch-{}", attachment_epoch.get());
+    match prefix {
+        RecoverableAuthorizedBlockdPrefix::Cat { cat_id } => cat_id == &checkpoint.cat_id,
+        RecoverableAuthorizedBlockdPrefix::Volume {
+            cat_id,
+            volume_id: observed,
+        } => cat_id == &checkpoint.cat_id && observed == volume_id,
+        RecoverableAuthorizedBlockdPrefix::Attachment {
+            cat_id,
+            volume_id: observed,
+            attachment_name: observed_attachment,
+        } => {
+            cat_id == &checkpoint.cat_id
+                && observed == volume_id
+                && observed_attachment == &attachment_name
+        }
+        RecoverableAuthorizedBlockdPrefix::Epoch {
+            cat_id,
+            volume_id: observed,
+            attachment_name: observed_attachment,
+            epoch_name: observed_epoch,
+        } => {
+            cat_id == &checkpoint.cat_id
+                && observed == volume_id
+                && observed_attachment == &attachment_name
+                && observed_epoch == &epoch_name
+        }
+    }
 }
 
 /// One immutable checkpoint-namespace join for the whole data-directory
@@ -2353,6 +2625,42 @@ pub(crate) fn snapshot_runtime_checkpoint_namespace(
     assigned_cats: &RuntimeAssignedCatSet,
     limit: usize,
 ) -> anyhow::Result<Option<RuntimeCheckpointNamespaceSnapshot>> {
+    snapshot_runtime_checkpoint_namespace_inner(root, context, assigned_cats, limit, false)
+}
+
+fn snapshot_runtime_checkpoint_namespace_for_data_inventory(
+    root: &File,
+    context: &RuntimeInventoryScanContext,
+    assigned_cats: &RuntimeAssignedCatSet,
+    limit: usize,
+) -> anyhow::Result<Option<RuntimeCheckpointNamespaceSnapshot>> {
+    let Some(mut snapshot) =
+        snapshot_runtime_checkpoint_namespace_inner(root, context, assigned_cats, limit, true)?
+    else {
+        return Ok(None);
+    };
+    let desired = context
+        .coordinates()
+        .desired
+        .desired_specs
+        .iter()
+        .map(|desired| (&desired.cat_id, desired))
+        .collect::<BTreeMap<_, _>>();
+    snapshot.checkpoints.retain(|cat_id, checkpoint| {
+        desired
+            .get(cat_id)
+            .is_some_and(|desired| checkpoint_binding(desired, checkpoint).is_ok())
+    });
+    Ok(Some(snapshot))
+}
+
+fn snapshot_runtime_checkpoint_namespace_inner(
+    root: &File,
+    context: &dyn RuntimePhysicalReadContext,
+    assigned_cats: &RuntimeAssignedCatSet,
+    limit: usize,
+    omit_corrupt_assigned: bool,
+) -> anyhow::Result<Option<RuntimeCheckpointNamespaceSnapshot>> {
     let directory = match open_state_namespace(root, CHECKPOINT_NAMESPACE)? {
         ManagedDirectory::Open(directory) => directory,
         ManagedDirectory::Missing | ManagedDirectory::Unavailable => return Ok(None),
@@ -2462,12 +2770,12 @@ pub(crate) fn snapshot_runtime_checkpoint_namespace(
         else {
             return Ok(None);
         };
-        let checkpoint =
-            decode_runtime_checkpoint(&bytes).context("decode handoff-index Runtime checkpoint")?;
-        anyhow::ensure!(
-            &checkpoint.cat_id == *cat_id,
-            "handoff index checkpoint filename and Cat identity disagree"
-        );
+        let checkpoint = match decode_runtime_checkpoint(&bytes) {
+            Ok(checkpoint) if &checkpoint.cat_id == *cat_id => checkpoint,
+            Ok(_) | Err(_) if omit_corrupt_assigned => continue,
+            Ok(_) => bail!("handoff index checkpoint filename and Cat identity disagree"),
+            Err(error) => return Err(error).context("decode handoff-index Runtime checkpoint"),
+        };
         anyhow::ensure!(
             checkpoints.insert((*cat_id).clone(), checkpoint).is_none(),
             "handoff index contains duplicate Runtime checkpoints for one Cat"
@@ -2580,19 +2888,46 @@ fn checkpoint_set_recovery_bindings(
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DataDirectoryProjectionBoundary {
+    Epoch,
+    Attachment,
+    Volume,
+    Cat,
+}
+
 fn scan_authorized_blockd_data(
     root: &File,
     state_path: &Path,
     context: &RuntimeInventoryScanContext,
     limits: ProbeLimits,
 ) -> anyhow::Result<AuthorizedBlockdDataScan> {
+    scan_authorized_blockd_data_with_projection_barrier(
+        root,
+        state_path,
+        context,
+        limits,
+        &mut |_| {},
+    )
+}
+
+fn scan_authorized_blockd_data_with_projection_barrier(
+    root: &File,
+    state_path: &Path,
+    context: &RuntimeInventoryScanContext,
+    limits: ProbeLimits,
+    projection_barrier: &mut impl FnMut(DataDirectoryProjectionBoundary),
+) -> anyhow::Result<AuthorizedBlockdDataScan> {
     let directory = match open_state_namespace(root, DATA_NAMESPACE)? {
         ManagedDirectory::Missing => {
             return Ok(AuthorizedBlockdDataScan {
                 evidence: BTreeMap::new(),
+                residue: Vec::new(),
                 candidate_volume_ids: BTreeSet::new(),
                 observed_volume_paths: BTreeSet::new(),
                 recoverable_publication_prefixes: BTreeSet::new(),
+                #[cfg(feature = "proposed-node-residue-reclamation")]
+                recoverable_cleanup_prefixes: BTreeMap::new(),
                 unattributed_incomplete: false,
                 leaf_count: 0,
                 complete: true,
@@ -2604,9 +2939,12 @@ fn scan_authorized_blockd_data(
         ManagedDirectory::Unavailable => {
             return Ok(AuthorizedBlockdDataScan {
                 evidence: BTreeMap::new(),
+                residue: Vec::new(),
                 candidate_volume_ids: BTreeSet::new(),
                 observed_volume_paths: BTreeSet::new(),
                 recoverable_publication_prefixes: BTreeSet::new(),
+                #[cfg(feature = "proposed-node-residue-reclamation")]
+                recoverable_cleanup_prefixes: BTreeMap::new(),
                 unattributed_incomplete: true,
                 leaf_count: 0,
                 complete: false,
@@ -2625,15 +2963,26 @@ fn scan_authorized_blockd_data(
         .map(|desired| (format!("cat-{}", desired.cat_id), desired))
         .collect::<BTreeMap<_, _>>();
     let assigned_cats = context.assigned_cats()?;
-    let checkpoint_snapshot =
-        snapshot_runtime_checkpoint_namespace(root, context, &assigned_cats, limits.state_entries)?;
+    let checkpoint_snapshot = snapshot_runtime_checkpoint_namespace_for_data_inventory(
+        root,
+        context,
+        &assigned_cats,
+        limits.state_entries,
+    )?;
     let mut budget = limits.state_entries;
+    // NodeObservation admits at most 4,096 residue items. Keep one shared
+    // source-wide budget and discover item 4,097 before returning Incomplete;
+    // no per-Cat reset may manufacture an over-limit wire projection.
+    let mut residue_wire_budget = NODE_OBSERVATION_MAX_RESIDUE_ITEMS;
     let Some(cat_entries) = strict_directory_entries(&directory, &mut budget, context)? else {
         return Ok(AuthorizedBlockdDataScan {
             evidence: BTreeMap::new(),
+            residue: Vec::new(),
             candidate_volume_ids: BTreeSet::new(),
             observed_volume_paths: BTreeSet::new(),
             recoverable_publication_prefixes: BTreeSet::new(),
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            recoverable_cleanup_prefixes: BTreeMap::new(),
             unattributed_incomplete: true,
             leaf_count: 0,
             complete: false,
@@ -2644,9 +2993,12 @@ fn scan_authorized_blockd_data(
     };
     let mut scan = AuthorizedBlockdDataScan {
         evidence: BTreeMap::new(),
+        residue: Vec::new(),
         candidate_volume_ids: BTreeSet::new(),
         observed_volume_paths: BTreeSet::new(),
         recoverable_publication_prefixes: BTreeSet::new(),
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        recoverable_cleanup_prefixes: BTreeMap::new(),
         unattributed_incomplete: false,
         leaf_count: 0,
         complete: true,
@@ -2659,14 +3011,47 @@ fn scan_authorized_blockd_data(
         let Some(cat_name) = cat_entry.name.to_str() else {
             bail!("authorized blockd data namespace contains non-UTF-8 Cat entry")
         };
-        let Some(desired) = desired_by_directory.get(cat_name) else {
-            bail!("authorized blockd data namespace retains foreign Cat {cat_name}")
+        let cat_directory = if desired_by_directory.contains_key(cat_name) {
+            open_exact_only_child_directory(&directory, &cat_entry, root, context)
+        } else {
+            context.check_active()?;
+            open_residue_child(&directory, &cat_entry, root)
         };
-        let Some(cat_directory) =
-            open_exact_only_child_directory(&directory, &cat_entry, root, context)?
-        else {
+        let Some(cat_directory) = cat_directory? else {
             scan.complete = false;
             scan.unattributed_incomplete = true;
+            continue;
+        };
+        let Some(desired) = desired_by_directory.get(cat_name) else {
+            // Before the Cat-scoped layout was introduced, this namespace
+            // could contain direct Volume directories. Keep every valid
+            // non-Cat name in the authority candidate set even while the
+            // physical scanner conservatively reports it as residue.
+            if !cat_name.starts_with("cat-") {
+                if let Some(volume_id) = Id::new(cat_name.to_owned()) {
+                    scan.candidate_volume_ids.insert(volume_id);
+                }
+            }
+            let path = state_path.join(DATA_NAMESPACE).join(cat_name);
+            let Some(mut residue) = scan_unassigned_cat_data_with_projection_barrier(
+                root,
+                &cat_directory,
+                &path,
+                cat_name,
+                &mut budget,
+                &mut residue_wire_budget,
+                context,
+                limits.recursion_depth,
+                Some((&directory, &cat_entry)),
+                projection_barrier,
+            )?
+            else {
+                scan.complete = false;
+                scan.unattributed_incomplete = true;
+                continue;
+            };
+            scan.residue.append(&mut residue);
+            drop(cat_directory);
             continue;
         };
         let Some(volume_entries) = strict_directory_entries(&cat_directory, &mut budget, context)?
@@ -2677,10 +3062,25 @@ fn scan_authorized_blockd_data(
         };
         if volume_entries.is_empty() {
             scan.complete = false;
-            scan.recoverable_publication_prefixes
-                .insert(RecoverableAuthorizedBlockdPrefix::Cat {
-                    cat_id: desired.cat_id.clone(),
-                });
+            projection_barrier(DataDirectoryProjectionBoundary::Cat);
+            if !revalidate_directory_entry(&directory, &cat_entry, &cat_directory, root) {
+                scan.unattributed_incomplete = true;
+                continue;
+            }
+            let prefix = RecoverableAuthorizedBlockdPrefix::Cat {
+                cat_id: desired.cat_id.clone(),
+            };
+            scan.recoverable_publication_prefixes.insert(prefix.clone());
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            scan.recoverable_cleanup_prefixes.insert(
+                prefix,
+                Arc::new(
+                    super::residue_reclaim::RetainedEmptyDataDirectoryPrefix::from_scanner(
+                        &[(&directory, cat_entry.name.as_os_str(), &cat_directory)],
+                        context,
+                    )?,
+                ),
+            );
             continue;
         }
         for volume_entry in volume_entries {
@@ -2695,6 +3095,72 @@ fn scan_authorized_blockd_data(
                 .iter()
                 .find(|volume| volume_name == format!("volume-{}", volume.volume_id))
                 .map(|volume| volume.volume_id.clone());
+            if scanned_volume_id.is_none() {
+                let path = state_path
+                    .join(DATA_NAMESPACE)
+                    .join(cat_name)
+                    .join(&volume_name);
+                let Some(volume_directory) =
+                    open_strict_child_directory(&cat_directory, &volume_entry, root)
+                        .unwrap_or_default()
+                else {
+                    scan.complete = false;
+                    scan.unattributed_incomplete = true;
+                    continue;
+                };
+                let Some(allocated_bytes) = observed_allocated_bytes_at(
+                    &volume_directory,
+                    root,
+                    &mut budget,
+                    context,
+                    limits.recursion_depth,
+                )?
+                else {
+                    scan.complete = false;
+                    scan.unattributed_incomplete = true;
+                    continue;
+                };
+                #[cfg(not(feature = "proposed-node-residue-reclamation"))]
+                let _ = allocated_bytes;
+                if residue_wire_budget.checked_sub(1).is_none() {
+                    scan.complete = false;
+                    scan.unattributed_incomplete = true;
+                    return Ok(scan);
+                }
+                residue_wire_budget -= 1;
+                projection_barrier(DataDirectoryProjectionBoundary::Volume);
+                if !revalidate_directory_entry(
+                    &cat_directory,
+                    &volume_entry,
+                    &volume_directory,
+                    root,
+                ) {
+                    scan.complete = false;
+                    scan.unattributed_incomplete = true;
+                    continue;
+                }
+                projection_barrier(DataDirectoryProjectionBoundary::Cat);
+                if !revalidate_directory_entry(&directory, &cat_entry, &cat_directory, root) {
+                    scan.complete = false;
+                    scan.unattributed_incomplete = true;
+                    continue;
+                }
+                scan.residue.push(NodeResidue::DataDirectory {
+                    #[cfg(feature = "proposed-node-residue-reclamation")]
+                    cat_id_hint: Some(desired.cat_id.clone()),
+                    #[cfg(feature = "proposed-node-residue-reclamation")]
+                    disk_id_hint: None,
+                    volume_id_hint: volume_name.strip_prefix("volume-").and_then(Id::new),
+                    data_directory: host_path(&path)?,
+                    #[cfg(feature = "proposed-node-residue-reclamation")]
+                    allocated_bytes,
+                    #[cfg(feature = "proposed-node-residue-reclamation")]
+                    retention_reason: DataDirectoryRetentionReason::AuthorityProofPending,
+                    ownership_token: OwnershipTokenEvidence::Missing,
+                    lineage: ResidueLineageEvidence::Unreadable,
+                });
+                continue;
+            }
             if let Some(volume_id) = &scanned_volume_id {
                 scan.observed_volume_paths
                     .insert((desired.cat_id.clone(), volume_id.clone()));
@@ -2707,22 +3173,50 @@ fn scan_authorized_blockd_data(
                 scan.complete = false;
                 continue;
             };
-            let (attachment_name, attachment_directory) = match descend_only_directory(
+            let (attachment_entry, attachment_directory) = match descend_only_directory(
                 &volume_directory,
                 root,
                 &mut budget,
                 context,
                 "attachment",
             )? {
-                OnlyDirectoryDescent::Open { name, directory } => (name, directory),
+                OnlyDirectoryDescent::Open { entry, directory } => (entry, directory),
                 OnlyDirectoryDescent::Empty => {
                     scan.complete = false;
                     if let Some(volume_id) = &scanned_volume_id {
-                        scan.recoverable_publication_prefixes.insert(
-                            RecoverableAuthorizedBlockdPrefix::Volume {
-                                cat_id: desired.cat_id.clone(),
-                                volume_id: volume_id.clone(),
-                            },
+                        projection_barrier(DataDirectoryProjectionBoundary::Volume);
+                        if !revalidate_directory_entry(
+                            &cat_directory,
+                            &volume_entry,
+                            &volume_directory,
+                            root,
+                        ) {
+                            scan.unattributed_incomplete = true;
+                            continue;
+                        }
+                        projection_barrier(DataDirectoryProjectionBoundary::Cat);
+                        if !revalidate_directory_entry(&directory, &cat_entry, &cat_directory, root)
+                        {
+                            scan.unattributed_incomplete = true;
+                            continue;
+                        }
+                        let prefix = RecoverableAuthorizedBlockdPrefix::Volume {
+                            cat_id: desired.cat_id.clone(),
+                            volume_id: volume_id.clone(),
+                        };
+                        scan.recoverable_publication_prefixes.insert(prefix.clone());
+                        #[cfg(feature = "proposed-node-residue-reclamation")]
+                        scan.recoverable_cleanup_prefixes.insert(
+                            prefix,
+                            Arc::new(
+                                super::residue_reclaim::RetainedEmptyDataDirectoryPrefix::from_scanner(
+                                    &[
+                                        (&directory, cat_entry.name.as_os_str(), &cat_directory),
+                                        (&cat_directory, volume_entry.name.as_os_str(), &volume_directory),
+                                    ],
+                                    context,
+                                )?,
+                            ),
                         );
                     }
                     continue;
@@ -2732,23 +3226,57 @@ fn scan_authorized_blockd_data(
                     continue;
                 }
             };
-            let (epoch_name, epoch_directory) = match descend_only_directory(
+            let attachment_name = attachment_entry
+                .name
+                .to_str()
+                .context("authorized blockd attachment path is not UTF-8")?
+                .to_owned();
+            let (epoch_entry, epoch_directory) = match descend_only_directory(
                 &attachment_directory,
                 root,
                 &mut budget,
                 context,
                 "epoch",
             )? {
-                OnlyDirectoryDescent::Open { name, directory } => (name, directory),
+                OnlyDirectoryDescent::Open { entry, directory } => (entry, directory),
                 OnlyDirectoryDescent::Empty => {
                     scan.complete = false;
                     if let Some(volume_id) = &scanned_volume_id {
-                        scan.recoverable_publication_prefixes.insert(
-                            RecoverableAuthorizedBlockdPrefix::Attachment {
-                                cat_id: desired.cat_id.clone(),
-                                volume_id: volume_id.clone(),
-                                attachment_name: attachment_name.clone(),
-                            },
+                        projection_barrier(DataDirectoryProjectionBoundary::Volume);
+                        if !revalidate_directory_entry(
+                            &cat_directory,
+                            &volume_entry,
+                            &volume_directory,
+                            root,
+                        ) {
+                            scan.unattributed_incomplete = true;
+                            continue;
+                        }
+                        projection_barrier(DataDirectoryProjectionBoundary::Cat);
+                        if !revalidate_directory_entry(&directory, &cat_entry, &cat_directory, root)
+                        {
+                            scan.unattributed_incomplete = true;
+                            continue;
+                        }
+                        let prefix = RecoverableAuthorizedBlockdPrefix::Attachment {
+                            cat_id: desired.cat_id.clone(),
+                            volume_id: volume_id.clone(),
+                            attachment_name: attachment_name.clone(),
+                        };
+                        scan.recoverable_publication_prefixes.insert(prefix.clone());
+                        #[cfg(feature = "proposed-node-residue-reclamation")]
+                        scan.recoverable_cleanup_prefixes.insert(
+                            prefix,
+                            Arc::new(
+                                super::residue_reclaim::RetainedEmptyDataDirectoryPrefix::from_scanner(
+                                    &[
+                                        (&directory, cat_entry.name.as_os_str(), &cat_directory),
+                                        (&cat_directory, volume_entry.name.as_os_str(), &volume_directory),
+                                        (&volume_directory, attachment_entry.name.as_os_str(), &attachment_directory),
+                                    ],
+                                    context,
+                                )?,
+                            ),
                         );
                     }
                     continue;
@@ -2758,6 +3286,15 @@ fn scan_authorized_blockd_data(
                     continue;
                 }
             };
+            let epoch_name = epoch_entry
+                .name
+                .to_str()
+                .context("authorized blockd epoch path is not UTF-8")?
+                .to_owned();
+            // Classify stable leaf names and inode shapes before measuring
+            // allocation. The allocation walker deliberately cannot open
+            // special inodes, but they are corrupt residue rather than a
+            // transiently unavailable source.
             let Some(leaf_entries) =
                 strict_directory_entries(&epoch_directory, &mut budget, context)?
             else {
@@ -2798,6 +3335,85 @@ fn scan_authorized_blockd_data(
             }) {
                 bail!("authorized blockd leaf retains foreign entry {foreign}")
             }
+            if let Some((name, _)) = by_name.iter().find(|(_, entry)| {
+                !matches!(
+                    entry.metadata.st_mode & libc::S_IFMT,
+                    libc::S_IFDIR | libc::S_IFREG
+                )
+            }) {
+                bail!("authorized blockd leaf retains special inode {name}")
+            }
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            let Some(allocated_bytes) = observed_allocated_bytes_at(
+                &epoch_directory,
+                root,
+                &mut budget,
+                context,
+                limits.recursion_depth,
+            )?
+            else {
+                scan.complete = false;
+                continue;
+            };
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            let reclaim_checkpoint = if by_name.contains_key(LAUNCH_CHECKPOINT_FILE)
+                && !has_unvalidated_handoff_artifact
+                && [
+                    IDENTITY_TEMP,
+                    AUTHORIZED_SERVING_TEMP,
+                    LAUNCH_CHECKPOINT_TEMP,
+                    ROOT_PROVISION_STOP_RECEIPT_FILE,
+                    ROOT_PROVISION_STOP_RECEIPT_TEMP,
+                    ".cache.data.init",
+                    ".dirty.bitmap.init",
+                ]
+                .into_iter()
+                .all(|name| !by_name.contains_key(name))
+            {
+                let bytes = read_strict_regular_at(
+                    &epoch_directory,
+                    &by_name[LAUNCH_CHECKPOINT_FILE],
+                    root,
+                    MAX_LAUNCH_CHECKPOINT_BYTES,
+                    context,
+                )?;
+                let checkpoint = bytes
+                    .as_deref()
+                    .map(|bytes| decode_exact_json(bytes, "reclaim launch checkpoint"))
+                    .transpose()?;
+                checkpoint.filter(|checkpoint: &AuthorizedBlockdCheckpoint| {
+                    validate_authorized_blockd_checkpoint(checkpoint).is_ok()
+                        && checkpoint_snapshot
+                            .as_ref()
+                            .and_then(|snapshot| snapshot.get(&desired.cat_id))
+                            .is_some_and(|runtime| {
+                                runtime.desired_revision == desired.desired_revision
+                                    && runtime.spec_digest == desired.spec_digest
+                                    && runtime.node_id == desired.placement.node_id
+                                    && runtime.placement_epoch
+                                        == desired.placement.placement_epoch
+                                    && matches!(
+                                        &runtime.step,
+                                        ReconcileStep::CleanupRelease { cleanup }
+                                            if matches!(
+                                                &cleanup.target,
+                                                cats_api::runtime_reconciliation::CleanupTarget::Volume {
+                                                    volume_id,
+                                                    attachment_id,
+                                                    attachment_epoch,
+                                                } if Some(volume_id) == scanned_volume_id.as_ref()
+                                                    && attachment_id == &checkpoint.attachment.identity.attachment_id
+                                                    && *attachment_epoch == checkpoint.attachment.identity.attachment_epoch
+                                                    && cleanup.volume_release.is_some()
+                                            )
+                                    )
+                            })
+                })
+            } else {
+                None
+            };
+            #[cfg(not(feature = "proposed-node-residue-reclamation"))]
+            let reclaim_checkpoint: Option<AuthorizedBlockdCheckpoint> = None;
             let recoverable_publication_window = matches!(
                 (
                     by_name.contains_key(IDENTITY_FILE),
@@ -2815,85 +3431,164 @@ fn scan_authorized_blockd_data(
                     | (true, false, true, false, false, false, 2)
                     | (true, false, true, false, false, true, 3)
             );
-            if [
-                IDENTITY_TEMP,
-                AUTHORIZED_SERVING_TEMP,
-                LAUNCH_CHECKPOINT_TEMP,
-                ".cache.data.init",
-                ".dirty.bitmap.init",
-            ]
-            .into_iter()
-            .any(|name| by_name.contains_key(name))
-                || [
-                    IDENTITY_FILE,
-                    AUTHORIZED_SERVING_FILE,
-                    LAUNCH_CHECKPOINT_FILE,
+            if reclaim_checkpoint.is_none()
+                && ([
+                    IDENTITY_TEMP,
+                    AUTHORIZED_SERVING_TEMP,
+                    LAUNCH_CHECKPOINT_TEMP,
+                    ".cache.data.init",
+                    ".dirty.bitmap.init",
                 ]
                 .into_iter()
-                .any(|name| !by_name.contains_key(name))
+                .any(|name| by_name.contains_key(name))
+                    || [
+                        IDENTITY_FILE,
+                        AUTHORIZED_SERVING_FILE,
+                        LAUNCH_CHECKPOINT_FILE,
+                    ]
+                    .into_iter()
+                    .any(|name| !by_name.contains_key(name)))
             {
                 scan.complete = false;
                 if recoverable_publication_window {
                     if let Some(volume_id) = &scanned_volume_id {
-                        scan.recoverable_publication_prefixes.insert(
-                            RecoverableAuthorizedBlockdPrefix::Epoch {
-                                cat_id: desired.cat_id.clone(),
-                                volume_id: volume_id.clone(),
-                                attachment_name: attachment_name.clone(),
-                                epoch_name: epoch_name.clone(),
-                            },
-                        );
+                        projection_barrier(DataDirectoryProjectionBoundary::Volume);
+                        if !revalidate_directory_entry(
+                            &cat_directory,
+                            &volume_entry,
+                            &volume_directory,
+                            root,
+                        ) {
+                            scan.unattributed_incomplete = true;
+                            continue;
+                        }
+                        projection_barrier(DataDirectoryProjectionBoundary::Cat);
+                        if !revalidate_directory_entry(&directory, &cat_entry, &cat_directory, root)
+                        {
+                            scan.unattributed_incomplete = true;
+                            continue;
+                        }
+                        let prefix = RecoverableAuthorizedBlockdPrefix::Epoch {
+                            cat_id: desired.cat_id.clone(),
+                            volume_id: volume_id.clone(),
+                            attachment_name: attachment_name.clone(),
+                            epoch_name: epoch_name.clone(),
+                        };
+                        scan.recoverable_publication_prefixes.insert(prefix.clone());
+                        #[cfg(feature = "proposed-node-residue-reclamation")]
+                        if by_name.is_empty() {
+                            scan.recoverable_cleanup_prefixes.insert(
+                                prefix,
+                                Arc::new(
+                                    super::residue_reclaim::RetainedEmptyDataDirectoryPrefix::from_scanner(
+                                        &[
+                                            (&directory, cat_entry.name.as_os_str(), &cat_directory),
+                                            (&cat_directory, volume_entry.name.as_os_str(), &volume_directory),
+                                            (&volume_directory, attachment_entry.name.as_os_str(), &attachment_directory),
+                                            (&attachment_directory, epoch_entry.name.as_os_str(), &epoch_directory),
+                                        ],
+                                        context,
+                                    )?,
+                                ),
+                            );
+                        }
                     } else {
                         scan.unattributed_incomplete = true;
                     }
                 }
                 continue;
             }
-            let Some(identity_bytes) = read_strict_regular_at(
-                &epoch_directory,
-                &by_name[IDENTITY_FILE],
-                root,
-                MAX_IDENTITY_BYTES,
-                context,
-            )?
-            else {
-                scan.complete = false;
-                continue;
-            };
-            let Some(attachment_bytes) = read_strict_regular_at(
-                &epoch_directory,
-                &by_name[AUTHORIZED_SERVING_FILE],
-                root,
-                MAX_AUTHORIZED_SERVING_BYTES,
-                context,
-            )?
-            else {
-                scan.complete = false;
-                continue;
-            };
-            let Some(checkpoint_bytes) = read_strict_regular_at(
-                &epoch_directory,
-                &by_name[LAUNCH_CHECKPOINT_FILE],
-                root,
-                MAX_LAUNCH_CHECKPOINT_BYTES,
-                context,
-            )?
-            else {
-                scan.complete = false;
-                continue;
-            };
+            let reclaim_in_progress = reclaim_checkpoint.is_some();
+            let checkpoint = if let Some(checkpoint) = reclaim_checkpoint {
+                if let Some(entry) = by_name.get(IDENTITY_FILE) {
+                    let Some(bytes) = read_strict_regular_at(
+                        &epoch_directory,
+                        entry,
+                        root,
+                        MAX_IDENTITY_BYTES,
+                        context,
+                    )?
+                    else {
+                        scan.complete = false;
+                        continue;
+                    };
+                    let identity: AttachmentLineageIdentity =
+                        decode_exact_json(&bytes, "reclaim attachment identity")?;
+                    anyhow::ensure!(
+                        identity == checkpoint.attachment.identity,
+                        "reclaim attachment identity conflicts with its launch checkpoint"
+                    );
+                }
+                if let Some(entry) = by_name.get(AUTHORIZED_SERVING_FILE) {
+                    let Some(bytes) = read_strict_regular_at(
+                        &epoch_directory,
+                        entry,
+                        root,
+                        MAX_AUTHORIZED_SERVING_BYTES,
+                        context,
+                    )?
+                    else {
+                        scan.complete = false;
+                        continue;
+                    };
+                    let attachment: AuthorizedServingAttachment =
+                        decode_exact_json(&bytes, "reclaim authorized serving attachment")?;
+                    anyhow::ensure!(
+                        attachment == checkpoint.attachment,
+                        "reclaim serving attachment conflicts with its launch checkpoint"
+                    );
+                }
+                checkpoint
+            } else {
+                let Some(identity_bytes) = read_strict_regular_at(
+                    &epoch_directory,
+                    &by_name[IDENTITY_FILE],
+                    root,
+                    MAX_IDENTITY_BYTES,
+                    context,
+                )?
+                else {
+                    scan.complete = false;
+                    continue;
+                };
+                let Some(attachment_bytes) = read_strict_regular_at(
+                    &epoch_directory,
+                    &by_name[AUTHORIZED_SERVING_FILE],
+                    root,
+                    MAX_AUTHORIZED_SERVING_BYTES,
+                    context,
+                )?
+                else {
+                    scan.complete = false;
+                    continue;
+                };
+                let Some(checkpoint_bytes) = read_strict_regular_at(
+                    &epoch_directory,
+                    &by_name[LAUNCH_CHECKPOINT_FILE],
+                    root,
+                    MAX_LAUNCH_CHECKPOINT_BYTES,
+                    context,
+                )?
+                else {
+                    scan.complete = false;
+                    continue;
+                };
 
-            let identity: AttachmentLineageIdentity =
-                decode_exact_json(&identity_bytes, "attachment identity")?;
-            let attachment: AuthorizedServingAttachment =
-                decode_exact_json(&attachment_bytes, "authorized serving attachment")?;
-            let checkpoint: AuthorizedBlockdCheckpoint =
-                decode_exact_json(&checkpoint_bytes, "authorized blockd checkpoint")?;
-            validate_authorized_blockd_checkpoint(&checkpoint)?;
-            anyhow::ensure!(
-                identity == attachment.identity && attachment == checkpoint.attachment,
-                "authorized blockd files do not form one exact lineage"
-            );
+                let identity: AttachmentLineageIdentity =
+                    decode_exact_json(&identity_bytes, "attachment identity")?;
+                let attachment: AuthorizedServingAttachment =
+                    decode_exact_json(&attachment_bytes, "authorized serving attachment")?;
+                let checkpoint: AuthorizedBlockdCheckpoint =
+                    decode_exact_json(&checkpoint_bytes, "authorized blockd checkpoint")?;
+                validate_authorized_blockd_checkpoint(&checkpoint)?;
+                anyhow::ensure!(
+                    identity == attachment.identity && attachment == checkpoint.attachment,
+                    "authorized blockd files do not form one exact lineage"
+                );
+                checkpoint
+            };
+            let attachment = checkpoint.attachment.clone();
+            let identity = attachment.identity.clone();
             let stop_target = if let Some(entry) = by_name.get(ROOT_PROVISION_STOP_RECEIPT_FILE) {
                 read_strict_regular_at(
                     &epoch_directory,
@@ -2961,7 +3656,14 @@ fn scan_authorized_blockd_data(
                 .into_iter()
                 .filter(|name| by_name.contains_key(*name))
                 .count();
-            let control_state = if present_control_files == 0 {
+            let control_state = if reclaim_in_progress {
+                #[cfg(feature = "proposed-node-residue-reclamation")]
+                {
+                    AuthorizedBlockdControlState::ReclaimInProgress
+                }
+                #[cfg(not(feature = "proposed-node-residue-reclamation"))]
+                unreachable!("reclaim checkpoint cannot exist without the compatibility feature")
+            } else if present_control_files == 0 {
                 AuthorizedBlockdControlState::NotStarted
             } else if present_control_files == control_files.len() {
                 let root_metadata = root.metadata().context("inspect retained state root")?;
@@ -2974,14 +3676,18 @@ fn scan_authorized_blockd_data(
                         && u64::try_from(cache.st_size).ok() == Some(attachment.size_bytes),
                     "root-provision control-only cache has unsafe identity or size"
                 );
-                if inspect_empty_dirty_bitmap_at(
-                    &epoch_directory,
-                    &by_name["dirty.bitmap"],
-                    root,
-                    attachment.size_bytes,
-                    context,
-                )?
-                .is_none()
+                // Once the sealed serving handoff exists, the serving lineage
+                // owns the engine files: Relaxed writes legitimately dirty the
+                // bitmap, so only a still-control-only dir must stay clean.
+                if !has_unvalidated_handoff_artifact
+                    && inspect_empty_dirty_bitmap_at(
+                        &epoch_directory,
+                        &by_name["dirty.bitmap"],
+                        root,
+                        attachment.size_bytes,
+                        context,
+                    )?
+                    .is_none()
                 {
                     scan.complete = false;
                     continue;
@@ -3001,8 +3707,11 @@ fn scan_authorized_blockd_data(
                     scan.complete = false;
                     continue;
                 };
+                // Once the sealed serving handoff exists, the serving lineage
+                // owns these engine files and Relaxed pending packs are its
+                // unique data; only a still-control-only dir must stay empty.
                 anyhow::ensure!(
-                    pending_entries.is_empty(),
+                    pending_entries.is_empty() || has_unvalidated_handoff_artifact,
                     "root-provision control-only blockd retains a pending pack"
                 );
                 AuthorizedBlockdControlState::ExactControlOnlyEmpty
@@ -3267,7 +3976,58 @@ fn scan_authorized_blockd_data(
                     &target,
                 )?);
             }
+            projection_barrier(DataDirectoryProjectionBoundary::Epoch);
+            if !revalidate_directory_entry(
+                &attachment_directory,
+                &epoch_entry,
+                &epoch_directory,
+                root,
+            ) {
+                scan.complete = false;
+                scan.unattributed_incomplete = true;
+                continue;
+            }
+            projection_barrier(DataDirectoryProjectionBoundary::Attachment);
+            if !revalidate_directory_entry(
+                &volume_directory,
+                &attachment_entry,
+                &attachment_directory,
+                root,
+            ) {
+                scan.complete = false;
+                scan.unattributed_incomplete = true;
+                continue;
+            }
+            projection_barrier(DataDirectoryProjectionBoundary::Volume);
+            if !revalidate_directory_entry(&cat_directory, &volume_entry, &volume_directory, root) {
+                scan.complete = false;
+                scan.unattributed_incomplete = true;
+                continue;
+            }
+            projection_barrier(DataDirectoryProjectionBoundary::Cat);
+            if !revalidate_directory_entry(&directory, &cat_entry, &cat_directory, root) {
+                scan.complete = false;
+                scan.unattributed_incomplete = true;
+                continue;
+            }
             scan.candidate_volume_ids.insert(identity.volume_id.clone());
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            let reclaim = Arc::new(super::residue_reclaim::RetainedDataDirectory::from_scanner(
+                &directory,
+                &cat_entry.name,
+                &cat_directory,
+                &volume_entry.name,
+                &volume_directory,
+                &attachment_entry.name,
+                &attachment_directory,
+                &epoch_entry.name,
+                &epoch_directory,
+                data_directory.clone(),
+                by_name
+                    .values()
+                    .map(|entry| (entry.name.as_os_str(), &entry.metadata)),
+                context,
+            )?);
             anyhow::ensure!(
                 scan.evidence
                     .entry(desired.cat_id.clone())
@@ -3276,12 +4036,16 @@ fn scan_authorized_blockd_data(
                         identity.volume_id.clone(),
                         AuthorizedBlockdInventoryEvidence {
                             data_directory,
+                            #[cfg(feature = "proposed-node-residue-reclamation")]
+                            allocated_bytes,
                             checkpoint,
                             binding,
                             control_state,
                             retained_root_process,
                             target_control_launch,
                             stop_receipt_socket,
+                            #[cfg(feature = "proposed-node-residue-reclamation")]
+                            reclaim,
                         },
                     )
                     .is_none(),
@@ -3290,6 +4054,861 @@ fn scan_authorized_blockd_data(
         }
     }
     Ok(scan)
+}
+
+fn host_path(path: &Path) -> anyhow::Result<HostPath> {
+    HostPath::new(
+        path.to_str()
+            .context("retained data-directory path is not UTF-8")?
+            .to_owned(),
+    )
+    .context("retained data-directory path is not canonical")
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn scan_unassigned_cat_data(
+    root: &File,
+    cat_directory: &File,
+    cat_path: &Path,
+    cat_name: &str,
+    entry_budget: &mut usize,
+    residue_wire_budget: &mut usize,
+    context: &RuntimeInventoryScanContext,
+    maximum_depth: usize,
+) -> anyhow::Result<Option<Vec<NodeResidue>>> {
+    scan_unassigned_cat_data_with_projection_barrier(
+        root,
+        cat_directory,
+        cat_path,
+        cat_name,
+        entry_budget,
+        residue_wire_budget,
+        context,
+        maximum_depth,
+        None,
+        &mut |_| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_unassigned_cat_data_with_projection_barrier(
+    root: &File,
+    cat_directory: &File,
+    cat_path: &Path,
+    cat_name: &str,
+    entry_budget: &mut usize,
+    residue_wire_budget: &mut usize,
+    context: &RuntimeInventoryScanContext,
+    maximum_depth: usize,
+    cat_parent_entry: Option<(&File, &StrictDirectoryEntry)>,
+    projection_barrier: &mut impl FnMut(DataDirectoryProjectionBoundary),
+) -> anyhow::Result<Option<Vec<NodeResidue>>> {
+    let cat_hint = cat_name
+        .strip_prefix("cat-")
+        .and_then(|value| Id::new(value.to_owned()));
+    let entries = match strict_directory_entries_bounded(
+        cat_directory,
+        entry_budget,
+        context,
+        *residue_wire_budget,
+    ) {
+        Ok(Some(BoundedDirectoryEntries::Complete(entries))) => entries,
+        Ok(Some(BoundedDirectoryEntries::LimitExceeded)) => return Ok(None),
+        Ok(None) | Err(_) => return Ok(None),
+    };
+    if entries.is_empty() {
+        if !consume_residue_wire_slot(residue_wire_budget) {
+            return Ok(None);
+        }
+        let Some(allocated_bytes) =
+            observed_allocated_bytes_at(cat_directory, root, entry_budget, context, maximum_depth)?
+        else {
+            return Ok(None);
+        };
+        let Some(residue) = unreadable_data_residue(cat_path, None, allocated_bytes) else {
+            return Ok(None);
+        };
+        if let Some((parent, entry)) = cat_parent_entry {
+            projection_barrier(DataDirectoryProjectionBoundary::Cat);
+            if !revalidate_directory_entry(parent, entry, cat_directory, root) {
+                return Ok(None);
+            }
+        }
+        return Ok(Some(vec![residue]));
+    }
+    let mut residue = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if !consume_residue_wire_slot(residue_wire_budget) {
+            return Ok(None);
+        }
+        let Some(volume_name) = entry.name.to_str() else {
+            return Ok(None);
+        };
+        let volume_path = cat_path.join(volume_name);
+        let volume_hint = volume_name
+            .strip_prefix("volume-")
+            .and_then(|value| Id::new(value.to_owned()));
+        let volume_directory = match open_strict_child_directory(cat_directory, &entry, root) {
+            Ok(Some(directory)) => directory,
+            Ok(None) | Err(_) => return Ok(None),
+        };
+        let allocated_bytes = match observed_allocated_bytes_at(
+            &volume_directory,
+            root,
+            entry_budget,
+            context,
+            maximum_depth,
+        )? {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        };
+        let exact = scan_unassigned_volume_lineage_at(
+            root,
+            &volume_directory,
+            &volume_path,
+            volume_name,
+            cat_hint.as_ref(),
+            entry_budget,
+            context,
+            maximum_depth,
+            projection_barrier,
+        )?;
+        let observed = match exact {
+            UnassignedVolumeLineageScan::Readable(exact) => *exact,
+            UnassignedVolumeLineageScan::Unreadable => {
+                let Some(residue) =
+                    unreadable_data_residue(&volume_path, volume_hint, allocated_bytes)
+                else {
+                    return Ok(None);
+                };
+                residue
+            }
+            UnassignedVolumeLineageScan::Unstable => return Ok(None),
+        };
+        projection_barrier(DataDirectoryProjectionBoundary::Volume);
+        if !revalidate_directory_entry(cat_directory, &entry, &volume_directory, root) {
+            return Ok(None);
+        }
+        residue.push(observed);
+    }
+    if let Some((parent, entry)) = cat_parent_entry {
+        projection_barrier(DataDirectoryProjectionBoundary::Cat);
+        if !revalidate_directory_entry(parent, entry, cat_directory, root) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(residue))
+}
+
+enum UnassignedVolumeLineageScan {
+    Readable(Box<NodeResidue>),
+    Unreadable,
+    Unstable,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_unassigned_volume_lineage_at(
+    root: &File,
+    volume_directory: &File,
+    volume_path: &Path,
+    volume_name: &str,
+    cat_hint: Option<&Id>,
+    entry_budget: &mut usize,
+    context: &RuntimeInventoryScanContext,
+    maximum_depth: usize,
+    projection_barrier: &mut impl FnMut(DataDirectoryProjectionBoundary),
+) -> anyhow::Result<UnassignedVolumeLineageScan> {
+    let (attachment_directory_entry, attachment_directory) = match descend_only_directory(
+        volume_directory,
+        root,
+        entry_budget,
+        context,
+        "unassigned attachment",
+    ) {
+        Ok(OnlyDirectoryDescent::Open { entry, directory }) => (entry, directory),
+        Ok(OnlyDirectoryDescent::Empty | OnlyDirectoryDescent::Unavailable) | Err(_) => {
+            return Ok(UnassignedVolumeLineageScan::Unreadable)
+        }
+    };
+    let Some(attachment_name) = attachment_directory_entry.name.to_str() else {
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
+    };
+    let (epoch_directory_entry, epoch_directory) = match descend_only_directory(
+        &attachment_directory,
+        root,
+        entry_budget,
+        context,
+        "unassigned epoch",
+    ) {
+        Ok(OnlyDirectoryDescent::Open { entry, directory }) => (entry, directory),
+        Ok(OnlyDirectoryDescent::Empty | OnlyDirectoryDescent::Unavailable) | Err(_) => {
+            return Ok(UnassignedVolumeLineageScan::Unreadable)
+        }
+    };
+    let Some(epoch_name) = epoch_directory_entry.name.to_str() else {
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
+    };
+    let epoch_path = volume_path.join(attachment_name).join(epoch_name);
+    let Some(allocated_bytes) =
+        observed_allocated_bytes_at(&epoch_directory, root, entry_budget, context, maximum_depth)?
+    else {
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
+    };
+    #[cfg(not(feature = "proposed-node-residue-reclamation"))]
+    let _ = allocated_bytes;
+    let entries = match strict_directory_entries(&epoch_directory, entry_budget, context) {
+        Ok(Some(entries)) => entries,
+        Ok(None) | Err(_) => {
+            return Ok(UnassignedVolumeLineageScan::Unreadable);
+        }
+    };
+    let by_name = entries
+        .iter()
+        .filter_map(|entry| entry.name.to_str().map(|name| (name, entry)))
+        .collect::<BTreeMap<_, _>>();
+    let Some(identity_entry) = by_name.get(IDENTITY_FILE) else {
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
+    };
+    let Some(authorized_serving_entry) = by_name.get(AUTHORIZED_SERVING_FILE) else {
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
+    };
+    let Some(checkpoint_entry) = by_name.get(LAUNCH_CHECKPOINT_FILE) else {
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
+    };
+    let Some(identity): Option<AttachmentLineageIdentity> = read_residue_exact_json_at(
+        &epoch_directory,
+        identity_entry,
+        root,
+        MAX_IDENTITY_BYTES,
+        context,
+    )?
+    else {
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
+    };
+    let Some(attachment): Option<AuthorizedServingAttachment> = read_residue_exact_json_at(
+        &epoch_directory,
+        authorized_serving_entry,
+        root,
+        MAX_AUTHORIZED_SERVING_BYTES,
+        context,
+    )?
+    else {
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
+    };
+    let Some(checkpoint): Option<AuthorizedBlockdCheckpoint> = read_residue_exact_json_at(
+        &epoch_directory,
+        checkpoint_entry,
+        root,
+        MAX_LAUNCH_CHECKPOINT_BYTES,
+        context,
+    )?
+    else {
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
+    };
+    if validate_authorized_blockd_checkpoint(&checkpoint).is_err() {
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
+    }
+    if identity != attachment.identity
+        || attachment != checkpoint.attachment
+        || cat_hint != Some(&checkpoint.desired.cat_id)
+        || checkpoint.volume.volume_id != identity.volume_id
+        || volume_name != format!("volume-{}", identity.volume_id)
+        || attachment_name != format!("attachment-{}", identity.attachment_id)
+        || epoch_name != format!("epoch-{}", identity.attachment_epoch.get())
+    {
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
+    }
+    let Some(pending_pack_count) = validate_residue_pending_packs_at(
+        root,
+        &epoch_directory,
+        &by_name,
+        &identity,
+        attachment.head.generation,
+        entry_budget,
+        context,
+    )?
+    else {
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
+    };
+    let remote_generation = attachment.head.generation;
+    let Some(local_generation) = remote_generation
+        .get()
+        .checked_add(pending_pack_count)
+        .and_then(Generation::new)
+    else {
+        return Ok(UnassignedVolumeLineageScan::Unreadable);
+    };
+    projection_barrier(DataDirectoryProjectionBoundary::Epoch);
+    if !revalidate_directory_entry(
+        &attachment_directory,
+        &epoch_directory_entry,
+        &epoch_directory,
+        root,
+    ) {
+        return Ok(UnassignedVolumeLineageScan::Unstable);
+    }
+    projection_barrier(DataDirectoryProjectionBoundary::Attachment);
+    if !revalidate_directory_entry(
+        volume_directory,
+        &attachment_directory_entry,
+        &attachment_directory,
+        root,
+    ) {
+        return Ok(UnassignedVolumeLineageScan::Unstable);
+    }
+    Ok(UnassignedVolumeLineageScan::Readable(Box::new(
+        NodeResidue::DataDirectory {
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            cat_id_hint: Some(checkpoint.desired.cat_id.clone()),
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            disk_id_hint: Some(checkpoint.volume.disk_id.clone()),
+            volume_id_hint: Some(identity.volume_id.clone()),
+            data_directory: host_path(&epoch_path)?,
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            allocated_bytes,
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            retention_reason: if pending_pack_count == 0 {
+                DataDirectoryRetentionReason::AuthorityProofPending
+            } else {
+                DataDirectoryRetentionReason::UniqueLocalTail
+            },
+            ownership_token: OwnershipTokenEvidence::Missing,
+            lineage: ResidueLineageEvidence::Readable {
+                #[cfg(feature = "proposed-node-residue-reclamation")]
+                lineage: Box::new(ResidueDataDirectoryLineage {
+                    workspace_id: checkpoint.desired.workspace_id.clone(),
+                    cat_id: checkpoint.desired.cat_id.clone(),
+                    disk_id: checkpoint.volume.disk_id.clone(),
+                    disk_kind: checkpoint.volume.disk_kind,
+                    volume_id: identity.volume_id.clone(),
+                    attachment_id: identity.attachment_id.clone(),
+                    attachment_epoch: identity.attachment_epoch,
+                    acquire_origin: identity.acquire_origin.clone(),
+                    node_id: identity.node_id.clone(),
+                    desired_revision: checkpoint.desired.desired_revision,
+                    spec_digest: checkpoint.desired.spec_digest.clone(),
+                    placement: checkpoint.desired.placement.clone(),
+                    placement_epoch: identity.placement_epoch,
+                    acquisition: attachment.acquire.clone(),
+                    acquisition_digest: residue_acquisition_digest(&attachment.acquire)?,
+                    local_durable_generation: local_generation,
+                    remote_durable_generation: remote_generation,
+                    remote_head: attachment.head.clone(),
+                    pending_pack_count: WireU64::new(pending_pack_count)
+                        .context("pending-pack count exceeds WireU64")?,
+                    fenced: false,
+                }),
+                #[cfg(not(feature = "proposed-node-residue-reclamation"))]
+                attachment_id_hint: Some(identity.attachment_id.clone()),
+                #[cfg(not(feature = "proposed-node-residue-reclamation"))]
+                attachment_epoch_hint: Some(identity.attachment_epoch),
+                #[cfg(not(feature = "proposed-node-residue-reclamation"))]
+                local_durable_generation: local_generation,
+                #[cfg(not(feature = "proposed-node-residue-reclamation"))]
+                remote_durable_generation: remote_generation,
+                #[cfg(not(feature = "proposed-node-residue-reclamation"))]
+                pending_pack_count: WireU64::new(pending_pack_count)
+                    .context("pending-pack count exceeds WireU64")?,
+                #[cfg(not(feature = "proposed-node-residue-reclamation"))]
+                fenced: false,
+            },
+        },
+    )))
+}
+
+fn validate_residue_pending_packs_at(
+    root: &File,
+    epoch_directory: &File,
+    by_name: &BTreeMap<&str, &StrictDirectoryEntry>,
+    identity: &AttachmentLineageIdentity,
+    remote_generation: Generation,
+    entry_budget: &mut usize,
+    context: &RuntimeInventoryScanContext,
+) -> anyhow::Result<Option<u64>> {
+    let Some(pending_entry) = by_name.get(PENDING_PACK_DIR) else {
+        return Ok(Some(0));
+    };
+    let pending = match open_strict_child_directory(epoch_directory, pending_entry, root) {
+        Ok(Some(directory)) => directory,
+        Ok(None) | Err(_) => return Ok(None),
+    };
+    let entries = match strict_directory_entries(&pending, entry_budget, context) {
+        Ok(Some(entries)) => entries,
+        Ok(None) | Err(_) => return Ok(None),
+    };
+    let Some(mut expected_generation) = i64::try_from(remote_generation.get()).ok() else {
+        return Ok(None);
+    };
+    let Some(expected_epoch) = i64::try_from(identity.attachment_epoch.get()).ok() else {
+        return Ok(None);
+    };
+    let mut transactions = BTreeSet::new();
+    let mut count = 0_u64;
+    for entry in entries {
+        if entry.metadata.st_mode & libc::S_IFMT != libc::S_IFREG
+            || !entry
+                .name
+                .to_str()
+                .is_some_and(|name| name.ends_with(PACK_FILE_SUFFIX))
+        {
+            return Ok(None);
+        }
+        let Some(header) = read_residue_pack_header_at(&pending, &entry, root, context)? else {
+            return Ok(None);
+        };
+        let expected_name = format!(
+            "{:020}-{}{}",
+            header.base_generation, header.txn, PACK_FILE_SUFFIX
+        );
+        if entry.name != OsStr::new(&expected_name)
+            || header.volume_id != identity.volume_id.as_str()
+            || header.lease_epoch.is_some()
+            || header.attachment_id.as_deref() != Some(identity.attachment_id.as_str())
+            || header.attachment_epoch != Some(expected_epoch)
+            || header.acquire_origin.as_ref() != Some(&identity.acquire_origin)
+            || header.base_generation != expected_generation
+            || !transactions.insert(header.txn)
+        {
+            return Ok(None);
+        }
+        let Some(next) = count.checked_add(1) else {
+            return Ok(None);
+        };
+        count = next;
+        let Some(next_generation) = expected_generation.checked_add(1) else {
+            return Ok(None);
+        };
+        expected_generation = next_generation;
+    }
+    Ok(Some(count))
+}
+
+fn read_residue_pack_header_at(
+    directory: &File,
+    entry: &StrictDirectoryEntry,
+    root: &File,
+    context: &RuntimeInventoryScanContext,
+) -> anyhow::Result<Option<PackHeader>> {
+    if validate_strict_regular_entry(entry, root, 0o600).is_err() {
+        return Ok(None);
+    }
+    context.check_active()?;
+    let Some(mut file) = open_residue_child(directory, entry, root)? else {
+        return Ok(None);
+    };
+    let before = match file.metadata() {
+        Ok(metadata) if metadata.is_file() && metadata.nlink() == 1 => metadata,
+        Ok(_) | Err(_) => return Ok(None),
+    };
+    let mut bytes = vec![0_u8; ENCODED_PACK_PREFIX_LEN];
+    if file.read_exact(&mut bytes).is_err() {
+        return Ok(None);
+    }
+    let Ok(encoded_header_len) = encoded_pack_header_len(&bytes) else {
+        return Ok(None);
+    };
+    if encoded_header_len > RESIDUE_PACK_HEADER_MAX_BYTES
+        || u64::try_from(encoded_header_len)
+            .ok()
+            .is_none_or(|length| length > before.len())
+    {
+        return Ok(None);
+    }
+    bytes.resize(encoded_header_len, 0);
+    if file
+        .read_exact(&mut bytes[ENCODED_PACK_PREFIX_LEN..])
+        .is_err()
+    {
+        return Ok(None);
+    }
+    let Ok((header, payload_offset)) = decode_pack_header(&bytes) else {
+        return Ok(None);
+    };
+    context.check_active()?;
+    let after = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(None),
+    };
+    if payload_offset != encoded_header_len
+        || !same_descriptor_identity(&before, &after)
+        || stat_at(directory, &entry.name)
+            .ok()
+            .is_none_or(|current| !same_stat_identity(&entry.metadata, &current))
+    {
+        return Ok(None);
+    }
+    Ok(Some(header))
+}
+
+fn read_residue_exact_json_at<T>(
+    directory: &File,
+    entry: &StrictDirectoryEntry,
+    root: &File,
+    maximum: usize,
+    context: &RuntimeInventoryScanContext,
+) -> anyhow::Result<Option<T>>
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    let Some(bytes) = read_strict_regular_at(directory, entry, root, maximum, context)? else {
+        return Ok(None);
+    };
+    let Ok(value) = serde_json::from_slice(&bytes) else {
+        return Ok(None);
+    };
+    Ok((serde_json::to_vec(&value).ok().as_deref() == Some(bytes.as_slice())).then_some(value))
+}
+
+fn unreadable_data_residue(
+    path: &Path,
+    volume_id_hint: Option<Id>,
+    _allocated_bytes: WireU64,
+) -> Option<NodeResidue> {
+    Some(NodeResidue::DataDirectory {
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        cat_id_hint: None,
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        disk_id_hint: None,
+        volume_id_hint,
+        data_directory: host_path(path).ok()?,
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        allocated_bytes: _allocated_bytes,
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        retention_reason: DataDirectoryRetentionReason::UnreadableIdentity,
+        ownership_token: OwnershipTokenEvidence::Missing,
+        lineage: ResidueLineageEvidence::Unreadable,
+    })
+}
+
+/// Descriptor-relative, iterative allocated-byte observation. Every child is
+/// enumerated against a retained parent descriptor, directories are reopened
+/// with O_NOFOLLOW plus inode/device comparison, and the caller supplies the
+/// one source-wide entry/depth budget. Races and cap+1 become Incomplete.
+fn observed_allocated_bytes_at(
+    directory: &File,
+    root: &File,
+    entry_budget: &mut usize,
+    context: &RuntimeInventoryScanContext,
+    maximum_depth: usize,
+) -> anyhow::Result<Option<WireU64>> {
+    let root_metadata = match directory.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(None),
+    };
+    let Some(mut bytes) = root_metadata.blocks().checked_mul(512) else {
+        return Ok(None);
+    };
+    let Some(reopened) = reopen_directory_descriptor(directory)? else {
+        return Ok(None);
+    };
+    enum Work {
+        Scan(File, usize),
+        Verify(File, StrictDirectoryEntry),
+    }
+
+    let mut stack = vec![Work::Scan(reopened, 0_usize)];
+    while let Some(work) = stack.pop() {
+        match work {
+            Work::Verify(parent, entry) => {
+                if context.check_active().is_err()
+                    || stat_at(&parent, &entry.name)
+                        .ok()
+                        .is_none_or(|after| !same_stat_identity(&entry.metadata, &after))
+                {
+                    return Ok(None);
+                }
+            }
+            Work::Scan(current, depth) => {
+                if depth > maximum_depth || context.check_active().is_err() {
+                    return Ok(None);
+                }
+                let entries = match strict_directory_entries(&current, entry_budget, context) {
+                    Ok(Some(entries)) => entries,
+                    Ok(None) | Err(_) => return Ok(None),
+                };
+                for entry in entries {
+                    let child = match open_residue_child(&current, &entry, root) {
+                        Ok(Some(child)) => child,
+                        Ok(None) | Err(_) => return Ok(None),
+                    };
+                    let metadata = match child.metadata() {
+                        Ok(metadata) => metadata,
+                        Err(_) => return Ok(None),
+                    };
+                    let Some(entry_bytes) = metadata.blocks().checked_mul(512) else {
+                        return Ok(None);
+                    };
+                    let Some(total) = bytes.checked_add(entry_bytes) else {
+                        return Ok(None);
+                    };
+                    bytes = total;
+
+                    if metadata.is_dir() {
+                        if depth == maximum_depth {
+                            return Ok(None);
+                        }
+                        let parent = match current.try_clone() {
+                            Ok(parent) => parent,
+                            Err(_) => return Ok(None),
+                        };
+                        // Verify the name only after its complete descriptor-
+                        // bound subtree. A rename/replacement during traversal
+                        // can therefore never be attributed to the old entry.
+                        stack.push(Work::Verify(parent, entry));
+                        stack.push(Work::Scan(child, depth + 1));
+                    } else if stat_at(&current, &entry.name)
+                        .ok()
+                        .is_none_or(|after| !same_stat_identity(&entry.metadata, &after))
+                    {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+    let after = match directory.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(None),
+    };
+    if !same_descriptor_identity(&root_metadata, &after) {
+        return Ok(None);
+    }
+    Ok(WireU64::new(bytes))
+}
+
+fn open_residue_child(
+    parent: &File,
+    entry: &StrictDirectoryEntry,
+    root: &File,
+) -> anyhow::Result<Option<File>> {
+    let file_type = entry.metadata.st_mode & libc::S_IFMT;
+    if !matches!(file_type, libc::S_IFDIR | libc::S_IFREG) {
+        return Ok(None);
+    }
+    let name = CString::new(entry.name.as_bytes()).context("residue entry name contains NUL")?;
+    let directory_flag = if file_type == libc::S_IFDIR {
+        libc::O_DIRECTORY
+    } else {
+        0
+    };
+    // SAFETY: retained parent/name are live. O_NOFOLLOW plus the fstat identity
+    // comparison prevents traversal or a path-replacement attribution.
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | directory_flag | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0,
+        )
+    };
+    if descriptor < 0 {
+        return Ok(None);
+    }
+    // SAFETY: successful openat returned one newly owned descriptor.
+    let child = unsafe { File::from_raw_fd(descriptor) };
+    let metadata = match child.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(None),
+    };
+    let root_uid = match root.metadata() {
+        Ok(metadata) => metadata.uid(),
+        Err(_) => return Ok(None),
+    };
+    Ok(exact_residue_descriptor_metadata(&metadata, &entry.metadata, root_uid).then_some(child))
+}
+
+fn reopen_directory_descriptor(directory: &File) -> anyhow::Result<Option<File>> {
+    let dot = c".";
+    // SAFETY: `directory` and the static C string remain live; success returns
+    // one newly owned descriptor with an independent directory-stream offset.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            dot.as_ptr(),
+            libc::O_RDONLY
+                | libc::O_DIRECTORY
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK,
+            0,
+        )
+    };
+    if descriptor < 0 {
+        return Ok(None);
+    }
+    // SAFETY: successful openat returned one newly owned descriptor.
+    let reopened = unsafe { File::from_raw_fd(descriptor) };
+    let before = directory.metadata()?;
+    let after = reopened.metadata()?;
+    Ok(
+        (before.is_dir() && after.is_dir() && same_descriptor_identity(&before, &after))
+            .then_some(reopened),
+    )
+}
+
+fn consume_residue_wire_slot(remaining: &mut usize) -> bool {
+    let Some(next) = remaining.checked_sub(1) else {
+        return false;
+    };
+    *remaining = next;
+    true
+}
+
+fn same_stat_identity(before: &libc::stat, after: &libc::stat) -> bool {
+    before.st_dev == after.st_dev
+        && before.st_ino == after.st_ino
+        && before.st_mode == after.st_mode
+        && before.st_uid == after.st_uid
+        && before.st_nlink == after.st_nlink
+        && before.st_size == after.st_size
+        && before.st_blocks == after.st_blocks
+        && before.st_mtime == after.st_mtime
+        && before.st_mtime_nsec == after.st_mtime_nsec
+        && before.st_ctime == after.st_ctime
+        && before.st_ctime_nsec == after.st_ctime_nsec
+}
+
+fn revalidate_directory_entry(
+    parent: &File,
+    entry: &StrictDirectoryEntry,
+    directory: &File,
+    root: &File,
+) -> bool {
+    let Ok(root_metadata) = root.metadata() else {
+        return false;
+    };
+    let Ok(descriptor_metadata) = directory.metadata() else {
+        return false;
+    };
+    descriptor_metadata.is_dir()
+        && exact_residue_descriptor_metadata(
+            &descriptor_metadata,
+            &entry.metadata,
+            root_metadata.uid(),
+        )
+        && descriptor_metadata.mode() & 0o777 == 0o700
+        && stat_at(parent, &entry.name)
+            .ok()
+            .is_some_and(|current| same_stat_identity(&entry.metadata, &current))
+}
+
+fn exact_residue_descriptor_metadata(
+    metadata: &std::fs::Metadata,
+    enumerated: &libc::stat,
+    root_uid: u32,
+) -> bool {
+    raw_device_to_u64(enumerated.st_dev) == Some(metadata.dev())
+        && enumerated.st_ino == metadata.ino()
+        && enumerated.st_uid == root_uid
+        && metadata.uid() == root_uid
+        && raw_mode_to_u32(enumerated.st_mode) == metadata.mode()
+        && raw_link_count_to_u64(enumerated.st_nlink) == metadata.nlink()
+        && u64::try_from(enumerated.st_size).ok() == Some(metadata.len())
+        && raw_blocks_to_u64(enumerated.st_blocks) == Some(metadata.blocks())
+}
+
+fn same_descriptor_identity(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.uid() == after.uid()
+        && before.mode() == after.mode()
+        && before.nlink() == after.nlink()
+        && before.len() == after.len()
+        && before.blocks() == after.blocks()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+}
+
+fn raw_blocks_to_u64(blocks: libc::blkcnt_t) -> Option<u64> {
+    u64::try_from(blocks).ok()
+}
+
+fn read_strict_regular_prefix_at(
+    directory: &File,
+    entry: &StrictDirectoryEntry,
+    root: &File,
+    context: &RuntimeInventoryScanContext,
+) -> anyhow::Result<Option<()>> {
+    if validate_strict_regular_entry(entry, root, 0o600).is_err() {
+        return Ok(None);
+    }
+    context.check_active()?;
+    let name = CString::new(entry.name.as_bytes()).context("file name contains NUL")?;
+    // SAFETY: retained parent/name are live; O_NOFOLLOW prevents symlink
+    // traversal and the post-open fstat binds the enumerated inode.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0,
+        )
+    };
+    if descriptor < 0 {
+        return Ok(None);
+    }
+    // SAFETY: successful openat returns one newly owned descriptor.
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(None),
+    };
+    let root_uid = match root.metadata() {
+        Ok(metadata) => metadata.uid(),
+        Err(_) => return Ok(None),
+    };
+    if !exact_residue_descriptor_metadata(&metadata, &entry.metadata, root_uid)
+        || stat_at(directory, &entry.name)
+            .ok()
+            .is_none_or(|after| !same_stat_identity(&entry.metadata, &after))
+    {
+        return Ok(None);
+    }
+    Ok(Some(()))
+}
+
+fn read_residue_regular_at(
+    directory: &File,
+    entry: &StrictDirectoryEntry,
+    root: &File,
+    cap: usize,
+    context: &RuntimeInventoryScanContext,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    if entry.metadata.st_mode & libc::S_IFMT != libc::S_IFREG || entry.metadata.st_nlink != 1 {
+        return Ok(None);
+    }
+    context.check_active()?;
+    let file = match open_residue_child(directory, entry, root)? {
+        Some(file) => file,
+        None => return Ok(None),
+    };
+    let before = match file.metadata() {
+        Ok(metadata) if metadata.is_file() && metadata.nlink() == 1 => metadata,
+        Ok(_) | Err(_) => return Ok(None),
+    };
+    let mut bytes = Vec::new();
+    if (&file)
+        .take(u64::try_from(cap)?.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    context.check_active()?;
+    let after = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(None),
+    };
+    if bytes.len() > cap
+        || !same_descriptor_identity(&before, &after)
+        || stat_at(directory, &entry.name)
+            .ok()
+            .is_none_or(|current| !same_stat_identity(&entry.metadata, &current))
+    {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
 }
 
 fn is_serving_handoff_artifact_name(name: &str) -> bool {
@@ -3331,13 +4950,22 @@ fn raw_device_to_u64(device: libc::dev_t) -> Option<u64> {
     u64::try_from(device).ok()
 }
 
-#[cfg(target_os = "linux")]
-fn raw_link_count_to_u64(links: libc::nlink_t) -> u64 {
-    links
+// See raw_link_count_to_u64: the generic bound hides the identity conversion
+// from Clippy on targets where mode_t is already u32.
+fn raw_mode_to_u32<T>(mode: T) -> u32
+where
+    u32: From<T>,
+{
+    u32::from(mode)
 }
 
-#[cfg(not(target_os = "linux"))]
-fn raw_link_count_to_u64(links: libc::nlink_t) -> u64 {
+// libc exposes `nlink_t` at different unsigned widths on supported targets.
+// The generic bound keeps the conversion lossless without making an identity
+// conversion visible to Clippy on targets where the alias is already `u64`.
+fn raw_link_count_to_u64<T>(links: T) -> u64
+where
+    u64: From<T>,
+{
     u64::from(links)
 }
 
@@ -3379,7 +5007,10 @@ fn read_scanned_handoff_artifact(
 enum OnlyDirectoryDescent {
     Empty,
     Unavailable,
-    Open { name: String, directory: File },
+    Open {
+        entry: StrictDirectoryEntry,
+        directory: File,
+    },
 }
 
 fn descend_only_directory(
@@ -3399,15 +5030,18 @@ fn descend_only_directory(
         entries.len() == 1,
         "authorized blockd {label} directory contains duplicate or foreign entries"
     );
-    let name = entries[0]
+    entries[0]
         .name
         .to_str()
-        .with_context(|| format!("authorized blockd {label} path is not UTF-8"))?
-        .to_owned();
-    let Some(directory) = open_strict_child_directory(parent, &entries[0], root)? else {
+        .with_context(|| format!("authorized blockd {label} path is not UTF-8"))?;
+    let entry = entries
+        .into_iter()
+        .next()
+        .expect("nonempty singleton entry");
+    let Some(directory) = open_strict_child_directory(parent, &entry, root)? else {
         return Ok(OnlyDirectoryDescent::Unavailable);
     };
-    Ok(OnlyDirectoryDescent::Open { name, directory })
+    Ok(OnlyDirectoryDescent::Open { entry, directory })
 }
 
 fn authorized_blockd_binding(
@@ -3463,6 +5097,7 @@ struct PlatformRootProcessInventoryBridge {
     state_directory: StateDirectory,
     process_paths: ProcessPaths,
     systemd_root: PathBuf,
+    static_service_identity: Option<StaticServiceIdentity>,
     metering_root: Option<PathBuf>,
     legacy_socket_root: PathBuf,
     limits: ProbeLimits,
@@ -3478,6 +5113,8 @@ struct PlatformRootProcessInventoryBridge {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     recovery_blob_store: Option<Arc<dyn BlobStore>>,
 }
+
+type NodeGlobalInventoryResidue = (Vec<NodeResidue>, Vec<NodeResidue>, Vec<NodeResidue>);
 
 enum AdmittedManagedProcessInspection {
     Exact {
@@ -3610,9 +5247,14 @@ impl PlatformRootProcessInventoryBridge {
             ManagedBlockdStartTarget::Root(expected) => admission
                 .root_control(&expected.cat_id)
                 .is_some_and(|(admitted, exact)| admitted == expected && exact.is_none()),
+            // Lease read skew between the admission mint and this start gate
+            // is not an identity mismatch; see
+            // ServingBlockdExpectation::matches_admitted.
             ManagedBlockdStartTarget::Serving(expected) => admission
                 .serving_blockd(expected.cat_id(), expected.volume_id())
-                .is_some_and(|(admitted, exact)| admitted == expected && exact.is_none()),
+                .is_some_and(|(admitted, exact)| {
+                    expected.matches_admitted(admitted) && exact.is_none()
+                }),
         };
         anyhow::ensure!(
             admitted_absent,
@@ -3692,11 +5334,17 @@ impl PlatformRootProcessInventoryBridge {
         let Some(root) = clone_state_root(&self.state_directory)? else {
             return Ok(None);
         };
-        let checkpoints_by_cat = match scan_runtime_checkpoints(&root, &physical, self.limits)? {
+        let checkpoints_by_cat = match scan_runtime_checkpoints(
+            &root,
+            self.state_directory.path(),
+            &physical,
+            self.limits,
+        )? {
             InventoryAbsence::Empty if checkpoints.iter_checkpoints().len() == 0 => BTreeMap::new(),
             InventoryAbsence::RuntimeCheckpoints(checkpoints_by_cat) => checkpoints_by_cat,
+            InventoryAbsence::RuntimeCheckpointsWithResidue { checkpoints, .. } => checkpoints,
             InventoryAbsence::Empty | InventoryAbsence::Unavailable => return Ok(None),
-            _ => unreachable!("checkpoint probe returned another source kind"),
+            _ => return Ok(None),
         };
         if checkpoints_by_cat.len() != checkpoints.iter_checkpoints().len()
             || checkpoints_by_cat.iter().any(|(cat_id, evidence)| {
@@ -3909,13 +5557,22 @@ impl PlatformRootProcessInventoryBridge {
         context: &dyn RuntimePhysicalReadContext,
     ) -> anyhow::Result<ProbeFact> {
         let mut budget = self.limits.os_entries;
+        let no_static_units = BTreeSet::new();
+        let static_units = self
+            .static_service_identity
+            .as_ref()
+            .map(|identity| &identity.expected_units)
+            .unwrap_or(&no_static_units);
         let systemd = scan_cgroup_tree_allowing(
             &self.systemd_root,
             CgroupKind::Systemd,
             0,
             &mut budget,
             self.limits.recursion_depth,
-            allowed_units,
+            SystemdUnitAllowances {
+                managed: allowed_units,
+                static_at_root: static_units,
+            },
             context,
         )?;
         let metering = if let Some(root) = &self.metering_root {
@@ -3925,7 +5582,10 @@ impl PlatformRootProcessInventoryBridge {
                 0,
                 &mut budget,
                 self.limits.recursion_depth,
-                &BTreeSet::new(),
+                SystemdUnitAllowances {
+                    managed: &BTreeSet::new(),
+                    static_at_root: &BTreeSet::new(),
+                },
                 context,
             )?
         } else {
@@ -4016,6 +5676,134 @@ impl PlatformRootProcessInventoryBridge {
         )
     }
 
+    /// Inventory-only counterpart to the effect-time conflict sweep. Stable
+    /// unaccounted artifacts are projected as closed residue; any unreadable,
+    /// racing, over-budget, or unrepresentable member makes the joint source
+    /// unavailable and therefore cannot mint an admission proof.
+    fn scan_node_global_inventory_residue(
+        &self,
+        allowed_units: &BTreeSet<Id>,
+        allowed_pids: &BTreeSet<u32>,
+        allowed_sockets: &BTreeSet<PathBuf>,
+        expected_vmms: &BTreeMap<Id, VmmProcessExpectation>,
+        context: &RuntimeInventoryScanContext,
+    ) -> anyhow::Result<Option<NodeGlobalInventoryResidue>> {
+        let mut budget = self.limits.os_entries;
+        let Some(systemd) = scan_systemd_residue_allowing(
+            &self.systemd_root,
+            &mut budget,
+            self.limits.recursion_depth,
+            allowed_units,
+            context,
+        )?
+        else {
+            return Ok(None);
+        };
+        if let Some(root) = &self.metering_root {
+            let no_units = BTreeSet::new();
+            if scan_cgroup_tree_allowing(
+                root,
+                CgroupKind::DedicatedMeteringRoot,
+                0,
+                &mut budget,
+                self.limits.recursion_depth,
+                SystemdUnitAllowances {
+                    managed: &no_units,
+                    static_at_root: &no_units,
+                },
+                context,
+            )? != ProbeFact::Empty
+            {
+                return Ok(None);
+            }
+        }
+        let Some(processes) =
+            scan_process_residue_allowing(&self.process_paths, allowed_pids, context)?
+        else {
+            return Ok(None);
+        };
+        let Some(root) = clone_state_root(&self.state_directory)? else {
+            return Ok(None);
+        };
+        let Some(mut control_sockets) = scan_socket_state_namespace_residue_allowing(
+            &root,
+            self.state_directory.path(),
+            CONTROL_SOCKET_NAMESPACE,
+            self.limits.state_entries,
+            context,
+            SocketResidueKind::Control,
+            allowed_sockets,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(mut legacy_sockets) = scan_socket_path_residue_allowing(
+            &self.legacy_socket_root,
+            self.limits.state_entries,
+            context,
+            SocketResidueKind::Control,
+            allowed_sockets,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(mut data_sockets) = scan_recursive_control_socket_residue_allowing(
+            &self.state_directory.path().join(DATA_NAMESPACE),
+            self.limits,
+            allowed_sockets,
+            context,
+        )?
+        else {
+            return Ok(None);
+        };
+        control_sockets.append(&mut legacy_sockets);
+        control_sockets.append(&mut data_sockets);
+
+        let checkpoints = expected_vmms
+            .values()
+            .map(VmmProcessExpectation::checkpoint)
+            .collect::<Vec<_>>();
+        match (
+            self.managed_vmm_socket_root.as_deref(),
+            self.vmm_socket_receipts.as_deref(),
+        ) {
+            (Some(root), Some(receipts)) => {
+                if scan_managed_vmm_socket_root(root, receipts, &checkpoints, context)?
+                    != ManagedVmmSocketRootScan::Accounted
+                {
+                    return Ok(None);
+                }
+            }
+            (None, None) if !self.process_paths.supported => return Ok(None),
+            (None, None) => {}
+            _ => return Ok(None),
+        }
+        #[cfg(target_os = "linux")]
+        match (
+            self.managed_vmm_launch_root.as_deref(),
+            self.managed_vmm_socket_root.as_deref(),
+            self.vmm_socket_receipts.as_deref(),
+        ) {
+            (Some(launch_root), Some(socket_root), Some(receipts)) => {
+                if scan_managed_vmm_launch_root(
+                    launch_root,
+                    socket_root,
+                    receipts,
+                    &checkpoints,
+                    context,
+                )? != ManagedVmmLaunchRootScan::Accounted
+                {
+                    return Ok(None);
+                }
+            }
+            (None, None, None) if !self.process_paths.supported => return Ok(None),
+            (None, None, None) => {}
+            _ => return Ok(None),
+        }
+        context.check_active()?;
+        Ok(Some((systemd, processes, control_sockets)))
+    }
+
     #[cfg(target_os = "linux")]
     fn sweep_node_global_stale_boot_recovery(
         &self,
@@ -4062,6 +5850,12 @@ impl PlatformRootProcessInventoryBridge {
             return Ok(ProbeFact::Present);
         }
         let mut budget = self.limits.os_entries;
+        let no_static_units = BTreeSet::new();
+        let static_units = self
+            .static_service_identity
+            .as_ref()
+            .map(|identity| &identity.expected_units)
+            .unwrap_or(&no_static_units);
         let mut allowed_units = BTreeSet::new();
         let mut allowed_pids = BTreeSet::new();
         let mut allowed_sockets = BTreeSet::new();
@@ -4143,7 +5937,10 @@ impl PlatformRootProcessInventoryBridge {
             0,
             &mut budget,
             self.limits.recursion_depth,
-            &allowed_units,
+            SystemdUnitAllowances {
+                managed: &allowed_units,
+                static_at_root: static_units,
+            },
             &physical,
         )?;
         let metering = if let Some(root) = &self.metering_root {
@@ -4153,7 +5950,10 @@ impl PlatformRootProcessInventoryBridge {
                 0,
                 &mut budget,
                 self.limits.recursion_depth,
-                &BTreeSet::new(),
+                SystemdUnitAllowances {
+                    managed: &BTreeSet::new(),
+                    static_at_root: &BTreeSet::new(),
+                },
                 &physical,
             )?
         } else {
@@ -4336,10 +6136,16 @@ impl PlatformRootProcessInventoryBridge {
         else {
             return Ok(AdmittedManagedProcessInspection::Unavailable);
         };
-        if root_first != root_admitted
-            || serving_first != serving_admitted
-            || vmm_first != vmm_admitted
-        {
+        // Serving evidence carries the live engine's durability counters,
+        // which a Relaxed writer mutates between the admission mint and this
+        // read; compare the stable identity instead of byte equality.
+        let serving_matches_admitted = serving_first.len() == serving_admitted.len()
+            && serving_first.iter().all(|(key, first)| {
+                serving_admitted
+                    .get(key)
+                    .is_some_and(|admitted| first.stable_identity_eq(admitted))
+            });
+        if root_first != root_admitted || !serving_matches_admitted || vmm_first != vmm_admitted {
             return Ok(AdmittedManagedProcessInspection::IdentityMismatch);
         }
 
@@ -4448,7 +6254,13 @@ impl PlatformRootProcessInventoryBridge {
         else {
             return Ok(AdmittedManagedProcessInspection::Unavailable);
         };
-        if root_first != root_second || serving_first != serving_second || vmm_first != vmm_second {
+        let serving_stable = serving_first.len() == serving_second.len()
+            && serving_first.iter().all(|(key, first)| {
+                serving_second
+                    .get(key)
+                    .is_some_and(|second| first.stable_identity_eq(second))
+            });
+        if root_first != root_second || !serving_stable || vmm_first != vmm_second {
             return Ok(AdmittedManagedProcessInspection::IdentityMismatch);
         }
         Ok(AdmittedManagedProcessInspection::Exact {
@@ -4549,6 +6361,10 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
         mut stop_receipt_sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
         context: &RuntimeInventoryScanContext,
     ) -> anyhow::Result<RootProcessInventoryBridgeOutcome> {
+        let unavailable =
+            |exact_running_negative_cats| RootProcessInventoryBridgeOutcome::Unavailable {
+                exact_running_negative_cats,
+            };
         let managed_blockd = match (
             self.managed_blockd_socket_root.as_ref(),
             self.blockd_socket_intents.as_ref(),
@@ -4565,7 +6381,7 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
                 Some((Arc::clone(root), Arc::clone(intents), expected, before))
             }
             (None, None) if !self.process_paths.supported => {
-                return Ok(RootProcessInventoryBridgeOutcome::Unavailable)
+                return Ok(unavailable(BTreeSet::new()))
             }
             #[cfg(test)]
             (None, None) => None,
@@ -4581,18 +6397,31 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
         let Some(root_first) =
             inspect_root_process_set(self.port.as_ref(), &root_expected, context)?
         else {
-            return Ok(RootProcessInventoryBridgeOutcome::Unavailable);
+            return Ok(unavailable(BTreeSet::new()));
         };
         let Some(serving_first) =
             inspect_serving_process_set(self.serving_port.as_ref(), &serving_expected, context)?
         else {
-            return Ok(RootProcessInventoryBridgeOutcome::Unavailable);
+            return Ok(unavailable(BTreeSet::new()));
         };
         let Some(vmm_first) =
             inspect_vmm_process_set(self.vmm_port.as_ref(), &vmm_expected, context)?
         else {
-            return Ok(RootProcessInventoryBridgeOutcome::Unavailable);
+            return Ok(unavailable(BTreeSet::new()));
         };
+        let exact_running_negative_cats = vmm_first
+            .iter()
+            .filter_map(|(cat_id, inspection)| match inspection {
+                VmmProcessInspection::Absent => Some(cat_id.clone()),
+                VmmProcessInspection::Exact(evidence)
+                    if evidence.state() != ProcessState::Running =>
+                {
+                    Some(cat_id.clone())
+                }
+                VmmProcessInspection::Exact(_) => None,
+                _ => unreachable!("inspection set contains only exact or absent"),
+            })
+            .collect::<BTreeSet<_>>();
 
         let mut allowed_units = root_first
             .values()
@@ -4630,6 +6459,34 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
                         && allowed_sockets.insert(PathBuf::from(evidence.listener_path().as_str())),
                     "managed-process inventory contains duplicate physical identity"
                 );
+            }
+        }
+        // An absent serving writer whose durable owner intent is still
+        // retained (an unretired hard-stop) keeps naming its managed socket
+        // paths: they are the retirement effect's responsibility, not stale
+        // residue for the sweep to reclassify. Only paths the managed-root
+        // snapshot itself retains stay allowed.
+        if let Some((_, _, _, before)) = managed_blockd.as_ref() {
+            let retained_paths = before.socket_paths();
+            for (key, inspection) in &serving_first {
+                let expectation = serving_expected
+                    .get(key)
+                    .expect("inspection keys originate from expectations");
+                if matches!(inspection, ServingBlockdProcessInspection::Absent)
+                    && before.retains_serving_owner(
+                        expectation.device_ownership_token(),
+                        &serving_socket_owner_authority_digest(expectation.prepared_device())?,
+                    )?
+                {
+                    for socket in [
+                        expectation.control_socket_path(),
+                        expectation.listener_path(),
+                    ] {
+                        if retained_paths.contains(socket) {
+                            allowed_sockets.insert(PathBuf::from(socket.as_str()));
+                        }
+                    }
+                }
             }
         }
         for inspection in vmm_first.values() {
@@ -4674,6 +6531,7 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
             "managed-process inventory contains duplicate unit or PID identity"
         );
 
+        let mut managed_socket_residue = Vec::new();
         if let Some((_, _, _, before)) = managed_blockd.as_ref() {
             let managed_paths = before
                 .socket_paths()
@@ -4691,53 +6549,108 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
                         .context("managed blockd socket path is not canonical")
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            anyhow::ensure!(
-                platform_managed_blockd_listeners_absent(stale_paths.iter(), context)?,
-                "absent managed blockd owner retains a live Unix listener"
-            );
+            if !platform_managed_blockd_listeners_absent(stale_paths.iter(), context)? {
+                return Ok(unavailable(exact_running_negative_cats));
+            }
+            managed_socket_residue.extend(stale_paths.into_iter().map(|socket_path| {
+                NodeResidue::ControlSocket {
+                    socket_path,
+                    role_hint: None,
+                    ownership_token: OwnershipTokenEvidence::Missing,
+                }
+            }));
         }
 
-        match self.sweep_node_global_inventory(
-            &allowed_units,
-            &allowed_pids,
-            &allowed_sockets,
-            &vmm_expected,
-            context,
-        )? {
-            ProbeFact::Present => {
-                bail!("managed-process inventory found foreign or duplicate managed residue")
+        let (systemd_residue, process_residue, mut control_socket_residue) = match self
+            .scan_node_global_inventory_residue(
+                &allowed_units,
+                &allowed_pids,
+                &allowed_sockets,
+                &vmm_expected,
+                context,
+            ) {
+            Ok(Some(residue)) => residue,
+            Ok(None) | Err(_) => {
+                return Ok(unavailable(exact_running_negative_cats));
             }
-            ProbeFact::Unavailable => return Ok(RootProcessInventoryBridgeOutcome::Unavailable),
-            ProbeFact::Empty => {}
-        }
+        };
+        control_socket_residue.append(&mut managed_socket_residue);
 
         if let Some((root, intents, expected, before)) = managed_blockd.as_ref() {
             let after = root.capture_closed_whole_root(intents, expected)?;
-            anyhow::ensure!(
-                before.same_coordinates(&after),
-                "managed blockd namespace changed across full Node-global inventory"
-            );
+            if !before.same_coordinates(&after) {
+                return Ok(unavailable(exact_running_negative_cats));
+            }
         }
 
-        let Some(root_second) =
-            inspect_root_process_set(self.port.as_ref(), &root_expected, context)?
-        else {
-            return Ok(RootProcessInventoryBridgeOutcome::Unavailable);
+        let root_second =
+            match inspect_root_process_set(self.port.as_ref(), &root_expected, context) {
+                Ok(Some(inspected)) => inspected,
+                Ok(None) => {
+                    return Ok(unavailable(exact_running_negative_cats));
+                }
+                Err(_problem) if context.check_active().is_err() => {
+                    return Ok(unavailable(exact_running_negative_cats));
+                }
+                Err(problem) => return Err(problem),
+            };
+        let serving_second = match inspect_serving_process_set(
+            self.serving_port.as_ref(),
+            &serving_expected,
+            context,
+        ) {
+            Ok(Some(inspected)) => inspected,
+            Ok(None) => {
+                return Ok(unavailable(exact_running_negative_cats));
+            }
+            Err(_problem) if context.check_active().is_err() => {
+                return Ok(unavailable(exact_running_negative_cats));
+            }
+            Err(problem) => return Err(problem),
         };
-        let Some(serving_second) =
-            inspect_serving_process_set(self.serving_port.as_ref(), &serving_expected, context)?
-        else {
-            return Ok(RootProcessInventoryBridgeOutcome::Unavailable);
-        };
-        let Some(vmm_second) =
-            inspect_vmm_process_set(self.vmm_port.as_ref(), &vmm_expected, context)?
-        else {
-            return Ok(RootProcessInventoryBridgeOutcome::Unavailable);
-        };
-        anyhow::ensure!(
-            root_first == root_second && serving_first == serving_second && vmm_first == vmm_second,
-            "managed-process identity changed across the global inventory sweep"
-        );
+        let vmm_second =
+            match inspect_vmm_process_set(self.vmm_port.as_ref(), &vmm_expected, context) {
+                Ok(Some(inspected)) => inspected,
+                Ok(None) => {
+                    return Ok(unavailable(exact_running_negative_cats));
+                }
+                Err(_problem) if context.check_active().is_err() => {
+                    return Ok(unavailable(exact_running_negative_cats));
+                }
+                Err(problem) => return Err(problem),
+            };
+        // Serving evidence carries the live engine's durability counters,
+        // which a Relaxed writer mutates between the two reads; compare the
+        // stable identity instead of byte equality.
+        let serving_stable = serving_first.len() == serving_second.len()
+            && serving_first.iter().all(|(key, first)| {
+                serving_second
+                    .get(key)
+                    .is_some_and(|second| first.stable_identity_eq(second))
+            });
+        if root_first != root_second || !serving_stable || vmm_first != vmm_second {
+            return Ok(unavailable(exact_running_negative_cats));
+        }
+        let mut absent_serving_owners = BTreeSet::new();
+        if let Some((_, _, _, before)) = managed_blockd.as_ref() {
+            for (key, inspection) in &serving_second {
+                let expectation = serving_expected
+                    .get(key)
+                    .expect("inspection keys originate from expectations");
+                if matches!(inspection, ServingBlockdProcessInspection::Absent)
+                    && matches!(
+                        expectation.frontend(),
+                        cats_api::runtime_reconciliation::PrepareDeviceFrontend::VhostUserBlk { .. }
+                    )
+                    && before.retains_serving_owner(
+                        expectation.device_ownership_token(),
+                        &serving_socket_owner_authority_digest(expectation.prepared_device())?,
+                    )?
+                {
+                    absent_serving_owners.insert(key.clone());
+                }
+            }
+        }
         let mut root_proofs = BTreeMap::new();
         for (cat_id, inspection) in root_second {
             if let RootProvisionProcessInspection::Exact(evidence) = inspection {
@@ -4769,14 +6682,29 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
                 vmm_proofs.insert(cat_id, expectation.prove_exact_process(*evidence)?);
             }
         }
-        Ok(RootProcessInventoryBridgeOutcome::Complete(
+        let admission =
             super::root_provision_process::NodeGlobalManagedProcessScanAdmission::from_root_controls(
                 root_expected, root_proofs,
             )?
             .with_serving_blockds(serving_expected, serving_proofs)?
+            .with_absent_serving_owners(absent_serving_owners)?
             .with_vmms(vmm_expected, vmm_proofs)?
-            .with_stop_receipt_sockets(stop_receipt_sockets)?,
-        ))
+            .with_stop_receipt_sockets(stop_receipt_sockets)?;
+        Ok(
+            if systemd_residue.is_empty()
+                && process_residue.is_empty()
+                && control_socket_residue.is_empty()
+            {
+                RootProcessInventoryBridgeOutcome::Complete(admission)
+            } else {
+                RootProcessInventoryBridgeOutcome::CompleteWithResidue {
+                    admission,
+                    systemd: systemd_residue,
+                    processes: process_residue,
+                    control_sockets: control_socket_residue,
+                }
+            },
+        )
     }
 }
 
@@ -4854,7 +6782,9 @@ impl ServingBlockdProcessGlobalPort for PlatformRootProcessInventoryBridge {
                 ServingBlockdProcessConflict::IdentityMismatch,
             ));
         };
-        if admitted_target != expected {
+        // Lease read skew between the admission mint and this sweep is not an
+        // identity mismatch; see ServingBlockdExpectation::matches_admitted.
+        if !expected.matches_admitted(admitted_target) {
             return Ok(ServingBlockdProcessInspection::Conflict(
                 ServingBlockdProcessConflict::IdentityMismatch,
             ));
@@ -4882,6 +6812,35 @@ impl ServingBlockdProcessGlobalPort for PlatformRootProcessInventoryBridge {
             }
         }
     }
+
+    fn retire_absent_socket_owner(
+        &self,
+        expected: &ServingBlockdExpectation,
+        context: &crate::runtime_spine::RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<super::blockd_socket_namespace::ManagedBlockdSocketOwnerRetirement> {
+        let absence =
+            ServingBlockdProcessGlobalPort::retain_start_socket_absence(self, expected, context)?
+                .context("fresh full scan did not seal serving socket-owner absence")?;
+        let current_boot = CurrentBlockdSocketBoot::read()?;
+        let root = RetainedManagedBlockdSocketRoot::open_installed()?;
+        let intents = BlockdSocketIntentStore::open_existing(context.state_directory().clone())?;
+        let intent = BlockdSocketOwnershipIntentV1::serving(
+            &root,
+            &current_boot,
+            expected.device_ownership_token().clone(),
+            serving_socket_owner_authority_digest(expected.prepared_device())?,
+        )?;
+        root.retire_absent_owner(&intents, &intent, &current_boot, absence)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn retire_absent_serving_socket_owner_for_test(
+    process: &dyn ServingBlockdProcessGlobalPort,
+    expected: &ServingBlockdExpectation,
+    context: &crate::runtime_spine::RuntimeDesiredEffectContext,
+) -> anyhow::Result<super::blockd_socket_namespace::ManagedBlockdSocketOwnerRetirement> {
+    process.retire_absent_socket_owner(expected, context)
 }
 
 impl vmm_process_sealed::Sealed for PlatformRootProcessInventoryBridge {}
@@ -5430,6 +7389,24 @@ impl InventoryAbsenceProbe for StateNamespaceProbe {
         let Some(root) = clone_state_root(&self.state_directory)? else {
             return Ok(InventoryAbsence::Unavailable);
         };
+        if self.source == InventorySource::WarmSnapshot {
+            return scan_warm_snapshot_residue(
+                &root,
+                self.state_directory.path(),
+                self.namespace,
+                self.limits,
+                context,
+            );
+        }
+        if self.source == InventorySource::PendingPack {
+            return scan_pending_pack_residue(
+                &root,
+                self.state_directory.path(),
+                self.namespace,
+                self.limits,
+                context,
+            );
+        }
         let mut facts = vec![scan_state_namespace(
             &root,
             self.namespace,
@@ -5452,10 +7429,124 @@ impl InventoryAbsenceProbe for StateNamespaceProbe {
     }
 }
 
+fn scan_warm_snapshot_residue(
+    root: &File,
+    state_path: &Path,
+    namespace: &str,
+    limits: ProbeLimits,
+    context: &RuntimeInventoryScanContext,
+) -> anyhow::Result<InventoryAbsence> {
+    let directory = match open_state_namespace(root, namespace)? {
+        ManagedDirectory::Missing => return Ok(InventoryAbsence::Empty),
+        ManagedDirectory::Unavailable => return Ok(InventoryAbsence::Unavailable),
+        ManagedDirectory::Open(directory) => directory,
+    };
+    let mut budget = limits.state_entries;
+    let entries = match strict_directory_entries(&directory, &mut budget, context) {
+        Ok(Some(entries)) => entries,
+        Ok(None) | Err(_) => return Ok(InventoryAbsence::Unavailable),
+    };
+    let mut residue = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.metadata.st_mode & libc::S_IFMT != libc::S_IFREG
+            || read_strict_regular_prefix_at(&directory, &entry, root, context)?.is_none()
+        {
+            return Ok(InventoryAbsence::Unavailable);
+        }
+        let Some(file_size_bytes) = u64::try_from(entry.metadata.st_size)
+            .ok()
+            .and_then(WireU64::new)
+        else {
+            return Ok(InventoryAbsence::Unavailable);
+        };
+        let Some(name) = entry.name.to_str() else {
+            return Ok(InventoryAbsence::Unavailable);
+        };
+        let path = state_path.join(namespace).join(name);
+        residue.push(NodeResidue::WarmSnapshot {
+            snapshot_id_hint: Path::new(name)
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .and_then(Id::new),
+            path: host_path(&path)?,
+            file_size_bytes,
+            // A bounded identity scan need not read an arbitrarily large
+            // snapshot merely to prove its physical presence.
+            file_digest: None,
+        });
+    }
+    Ok(if residue.is_empty() {
+        InventoryAbsence::Empty
+    } else {
+        InventoryAbsence::Residue(residue)
+    })
+}
+
+fn scan_pending_pack_residue(
+    root: &File,
+    state_path: &Path,
+    namespace: &str,
+    limits: ProbeLimits,
+    context: &RuntimeInventoryScanContext,
+) -> anyhow::Result<InventoryAbsence> {
+    let directory = match open_state_namespace(root, namespace)? {
+        ManagedDirectory::Missing => return Ok(InventoryAbsence::Empty),
+        ManagedDirectory::Unavailable => return Ok(InventoryAbsence::Unavailable),
+        ManagedDirectory::Open(directory) => directory,
+    };
+    let mut budget = limits.state_entries;
+    let entries = match strict_directory_entries(&directory, &mut budget, context) {
+        Ok(Some(entries)) => entries,
+        Ok(None) | Err(_) => return Ok(InventoryAbsence::Unavailable),
+    };
+    let mut residue = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let child = match open_residue_child(&directory, &entry, root) {
+            Ok(Some(child)) if child.metadata().is_ok_and(|metadata| metadata.is_dir()) => child,
+            Ok(Some(_)) | Ok(None) | Err(_) => return Ok(InventoryAbsence::Unavailable),
+        };
+        let Some(allocated_bytes) = observed_allocated_bytes_at(
+            &child,
+            root,
+            &mut budget,
+            context,
+            limits.recursion_depth,
+        )?
+        else {
+            return Ok(InventoryAbsence::Unavailable);
+        };
+        #[cfg(not(feature = "proposed-node-residue-reclamation"))]
+        let _ = allocated_bytes;
+        let Some(name) = entry.name.to_str() else {
+            return Ok(InventoryAbsence::Unavailable);
+        };
+        residue.push(NodeResidue::DataDirectory {
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            cat_id_hint: None,
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            disk_id_hint: None,
+            volume_id_hint: Id::new(name.to_owned()),
+            data_directory: host_path(&state_path.join(namespace).join(name))?,
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            allocated_bytes,
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            retention_reason: DataDirectoryRetentionReason::IncompletePhysicalInventory,
+            ownership_token: OwnershipTokenEvidence::Missing,
+            lineage: ResidueLineageEvidence::Unreadable,
+        });
+    }
+    Ok(if residue.is_empty() {
+        InventoryAbsence::Empty
+    } else {
+        InventoryAbsence::Residue(residue)
+    })
+}
+
 #[derive(Clone)]
 struct ProcessPaths {
     root: PathBuf,
     binaries: Vec<PathBuf>,
+    current_static_service: Option<StaticServiceIdentity>,
     supported: bool,
     limits: ProbeLimits,
 }
@@ -5475,13 +7566,18 @@ impl InventoryAbsenceProbe for ProcessProbe {
         &self,
         context: &RuntimeInventoryScanContext,
     ) -> anyhow::Result<InventoryAbsence> {
-        finish_absence(self.source(), &[scan_processes(&self.paths, context)?])
+        match scan_process_residue(&self.paths, context)? {
+            Some(residue) if residue.is_empty() => Ok(InventoryAbsence::Empty),
+            Some(residue) => Ok(InventoryAbsence::Residue(residue)),
+            None => Ok(InventoryAbsence::Unavailable),
+        }
     }
 }
 
 struct SystemdProbe {
     systemd_root: PathBuf,
     metering_root: Option<PathBuf>,
+    static_service_identity: Option<StaticServiceIdentity>,
     supported: bool,
     limits: ProbeLimits,
 }
@@ -5501,26 +7597,176 @@ impl InventoryAbsenceProbe for SystemdProbe {
             return Ok(InventoryAbsence::Unavailable);
         }
         let mut budget = self.limits.os_entries;
-        let mut facts = vec![scan_cgroup_tree(
+        let no_units = BTreeSet::new();
+        let static_units = self
+            .static_service_identity
+            .as_ref()
+            .map(|identity| &identity.expected_units)
+            .unwrap_or(&no_units);
+        let systemd = scan_systemd_residue_allowing(
             &self.systemd_root,
-            CgroupKind::Systemd,
-            0,
             &mut budget,
             self.limits.recursion_depth,
+            static_units,
             context,
-        )?];
+        )?;
         if let Some(root) = &self.metering_root {
-            facts.push(scan_cgroup_tree(
+            if scan_cgroup_tree_allowing(
                 root,
                 CgroupKind::DedicatedMeteringRoot,
                 0,
                 &mut budget,
                 self.limits.recursion_depth,
+                SystemdUnitAllowances {
+                    managed: &no_units,
+                    static_at_root: &no_units,
+                },
                 context,
-            )?);
+            )? != ProbeFact::Empty
+            {
+                return Ok(InventoryAbsence::Unavailable);
+            }
         }
-        finish_absence(self.source(), &facts)
+        let Some(residue) = systemd else {
+            return Ok(InventoryAbsence::Unavailable);
+        };
+        Ok(if residue.is_empty() {
+            InventoryAbsence::Empty
+        } else {
+            InventoryAbsence::Residue(residue)
+        })
     }
+}
+
+fn scan_systemd_residue_allowing(
+    root: &Path,
+    budget: &mut usize,
+    depth_cap: usize,
+    allowed_units: &BTreeSet<Id>,
+    context: &RuntimeInventoryScanContext,
+) -> anyhow::Result<Option<Vec<NodeResidue>>> {
+    struct WalkState<'a> {
+        budget: &'a mut usize,
+        depth_cap: usize,
+        root_uid: u32,
+        allowed_units: &'a BTreeSet<Id>,
+        context: &'a RuntimeInventoryScanContext,
+        residue: &'a mut Vec<NodeResidue>,
+    }
+
+    fn walk(path: &Path, depth: usize, state: &mut WalkState<'_>) -> anyhow::Result<bool> {
+        if depth > state.depth_cap {
+            return Ok(false);
+        }
+        let entries = match std::fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(source) if unavailable_io(&source) || source.kind() == io::ErrorKind::NotFound => {
+                return Ok(false)
+            }
+            Err(source) => return Err(source).with_context(|| format!("read {}", path.display())),
+        };
+        for entry in entries {
+            state.context.check_active()?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(source) if unavailable_io(&source) => return Ok(false),
+                Err(source) => return Err(source).context("enumerate cgroup entry"),
+            };
+            *state.budget = match state.budget.checked_sub(1) {
+                Some(remaining) => remaining,
+                None => return Ok(false),
+            };
+            let before = match std::fs::symlink_metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(_) => return Ok(false),
+            };
+            if before.file_type().is_symlink() {
+                return Ok(false);
+            }
+            if !before.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            if is_cats_unit(&name) {
+                let Some(scope_id) = name.to_str().and_then(Id::new) else {
+                    return Ok(false);
+                };
+                if state.allowed_units.contains(&scope_id) {
+                    if !walk(&entry.path(), depth + 1, state)? {
+                        return Ok(false);
+                    }
+                    continue;
+                }
+                let members = match read_bounded_optional(
+                    &entry.path().join("cgroup.procs"),
+                    64 * 1024,
+                    state.context,
+                ) {
+                    Ok(OptionalBytes::Bytes(members)) => members,
+                    Ok(OptionalBytes::Missing | OptionalBytes::Unavailable) | Err(_) => {
+                        return Ok(false)
+                    }
+                };
+                if !members.iter().all(u8::is_ascii_whitespace) {
+                    // A live member must be represented by a Process residue
+                    // with stable PID identity; this standalone scope scan is
+                    // deliberately unable to guess that join.
+                    return Ok(false);
+                }
+                let after = match std::fs::symlink_metadata(entry.path()) {
+                    Ok(metadata) => metadata,
+                    Err(_) => return Ok(false),
+                };
+                if before.uid() != state.root_uid
+                    || !before.is_dir()
+                    || !after.is_dir()
+                    || !same_descriptor_identity(&before, &after)
+                {
+                    return Ok(false);
+                }
+                let cgroup_path = match host_path(&entry.path()) {
+                    Ok(path) => path,
+                    Err(_) => return Ok(false),
+                };
+                state.residue.push(NodeResidue::SystemdScope {
+                    scope_id,
+                    cgroup_path,
+                    ownership_token: OwnershipTokenEvidence::Missing,
+                });
+                continue;
+            }
+            if !walk(&entry.path(), depth + 1, state)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    let metadata = match std::fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => metadata,
+        Ok(_) => return Ok(None),
+        Err(source) if unavailable_io(&source) || source.kind() == io::ErrorKind::NotFound => {
+            return Ok(None)
+        }
+        Err(source) => return Err(source).with_context(|| format!("inspect {}", root.display())),
+    };
+    let mut residue = Vec::new();
+    let complete = {
+        let mut state = WalkState {
+            budget,
+            depth_cap,
+            root_uid: metadata.uid(),
+            allowed_units,
+            context,
+            residue: &mut residue,
+        };
+        walk(root, 0, &mut state)?
+    };
+    if !complete {
+        return Ok(None);
+    }
+    context.check_active()?;
+    Ok(Some(residue))
 }
 
 struct ControlSocketProbe {
@@ -5543,23 +7789,247 @@ impl InventoryAbsenceProbe for ControlSocketProbe {
         let Some(root) = clone_state_root(&self.state_directory)? else {
             return Ok(InventoryAbsence::Unavailable);
         };
-        finish_absence(
-            self.source(),
-            &[
-                scan_state_namespace(
-                    &root,
-                    CONTROL_SOCKET_NAMESPACE,
-                    self.limits.state_entries,
-                    context,
-                )?,
-                scan_managed_path_namespace(
-                    &self.legacy_socket_root,
-                    self.limits.state_entries,
-                    context,
-                )?,
-            ],
-        )
+        let state = scan_socket_state_namespace_residue(
+            &root,
+            self.state_directory.path(),
+            CONTROL_SOCKET_NAMESPACE,
+            self.limits.state_entries,
+            context,
+            SocketResidueKind::Control,
+        )?;
+        let legacy = scan_socket_path_residue(
+            &self.legacy_socket_root,
+            self.limits.state_entries,
+            context,
+            SocketResidueKind::Control,
+        )?;
+        combine_residue_sources(state, legacy)
     }
+}
+
+#[derive(Clone, Copy)]
+enum SocketResidueKind {
+    Control,
+    VhostUserBlk,
+}
+
+fn combine_residue_sources(
+    first: Option<Vec<NodeResidue>>,
+    second: Option<Vec<NodeResidue>>,
+) -> anyhow::Result<InventoryAbsence> {
+    let (Some(mut first), Some(mut second)) = (first, second) else {
+        return Ok(InventoryAbsence::Unavailable);
+    };
+    first.append(&mut second);
+    Ok(if first.is_empty() {
+        InventoryAbsence::Empty
+    } else {
+        InventoryAbsence::Residue(first)
+    })
+}
+
+fn scan_socket_state_namespace_residue(
+    root: &File,
+    state_path: &Path,
+    namespace: &str,
+    cap: usize,
+    context: &RuntimeInventoryScanContext,
+    kind: SocketResidueKind,
+) -> anyhow::Result<Option<Vec<NodeResidue>>> {
+    scan_socket_state_namespace_residue_allowing(
+        root,
+        state_path,
+        namespace,
+        cap,
+        context,
+        kind,
+        &BTreeSet::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_socket_state_namespace_residue_allowing(
+    root: &File,
+    state_path: &Path,
+    namespace: &str,
+    cap: usize,
+    context: &RuntimeInventoryScanContext,
+    kind: SocketResidueKind,
+    allowed_paths: &BTreeSet<PathBuf>,
+) -> anyhow::Result<Option<Vec<NodeResidue>>> {
+    let directory = match open_state_namespace(root, namespace)? {
+        ManagedDirectory::Missing => return Ok(Some(Vec::new())),
+        ManagedDirectory::Unavailable => return Ok(None),
+        ManagedDirectory::Open(directory) => directory,
+    };
+    scan_socket_open_directory_residue(
+        &directory,
+        &state_path.join(namespace),
+        cap,
+        context,
+        kind,
+        allowed_paths,
+    )
+}
+
+fn scan_socket_path_residue(
+    path: &Path,
+    cap: usize,
+    context: &RuntimeInventoryScanContext,
+    kind: SocketResidueKind,
+) -> anyhow::Result<Option<Vec<NodeResidue>>> {
+    scan_socket_path_residue_allowing(path, cap, context, kind, &BTreeSet::new())
+}
+
+fn scan_socket_path_residue_allowing(
+    path: &Path,
+    cap: usize,
+    context: &RuntimeInventoryScanContext,
+    kind: SocketResidueKind,
+    allowed_paths: &BTreeSet<PathBuf>,
+) -> anyhow::Result<Option<Vec<NodeResidue>>> {
+    let directory = match open_managed_directory(path)? {
+        ManagedDirectory::Missing => return Ok(Some(Vec::new())),
+        ManagedDirectory::Unavailable => return Ok(None),
+        ManagedDirectory::Open(directory) => directory,
+    };
+    scan_socket_open_directory_residue(&directory, path, cap, context, kind, allowed_paths)
+}
+
+fn scan_socket_open_directory_residue(
+    directory: &File,
+    path: &Path,
+    cap: usize,
+    context: &RuntimeInventoryScanContext,
+    kind: SocketResidueKind,
+    allowed_paths: &BTreeSet<PathBuf>,
+) -> anyhow::Result<Option<Vec<NodeResidue>>> {
+    let directory_uid = match directory.metadata() {
+        Ok(metadata) => metadata.uid(),
+        Err(_) => return Ok(None),
+    };
+    let mut budget = cap;
+    let entries = match strict_directory_entries(directory, &mut budget, context) {
+        Ok(Some(entries)) => entries,
+        Ok(None) | Err(_) => return Ok(None),
+    };
+    let mut residue = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.metadata.st_mode & libc::S_IFMT != libc::S_IFSOCK
+            || entry.metadata.st_uid != directory_uid
+            || entry.metadata.st_nlink != 1
+        {
+            return Ok(None);
+        }
+        context.check_active()?;
+        let after = match stat_at(directory, &entry.name) {
+            Ok(after) if same_stat_identity(&entry.metadata, &after) => after,
+            Ok(_) | Err(_) => return Ok(None),
+        };
+        if after.st_mode & libc::S_IFMT != libc::S_IFSOCK || after.st_uid != directory_uid {
+            return Ok(None);
+        }
+        let Some(name) = entry.name.to_str() else {
+            return Ok(None);
+        };
+        let physical_path = path.join(name);
+        if allowed_paths.contains(&physical_path) {
+            continue;
+        }
+        let socket_path = match host_path(&physical_path) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        residue.push(match kind {
+            SocketResidueKind::Control => NodeResidue::ControlSocket {
+                socket_path,
+                role_hint: None,
+                ownership_token: OwnershipTokenEvidence::Missing,
+            },
+            SocketResidueKind::VhostUserBlk => NodeResidue::VhostUserBlk {
+                volume_id_hint: None,
+                guest_device: None,
+                socket_path,
+                ownership_token: OwnershipTokenEvidence::Missing,
+            },
+        });
+    }
+    context.check_active()?;
+    Ok(Some(residue))
+}
+
+fn scan_recursive_control_socket_residue_allowing(
+    root: &Path,
+    limits: ProbeLimits,
+    allowed_paths: &BTreeSet<PathBuf>,
+    context: &RuntimeInventoryScanContext,
+) -> anyhow::Result<Option<Vec<NodeResidue>>> {
+    let root_metadata = match std::fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => metadata,
+        Ok(_) => return Ok(None),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(Some(Vec::new())),
+        Err(source) if unavailable_io(&source) => return Ok(None),
+        Err(source) => return Err(source).with_context(|| format!("inspect {}", root.display())),
+    };
+    let collect = || -> anyhow::Result<Option<BTreeSet<PathBuf>>> {
+        let mut sockets = BTreeSet::new();
+        let mut budget = limits.state_entries;
+        match collect_managed_sockets(
+            root,
+            0,
+            limits.recursion_depth,
+            &mut budget,
+            context,
+            &mut sockets,
+        )? {
+            ProbeFact::Empty | ProbeFact::Present => Ok(Some(sockets)),
+            ProbeFact::Unavailable => Ok(None),
+        }
+    };
+    let Some(first) = collect()? else {
+        return Ok(None);
+    };
+    let Some(second) = collect()? else {
+        return Ok(None);
+    };
+    if first != second {
+        return Ok(None);
+    }
+    let mut residue = Vec::new();
+    for socket in second {
+        if allowed_paths.contains(&socket) {
+            continue;
+        }
+        let before = match std::fs::symlink_metadata(&socket) {
+            Ok(metadata)
+                if metadata.file_type().is_socket()
+                    && metadata.uid() == root_metadata.uid()
+                    && metadata.nlink() == 1 =>
+            {
+                metadata
+            }
+            Ok(_) | Err(_) => return Ok(None),
+        };
+        context.check_active()?;
+        let after = match std::fs::symlink_metadata(&socket) {
+            Ok(metadata) => metadata,
+            Err(_) => return Ok(None),
+        };
+        if !same_descriptor_identity(&before, &after) {
+            return Ok(None);
+        }
+        let socket_path = match host_path(&socket) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        residue.push(NodeResidue::ControlSocket {
+            socket_path,
+            role_hint: None,
+            ownership_token: OwnershipTokenEvidence::Missing,
+        });
+    }
+    context.check_active()?;
+    Ok(Some(residue))
 }
 
 struct BlockFrontendProbe {
@@ -5586,28 +8056,39 @@ impl InventoryAbsenceProbe for BlockFrontendProbe {
             return Ok(InventoryAbsence::Unavailable);
         };
         let nbd = if self.supported {
-            scan_nbd(
+            scan_nbd_residue(
                 &self.block_class_root,
                 self.limits.os_entries,
                 self.managed_kernel_nbd_device_count,
                 context,
             )?
         } else {
-            ProbeFact::Unavailable
+            None
         };
-        finish_absence(
-            self.source(),
-            &[
-                nbd,
-                scan_state_namespace(&root, VHOST_NAMESPACE, self.limits.state_entries, context)?,
-                scan_managed_path_namespace_matching(
-                    &self.legacy_socket_root,
-                    self.limits.state_entries,
-                    context,
-                    socket_candidate,
-                )?,
-            ],
-        )
+        let state = scan_socket_state_namespace_residue(
+            &root,
+            self.state_directory.path(),
+            VHOST_NAMESPACE,
+            self.limits.state_entries,
+            context,
+            SocketResidueKind::VhostUserBlk,
+        )?;
+        let legacy = scan_socket_path_residue(
+            &self.legacy_socket_root,
+            self.limits.state_entries,
+            context,
+            SocketResidueKind::VhostUserBlk,
+        )?;
+        let (Some(mut residue), Some(mut state), Some(mut legacy)) = (nbd, state, legacy) else {
+            return Ok(InventoryAbsence::Unavailable);
+        };
+        residue.append(&mut state);
+        residue.append(&mut legacy);
+        Ok(if residue.is_empty() {
+            InventoryAbsence::Empty
+        } else {
+            InventoryAbsence::Residue(residue)
+        })
     }
 }
 
@@ -5634,25 +8115,32 @@ impl InventoryAbsenceProbe for NetworkProbe {
             return Ok(InventoryAbsence::Unavailable);
         };
         let interfaces = if self.physical_inventory_owned_by_bridge {
-            ProbeFact::Empty
+            Some(Vec::new())
         } else if self.supported {
-            scan_network_interfaces(&self.network_class_root, self.limits.os_entries, context)?
+            scan_network_residue(&self.network_class_root, self.limits.os_entries, context)?
         } else {
-            ProbeFact::Unavailable
+            None
         };
-        finish_absence(
-            self.source(),
-            &[
-                interfaces,
-                scan_state_namespace(&root, NETWORK_NAMESPACE, self.limits.state_entries, context)?,
-                scan_state_namespace(
-                    &root,
-                    RUNTIME_EFFECTS_NAMESPACE,
-                    self.limits.state_entries,
-                    context,
-                )?,
-            ],
-        )
+        let facts = [
+            scan_state_namespace(&root, NETWORK_NAMESPACE, self.limits.state_entries, context)?,
+            scan_state_namespace(
+                &root,
+                RUNTIME_EFFECTS_NAMESPACE,
+                self.limits.state_entries,
+                context,
+            )?,
+        ];
+        let Some(residue) = interfaces else {
+            return Ok(InventoryAbsence::Unavailable);
+        };
+        if facts.iter().any(|fact| *fact != ProbeFact::Empty) {
+            return Ok(InventoryAbsence::Unavailable);
+        }
+        Ok(if residue.is_empty() {
+            InventoryAbsence::Empty
+        } else {
+            InventoryAbsence::Residue(residue)
+        })
     }
 }
 
@@ -5684,61 +8172,78 @@ impl InventoryAbsenceProbe for MetadataStoreProbe {
 
         let mut local_candidates_complete = true;
         if let Some(root) = clone_state_root(&self.state_directory)? {
-            match scan_runtime_checkpoints(&root, context, self.limits)? {
-                InventoryAbsence::RuntimeCheckpoints(checkpoints) => {
-                    for (cat_id, evidence) in checkpoints {
-                        if evidence.binding == DesiredCheckpointBinding::Current {
-                            if let cats_api::runtime_reconciliation::ReconcileStep::CleanupRelease {
-                                cleanup,
-                            } = &evidence.checkpoint.step
+            let (checkpoints, checkpoints_complete) = match scan_runtime_checkpoints(
+                &root,
+                self.state_directory.path(),
+                context,
+                self.limits,
+            )? {
+                InventoryAbsence::RuntimeCheckpoints(checkpoints) => (Some(checkpoints), true),
+                InventoryAbsence::RuntimeCheckpointsWithResidue { checkpoints, .. } => {
+                    (Some(checkpoints), true)
+                }
+                InventoryAbsence::RuntimeCheckpointsWithCorrupt { checkpoints, .. } => {
+                    (Some(checkpoints), true)
+                }
+                InventoryAbsence::Empty => (None, true),
+                InventoryAbsence::Unavailable => (None, false),
+                _ => unreachable!("checkpoint scan returns only checkpoint evidence"),
+            };
+            local_candidates_complete &= checkpoints_complete;
+            if let Some(checkpoints) = checkpoints {
+                for (cat_id, evidence) in checkpoints {
+                    if evidence.binding == DesiredCheckpointBinding::Current {
+                        if let cats_api::runtime_reconciliation::ReconcileStep::CleanupRelease {
+                            cleanup,
+                        } = &evidence.checkpoint.step
+                        {
+                            if let cats_api::runtime_reconciliation::CleanupTarget::Volume {
+                                volume_id,
+                                ..
+                            } = &cleanup.target
                             {
-                                if let cats_api::runtime_reconciliation::CleanupTarget::Volume {
-                                    volume_id,
-                                    ..
-                                } = &cleanup.target
-                                {
-                                    anyhow::ensure!(
-                                        cleanup_replays
-                                            .insert(volume_id.clone(), cleanup.clone())
-                                            .is_none(),
-                                        "multiple current cleanups name one Volume"
-                                    );
-                                }
+                                anyhow::ensure!(
+                                    cleanup_replays
+                                        .insert(volume_id.clone(), cleanup.clone())
+                                        .is_none(),
+                                    "multiple current cleanups name one Volume"
+                                );
                             }
                         }
-                        let carries_superseded_acquire = matches!(
-                            &evidence.checkpoint.step,
-                            cats_api::runtime_reconciliation::ReconcileStep::AcquireVolume {
-                                request: cats_api::runtime_reconciliation::VolumeAcquireRequest::Normal {
-                                    desired_revision,
-                                    ..
-                                },
-                            } if *desired_revision < evidence.checkpoint.desired_revision
+                    }
+                    let carries_superseded_acquire = matches!(
+                        &evidence.checkpoint.step,
+                        cats_api::runtime_reconciliation::ReconcileStep::AcquireVolume {
+                            request: cats_api::runtime_reconciliation::VolumeAcquireRequest::Normal {
+                                desired_revision,
+                                ..
+                            },
+                        } if *desired_revision < evidence.checkpoint.desired_revision
+                    );
+                    let carries_owned_adoption = evidence.binding
+                        == DesiredCheckpointBinding::Current
+                        && matches!(
+                            evidence.checkpoint.step,
+                            cats_api::runtime_reconciliation::ReconcileStep::AcquireVolume { .. }
+                        )
+                        && evidence.checkpoint.volumes.iter().any(|volume| {
+                            matches!(volume.authority, VolumeAuthorityEvidence::Owned { .. })
+                        });
+                    let carries_quarantined_lineage = evidence.binding
+                        == DesiredCheckpointBinding::Current
+                        && matches!(
+                            evidence.checkpoint.step,
+                            cats_api::runtime_reconciliation::ReconcileStep::Quarantined
                         );
-                        let carries_owned_adoption = evidence.binding
-                            == DesiredCheckpointBinding::Current
-                            && matches!(
-                                evidence.checkpoint.step,
-                                cats_api::runtime_reconciliation::ReconcileStep::AcquireVolume { .. }
-                            )
-                            && evidence.checkpoint.volumes.iter().any(|volume| {
-                                matches!(volume.authority, VolumeAuthorityEvidence::Owned { .. })
-                            });
-                        let carries_quarantined_lineage = evidence.binding
-                            == DesiredCheckpointBinding::Current
-                            && matches!(
-                                evidence.checkpoint.step,
-                                cats_api::runtime_reconciliation::ReconcileStep::Quarantined
-                            );
-                        if evidence.binding != DesiredCheckpointBinding::Superseded
-                            && !carries_superseded_acquire
-                            && !carries_owned_adoption
-                            && !carries_quarantined_lineage
-                        {
-                            continue;
-                        }
-                        for observed in &evidence.checkpoint.volumes {
-                            insert_stale_volume_projection(
+                    if evidence.binding != DesiredCheckpointBinding::Superseded
+                        && !carries_superseded_acquire
+                        && !carries_owned_adoption
+                        && !carries_quarantined_lineage
+                    {
+                        continue;
+                    }
+                    for observed in &evidence.checkpoint.volumes {
+                        insert_stale_volume_projection(
                                 &mut stale_volumes,
                                 StaleVolumeProjection {
                                     cat_id: cat_id.clone(),
@@ -5753,12 +8258,8 @@ impl InventoryAbsenceProbe for MetadataStoreProbe {
                                     },
                                 },
                             )?;
-                        }
                     }
                 }
-                InventoryAbsence::Empty => {}
-                InventoryAbsence::Unavailable => local_candidates_complete = false,
-                _ => unreachable!("checkpoint scan returns only checkpoint evidence"),
             }
             match scan_authorized_blockd_data(
                 &root,
@@ -5977,9 +8478,12 @@ fn supported_desired_volumes(
 ) -> anyhow::Result<Option<BTreeMap<Id, (&DesiredRuntimeSpec, &VolumeIntent)>>> {
     let mut volumes = BTreeMap::new();
     for desired in &context.coordinates().desired.desired_specs {
-        if desired.target != cats_api::runtime_reconciliation::RuntimeTarget::Running
-            || encode_desired_runtime_spec(desired).is_err()
-        {
+        // The frozen Desired wire already closes lifecycle target/disposition
+        // compatibility: non-Deleted retains every volume, while Deleted
+        // permits only explicit detach/delete dispositions and restricts
+        // disposable delete to Root. Inventory is observation-only, so the
+        // same complete authority read is valid for every lifecycle target.
+        if encode_desired_runtime_spec(desired).is_err() {
             return Ok(None);
         }
         if desired.volumes.is_empty() || desired.volumes.len() > 64 {
@@ -5988,7 +8492,6 @@ fn supported_desired_volumes(
         for (index, intent) in desired.volumes.iter().enumerate() {
             let shape_is_exact = usize::from(intent.guest_device.slot) == index
                 && intent.access == VolumeAccess::ReadWriteOnce
-                && matches!(intent.disposition, VolumeDisposition::Retain)
                 && match index {
                     0 => intent.disk_kind == DiskKind::Root && intent.mount.is_none(),
                     _ => intent.disk_kind == DiskKind::Persistent && intent.mount.is_some(),
@@ -6281,8 +8784,6 @@ struct LocalVolumeCandidates {
 
 struct GuestMountProbe {
     state_directory: StateDirectory,
-    legacy_socket_root: PathBuf,
-    guest_process_paths: ProcessPaths,
     limits: ProbeLimits,
 }
 
@@ -6302,26 +8803,12 @@ impl InventoryAbsenceProbe for GuestMountProbe {
         };
         finish_absence(
             self.source(),
-            &[
-                scan_processes(&self.guest_process_paths, context)?,
-                scan_state_namespace(
-                    &root,
-                    CONTROL_SOCKET_NAMESPACE,
-                    self.limits.state_entries,
-                    context,
-                )?,
-                scan_managed_path_namespace(
-                    &self.legacy_socket_root,
-                    self.limits.state_entries,
-                    context,
-                )?,
-                scan_state_namespace(
-                    &root,
-                    GUEST_MOUNT_NAMESPACE,
-                    self.limits.state_entries,
-                    context,
-                )?,
-            ],
+            &[scan_state_namespace(
+                &root,
+                GUEST_MOUNT_NAMESPACE,
+                self.limits.state_entries,
+                context,
+            )?],
         )
     }
 }
@@ -6493,9 +8980,15 @@ enum ManagedDirectory {
     Open(File),
 }
 
+#[derive(Clone)]
 struct StrictDirectoryEntry {
     name: OsString,
     metadata: libc::stat,
+}
+
+enum BoundedDirectoryEntries {
+    Complete(Vec<StrictDirectoryEntry>),
+    LimitExceeded,
 }
 
 fn strict_directory_entries(
@@ -6503,7 +8996,19 @@ fn strict_directory_entries(
     budget: &mut usize,
     context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<Option<Vec<StrictDirectoryEntry>>> {
-    strict_directory_entries_with_release_links(directory, budget, context, false)
+    match strict_directory_entries_bounded_with_release_links(
+        directory,
+        budget,
+        context,
+        usize::MAX,
+        false,
+    )? {
+        Some(BoundedDirectoryEntries::Complete(entries)) => Ok(Some(entries)),
+        Some(BoundedDirectoryEntries::LimitExceeded) => {
+            unreachable!("usize::MAX directory cap cannot be exceeded")
+        }
+        None => Ok(None),
+    }
 }
 
 fn strict_checkpoint_directory_entries(
@@ -6511,15 +9016,43 @@ fn strict_checkpoint_directory_entries(
     budget: &mut usize,
     context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<Option<Vec<StrictDirectoryEntry>>> {
-    strict_directory_entries_with_release_links(directory, budget, context, true)
+    match strict_directory_entries_bounded_with_release_links(
+        directory,
+        budget,
+        context,
+        usize::MAX,
+        true,
+    )? {
+        Some(BoundedDirectoryEntries::Complete(entries)) => Ok(Some(entries)),
+        Some(BoundedDirectoryEntries::LimitExceeded) => {
+            unreachable!("usize::MAX directory cap cannot be exceeded")
+        }
+        None => Ok(None),
+    }
 }
 
-fn strict_directory_entries_with_release_links(
+fn strict_directory_entries_bounded(
     directory: &File,
     budget: &mut usize,
     context: &dyn RuntimePhysicalReadContext,
+    maximum_entries: usize,
+) -> anyhow::Result<Option<BoundedDirectoryEntries>> {
+    strict_directory_entries_bounded_with_release_links(
+        directory,
+        budget,
+        context,
+        maximum_entries,
+        false,
+    )
+}
+
+fn strict_directory_entries_bounded_with_release_links(
+    directory: &File,
+    budget: &mut usize,
+    context: &dyn RuntimePhysicalReadContext,
+    maximum_entries: usize,
     allow_release_publication_links: bool,
-) -> anyhow::Result<Option<Vec<StrictDirectoryEntry>>> {
+) -> anyhow::Result<Option<BoundedDirectoryEntries>> {
     let mut stream = match DirectoryStream::open(directory) {
         Ok(stream) => stream,
         Err(source) if unavailable_io(&source) => return Ok(None),
@@ -6538,6 +9071,9 @@ fn strict_directory_entries_with_release_links(
             Some(remaining) => remaining,
             None => bail!("authorized Runtime namespace exceeds entry cap"),
         };
+        if entries.len() == maximum_entries {
+            return Ok(Some(BoundedDirectoryEntries::LimitExceeded));
+        }
         let metadata = match stat_at(directory, &name) {
             Ok(metadata) => metadata,
             Err(source) if unavailable_io(&source) || source.kind() == io::ErrorKind::NotFound => {
@@ -6563,7 +9099,7 @@ fn strict_directory_entries_with_release_links(
     }
     context.check_active()?;
     entries.sort_by(|left, right| left.name.cmp(&right.name));
-    Ok(Some(entries))
+    Ok(Some(BoundedDirectoryEntries::Complete(entries)))
 }
 
 fn open_exact_only_child_directory(
@@ -7091,23 +9627,10 @@ enum CgroupKind {
     DedicatedMeteringRoot,
 }
 
-fn scan_cgroup_tree(
-    root: &Path,
-    kind: CgroupKind,
-    depth: usize,
-    budget: &mut usize,
-    depth_cap: usize,
-    context: &dyn RuntimePhysicalReadContext,
-) -> anyhow::Result<ProbeFact> {
-    scan_cgroup_tree_allowing(
-        root,
-        kind,
-        depth,
-        budget,
-        depth_cap,
-        &BTreeSet::new(),
-        context,
-    )
+#[derive(Clone, Copy)]
+struct SystemdUnitAllowances<'a> {
+    managed: &'a BTreeSet<Id>,
+    static_at_root: &'a BTreeSet<Id>,
 }
 
 fn scan_cgroup_tree_allowing(
@@ -7116,7 +9639,7 @@ fn scan_cgroup_tree_allowing(
     depth: usize,
     budget: &mut usize,
     depth_cap: usize,
-    allowed_systemd_units: &BTreeSet<Id>,
+    allowances: SystemdUnitAllowances<'_>,
     context: &dyn RuntimePhysicalReadContext,
 ) -> anyhow::Result<ProbeFact> {
     context.check_active()?;
@@ -7180,10 +9703,10 @@ fn scan_cgroup_tree_allowing(
         };
         if candidate {
             let allowed = matches!(kind, CgroupKind::Systemd)
-                && name
-                    .to_str()
-                    .and_then(Id::new)
-                    .is_some_and(|unit| allowed_systemd_units.contains(&unit));
+                && name.to_str().and_then(Id::new).is_some_and(|unit| {
+                    allowances.managed.contains(&unit)
+                        || (depth == 0 && allowances.static_at_root.contains(&unit))
+                });
             if !allowed {
                 return Ok(ProbeFact::Present);
             }
@@ -7193,7 +9716,7 @@ fn scan_cgroup_tree_allowing(
                 depth + 1,
                 budget,
                 depth_cap,
-                allowed_systemd_units,
+                allowances,
                 context,
             )? {
                 ProbeFact::Present => return Ok(ProbeFact::Present),
@@ -7208,7 +9731,7 @@ fn scan_cgroup_tree_allowing(
             depth + 1,
             budget,
             depth_cap,
-            allowed_systemd_units,
+            allowances,
             context,
         )? {
             ProbeFact::Present => return Ok(ProbeFact::Present),
@@ -7227,14 +9750,176 @@ fn is_cats_unit(name: &OsStr) -> bool {
     let Some(name) = name.to_str() else {
         return false;
     };
+    is_reserved_runtime_unit(name)
+}
+
+fn is_reserved_runtime_unit(name: &str) -> bool {
     name.starts_with("cats-") && (name.ends_with(".scope") || name.ends_with(".service"))
 }
 
-fn scan_processes(
+/// Enumerate every Cats executable as stable `(pid,start_ticks,exe)` residue.
+/// A command-line match is only a candidate: it never substitutes for the
+/// descriptor-independent executable link plus two equal stat reads. Any PID
+/// disappearance/reuse, malformed stat, cap overflow, or unreadable candidate
+/// makes the entire Process source incomplete rather than publishing a
+/// truncated or guessed list.
+fn scan_process_residue(
     paths: &ProcessPaths,
     context: &dyn RuntimePhysicalReadContext,
-) -> anyhow::Result<ProbeFact> {
-    scan_processes_allowing(paths, &BTreeSet::new(), context)
+) -> anyhow::Result<Option<Vec<NodeResidue>>> {
+    let Some(expected) = paths.current_static_service.as_ref() else {
+        return scan_process_residue_allowing(paths, &BTreeSet::new(), context);
+    };
+    match inspect_static_service_process(paths, expected, context)? {
+        StaticProcessInspection::Exact => {
+            scan_process_residue_allowing(paths, &BTreeSet::from([expected.process_id]), context)
+        }
+        StaticProcessInspection::Unavailable => Ok(None),
+        StaticProcessInspection::Conflict => {
+            let residue = scan_process_residue_allowing(paths, &BTreeSet::new(), context)?;
+            Ok(residue.filter(|items| {
+                items.iter().any(|item| {
+                    matches!(
+                        item,
+                        NodeResidue::Process { process_id, .. }
+                            if *process_id == expected.process_id
+                    )
+                })
+            }))
+        }
+    }
+}
+
+fn scan_process_residue_allowing(
+    paths: &ProcessPaths,
+    allowed_pids: &BTreeSet<u32>,
+    context: &dyn RuntimePhysicalReadContext,
+) -> anyhow::Result<Option<Vec<NodeResidue>>> {
+    if !paths.supported {
+        return Ok(None);
+    }
+    context.check_active()?;
+    match std::fs::symlink_metadata(&paths.root) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Ok(None),
+        Err(source) if unavailable_io(&source) || source.kind() == io::ErrorKind::NotFound => {
+            return Ok(None)
+        }
+        Err(source) => return Err(source).context("inspect proc root"),
+    }
+    let entries = match std::fs::read_dir(&paths.root) {
+        Ok(entries) => entries,
+        Err(source) if unavailable_io(&source) => return Ok(None),
+        Err(source) => return Err(source).context("read proc root"),
+    };
+    let mut count = 0_usize;
+    let mut residue = Vec::new();
+    for entry in entries {
+        context.check_active()?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(source) if unavailable_io(&source) => return Ok(None),
+            Err(source) => return Err(source).context("enumerate proc root"),
+        };
+        let name = entry.file_name();
+        if name.is_empty() || !name.as_bytes().iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        count = match count.checked_add(1) {
+            Some(count) if count <= paths.limits.os_entries => count,
+            _ => return Ok(None),
+        };
+        match entry.file_type() {
+            Ok(file_type) if file_type.is_dir() && !file_type.is_symlink() => {}
+            Ok(_) => return Ok(None),
+            Err(source) if unavailable_io(&source) => return Ok(None),
+            Err(source) => return Err(source).context("inspect proc entry"),
+        }
+        let pid_path = entry.path();
+        let process_id = match name.to_str().and_then(|value| value.parse::<u32>().ok()) {
+            Some(process_id) if process_id > 0 => process_id,
+            _ => return Ok(None),
+        };
+        let first_exe = std::fs::read_link(pid_path.join("exe"));
+        let cmdline = match read_bounded_optional(
+            &pid_path.join("cmdline"),
+            paths.limits.process_cmdline_bytes,
+            context,
+        ) {
+            Ok(cmdline) => cmdline,
+            Err(_) => return Ok(None),
+        };
+        let exe_matches = first_exe
+            .as_ref()
+            .is_ok_and(|exe| paths.binaries.iter().any(|binary| binary == exe));
+        let cmdline_matches = matches!(&cmdline, OptionalBytes::Bytes(bytes) if {
+            let first = bytes.split(|byte| *byte == 0).next().unwrap_or_default();
+            paths
+                .binaries
+                .iter()
+                .any(|binary| binary.as_os_str().as_bytes() == first)
+        });
+        if !exe_matches && !cmdline_matches {
+            if first_exe.is_err() && matches!(cmdline, OptionalBytes::Unavailable) {
+                return Ok(None);
+            }
+            continue;
+        }
+        if allowed_pids.contains(&process_id) {
+            continue;
+        }
+        let first_exe = match first_exe {
+            Ok(exe) if paths.binaries.iter().any(|binary| binary == &exe) => exe,
+            _ => return Ok(None),
+        };
+        let first_stat = match read_bounded_optional(&pid_path.join("stat"), 4096, context) {
+            Ok(OptionalBytes::Bytes(bytes)) => bytes,
+            Ok(OptionalBytes::Missing | OptionalBytes::Unavailable) | Err(_) => return Ok(None),
+        };
+        let first_stat = match std::str::from_utf8(&first_stat)
+            .ok()
+            .and_then(crate::proc::parse_start_ticks)
+            .and_then(WireU64::new)
+        {
+            Some(start_ticks) if start_ticks.get() > 0 => start_ticks,
+            _ => return Ok(None),
+        };
+        context.check_active()?;
+        let second_exe = match std::fs::read_link(pid_path.join("exe")) {
+            Ok(exe) => exe,
+            Err(_) => return Ok(None),
+        };
+        let second_stat = match read_bounded_optional(&pid_path.join("stat"), 4096, context) {
+            Ok(OptionalBytes::Bytes(bytes)) => bytes,
+            Ok(OptionalBytes::Missing | OptionalBytes::Unavailable) | Err(_) => return Ok(None),
+        };
+        let second_stat = std::str::from_utf8(&second_stat)
+            .ok()
+            .and_then(crate::proc::parse_start_ticks)
+            .and_then(WireU64::new);
+        if second_exe != first_exe || second_stat != Some(first_stat) {
+            return Ok(None);
+        }
+        let Some(executable_path) = first_exe
+            .to_str()
+            .map(str::to_owned)
+            .and_then(HostPath::new)
+        else {
+            return Ok(None);
+        };
+        residue.push(NodeResidue::Process {
+            process_id,
+            process_start_time_ticks: first_stat,
+            executable_path,
+            scope_id: None,
+            control_socket_path: None,
+            role_hint: None,
+            ownership_token: OwnershipTokenEvidence::Missing,
+            control_handshake: ControlHandshakeEvidence::Unavailable,
+        });
+    }
+    context.check_active()?;
+    Ok(Some(residue))
 }
 
 fn scan_processes_allowing(
@@ -7260,7 +9945,16 @@ fn scan_processes_allowing(
         Err(source) => return Err(source).context("read proc root"),
     };
     let mut count = 0_usize;
-    let mut unavailable = false;
+    let static_process = paths
+        .current_static_service
+        .as_ref()
+        .map(|identity| inspect_static_service_process(paths, identity, context))
+        .transpose()?;
+    let mut unavailable = matches!(static_process, Some(StaticProcessInspection::Unavailable));
+    if matches!(static_process, Some(StaticProcessInspection::Conflict)) {
+        return Ok(ProbeFact::Present);
+    }
+    let mut saw_static_process = false;
     for entry in entries {
         context.check_active()?;
         let entry = match entry {
@@ -7296,6 +9990,14 @@ fn scan_processes_allowing(
         );
         let pid_path = entry.path();
         let process_id = name.to_str().and_then(|value| value.parse::<u32>().ok());
+        if process_id
+            == paths
+                .current_static_service
+                .as_ref()
+                .map(|identity| identity.process_id)
+        {
+            saw_static_process = true;
+        }
         let exe = std::fs::read_link(pid_path.join("exe"));
         let exe_matches = exe
             .as_ref()
@@ -7314,10 +10016,28 @@ fn scan_processes_allowing(
         } else {
             false
         };
-        if (exe_matches || cmdline_matches)
-            && !process_id.is_some_and(|process_id| allowed_pids.contains(&process_id))
-        {
-            return Ok(ProbeFact::Present);
+        if exe_matches || cmdline_matches {
+            let dynamically_allowed =
+                process_id.is_some_and(|process_id| allowed_pids.contains(&process_id));
+            let exact_static_process = process_id
+                == paths
+                    .current_static_service
+                    .as_ref()
+                    .map(|identity| identity.process_id)
+                && matches!(static_process, Some(StaticProcessInspection::Exact));
+            if !dynamically_allowed && !exact_static_process {
+                if process_id
+                    == paths
+                        .current_static_service
+                        .as_ref()
+                        .map(|identity| identity.process_id)
+                    && matches!(static_process, Some(StaticProcessInspection::Unavailable))
+                {
+                    unavailable = true;
+                } else {
+                    return Ok(ProbeFact::Present);
+                }
+            }
         }
         if let Err(source) = exe {
             unavailable |= source.kind() != io::ErrorKind::NotFound
@@ -7327,12 +10047,55 @@ fn scan_processes_allowing(
             unavailable = true;
         }
     }
+    if paths.current_static_service.is_some() && !saw_static_process {
+        unavailable = true;
+    }
     context.check_active()?;
     Ok(if unavailable {
         ProbeFact::Unavailable
     } else {
         ProbeFact::Empty
     })
+}
+
+#[derive(Clone, Copy)]
+enum StaticProcessInspection {
+    Exact,
+    Unavailable,
+    Conflict,
+}
+
+fn inspect_static_service_process(
+    paths: &ProcessPaths,
+    expected: &StaticServiceIdentity,
+    context: &dyn RuntimePhysicalReadContext,
+) -> anyhow::Result<StaticProcessInspection> {
+    context.check_active()?;
+    let process = paths.root.join(expected.process_id.to_string());
+    let executable = match std::fs::read_link(process.join("exe")) {
+        Ok(executable) => executable,
+        Err(source) if unavailable_io(&source) || source.kind() == io::ErrorKind::NotFound => {
+            return Ok(StaticProcessInspection::Unavailable)
+        }
+        Err(source) => return Err(source).context("inspect current static service executable"),
+    };
+    let cgroup = match read_bounded_optional(
+        &process.join("cgroup"),
+        STATIC_SERVICE_CGROUP_MAX_BYTES,
+        context,
+    )? {
+        OptionalBytes::Bytes(cgroup) => cgroup,
+        OptionalBytes::Missing | OptionalBytes::Unavailable => {
+            return Ok(StaticProcessInspection::Unavailable)
+        }
+    };
+    context.check_active()?;
+    Ok(
+        match StaticServiceIdentity::from_process_facts(expected.process_id, executable, &cgroup) {
+            Some(observed) if &observed == expected => StaticProcessInspection::Exact,
+            Some(_) | None => StaticProcessInspection::Conflict,
+        },
+    )
 }
 
 enum OptionalBytes {
@@ -7378,54 +10141,81 @@ fn read_bounded_optional(
     Ok(OptionalBytes::Bytes(bytes))
 }
 
-fn scan_nbd(
+fn scan_nbd_residue(
     root: &Path,
     cap: usize,
     managed_device_count: Option<u32>,
     context: &RuntimeInventoryScanContext,
-) -> anyhow::Result<ProbeFact> {
+) -> anyhow::Result<Option<Vec<NodeResidue>>> {
     let Some(entries) = required_directory_entries(root)? else {
-        return Ok(ProbeFact::Unavailable);
+        return Ok(None);
     };
     let mut count = 0_usize;
+    let mut residue = Vec::new();
     for entry in entries {
         context.check_active()?;
         let entry = match entry {
             Ok(entry) => entry,
-            Err(source) if unavailable_io(&source) => return Ok(ProbeFact::Unavailable),
+            Err(source) if unavailable_io(&source) => return Ok(None),
             Err(source) => return Err(source).context("enumerate block class"),
         };
-        count += 1;
-        anyhow::ensure!(count <= cap, "block class exceeds entry cap {cap}");
+        count = match count.checked_add(1) {
+            Some(count) if count <= cap => count,
+            _ => return Ok(None),
+        };
         let name = entry.file_name();
         if !is_nbd_name(&name) {
             continue;
         }
-        let index = std::str::from_utf8(&name.as_bytes()[3..])
+        let index = match std::str::from_utf8(&name.as_bytes()[3..])
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
-            .context("kernel-NBD sysfs entry index is not a u32")?;
+        {
+            Some(index) => index,
+            None => return Ok(None),
+        };
         if managed_device_count.is_some_and(|count| index < count) {
-            // The allocation-flock-protected kernel pool bridge inspects this
-            // configured slot and joins it to the complete checkpoint
-            // namespace. This generic residue probe owns only slots outside
-            // that closed pool.
             continue;
         }
-        let pid = read_kernel_u64(&entry.path().join("pid"), context)?;
-        let size = read_kernel_u64(&entry.path().join("size"), context)?;
-        match (pid, size) {
-            (_, KernelInteger::Value(size)) if size > 0 => {
-                return Ok(ProbeFact::Present);
-            }
-            (KernelInteger::Value(pid), KernelInteger::Value(0)) if pid > 0 => {
-                return Ok(ProbeFact::Present);
-            }
-            (KernelInteger::Missing | KernelInteger::Value(0), KernelInteger::Value(0)) => {}
-            _ => return Ok(ProbeFact::Unavailable),
+        let first = match (
+            read_kernel_u64(&entry.path().join("pid"), context),
+            read_kernel_u64(&entry.path().join("size"), context),
+        ) {
+            (Ok(pid), Ok(size)) => (pid, size),
+            _ => return Ok(None),
+        };
+        context.check_active()?;
+        let second = match (
+            read_kernel_u64(&entry.path().join("pid"), context),
+            read_kernel_u64(&entry.path().join("size"), context),
+        ) {
+            (Ok(pid), Ok(size)) => (pid, size),
+            _ => return Ok(None),
+        };
+        if first != second {
+            return Ok(None);
+        }
+        let active = match first {
+            (_, KernelInteger::Value(size)) if size > 0 => true,
+            (KernelInteger::Value(pid), KernelInteger::Value(0)) if pid > 0 => true,
+            (KernelInteger::Missing | KernelInteger::Value(0), KernelInteger::Value(0)) => false,
+            _ => return Ok(None),
+        };
+        if active {
+            let Some(name) = name.to_str() else {
+                return Ok(None);
+            };
+            residue.push(NodeResidue::KernelNbd {
+                volume_id_hint: None,
+                guest_device: None,
+                device_path: HostPath::new(format!("/dev/{name}"))
+                    .expect("validated kernel-NBD basename forms a canonical path"),
+                ownership_token: OwnershipTokenEvidence::Missing,
+            });
         }
     }
-    Ok(ProbeFact::Empty)
+    context.check_active()?;
+    Ok(Some(residue))
 }
 
 fn is_nbd_name(name: &OsStr) -> bool {
@@ -7433,6 +10223,7 @@ fn is_nbd_name(name: &OsStr) -> bool {
     bytes.starts_with(b"nbd") && bytes.len() > 3 && bytes[3..].iter().all(u8::is_ascii_digit)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KernelInteger {
     Missing,
     Unavailable,
@@ -7454,29 +10245,65 @@ fn read_kernel_u64(
     )?))
 }
 
-fn scan_network_interfaces(
+fn scan_network_residue(
     root: &Path,
     cap: usize,
     context: &RuntimeInventoryScanContext,
-) -> anyhow::Result<ProbeFact> {
-    let Some(entries) = required_directory_entries(root)? else {
-        return Ok(ProbeFact::Unavailable);
-    };
-    let mut count = 0_usize;
-    for entry in entries {
-        context.check_active()?;
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(source) if unavailable_io(&source) => return Ok(ProbeFact::Unavailable),
-            Err(source) => return Err(source).context("enumerate network class"),
+) -> anyhow::Result<Option<Vec<NodeResidue>>> {
+    fn snapshot(
+        root: &Path,
+        cap: usize,
+        context: &RuntimeInventoryScanContext,
+    ) -> anyhow::Result<Option<BTreeSet<OsString>>> {
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(source) if unavailable_io(&source) || source.kind() == io::ErrorKind::NotFound => {
+                return Ok(None)
+            }
+            Err(source) => return Err(source).context("read network class"),
         };
-        count += 1;
-        anyhow::ensure!(count <= cap, "network class exceeds entry cap {cap}");
-        if network_candidate(&entry.file_name()) {
-            return Ok(ProbeFact::Present);
+        let mut names = BTreeSet::new();
+        let mut count = 0_usize;
+        for entry in entries {
+            context.check_active()?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(source) if unavailable_io(&source) => return Ok(None),
+                Err(source) => return Err(source).context("enumerate network class"),
+            };
+            count = match count.checked_add(1) {
+                Some(count) if count <= cap => count,
+                _ => return Ok(None),
+            };
+            if network_candidate(&entry.file_name()) {
+                names.insert(entry.file_name());
+            }
         }
+        Ok(Some(names))
     }
-    Ok(ProbeFact::Empty)
+
+    let Some(first) = snapshot(root, cap, context)? else {
+        return Ok(None);
+    };
+    context.check_active()?;
+    let Some(second) = snapshot(root, cap, context)? else {
+        return Ok(None);
+    };
+    if first != second {
+        return Ok(None);
+    }
+    let mut residue = Vec::with_capacity(first.len());
+    for name in first {
+        let Some(tap_name) = name.to_str().and_then(Id::new) else {
+            return Ok(None);
+        };
+        residue.push(NodeResidue::NetworkTap {
+            network_id_hint: None,
+            tap_name,
+            ownership_token: OwnershipTokenEvidence::Missing,
+        });
+    }
+    Ok(Some(residue))
 }
 
 fn network_candidate(name: &OsStr) -> bool {
@@ -7491,10 +10318,6 @@ fn network_candidate(name: &OsStr) -> bool {
         || name.starts_with("cats-tun")
         || name.starts_with("tap-cats")
         || name.starts_with("tun-cats")
-}
-
-fn socket_candidate(name: &OsStr) -> bool {
-    name.as_bytes().ends_with(b".sock")
 }
 
 fn scan_root_process_sockets(
@@ -7695,16 +10518,19 @@ mod tests {
         AssignedPlacement, CheckpointEvidence, CleanupRelease, CleanupTarget, ContractVersion,
         DesiredRuntimeSpec, DirectAuthorizedAttachmentIdentity, DirectAuthorizedAttachmentPurpose,
         DiskKind, Durability, Epoch, Ext4MountIntent, FenceEpoch, FilesystemInitialization,
-        Generation, GuestBootId, GuestDeviceIdentity, HostPath, Id, Ipv4Address, IsolatedIpv4Kind,
-        LifecycleAdmission, MacAddress, MountAccess, NetworkConfig, NodeBootId, NodeObservation,
-        NormalAcquireRequest, ObservedNetwork, OwnershipTokenEvidence, PersistentFilesystemBinding,
-        PersistentInitializationReceipt, PrepareDeviceFrontend, PreparedDeviceInput, RandomId128,
-        ReconcileStep, RemoteHead, Revision, RuntimeConfig, RuntimeNetworkIdentity, RuntimeTarget,
-        RuntimeTransition, RuntimeVolumeTransition, RuntimeVolumeTransitionPreconditionProblem,
+        Generation, GuestBootId, GuestDeviceIdentity, GuestTransportEvidence, HostPath, Id,
+        Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, MacAddress, MountAccess, NetworkConfig,
+        NodeBootId, NodeObservation, NormalAcquireRequest, ObservedNetwork, OwnershipTokenEvidence,
+        PersistentFilesystemBinding, PersistentInitializationReceipt, PrepareDeviceFrontend,
+        PreparedDeviceInput, ProcessState, RandomId128, ReconcileStep, RemoteHead, Revision,
+        RuntimeConfig, RuntimeNetworkIdentity, RuntimeTarget, RuntimeTransition,
+        RuntimeVolumeTransition, RuntimeVolumeTransitionPreconditionProblem,
         RuntimeVolumeTransitionRequest, ServingAuthorityProvenance, ServingBlockdIdentity,
         SessionBinding, Sha256Digest, UnixMillis, VolumeAccess, VolumeAcquire,
         VolumeAcquireRequest, VolumeDisposition, VolumeIntent, VolumeReleaseReplay, WireU64,
     };
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    use cats_api::runtime_reconciliation::{LastVolumeTransition, ReleaseRequest, ReleaseResult};
     use cats_storage::{
         encode_image_manifest, AdapterConfig, AdapterSelection, BlobError, ImageManifestV1,
         LowerHexSha256,
@@ -7727,8 +10553,9 @@ mod tests {
         ProvisionHeadRead, SignedRunningPublicationRecovery,
     };
     use super::super::{
-        runtime_checkpoint_path, AuthorizedBlockdStore, FileCheckpointStore,
-        NodeGlobalManagedProcessScanAdmission, NodeGlobalNetworkScanAdmission, StoredCheckpoint,
+        runtime_checkpoint_path, AdmissionCell, AdmissionSnapshot, AuthorizedBlockdStore,
+        FileCheckpointStore, NodeGlobalManagedProcessScanAdmission, NodeGlobalNetworkScanAdmission,
+        StoredCheckpoint,
     };
     #[cfg(target_os = "linux")]
     use super::super::{ManagedVmmLaunchFilePaths, VmmSocketOwnershipReceiptV1};
@@ -7790,10 +10617,14 @@ mod tests {
             .unwrap();
         match outcome {
             // Non-Linux builds cannot perform the production VMM inspection.
-            RootProcessInventoryBridgeOutcome::Unavailable => {}
+            RootProcessInventoryBridgeOutcome::Unavailable { .. } => {}
             // Linux can prove the exact unit absent. Absence is sealed in the
             // private admission but must never become a public VMM process.
             RootProcessInventoryBridgeOutcome::Complete(admission) => {
+                assert!(admission.process_projections().is_empty());
+                assert!(admission.vmm_proofs().is_empty());
+            }
+            RootProcessInventoryBridgeOutcome::CompleteWithResidue { admission, .. } => {
                 assert!(admission.process_projections().is_empty());
                 assert!(admission.vmm_proofs().is_empty());
             }
@@ -8583,6 +11414,31 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct ExactSetMetadataAuthorityReader {
+        records: BTreeMap<Id, VolumeRecord>,
+    }
+
+    impl metadata_authority_reader_sealed::Sealed for ExactSetMetadataAuthorityReader {}
+
+    impl MetadataAuthorityAbsenceReader for ExactSetMetadataAuthorityReader {
+        fn read_candidates(
+            &self,
+            _node_id: &Id,
+            candidate_volume_ids: &BTreeSet<Id>,
+            deadline: Instant,
+            context: &RuntimeInventoryScanContext,
+        ) -> anyhow::Result<MetadataAuthorityCandidateInventory> {
+            assert_eq!(deadline, context.deadline());
+            context.check_active()?;
+            Ok(if self.records.keys().eq(candidate_volume_ids.iter()) {
+                MetadataAuthorityCandidateInventory::Records(self.records.clone())
+            } else {
+                MetadataAuthorityCandidateInventory::Unavailable
+            })
+        }
+    }
+
+    #[derive(Debug)]
     struct ScriptedMetadataAuthorityInventoryPort {
         reads: Mutex<VecDeque<MetadataAuthorityPageRead>>,
         calls: Arc<Mutex<Vec<MetadataAuthorityPageRequest>>>,
@@ -8830,6 +11686,7 @@ mod tests {
                 cloud_hypervisor_binary: self.ch_binary.clone(),
                 blockd_binary: self.blockd_binary.clone(),
                 guest_agent_binary: self.guest_binary.clone(),
+                static_service_identity: None,
                 linux_sources_supported: true,
                 limits: ProbeLimits::default(),
                 root_process_port: None,
@@ -9040,6 +11897,7 @@ mod tests {
                 node_id: desired.placement.node_id.clone(),
                 placement_epoch: desired.placement.placement_epoch,
             },
+            object_write_credential: None,
             size_bytes: volume.size_bytes,
             durability: volume.durability,
             head: record.head.clone(),
@@ -9155,6 +12013,19 @@ mod tests {
         process_ids: Mutex<VecDeque<Option<u32>>>,
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum ScriptedVmmInspection {
+        Absent,
+        Exact(ProcessState),
+        Unavailable,
+    }
+
+    struct ScriptedVmmProcessPort {
+        inspections: Mutex<VecDeque<ScriptedVmmInspection>>,
+        cancel_after_first: Option<RuntimeInventoryScanContext>,
+        calls: AtomicUsize,
+    }
+
     impl super::super::vmm_process::VmmProcessPortSealedForTest for FakeVmmProcessPort {}
 
     impl VmmProcessPort for FakeVmmProcessPort {
@@ -9188,11 +12059,49 @@ mod tests {
         }
     }
 
+    impl super::super::vmm_process::VmmProcessPortSealedForTest for ScriptedVmmProcessPort {}
+
+    impl VmmProcessPort for ScriptedVmmProcessPort {
+        fn inspect(
+            &self,
+            expected: &VmmProcessExpectation,
+            _context: &dyn RuntimePhysicalReadContext,
+        ) -> anyhow::Result<VmmProcessInspection> {
+            let inspection = match self
+                .inspections
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted VMM inspection exhausted")
+            {
+                ScriptedVmmInspection::Absent => VmmProcessInspection::Absent,
+                ScriptedVmmInspection::Exact(state) => VmmProcessInspection::Exact(Box::new(
+                    expected.exact_evidence_with_state_for_test(101, state),
+                )),
+                ScriptedVmmInspection::Unavailable => VmmProcessInspection::Unavailable,
+            };
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                if let Some(context) = &self.cancel_after_first {
+                    context.cancel_for_test();
+                }
+            }
+            Ok(inspection)
+        }
+
+        fn start_checkpointed(
+            &self,
+            _checkpointed: super::super::vmm_process::CheckpointedVmmProcess<'_>,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> anyhow::Result<super::super::vmm_process::VmmProcessStart> {
+            unreachable!("inventory fake is read-only")
+        }
+    }
+
     struct ExactRunningProcessBridge {
         state_directory: StateDirectory,
         systemd: RootProvisionSystemdConfig,
         executable_path: HostPath,
-        exact_vmms: bool,
+        exact_vmm_state: Option<ProcessState>,
     }
 
     impl root_process_inventory_bridge_sealed::Sealed for ExactRunningProcessBridge {}
@@ -9247,7 +12156,7 @@ mod tests {
                     ))
                 })
                 .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
-            let vmm_exact = if self.exact_vmms {
+            let vmm_exact = if let Some(state) = self.exact_vmm_state {
                 vmm_expected
                     .iter()
                     .enumerate()
@@ -9259,7 +12168,7 @@ mod tests {
                         Ok((
                             cat_id.clone(),
                             expectation.clone().prove_exact_process(
-                                expectation.exact_evidence_for_test(process_id),
+                                expectation.exact_evidence_with_state_for_test(process_id, state),
                             )?,
                         ))
                     })
@@ -9275,6 +12184,51 @@ mod tests {
             .with_vmms(vmm_expected, vmm_exact)?
             .with_stop_receipt_sockets(stop_receipt_sockets)?;
             Ok(RootProcessInventoryBridgeOutcome::Complete(admission))
+        }
+    }
+
+    struct PreservedNegativeUnavailableProcessBridge {
+        inner: ExactRunningProcessBridge,
+        exact_running_negative_cats: BTreeSet<Id>,
+    }
+
+    impl root_process_inventory_bridge_sealed::Sealed for PreservedNegativeUnavailableProcessBridge {}
+
+    impl RootProcessInventoryBridge for PreservedNegativeUnavailableProcessBridge {
+        fn executable_path(&self) -> &HostPath {
+            self.inner.executable_path()
+        }
+
+        fn serving_expectation(
+            &self,
+            checkpoint: &RuntimeCheckpoint,
+            physical_desired: &DesiredRuntimeSpec,
+            gate_desired: &DesiredRuntimeSpec,
+            prepared: &PreparedDeviceInput,
+            blockd: &AuthorizedBlockdInventoryEvidence,
+            authority: &VolumeRecord,
+        ) -> anyhow::Result<ServingBlockdExpectation> {
+            self.inner.serving_expectation(
+                checkpoint,
+                physical_desired,
+                gate_desired,
+                prepared,
+                blockd,
+                authority,
+            )
+        }
+
+        fn inspect_all(
+            &self,
+            _root_expected: BTreeMap<Id, RootProvisionProcessExpectation>,
+            _serving_expected: BTreeMap<ManagedServingKey, ServingBlockdExpectation>,
+            _vmm_expected: BTreeMap<Id, VmmProcessExpectation>,
+            _stop_receipt_sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
+            _context: &RuntimeInventoryScanContext,
+        ) -> anyhow::Result<RootProcessInventoryBridgeOutcome> {
+            Ok(RootProcessInventoryBridgeOutcome::Unavailable {
+                exact_running_negative_cats: self.exact_running_negative_cats.clone(),
+            })
         }
     }
 
@@ -9616,6 +12570,8 @@ mod tests {
             .take_node_global_network_admission()
             .expect("filesystem scan lacks its sealed network authority");
         let kernel_nbd_scan = inventory.take_kernel_nbd_pool_admission();
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        let data_directory_reclaim_scan = inventory.take_data_directory_reclaim_admission();
         let coordinates = scan_context.coordinates().clone();
         let mut observation = NodeObservation {
             version: ContractVersion::V1,
@@ -9640,6 +12596,9 @@ mod tests {
         let process = process_scan.bind(&observation).unwrap();
         let network = network_scan.bind(&observation).unwrap();
         let kernel_nbd = kernel_nbd_scan.map(|scan| scan.bind(&observation).unwrap());
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        let data_directory_reclaim =
+            data_directory_reclaim_scan.map(|scan| scan.bind(&observation).unwrap());
         let desired = coordinates
             .desired
             .desired_specs
@@ -9670,6 +12629,13 @@ mod tests {
         };
         let admission = RuntimeDesiredEffectAdmission::for_test(session, observation, attestation)
             .bind_assigned_cats_for_test(&coordinates.desired);
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        let admission = match data_directory_reclaim {
+            Some(data_directory_reclaim) => {
+                admission.with_data_directory_reclaim_for_test(data_directory_reclaim)
+            }
+            None => admission,
+        };
         let context = RuntimeDesiredEffectContext::for_test_with_admission(
             state_directory,
             Instant::now() + Duration::from_secs(5),
@@ -9717,7 +12683,10 @@ mod tests {
 
     struct ExactRunningNetworkBridge;
 
+    struct UnavailableRunningNetworkBridge;
+
     impl network_inventory_bridge_sealed::Sealed for ExactRunningNetworkBridge {}
+    impl network_inventory_bridge_sealed::Sealed for UnavailableRunningNetworkBridge {}
 
     impl NetworkInventoryBridge for ExactRunningNetworkBridge {
         fn inspect_all(
@@ -9736,6 +12705,16 @@ mod tests {
             Ok(NetworkInventoryBridgeOutcome::Complete(
                 NodeGlobalNetworkScanAdmission::exact_checkpoint_for_test(&checkpoint.checkpoint)?,
             ))
+        }
+    }
+
+    impl NetworkInventoryBridge for UnavailableRunningNetworkBridge {
+        fn inspect_all(
+            &self,
+            _checkpoints: &BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+            _context: &RuntimeInventoryScanContext,
+        ) -> anyhow::Result<NetworkInventoryBridgeOutcome> {
+            Ok(NetworkInventoryBridgeOutcome::Unavailable)
         }
     }
 
@@ -10147,10 +13126,12 @@ mod tests {
             process_paths: ProcessPaths {
                 root: environment.proc_root.clone(),
                 binaries: vec![environment.blockd_binary.clone()],
+                current_static_service: None,
                 supported: true,
                 limits: ProbeLimits::default(),
             },
             systemd_root: environment.systemd_root.clone(),
+            static_service_identity: None,
             metering_root: None,
             legacy_socket_root: environment.socket_root.clone(),
             limits: ProbeLimits::default(),
@@ -10362,6 +13343,32 @@ mod tests {
         }
     }
 
+    fn retain_only_data_cat(
+        environment: &TestEnvironment,
+        context: &RuntimeInventoryScanContext,
+    ) -> (std::fs::File, std::fs::File, PathBuf, String) {
+        let state = StateDirectory::unanchored(environment.state.clone());
+        let root = clone_state_root(&state).unwrap().unwrap();
+        let ManagedDirectory::Open(data_root) =
+            open_state_namespace(&root, DATA_NAMESPACE).unwrap()
+        else {
+            panic!("fixture lacks its data namespace")
+        };
+        let mut entry_budget = ProbeLimits::default().state_entries;
+        let entries = strict_directory_entries(&data_root, &mut entry_budget, context)
+            .unwrap()
+            .unwrap();
+        let [entry] = entries.as_slice() else {
+            panic!("fixture must have exactly one retained Cat directory")
+        };
+        let cat_name = entry.name.to_str().unwrap().to_owned();
+        let cat_path = environment.state.join(DATA_NAMESPACE).join(&cat_name);
+        let cat = open_exact_only_child_directory(&data_root, entry, &root, context)
+            .unwrap()
+            .unwrap();
+        (root, cat, cat_path, cat_name)
+    }
+
     fn write_empty_dirty_bitmap(path: &Path, size_bytes: u64) {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -10394,6 +13401,34 @@ mod tests {
         .unwrap();
     }
 
+    fn write_test_pending_pack(
+        data_directory: &Path,
+        attachment: &AuthorizedServingAttachment,
+        base_generation: i64,
+        txn: &str,
+        mutate: impl FnOnce(&mut PackHeader),
+    ) -> PathBuf {
+        let mut header = PackHeader {
+            txn: txn.to_owned(),
+            volume_id: attachment.identity.volume_id.as_str().to_owned(),
+            base_generation,
+            lease_epoch: None,
+            attachment_id: Some(attachment.identity.attachment_id.as_str().to_owned()),
+            attachment_epoch: Some(
+                i64::try_from(attachment.identity.attachment_epoch.get()).unwrap(),
+            ),
+            acquire_origin: Some(attachment.identity.acquire_origin.clone()),
+            entries: Vec::new(),
+        };
+        mutate(&mut header);
+        let path = data_directory
+            .join(PENDING_PACK_DIR)
+            .join(format!("{base_generation:020}-{txn}{PACK_FILE_SUFFIX}"));
+        std::fs::write(&path, cats_blockd::format::encode_pack(&header, &[])).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    }
+
     #[test]
     fn authorized_data_probe_accepts_exact_control_only_engine_files_without_a_legacy_socket() {
         let environment = TestEnvironment::new();
@@ -10419,34 +13454,699 @@ mod tests {
     }
 
     #[test]
-    fn authorized_data_probe_rejects_and_preserves_a_legacy_data_directory_socket() {
+    fn data_directory_projection_revalidates_every_parent_entry_after_descriptor_scan() {
+        for boundary in [
+            DataDirectoryProjectionBoundary::Epoch,
+            DataDirectoryProjectionBoundary::Attachment,
+            DataDirectoryProjectionBoundary::Volume,
+            DataDirectoryProjectionBoundary::Cat,
+        ] {
+            let environment = TestEnvironment::new();
+            let mut scan_context = assigned_context(true);
+            let desired = scan_context.coordinates().desired.desired_specs[0].clone();
+            let (_record, attachment) = exact_owned_record_and_attachment(&desired);
+            let data_directory = prepare_exact_lineage(&environment, &desired, &attachment);
+            let volume_path = data_directory
+                .parent()
+                .and_then(Path::parent)
+                .unwrap()
+                .to_path_buf();
+            let cat_path = volume_path.parent().unwrap().to_path_buf();
+            let data_root = cat_path.parent().unwrap().to_path_buf();
+            scan_context.coordinates_mut().desired.desired_specs.clear();
+
+            let state = StateDirectory::unanchored(environment.state.clone());
+            let root = clone_state_root(&state).unwrap().unwrap();
+            let state_path = environment.state.clone();
+            let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(0);
+            let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+            let scan = std::thread::spawn(move || {
+                let mut reached = false;
+                let mut barrier = |observed| {
+                    if !reached && observed == boundary {
+                        reached = true;
+                        reached_tx.send(()).unwrap();
+                        resume_rx.recv().unwrap();
+                    }
+                };
+                let scan = scan_authorized_blockd_data_with_projection_barrier(
+                    &root,
+                    &state_path,
+                    &scan_context,
+                    ProbeLimits::default(),
+                    &mut barrier,
+                )
+                .unwrap();
+                (scan, reached)
+            });
+
+            reached_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("descriptor scan did not reach its pre-projection barrier");
+            let (entry_path, retained_path) = match boundary {
+                DataDirectoryProjectionBoundary::Epoch => (
+                    data_directory.clone(),
+                    data_directory.parent().unwrap().join("retained-epoch"),
+                ),
+                DataDirectoryProjectionBoundary::Attachment => (
+                    data_directory.parent().unwrap().to_path_buf(),
+                    volume_path.join("retained-attachment"),
+                ),
+                DataDirectoryProjectionBoundary::Volume => {
+                    (volume_path.clone(), cat_path.join("retained-volume"))
+                }
+                DataDirectoryProjectionBoundary::Cat => {
+                    (cat_path.clone(), data_root.join("retained-cat"))
+                }
+            };
+            std::fs::rename(&entry_path, &retained_path).unwrap();
+            std::fs::create_dir(&entry_path).unwrap();
+            std::fs::set_permissions(&entry_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            resume_tx.send(()).unwrap();
+
+            let (scan, reached) = scan.join().unwrap();
+            assert!(reached);
+            assert!(
+                !scan.complete && scan.unattributed_incomplete,
+                "{boundary:?} rename plus same-name replacement must make DataDirectory incomplete"
+            );
+            assert!(
+                scan.residue.is_empty(),
+                "the descriptor-retained subtree must not be projected at its replacement path"
+            );
+            assert!(
+                entry_path.exists() && retained_path.exists(),
+                "inventory must preserve both replacement and retained subtree"
+            );
+        }
+    }
+
+    #[test]
+    fn unassigned_exact_lineage_is_reported_instead_of_aborting_the_scan() {
         let environment = TestEnvironment::new();
-        let scan_context = assigned_context(true);
-        let desired = &scan_context.coordinates().desired.desired_specs[0];
-        let (_record, attachment) = exact_owned_record_and_attachment(desired);
-        let data_directory = prepare_exact_lineage(&environment, desired, &attachment);
+        let mut scan_context = assigned_context(true);
+        let desired = scan_context.coordinates().desired.desired_specs[0].clone();
+        let (_record, attachment) = exact_owned_record_and_attachment(&desired);
+        let data_directory = prepare_exact_lineage(&environment, &desired, &attachment);
         install_exact_control_only_files(&data_directory, attachment.size_bytes);
-        let legacy_socket = data_directory.join("root-provision.sock");
-        // Bind below SUN_LEN through a short pathname, then move the socket
-        // inode into the deliberately long legacy data-directory location.
-        // The probe only trusts the final descriptor-relative entry; keeping
-        // the listener open preserves the socket inode without making
-        // this fixture depend on the host's temporary-directory prefix.
-        let short_socket = environment._root.path().join("legacy.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&short_socket).unwrap();
-        std::fs::rename(&short_socket, &legacy_socket).unwrap();
+        scan_context.coordinates_mut().desired.desired_specs.clear();
 
-        let error = authorized_data_probe(&environment)
-            .prove_absent(&scan_context)
-            .expect_err("the old data-directory socket is foreign residue");
+        let InventoryAbsence::AuthorizedBlockdWithResidue { blockds, residue } =
+            authorized_data_probe(&environment)
+                .prove_absent(&scan_context)
+                .unwrap()
+        else {
+            panic!("an unassigned exact lineage must remain visible residue")
+        };
+        assert!(blockds.is_empty());
+        assert_eq!(residue.len(), 1);
+        let NodeResidue::DataDirectory {
+            volume_id_hint,
+            data_directory: observed_path,
+            lineage,
+            ..
+        } = &residue[0]
+        else {
+            panic!("unassigned lineage projected another residue kind")
+        };
+        assert_eq!(volume_id_hint.as_ref(), Some(&desired.volumes[0].volume_id));
+        assert_eq!(observed_path.as_str(), data_directory.to_str().unwrap());
+        #[cfg(not(feature = "proposed-node-residue-reclamation"))]
+        {
+            let ResidueLineageEvidence::Readable {
+                attachment_id_hint,
+                attachment_epoch_hint,
+                local_durable_generation,
+                remote_durable_generation,
+                pending_pack_count,
+                fenced,
+            } = lineage
+            else {
+                panic!("valid immutable lineage was not reported exactly")
+            };
+            assert_eq!(
+                attachment_id_hint.as_ref(),
+                Some(&attachment.identity.attachment_id)
+            );
+            assert_eq!(
+                *attachment_epoch_hint,
+                Some(attachment.identity.attachment_epoch)
+            );
+            assert_eq!(*local_durable_generation, attachment.head.generation);
+            assert_eq!(*remote_durable_generation, attachment.head.generation);
+            assert_eq!(pending_pack_count.get(), 0);
+            assert!(!fenced);
+        }
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        {
+            let ResidueLineageEvidence::Readable { lineage } = lineage else {
+                panic!("valid immutable lineage was not reported exactly")
+            };
+            assert_eq!(lineage.attachment_id, attachment.identity.attachment_id);
+            assert_eq!(
+                lineage.attachment_epoch,
+                attachment.identity.attachment_epoch
+            );
+            assert_eq!(lineage.local_durable_generation, attachment.head.generation);
+            assert_eq!(
+                lineage.remote_durable_generation,
+                attachment.head.generation
+            );
+            assert_eq!(lineage.pending_pack_count.get(), 0);
+            assert!(!lineage.fenced);
+        }
+    }
 
-        assert!(format!("{error:#}").contains("foreign entry root-provision.sock"));
-        assert!(legacy_socket
-            .symlink_metadata()
+    #[test]
+    fn unassigned_pending_pack_headers_must_form_the_exact_attachment_chain() {
+        let environment = TestEnvironment::new();
+        let mut scan_context = assigned_context(true);
+        let desired = scan_context.coordinates().desired.desired_specs[0].clone();
+        let (_record, attachment) = exact_owned_record_and_attachment(&desired);
+        let data_directory = prepare_exact_lineage(&environment, &desired, &attachment);
+        install_exact_control_only_files(&data_directory, attachment.size_bytes);
+        let base_generation = i64::try_from(attachment.head.generation.get()).unwrap();
+        write_test_pending_pack(
+            &data_directory,
+            &attachment,
+            base_generation,
+            "txn-valid",
+            |_| {},
+        );
+        scan_context.coordinates_mut().desired.desired_specs.clear();
+
+        let InventoryAbsence::AuthorizedBlockdWithResidue { residue, .. } =
+            authorized_data_probe(&environment)
+                .prove_absent(&scan_context)
+                .unwrap()
+        else {
+            panic!("exact pending chain must remain visible residue")
+        };
+        let [NodeResidue::DataDirectory {
+            lineage: ResidueLineageEvidence::Readable { .. },
+            ..
+        }] = residue.as_slice()
+        else {
+            panic!("exact pending chain did not produce readable lineage: {residue:?}")
+        };
+        #[cfg(not(feature = "proposed-node-residue-reclamation"))]
+        let NodeResidue::DataDirectory {
+            lineage:
+                ResidueLineageEvidence::Readable {
+                    local_durable_generation,
+                    remote_durable_generation,
+                    pending_pack_count,
+                    ..
+                },
+            ..
+        } = &residue[0]
+        else {
+            unreachable!()
+        };
+        #[cfg(not(feature = "proposed-node-residue-reclamation"))]
+        {
+            assert_eq!(*remote_durable_generation, attachment.head.generation);
+            assert_eq!(
+                local_durable_generation.get(),
+                attachment.head.generation.get() + 1
+            );
+            assert_eq!(pending_pack_count.get(), 1);
+        }
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        let NodeResidue::DataDirectory {
+            lineage: ResidueLineageEvidence::Readable { lineage },
+            ..
+        } = &residue[0]
+        else {
+            unreachable!()
+        };
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        {
+            assert_eq!(
+                lineage.remote_durable_generation,
+                attachment.head.generation
+            );
+            assert_eq!(
+                lineage.local_durable_generation.get(),
+                attachment.head.generation.get() + 1
+            );
+            assert_eq!(lineage.pending_pack_count.get(), 1);
+        }
+    }
+
+    #[test]
+    fn corrupt_foreign_or_gapped_pending_pack_headers_never_become_readable_lineage() {
+        for mutation in ["bogus", "wrong-volume", "wrong-epoch", "generation-gap"] {
+            let environment = TestEnvironment::new();
+            let mut scan_context = assigned_context(true);
+            let desired = scan_context.coordinates().desired.desired_specs[0].clone();
+            let (_record, attachment) = exact_owned_record_and_attachment(&desired);
+            let data_directory = prepare_exact_lineage(&environment, &desired, &attachment);
+            install_exact_control_only_files(&data_directory, attachment.size_bytes);
+            let remote = i64::try_from(attachment.head.generation.get()).unwrap();
+            let base = if mutation == "generation-gap" {
+                remote + 1
+            } else {
+                remote
+            };
+            let path = write_test_pending_pack(
+                &data_directory,
+                &attachment,
+                base,
+                "txn-invalid",
+                |header| match mutation {
+                    "wrong-volume" => header.volume_id = "volume-foreign".to_owned(),
+                    "wrong-epoch" => {
+                        header.attachment_epoch = header
+                            .attachment_epoch
+                            .and_then(|epoch| epoch.checked_add(1));
+                    }
+                    "bogus" | "generation-gap" => {}
+                    _ => unreachable!(),
+                },
+            );
+            if mutation == "bogus" {
+                std::fs::write(&path, b"not-a-pack").unwrap();
+            }
+            scan_context.coordinates_mut().desired.desired_specs.clear();
+
+            let InventoryAbsence::AuthorizedBlockdWithResidue { residue, .. } =
+                authorized_data_probe(&environment)
+                    .prove_absent(&scan_context)
+                    .unwrap()
+            else {
+                panic!("{mutation} pack must remain visible residue")
+            };
+            assert!(matches!(
+                residue.as_slice(),
+                [NodeResidue::DataDirectory {
+                    lineage: ResidueLineageEvidence::Unreadable,
+                    ..
+                }]
+            ));
+            assert!(path.exists(), "scanner changed {mutation} pending pack");
+        }
+    }
+
+    #[test]
+    fn unassigned_corrupt_or_duplicate_lineage_is_reported_unreadable_and_preserved() {
+        for mutation in ["corrupt", "duplicate"] {
+            let environment = TestEnvironment::new();
+            let mut scan_context = assigned_context(true);
+            let desired = scan_context.coordinates().desired.desired_specs[0].clone();
+            let (_record, attachment) = exact_owned_record_and_attachment(&desired);
+            let data_directory = prepare_exact_lineage(&environment, &desired, &attachment);
+            match mutation {
+                "corrupt" => {
+                    std::fs::write(data_directory.join(IDENTITY_FILE), b"not-json").unwrap()
+                }
+                "duplicate" => {
+                    let volume = data_directory.parent().unwrap().parent().unwrap();
+                    std::fs::create_dir(volume.join("attachment-duplicate")).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            scan_context.coordinates_mut().desired.desired_specs.clear();
+
+            let result = authorized_data_probe(&environment)
+                .prove_absent(&scan_context)
+                .unwrap();
+            let InventoryAbsence::AuthorizedBlockdWithResidue { residue, .. } = result else {
+                panic!("{mutation} lineage was not reported as residue: {result:?}")
+            };
+            assert_eq!(residue.len(), 1);
+            assert!(matches!(
+                &residue[0],
+                NodeResidue::DataDirectory {
+                    lineage: ResidueLineageEvidence::Unreadable,
+                    ..
+                }
+            ));
+            assert!(
+                data_directory.exists(),
+                "scanner changed {mutation} residue"
+            );
+        }
+    }
+
+    #[test]
+    fn full_inventory_reports_unassigned_data_residue_without_becoming_incomplete() {
+        let environment = TestEnvironment::new();
+        let mut scan_context = assigned_context(true);
+        let desired = scan_context.coordinates().desired.desired_specs[0].clone();
+        let (_record, attachment) = exact_owned_record_and_attachment(&desired);
+        let data_directory = prepare_exact_lineage(&environment, &desired, &attachment);
+        install_exact_control_only_files(&data_directory, attachment.size_bytes);
+        scan_context.coordinates_mut().desired.desired_specs.clear();
+        let restart_context = scan_context.clone();
+
+        let scanner = scanner(environment.config()).unwrap();
+        let RuntimeInventoryScanOutcome::Complete(inventory) =
+            scanner.scan_complete(scan_context).unwrap()
+        else {
+            panic!("closed residue must not turn a complete scan into source downtime")
+        };
+        assert!(inventory.runtimes().is_empty());
+        assert!(matches!(
+            inventory.residue(),
+            [NodeResidue::DataDirectory {
+                lineage: ResidueLineageEvidence::Readable { .. },
+                ..
+            }]
+        ));
+        assert!(
+            data_directory.exists(),
+            "inventory must be observation-only"
+        );
+        let RuntimeInventoryScanOutcome::Complete(restarted) =
+            scanner.scan_complete(restart_context).unwrap()
+        else {
+            panic!("restart must rediscover the same closed residue")
+        };
+        assert_eq!(
+            inventory.residue(),
+            restarted.residue(),
+            "restart must not turn observation into mutation or lose residue"
+        );
+    }
+
+    #[test]
+    fn unassigned_residue_budget_is_global_and_item_4097_stops_before_projection() {
+        let environment = TestEnvironment::new();
+        let context = assigned_context(true);
+        let desired = context.coordinates().desired.desired_specs[0].clone();
+        let (_record, attachment) = exact_owned_record_and_attachment(&desired);
+        let data_directory = prepare_exact_lineage(&environment, &desired, &attachment);
+        install_exact_control_only_files(&data_directory, attachment.size_bytes);
+
+        let mut residue_wire_budget = NODE_OBSERVATION_MAX_RESIDUE_ITEMS;
+        for item in 1..=NODE_OBSERVATION_MAX_RESIDUE_ITEMS {
+            assert!(
+                consume_residue_wire_slot(&mut residue_wire_budget),
+                "wire item {item} must fit the global observation cap"
+            );
+        }
+        assert_eq!(residue_wire_budget, 0);
+        assert!(
+            !consume_residue_wire_slot(&mut residue_wire_budget),
+            "wire item 4097 must stop the source without wrapping its budget"
+        );
+
+        let (root, cat, cat_path, cat_name) = retain_only_data_cat(&environment, &context);
+        let mut entry_budget = ProbeLimits::default().state_entries;
+        assert!(
+            scan_unassigned_cat_data(
+                &root,
+                &cat,
+                &cat_path,
+                &cat_name,
+                &mut entry_budget,
+                &mut residue_wire_budget,
+                &context,
+                ProbeLimits::default().recursion_depth,
+            )
             .unwrap()
-            .file_type()
-            .is_socket());
-        drop(listener);
+            .is_none(),
+            "an exhausted shared wire budget must map the source to Incomplete"
+        );
+        assert!(
+            data_directory.exists(),
+            "the cap path must not delete residue"
+        );
+    }
+
+    #[test]
+    fn unassigned_descriptor_scan_maps_cancellation_and_deadline_to_incomplete() {
+        for boundary in ["cancellation", "deadline"] {
+            let environment = TestEnvironment::new();
+            let live_context = assigned_context(true);
+            let desired = live_context.coordinates().desired.desired_specs[0].clone();
+            let (_record, attachment) = exact_owned_record_and_attachment(&desired);
+            let data_directory = prepare_exact_lineage(&environment, &desired, &attachment);
+            install_exact_control_only_files(&data_directory, attachment.size_bytes);
+            let (root, cat, cat_path, cat_name) = retain_only_data_cat(&environment, &live_context);
+            let inactive_context = if boundary == "cancellation" {
+                let context = live_context.clone();
+                context.cancel_for_test();
+                context
+            } else {
+                context_until(Instant::now())
+            };
+            let mut entry_budget = ProbeLimits::default().state_entries;
+            let mut residue_wire_budget = NODE_OBSERVATION_MAX_RESIDUE_ITEMS;
+            assert!(
+                scan_unassigned_cat_data(
+                    &root,
+                    &cat,
+                    &cat_path,
+                    &cat_name,
+                    &mut entry_budget,
+                    &mut residue_wire_budget,
+                    &inactive_context,
+                    ProbeLimits::default().recursion_depth,
+                )
+                .unwrap()
+                .is_none(),
+                "{boundary} must make the unassigned source Incomplete"
+            );
+            assert!(
+                data_directory.exists(),
+                "{boundary} must preserve descriptor-retained residue"
+            );
+        }
+    }
+
+    #[test]
+    fn unassigned_depth_and_path_substitution_make_the_full_inventory_incomplete() {
+        for boundary in ["depth", "path_substitution"] {
+            let environment = TestEnvironment::new();
+            let mut scan_context = assigned_context(true);
+            let desired = scan_context.coordinates().desired.desired_specs[0].clone();
+            let (_record, attachment) = exact_owned_record_and_attachment(&desired);
+            let data_directory = prepare_exact_lineage(&environment, &desired, &attachment);
+            install_exact_control_only_files(&data_directory, attachment.size_bytes);
+            let mut config = environment.config();
+            let retained_path = if boundary == "depth" {
+                config.limits.recursion_depth = 3;
+                let first = data_directory.join("nested-residue");
+                let second = first.join("past-depth-bound");
+                std::fs::create_dir(&first).unwrap();
+                std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o700)).unwrap();
+                std::fs::create_dir(&second).unwrap();
+                std::fs::set_permissions(&second, std::fs::Permissions::from_mode(0o700)).unwrap();
+                second
+            } else {
+                let volume_directory = data_directory.parent().unwrap().parent().unwrap();
+                let substituted = environment.state.join("substituted-volume");
+                std::fs::rename(volume_directory, &substituted).unwrap();
+                std::os::unix::fs::symlink(&substituted, volume_directory).unwrap();
+                volume_directory.to_path_buf()
+            };
+            scan_context.coordinates_mut().desired.desired_specs.clear();
+
+            let outcome = scanner(config)
+                .unwrap()
+                .scan_complete(scan_context)
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                RuntimeInventoryScanOutcome::Incomplete {
+                    unavailable_sources,
+                    ..
+                } if unavailable_sources.contains(&InventorySource::DataDirectory)
+            ));
+            assert!(
+                std::fs::symlink_metadata(&retained_path).is_ok(),
+                "{boundary} must not mutate the substituted or over-depth path"
+            );
+        }
+    }
+
+    #[test]
+    fn full_inventory_reports_corrupt_foreign_checkpoint_without_deleting_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let environment = TestEnvironment::new();
+        let checkpoint_directory = environment.state.join(CHECKPOINT_NAMESPACE);
+        std::fs::create_dir_all(&checkpoint_directory).unwrap();
+        let checkpoint_path = checkpoint_directory.join("foreign.json");
+        std::fs::write(&checkpoint_path, b"not-a-checkpoint").unwrap();
+        std::fs::set_permissions(&checkpoint_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let scanner = scanner(environment.config()).unwrap();
+        let RuntimeInventoryScanOutcome::Complete(inventory) =
+            scanner.scan_complete(context()).unwrap()
+        else {
+            panic!("bounded corrupt checkpoint residue must remain reportable")
+        };
+        assert!(matches!(
+            inventory.residue(),
+            [NodeResidue::CheckpointFile {
+                evidence: ResidueCheckpointFileEvidence::Corrupt { .. },
+                ..
+            }]
+        ));
+        assert!(
+            checkpoint_path.exists(),
+            "inventory must be observation-only"
+        );
+    }
+
+    #[test]
+    fn assigned_canonical_corrupt_or_wrong_binding_checkpoint_projects_only_cat_corruption() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for case in ["malformed", "wrong_binding", "malformed_with_lineage"] {
+            let environment = TestEnvironment::new();
+            let scan_context = assigned_context(true);
+            let desired = scan_context.coordinates().desired.desired_specs[0].clone();
+            let (record, attachment) = exact_owned_record_and_attachment(&desired);
+            let retained_data = (case == "malformed_with_lineage").then(|| {
+                let data_directory = prepare_exact_lineage(&environment, &desired, &attachment);
+                install_exact_control_only_files(&data_directory, attachment.size_bytes);
+                data_directory
+            });
+            let checkpoint_directory = environment.state.join(CHECKPOINT_NAMESPACE);
+            std::fs::create_dir_all(&checkpoint_directory).unwrap();
+            let checkpoint_path =
+                super::super::runtime_checkpoint_path(&checkpoint_directory, &desired.cat_id);
+            let bytes = if case != "wrong_binding" {
+                b"not-a-checkpoint".to_vec()
+            } else {
+                serde_json::to_vec(&serde_json::json!({
+                    "version": 1,
+                    "cat_id": desired.cat_id,
+                    "node_id": desired.placement.node_id,
+                    "placement_epoch": desired.placement.placement_epoch,
+                    "desired_revision": desired.desired_revision,
+                    "spec_digest": Sha256Digest::from_bytes([99; 32]),
+                    "runtime_incarnation": null,
+                    "runtime_launch": {"kind": "absent"},
+                    "stable_state": null,
+                    "step": {"kind": "inspect_inventory", "inventory_epoch": 1},
+                    "require_idle": {"kind": "not_applicable"},
+                    "updated_at_unix_ms": 1,
+                    "lifecycle_admission": "closed",
+                    "processes": [],
+                    "volumes": [],
+                    "mounts": [],
+                    "networks": [],
+                    "guest_transport": {"kind": "unavailable"},
+                    "warm_snapshot": {"kind": "absent"},
+                    "route_gates": [],
+                }))
+                .unwrap()
+            };
+            std::fs::write(&checkpoint_path, &bytes).unwrap();
+            std::fs::set_permissions(&checkpoint_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+
+            let (authority, _) = TestVolumeDataAuthority::exact(record);
+            let reader = Arc::new(VolumeDataAuthorityMetadataReader::start(authority).unwrap());
+            let outcome = scanner_with_metadata_authority(environment.config(), reader)
+                .unwrap()
+                .scan_complete(scan_context)
+                .unwrap();
+            let RuntimeInventoryScanOutcome::Complete(inventory) = outcome else {
+                panic!(
+                    "assigned canonical {case} checkpoint must remain an encodable full scan: {outcome:?}"
+                )
+            };
+            let [runtime] = inventory.runtimes() else {
+                panic!("assigned Cat must have one runtime projection")
+            };
+            assert!(matches!(
+                &runtime.checkpoint,
+                CheckpointEvidence::Corrupt {
+                    checkpoint_path: observed,
+                    raw_content_digest,
+                } if observed.as_str() == checkpoint_path.to_str().unwrap()
+                    && raw_content_digest == &Sha256Digest::from_bytes(Sha256::digest(&bytes).into())
+            ));
+            assert!(matches!(
+                runtime.step,
+                ReconcileStep::InspectInventory { .. }
+            ));
+            assert_eq!(runtime.lifecycle_admission, LifecycleAdmission::Closed);
+            assert!(runtime.conditions.is_empty());
+            assert!(inventory.residue().is_empty());
+            if let Some(retained_data) = retained_data {
+                assert!(matches!(
+                    runtime.volumes.as_slice(),
+                    [ObservedVolume { local_lineages, .. }]
+                        if matches!(local_lineages.as_slice(), [lineage]
+                            if lineage.data_directory.as_str()
+                                == retained_data.to_str().unwrap())
+                ));
+                assert!(
+                    retained_data.exists(),
+                    "inventory must not mutate local lineage"
+                );
+            } else {
+                assert!(runtime
+                    .volumes
+                    .iter()
+                    .all(|volume| volume.local_lineages.is_empty()));
+            }
+            assert_eq!(std::fs::read(&checkpoint_path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn authorized_data_probe_rejects_and_preserves_special_inode_names_before_allocation() {
+        for (name, foreign_name) in [
+            ("root-provision.sock", true),
+            (PENDING_PACK_DIR, false),
+            (IDENTITY_FILE, false),
+            ("serving-handoff-foreign.sock", false),
+        ] {
+            let environment = TestEnvironment::new();
+            let scan_context = assigned_context(true);
+            let desired = &scan_context.coordinates().desired.desired_specs[0];
+            let (_record, attachment) = exact_owned_record_and_attachment(desired);
+            let data_directory = prepare_exact_lineage(&environment, desired, &attachment);
+            install_exact_control_only_files(&data_directory, attachment.size_bytes);
+            let socket = data_directory.join(name);
+            if socket.is_dir() {
+                std::fs::remove_dir(&socket).unwrap();
+            } else if socket.exists() {
+                std::fs::remove_file(&socket).unwrap();
+            }
+            // Bind below SUN_LEN through a short pathname, then move the socket
+            // inode into the deliberately long data-directory location. The
+            // probe only trusts the final descriptor-relative entry; keeping
+            // the listener open preserves it without depending on the host's
+            // temporary-directory prefix.
+            let short_socket = environment._root.path().join("special.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&short_socket).unwrap();
+            std::fs::rename(&short_socket, &socket).unwrap();
+
+            let error = match authorized_data_probe(&environment).prove_absent(&scan_context) {
+                Err(error) => error,
+                Ok(outcome) => {
+                    panic!("stable special inode {name} did not fail closed: {outcome:?}")
+                }
+            };
+            let expected_error = if foreign_name {
+                format!("foreign entry {name}")
+            } else {
+                format!("special inode {name}")
+            };
+            assert!(
+                format!("{error:#}").contains(&expected_error),
+                "unexpected error for {name}: {error:#}"
+            );
+            let full_error = scanner(environment.config())
+                .unwrap()
+                .scan_complete(scan_context)
+                .expect_err("the full scanner must not downgrade a special inode to Incomplete");
+            assert!(
+                format!("{full_error:#}").contains(&expected_error),
+                "unexpected full-scanner error for {name}: {full_error:#}"
+            );
+            assert!(socket.symlink_metadata().unwrap().file_type().is_socket());
+            drop(listener);
+        }
     }
 
     #[test]
@@ -10791,6 +14491,49 @@ mod tests {
     }
 
     #[test]
+    fn residue_child_descriptor_rejects_foreign_owner_and_leaf_swap_without_cleanup() {
+        let environment = TestEnvironment::new();
+        let directory_path = environment.state.join("descriptor-residue");
+        std::fs::create_dir(&directory_path).unwrap();
+        let leaf = directory_path.join("leaf");
+        std::fs::write(&leaf, b"first").unwrap();
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let root = File::open(&environment.state).unwrap();
+        let directory = File::open(&directory_path).unwrap();
+        let enumerated = stat_at(&directory, OsStr::new("leaf")).unwrap();
+
+        let mut foreign = enumerated;
+        foreign.st_uid = foreign.st_uid.wrapping_add(1);
+        assert!(open_residue_child(
+            &directory,
+            &StrictDirectoryEntry {
+                name: OsString::from("leaf"),
+                metadata: foreign,
+            },
+            &root,
+        )
+        .unwrap()
+        .is_none());
+
+        let retained = directory_path.join("retained-first");
+        std::fs::rename(&leaf, &retained).unwrap();
+        std::fs::write(&leaf, b"replacement").unwrap();
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(open_residue_child(
+            &directory,
+            &StrictDirectoryEntry {
+                name: OsString::from("leaf"),
+                metadata: enumerated,
+            },
+            &root,
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(std::fs::read(retained).unwrap(), b"first");
+        assert_eq!(std::fs::read(leaf).unwrap(), b"replacement");
+    }
+
+    #[test]
     fn unvalidated_target_control_and_handoff_artifacts_are_preserved_as_unavailable() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -11007,6 +14750,7 @@ mod tests {
 
     #[test]
     fn foreign_unsafe_and_duplicate_authorized_lineages_fail_closed_without_cleanup() {
+        #[derive(Clone, Copy)]
         enum Residue {
             ForeignCat,
             DuplicateEpoch,
@@ -11030,6 +14774,8 @@ mod tests {
                 Residue::ForeignCat => {
                     let path = environment.state.join(DATA_NAMESPACE).join("cat-foreign");
                     std::fs::create_dir(&path).unwrap();
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
                     path
                 }
                 Residue::DuplicateEpoch => {
@@ -11051,9 +14797,20 @@ mod tests {
                 }
             };
 
-            authorized_data_probe(&environment)
-                .prove_absent(&scan_context)
-                .expect_err("foreign, unsafe or duplicate lineage must be residue");
+            let result = authorized_data_probe(&environment).prove_absent(&scan_context);
+            match residue {
+                Residue::ForeignCat => assert!(matches!(
+                    result.unwrap(),
+                    InventoryAbsence::AuthorizedBlockdWithResidue { residue, .. }
+                        if matches!(residue.as_slice(), [NodeResidue::DataDirectory {
+                            lineage: ResidueLineageEvidence::Unreadable,
+                            ..
+                        }])
+                )),
+                Residue::DuplicateEpoch | Residue::Symlink | Residue::Hardlink => {
+                    result.expect_err("unsafe or duplicate lineage must remain fail-closed");
+                }
+            }
             assert!(
                 std::fs::symlink_metadata(&retained_path).is_ok(),
                 "the read-only probe must preserve residue"
@@ -11079,13 +14836,27 @@ mod tests {
         .unwrap();
         let before = std::fs::read(&duplicate).unwrap();
 
-        RuntimeCheckpointProbe {
+        let InventoryAbsence::RuntimeCheckpointsWithResidue {
+            checkpoints,
+            residue,
+        } = RuntimeCheckpointProbe {
             state_directory: StateDirectory::unanchored(environment.state.clone()),
             reject_legacy_root: true,
             limits: ProbeLimits::default(),
         }
         .prove_absent(&scan_context)
-        .expect_err("a second representation for one Cat checkpoint is residue");
+        .unwrap()
+        else {
+            panic!("a second representation for one Cat checkpoint must be reported as residue")
+        };
+        assert_eq!(checkpoints.len(), 1);
+        assert!(matches!(
+            residue.as_slice(),
+            [NodeResidue::CheckpointFile {
+                evidence: ResidueCheckpointFileEvidence::Valid { cat_id, .. },
+                ..
+            }] if cat_id == &desired.cat_id
+        ));
         assert_eq!(std::fs::read(duplicate).unwrap(), before);
     }
 
@@ -11649,7 +15420,10 @@ mod tests {
         let scanner = scanner_with_metadata_authority(environment.config(), reader).unwrap();
         assert!(matches!(
             scanner.scan_complete(context()).unwrap(),
-            RuntimeInventoryScanOutcome::Incomplete { unavailable_sources }
+            RuntimeInventoryScanOutcome::Incomplete {
+                unavailable_sources,
+                ..
+            }
                 if unavailable_sources == [InventorySource::MetadataStore]
         ));
         assert!(calls.lock().unwrap().is_empty());
@@ -11688,7 +15462,10 @@ mod tests {
         let scanner = scanner_with_metadata_authority(environment.config(), reader).unwrap();
         assert!(matches!(
             scanner.scan_complete(assigned_context(true)).unwrap(),
-            RuntimeInventoryScanOutcome::Incomplete { unavailable_sources }
+            RuntimeInventoryScanOutcome::Incomplete {
+                unavailable_sources,
+                ..
+            }
                 if unavailable_sources == [InventorySource::MetadataStore]
         ));
         assert_eq!(
@@ -11851,8 +15628,12 @@ mod tests {
 
     #[test]
     fn authority_record_for_a_local_only_volume_is_never_folded_into_desired() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let environment = TestEnvironment::new();
-        std::fs::create_dir_all(environment.state.join(DATA_NAMESPACE).join("vol_orphan")).unwrap();
+        let orphan = environment.state.join(DATA_NAMESPACE).join("vol_orphan");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::set_permissions(&orphan, std::fs::Permissions::from_mode(0o700)).unwrap();
         let (authority, calls) = TestVolumeDataAuthority::present();
         let reader = Arc::new(VolumeDataAuthorityMetadataReader::start(authority).unwrap());
         let error = metadata_probe(&environment, reader)
@@ -11874,35 +15655,66 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_target_persistent_or_multi_volume_remains_outside_the_first_slice() {
-        for make_unsupported in ["cold", "persistent", "multi"] {
+    fn full_scanner_covers_every_lifecycle_target_and_complete_volume_disposition_set() {
+        for target in [
+            RuntimeTarget::Running,
+            RuntimeTarget::Suspended,
+            RuntimeTarget::Warm,
+            RuntimeTarget::Cold,
+            RuntimeTarget::Deleted,
+        ] {
             let environment = TestEnvironment::new();
-            let (reader, calls) =
-                recording_metadata_reader(MetadataReaderBehavior::AuthoritativeEmpty);
-            let mut scan_context = assigned_context(true);
+            let mut scan_context = assigned_context_with_root_and_persistent();
             let desired = &mut scan_context.coordinates_mut().desired.desired_specs[0];
-            match make_unsupported {
-                "cold" => desired.target = RuntimeTarget::Cold,
-                "persistent" => desired.volumes[0].disk_kind = DiskKind::Persistent,
-                "multi" => {
-                    desired.volumes.push(desired.volumes[0].clone());
-                    desired.volumes[1].volume_intent_id = Id::new("vint_second").unwrap();
-                    desired.volumes[1].disk_id = Id::new("disk_second").unwrap();
-                    desired.volumes[1].volume_id = Id::new("vol_second").unwrap();
-                    desired.volumes[1].attachment_id = Id::new("att_second").unwrap();
-                }
-                _ => unreachable!("closed test cases"),
+            desired.target = target;
+            if target == RuntimeTarget::Deleted {
+                desired.volumes[0].disposition = VolumeDisposition::DeleteDisposableRoot {
+                    delete_id: Id::new("delete_root_lifecycle").unwrap(),
+                };
+                desired.volumes[1].disposition = VolumeDisposition::DetachRetained;
             }
+            desired.spec_digest = spec_digest(desired).unwrap();
+            let records = desired
+                .volumes
+                .iter()
+                .map(|intent| {
+                    (
+                        intent.volume_id.clone(),
+                        unowned_record(intent.volume_id.as_str(), intent.size_bytes),
+                    )
+                })
+                .collect();
+            let scanner = scanner_with_metadata_authority(
+                environment.config(),
+                Arc::new(ExactSetMetadataAuthorityReader { records }),
+            )
+            .unwrap();
+            let RuntimeInventoryScanOutcome::Complete(inventory) =
+                scanner.scan_complete(scan_context).unwrap()
+            else {
+                panic!("{target:?} complete multi-volume authority must form a full inventory")
+            };
+            let [runtime] = inventory.runtimes() else {
+                panic!("{target:?} must project exactly one Runtime")
+            };
+            assert_eq!(runtime.volumes.len(), 2, "{target:?}");
+            assert!(runtime
+                .volumes
+                .iter()
+                .all(|volume| matches!(volume.authority, VolumeAuthorityEvidence::Unowned { .. })));
             assert_eq!(
-                metadata_probe(&environment, reader)
-                    .prove_absent(&scan_context)
-                    .unwrap(),
-                InventoryAbsence::Unavailable,
-                "{make_unsupported}"
-            );
-            assert!(
-                calls.lock().unwrap().is_empty(),
-                "unsupported intent must fail before authority I/O"
+                runtime
+                    .volumes
+                    .iter()
+                    .map(|volume| volume.volume_id.clone())
+                    .collect::<BTreeSet<_>>(),
+                [
+                    Id::new("vol_root").unwrap(),
+                    Id::new("vol_persistent").unwrap()
+                ]
+                .into_iter()
+                .collect(),
+                "{target:?}"
             );
         }
     }
@@ -12023,7 +15835,10 @@ mod tests {
             let scanner = scanner_with_metadata_authority(environment.config(), reader).unwrap();
             assert!(matches!(
                 scanner.scan_complete(assigned_context(true)).unwrap(),
-                RuntimeInventoryScanOutcome::Incomplete { unavailable_sources }
+                RuntimeInventoryScanOutcome::Incomplete {
+                    unavailable_sources,
+                    ..
+                }
                     if unavailable_sources == [InventorySource::MetadataStore]
             ));
             assert_eq!(calls.lock().unwrap().len(), 1, "{behavior:?}");
@@ -12089,6 +15904,7 @@ mod tests {
         let unavailable_process = ProcessPaths {
             root: environment.proc_root.clone(),
             binaries: vec![environment.guest_binary.clone()],
+            current_static_service: None,
             supported: false,
             limits,
         };
@@ -12103,6 +15919,7 @@ mod tests {
             Box::new(SystemdProbe {
                 systemd_root: environment.systemd_root.clone(),
                 metering_root: None,
+                static_service_identity: None,
                 supported: false,
                 limits,
             }),
@@ -12156,9 +15973,7 @@ mod tests {
                 limits,
             }),
             Box::new(GuestMountProbe {
-                state_directory: StateDirectory::unanchored(environment.state.clone()),
-                legacy_socket_root: environment.socket_root.clone(),
-                guest_process_paths: unavailable_process,
+                state_directory: missing_state.clone(),
                 limits,
             }),
         ];
@@ -12189,17 +16004,26 @@ mod tests {
             std::fs::create_dir_all(residue.parent().unwrap()).unwrap();
             std::fs::write(&residue, b"legacy residue").unwrap();
             let scanner = scanner(environment.config()).unwrap();
-            assert!(scanner.scan_complete(context()).is_err(), "{relative_file}");
+            let outcome = scanner.scan_complete(context()).unwrap();
+            assert!(
+                matches!(outcome, RuntimeInventoryScanOutcome::Incomplete { .. })
+                    || matches!(outcome, RuntimeInventoryScanOutcome::Complete(ref inventory)
+                        if !inventory.residue().is_empty()),
+                "{relative_file}"
+            );
             assert!(residue.exists(), "scanner removed {relative_file}");
         }
 
         let environment = TestEnvironment::new();
         let legacy_cats = environment.state.join(LEGACY_CATS_DIRECTORY);
         std::fs::create_dir(&legacy_cats).unwrap();
-        assert!(scanner(environment.config())
-            .unwrap()
-            .scan_complete(context())
-            .is_err());
+        assert!(matches!(
+            scanner(environment.config())
+                .unwrap()
+                .scan_complete(context())
+                .unwrap(),
+            RuntimeInventoryScanOutcome::Incomplete { .. }
+        ));
         assert!(legacy_cats.is_dir());
     }
 
@@ -12225,12 +16049,42 @@ mod tests {
                 "residue"
             });
             std::fs::write(&residue, b"partial").unwrap();
-            assert!(scanner(environment.config())
+            let outcome = scanner(environment.config())
                 .unwrap()
                 .scan_complete(context())
-                .is_err());
+                .unwrap();
+            assert!(
+                matches!(outcome, RuntimeInventoryScanOutcome::Incomplete { .. })
+                    || matches!(outcome, RuntimeInventoryScanOutcome::Complete(ref inventory)
+                        if !inventory.residue().is_empty())
+            );
             assert!(residue.exists());
         }
+    }
+
+    #[test]
+    fn opaque_guest_mount_marker_is_exactly_incomplete_and_preserved() {
+        let environment = TestEnvironment::new();
+        let directory = environment.state.join(GUEST_MOUNT_NAMESPACE);
+        std::fs::create_dir(&directory).unwrap();
+        let marker = directory.join("orphan");
+        std::fs::write(&marker, b"opaque mount state").unwrap();
+
+        assert!(matches!(
+            scanner(environment.config())
+                .unwrap()
+                .scan_complete(context())
+                .unwrap(),
+            RuntimeInventoryScanOutcome::Incomplete {
+                unavailable_sources,
+                exact_physical_negative_cats,
+            } if unavailable_sources == [InventorySource::GuestMount]
+                && exact_physical_negative_cats.is_empty()
+        ));
+        assert!(
+            marker.exists(),
+            "opaque GuestMount evidence must never be guessed or removed"
+        );
     }
 
     #[test]
@@ -12278,27 +16132,48 @@ mod tests {
         let environment = TestEnvironment::new();
         let scope = environment.systemd_root.join("cats-orphan.scope");
         std::fs::create_dir(&scope).unwrap();
+        std::fs::write(scope.join("cgroup.procs"), b"").unwrap();
         let systemd = SystemdProbe {
             systemd_root: environment.systemd_root.clone(),
             metering_root: None,
+            static_service_identity: None,
             supported: true,
             limits: ProbeLimits::default(),
         };
-        assert!(systemd.prove_absent(&context()).is_err());
+        assert!(matches!(
+            systemd.prove_absent(&context()).unwrap(),
+            InventoryAbsence::Residue(residue)
+                if matches!(residue.as_slice(), [NodeResidue::SystemdScope { scope_id, .. }]
+                    if scope_id.as_str() == "cats-orphan.scope")
+        ));
 
         let pid = environment.proc_root.join("123");
         std::fs::create_dir(&pid).unwrap();
         std::os::unix::fs::symlink(&environment.ch_binary, pid.join("exe")).unwrap();
         std::fs::write(pid.join("cmdline"), b"unrelated\0").unwrap();
+        std::fs::write(
+            pid.join("stat"),
+            b"123 (cloud-hypervisor) S 1 123 123 0 -1 4194560 512 0 0 0 11 3 0 0 20 0 5 0 918273 ",
+        )
+        .unwrap();
         let process = ProcessProbe {
             paths: ProcessPaths {
                 root: environment.proc_root.clone(),
                 binaries: vec![environment.ch_binary.clone()],
+                current_static_service: None,
                 supported: true,
                 limits: ProbeLimits::default(),
             },
         };
-        assert!(process.prove_absent(&context()).is_err());
+        assert!(matches!(
+            process.prove_absent(&context()).unwrap(),
+            InventoryAbsence::Residue(residue)
+                if matches!(residue.as_slice(), [NodeResidue::Process {
+                    process_id: 123,
+                    process_start_time_ticks,
+                    ..
+                }] if process_start_time_ticks.get() == 918_273)
+        ));
 
         let interface = environment.network_root.join("cat00000000abc");
         std::fs::create_dir(&interface).unwrap();
@@ -12309,7 +16184,140 @@ mod tests {
             physical_inventory_owned_by_bridge: false,
             limits: ProbeLimits::default(),
         };
-        assert!(network.prove_absent(&context()).is_err());
+        assert!(matches!(
+            network.prove_absent(&context()).unwrap(),
+            InventoryAbsence::Residue(residue)
+                if matches!(residue.as_slice(), [NodeResidue::NetworkTap { tap_name, .. }]
+                    if tap_name.as_str() == "cat00000000abc")
+        ));
+    }
+
+    #[test]
+    fn full_scanner_aggregates_every_stably_representable_physical_source_without_cleanup() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::net::UnixListener;
+
+        let environment = TestEnvironment::new();
+
+        let scope = environment.systemd_root.join("cats-orphan.scope");
+        std::fs::create_dir(&scope).unwrap();
+        std::fs::write(scope.join("cgroup.procs"), b"").unwrap();
+
+        let pid = environment.proc_root.join("123");
+        std::fs::create_dir(&pid).unwrap();
+        std::os::unix::fs::symlink(&environment.ch_binary, pid.join("exe")).unwrap();
+        std::fs::write(pid.join("cmdline"), b"unrelated\0").unwrap();
+        std::fs::write(
+            pid.join("stat"),
+            b"123 (cloud-hypervisor) S 1 123 123 0 -1 4194560 512 0 0 0 11 3 0 0 20 0 5 0 918273 ",
+        )
+        .unwrap();
+
+        let control_directory = environment.state.join(CONTROL_SOCKET_NAMESPACE);
+        std::fs::create_dir(&control_directory).unwrap();
+        let control_socket = control_directory.join("orphan-control.sock");
+        drop(UnixListener::bind(&control_socket).unwrap());
+
+        let vhost_directory = environment.state.join(VHOST_NAMESPACE);
+        std::fs::create_dir(&vhost_directory).unwrap();
+        let vhost_socket = vhost_directory.join("orphan-vhost.sock");
+        drop(UnixListener::bind(&vhost_socket).unwrap());
+
+        let nbd = environment.block_root.join("nbd0");
+        std::fs::create_dir(&nbd).unwrap();
+        std::fs::write(nbd.join("size"), b"8\n").unwrap();
+
+        let tap = environment.network_root.join("cat00000000abc");
+        std::fs::create_dir(&tap).unwrap();
+
+        let pending_directory = environment.state.join(PENDING_PACK_NAMESPACE);
+        let pending = pending_directory.join("vol_root");
+        std::fs::create_dir_all(&pending).unwrap();
+
+        let warm_directory = environment.state.join(WARM_SNAPSHOT_NAMESPACE);
+        std::fs::create_dir(&warm_directory).unwrap();
+        let warm = warm_directory.join("snap-orphan.bin");
+        std::fs::write(&warm, b"warm").unwrap();
+        std::fs::set_permissions(&warm, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let outcome = scanner_with_metadata_authority(
+            environment.config(),
+            Arc::new(ExactSetMetadataAuthorityReader {
+                records: BTreeMap::from([(
+                    Id::new("vol_root").unwrap(),
+                    unowned_record("vol_root", 4_294_967_296),
+                )]),
+            }),
+        )
+        .unwrap()
+        .scan_complete(assigned_context(true))
+        .unwrap();
+        let RuntimeInventoryScanOutcome::Complete(inventory) = outcome else {
+            panic!("stable physical artifacts must remain one complete observation: {outcome:?}")
+        };
+
+        let residue = inventory.residue();
+        assert_eq!(residue.len(), 8);
+        assert!(residue.iter().any(|item| matches!(
+            item,
+            NodeResidue::SystemdScope { scope_id, .. }
+                if scope_id.as_str() == "cats-orphan.scope"
+        )));
+        assert!(residue.iter().any(|item| matches!(
+            item,
+            NodeResidue::Process {
+                process_id: 123,
+                process_start_time_ticks,
+                ..
+            } if process_start_time_ticks.get() == 918_273
+        )));
+        assert!(residue.iter().any(|item| matches!(
+            item,
+            NodeResidue::ControlSocket { socket_path, .. }
+                if socket_path.as_str() == control_socket.to_string_lossy()
+        )));
+        assert!(residue.iter().any(|item| matches!(
+            item,
+            NodeResidue::VhostUserBlk { socket_path, .. }
+                if socket_path.as_str() == vhost_socket.to_string_lossy()
+        )));
+        assert!(residue.iter().any(|item| matches!(
+            item,
+            NodeResidue::KernelNbd { device_path, .. }
+                if device_path.as_str() == "/dev/nbd0"
+        )));
+        assert!(residue.iter().any(|item| matches!(
+            item,
+            NodeResidue::NetworkTap { tap_name, .. }
+                if tap_name.as_str() == "cat00000000abc"
+        )));
+        assert!(residue.iter().any(|item| matches!(
+            item,
+            NodeResidue::DataDirectory { data_directory, .. }
+                if data_directory.as_str() == pending.to_string_lossy()
+        )));
+        assert!(residue.iter().any(|item| matches!(
+            item,
+            NodeResidue::WarmSnapshot { path, file_size_bytes, .. }
+                if path.as_str() == warm.to_string_lossy() && file_size_bytes.get() == 4
+        )));
+
+        for retained in [
+            scope,
+            pid,
+            control_socket,
+            vhost_socket,
+            nbd,
+            tap,
+            pending,
+            warm,
+        ] {
+            assert!(
+                retained.exists(),
+                "inventory removed {}",
+                retained.display()
+            );
+        }
     }
 
     #[test]
@@ -12330,17 +16338,20 @@ mod tests {
         let legacy = environment.state.join(RUNTIME_EFFECTS_NAMESPACE);
         std::fs::create_dir(&legacy).unwrap();
         std::fs::write(legacy.join("old-network.json"), b"foreign").unwrap();
-        assert!(network.prove_absent(&context()).is_err());
+        assert_eq!(
+            network.prove_absent(&context()).unwrap(),
+            InventoryAbsence::Unavailable
+        );
     }
 
     #[test]
     fn nbd_free_serving_leaked_and_malformed_states_are_distinct() {
         let cases = [
-            (None, "0", ProbeFact::Empty),
-            (Some("123"), "8", ProbeFact::Present),
-            (None, "8", ProbeFact::Present),
+            (None, "0", false),
+            (Some("123"), "8", true),
+            (None, "8", true),
         ];
-        for (pid, size, expected) in cases {
+        for (pid, size, present) in cases {
             let environment = TestEnvironment::new();
             let nbd = environment.block_root.join("nbd0");
             std::fs::create_dir(&nbd).unwrap();
@@ -12348,22 +16359,40 @@ mod tests {
                 std::fs::write(nbd.join("pid"), pid).unwrap();
             }
             std::fs::write(nbd.join("size"), size).unwrap();
-            assert_eq!(
-                scan_nbd(&environment.block_root, 16, None, &context()).unwrap(),
-                expected
-            );
+            let observed = scan_nbd_residue(&environment.block_root, 16, None, &context())
+                .unwrap()
+                .unwrap();
+            assert_eq!(observed.len(), usize::from(present));
+            if present {
+                assert!(matches!(
+                    observed.as_slice(),
+                    [NodeResidue::KernelNbd { device_path, .. }]
+                        if device_path.as_str() == "/dev/nbd0"
+                ));
+            }
         }
 
         let environment = TestEnvironment::new();
         let nbd = environment.block_root.join("nbd0");
         std::fs::create_dir(&nbd).unwrap();
         std::fs::write(nbd.join("size"), "not-a-number").unwrap();
-        assert!(scan_nbd(&environment.block_root, 16, None, &context()).is_err());
+        assert!(
+            scan_nbd_residue(&environment.block_root, 16, None, &context())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn installed_factory_derives_checkpoint_evidence_from_the_scanned_dirfd_child() {
+        // Provisioning the installed /run/cats namespace requires root; the
+        // Docker and metal root gates execute the full body.
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: installed /run/cats namespace requires the root gates");
+            return;
+        }
         let environment = TestEnvironment::new();
         let state = StateDirectory::unanchored(environment.state.clone());
         #[cfg(target_os = "linux")]
@@ -13558,12 +17587,18 @@ mod tests {
                 process_ids: Mutex::new(VecDeque::from([None, None])),
             }),
         );
-        let error = managed_inspect_all(&bridge, &managed, BTreeMap::new())
-            .expect_err("live managed listeners were projected as absent");
-        assert!(
-            format!("{error:#}").contains("retains a live Unix listener"),
-            "{error:#}"
-        );
+        // A live listener whose owner process reports Absent is scan
+        // incompleteness: the joint inspection fails closed as Unavailable,
+        // never completing inventory and never touching local state.
+        let outcome = managed_inspect_all(&bridge, &managed, BTreeMap::new())
+            .expect("mismatched live listeners fail closed as incomplete inventory");
+        let crate::runtime::reconciliation::inventory::RootProcessInventoryBridgeOutcome::Unavailable {
+            exact_running_negative_cats,
+        } = outcome
+        else {
+            panic!("live managed listeners entered a completed inventory: {outcome:?}");
+        };
+        assert!(exact_running_negative_cats.is_empty());
         assert_eq!(
             before,
             [
@@ -13762,12 +17797,18 @@ mod tests {
                 process_ids: Mutex::new(VecDeque::from([None, None])),
             }),
         );
-        let error = managed_inspect_all(&bridge, &managed, BTreeMap::new())
-            .expect_err("same-name managed marker inode ABA entered a complete full inventory");
-        assert!(
-            format!("{error:#}").contains("changed across full Node-global inventory"),
-            "{error:#}"
-        );
+        // A same-name marker whose inode changed mid-scan is scan
+        // incompleteness: the joint inspection fails closed as Unavailable,
+        // never completing inventory and never touching local state.
+        let outcome = managed_inspect_all(&bridge, &managed, BTreeMap::new())
+            .expect("marker inode ABA fails closed as incomplete inventory");
+        let crate::runtime::reconciliation::inventory::RootProcessInventoryBridgeOutcome::Unavailable {
+            exact_running_negative_cats,
+        } = outcome
+        else {
+            panic!("same-name marker inode ABA entered a completed inventory: {outcome:?}");
+        };
+        assert!(exact_running_negative_cats.is_empty());
         assert_eq!(root_port.calls.load(Ordering::SeqCst), 1);
         let marker_after = file_bytes_and_inode(&marker);
         assert_eq!(marker_after.0, marker_before.0);
@@ -14219,7 +18260,7 @@ mod tests {
                 environment.blockd_binary.to_string_lossy().into_owned(),
             )
             .unwrap(),
-            exact_vmms: true,
+            exact_vmm_state: Some(ProcessState::Running),
         });
         let registry = AdmissionCellRegistry::for_state_directory(&state_directory);
         let guest_calls = Arc::new(AtomicUsize::new(0));
@@ -14259,6 +18300,165 @@ mod tests {
         let tail = inventory
             .take_running_tail_admission()
             .expect("exact scan must retain a private Running-tail admission");
+
+        let paused_registry = AdmissionCellRegistry::for_state_directory(&state_directory);
+        let paused_cell = AdmissionCell::new(
+            AdmissionSnapshot::from_checkpoint(start_stored.checkpoint()).unwrap(),
+        )
+        .unwrap();
+        paused_registry
+            .insert_cell_for_machine_test(desired.cat_id.clone(), paused_cell)
+            .unwrap();
+        let paused_guest_calls = Arc::new(AtomicUsize::new(0));
+        let paused_bridge = Arc::new(ExactRunningProcessBridge {
+            state_directory: state_directory.clone(),
+            systemd: test_root_provision_systemd(&environment.blockd_binary),
+            executable_path: HostPath::new(
+                environment.blockd_binary.to_string_lossy().into_owned(),
+            )
+            .unwrap(),
+            exact_vmm_state: Some(ProcessState::Paused),
+        });
+        let paused_scanner = full_root_scanner(&fixture, [])
+            .with_root_process_bridge_for_test(paused_bridge)
+            .with_network_bridge(Arc::new(ExactRunningNetworkBridge))
+            .with_running_tail_transport_for_test(
+                paused_registry,
+                Arc::new(ExactRunningGuestReadyPort {
+                    calls: Arc::clone(&paused_guest_calls),
+                    fault: RunningGuestReadyFault::Exact,
+                }),
+            );
+        let RuntimeInventoryScanOutcome::Complete(mut paused_inventory) = paused_scanner
+            .scan_complete(fixture.scan_context.clone())
+            .unwrap()
+        else {
+            panic!("a Paused VMM must remain a complete fail-closed observation")
+        };
+        drop(paused_scanner);
+        assert_eq!(
+            paused_guest_calls.load(Ordering::SeqCst),
+            0,
+            "Paused VMM must be rejected before a successful Guest-ready response can mint Ready"
+        );
+        assert!(matches!(
+            paused_inventory.runtimes()[0].guest_transport,
+            GuestTransportEvidence::Unavailable
+        ));
+        let paused_tail = paused_inventory
+            .take_running_tail_admission()
+            .expect("Paused VMM with an existing cell must mint close-only authority");
+        assert!(!paused_tail.has_ready_for_test(&desired.cat_id));
+        assert_eq!(
+            paused_tail.route_retirement_mode_for_test(&desired.cat_id),
+            Some(super::super::RouteRetirementMode::GlobalPhysicalNegative)
+        );
+
+        let hybrid_scanner = full_root_scanner(&fixture, [])
+            .with_root_process_bridge_for_test(Arc::new(ExactRunningProcessBridge {
+                state_directory: state_directory.clone(),
+                systemd: test_root_provision_systemd(&environment.blockd_binary),
+                executable_path: HostPath::new(
+                    environment.blockd_binary.to_string_lossy().into_owned(),
+                )
+                .unwrap(),
+                exact_vmm_state: Some(ProcessState::Paused),
+            }))
+            .with_network_bridge(Arc::new(UnavailableRunningNetworkBridge));
+        let RuntimeInventoryScanOutcome::Incomplete {
+            unavailable_sources,
+            exact_physical_negative_cats,
+        } = hybrid_scanner
+            .scan_complete(fixture.scan_context.clone())
+            .unwrap()
+        else {
+            panic!("a later unavailable source must retain the earlier exact Paused negative")
+        };
+        assert!(unavailable_sources.contains(&InventorySource::Network));
+        assert_eq!(
+            exact_physical_negative_cats,
+            BTreeSet::from([desired.cat_id.clone()])
+        );
+
+        for (initial, label) in [
+            (ScriptedVmmInspection::Exact(ProcessState::Paused), "paused"),
+            (ScriptedVmmInspection::Absent, "absent"),
+        ] {
+            for later_unavailable in [
+                "node-global-sweep",
+                "node-global-cancellation",
+                "second-vmm-sample",
+            ] {
+                let platform_scan_context = RuntimeInventoryScanContext::for_test(
+                    fixture.scan_context.coordinates().clone(),
+                    Instant::now() + Duration::from_secs(5),
+                );
+                let vmm_inspections = match later_unavailable {
+                    "node-global-sweep" | "node-global-cancellation" => VecDeque::from([initial]),
+                    "second-vmm-sample" => {
+                        VecDeque::from([initial, ScriptedVmmInspection::Unavailable])
+                    }
+                    _ => unreachable!(),
+                };
+                let root_process = live.old_process.clone();
+                let mut platform_bridge = root_process_bridge_with_all_ports(
+                    &environment,
+                    Arc::new(FakeRootProcessPort {
+                        inspections: Mutex::new(VecDeque::from([
+                            RootProvisionProcessInspection::Exact(Box::new(root_process.clone())),
+                            RootProvisionProcessInspection::Exact(Box::new(root_process)),
+                        ])),
+                    }),
+                    Arc::new(FakeServingProcessPort {
+                        process_ids: Mutex::new(VecDeque::from([Some(81), Some(81)])),
+                    }),
+                    Arc::new(ScriptedVmmProcessPort {
+                        inspections: Mutex::new(vmm_inspections),
+                        cancel_after_first: (later_unavailable == "node-global-cancellation")
+                            .then(|| platform_scan_context.clone()),
+                        calls: AtomicUsize::new(0),
+                    }),
+                );
+                let empty_os = TempDir::new().unwrap();
+                platform_bridge.systemd_root = empty_os.path().join("systemd");
+                platform_bridge.process_paths.root = empty_os.path().join("proc");
+                platform_bridge.legacy_socket_root = empty_os.path().join("legacy-sockets");
+                for path in [
+                    &platform_bridge.systemd_root,
+                    &platform_bridge.process_paths.root,
+                    &platform_bridge.legacy_socket_root,
+                ] {
+                    std::fs::create_dir(path).unwrap();
+                }
+                if later_unavailable == "node-global-sweep" {
+                    let unavailable_sweep_root = environment.state.parent().unwrap().join(format!(
+                        "managed-vmm-unavailable-{label}-{later_unavailable}"
+                    ));
+                    platform_bridge.managed_vmm_socket_root = Some(Arc::new(
+                        RetainedManagedVmmSocketRoot::provision_for_test(&unavailable_sweep_root)
+                            .unwrap(),
+                    ));
+                }
+                let platform_scanner = full_root_scanner(&fixture, [])
+                    .with_root_process_bridge_for_test(Arc::new(platform_bridge))
+                    .with_network_bridge(Arc::new(ExactRunningNetworkBridge));
+                let RuntimeInventoryScanOutcome::Incomplete {
+                    unavailable_sources,
+                    exact_physical_negative_cats,
+                } = platform_scanner
+                    .scan_complete(platform_scan_context)
+                    .unwrap()
+                else {
+                    panic!("production scanner lost {label} negative before {later_unavailable}")
+                };
+                assert!(unavailable_sources.contains(&InventorySource::Process));
+                assert_eq!(
+                    exact_physical_negative_cats,
+                    BTreeSet::from([desired.cat_id.clone()]),
+                    "production scanner lost {label} negative before {later_unavailable}"
+                );
+            }
+        }
         let mut observation = NodeObservation {
             version: ContractVersion::V1,
             observation_id: RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
@@ -14291,7 +18491,7 @@ mod tests {
                 environment.blockd_binary.to_string_lossy().into_owned(),
             )
             .unwrap(),
-            exact_vmms: false,
+            exact_vmm_state: None,
         });
         let absent_registry = AdmissionCellRegistry::for_state_directory(&state_directory);
         let absent_scanner = full_root_scanner(&fixture, [])
@@ -14747,7 +18947,7 @@ mod tests {
         let records = Arc::new(Mutex::new(records));
         let registry = AdmissionCellRegistry::for_state_directory(&state_directory);
         let guest_calls = Arc::new(AtomicUsize::new(0));
-        let build_scanner = |fault, exact_vmms| {
+        let build_scanner = |fault, exact_vmms: bool| {
             let authority: Arc<dyn VolumeDataAuthority> = Arc::new(ExactVolumeSetDataAuthority {
                 records: records.lock().unwrap().clone(),
             });
@@ -14758,7 +18958,7 @@ mod tests {
                     environment.blockd_binary.to_string_lossy().into_owned(),
                 )
                 .unwrap(),
-                exact_vmms,
+                exact_vmm_state: exact_vmms.then_some(ProcessState::Running),
             });
             let mut config = environment.config();
             if let Some(client) = &kernel_nbd_client {
@@ -14788,6 +18988,71 @@ mod tests {
                 }),
             )
         };
+
+        if let Some(client) = &kernel_nbd_client {
+            let allocation_lock = environment.state.join("kernel-nbd-allocation.lock");
+            let allocation_lock_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&allocation_lock)
+                .unwrap();
+            // SAFETY: the fixture owns this descriptor and releases the
+            // advisory lock below before dropping it.
+            let lock_result =
+                unsafe { libc::flock(allocation_lock_file.as_raw_fd(), libc::LOCK_EX) };
+            assert_eq!(lock_result, 0);
+            let authority: Arc<dyn VolumeDataAuthority> = Arc::new(ExactVolumeSetDataAuthority {
+                records: records.lock().unwrap().clone(),
+            });
+            let mut config = environment.config();
+            config.kernel_nbd_inventory_port = Some(KernelNbdInventoryPort::new(
+                KernelNbdInventoryConfig::fixture(
+                    state_directory.clone(),
+                    environment.block_root.clone(),
+                    environment.proc_root.clone(),
+                    client.clone(),
+                    u32::try_from(desired.volumes.len()).unwrap(),
+                ),
+            ));
+            let scanner = scanner_with_metadata_authority_and_blob(
+                config,
+                Arc::new(VolumeDataAuthorityMetadataReader::start(authority).unwrap()),
+                None,
+            )
+            .unwrap()
+            .with_root_process_bridge_for_test(Arc::new(
+                PreservedNegativeUnavailableProcessBridge {
+                    inner: ExactRunningProcessBridge {
+                        state_directory: state_directory.clone(),
+                        systemd: test_root_provision_systemd(&environment.blockd_binary),
+                        executable_path: HostPath::new(
+                            environment.blockd_binary.to_string_lossy().into_owned(),
+                        )
+                        .unwrap(),
+                        exact_vmm_state: None,
+                    },
+                    exact_running_negative_cats: BTreeSet::from([desired.cat_id.clone()]),
+                },
+            ))
+            .with_network_bridge(Arc::new(ExactRunningNetworkBridge));
+            let RuntimeInventoryScanOutcome::Incomplete {
+                unavailable_sources,
+                exact_physical_negative_cats,
+            } = scanner.scan_complete(scan_context.clone()).unwrap()
+            else {
+                panic!("missing process admission must skip the locked kernel-NBD pool")
+            };
+            assert!(unavailable_sources.contains(&InventorySource::Process));
+            assert!(unavailable_sources.contains(&InventorySource::BlockFrontend));
+            assert_eq!(
+                exact_physical_negative_cats,
+                BTreeSet::from([desired.cat_id.clone()])
+            );
+            // SAFETY: this unlock matches the successful fixture flock above.
+            let unlock_result =
+                unsafe { libc::flock(allocation_lock_file.as_raw_fd(), libc::LOCK_UN) };
+            assert_eq!(unlock_result, 0);
+        }
 
         let RuntimeInventoryScanOutcome::Complete(mut early_inventory) =
             build_scanner(RunningGuestReadyFault::Exact, true)
@@ -14971,7 +19236,7 @@ mod tests {
                 panic!("filesystem phase must retain one complete physical inventory")
             };
             let context = bind_inventory_for_running_effect(
-                inventory,
+                *inventory,
                 &scan_context,
                 state_directory.clone(),
             );
@@ -15421,7 +19686,7 @@ mod tests {
                 environment.blockd_binary.to_string_lossy().into_owned(),
             )
             .unwrap(),
-            exact_vmms: true,
+            exact_vmm_state: Some(ProcessState::Running),
         });
         let mut config = environment.config();
         if let Some(client) = &kernel_nbd_client {
@@ -16283,7 +20548,10 @@ mod tests {
 
         assert!(matches!(
             scanner.scan_complete(fixture.scan_context).unwrap(),
-            RuntimeInventoryScanOutcome::Incomplete { unavailable_sources }
+            RuntimeInventoryScanOutcome::Incomplete {
+                unavailable_sources,
+                ..
+            }
                 if unavailable_sources.contains(&InventorySource::DataDirectory)
         ));
         for name in ["cache.data", "dirty.bitmap", PENDING_PACK_DIR] {
@@ -16327,6 +20595,351 @@ mod tests {
         for name in ["cache.data", "dirty.bitmap", PENDING_PACK_DIR] {
             assert!(!fixture.data_directory.join(name).exists(), "{name}");
         }
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    fn released_cleanup_fixture(environment: &TestEnvironment) -> FullRootScannerFixture {
+        let mut fixture = full_root_scanner_fixture(environment);
+        let (desired_revision, desired_digest) = {
+            let desired = &mut fixture.scan_context.coordinates_mut().desired.desired_specs[0];
+            desired.target = RuntimeTarget::Cold;
+            desired.desired_revision = Revision::new(desired.desired_revision.get() + 1).unwrap();
+            desired.spec_digest = spec_digest(desired).unwrap();
+            (desired.desired_revision, desired.spec_digest.clone())
+        };
+        let attachment = fixture.acquired.attachment.clone();
+        let release_transition_id = RandomId128::new("edededededededededededededededed").unwrap();
+        let resulting_epoch =
+            FenceEpoch::new(attachment.identity.attachment_epoch.get() + 1).unwrap();
+        let cleanup = CleanupRelease {
+            target: CleanupTarget::Volume {
+                volume_id: attachment.identity.volume_id.clone(),
+                attachment_id: attachment.identity.attachment_id.clone(),
+                attachment_epoch: attachment.identity.attachment_epoch,
+            },
+            inventory_session: fixture.scan_context.coordinates().session.clone(),
+            inventory_epoch: fixture.scan_context.coordinates().inventory_epoch,
+            inventory_read_position: fixture.scan_context.coordinates().desired.read_position,
+            desired_read_position: fixture.scan_context.coordinates().desired.read_position,
+            volume_release: Some(VolumeReleaseReplay {
+                release_transition_id: release_transition_id.clone(),
+                generation: fixture.record.head.generation,
+                disposition: fixture.acquired.volume.disposition.clone(),
+            }),
+        };
+        let mut checkpoint = fixture.stored_checkpoint.checkpoint().clone();
+        checkpoint.desired_revision = desired_revision;
+        checkpoint.spec_digest = desired_digest;
+        checkpoint.step = ReconcileStep::CleanupRelease {
+            cleanup: cleanup.clone(),
+        };
+        checkpoint.updated_at_unix_ms =
+            UnixMillis::new(checkpoint.updated_at_unix_ms.get() + 1).unwrap();
+        let store = FileCheckpointStore::open(
+            &environment.state.join(CHECKPOINT_NAMESPACE),
+            &fixture.acquired.desired.cat_id,
+        )
+        .unwrap();
+        fixture.stored_checkpoint = store
+            .replace(&fixture.stored_checkpoint, &checkpoint)
+            .unwrap();
+
+        fixture.record.lease_owner = None;
+        fixture.record.lease_epoch = resulting_epoch;
+        fixture.record.lease_expires_at = None;
+        fixture.record.last_transition = Some(LastVolumeTransition::Release {
+            request: ReleaseRequest {
+                volume_id: attachment.identity.volume_id.clone(),
+                transition_id: release_transition_id.clone(),
+                attachment_id: attachment.identity.attachment_id.clone(),
+                expected_epoch: attachment.identity.attachment_epoch,
+            },
+            result: ReleaseResult {
+                volume_id: attachment.identity.volume_id.clone(),
+                transition_id: release_transition_id,
+                released_attachment_id: attachment.identity.attachment_id.clone(),
+                resulting_epoch,
+                resulting_head: fixture.record.head.clone(),
+            },
+        });
+        fixture
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    #[test]
+    fn released_cleanup_projects_data_directory_residue_with_retained_reclaim_admission() {
+        let environment = TestEnvironment::new();
+        let fixture = released_cleanup_fixture(&environment);
+        let attachment = fixture.acquired.attachment.clone();
+
+        let scanner = full_root_scanner(
+            &fixture,
+            [
+                RootProvisionProcessInspection::Absent,
+                RootProvisionProcessInspection::Absent,
+            ],
+        );
+        let RuntimeInventoryScanOutcome::Complete(mut inventory) =
+            scanner.scan_complete(fixture.scan_context.clone()).unwrap()
+        else {
+            panic!("exact released cleanup must remain a complete inventory")
+        };
+        assert!(inventory.runtimes()[0].volumes[0].local_lineages.is_empty());
+        assert!(matches!(
+            inventory.residue(),
+            [NodeResidue::DataDirectory {
+                cat_id_hint: Some(cat_id),
+                disk_id_hint: Some(disk_id),
+                volume_id_hint: Some(volume_id),
+                retention_reason: DataDirectoryRetentionReason::ExactReclaimPending,
+                lineage: ResidueLineageEvidence::Readable { lineage },
+                ..
+            }] if cat_id == &fixture.acquired.desired.cat_id
+                && disk_id == &fixture.acquired.volume.disk_id
+                && volume_id == &fixture.acquired.volume.volume_id
+                && lineage.attachment_id == attachment.identity.attachment_id
+                && lineage.attachment_epoch == attachment.identity.attachment_epoch
+                && lineage.acquisition == attachment.acquire
+                && lineage.local_durable_generation == lineage.remote_durable_generation
+                && lineage.pending_pack_count.get() == 0
+                && lineage.fenced
+        ));
+        assert!(inventory.take_data_directory_reclaim_admission().is_some());
+        assert!(fixture.data_directory.exists());
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    struct ExactReleasedResidueAuthority {
+        record: VolumeRecord,
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    struct EmptyResidueNetworkBridge;
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    impl network_inventory_bridge_sealed::Sealed for EmptyResidueNetworkBridge {}
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    impl NetworkInventoryBridge for EmptyResidueNetworkBridge {
+        fn inspect_all(
+            &self,
+            _checkpoints: &BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+            _context: &RuntimeInventoryScanContext,
+        ) -> anyhow::Result<NetworkInventoryBridgeOutcome> {
+            Ok(NetworkInventoryBridgeOutcome::Complete(
+                NodeGlobalNetworkScanAdmission::empty_for_test(),
+            ))
+        }
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    impl super::super::residue_reclaim::ResidueAuthorityPort for ExactReleasedResidueAuthority {
+        fn request(
+            &self,
+            request: &cats_api::runtime_reconciliation::RuntimeResidueAuthorityRequest,
+            _deadline: Instant,
+        ) -> Result<
+            super::super::RuntimeResidueAuthorityAttempt,
+            cats_api::runtime_reconciliation::ContractError,
+        > {
+            Ok(super::super::RuntimeResidueAuthorityAttempt::Qualified(
+                Box::new(
+                    cats_api::runtime_reconciliation::RuntimeResidueAuthoritySuccess {
+                        version: ContractVersion::V1,
+                        session: request.session.clone(),
+                        lineage: request.lineage.clone(),
+                        outcome: cats_api::runtime_reconciliation::RuntimeResidueAuthorityOutcome::Reclaimable {
+                            proof: Box::new(
+                                cats_api::runtime_reconciliation::ResidueReclaimProof::OrdinaryRelease {
+                                    current_volume: self.record.clone(),
+                                },
+                            ),
+                        },
+                    },
+                ),
+            ))
+        }
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    #[test]
+    fn checkpointed_exact_release_proof_reclaims_the_retained_data_directory() {
+        let environment = TestEnvironment::new();
+        let fixture = released_cleanup_fixture(&environment);
+        let scanner = full_root_scanner(
+            &fixture,
+            [
+                RootProvisionProcessInspection::Absent,
+                RootProvisionProcessInspection::Absent,
+            ],
+        )
+        .with_network_bridge(Arc::new(EmptyResidueNetworkBridge));
+        let RuntimeInventoryScanOutcome::Complete(inventory) =
+            scanner.scan_complete(fixture.scan_context.clone()).unwrap()
+        else {
+            panic!("exact released cleanup must form a complete reclaim admission")
+        };
+        let context = bind_inventory_for_running_effect(
+            *inventory,
+            &fixture.scan_context,
+            StateDirectory::unanchored(environment.state.clone()),
+        );
+        let desired = &fixture.scan_context.coordinates().desired.desired_specs[0];
+        let store = FileCheckpointStore::open_preserving_checkpoint_temp(
+            &environment.state.join(CHECKPOINT_NAMESPACE),
+            &desired.cat_id,
+        )
+        .unwrap();
+        let stored = store.load().unwrap().unwrap();
+        let checkpoint_bytes = std::fs::read(store.path()).unwrap();
+        let current = store.assert_current(&stored).unwrap();
+        let effect = super::super::DataDirectoryReclaimEffect::for_test(Arc::new(
+            ExactReleasedResidueAuthority {
+                record: fixture.record.clone(),
+            },
+        ));
+
+        assert_eq!(
+            effect
+                .try_apply(&context, desired, &store, &stored, &current)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert!(!fixture.data_directory.exists());
+        assert_eq!(std::fs::read(store.path()).unwrap(), checkpoint_bytes);
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    #[test]
+    fn restart_rediscovers_a_partial_reclaim_from_the_retained_launch_checkpoint() {
+        let environment = TestEnvironment::new();
+        let fixture = released_cleanup_fixture(&environment);
+        std::fs::remove_file(fixture.data_directory.join(IDENTITY_FILE)).unwrap();
+        std::fs::remove_file(fixture.data_directory.join(AUTHORIZED_SERVING_FILE)).unwrap();
+
+        let scanner = full_root_scanner(
+            &fixture,
+            [
+                RootProvisionProcessInspection::Absent,
+                RootProvisionProcessInspection::Absent,
+            ],
+        )
+        .with_network_bridge(Arc::new(EmptyResidueNetworkBridge));
+        let RuntimeInventoryScanOutcome::Complete(inventory) =
+            scanner.scan_complete(fixture.scan_context.clone()).unwrap()
+        else {
+            panic!("partial reclaim with its launch anchor must remain rediscoverable")
+        };
+        let context = bind_inventory_for_running_effect(
+            *inventory,
+            &fixture.scan_context,
+            StateDirectory::unanchored(environment.state.clone()),
+        );
+        let desired = &fixture.scan_context.coordinates().desired.desired_specs[0];
+        let store = FileCheckpointStore::open_preserving_checkpoint_temp(
+            &environment.state.join(CHECKPOINT_NAMESPACE),
+            &desired.cat_id,
+        )
+        .unwrap();
+        let stored = store.load().unwrap().unwrap();
+        let current = store.assert_current(&stored).unwrap();
+        let effect = super::super::DataDirectoryReclaimEffect::for_test(Arc::new(
+            ExactReleasedResidueAuthority {
+                record: fixture.record.clone(),
+            },
+        ));
+
+        assert_eq!(
+            effect
+                .try_apply(&context, desired, &store, &stored, &current)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert!(!fixture.data_directory.exists());
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    #[test]
+    fn restart_finishes_an_empty_reclaim_prefix_only_after_the_exact_release_successor() {
+        let environment = TestEnvironment::new();
+        let fixture = released_cleanup_fixture(&environment);
+        for entry in std::fs::read_dir(&fixture.data_directory).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                std::fs::remove_dir_all(entry.path()).unwrap();
+            } else {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        let recovery_context = RuntimePreScanRecoveryContext::for_test(
+            StateDirectory::unanchored(environment.state.clone()),
+            fixture.scan_context.coordinates().clone(),
+            Instant::now() + Duration::from_secs(10),
+        );
+        assert!(matches!(
+            classify_local_publication_recovery(&recovery_context).unwrap(),
+            LocalPublicationRecoveryEvidence::ReleasedDataDirectoryPrefix { cat_id, .. }
+                if cat_id == fixture.acquired.desired.cat_id
+        ));
+        let (authority, _) = TestVolumeDataAuthority::exact(fixture.record.clone());
+        let outcome = SignedRunningPublicationRecovery::new(authority)
+            .recover_one(recovery_context)
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                RuntimePreScanRecoveryOutcome::Recovered { ref cat_id }
+                    if cat_id == &fixture.acquired.desired.cat_id
+            ),
+            "unexpected empty-prefix recovery outcome: {outcome:?}"
+        );
+        assert!(!fixture.data_directory.exists());
+        assert!(!fixture
+            .data_directory
+            .ancestors()
+            .nth(3)
+            .expect("fixture has a Cat directory")
+            .exists());
+    }
+
+    #[test]
+    fn full_scanner_reports_stable_extra_process_as_closed_residue() {
+        let environment = TestEnvironment::new();
+        let fixture = full_root_scanner_fixture(&environment);
+        let extra = environment.proc_root.join("52");
+        std::fs::create_dir(&extra).unwrap();
+        std::os::unix::fs::symlink(&environment.blockd_binary, extra.join("exe")).unwrap();
+        std::fs::write(extra.join("cmdline"), b"").unwrap();
+        std::fs::write(
+            extra.join("stat"),
+            b"52 (cats-blockd) S 1 52 52 0 -1 4194560 512 0 0 0 11 3 0 0 20 0 5 0 918273 ",
+        )
+        .unwrap();
+        let scanner = full_root_scanner(
+            &fixture,
+            [
+                RootProvisionProcessInspection::Absent,
+                RootProvisionProcessInspection::Absent,
+            ],
+        );
+
+        let RuntimeInventoryScanOutcome::Complete(inventory) =
+            scanner.scan_complete(fixture.scan_context).unwrap()
+        else {
+            panic!("one stable extra process must remain complete residue")
+        };
+        assert!(inventory.runtimes()[0].processes.is_empty());
+        assert!(matches!(
+            inventory.residue(),
+            [NodeResidue::Process {
+                process_id: 52,
+                process_start_time_ticks,
+                ownership_token: OwnershipTokenEvidence::Missing,
+                control_handshake: ControlHandshakeEvidence::Unavailable,
+                ..
+            }] if process_start_time_ticks.get() == 918_273
+        ));
+        assert!(extra.exists(), "inventory must not remove physical residue");
     }
 
     #[test]
@@ -16460,7 +21073,7 @@ mod tests {
                     &assigned_context(true),
                 )
                 .unwrap(),
-            RootProcessInventoryBridgeOutcome::Unavailable
+            RootProcessInventoryBridgeOutcome::Unavailable { .. }
         ));
     }
 
@@ -16486,7 +21099,9 @@ mod tests {
 
         let environment = TestEnvironment::new();
         let (expected, _) = root_process_expectation(&environment);
-        std::fs::create_dir(environment.systemd_root.join("cats-foreign.service")).unwrap();
+        let foreign_scope = environment.systemd_root.join("cats-foreign.service");
+        std::fs::create_dir(&foreign_scope).unwrap();
+        std::fs::write(foreign_scope.join("cgroup.procs"), b"").unwrap();
         let bridge = root_process_bridge(
             &environment,
             [
@@ -16494,22 +21109,27 @@ mod tests {
                 RootProvisionProcessInspection::Absent,
             ],
         );
-        assert!(bridge
-            .inspect_all(
-                BTreeMap::from([(expected.cat_id.clone(), expected)]),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                &assigned_context(true),
-            )
-            .is_err());
+        assert!(matches!(
+            bridge
+                .inspect_all(
+                    BTreeMap::from([(expected.cat_id.clone(), expected)]),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    &assigned_context(true),
+                )
+                .unwrap(),
+            RootProcessInventoryBridgeOutcome::CompleteWithResidue { systemd, .. }
+                if matches!(systemd.as_slice(), [NodeResidue::SystemdScope { scope_id, .. }]
+                    if scope_id.as_str() == "cats-foreign.service")
+        ));
 
         let environment = TestEnvironment::new();
         let (expected, _) = root_process_expectation(&environment);
         let legacy_socket = environment.socket_root.join("legacy-root-provision.sock");
         let _partial = std::os::unix::net::UnixListener::bind(&legacy_socket).unwrap();
         std::fs::set_permissions(
-            legacy_socket,
+            &legacy_socket,
             <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
         )
         .unwrap();
@@ -16520,15 +21140,22 @@ mod tests {
                 RootProvisionProcessInspection::Absent,
             ],
         );
-        assert!(bridge
-            .inspect_all(
-                BTreeMap::from([(expected.cat_id.clone(), expected)]),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                &assigned_context(true),
-            )
-            .is_err());
+        assert!(matches!(
+            bridge
+                .inspect_all(
+                    BTreeMap::from([(expected.cat_id.clone(), expected)]),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    &assigned_context(true),
+                )
+                .unwrap(),
+            RootProcessInventoryBridgeOutcome::CompleteWithResidue { control_sockets, .. }
+                if matches!(control_sockets.as_slice(), [NodeResidue::ControlSocket {
+                    socket_path,
+                    ..
+                }] if socket_path.as_str() == legacy_socket.to_string_lossy())
+        ));
     }
 
     #[test]
@@ -16877,6 +21504,11 @@ mod tests {
         std::fs::create_dir(&extra).unwrap();
         std::os::unix::fs::symlink(expected.executable_path.as_str(), extra.join("exe")).unwrap();
         std::fs::write(extra.join("cmdline"), b"").unwrap();
+        std::fs::write(
+            extra.join("stat"),
+            b"52 (cats-blockd) S 1 52 52 0 -1 4194560 512 0 0 0 11 3 0 0 20 0 5 0 918273 ",
+        )
+        .unwrap();
         let bridge = root_process_bridge(
             &environment,
             [
@@ -16884,15 +21516,23 @@ mod tests {
                 RootProvisionProcessInspection::Exact(Box::new(exact)),
             ],
         );
-        assert!(bridge
-            .inspect_all(
-                BTreeMap::from([(expected.cat_id.clone(), expected)]),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                &assigned_context(true),
-            )
-            .is_err());
+        assert!(matches!(
+            bridge
+                .inspect_all(
+                    BTreeMap::from([(expected.cat_id.clone(), expected)]),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    &assigned_context(true),
+                )
+                .unwrap(),
+            RootProcessInventoryBridgeOutcome::CompleteWithResidue { processes, .. }
+                if matches!(processes.as_slice(), [NodeResidue::Process {
+                    process_id: 52,
+                    process_start_time_ticks,
+                    ..
+                }] if process_start_time_ticks.get() == 918_273)
+        ));
 
         let environment = TestEnvironment::new();
         let (expected, _) = root_process_expectation(&environment);
@@ -16905,33 +21545,128 @@ mod tests {
                 RootProvisionProcessInspection::Absent,
             ],
         );
-        assert!(bridge
-            .inspect_all(
-                BTreeMap::from([(expected.cat_id.clone(), expected)]),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                BTreeMap::new(),
-                &assigned_context(true),
-            )
-            .is_err());
+        assert!(matches!(
+            bridge
+                .inspect_all(
+                    BTreeMap::from([(expected.cat_id.clone(), expected)]),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    &assigned_context(true),
+                )
+                .unwrap(),
+            RootProcessInventoryBridgeOutcome::Unavailable { .. }
+        ));
     }
 
     #[test]
-    fn systemd_global_sweep_recognizes_transient_cats_services() {
-        let environment = TestEnvironment::new();
-        std::fs::create_dir(environment.systemd_root.join("cats-root-token.service")).unwrap();
-        let mut budget = 16;
-        assert_eq!(
-            scan_cgroup_tree(
-                &environment.systemd_root,
-                CgroupKind::Systemd,
-                0,
-                &mut budget,
-                4,
-                &context(),
+    fn node_global_sweep_allows_only_the_exact_current_static_service_pair() {
+        for (process_id, agent_unit, companion_unit, alternate_unit) in [
+            (
+                71,
+                "cats-noded.service",
+                "cats-controld.service",
+                "cats-worker.service",
+            ),
+            (
+                81,
+                "cats-worker.service",
+                "cats-postgres-url.service",
+                "cats-noded.service",
+            ),
+        ] {
+            let environment = TestEnvironment::new();
+            let executable = environment
+                .proc_root
+                .parent()
+                .unwrap()
+                .join("bin/cats-noded");
+            let control_group = format!("0::/system.slice/{agent_unit}\n");
+            let identity = StaticServiceIdentity::from_process_facts(
+                process_id,
+                executable.clone(),
+                control_group.as_bytes(),
             )
-            .unwrap(),
-            ProbeFact::Present
-        );
+            .unwrap();
+            let process = environment.proc_root.join(process_id.to_string());
+            std::fs::create_dir(&process).unwrap();
+            std::os::unix::fs::symlink(&executable, process.join("exe")).unwrap();
+            let mut command_line = executable.as_os_str().as_bytes().to_vec();
+            command_line.push(0);
+            std::fs::write(process.join("cmdline"), &command_line).unwrap();
+            std::fs::write(process.join("cgroup"), &control_group).unwrap();
+            for expected in [agent_unit, companion_unit] {
+                std::fs::create_dir(environment.systemd_root.join(expected)).unwrap();
+            }
+            let process_paths = ProcessPaths {
+                root: environment.proc_root.clone(),
+                binaries: vec![executable.clone()],
+                current_static_service: Some(identity.clone()),
+                supported: true,
+                limits: ProbeLimits::default(),
+            };
+            let scan_systemd = || {
+                let mut budget = 32;
+                scan_cgroup_tree_allowing(
+                    &environment.systemd_root,
+                    CgroupKind::Systemd,
+                    0,
+                    &mut budget,
+                    4,
+                    SystemdUnitAllowances {
+                        managed: &BTreeSet::new(),
+                        static_at_root: &identity.expected_units,
+                    },
+                    &context(),
+                )
+                .unwrap()
+            };
+
+            assert_eq!(scan_systemd(), ProbeFact::Empty);
+            assert!(matches!(
+                scan_process_residue(&process_paths, &context()).unwrap(),
+                Some(residue) if residue.is_empty()
+            ));
+
+            let unknown = environment
+                .systemd_root
+                .join("cats-serving-22222222222222222222222222222222.service");
+            std::fs::create_dir(&unknown).unwrap();
+            assert_eq!(scan_systemd(), ProbeFact::Present);
+            std::fs::remove_dir(unknown).unwrap();
+
+            let stale_alternate = environment.systemd_root.join(alternate_unit);
+            std::fs::create_dir(&stale_alternate).unwrap();
+            assert_eq!(scan_systemd(), ProbeFact::Present);
+            std::fs::remove_dir(stale_alternate).unwrap();
+
+            let alternate_slice = environment.systemd_root.join("alternate.slice");
+            std::fs::create_dir(&alternate_slice).unwrap();
+            std::fs::create_dir(alternate_slice.join(agent_unit)).unwrap();
+            assert_eq!(scan_systemd(), ProbeFact::Present);
+            std::fs::remove_dir_all(alternate_slice).unwrap();
+
+            let duplicate = environment.proc_root.join((process_id + 1).to_string());
+            std::fs::create_dir(&duplicate).unwrap();
+            std::os::unix::fs::symlink(&executable, duplicate.join("exe")).unwrap();
+            std::fs::write(duplicate.join("cmdline"), &command_line).unwrap();
+            std::fs::write(
+                duplicate.join("stat"),
+                format!(
+                    "{} (cats-noded) S 1 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 918273 ",
+                    process_id + 1
+                ),
+            )
+            .unwrap();
+            assert!(matches!(
+                scan_process_residue(&process_paths, &context()).unwrap(),
+                Some(residue)
+                    if matches!(
+                        residue.as_slice(),
+                        [NodeResidue::Process { process_id: duplicate_id, .. }]
+                            if *duplicate_id == process_id + 1
+                    )
+            ));
+        }
     }
 }

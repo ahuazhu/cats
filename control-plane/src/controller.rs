@@ -48,7 +48,8 @@ pub struct AutoTierPolicy {
 
 pub struct Controller {
     pub store: Arc<Store>,
-    pub storage_meta: Arc<dyn MetadataStore>,
+    #[cfg(debug_assertions)]
+    retired_storage_meta_for_tests: Option<Arc<dyn MetadataStore>>,
     pub http: reqwest::Client,
     pub notify: Arc<tokio::sync::Notify>,
     pub node_lease_timeout_ms: i64,
@@ -83,28 +84,9 @@ const RETRY_BACKOFF_BASE: Duration = Duration::from_secs(1);
 const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 impl Controller {
-    pub fn new(
-        store: Arc<Store>,
-        storage_meta: Arc<dyn MetadataStore>,
-        notify: Arc<tokio::sync::Notify>,
-        node_lease_timeout_ms: i64,
-        auth_token: String,
-        auto_tier_policy: AutoTierPolicy,
-    ) -> Arc<Self> {
-        Self::new_with_liveness_authority(
-            store,
-            storage_meta,
-            notify,
-            node_lease_timeout_ms,
-            auth_token,
-            auto_tier_policy,
-            NodeLivenessAuthority::SignedSession,
-        )
-    }
-
     pub(crate) fn new_with_liveness_authority(
         store: Arc<Store>,
-        storage_meta: Arc<dyn MetadataStore>,
+        #[cfg(debug_assertions)] retired_storage_meta_for_tests: Option<Arc<dyn MetadataStore>>,
         notify: Arc<tokio::sync::Notify>,
         node_lease_timeout_ms: i64,
         auth_token: String,
@@ -113,7 +95,8 @@ impl Controller {
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
-            storage_meta,
+            #[cfg(debug_assertions)]
+            retired_storage_meta_for_tests,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(60))
                 .build()
@@ -128,6 +111,21 @@ impl Controller {
             attempts: Mutex::new(HashMap::new()),
             retry_after: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn retired_storage_meta(&self) -> anyhow::Result<&dyn MetadataStore> {
+        #[cfg(debug_assertions)]
+        {
+            self.retired_storage_meta_for_tests
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("legacy storage authority is not composed"))
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            Err(anyhow::anyhow!(
+                "legacy storage authority is absent from release builds"
+            ))
+        }
     }
 
     pub async fn run(self: Arc<Self>, interval: Duration) {
@@ -326,6 +324,7 @@ impl Controller {
     /// Complete a lost-Host handoff after an external actor has proved that
     /// the old Host is stopped or isolated. The API owns that explicit safety
     /// confirmation; this method performs the idempotent state transition.
+    #[cfg(debug_assertions)]
     pub(crate) async fn confirm_node_fenced(&self, node_id: &str) -> anyhow::Result<()> {
         let node_id = node_id.to_string();
         let converge_node_id = node_id.clone();
@@ -376,7 +375,6 @@ impl Controller {
             self.store
                 .execute(move |store| store.set_observed(&cat_id, ObservedState::Unknown))
                 .await?;
-            self.fence_cat_volumes(&cat).await?;
             let cat_id = cat.id;
             self.store
                 .execute(move |store| {
@@ -385,21 +383,6 @@ impl Controller {
                     store.set_observed(&cat_id, ObservedState::Cold)
                 })
                 .await?;
-        }
-        Ok(())
-    }
-
-    async fn fence_cat_volumes(&self, cat: &Cat) -> anyhow::Result<()> {
-        let cat_id = cat.id.clone();
-        let disks = self
-            .store
-            .execute(move |store| store.list_disks_for_cat(&cat_id))
-            .await?;
-        for disk in disks {
-            match self.storage_meta.revoke_lease(&disk.volume_id) {
-                Ok(()) | Err(MetaError::NotFound(_)) => {}
-                Err(e) => return Err(e.into()),
-            }
         }
         Ok(())
     }
@@ -442,7 +425,6 @@ impl Controller {
                         self.store
                             .execute(move |store| store.unbind_routes(&cat_id))
                             .await?;
-                        self.fence_cat_volumes(&cat).await?;
                         let cat_id = cat.id;
                         self.store
                             .execute(move |store| {
@@ -698,7 +680,10 @@ impl Controller {
         let mut grants = Vec::with_capacity(bindings.len());
         for (binding, disk) in bindings {
             let size = cats_api::chunk::round_up_to_chunk(disk.size_bytes);
-            match self.storage_meta.create_volume(&disk.volume_id, size) {
+            match self
+                .retired_storage_meta()?
+                .create_volume(&disk.volume_id, size)
+            {
                 Ok(()) | Err(MetaError::AlreadyExists(_)) => {}
                 Err(e) => return Err(e.into()),
             }
@@ -751,10 +736,6 @@ impl Controller {
 
         let grants = self.volume_grants(cat).await?;
         if !replaying_dispatch {
-            // Fence stale writers before crossing the durable dispatch
-            // boundary. A crash before `Starting` can safely repeat this step;
-            // a crash after it must preserve the epoch a live blockd may hold.
-            self.fence_cat_volumes(cat).await?;
             let cat_id = cat.id.clone();
             self.store
                 .execute(move |store| store.set_observed(&cat_id, ObservedState::Starting))
@@ -1008,7 +989,6 @@ impl Controller {
                     },
                 };
                 let _ = self.dispatch(&node.agent_url, &cleanup).await;
-                self.fence_cat_volumes(cat).await?;
                 let cat_id = cat.id.clone();
                 self.store
                     .execute(move |store| {
@@ -1103,7 +1083,6 @@ impl Controller {
         self.store
             .execute(move |store| store.unbind_routes(&cat_id))
             .await?;
-        self.fence_cat_volumes(cat).await?;
         let cat_id = cat.id.clone();
         self.store
             .execute(move |store| {
@@ -1118,7 +1097,7 @@ impl Controller {
 
     async fn delete_flow(&self, cat: &Cat) -> anyhow::Result<()> {
         if cat.node_id.is_some() {
-            // Stop first (also fences + unbinds routes). The RootDisk is being
+            // Stop first (also unbinds routes). The RootDisk is being
             // deleted, so the node may discard only its local journal/cache;
             // PersistentDisks still cross the mandatory remote-drain boundary.
             let mut disposable_root_disk_ids = Vec::new();
@@ -1172,7 +1151,7 @@ impl Controller {
             .await?;
         for disk in disks {
             if disk.kind == DiskKind::Root {
-                match self.storage_meta.delete_volume(&disk.volume_id) {
+                match self.retired_storage_meta()?.delete_volume(&disk.volume_id) {
                     Ok(()) | Err(MetaError::NotFound(_)) => {}
                     Err(e) => return Err(e.into()),
                 }

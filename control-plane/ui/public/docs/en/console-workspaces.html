@@ -25,12 +25,13 @@
 <h2 id="user-console">User console</h2>
 <p>The console provides:</p>
 <ul>
-  <li>Fleet-independent overview of your Cats, sleeping states, disks, and active Operations.</li>
-  <li>Create, start, suspend, Warm, stop, exec, expose, and destroy actions for Cats.</li>
-  <li>Create, snapshot, mount, unmount, resize, and delete actions for disks.</li>
+  <li>Workspace-scoped Cat and PersistentDisk creation with current product reads.</li>
+  <li>Strict browser-persistent replay of the exact request and Idempotency-Key after an ambiguous create response.</li>
+  <li>Exact accepted Operation identity for Cat create; there is no Operation collection.</li>
   <li>Near-real-time provisional billing by meter and Cat, with a selected Cat's range total, per-meter totals, over-time spend curves, and bounded period detail.</li>
   <li>Structured status and error display with automatic session refresh.</li>
 </ul>
+<p>Lifecycle and other Cat/Disk mutation controls are absent during the signed runtime cutover. The browser fails those paths locally and does not offer a legacy fallback.</p>
 
 <h2 id="language">Language switching</h2>
 <p>Both user and administrator consoles support English and Simplified Chinese. The default follows <code>navigator.languages</code>/<code>navigator.language</code>. A manual selection is stored locally for the current site and updates static text, dynamic states/actions, form labels, errors, dates, number formatting, document title, and <code>html lang</code>.</p>

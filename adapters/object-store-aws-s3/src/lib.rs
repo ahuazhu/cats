@@ -14,7 +14,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cats_storage::blob::{validate_key, BlobError, BlobStore, Result};
+use cats_storage::blob::{
+    validate_key, validate_list_maximum, validate_list_result, BlobError, BlobListPage, BlobStore,
+    QualifiedDeleteListPage, Result,
+};
 use cats_storage::{AdapterConfig, AdapterError, BlobStoreFactory};
 
 pub const ADAPTER_NAME: &str = "aws-s3";
@@ -25,6 +28,8 @@ const RETRY_INITIAL_DELAY_MS: u64 = 100;
 const RETRY_MAX_DELAY_MS: u64 = 3_000;
 const ERROR_RESPONSE_MAX_BYTES: usize = 8 * 1024;
 const CREDENTIAL_RESPONSE_MAX_BYTES: usize = 16 * 1024;
+const LIST_RESPONSE_BYTES_PER_KEY: usize = 8 * 1024;
+const LIST_RESPONSE_FIXED_BYTES: usize = 64 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -922,8 +927,25 @@ impl BlobStore for AwsS3BlobStore {
     }
 
     fn delete(&self, key: &str) -> Result<()> {
+        self.delete_until(key, Instant::now() + Duration::from_secs(60))
+    }
+
+    fn delete_until(&self, key: &str, deadline: Instant) -> Result<()> {
         let path = self.object_path(key)?;
-        let (status, body) = self.request("DELETE", &path, &[], b"", &[], key)?;
+        let (status, body) = self.request_with_bounds(
+            RequestParts {
+                method: "DELETE",
+                path: &path,
+                query: &[],
+                body: b"",
+                extra_headers: &[],
+                key_for_errors: key,
+            },
+            Some(ReadBounds {
+                maximum: ERROR_RESPONSE_MAX_BYTES,
+                deadline,
+            }),
+        )?;
         if !(200..300).contains(&status) && status != 404 {
             return Err(BlobError::Backend {
                 key: key.to_string(),
@@ -979,6 +1001,127 @@ impl BlobStore for AwsS3BlobStore {
         }
         out.sort();
         Ok(out)
+    }
+
+    fn list_bounded(&self, prefix: &str, maximum: usize) -> Result<BlobListPage> {
+        self.list_bounded_until(prefix, maximum, Instant::now() + Duration::from_secs(60))
+    }
+
+    fn list_for_delete_bounded_until(
+        &self,
+        prefix: &str,
+        maximum: usize,
+        deadline: Instant,
+    ) -> Result<QualifiedDeleteListPage> {
+        // Amazon S3 provides strong read-after-write consistency for DELETE
+        // and LIST. Compatible endpoints must meet the same adapter contract
+        // before this implementation is selected for production deletion.
+        self.list_bounded_until(prefix, maximum, deadline)
+            .map(QualifiedDeleteListPage::from_strongly_consistent_adapter)
+    }
+}
+
+impl AwsS3BlobStore {
+    fn list_bounded_until(
+        &self,
+        prefix: &str,
+        maximum: usize,
+        deadline: Instant,
+    ) -> Result<BlobListPage> {
+        validate_list_maximum(prefix, maximum)?;
+        let full_prefix = self.full_key(prefix);
+        let strip = if self.cfg.prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", self.cfg.prefix.trim_end_matches('/'))
+        };
+        let query = vec![
+            ("list-type".to_string(), "2".to_string()),
+            ("prefix".to_string(), full_prefix.clone()),
+            ("max-keys".to_string(), maximum.to_string()),
+        ];
+        let path = format!("/{}", uri_encode(&self.cfg.bucket, false));
+        let maximum_bytes = maximum
+            .checked_mul(LIST_RESPONSE_BYTES_PER_KEY)
+            .and_then(|bytes| bytes.checked_add(LIST_RESPONSE_FIXED_BYTES))
+            .ok_or_else(|| BlobError::Backend {
+                key: prefix.to_string(),
+                message: "bounded LIST response budget overflow".into(),
+            })?;
+        let (status, body) = self.request_with_bounds(
+            RequestParts {
+                method: "GET",
+                path: &path,
+                query: &query,
+                body: b"",
+                extra_headers: &[],
+                key_for_errors: prefix,
+            },
+            Some(ReadBounds {
+                maximum: maximum_bytes,
+                deadline,
+            }),
+        )?;
+        if !(200..300).contains(&status) {
+            return Err(BlobError::Backend {
+                key: prefix.to_string(),
+                message: format!("LIST status {status}: {}", snippet(&body)),
+            });
+        }
+        let parsed = parse_list_bucket_result(&body, prefix)?;
+        let response_prefix = parsed.prefix.ok_or_else(|| list_shape_error(prefix))?;
+        if response_prefix != full_prefix {
+            return Err(BlobError::Backend {
+                key: prefix.to_string(),
+                message: "LIST response prefix differs from the request".into(),
+            });
+        }
+        let response_maximum = parsed.max_keys.ok_or_else(|| list_shape_error(prefix))?;
+        if response_maximum != maximum {
+            return Err(BlobError::Backend {
+                key: prefix.to_string(),
+                message: "LIST response MaxKeys differs from the request".into(),
+            });
+        }
+        let is_truncated = parsed
+            .is_truncated
+            .ok_or_else(|| list_shape_error(prefix))?;
+        let mut keys = parsed
+            .keys
+            .into_iter()
+            .map(|key| key.strip_prefix(&strip).unwrap_or(&key).to_string())
+            .collect::<Vec<_>>();
+        let key_count = parsed.key_count.ok_or_else(|| list_shape_error(prefix))?;
+        if key_count != keys.len() {
+            return Err(BlobError::Backend {
+                key: prefix.to_string(),
+                message: "LIST response KeyCount differs from decoded keys".into(),
+            });
+        }
+        if keys.len() > maximum {
+            return Err(BlobError::Backend {
+                key: prefix.to_string(),
+                message: "LIST response exceeded max-keys".into(),
+            });
+        }
+        keys.sort();
+        if keys.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(BlobError::Backend {
+                key: prefix.to_string(),
+                message: "LIST response repeated an object key".into(),
+            });
+        }
+        if (is_truncated
+            && !matches!(parsed.next_continuation_token.as_deref(), Some(token) if !token.is_empty()))
+            || (!is_truncated && parsed.next_continuation_token.is_some())
+        {
+            return Err(BlobError::Backend {
+                key: prefix.to_string(),
+                message: "LIST response continuation-token shape is invalid".into(),
+            });
+        }
+        validate_list_result(prefix, &keys)?;
+        Ok(BlobListPage { keys, is_truncated })
     }
 }
 
@@ -1120,6 +1263,208 @@ fn xml_unescape(s: &str) -> String {
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
+}
+
+#[derive(Default)]
+struct ParsedListBucketResult {
+    prefix: Option<String>,
+    key_count: Option<usize>,
+    max_keys: Option<usize>,
+    is_truncated: Option<bool>,
+    next_continuation_token: Option<String>,
+    keys: Vec<String>,
+}
+
+fn list_shape_error(key: &str) -> BlobError {
+    BlobError::Backend {
+        key: key.to_string(),
+        message: "LIST response does not match the closed ListObjectsV2 schema".into(),
+    }
+}
+
+fn parse_list_bucket_result(body: &[u8], key: &str) -> Result<ParsedListBucketResult> {
+    use xmlparser::{ElementEnd, Token, Tokenizer};
+
+    let xml = std::str::from_utf8(body).map_err(|error| BlobError::Backend {
+        key: key.to_string(),
+        message: format!("LIST response is not UTF-8: {error}"),
+    })?;
+    let mut result = ParsedListBucketResult::default();
+    let mut stack: Vec<String> = Vec::new();
+    let mut pending_start: Option<String> = None;
+    let mut root_seen = false;
+    let mut root_closed = false;
+    let mut root_namespace_seen = false;
+    let mut seen_root_fields = std::collections::BTreeSet::new();
+    let mut seen_contents_fields = std::collections::BTreeSet::new();
+    let mut current_contents_key: Option<String> = None;
+    for token in Tokenizer::from(xml) {
+        let token = token.map_err(|_| list_shape_error(key))?;
+        match token {
+            Token::Declaration { .. }
+                if !root_seen && stack.is_empty() && pending_start.is_none() => {}
+            Token::ElementStart { prefix, local, .. } => {
+                if root_closed || pending_start.is_some() {
+                    return Err(list_shape_error(key));
+                }
+                if !prefix.as_str().is_empty() {
+                    return Err(list_shape_error(key));
+                }
+                pending_start = Some(local.as_str().to_string());
+            }
+            Token::Attribute {
+                prefix,
+                local,
+                value,
+                ..
+            } => {
+                if pending_start.as_deref() != Some("ListBucketResult")
+                    || !prefix.as_str().is_empty()
+                    || local.as_str() != "xmlns"
+                    || value.as_str().is_empty()
+                    || std::mem::replace(&mut root_namespace_seen, true)
+                {
+                    return Err(list_shape_error(key));
+                }
+            }
+            Token::ElementEnd { end, .. } => match end {
+                ElementEnd::Open => {
+                    let name = pending_start.take().ok_or_else(|| list_shape_error(key))?;
+                    if stack.is_empty() {
+                        if root_seen || name != "ListBucketResult" {
+                            return Err(list_shape_error(key));
+                        }
+                        root_seen = true;
+                    } else if !allowed_list_child(&stack, &name) {
+                        return Err(list_shape_error(key));
+                    }
+                    if matches!(stack.as_slice(), [root] if root == "ListBucketResult") {
+                        if name == "Contents" {
+                            if current_contents_key.is_some() || !seen_contents_fields.is_empty() {
+                                return Err(list_shape_error(key));
+                            }
+                        } else if !seen_root_fields.insert(name.clone()) {
+                            return Err(list_shape_error(key));
+                        }
+                    } else if matches!(
+                        stack.as_slice(),
+                        [root, contents]
+                            if root == "ListBucketResult" && contents == "Contents"
+                    ) && !seen_contents_fields.insert(name.clone())
+                    {
+                        return Err(list_shape_error(key));
+                    }
+                    stack.push(name);
+                }
+                ElementEnd::Empty => return Err(list_shape_error(key)),
+                ElementEnd::Close(prefix, local) => {
+                    if !prefix.as_str().is_empty() {
+                        return Err(list_shape_error(key));
+                    }
+                    if pending_start.is_some() || stack.pop().as_deref() != Some(local.as_str()) {
+                        return Err(list_shape_error(key));
+                    }
+                    if local.as_str() == "Contents" {
+                        result.keys.push(
+                            current_contents_key
+                                .take()
+                                .ok_or_else(|| list_shape_error(key))?,
+                        );
+                        seen_contents_fields.clear();
+                    }
+                    if stack.is_empty() {
+                        root_closed = true;
+                    }
+                }
+            },
+            Token::Text { text } => {
+                let value = text.as_str();
+                if value.trim().is_empty() {
+                    continue;
+                }
+                match stack.as_slice() {
+                    [root, field] if root == "ListBucketResult" => match field.as_str() {
+                        "Prefix" => set_once(&mut result.prefix, xml_unescape(value), key)?,
+                        "KeyCount" => set_once(
+                            &mut result.key_count,
+                            value.parse().map_err(|_| list_shape_error(key))?,
+                            key,
+                        )?,
+                        "MaxKeys" => set_once(
+                            &mut result.max_keys,
+                            value.parse().map_err(|_| list_shape_error(key))?,
+                            key,
+                        )?,
+                        "IsTruncated" => set_once(
+                            &mut result.is_truncated,
+                            match value {
+                                "true" => true,
+                                "false" => false,
+                                _ => return Err(list_shape_error(key)),
+                            },
+                            key,
+                        )?,
+                        "NextContinuationToken" => set_once(
+                            &mut result.next_continuation_token,
+                            xml_unescape(value),
+                            key,
+                        )?,
+                        "Name" | "ContinuationToken" | "StartAfter" | "EncodingType" => {}
+                        _ => return Err(list_shape_error(key)),
+                    },
+                    [root, contents, field]
+                        if root == "ListBucketResult" && contents == "Contents" =>
+                    {
+                        if field == "Key" {
+                            set_once(&mut current_contents_key, xml_unescape(value), key)?;
+                        }
+                    }
+                    _ => return Err(list_shape_error(key)),
+                }
+            }
+            _ => return Err(list_shape_error(key)),
+        }
+    }
+    if !root_seen || !root_closed || !stack.is_empty() || pending_start.is_some() {
+        return Err(list_shape_error(key));
+    }
+    Ok(result)
+}
+
+fn allowed_list_child(stack: &[String], name: &str) -> bool {
+    match stack {
+        [root] if root == "ListBucketResult" => matches!(
+            name,
+            "Name"
+                | "Prefix"
+                | "KeyCount"
+                | "MaxKeys"
+                | "IsTruncated"
+                | "ContinuationToken"
+                | "NextContinuationToken"
+                | "StartAfter"
+                | "EncodingType"
+                | "Contents"
+        ),
+        [root, contents] if root == "ListBucketResult" && contents == "Contents" => matches!(
+            name,
+            "Key"
+                | "LastModified"
+                | "ETag"
+                | "ChecksumAlgorithm"
+                | "ChecksumType"
+                | "Size"
+                | "StorageClass"
+        ),
+        _ => false,
+    }
+}
+
+fn set_once<T>(slot: &mut Option<T>, value: T, key: &str) -> Result<()> {
+    if slot.replace(value).is_some() {
+        return Err(list_shape_error(key));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1460,6 +1805,125 @@ mod tests {
             Err(BlobError::NotFound(_))
         ));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn bounded_list_uses_one_max_keys_page_and_validates_exact_prefix() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (request_tx, request_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            request_tx.send(read_request(&mut stream)).unwrap();
+            let body = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>test</Name><Prefix>env/volumes/vol_a/</Prefix><KeyCount>2</KeyCount><MaxKeys>2</MaxKeys><IsTruncated>true</IsTruncated><Contents><Key>env/volumes/vol_a/data/a</Key><LastModified>2026-01-01T00:00:00Z</LastModified><ETag>&quot;a&quot;</ETag><Size>1</Size><StorageClass>STANDARD</StorageClass></Contents><Contents><Key>env/volumes/vol_a/maps/b</Key><LastModified>2026-01-01T00:00:00Z</LastModified><ETag>&quot;b&quot;</ETag><Size>1</Size><StorageClass>STANDARD</StorageClass></Contents><NextContinuationToken>opaque</NextContinuationToken></ListBucketResult>";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+        let store = AwsS3BlobStore::new(AwsS3Config {
+            endpoint,
+            bucket: "test".into(),
+            region: "us-east-1".into(),
+            access_key: "test-access".into(),
+            secret_key: "test-secret".into(),
+            session_token: None,
+            prefix: "env".into(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            store.list_bounded("volumes/vol_a/", 2).unwrap(),
+            BlobListPage {
+                keys: vec!["volumes/vol_a/data/a".into(), "volumes/vol_a/maps/b".into(),],
+                is_truncated: true,
+            }
+        );
+        let request = String::from_utf8(request_rx.recv().unwrap()).unwrap();
+        assert!(request.starts_with(
+            "GET /test?list-type=2&max-keys=2&prefix=env%2Fvolumes%2Fvol_a%2F HTTP/1.1"
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn bounded_list_fails_closed_on_a_key_outside_the_requested_prefix() {
+        let (store, server) = local_store(|mut stream| {
+            let body = b"<ListBucketResult><Prefix>volumes/vol_a/</Prefix><KeyCount>1</KeyCount><MaxKeys>10</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>volumes/vol_ab/data/not-a</Key></Contents></ListBucketResult>";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+        assert!(matches!(
+            store.list_bounded("volumes/vol_a/", 10),
+            Err(BlobError::Backend { .. })
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn bounded_list_fails_closed_on_malformed_truncated_and_duplicate_xml() {
+        for body in [
+            "<ListBucketResult><Prefix>volumes/vol_a/</Prefix><KeyCount>0</KeyCount><MaxKeys>10</MaxKeys><IsTruncated>false</IsTruncated>",
+            "<ListBucketResult><Prefix>volumes/vol_a/</Prefix><KeyCount>0</KeyCount><MaxKeys>10</MaxKeys><IsTruncated>true</IsTruncated></ListBucketResult>",
+            "<ListBucketResult><Prefix>volumes/vol_a/</Prefix><Prefix>volumes/vol_a/</Prefix><KeyCount>0</KeyCount><MaxKeys>10</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>",
+            "junk<ListBucketResult><Prefix>volumes/vol_a/</Prefix><KeyCount>0</KeyCount><MaxKeys>10</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>",
+        ] {
+            let body = body.as_bytes().to_vec();
+            let (store, server) = local_store(move |mut stream| {
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(&body).unwrap();
+            });
+            assert!(matches!(
+                store.list_bounded("volumes/vol_a/", 10),
+                Err(BlobError::Backend { .. })
+            ));
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn destructive_list_and_delete_share_the_callers_absolute_deadline() {
+        let (list_store, list_server) = local_store(|_stream| {
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        let started = Instant::now();
+        assert!(matches!(
+            list_store.list_for_delete_bounded_until(
+                "volumes/vol_a/",
+                10,
+                Instant::now() + Duration::from_millis(50),
+            ),
+            Err(BlobError::Backend { .. })
+        ));
+        assert!(started.elapsed() < Duration::from_millis(200));
+        list_server.join().unwrap();
+
+        let (delete_store, delete_server) = local_store(|_stream| {
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        let started = Instant::now();
+        assert!(matches!(
+            delete_store.delete_until(
+                "volumes/vol_a/data/a",
+                Instant::now() + Duration::from_millis(50),
+            ),
+            Err(BlobError::Backend { .. })
+        ));
+        assert!(started.elapsed() < Duration::from_millis(200));
+        delete_server.join().unwrap();
     }
 
     #[test]

@@ -7,16 +7,26 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use tokio::sync::mpsc as tokio_mpsc;
 
 use cats_api::metering::UsageMetric;
 use cats_metering::{
-    metric_from_slug, usage_view_from_intervals, validate_checkout_intent,
-    validate_checkout_payment, validate_checkout_refund, validate_checkpoint, validate_usage_query,
-    AttributedCheckpoint, CheckoutIntent, CheckoutPayment, CheckoutRefund, CreditApplyOutcome,
-    CreditStore, CreditStoreFuture, CreditSummary, IngestOutcome, MeteringError, Result,
-    UsageAggregate, UsageAttribution, UsageInterval, UsageQuery, UsageStore, UsageStoreFuture,
+    build_source_terminal_receipt, decode_terminal_receipt, metric_from_slug, sha256_prefixed,
+    target_terminal_marker, target_terminal_request_sha256, usage_view_from_intervals,
+    validate_archive_evidence, validate_checkout_intent, validate_checkout_payment,
+    validate_checkout_refund, validate_checkpoint, validate_target_terminal_receipt,
+    validate_target_terminal_request, validate_usage_query, ArchivedUsageCheckpoint,
+    ArchivedUsageTerminalBarrier, AttributedCheckpoint, CheckoutIntent, CheckoutPayment,
+    CheckoutRefund, CreditApplyOutcome, CreditStore, CreditStoreFuture, CreditSummary,
+    IngestOutcome, MeteringError, Result, RuntimeUsageSourceBinding, UsageAggregate,
+    UsageArchiveEvidence, UsageAttribution, UsageInterval, UsageQuery, UsageSourceTerminalReceipt,
+    UsageStore, UsageStoreFuture, UsageTargetTerminalReceipt, UsageTargetTerminalRequest,
+    UsageTargetTerminalState, UsageTerminalBarrierProjection, UsageTerminalPrepareOutcome,
     UsageTotals, UsageView,
 };
 use native_tls::{Certificate, TlsConnector};
@@ -25,6 +35,201 @@ use postgres_native_tls::MakeTlsConnector;
 
 pub const DEFAULT_SCHEMA: &str = "cats_usage";
 pub const DEFAULT_WORKERS: usize = 4;
+pub const USAGE_SCHEMA_VERSION: i32 = 16;
+/// SHA-256 of the PostgreSQL-16 normalized catalog rows selected by
+/// `USAGE_SCHEMA_V16_CATALOG_SQL`. This is a release protocol constant, not a
+/// migration hint: any mismatch is refused without repair.
+pub const USAGE_SCHEMA_V16_CATALOG_SHA256: &str =
+    "sha256:ec10b4afe112dba411466e9b2d67d1cef5d8d232da4ec52c11ced993d771f157";
+pub const USAGE_SCHEMA_V16_FUNCTION_PROSRC_SHA256: &[(&str, &str)] = &[
+    (
+        "reject_credit_ledger_mutation",
+        "sha256:cdb5c3f99782490aaab6986cffe264cbcae9dcecf5b50f2143390ed120183b11",
+    ),
+    (
+        "reject_usage_checkpoint_mutation",
+        "sha256:3f7dac6e76c38bd26adce3f6353d452244aeaa8f0476b66e3dc1366cea70872d",
+    ),
+    (
+        "reject_usage_terminal_mutation",
+        "sha256:cf292f5255d98ef61ca15dc3d801863fcf63b63675d86902ddf67b32d278c9e0",
+    ),
+];
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const STATEMENT_TIMEOUT: Duration = Duration::from_secs(5);
+const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+const WORKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const DISPATCH_TIMEOUT: Duration = Duration::from_secs(10);
+// One slot for each globally admitted signed-runtime request is sufficient
+// even if all of them select the same worker. Other callers then backpressure
+// instead of growing synchronous database work without a bound.
+const JOBS_PER_WORKER: usize = 64;
+
+/// PostgreSQL 16 canonicalizes DDL before returning it from `pg_get_*def`.
+/// Hashing this complete, schema-name-neutral row set detects extra, missing or
+/// altered relations, columns, constraints, indexes, user triggers, functions,
+/// policies, rules and schema-owned scalar types. Internal FK triggers are
+/// deliberately represented by their constraints instead of unstable OIDs.
+const USAGE_SCHEMA_V16_CATALOG_SQL: &str = r#"
+WITH catalog(kind, key1, key2, definition) AS (
+    SELECT 'relation', class_row.relname, '',
+           jsonb_build_array(
+               class_row.relkind::text,
+               class_row.relpersistence::text,
+               COALESCE(access_method_row.amname, ''),
+               class_row.relrowsecurity,
+               class_row.relforcerowsecurity,
+               class_row.relreplident::text,
+               COALESCE(array_to_string(class_row.reloptions, E'\x1f'), '')
+           )::text
+      FROM pg_catalog.pg_class class_row
+      JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid=class_row.relnamespace
+      LEFT JOIN pg_catalog.pg_am access_method_row ON access_method_row.oid=class_row.relam
+     WHERE namespace_row.nspname=$1
+    UNION ALL
+    SELECT 'column', class_row.relname, attribute_row.attname,
+           jsonb_build_array(
+               attribute_row.attnum,
+               pg_catalog.format_type(attribute_row.atttypid, attribute_row.atttypmod),
+               attribute_row.attnotnull,
+               attribute_row.attidentity::text,
+               attribute_row.attgenerated::text,
+               attribute_row.attstorage::text,
+               attribute_row.attcompression::text,
+               attribute_row.attstattarget,
+               COALESCE(collation_row.collname, ''),
+               COALESCE(replace(
+                   pg_catalog.pg_get_expr(default_row.adbin, default_row.adrelid, true),
+                   $1 || '.', '<schema>.'
+               ), '')
+           )::text
+      FROM pg_catalog.pg_attribute attribute_row
+      JOIN pg_catalog.pg_class class_row ON class_row.oid=attribute_row.attrelid
+      JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid=class_row.relnamespace
+      LEFT JOIN pg_catalog.pg_attrdef default_row
+        ON default_row.adrelid=attribute_row.attrelid
+       AND default_row.adnum=attribute_row.attnum
+      LEFT JOIN pg_catalog.pg_collation collation_row ON collation_row.oid=attribute_row.attcollation
+     WHERE namespace_row.nspname=$1
+       AND class_row.relkind IN ('r','p')
+       AND attribute_row.attnum > 0
+       AND NOT attribute_row.attisdropped
+    UNION ALL
+    SELECT 'constraint', class_row.relname, constraint_row.conname,
+           jsonb_build_array(
+               constraint_row.contype::text,
+               constraint_row.condeferrable,
+               constraint_row.condeferred,
+               constraint_row.convalidated,
+               constraint_row.connoinherit,
+               replace(
+                   pg_catalog.pg_get_constraintdef(constraint_row.oid, true),
+                   $1 || '.', '<schema>.'
+               )
+           )::text
+      FROM pg_catalog.pg_constraint constraint_row
+      JOIN pg_catalog.pg_class class_row ON class_row.oid=constraint_row.conrelid
+      JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid=class_row.relnamespace
+     WHERE namespace_row.nspname=$1
+    UNION ALL
+    SELECT 'index', table_class.relname, index_class.relname,
+           jsonb_build_array(
+               index_row.indisunique,
+               index_row.indisprimary,
+               index_row.indisvalid,
+               index_row.indisready,
+               index_row.indisclustered,
+               index_row.indnullsnotdistinct,
+               replace(
+                   pg_catalog.pg_get_indexdef(index_row.indexrelid, 0, true),
+                   $1 || '.', '<schema>.'
+               )
+           )::text
+      FROM pg_catalog.pg_index index_row
+      JOIN pg_catalog.pg_class index_class ON index_class.oid=index_row.indexrelid
+      JOIN pg_catalog.pg_class table_class ON table_class.oid=index_row.indrelid
+      JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid=table_class.relnamespace
+     WHERE namespace_row.nspname=$1
+    UNION ALL
+    SELECT 'trigger', class_row.relname, trigger_row.tgname,
+           jsonb_build_array(
+               trigger_row.tgenabled::text,
+               CASE WHEN function_namespace.nspname=$1
+                    THEN '<schema>' ELSE function_namespace.nspname END,
+               function_row.proname,
+               replace(
+                   pg_catalog.pg_get_triggerdef(trigger_row.oid, true),
+                   $1 || '.', '<schema>.'
+               )
+           )::text
+      FROM pg_catalog.pg_trigger trigger_row
+      JOIN pg_catalog.pg_class class_row ON class_row.oid=trigger_row.tgrelid
+      JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid=class_row.relnamespace
+      JOIN pg_catalog.pg_proc function_row ON function_row.oid=trigger_row.tgfoid
+      JOIN pg_catalog.pg_namespace function_namespace
+        ON function_namespace.oid=function_row.pronamespace
+     WHERE namespace_row.nspname=$1 AND NOT trigger_row.tgisinternal
+    UNION ALL
+    SELECT 'function', function_row.proname,
+           pg_catalog.pg_get_function_identity_arguments(function_row.oid),
+           jsonb_build_array(
+               function_row.prokind::text,
+               language_row.lanname,
+               function_row.provolatile::text,
+               function_row.proisstrict,
+               function_row.prosecdef,
+               function_row.proleakproof,
+               function_row.proparallel::text,
+               COALESCE(array_to_string(function_row.proconfig, E'\x1f'), ''),
+               pg_catalog.pg_get_function_result(function_row.oid),
+               replace(
+                   pg_catalog.pg_get_functiondef(function_row.oid),
+                   $1 || '.', '<schema>.'
+               )
+           )::text
+      FROM pg_catalog.pg_proc function_row
+      JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid=function_row.pronamespace
+      JOIN pg_catalog.pg_language language_row ON language_row.oid=function_row.prolang
+     WHERE namespace_row.nspname=$1
+    UNION ALL
+    SELECT 'policy', class_row.relname, policy_row.polname,
+           jsonb_build_array(
+               policy_row.polcmd::text,
+               policy_row.polpermissive,
+               COALESCE(pg_catalog.pg_get_expr(policy_row.polqual, policy_row.polrelid, true), ''),
+               COALESCE(pg_catalog.pg_get_expr(policy_row.polwithcheck, policy_row.polrelid, true), '')
+           )::text
+      FROM pg_catalog.pg_policy policy_row
+      JOIN pg_catalog.pg_class class_row ON class_row.oid=policy_row.polrelid
+      JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid=class_row.relnamespace
+     WHERE namespace_row.nspname=$1
+    UNION ALL
+    SELECT 'rule', class_row.relname, rewrite_row.rulename,
+           replace(
+               pg_catalog.pg_get_ruledef(rewrite_row.oid, true),
+               $1 || '.', '<schema>.'
+           )
+      FROM pg_catalog.pg_rewrite rewrite_row
+      JOIN pg_catalog.pg_class class_row ON class_row.oid=rewrite_row.ev_class
+      JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid=class_row.relnamespace
+     WHERE namespace_row.nspname=$1 AND rewrite_row.rulename <> '_RETURN'
+    UNION ALL
+    SELECT 'type', type_row.typname, '',
+           jsonb_build_array(
+               type_row.typtype::text,
+               type_row.typcategory::text,
+               type_row.typnotnull,
+               COALESCE(type_row.typdefault, ''),
+               COALESCE(pg_catalog.format_type(NULLIF(type_row.typbasetype, 0), type_row.typtypmod), '')
+           )::text
+      FROM pg_catalog.pg_type type_row
+      JOIN pg_catalog.pg_namespace namespace_row ON namespace_row.oid=type_row.typnamespace
+     WHERE namespace_row.nspname=$1 AND type_row.typrelid=0 AND type_row.typelem=0
+)
+SELECT kind, key1, key2, definition
+  FROM catalog
+ ORDER BY kind COLLATE "C", key1 COLLATE "C", key2 COLLATE "C", definition COLLATE "C"
+"#;
 
 /// A job receives the connection or the reason there is not one. Dropping it
 /// unrun would reach the caller as "operation was canceled", which is the kind
@@ -74,9 +279,11 @@ impl DsnSource {
 /// clients. Callers await a Tokio oneshot, so database I/O never blocks an
 /// async control-plane executor thread.
 pub struct PostgresUsageStore {
-    workers: Vec<mpsc::Sender<Job>>,
+    workers: Vec<tokio_mpsc::Sender<Job>>,
     next_worker: AtomicUsize,
     schema: String,
+    poisoned: Arc<AtomicBool>,
+    dispatch_timeout: Duration,
 }
 
 impl PostgresUsageStore {
@@ -95,6 +302,52 @@ impl PostgresUsageStore {
         schema: &str,
         workers: usize,
     ) -> Result<Self> {
+        Self::connect_from_with_timeouts(
+            dsn,
+            ca_file,
+            schema,
+            workers,
+            WORKER_STARTUP_TIMEOUT,
+            DISPATCH_TIMEOUT,
+        )
+    }
+
+    /// Read-only reset/preflight hook. Unlike normal startup this never
+    /// installs an empty schema: absence, partial state and every catalog
+    /// mismatch are returned as failure without making a database change.
+    pub fn verify_existing_schema_v16(
+        url: &str,
+        ca_file: Option<&str>,
+        schema: &str,
+    ) -> Result<()> {
+        validate_schema_name(schema)?;
+        let mut client = connect_uninitialized_client(url, ca_file)?;
+        let mut transaction = client
+            .transaction()
+            .map_err(|error| pg_error("start read-only Usage v16 verification", error))?;
+        transaction
+            .batch_execute("SET TRANSACTION READ ONLY")
+            .map_err(|error| pg_error("make Usage v16 verification read-only", error))?;
+        transaction
+            .query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended('cats-usage-schema-v16', 0))",
+                &[],
+            )
+            .map_err(|error| pg_error("lock read-only Usage v16 verification", error))?;
+        verify_exact_usage_schema_v16(&mut transaction, schema)?;
+        transaction
+            .commit()
+            .map_err(|error| pg_error("commit read-only Usage v16 verification", error))
+    }
+
+    fn connect_from_with_timeouts(
+        dsn: &DsnSource,
+        ca_file: Option<&str>,
+        schema: &str,
+        workers: usize,
+        worker_startup_timeout: Duration,
+        dispatch_timeout: Duration,
+    ) -> Result<Self> {
         validate_schema_name(schema)?;
         if !(1..=64).contains(&workers) {
             return Err(MeteringError::Invalid(
@@ -108,12 +361,15 @@ impl PostgresUsageStore {
                 ca_file.map(str::to_string),
                 schema.to_string(),
                 worker_index,
+                worker_startup_timeout,
             )?);
         }
         Ok(Self {
             workers: senders,
             next_worker: AtomicUsize::new(0),
             schema: schema.to_string(),
+            poisoned: Arc::new(AtomicBool::new(false)),
+            dispatch_timeout,
         })
     }
 
@@ -124,20 +380,77 @@ impl PostgresUsageStore {
     where
         T: Send + 'static,
     {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(poisoned_store_error());
+        }
+        let deadline = Instant::now()
+            .checked_add(self.dispatch_timeout)
+            .ok_or_else(poisoned_store_error)?;
+        let mut poison_on_drop = PoisonStoreOnDrop::new(Arc::clone(&self.poisoned));
         let index = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        self.workers[index]
-            .send(Box::new(move |client| {
-                let _ = result_tx.send(match client {
-                    Ok(client) => operation(client),
-                    Err(error) => Err(error),
-                });
-            }))
-            .map_err(|_| MeteringError::Store("PostgreSQL usage worker exited".to_string()))?;
-        result_rx.await.map_err(|_| {
-            MeteringError::Store("PostgreSQL usage operation was canceled".to_string())
-        })?
+        let poisoned = Arc::clone(&self.poisoned);
+        let job: Job = Box::new(move |client| {
+            // A request that timed out while this job waited in the
+            // bounded queue has dropped its receiver. Do not perform its
+            // database effect after cancellation.
+            if poisoned.load(Ordering::Acquire) || result_tx.is_closed() {
+                return;
+            }
+            let _ = result_tx.send(match client {
+                Ok(client) => operation(client),
+                Err(error) => Err(error),
+            });
+        });
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.workers[index].send(job),
+        )
+        .await
+        .map_err(|_| poisoned_store_error())?
+        .map_err(|_| poisoned_store_error())?;
+        let result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), result_rx)
+            .await
+            .map_err(|_| poisoned_store_error())?
+            .map_err(|_| poisoned_store_error())?;
+        poison_on_drop.disarm();
+        result
     }
+}
+
+struct PoisonStoreOnDrop {
+    poisoned: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl PoisonStoreOnDrop {
+    fn new(poisoned: Arc<AtomicBool>) -> Self {
+        Self {
+            poisoned,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PoisonStoreOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            // Synchronous postgres work cannot be cancelled once it starts.
+            // Fail the complete store closed so at most the fixed worker set
+            // can remain stuck and a daemon restart is the only recovery.
+            self.poisoned.store(true, Ordering::Release);
+        }
+    }
+}
+
+fn poisoned_store_error() -> MeteringError {
+    MeteringError::Store(
+        "PostgreSQL usage store timed out or lost a worker; restart required".to_string(),
+    )
 }
 
 impl UsageStore for PostgresUsageStore {
@@ -184,6 +497,94 @@ impl UsageStore for PostgresUsageStore {
                 source_epoch_attribution(client, &schema, &source_id, &source_epoch)
             })
             .await
+        })
+    }
+
+    fn project_archived<'a>(
+        &'a self,
+        value: &'a ArchivedUsageCheckpoint,
+    ) -> UsageStoreFuture<'a, IngestOutcome> {
+        let value = value.clone();
+        let schema = self.schema.clone();
+        Box::pin(async move {
+            self.dispatch(move |client| pg_project_archived(client, &schema, &value))
+                .await
+        })
+    }
+
+    fn source_terminal_receipt<'a>(
+        &'a self,
+        source_id: &'a str,
+        source_epoch: &'a str,
+    ) -> UsageStoreFuture<'a, Option<UsageSourceTerminalReceipt>> {
+        let source_id = source_id.to_string();
+        let source_epoch = source_epoch.to_string();
+        let schema = self.schema.clone();
+        Box::pin(async move {
+            self.dispatch(move |client| {
+                pg_source_terminal_receipt(client, &schema, &source_id, &source_epoch)
+            })
+            .await
+        })
+    }
+
+    fn active_target_terminal<'a>(
+        &'a self,
+    ) -> UsageStoreFuture<'a, Option<UsageTargetTerminalState>> {
+        let schema = self.schema.clone();
+        Box::pin(async move {
+            self.dispatch(move |client| pg_active_target_terminal(client, &schema))
+                .await
+        })
+    }
+
+    fn prepare_target_terminal<'a>(
+        &'a self,
+        request: &'a UsageTargetTerminalRequest,
+    ) -> UsageStoreFuture<'a, UsageTerminalPrepareOutcome> {
+        let request = request.clone();
+        let schema = self.schema.clone();
+        Box::pin(async move {
+            self.dispatch(move |client| pg_prepare_target_terminal(client, &schema, &request))
+                .await
+        })
+    }
+
+    fn project_terminal_barrier<'a>(
+        &'a self,
+        barrier: &'a ArchivedUsageTerminalBarrier,
+    ) -> UsageStoreFuture<'a, IngestOutcome> {
+        let barrier = barrier.clone();
+        let schema = self.schema.clone();
+        Box::pin(async move {
+            self.dispatch(move |client| pg_project_terminal_barrier(client, &schema, &barrier))
+                .await
+        })
+    }
+
+    fn target_terminal_state<'a>(
+        &'a self,
+        terminal_epoch_id: &'a str,
+    ) -> UsageStoreFuture<'a, Option<UsageTargetTerminalState>> {
+        let terminal_epoch_id = terminal_epoch_id.to_string();
+        let schema = self.schema.clone();
+        Box::pin(async move {
+            self.dispatch(move |client| {
+                pg_target_terminal_state(client, &schema, &terminal_epoch_id)
+            })
+            .await
+        })
+    }
+
+    fn commit_target_terminal<'a>(
+        &'a self,
+        receipt: &'a UsageTargetTerminalReceipt,
+    ) -> UsageStoreFuture<'a, UsageTerminalPrepareOutcome> {
+        let receipt = receipt.clone();
+        let schema = self.schema.clone();
+        Box::pin(async move {
+            self.dispatch(move |client| pg_commit_target_terminal(client, &schema, &receipt))
+                .await
         })
     }
 }
@@ -769,14 +1170,591 @@ fn source_epoch_attribution(
         .map_err(|error| pg_error("look up usage source epoch attribution", error))
 }
 
+fn pg_project_archived(
+    client: &mut Client,
+    schema: &str,
+    archived: &ArchivedUsageCheckpoint,
+) -> Result<IngestOutcome> {
+    validate_archive_evidence(&archived.archive)?;
+    let outcome = ingest_checkpoint(client, schema, &archived.value)?;
+    let evidence_json = serde_json::to_string(&archived.archive)?;
+    let mut transaction = client
+        .transaction()
+        .map_err(|error| pg_error("start usage archive projection", error))?;
+    let epoch_lock = format!(
+        "{}:{}{}",
+        archived.value.checkpoint.source_id.len(),
+        archived.value.checkpoint.source_id,
+        archived.value.checkpoint.source_epoch
+    );
+    transaction
+        .query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&epoch_lock],
+        )
+        .map_err(|error| pg_error("lock archived usage source epoch", error))?;
+    let insert_sql = format!(
+        "INSERT INTO {schema}.usage_archive_projections (
+             event_id, stream_name, archive_bucket, shard_id, sequence_number,
+             sequence_number_text, archive_key, archive_sha256, evidence_json
+         ) VALUES ($1,$2,$3,$4,$5::text::numeric,$5,$6,$7,$8)
+         ON CONFLICT (event_id) DO NOTHING"
+    );
+    let inserted = transaction
+        .execute(
+            &insert_sql,
+            &[
+                &archived.value.checkpoint.event_id,
+                &archived.archive.stream_name,
+                &archived.archive.archive_bucket,
+                &archived.archive.shard_id,
+                &archived.archive.sequence_number,
+                &archived.archive.archive_key,
+                &archived.archive.archive_sha256,
+                &evidence_json,
+            ],
+        )
+        .map_err(|error| pg_error("insert usage archive projection", error))?;
+    if inserted == 0 {
+        let existing_sql = format!(
+            "SELECT checkpoint.payload_json, archive.evidence_json
+               FROM {schema}.usage_archive_projections archive
+               JOIN {schema}.usage_checkpoints checkpoint
+                 ON checkpoint.event_id=archive.event_id
+              WHERE archive.event_id=$1"
+        );
+        let existing = transaction
+            .query_one(&existing_sql, &[&archived.value.checkpoint.event_id])
+            .map_err(|error| pg_error("read usage archive projection replay", error))?;
+        let payload_json = serde_json::to_string(&archived.value.checkpoint)?;
+        if outcome != IngestOutcome::Duplicate || existing.get::<_, String>(0) != payload_json {
+            return Err(MeteringError::Conflict(format!(
+                "event {} was replayed without one exact archived payload",
+                archived.value.checkpoint.event_id
+            )));
+        }
+        // Preserve the first canonical evidence. Exact Kinesis retries can
+        // legitimately have another stream position or immutable batch key.
+        let canonical_evidence: UsageArchiveEvidence =
+            serde_json::from_str(&existing.get::<_, String>(1))?;
+        validate_archive_evidence(&canonical_evidence)?;
+    }
+    pg_maybe_insert_source_terminal_receipt(
+        &mut transaction,
+        schema,
+        &archived.value.checkpoint.source_id,
+        &archived.value.checkpoint.source_epoch,
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| pg_error("commit usage archive projection", error))?;
+    Ok(outcome)
+}
+
+fn pg_maybe_insert_source_terminal_receipt(
+    transaction: &mut Transaction<'_>,
+    schema: &str,
+    source_id: &str,
+    source_epoch: &str,
+) -> Result<()> {
+    let sql = format!(
+        "SELECT checkpoint.payload_json, checkpoint.source_binding_json,
+                archive.evidence_json
+           FROM {schema}.usage_checkpoints checkpoint
+           JOIN {schema}.usage_archive_projections archive
+             ON archive.event_id=checkpoint.event_id
+          WHERE checkpoint.source_id=$1 AND checkpoint.source_epoch=$2
+          ORDER BY checkpoint.sequence, checkpoint.metric, checkpoint.event_id"
+    );
+    let rows = transaction
+        .query(&sql, &[&source_id, &source_epoch])
+        .map_err(|error| pg_error("read projected source epoch", error))?;
+    let mut projected = Vec::<(
+        cats_api::metering::CatUsageCheckpoint,
+        RuntimeUsageSourceBinding,
+        UsageArchiveEvidence,
+    )>::with_capacity(rows.len());
+    for row in rows {
+        projected.push((
+            serde_json::from_str(&row.get::<_, String>(0))?,
+            serde_json::from_str(&row.get::<_, String>(1))?,
+            serde_json::from_str(&row.get::<_, String>(2))?,
+        ));
+    }
+    let Some(receipt) = build_source_terminal_receipt(source_id, source_epoch, &projected)? else {
+        return Ok(());
+    };
+    let receipt_json = serde_json::to_string(&receipt)?;
+    let receipt_sha256 = sha256_prefixed(receipt_json.as_bytes());
+    let insert_sql = format!(
+        "INSERT INTO {schema}.usage_source_terminal_receipts (
+             source_id, source_epoch, receipt_json, receipt_sha256
+         ) VALUES ($1,$2,$3,$4)
+         ON CONFLICT (source_id, source_epoch) DO NOTHING"
+    );
+    let inserted = transaction
+        .execute(
+            &insert_sql,
+            &[&source_id, &source_epoch, &receipt_json, &receipt_sha256],
+        )
+        .map_err(|error| pg_error("insert usage source terminal receipt", error))?;
+    if inserted == 0 {
+        let existing_sql = format!(
+            "SELECT receipt_json, receipt_sha256
+               FROM {schema}.usage_source_terminal_receipts
+              WHERE source_id=$1 AND source_epoch=$2"
+        );
+        let row = transaction
+            .query_one(&existing_sql, &[&source_id, &source_epoch])
+            .map_err(|error| pg_error("read usage terminal receipt replay", error))?;
+        let existing = (row.get::<_, String>(0), row.get::<_, String>(1));
+        if existing != (receipt_json, receipt_sha256) {
+            return Err(MeteringError::Conflict(
+                "source terminal receipt conflicts with its immutable replay".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn pg_source_terminal_receipt(
+    client: &mut Client,
+    schema: &str,
+    source_id: &str,
+    source_epoch: &str,
+) -> Result<Option<UsageSourceTerminalReceipt>> {
+    let sql = format!(
+        "SELECT receipt_json, receipt_sha256
+           FROM {schema}.usage_source_terminal_receipts
+          WHERE source_id=$1 AND source_epoch=$2"
+    );
+    client
+        .query_opt(&sql, &[&source_id, &source_epoch])
+        .map_err(|error| pg_error("read usage source terminal receipt", error))?
+        .map(|row| decode_terminal_receipt(&row.get::<_, String>(0), &row.get::<_, String>(1)))
+        .transpose()
+}
+
+fn pg_prepare_target_terminal(
+    client: &mut Client,
+    schema: &str,
+    request: &UsageTargetTerminalRequest,
+) -> Result<UsageTerminalPrepareOutcome> {
+    validate_target_terminal_request(request)?;
+    if request.old_target.usage_schema != schema {
+        return Err(MeteringError::Invalid(format!(
+            "terminal old usage schema {} does not match opened projection {schema}",
+            request.old_target.usage_schema
+        )));
+    }
+    let request_json = serde_json::to_string(request)?;
+    let request_sha256 = target_terminal_request_sha256(request)?;
+    let terminal_epoch_id = request.terminal_epoch_id.to_string();
+    let mut transaction = client
+        .transaction()
+        .map_err(|error| pg_error("start Usage target terminal preparation", error))?;
+    transaction
+        .query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended('cats-usage-target-terminal-v1', 0))",
+            &[],
+        )
+        .map_err(|error| pg_error("lock Usage target terminal preparation", error))?;
+    let existing_sql = format!(
+        "SELECT terminal_epoch_id, request_json, request_sha256
+           FROM {schema}.usage_terminal_operations
+          ORDER BY terminal_epoch_id
+          LIMIT 2"
+    );
+    let existing = transaction
+        .query(&existing_sql, &[])
+        .map_err(|error| pg_error("read Usage target terminal operation", error))?;
+    if let Some(row) = existing.first() {
+        if existing.len() == 1
+            && row.get::<_, String>(0) == terminal_epoch_id
+            && row.get::<_, String>(1) == request_json
+            && row.get::<_, String>(2) == request_sha256
+        {
+            transaction
+                .commit()
+                .map_err(|error| pg_error("commit Usage target terminal replay", error))?;
+            return Ok(UsageTerminalPrepareOutcome::ExactReplay);
+        }
+        return Err(MeteringError::Conflict(
+            "Usage target already has a different terminal operation".to_string(),
+        ));
+    }
+    pg_verify_terminal_source_set(&mut transaction, schema, request)?;
+    let insert_sql = format!(
+        "INSERT INTO {schema}.usage_terminal_operations (
+             terminal_epoch_id, request_json, request_sha256, created_at_ms
+         ) VALUES ($1,$2,$3,$4)"
+    );
+    transaction
+        .execute(
+            &insert_sql,
+            &[
+                &terminal_epoch_id,
+                &request_json,
+                &request_sha256,
+                &request.created_at_unix_ms,
+            ],
+        )
+        .map_err(|error| pg_error("insert Usage target terminal operation", error))?;
+    transaction
+        .commit()
+        .map_err(|error| pg_error("commit Usage target terminal preparation", error))?;
+    Ok(UsageTerminalPrepareOutcome::Prepared)
+}
+
+fn pg_verify_terminal_source_set(
+    transaction: &mut Transaction<'_>,
+    schema: &str,
+    request: &UsageTargetTerminalRequest,
+) -> Result<Vec<UsageSourceTerminalReceipt>> {
+    let source_sql = format!(
+        "SELECT DISTINCT source_id, source_epoch
+           FROM {schema}.usage_checkpoints
+          ORDER BY source_id COLLATE \"C\", source_epoch COLLATE \"C\""
+    );
+    let actual_keys = transaction
+        .query(&source_sql, &[])
+        .map_err(|error| pg_error("enumerate Usage terminal source set", error))?
+        .into_iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect::<Vec<_>>();
+    let expected_keys = request
+        .sources
+        .iter()
+        .map(|source| (source.source_id.clone(), source.source_epoch.clone()))
+        .collect::<Vec<_>>();
+    if actual_keys != expected_keys {
+        return Err(MeteringError::Conflict(
+            "Usage target source closed set is incomplete or contains a foreign epoch".to_string(),
+        ));
+    }
+    let receipt_sql = format!(
+        "SELECT receipt_json, receipt_sha256
+           FROM {schema}.usage_source_terminal_receipts
+          WHERE source_id=$1 AND source_epoch=$2"
+    );
+    let mut receipts = Vec::with_capacity(request.sources.len());
+    for expected in &request.sources {
+        let row = transaction
+            .query_opt(&receipt_sql, &[&expected.source_id, &expected.source_epoch])
+            .map_err(|error| pg_error("read required source terminal receipt", error))?
+            .ok_or_else(|| {
+                MeteringError::Conflict(format!(
+                    "source {}/{} has no terminal receipt",
+                    expected.source_id, expected.source_epoch
+                ))
+            })?;
+        let receipt_json: String = row.get(0);
+        let receipt_sha256: String = row.get(1);
+        if receipt_sha256 != expected.receipt_sha256 {
+            return Err(MeteringError::Conflict(format!(
+                "source {}/{} terminal receipt digest changed",
+                expected.source_id, expected.source_epoch
+            )));
+        }
+        receipts.push(decode_terminal_receipt(&receipt_json, &receipt_sha256)?);
+    }
+    Ok(receipts)
+}
+
+fn pg_project_terminal_barrier(
+    client: &mut Client,
+    schema: &str,
+    barrier: &ArchivedUsageTerminalBarrier,
+) -> Result<IngestOutcome> {
+    validate_archive_evidence(&barrier.archive)?;
+    let terminal_epoch_id = barrier.marker.terminal_epoch_id.to_string();
+    let mut transaction = client
+        .transaction()
+        .map_err(|error| pg_error("start Usage terminal barrier projection", error))?;
+    let operation_sql = format!(
+        "SELECT request_json, request_sha256
+           FROM {schema}.usage_terminal_operations
+          WHERE terminal_epoch_id=$1"
+    );
+    let operation = transaction
+        .query_opt(&operation_sql, &[&terminal_epoch_id])
+        .map_err(|error| pg_error("read Usage terminal barrier operation", error))?
+        .ok_or_else(|| {
+            MeteringError::Conflict("terminal barrier has no prepared operation".into())
+        })?;
+    let request_json: String = operation.get(0);
+    let request: UsageTargetTerminalRequest = serde_json::from_str(&request_json)?;
+    if operation.get::<_, String>(1) != target_terminal_request_sha256(&request)?
+        || barrier.marker != target_terminal_marker(&request, &barrier.marker.shard_id)?
+        || barrier.archive.shard_id != barrier.marker.shard_id
+        || barrier.archive.stream_name != request.old_target.stream_name
+        || barrier.archive.archive_bucket != request.old_target.archive_bucket_name
+    {
+        return Err(MeteringError::Conflict(
+            "terminal barrier does not match its prepared old Usage target".into(),
+        ));
+    }
+    let marker_json = serde_json::to_string(&barrier.marker)?;
+    let evidence_json = serde_json::to_string(&barrier.archive)?;
+    let insert_sql = format!(
+        "INSERT INTO {schema}.usage_terminal_barrier_projections (
+             marker_id, sequence_number, sequence_number_text, terminal_epoch_id,
+             shard_id, marker_json, evidence_json
+         ) VALUES ($1,$2::text::numeric,$2,$3,$4,$5,$6)
+         ON CONFLICT (marker_id, sequence_number) DO NOTHING"
+    );
+    let inserted = transaction
+        .execute(
+            &insert_sql,
+            &[
+                &barrier.marker.marker_id,
+                &barrier.archive.sequence_number,
+                &terminal_epoch_id,
+                &barrier.marker.shard_id,
+                &marker_json,
+                &evidence_json,
+            ],
+        )
+        .map_err(|error| pg_error("insert Usage terminal barrier projection", error))?;
+    if inserted == 0 {
+        let existing_sql = format!(
+            "SELECT marker_json, evidence_json
+               FROM {schema}.usage_terminal_barrier_projections
+              WHERE marker_id=$1 AND sequence_number=$2::text::numeric"
+        );
+        let row = transaction
+            .query_one(
+                &existing_sql,
+                &[&barrier.marker.marker_id, &barrier.archive.sequence_number],
+            )
+            .map_err(|error| pg_error("read Usage terminal barrier replay", error))?;
+        if row.get::<_, String>(0) != marker_json {
+            return Err(MeteringError::Conflict(
+                "terminal barrier position was replayed with a foreign marker".into(),
+            ));
+        }
+        // A retry after archive/project success but before the DynamoDB
+        // checkpoint may regroup this exact Kinesis position into a different
+        // immutable batch. Keep the first canonical evidence and let the
+        // shard checkpoint advance over the exact marker replay.
+        let canonical_evidence: UsageArchiveEvidence =
+            serde_json::from_str(&row.get::<_, String>(1))?;
+        validate_archive_evidence(&canonical_evidence)?;
+        if canonical_evidence.shard_id != barrier.marker.shard_id
+            || canonical_evidence.stream_name != request.old_target.stream_name
+            || canonical_evidence.archive_bucket != request.old_target.archive_bucket_name
+        {
+            return Err(MeteringError::Conflict(
+                "terminal barrier canonical archive evidence drifted".into(),
+            ));
+        }
+    }
+    transaction
+        .commit()
+        .map_err(|error| pg_error("commit Usage terminal barrier projection", error))?;
+    Ok(if inserted == 0 {
+        IngestOutcome::Duplicate
+    } else {
+        IngestOutcome::Accepted
+    })
+}
+
+fn pg_target_terminal_state(
+    client: &mut Client,
+    schema: &str,
+    terminal_epoch_id: &str,
+) -> Result<Option<UsageTargetTerminalState>> {
+    let operation_sql = format!(
+        "SELECT request_json, request_sha256
+           FROM {schema}.usage_terminal_operations
+          WHERE terminal_epoch_id=$1"
+    );
+    let Some(operation) = client
+        .query_opt(&operation_sql, &[&terminal_epoch_id])
+        .map_err(|error| pg_error("discover Usage target terminal operation", error))?
+    else {
+        return Ok(None);
+    };
+    let request_json: String = operation.get(0);
+    let request: UsageTargetTerminalRequest = serde_json::from_str(&request_json)?;
+    let request_sha256: String = operation.get(1);
+    if request_sha256 != target_terminal_request_sha256(&request)? {
+        return Err(MeteringError::Store(
+            "stored Usage terminal request digest is corrupt".into(),
+        ));
+    }
+    let barriers = pg_load_canonical_barriers(client, schema, terminal_epoch_id)?;
+    let receipt_sql = format!(
+        "SELECT receipt_json, receipt_sha256
+           FROM {schema}.usage_target_terminal_receipts
+          WHERE terminal_epoch_id=$1"
+    );
+    let receipt = client
+        .query_opt(&receipt_sql, &[&terminal_epoch_id])
+        .map_err(|error| pg_error("discover Usage target terminal receipt", error))?
+        .map(|row| {
+            let json: String = row.get(0);
+            let expected_sha256: String = row.get(1);
+            if sha256_prefixed(json.as_bytes()) != expected_sha256 {
+                return Err(MeteringError::Store(
+                    "stored Usage target terminal receipt digest is corrupt".into(),
+                ));
+            }
+            let receipt: UsageTargetTerminalReceipt = serde_json::from_str(&json)?;
+            validate_target_terminal_receipt(&receipt)?;
+            Ok(receipt)
+        })
+        .transpose()?;
+    Ok(Some(UsageTargetTerminalState {
+        request,
+        request_sha256,
+        barriers,
+        receipt,
+    }))
+}
+
+fn pg_active_target_terminal(
+    client: &mut Client,
+    schema: &str,
+) -> Result<Option<UsageTargetTerminalState>> {
+    let sql = format!(
+        "SELECT terminal_epoch_id
+           FROM {schema}.usage_terminal_operations
+          ORDER BY terminal_epoch_id
+          LIMIT 2"
+    );
+    let operations = client
+        .query(&sql, &[])
+        .map_err(|error| pg_error("discover active Usage target terminal operation", error))?;
+    if operations.len() > 1 {
+        return Err(MeteringError::Store(
+            "multiple Usage target terminal operations violate the singleton authority".into(),
+        ));
+    }
+    let Some(operation) = operations.first() else {
+        return Ok(None);
+    };
+    pg_target_terminal_state(client, schema, &operation.get::<_, String>(0))
+}
+
+fn pg_load_canonical_barriers(
+    client: &mut impl postgres::GenericClient,
+    schema: &str,
+    terminal_epoch_id: &str,
+) -> Result<Vec<UsageTerminalBarrierProjection>> {
+    let sql = format!(
+        "SELECT DISTINCT ON (shard_id) marker_json, evidence_json
+           FROM {schema}.usage_terminal_barrier_projections
+          WHERE terminal_epoch_id=$1
+          ORDER BY shard_id, sequence_number"
+    );
+    client
+        .query(&sql, &[&terminal_epoch_id])
+        .map_err(|error| pg_error("read canonical Usage terminal barriers", error))?
+        .into_iter()
+        .map(|row| {
+            Ok(UsageTerminalBarrierProjection {
+                marker: serde_json::from_str(&row.get::<_, String>(0))?,
+                archive: serde_json::from_str(&row.get::<_, String>(1))?,
+            })
+        })
+        .collect()
+}
+
+fn pg_commit_target_terminal(
+    client: &mut Client,
+    schema: &str,
+    receipt: &UsageTargetTerminalReceipt,
+) -> Result<UsageTerminalPrepareOutcome> {
+    validate_target_terminal_receipt(receipt)?;
+    if receipt.request.old_target.usage_schema != schema {
+        return Err(MeteringError::Invalid(
+            "target receipt old schema does not match opened projection".into(),
+        ));
+    }
+    let terminal_epoch_id = receipt.request.terminal_epoch_id.to_string();
+    let receipt_json = serde_json::to_string(receipt)?;
+    let receipt_sha256 = sha256_prefixed(receipt_json.as_bytes());
+    let mut transaction = client
+        .transaction()
+        .map_err(|error| pg_error("start Usage target terminal commit", error))?;
+    transaction
+        .query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended('cats-usage-target-terminal-v1', 0))",
+            &[],
+        )
+        .map_err(|error| pg_error("lock Usage target terminal commit", error))?;
+    let operation_sql = format!(
+        "SELECT request_json, request_sha256
+           FROM {schema}.usage_terminal_operations
+          WHERE terminal_epoch_id=$1"
+    );
+    let operation = transaction
+        .query_opt(&operation_sql, &[&terminal_epoch_id])
+        .map_err(|error| pg_error("read prepared Usage terminal operation", error))?
+        .ok_or_else(|| {
+            MeteringError::Conflict("target receipt has no prepared operation".into())
+        })?;
+    if operation.get::<_, String>(0) != serde_json::to_string(&receipt.request)?
+        || operation.get::<_, String>(1) != receipt.request_sha256
+    {
+        return Err(MeteringError::Conflict(
+            "target receipt does not match prepared operation".into(),
+        ));
+    }
+    let source_receipts =
+        pg_verify_terminal_source_set(&mut transaction, schema, &receipt.request)?;
+    let barriers = pg_load_canonical_barriers(&mut transaction, schema, &terminal_epoch_id)?;
+    if source_receipts != receipt.source_receipts || barriers != receipt.barriers {
+        return Err(MeteringError::Conflict(
+            "target receipt source or barrier evidence changed before commit".into(),
+        ));
+    }
+    let existing_sql = format!(
+        "SELECT receipt_json, receipt_sha256
+           FROM {schema}.usage_target_terminal_receipts
+          WHERE terminal_epoch_id=$1"
+    );
+    if let Some(row) = transaction
+        .query_opt(&existing_sql, &[&terminal_epoch_id])
+        .map_err(|error| pg_error("read Usage target terminal receipt replay", error))?
+    {
+        if (row.get::<_, String>(0), row.get::<_, String>(1)) != (receipt_json, receipt_sha256) {
+            return Err(MeteringError::Conflict(
+                "target terminal receipt conflicts with immutable replay".into(),
+            ));
+        }
+        transaction
+            .commit()
+            .map_err(|error| pg_error("commit Usage target terminal receipt replay", error))?;
+        return Ok(UsageTerminalPrepareOutcome::ExactReplay);
+    }
+    let insert_sql = format!(
+        "INSERT INTO {schema}.usage_target_terminal_receipts (
+             terminal_epoch_id, receipt_json, receipt_sha256
+         ) VALUES ($1,$2,$3)"
+    );
+    transaction
+        .execute(
+            &insert_sql,
+            &[&terminal_epoch_id, &receipt_json, &receipt_sha256],
+        )
+        .map_err(|error| pg_error("insert Usage target terminal receipt", error))?;
+    transaction
+        .commit()
+        .map_err(|error| pg_error("commit Usage target terminal receipt", error))?;
+    Ok(UsageTerminalPrepareOutcome::Prepared)
+}
+
 fn spawn_worker(
     dsn: DsnSource,
     ca_file: Option<String>,
     schema: String,
     worker_index: usize,
-) -> Result<mpsc::Sender<Job>> {
-    let (jobs, receiver) = mpsc::channel::<Job>();
-    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    startup_timeout: Duration,
+) -> Result<tokio_mpsc::Sender<Job>> {
+    let (jobs, mut receiver) = tokio_mpsc::channel::<Job>(JOBS_PER_WORKER);
+    let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name(format!("cats-postgres-usage-{worker_index}"))
         .spawn(move || {
@@ -790,7 +1768,7 @@ fn spawn_worker(
                     return;
                 }
             };
-            for job in receiver {
+            while let Some(job) = receiver.blocking_recv() {
                 // This worker previously had no reconnect at all: a dropped
                 // connection left it running every later job against a dead
                 // client, so usage ingestion stayed broken until the process
@@ -809,9 +1787,22 @@ fn spawn_worker(
             }
         })
         .map_err(|error| MeteringError::Store(format!("start PostgreSQL usage worker: {error}")))?;
-    ready_rx
-        .recv()
-        .map_err(|_| MeteringError::Store("PostgreSQL usage worker exited at startup".into()))??;
+    // The synchronous postgres handshake has no cancellation handle. A timed
+    // out constructor drops the queue and fails startup; at most this one
+    // fixed worker remains blocked until the daemon exits.
+    match ready_rx.recv_timeout(startup_timeout) {
+        Ok(result) => result?,
+        Err(std_mpsc::RecvTimeoutError::Timeout) => {
+            return Err(MeteringError::Store(
+                "PostgreSQL usage worker startup timed out; restart required".into(),
+            ));
+        }
+        Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(MeteringError::Store(
+                "PostgreSQL usage worker exited at startup".into(),
+            ));
+        }
+    }
     Ok(jobs)
 }
 
@@ -822,11 +1813,40 @@ fn connect_resolved(dsn: &DsnSource, ca_file: Option<&str>, schema: &str) -> Res
 }
 
 fn connect_client(url: &str, ca_file: Option<&str>, schema: &str) -> Result<Client> {
-    let connector = tls_connector(ca_file)?;
-    let mut client = Client::connect(url, MakeTlsConnector::new(connector))
-        .map_err(|error| pg_error("connect PostgreSQL", error))?;
+    let mut client = connect_uninitialized_client(url, ca_file)?;
     migrate(&mut client, schema)?;
     Ok(client)
+}
+
+fn connect_uninitialized_client(url: &str, ca_file: Option<&str>) -> Result<Client> {
+    let connector = tls_connector(ca_file)?;
+    let config = client_config(url)?;
+    let mut client = config
+        .connect(MakeTlsConnector::new(connector))
+        .map_err(|error| pg_error("connect PostgreSQL", error))?;
+    configure_session(&mut client)?;
+    Ok(client)
+}
+
+fn client_config(url: &str) -> Result<postgres::Config> {
+    let mut config: postgres::Config = url
+        .parse()
+        .map_err(|error| MeteringError::Store(format!("parse PostgreSQL URL: {error}")))?;
+    config.connect_timeout(CONNECT_TIMEOUT);
+    Ok(config)
+}
+
+/// Apply the same server-side failure bounds on the initial connection and
+/// every reconnect before either migrations or usage work can claim a worker.
+fn configure_session(client: &mut Client) -> Result<()> {
+    let sql = format!(
+        "SET statement_timeout = '{}ms'; SET lock_timeout = '{}ms'",
+        STATEMENT_TIMEOUT.as_millis(),
+        LOCK_TIMEOUT.as_millis(),
+    );
+    client
+        .batch_execute(&sql)
+        .map_err(|error| pg_error("configure PostgreSQL usage session", error))
 }
 
 fn tls_connector(ca_file: Option<&str>) -> Result<TlsConnector> {
@@ -894,77 +1914,323 @@ fn validate_schema_name(schema: &str) -> Result<()> {
 }
 
 fn migrate(client: &mut Client, schema: &str) -> Result<()> {
-    let sql = migration_sql(schema);
     let mut transaction = client
         .transaction()
-        .map_err(|error| pg_error("start usage migration", error))?;
+        .map_err(|error| pg_error("start Usage v16 schema verification", error))?;
     transaction
         .query_one(
-            "SELECT pg_advisory_xact_lock(hashtextextended('cats-usage-schema-v1', 0))",
+            "SELECT pg_advisory_xact_lock(hashtextextended('cats-usage-schema-v16', 0))",
             &[],
         )
-        .map_err(|error| pg_error("lock usage migration", error))?;
-    transaction
-        .batch_execute(&sql)
-        .map_err(|error| pg_error("migrate usage schema", error))?;
+        .map_err(|error| pg_error("lock Usage v16 schema verification", error))?;
+    let schema_exists = transaction
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname=$1)",
+            &[&schema],
+        )
+        .map_err(|error| pg_error("discover Usage schema", error))?
+        .get::<_, bool>(0);
+    let install = if schema_exists {
+        usage_schema_is_empty(&mut transaction, schema)?
+    } else {
+        transaction
+            .batch_execute(&format!("CREATE SCHEMA {schema}"))
+            .map_err(|error| pg_error("create empty Usage v16 schema", error))?;
+        true
+    };
+    if install {
+        transaction
+            .batch_execute(&fresh_schema_sql(schema))
+            .map_err(|error| pg_error("install exact fresh Usage v16 schema", error))?;
+    }
+    verify_exact_usage_schema_v16(&mut transaction, schema)?;
     transaction
         .commit()
-        .map_err(|error| pg_error("commit usage migration", error))
+        .map_err(|error| pg_error("commit Usage v16 schema verification", error))
 }
 
-fn migration_sql(schema: &str) -> String {
+fn usage_schema_is_empty(transaction: &mut Transaction<'_>, schema: &str) -> Result<bool> {
+    transaction
+        .query_one(
+            r#"SELECT NOT EXISTS (
+                   SELECT 1 FROM pg_catalog.pg_class class_row
+                   JOIN pg_catalog.pg_namespace namespace_row
+                     ON namespace_row.oid=class_row.relnamespace
+                   WHERE namespace_row.nspname=$1
+                   UNION ALL
+                   SELECT 1 FROM pg_catalog.pg_proc function_row
+                   JOIN pg_catalog.pg_namespace namespace_row
+                     ON namespace_row.oid=function_row.pronamespace
+                   WHERE namespace_row.nspname=$1
+                   UNION ALL
+                   SELECT 1 FROM pg_catalog.pg_type type_row
+                   JOIN pg_catalog.pg_namespace namespace_row
+                     ON namespace_row.oid=type_row.typnamespace
+                   WHERE namespace_row.nspname=$1
+                     AND type_row.typrelid=0 AND type_row.typelem=0
+               )"#,
+            &[&schema],
+        )
+        .map(|row| row.get(0))
+        .map_err(|error| pg_error("inspect empty Usage schema", error))
+}
+
+fn verify_exact_usage_schema_v16(transaction: &mut Transaction<'_>, schema: &str) -> Result<()> {
+    let stamp_sql = format!("SELECT version FROM {schema}.schema_migrations ORDER BY version");
+    let versions = transaction
+        .query(&stamp_sql, &[])
+        .map_err(|_| {
+            MeteringError::Conflict(
+                "nonempty Usage schema has no readable exact v16 stamp; refusing repair".into(),
+            )
+        })?
+        .into_iter()
+        .map(|row| row.get::<_, i32>(0))
+        .collect::<Vec<_>>();
+    if versions != [USAGE_SCHEMA_VERSION] {
+        return Err(MeteringError::Conflict(format!(
+            "Usage schema version rows {versions:?} are not the one exact v16 stamp"
+        )));
+    }
+    let functions = transaction
+        .query(
+            "SELECT function_row.proname, function_row.prosrc
+               FROM pg_catalog.pg_proc function_row
+               JOIN pg_catalog.pg_namespace namespace_row
+                 ON namespace_row.oid=function_row.pronamespace
+              WHERE namespace_row.nspname=$1
+              ORDER BY function_row.proname COLLATE \"C\"",
+            &[&schema],
+        )
+        .map_err(|error| pg_error("read Usage v16 function bodies", error))?
+        .into_iter()
+        .map(|row| {
+            let name = row.get::<_, String>(0);
+            let body = row.get::<_, String>(1);
+            (name, sha256_prefixed(body.as_bytes()))
+        })
+        .collect::<Vec<_>>();
+    let expected_functions = USAGE_SCHEMA_V16_FUNCTION_PROSRC_SHA256
+        .iter()
+        .map(|(name, digest)| ((*name).to_string(), (*digest).to_string()))
+        .collect::<Vec<_>>();
+    if functions != expected_functions {
+        return Err(MeteringError::Conflict(
+            "Usage schema v16 function prosrc digest set differs from the release; refusing repair"
+                .into(),
+        ));
+    }
+    let actual = usage_schema_catalog_sha256(transaction, schema)?;
+    if actual != USAGE_SCHEMA_V16_CATALOG_SHA256 {
+        return Err(MeteringError::Conflict(format!(
+            "Usage schema v16 catalog digest {actual} does not match release digest {USAGE_SCHEMA_V16_CATALOG_SHA256}; refusing repair"
+        )));
+    }
+    Ok(())
+}
+
+fn usage_schema_catalog_sha256(transaction: &mut Transaction<'_>, schema: &str) -> Result<String> {
+    let rows = transaction
+        .query(USAGE_SCHEMA_V16_CATALOG_SQL, &[&schema])
+        .map_err(|error| pg_error("read normalized Usage v16 catalog", error))?;
+    let mut bytes = Vec::new();
+    for row in rows {
+        for column in 0..4 {
+            let value = row.get::<_, String>(column);
+            bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
+            bytes.extend_from_slice(value.as_bytes());
+        }
+    }
+    Ok(sha256_prefixed(&bytes))
+}
+
+fn fresh_schema_sql(schema: &str) -> String {
     format!(
         r#"
-CREATE SCHEMA IF NOT EXISTS {schema};
-CREATE TABLE IF NOT EXISTS {schema}.schema_migrations (
-    version INTEGER PRIMARY KEY,
+CREATE TABLE {schema}.schema_migrations (
+    version INTEGER NOT NULL,
+    CONSTRAINT schema_migrations_pk PRIMARY KEY (version),
+    CONSTRAINT schema_migrations_version_exact CHECK (version = 16),
     applied_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
-CREATE TABLE IF NOT EXISTS {schema}.usage_checkpoints (
-    event_id TEXT PRIMARY KEY,
+CREATE TABLE {schema}.usage_checkpoints (
+    event_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
     source_epoch TEXT NOT NULL,
-    sequence BIGINT NOT NULL CHECK (sequence >= 0),
-    observed_at_ms BIGINT NOT NULL CHECK (observed_at_ms >= 0),
+    sequence BIGINT NOT NULL,
+    observed_at_ms BIGINT NOT NULL,
     metric TEXT NOT NULL,
-    cumulative_quantity NUMERIC(39, 0) NOT NULL CHECK (cumulative_quantity >= 0),
+    cumulative_quantity NUMERIC(39, 0) NOT NULL,
     billing_account_id TEXT NOT NULL,
     workspace_id TEXT NOT NULL,
     resource_type TEXT NOT NULL,
     resource_id TEXT NOT NULL,
     attributed_cat_id TEXT,
     payload_json TEXT NOT NULL,
+    source_binding_json TEXT NOT NULL
+        CONSTRAINT usage_checkpoints_source_binding_nonempty
+        CHECK (source_binding_json <> ''),
     ingested_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-    UNIQUE (source_id, source_epoch, metric, sequence)
+    CONSTRAINT usage_checkpoints_pk PRIMARY KEY (event_id),
+    CONSTRAINT usage_checkpoints_sequence_nonnegative CHECK (sequence >= 0),
+    CONSTRAINT usage_checkpoints_observed_nonnegative CHECK (observed_at_ms >= 0),
+    CONSTRAINT usage_checkpoints_quantity_nonnegative CHECK (cumulative_quantity >= 0),
+    CONSTRAINT usage_checkpoints_source_metric_sequence_unique
+        UNIQUE (source_id, source_epoch, metric, sequence)
 );
-CREATE INDEX IF NOT EXISTS usage_checkpoints_account_time_idx
+CREATE INDEX usage_checkpoints_account_time_idx
     ON {schema}.usage_checkpoints (billing_account_id, observed_at_ms);
-CREATE TABLE IF NOT EXISTS {schema}.usage_intervals (
-    end_event_id TEXT PRIMARY KEY
+CREATE TABLE {schema}.usage_archive_projections (
+    event_id TEXT NOT NULL,
+    stream_name TEXT NOT NULL,
+    archive_bucket TEXT NOT NULL,
+    shard_id TEXT NOT NULL,
+    sequence_number NUMERIC(78, 0) NOT NULL,
+    sequence_number_text TEXT NOT NULL,
+    archive_key TEXT NOT NULL,
+    archive_sha256 TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    projected_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT usage_archive_projections_pk PRIMARY KEY (event_id),
+    CONSTRAINT usage_archive_projections_event_fk FOREIGN KEY (event_id)
         REFERENCES {schema}.usage_checkpoints(event_id),
-    start_event_id TEXT NOT NULL
-        REFERENCES {schema}.usage_checkpoints(event_id),
+    CONSTRAINT usage_archive_projections_sequence_nonnegative
+        CHECK (sequence_number >= 0),
+    CONSTRAINT usage_archive_projections_sequence_text_canonical
+        CHECK (sequence_number_text ~ '^(0|[1-9][0-9]{{0,77}})$'),
+    CONSTRAINT usage_archive_projections_sequence_exact
+        CHECK (sequence_number = sequence_number_text::numeric),
+    CONSTRAINT usage_archive_projections_sha256_canonical
+        CHECK (archive_sha256 ~ '^sha256:[0-9a-f]{{64}}$'),
+    CONSTRAINT usage_archive_projections_evidence_nonempty
+        CHECK (evidence_json <> ''),
+    CONSTRAINT usage_archive_projections_stream_position_unique
+        UNIQUE (stream_name, shard_id, sequence_number)
+);
+CREATE TABLE {schema}.usage_source_terminal_receipts (
     source_id TEXT NOT NULL,
     source_epoch TEXT NOT NULL,
-    end_sequence BIGINT NOT NULL CHECK (end_sequence >= 0),
+    receipt_json TEXT NOT NULL,
+    receipt_sha256 TEXT NOT NULL,
+    completed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT usage_source_terminal_receipts_pk PRIMARY KEY (source_id, source_epoch),
+    CONSTRAINT usage_source_terminal_receipts_json_nonempty CHECK (receipt_json <> ''),
+    CONSTRAINT usage_source_terminal_receipts_sha256_canonical
+        CHECK (receipt_sha256 ~ '^sha256:[0-9a-f]{{64}}$')
+);
+CREATE TABLE {schema}.usage_terminal_operations (
+    terminal_epoch_id TEXT NOT NULL,
+    singleton_key BOOLEAN NOT NULL DEFAULT TRUE,
+    request_json TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    CONSTRAINT usage_terminal_operations_pk PRIMARY KEY (terminal_epoch_id),
+    CONSTRAINT usage_terminal_operations_epoch_canonical
+        CHECK (terminal_epoch_id ~ '^[0-9a-f]{{32}}$'
+               AND terminal_epoch_id <> repeat('0', 32)),
+    CONSTRAINT usage_terminal_operations_singleton_unique UNIQUE (singleton_key),
+    CONSTRAINT usage_terminal_operations_singleton_true CHECK (singleton_key),
+    CONSTRAINT usage_terminal_operations_request_nonempty CHECK (request_json <> ''),
+    CONSTRAINT usage_terminal_operations_sha256_canonical
+        CHECK (request_sha256 ~ '^sha256:[0-9a-f]{{64}}$'),
+    CONSTRAINT usage_terminal_operations_created_nonnegative CHECK (created_at_ms >= 0)
+);
+CREATE TABLE {schema}.usage_terminal_barrier_projections (
+    marker_id TEXT NOT NULL,
+    sequence_number NUMERIC(78, 0) NOT NULL,
+    sequence_number_text TEXT NOT NULL,
+    terminal_epoch_id TEXT NOT NULL,
+    shard_id TEXT NOT NULL,
+    marker_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    projected_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT usage_terminal_barrier_projections_pk
+        PRIMARY KEY (marker_id, sequence_number),
+    CONSTRAINT usage_terminal_barrier_projections_operation_fk
+        FOREIGN KEY (terminal_epoch_id)
+        REFERENCES {schema}.usage_terminal_operations(terminal_epoch_id),
+    CONSTRAINT usage_terminal_barrier_projections_marker_canonical
+        CHECK (marker_id ~ '^usage_terminal_marker_[0-9a-f]{{64}}$'),
+    CONSTRAINT usage_terminal_barrier_projections_sequence_nonnegative
+        CHECK (sequence_number >= 0),
+    CONSTRAINT usage_terminal_barrier_projections_sequence_text_canonical
+        CHECK (sequence_number_text ~ '^(0|[1-9][0-9]{{0,77}})$'),
+    CONSTRAINT usage_terminal_barrier_projections_sequence_exact
+        CHECK (sequence_number = sequence_number_text::numeric),
+    CONSTRAINT usage_terminal_barrier_projections_marker_nonempty CHECK (marker_json <> ''),
+    CONSTRAINT usage_terminal_barrier_projections_evidence_nonempty CHECK (evidence_json <> ''),
+    CONSTRAINT usage_terminal_barrier_projections_position_unique
+        UNIQUE (terminal_epoch_id, shard_id, sequence_number)
+);
+CREATE INDEX usage_terminal_barrier_operation_idx
+    ON {schema}.usage_terminal_barrier_projections
+       (terminal_epoch_id, shard_id, sequence_number);
+CREATE TABLE {schema}.usage_target_terminal_receipts (
+    terminal_epoch_id TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    receipt_sha256 TEXT NOT NULL,
+    completed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT usage_target_terminal_receipts_pk PRIMARY KEY (terminal_epoch_id),
+    CONSTRAINT usage_target_terminal_receipts_operation_fk FOREIGN KEY (terminal_epoch_id)
+        REFERENCES {schema}.usage_terminal_operations(terminal_epoch_id),
+    CONSTRAINT usage_target_terminal_receipts_json_nonempty CHECK (receipt_json <> ''),
+    CONSTRAINT usage_target_terminal_receipts_sha256_canonical
+        CHECK (receipt_sha256 ~ '^sha256:[0-9a-f]{{64}}$')
+);
+CREATE FUNCTION {schema}.reject_usage_terminal_mutation()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $function$
+BEGIN
+    RAISE EXCEPTION 'usage terminal evidence is insert-only';
+END
+$function$;
+CREATE TRIGGER usage_archive_projections_insert_only
+    BEFORE UPDATE OR DELETE ON {schema}.usage_archive_projections
+    FOR EACH ROW EXECUTE FUNCTION {schema}.reject_usage_terminal_mutation();
+CREATE TRIGGER usage_source_terminal_receipts_insert_only
+    BEFORE UPDATE OR DELETE ON {schema}.usage_source_terminal_receipts
+    FOR EACH ROW EXECUTE FUNCTION {schema}.reject_usage_terminal_mutation();
+CREATE TRIGGER usage_terminal_operations_insert_only
+    BEFORE UPDATE OR DELETE ON {schema}.usage_terminal_operations
+    FOR EACH ROW EXECUTE FUNCTION {schema}.reject_usage_terminal_mutation();
+CREATE TRIGGER usage_terminal_barrier_projections_insert_only
+    BEFORE UPDATE OR DELETE ON {schema}.usage_terminal_barrier_projections
+    FOR EACH ROW EXECUTE FUNCTION {schema}.reject_usage_terminal_mutation();
+CREATE TRIGGER usage_target_terminal_receipts_insert_only
+    BEFORE UPDATE OR DELETE ON {schema}.usage_target_terminal_receipts
+    FOR EACH ROW EXECUTE FUNCTION {schema}.reject_usage_terminal_mutation();
+CREATE TABLE {schema}.usage_intervals (
+    end_event_id TEXT NOT NULL,
+    start_event_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    source_epoch TEXT NOT NULL,
+    end_sequence BIGINT NOT NULL,
     interval_start_ms BIGINT NOT NULL,
     interval_end_ms BIGINT NOT NULL,
     metric TEXT NOT NULL,
-    quantity NUMERIC(39, 0) NOT NULL CHECK (quantity >= 0),
+    quantity NUMERIC(39, 0) NOT NULL,
     billing_account_id TEXT NOT NULL,
     workspace_id TEXT NOT NULL,
     resource_type TEXT NOT NULL,
     resource_id TEXT NOT NULL,
     attributed_cat_id TEXT,
-    CHECK (interval_end_ms > interval_start_ms)
+    CONSTRAINT usage_intervals_pk PRIMARY KEY (end_event_id),
+    CONSTRAINT usage_intervals_end_event_fk FOREIGN KEY (end_event_id)
+        REFERENCES {schema}.usage_checkpoints(event_id),
+    CONSTRAINT usage_intervals_start_event_fk FOREIGN KEY (start_event_id)
+        REFERENCES {schema}.usage_checkpoints(event_id),
+    CONSTRAINT usage_intervals_end_sequence_nonnegative CHECK (end_sequence >= 0),
+    CONSTRAINT usage_intervals_quantity_nonnegative CHECK (quantity >= 0),
+    CONSTRAINT usage_intervals_time_order CHECK (interval_end_ms > interval_start_ms)
 );
-CREATE INDEX IF NOT EXISTS usage_intervals_account_time_idx
+CREATE INDEX usage_intervals_account_time_idx
     ON {schema}.usage_intervals
         (billing_account_id, interval_start_ms, interval_end_ms);
-CREATE INDEX IF NOT EXISTS usage_intervals_cat_time_idx
+CREATE INDEX usage_intervals_cat_time_idx
     ON {schema}.usage_intervals
         (attributed_cat_id, interval_start_ms, interval_end_ms);
-CREATE OR REPLACE FUNCTION {schema}.reject_usage_checkpoint_mutation()
+CREATE FUNCTION {schema}.reject_usage_checkpoint_mutation()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $function$
@@ -972,48 +2238,37 @@ BEGIN
     RAISE EXCEPTION 'usage checkpoints are insert-only';
 END
 $function$;
-DROP TRIGGER IF EXISTS usage_checkpoints_insert_only
-    ON {schema}.usage_checkpoints;
 CREATE TRIGGER usage_checkpoints_insert_only
     BEFORE UPDATE OR DELETE ON {schema}.usage_checkpoints
     FOR EACH ROW EXECUTE FUNCTION {schema}.reject_usage_checkpoint_mutation();
-INSERT INTO {schema}.schema_migrations (version)
-VALUES (1) ON CONFLICT (version) DO NOTHING;
-DO $migration$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM {schema}.schema_migrations WHERE version = 2
-    ) THEN
-        ALTER TABLE {schema}.usage_checkpoints
-            ALTER COLUMN cumulative_quantity TYPE NUMERIC(39, 0)
-            USING cumulative_quantity::numeric;
-        ALTER TABLE {schema}.usage_intervals
-            ALTER COLUMN quantity TYPE NUMERIC(39, 0)
-            USING quantity::numeric;
-        INSERT INTO {schema}.schema_migrations (version) VALUES (2);
-    END IF;
-END
-$migration$;
-CREATE TABLE IF NOT EXISTS {schema}.billing_accounts (
-    billing_account_id TEXT PRIMARY KEY,
+CREATE TABLE {schema}.billing_accounts (
+    billing_account_id TEXT NOT NULL,
     account_id TEXT NOT NULL,
-    currency TEXT NOT NULL CHECK (currency = 'USD'),
+    currency TEXT NOT NULL,
     stripe_customer_id TEXT,
-    created_at_ms BIGINT NOT NULL CHECK (created_at_ms >= 0)
+    created_at_ms BIGINT NOT NULL,
+    CONSTRAINT billing_accounts_pk PRIMARY KEY (billing_account_id),
+    CONSTRAINT billing_accounts_currency_usd CHECK (currency = 'USD'),
+    CONSTRAINT billing_accounts_created_nonnegative CHECK (created_at_ms >= 0)
 );
-CREATE TABLE IF NOT EXISTS {schema}.credit_ledger_entries (
-    entry_id TEXT PRIMARY KEY,
-    billing_account_id TEXT NOT NULL
-        REFERENCES {schema}.billing_accounts(billing_account_id),
+CREATE TABLE {schema}.credit_ledger_entries (
+    entry_id TEXT NOT NULL,
+    billing_account_id TEXT NOT NULL,
     kind TEXT NOT NULL,
     amount_nanos NUMERIC(39, 0) NOT NULL,
-    currency TEXT NOT NULL CHECK (currency = 'USD'),
-    external_reference TEXT NOT NULL UNIQUE,
-    effective_at_ms BIGINT NOT NULL CHECK (effective_at_ms >= 0)
+    currency TEXT NOT NULL,
+    external_reference TEXT NOT NULL,
+    effective_at_ms BIGINT NOT NULL,
+    CONSTRAINT credit_ledger_entries_pk PRIMARY KEY (entry_id),
+    CONSTRAINT credit_ledger_entries_account_fk FOREIGN KEY (billing_account_id)
+        REFERENCES {schema}.billing_accounts(billing_account_id),
+    CONSTRAINT credit_ledger_entries_currency_usd CHECK (currency = 'USD'),
+    CONSTRAINT credit_ledger_entries_external_reference_unique UNIQUE (external_reference),
+    CONSTRAINT credit_ledger_entries_effective_nonnegative CHECK (effective_at_ms >= 0)
 );
-CREATE INDEX IF NOT EXISTS credit_ledger_account_time_idx
+CREATE INDEX credit_ledger_account_time_idx
     ON {schema}.credit_ledger_entries (billing_account_id, effective_at_ms);
-CREATE OR REPLACE FUNCTION {schema}.reject_credit_ledger_mutation()
+CREATE FUNCTION {schema}.reject_credit_ledger_mutation()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $function$
@@ -1021,91 +2276,40 @@ BEGIN
     RAISE EXCEPTION 'credit ledger entries are insert-only';
 END
 $function$;
-DROP TRIGGER IF EXISTS credit_ledger_insert_only
-    ON {schema}.credit_ledger_entries;
 CREATE TRIGGER credit_ledger_insert_only
     BEFORE UPDATE OR DELETE ON {schema}.credit_ledger_entries
     FOR EACH ROW EXECUTE FUNCTION {schema}.reject_credit_ledger_mutation();
-CREATE TABLE IF NOT EXISTS {schema}.checkout_intents (
-    intent_id TEXT PRIMARY KEY,
-    billing_account_id TEXT NOT NULL
-        REFERENCES {schema}.billing_accounts(billing_account_id),
+CREATE TABLE {schema}.checkout_intents (
+    intent_id TEXT NOT NULL,
+    billing_account_id TEXT NOT NULL,
     account_id TEXT NOT NULL,
-    amount_cents BIGINT NOT NULL CHECK (amount_cents > 0),
-    currency TEXT NOT NULL CHECK (currency = 'USD'),
-    created_at_ms BIGINT NOT NULL CHECK (created_at_ms >= 0),
-    stripe_session_id TEXT UNIQUE,
+    amount_cents BIGINT NOT NULL,
+    currency TEXT NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    stripe_session_id TEXT,
     checkout_url TEXT,
-    stripe_payment_intent_id TEXT UNIQUE,
-    status TEXT NOT NULL CHECK (status IN ('pending', 'paid'))
+    stripe_payment_intent_id TEXT,
+    status TEXT NOT NULL,
+    CONSTRAINT checkout_intents_pk PRIMARY KEY (intent_id),
+    CONSTRAINT checkout_intents_account_fk FOREIGN KEY (billing_account_id)
+        REFERENCES {schema}.billing_accounts(billing_account_id),
+    CONSTRAINT checkout_intents_amount_positive CHECK (amount_cents > 0),
+    CONSTRAINT checkout_intents_currency_usd CHECK (currency = 'USD'),
+    CONSTRAINT checkout_intents_created_nonnegative CHECK (created_at_ms >= 0),
+    CONSTRAINT checkout_intents_stripe_session_unique UNIQUE (stripe_session_id),
+    CONSTRAINT checkout_intents_stripe_payment_unique UNIQUE (stripe_payment_intent_id),
+    CONSTRAINT checkout_intents_status_valid CHECK (status IN ('pending', 'paid'))
 );
-CREATE TABLE IF NOT EXISTS {schema}.stripe_events (
-    event_id TEXT PRIMARY KEY,
+CREATE TABLE {schema}.stripe_events (
+    event_id TEXT NOT NULL,
     event_type TEXT NOT NULL,
     payload_sha256 TEXT NOT NULL,
     livemode BOOLEAN NOT NULL,
-    processed_at_ms BIGINT NOT NULL CHECK (processed_at_ms >= 0)
+    processed_at_ms BIGINT NOT NULL,
+    CONSTRAINT stripe_events_pk PRIMARY KEY (event_id),
+    CONSTRAINT stripe_events_processed_nonnegative CHECK (processed_at_ms >= 0)
 );
-INSERT INTO {schema}.schema_migrations (version)
-VALUES (3) ON CONFLICT (version) DO NOTHING;
-DO $migration$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM {schema}.schema_migrations WHERE version = 4
-    ) THEN
-        -- The Project -> Account rename (ADR-0018) changed this column in the
-        -- CREATE DDL without migrating databases that already had the table.
-        IF EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_schema = '{schema}'
-              AND table_name = 'billing_accounts'
-              AND column_name = 'project_id'
-        ) THEN
-            ALTER TABLE {schema}.billing_accounts
-                RENAME COLUMN project_id TO account_id;
-        END IF;
-        INSERT INTO {schema}.schema_migrations (version) VALUES (4);
-    END IF;
-END
-$migration$;
-DO $migration$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM {schema}.schema_migrations WHERE version = 5
-    ) THEN
-        -- Remaining legacy project_id columns from the same pre-rename shape:
-        -- the usage tables track the Workspace, checkout intents the Account.
-        IF EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_schema = '{schema}'
-              AND table_name = 'usage_checkpoints'
-              AND column_name = 'project_id'
-        ) THEN
-            ALTER TABLE {schema}.usage_checkpoints
-                RENAME COLUMN project_id TO workspace_id;
-        END IF;
-        IF EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_schema = '{schema}'
-              AND table_name = 'usage_intervals'
-              AND column_name = 'project_id'
-        ) THEN
-            ALTER TABLE {schema}.usage_intervals
-                RENAME COLUMN project_id TO workspace_id;
-        END IF;
-        IF EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_schema = '{schema}'
-              AND table_name = 'checkout_intents'
-              AND column_name = 'project_id'
-        ) THEN
-            ALTER TABLE {schema}.checkout_intents
-                RENAME COLUMN project_id TO account_id;
-        END IF;
-        INSERT INTO {schema}.schema_migrations (version) VALUES (5);
-    END IF;
-END
-$migration$;
+INSERT INTO {schema}.schema_migrations (version) VALUES (16);
 "#
     )
 }
@@ -1146,6 +2350,7 @@ fn ingest_checkpoint(
     let sequence = signed(value.checkpoint.sequence, "sequence")?;
     let cumulative_quantity = value.checkpoint.cumulative_quantity.to_string();
     let payload = serde_json::to_string(&value.checkpoint)?;
+    let source_binding_json = serde_json::to_string(&value.source_binding)?;
     let mut transaction = client
         .transaction()
         .map_err(|error| pg_error("start usage ingestion", error))?;
@@ -1163,7 +2368,7 @@ fn ingest_checkpoint(
         .map_err(|error| pg_error("lock usage source epoch", error))?;
 
     let existing_sql = format!(
-        "SELECT payload_json, billing_account_id, workspace_id,
+        "SELECT payload_json, source_binding_json, billing_account_id, workspace_id,
                 resource_type, resource_id, attributed_cat_id
            FROM {schema}.usage_checkpoints WHERE event_id=$1"
     );
@@ -1172,8 +2377,12 @@ fn ingest_checkpoint(
         .map_err(|error| pg_error("look up usage event", error))?
     {
         let existing_payload: String = row.get(0);
-        let existing_attribution = attribution_from_row(&row, 1);
-        if existing_payload == payload && existing_attribution == value.attribution {
+        let existing_source_binding: String = row.get(1);
+        let existing_attribution = attribution_from_row(&row, 2);
+        if existing_payload == payload
+            && existing_source_binding == source_binding_json
+            && existing_attribution == value.attribution
+        {
             transaction
                 .commit()
                 .map_err(|error| pg_error("commit duplicate usage event", error))?;
@@ -1183,6 +2392,34 @@ fn ingest_checkpoint(
             "event {} was replayed with a different payload",
             value.checkpoint.event_id
         )));
+    }
+
+    let target_terminal_sql = format!("SELECT 1 FROM {schema}.usage_terminal_operations LIMIT 1");
+    if transaction
+        .query_opt(&target_terminal_sql, &[])
+        .map_err(|error| pg_error("look up Usage target terminal operation", error))?
+        .is_some()
+    {
+        return Err(MeteringError::Conflict(
+            "Usage target is terminal and accepts no brand-new event".to_string(),
+        ));
+    }
+
+    let terminal_sql = format!(
+        "SELECT 1 FROM {schema}.usage_source_terminal_receipts
+          WHERE source_id=$1 AND source_epoch=$2"
+    );
+    if transaction
+        .query_opt(
+            &terminal_sql,
+            &[&value.checkpoint.source_id, &value.checkpoint.source_epoch],
+        )
+        .map_err(|error| pg_error("look up usage source terminal receipt", error))?
+        .is_some()
+    {
+        return Err(MeteringError::Conflict(
+            "source epoch is already terminal".to_string(),
+        ));
     }
 
     let attribution_sql = format!(
@@ -1206,6 +2443,26 @@ fn ingest_checkpoint(
         }
     }
 
+    let binding_sql = format!(
+        "SELECT source_binding_json
+           FROM {schema}.usage_checkpoints
+          WHERE source_id=$1 AND source_epoch=$2
+          LIMIT 1"
+    );
+    if let Some(row) = transaction
+        .query_opt(
+            &binding_sql,
+            &[&value.checkpoint.source_id, &value.checkpoint.source_epoch],
+        )
+        .map_err(|error| pg_error("look up usage runtime binding", error))?
+    {
+        if row.get::<_, String>(0) != source_binding_json {
+            return Err(MeteringError::Conflict(
+                "runtime authority changed inside one source epoch".to_string(),
+            ));
+        }
+    }
+
     let previous = adjacent_checkpoint(&mut transaction, schema, value, sequence, true)?;
     let next = adjacent_checkpoint(&mut transaction, schema, value, sequence, false)?;
     validate_adjacent(value, previous.as_ref(), next.as_ref())?;
@@ -1214,9 +2471,10 @@ fn ingest_checkpoint(
         "INSERT INTO {schema}.usage_checkpoints (
             event_id, source_id, source_epoch, sequence, observed_at_ms,
             metric, cumulative_quantity, billing_account_id, workspace_id,
-            resource_type, resource_id, attributed_cat_id, payload_json
+            resource_type, resource_id, attributed_cat_id, payload_json,
+            source_binding_json
          ) VALUES (
-            $1,$2,$3,$4,$5,$6,$7::text::numeric,$8,$9,$10,$11,$12,$13
+            $1,$2,$3,$4,$5,$6,$7::text::numeric,$8,$9,$10,$11,$12,$13,$14
          )"
     );
     transaction
@@ -1236,6 +2494,7 @@ fn ingest_checkpoint(
                 &value.attribution.resource_id,
                 &value.attribution.attributed_cat_id,
                 &payload,
+                &source_binding_json,
             ],
         )
         .map_err(|error| pg_error("insert usage checkpoint", error))?;
@@ -1582,6 +2841,17 @@ mod tests {
     use super::*;
     use cats_metering::{deterministic_event_id, UsageAggregate};
 
+    async fn drop_test_schema(url: String, schema: String) {
+        tokio::task::spawn_blocking(move || {
+            let mut cleanup = connect_client(&url, None, &schema).unwrap();
+            cleanup
+                .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+                .unwrap();
+        })
+        .await
+        .expect("join PostgreSQL test schema cleanup");
+    }
+
     /// The worker resolves this on every connect, so a rotated credential
     /// reaches the next reconnect instead of waiting for a restart that a
     /// stale credential would prevent anyway.
@@ -1662,7 +2932,7 @@ mod tests {
     /// says nothing about the credential that actually failed.
     #[test]
     fn a_worker_without_a_connection_reports_the_reason() {
-        let (jobs, receiver) = mpsc::channel::<Job>();
+        let (jobs, receiver) = std_mpsc::channel::<Job>();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         jobs.send(Box::new(move |client| {
             let _ = result_tx.send(match client {
@@ -1707,24 +2977,535 @@ mod tests {
     }
 
     #[test]
-    fn migration_makes_raw_checkpoints_insert_only() {
-        let sql = migration_sql("cats_usage");
+    fn fresh_v16_schema_has_one_stamp_and_no_upgrade_or_repair_path() {
+        let sql = fresh_schema_sql("cats_usage");
         assert!(sql.contains("BEFORE UPDATE OR DELETE"));
         assert!(sql.contains("usage_intervals"));
         assert!(sql.contains("schema_migrations"));
         assert!(sql.contains("NUMERIC(39, 0)"));
-        assert!(sql.contains("version = 2"));
-        assert!(sql.contains("VALUES (3) ON CONFLICT"));
-        // Rungs 4 and 5 heal databases created before the Project -> Account/
-        // Workspace rename, where the tables still carry project_id.
-        assert!(sql.contains("version = 4"));
-        assert!(sql.contains("RENAME COLUMN project_id TO account_id"));
-        assert!(sql.contains("version = 5"));
-        assert!(sql.contains("RENAME COLUMN project_id TO workspace_id"));
+        assert!(sql.contains("schema_migrations_version_exact CHECK (version = 16)"));
+        assert!(sql.contains("schema_migrations (version) VALUES (16)"));
+        assert_eq!(sql.matches("schema_migrations (version) VALUES").count(), 1);
+        assert!(!sql.contains("IF NOT EXISTS"));
+        assert!(!sql.contains("ON CONFLICT"));
+        assert!(!sql.contains("ALTER TABLE"));
+        assert!(!sql.contains("RENAME COLUMN"));
+        assert!(!sql.contains("CREATE OR REPLACE"));
+        assert!(!sql.contains("DROP TRIGGER"));
         assert!(sql.contains("credit_ledger_entries"));
         assert!(sql.contains("checkout_intents"));
         assert!(sql.contains("stripe_events"));
         assert!(sql.contains("reject_credit_ledger_mutation"));
+        assert!(USAGE_SCHEMA_V16_CATALOG_SQL.contains("pg_get_constraintdef"));
+        assert!(USAGE_SCHEMA_V16_CATALOG_SQL.contains("pg_get_indexdef"));
+        assert!(USAGE_SCHEMA_V16_CATALOG_SQL.contains("pg_get_triggerdef"));
+        assert!(USAGE_SCHEMA_V16_CATALOG_SQL.contains("pg_get_functiondef"));
+        assert_eq!(USAGE_SCHEMA_V16_CATALOG_SHA256.len(), 71);
+        assert!(USAGE_SCHEMA_V16_CATALOG_SHA256
+            .strip_prefix("sha256:")
+            .is_some_and(|digest| {
+                digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }));
+    }
+
+    #[test]
+    fn a_silent_postgres_peer_cannot_block_worker_startup() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release, released) = std_mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            released.recv().unwrap();
+            drop(stream);
+        });
+        let dsn = DsnSource::Literal(format!("postgres://cats@{address}/cats?sslmode=disable"));
+        let started = Instant::now();
+        let error = PostgresUsageStore::connect_from_with_timeouts(
+            &dsn,
+            None,
+            "cats_usage_silent_startup",
+            1,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+        )
+        .err()
+        .expect("silent PostgreSQL peer unexpectedly completed startup");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "silent peer exceeded the worker startup wall-clock bound"
+        );
+        assert!(error.to_string().contains("startup timed out"), "{error}");
+        release.send(()).unwrap();
+        peer.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_deadline_poisons_the_store_and_skips_queued_effects() {
+        let url = std::env::var("CATS_TEST_POSTGRES_URL")
+            .expect("CATS_TEST_POSTGRES_URL is required for PostgreSQL usage tests");
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let schema = format!("cats_usage_poison_{}_{}", std::process::id(), suffix);
+        let store = Arc::new(
+            PostgresUsageStore::connect_from_with_timeouts(
+                &DsnSource::Literal(url.clone()),
+                None,
+                &schema,
+                1,
+                Duration::from_secs(10),
+                Duration::from_millis(200),
+            )
+            .unwrap(),
+        );
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std_mpsc::channel();
+        let slow_store = Arc::clone(&store);
+        let slow = tokio::spawn(async move {
+            slow_store
+                .dispatch(move |_| {
+                    let _ = entered.send(());
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.unwrap();
+
+        struct Processed(std_mpsc::Sender<()>);
+        impl Drop for Processed {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+
+        let effects = Arc::new(AtomicUsize::new(0));
+        let (processed, processed_rx) = std_mpsc::channel();
+        let queued_store = Arc::clone(&store);
+        let queued_effects = Arc::clone(&effects);
+        let queued = tokio::spawn(async move {
+            let processed = Processed(processed);
+            queued_store
+                .dispatch(move |_| {
+                    let _processed = processed;
+                    queued_effects.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let error = slow.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("restart required"), "{error}");
+        let dispatches_before_rejection = store.next_worker.load(Ordering::SeqCst);
+        let rejected = store.dispatch(|_| Ok(())).await.unwrap_err();
+        assert_eq!(
+            store.next_worker.load(Ordering::SeqCst),
+            dispatches_before_rejection,
+            "a poisoned store admitted another worker job"
+        );
+        assert!(
+            rejected.to_string().contains("restart required"),
+            "{rejected}"
+        );
+        assert!(queued
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("restart required"));
+
+        release.send(()).unwrap();
+        processed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker did not discard the queued effect after poison");
+        assert_eq!(effects.load(Ordering::SeqCst), 0);
+        drop(store);
+        drop_test_schema(url, schema).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_waiting_for_a_worker_poisons_the_store() {
+        let url = std::env::var("CATS_TEST_POSTGRES_URL")
+            .expect("CATS_TEST_POSTGRES_URL is required for PostgreSQL usage tests");
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let schema = format!("cats_usage_cancel_{}_{}", std::process::id(), suffix);
+        let store = Arc::new(
+            PostgresUsageStore::connect_from_with_timeouts(
+                &DsnSource::Literal(url.clone()),
+                None,
+                &schema,
+                1,
+                Duration::from_secs(10),
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+        );
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std_mpsc::channel();
+        let (finished, finished_rx) = std_mpsc::channel();
+        let cancelled_store = Arc::clone(&store);
+        let cancelled = tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                cancelled_store.dispatch(move |_| {
+                    struct Finished(std_mpsc::Sender<()>);
+                    impl Drop for Finished {
+                        fn drop(&mut self) {
+                            let _ = self.0.send(());
+                        }
+                    }
+
+                    let _finished = Finished(finished);
+                    let _ = entered.send(());
+                    release_rx.recv().unwrap();
+                    Ok(())
+                }),
+            )
+            .await
+        });
+        entered_rx.await.unwrap();
+        assert!(cancelled.await.unwrap().is_err());
+        assert!(store.dispatch(|_| Ok(())).await.is_err());
+        release.send(()).unwrap();
+        finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancelled worker effect did not exit after release");
+        drop(store);
+        drop_test_schema(url, schema).await;
+    }
+
+    #[tokio::test]
+    async fn connection_statement_and_lock_stalls_are_bounded_and_the_worker_recovers() {
+        let url = std::env::var("CATS_TEST_POSTGRES_URL")
+            .expect("CATS_TEST_POSTGRES_URL is required for PostgreSQL usage tests");
+        assert_eq!(
+            client_config(&url).unwrap().get_connect_timeout(),
+            Some(&CONNECT_TIMEOUT),
+            "every initial connection and reconnect must bound its socket attempt"
+        );
+
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let schema = format!("cats_usage_bounds_{}_{}", std::process::id(), suffix);
+        let store = PostgresUsageStore::connect(&url, None, &schema, 1).unwrap();
+        let settings = store
+            .dispatch(|client| {
+                client
+                    .query(
+                        "SELECT name, setting FROM pg_settings
+                          WHERE name IN ('statement_timeout', 'lock_timeout')",
+                        &[],
+                    )
+                    .map(|rows| {
+                        rows.into_iter()
+                            .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+                            .collect::<Vec<_>>()
+                    })
+                    .map_err(|error| pg_error("read usage session failure bounds", error))
+            })
+            .await
+            .unwrap();
+        for (name, expected) in [
+            ("statement_timeout", STATEMENT_TIMEOUT.as_millis()),
+            ("lock_timeout", LOCK_TIMEOUT.as_millis()),
+        ] {
+            let expected = expected.to_string();
+            assert_eq!(
+                settings
+                    .iter()
+                    .find_map(|(setting, value)| (setting == name).then_some(value.as_str())),
+                Some(expected.as_str()),
+                "{name} was not installed on the worker session"
+            );
+        }
+
+        let worker_pid = store
+            .dispatch(|client| {
+                client
+                    .query_one("SELECT pg_backend_pid()", &[])
+                    .map(|row| row.get::<_, i32>(0))
+                    .map_err(|error| pg_error("read usage worker backend pid", error))
+            })
+            .await
+            .unwrap();
+        let blocker_url = url.clone();
+        let blocker_schema = schema.clone();
+        let mut blocker = tokio::task::spawn_blocking(move || {
+            let mut blocker = connect_client(&blocker_url, None, &blocker_schema).unwrap();
+            assert!(blocker
+                .query_one("SELECT pg_terminate_backend($1)", &[&worker_pid])
+                .unwrap()
+                .get::<_, bool>(0));
+            blocker
+        })
+        .await
+        .expect("join PostgreSQL worker termination setup");
+        let first_reconnect = tokio::time::timeout(
+            Duration::from_secs(10),
+            store.dispatch(|client| {
+                client
+                    .query_one("SELECT 1::INT", &[])
+                    .map(|row| row.get::<_, i32>(0))
+                    .map_err(|error| pg_error("probe first bounded usage reconnect", error))
+            }),
+        )
+        .await
+        .expect("usage reconnect exceeded its connection bound");
+        let reconnected = match first_reconnect {
+            Ok(value) => value,
+            Err(_) => tokio::time::timeout(
+                Duration::from_secs(10),
+                store.dispatch(|client| {
+                    client
+                        .query_one("SELECT 1::INT", &[])
+                        .map(|row| row.get::<_, i32>(0))
+                        .map_err(|error| pg_error("probe retried bounded usage reconnect", error))
+                }),
+            )
+            .await
+            .expect("retried usage reconnect exceeded its connection bound")
+            .unwrap(),
+        };
+        assert_eq!(reconnected, 1);
+
+        let statement_error = tokio::time::timeout(
+            Duration::from_secs(10),
+            store.dispatch(|client| {
+                client
+                    .simple_query("SELECT pg_sleep(30)")
+                    .map(|_| ())
+                    .map_err(|error| pg_error("exercise usage statement timeout", error))
+            }),
+        )
+        .await
+        .expect("server-side statement_timeout did not bound the worker")
+        .unwrap_err();
+        assert!(
+            statement_error.to_string().contains("[57014]"),
+            "statement was not canceled by PostgreSQL: {statement_error}"
+        );
+        assert_eq!(
+            store
+                .dispatch(|client| {
+                    client
+                        .query_one("SELECT 1::INT", &[])
+                        .map(|row| row.get::<_, i32>(0))
+                        .map_err(|error| pg_error("reuse worker after statement timeout", error))
+                })
+                .await
+                .unwrap(),
+            1
+        );
+
+        let lock_key = i64::try_from(suffix % u128::try_from(i64::MAX).unwrap()).unwrap();
+        blocker = tokio::task::spawn_blocking(move || {
+            blocker
+                .query_one("SELECT pg_advisory_lock($1)", &[&lock_key])
+                .unwrap();
+            blocker
+        })
+        .await
+        .expect("join PostgreSQL advisory-lock setup");
+        let lock_result = tokio::time::timeout(
+            Duration::from_secs(7),
+            store.dispatch(move |client| {
+                client
+                    .query_one("SELECT pg_advisory_lock($1)", &[&lock_key])
+                    .map(|_| ())
+                    .map_err(|error| pg_error("exercise usage lock timeout", error))
+            }),
+        )
+        .await;
+        tokio::task::spawn_blocking(move || drop(blocker))
+            .await
+            .expect("join PostgreSQL advisory-lock release");
+        let lock_error = lock_result
+            .expect("server-side lock_timeout did not bound the worker")
+            .unwrap_err();
+        assert!(
+            lock_error.to_string().contains("[55P03]"),
+            "lock wait was not canceled by PostgreSQL: {lock_error}"
+        );
+        assert_eq!(
+            store
+                .dispatch(|client| {
+                    client
+                        .query_one("SELECT 1::INT", &[])
+                        .map(|row| row.get::<_, i32>(0))
+                        .map_err(|error| pg_error("reuse worker after lock timeout", error))
+                })
+                .await
+                .unwrap(),
+            1
+        );
+
+        store
+            .dispatch(move |client| {
+                client
+                    .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+                    .map_err(|error| pg_error("drop failure-bounds test schema", error))
+            })
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn live_postgres_v16_refuses_old_partial_and_drifted_catalogs_without_repair() {
+        let Ok(url) = std::env::var("CATS_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let short_suffix = suffix % 1_000_000_000;
+        let mut admin = connect_uninitialized_client(&url, None).unwrap();
+        let old_schema = format!("cats_usage_old_{}_{}", std::process::id(), short_suffix);
+        admin
+            .batch_execute(&format!(
+                "CREATE SCHEMA {old_schema};
+                 CREATE TABLE {old_schema}.schema_migrations (version INTEGER PRIMARY KEY);
+                 INSERT INTO {old_schema}.schema_migrations VALUES (5);"
+            ))
+            .unwrap();
+        let old_error = connect_client(&url, None, &old_schema)
+            .err()
+            .expect("old Usage schema unexpectedly started");
+        assert!(old_error
+            .to_string()
+            .contains("not the one exact v16 stamp"));
+        assert_eq!(
+            admin
+                .query_one(
+                    &format!("SELECT version FROM {old_schema}.schema_migrations"),
+                    &[],
+                )
+                .unwrap()
+                .get::<_, i32>(0),
+            5
+        );
+
+        let partial_schema = format!("cats_usage_partial_{}_{}", std::process::id(), short_suffix);
+        admin
+            .batch_execute(&format!(
+                "CREATE SCHEMA {partial_schema};
+                 CREATE TABLE {partial_schema}.schema_migrations (version INTEGER PRIMARY KEY);
+                 INSERT INTO {partial_schema}.schema_migrations VALUES (16);"
+            ))
+            .unwrap();
+        let partial_error = connect_client(&url, None, &partial_schema)
+            .err()
+            .expect("partial Usage schema unexpectedly started");
+        assert!(partial_error.to_string().contains("prosrc digest"));
+        assert_eq!(
+            admin
+                .query_one(
+                    "SELECT count(*)::BIGINT FROM pg_catalog.pg_class class_row
+                     JOIN pg_catalog.pg_namespace namespace_row
+                       ON namespace_row.oid=class_row.relnamespace
+                     WHERE namespace_row.nspname=$1",
+                    &[&partial_schema],
+                )
+                .unwrap()
+                .get::<_, i64>(0),
+            2,
+            "failed startup must not create or repair any partial relation"
+        );
+
+        fn catalog_digest(client: &mut Client, schema: &str) -> String {
+            let mut transaction = client.transaction().unwrap();
+            let digest = usage_schema_catalog_sha256(&mut transaction, schema).unwrap();
+            transaction.rollback().unwrap();
+            digest
+        }
+
+        for drift in [
+            "extra_relation",
+            "missing_relation",
+            "missing_column",
+            "constraint_definition",
+            "index_definition",
+            "trigger_definition",
+            "function_body",
+        ] {
+            let schema = format!(
+                "cats_usage_drift_{}_{}_{}",
+                drift,
+                std::process::id(),
+                short_suffix
+            );
+            drop(connect_client(&url, None, &schema).unwrap());
+            PostgresUsageStore::verify_existing_schema_v16(&url, None, &schema).unwrap();
+            let mutation = match drift {
+                "extra_relation" => format!("CREATE TABLE {schema}.foreign_table (id INTEGER)"),
+                "missing_relation" => format!("DROP TABLE {schema}.stripe_events"),
+                "missing_column" => {
+                    format!("ALTER TABLE {schema}.stripe_events DROP COLUMN event_type")
+                }
+                "constraint_definition" => format!(
+                    "ALTER TABLE {schema}.usage_checkpoints
+                       DROP CONSTRAINT usage_checkpoints_sequence_nonnegative;
+                     ALTER TABLE {schema}.usage_checkpoints
+                       ADD CONSTRAINT usage_checkpoints_sequence_nonnegative CHECK (sequence >= -1)"
+                ),
+                "index_definition" => format!(
+                    "DROP INDEX {schema}.usage_checkpoints_account_time_idx;
+                     CREATE INDEX usage_checkpoints_account_time_idx
+                       ON {schema}.usage_checkpoints (workspace_id, observed_at_ms)"
+                ),
+                "trigger_definition" => format!(
+                    "DROP TRIGGER usage_checkpoints_insert_only ON {schema}.usage_checkpoints;
+                     CREATE TRIGGER usage_checkpoints_insert_only
+                       BEFORE DELETE ON {schema}.usage_checkpoints
+                       FOR EACH ROW EXECUTE FUNCTION {schema}.reject_usage_checkpoint_mutation()"
+                ),
+                "function_body" => format!(
+                    "CREATE OR REPLACE FUNCTION {schema}.reject_usage_checkpoint_mutation()
+                     RETURNS trigger LANGUAGE plpgsql AS $body$
+                     BEGIN RAISE EXCEPTION 'changed insert-only authority'; END
+                     $body$"
+                ),
+                _ => unreachable!(),
+            };
+            admin.batch_execute(&mutation).unwrap();
+            let before = catalog_digest(&mut admin, &schema);
+            let error =
+                PostgresUsageStore::verify_existing_schema_v16(&url, None, &schema).unwrap_err();
+            assert!(
+                error.to_string().contains("catalog digest")
+                    || error.to_string().contains("prosrc digest"),
+                "{drift} returned {error}"
+            );
+            assert_eq!(before, catalog_digest(&mut admin, &schema));
+            assert_eq!(
+                admin
+                    .query_one(
+                        &format!("SELECT version FROM {schema}.schema_migrations"),
+                        &[],
+                    )
+                    .unwrap()
+                    .get::<_, i32>(0),
+                USAGE_SCHEMA_VERSION
+            );
+            admin
+                .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+                .unwrap();
+        }
+        admin
+            .batch_execute(&format!(
+                "DROP SCHEMA {old_schema} CASCADE;
+                 DROP SCHEMA {partial_schema} CASCADE;"
+            ))
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1749,11 +3530,32 @@ mod tests {
                 cat_id: "cat-a".to_string(),
                 cat_generation: 7,
                 metric,
+                epoch_marker: cats_api::metering::UsageEpochMarker::Open,
                 cumulative_quantity,
             };
             checkpoint.event_id = deterministic_event_id(&checkpoint);
             AttributedCheckpoint {
                 checkpoint,
+                source_binding: cats_metering::RuntimeUsageSourceBinding {
+                    session: cats_api::runtime_reconciliation::SessionBinding {
+                        node_id: cats_api::runtime_reconciliation::Id::new("node-a").unwrap(),
+                        node_boot_id: cats_api::runtime_reconciliation::NodeBootId::new(
+                            "11111111111111111111111111111111",
+                        )
+                        .unwrap(),
+                        agent_instance_id: cats_api::runtime_reconciliation::RandomId128::new(
+                            "22222222222222222222222222222222",
+                        )
+                        .unwrap(),
+                        agent_session_epoch: cats_api::runtime_reconciliation::Epoch::new(1)
+                            .unwrap(),
+                    },
+                    desired_revision: cats_api::runtime_reconciliation::Revision::new(7).unwrap(),
+                    runtime_incarnation: cats_api::runtime_reconciliation::RandomId128::new(
+                        "33333333333333333333333333333333",
+                    )
+                    .unwrap(),
+                },
                 attribution: UsageAttribution {
                     billing_account_id: "ba-org-a".to_string(),
                     workspace_id: "workspace-a".to_string(),

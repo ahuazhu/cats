@@ -17,9 +17,7 @@ use cats_api::runtime_reconciliation::{
 use cats_control_plane::controller::AutoTierPolicy;
 use cats_control_plane::server::{spawn, Config, Handle};
 use cats_control_plane::store::DsnSource;
-use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_metering::SqliteUsageStore;
-use cats_storage::MetadataStore;
 use reqwest::{Method, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -73,8 +71,6 @@ impl Context {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let usage = Arc::new(SqliteUsageStore::open(&dir.path().join("usage.db")).unwrap());
-        let storage_meta: Arc<dyn MetadataStore> =
-            Arc::new(SqliteMetadataStore::open(&dir.path().join("storage.db")).unwrap());
         let receipt = cats_control_plane::testsupport::test_guest_runtime_profile_receipt();
         let server = spawn(Config {
             listen: "127.0.0.1:0".into(),
@@ -84,12 +80,15 @@ impl Context {
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: usage,
-            storage_meta,
+            #[cfg(debug_assertions)]
+            retired_storage_meta_for_tests: None,
             image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
             auth_token: SERVICE_TOKEN.into(),
             guest_runtime_profile_receipt: receipt.clone(),
             runtime_provisioner_trust_bundle:
                 cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
+            production_cutover_operator_trust_bundle:
+                cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
             route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
             admin_token: ADMIN_TOKEN.into(),
             workos: None,
@@ -110,6 +109,12 @@ impl Context {
         let identity = NodeIdentity {
             version: ContractVersion::V1,
             node_id: Id::new("node_spine_a").unwrap(),
+            provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+                provider: Id::new("test_provider").unwrap(),
+                partition: Id::new("test_partition").unwrap(),
+                account_id: Id::new("test_account").unwrap(),
+                region: Id::new("test_region").unwrap(),
+            },
             immutable_host_id: Id::new("host_spine_a").unwrap(),
             credential_id: signer.credential_id().clone(),
             credential_binding: CredentialBinding::PublicKey {

@@ -10,6 +10,12 @@ import {
   parseCatCreateV2AcceptedResponseBody,
   sendDurableCatCreateV2,
 } from "./cat-create-v2.mjs";
+import {
+  buildPersistentDiskCreateV1Request,
+  listPendingPersistentDiskCreateV1,
+  persistentDiskCreateV1Path,
+  sendDurablePersistentDiskCreateV1,
+} from "./persistent-disk-create-v1.mjs";
 
 const DIGEST = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -190,18 +196,34 @@ test("accepted response is flat and exact", () => {
   ));
 });
 
-test("closed legacy authority paths fail locally while exact create remains allowed", () => {
+test("runtime read paths and exact creates are allowed while retired authority stays local", () => {
   assert.doesNotThrow(() => assertRuntimeCutoverClientRequestSupported(
     "/v1/workspaces/ws_01/cats",
     "POST",
   ));
+  assert.doesNotThrow(() => assertRuntimeCutoverClientRequestSupported(
+    "/v1/workspaces/ws_01/disks",
+    "POST",
+  ));
+  for (const path of [
+    "/v1/workspaces/ws_01/cats",
+    "/v1/workspaces/ws_01/cats?limit=100",
+    "/v1/workspaces/ws_01/cats/cat_01",
+    "/v1/workspaces/ws_01/disks",
+    "/v1/workspaces/ws_01/disks/disk_01",
+    "/v1/workspaces/ws_01/operations/op_01",
+  ]) {
+    assert.doesNotThrow(() => assertRuntimeCutoverClientRequestSupported(path, "GET"), path);
+  }
   for (const [method, path] of [
-    ["GET", "/v1/workspaces/ws_01/cats"],
     ["POST", "/v1/workspaces//cats"],
-    ["GET", "/v1/workspaces/ws_01/cats/cat_01"],
+    ["GET", "/v1/workspaces/ws_01/cats/app"],
+    ["GET", "/v1/workspaces/ws_01/cats/disk_01"],
+    ["GET", "/v1/workspaces/ws_01/cats/cat_01?view=full"],
     ["POST", "/v1/workspaces/ws_01/cats/cat_01/actions/start"],
     ["POST", "/v1/workspaces/ws_01/cats/cat_01/endpoints"],
-    ["GET", "/v1/workspaces/ws_01/disks"],
+    ["GET", "/v1/workspaces/ws_01/disks/data"],
+    ["GET", "/v1/workspaces/ws_01/disks/cat_01"],
     ["GET", "/v1/workspaces/ws_01/operations"],
     ["GET", "/v1/operations/op_01"],
     ["GET", "/v1/admin/monitoring"],
@@ -214,6 +236,134 @@ test("closed legacy authority paths fail locally while exact create remains allo
       `${method} ${path}`,
     );
   }
+});
+
+test("PersistentDisk builder emits the closed V1 DTO with an explicit Strict default", () => {
+  assert.equal(
+    JSON.stringify(buildPersistentDiskCreateV1Request({ name: "data", sizeGib: 1 })),
+    '{"durability":"strict","name":"data","size_bytes":1073741824}',
+  );
+  assert.throws(
+    () => buildPersistentDiskCreateV1Request({ name: "data", sizeGib: "" }),
+    /size_bytes.*positive safe integer/,
+  );
+  assert.throws(
+    () => buildPersistentDiskCreateV1Request({ name: "data", sizeGib: 1, durability: "" }),
+    /durability/,
+  );
+});
+
+test("PersistentDisk browser create sends one canonical request and clears recovery state", async () => {
+  const pendingStore = new MemoryDurablePendingStore();
+  const workspaceId = "ws_01";
+  const path = persistentDiskCreateV1Path(workspaceId);
+  const requestBody = JSON.stringify(buildPersistentDiskCreateV1Request({
+    name: "data",
+    sizeGib: 1,
+  }));
+  let observed;
+  const disk = await sendDurablePersistentDiskCreateV1({
+    pendingStore,
+    lockManager: new MemoryLocks(),
+    workspaceId,
+    path,
+    requestBody,
+    idempotencyKeyFactory: () => "disk-success-key",
+    send: async (requestPath, options) => {
+      assert.equal(requestPath, path);
+      assert.equal(options.body, requestBody);
+      assert.deepEqual(options.headers, {
+        "Content-Type": "application/json",
+        "Idempotency-Key": "disk-success-key",
+      });
+      return {
+        status: 201,
+        contentType: "application/json",
+        contentEncoding: "",
+        body: '{"id":"disk_11111111111111111111111111111111","workspace_id":"ws_01","name":"data","kind":"persistent","size_bytes":1073741824,"state":"available","durability":"strict","volume_id":"vol_22222222222222222222222222222222","created_at_unix":1720000000}',
+      };
+    },
+    onCreated: (created) => { observed = created; },
+  });
+  assert.equal(disk.id, "disk_11111111111111111111111111111111");
+  assert.deepEqual(observed, disk);
+  assert.equal(
+    (await listPendingPersistentDiskCreateV1({ pendingStore, workspaceId })).length,
+    0,
+  );
+});
+
+test("PersistentDisk response loss replays the exact path, body, and Idempotency-Key", async () => {
+  const pendingStore = new MemoryDurablePendingStore();
+  const lockManager = new MemoryLocks();
+  const workspaceId = "ws_01";
+  const path = persistentDiskCreateV1Path(workspaceId);
+  const requestBody = JSON.stringify(buildPersistentDiskCreateV1Request({
+    name: "data",
+    sizeGib: 1,
+  }));
+  const responseBody = '{"id":"disk_11111111111111111111111111111111","workspace_id":"ws_01","name":"data","kind":"persistent","size_bytes":1073741824,"state":"available","durability":"strict","volume_id":"vol_22222222222222222222222222222222","created_at_unix":1720000000}';
+  const requests = [];
+  let loseResponse = true;
+  const send = async (requestPath, options) => {
+    requests.push({ path: requestPath, ...options });
+    if (loseResponse) {
+      loseResponse = false;
+      throw new Error("connection closed after commit");
+    }
+    return {
+      status: 201,
+      contentType: "application/json",
+      contentEncoding: "",
+      body: responseBody,
+    };
+  };
+
+  await assert.rejects(sendDurablePersistentDiskCreateV1({
+    pendingStore,
+    lockManager,
+    workspaceId,
+    path,
+    requestBody,
+    send,
+    idempotencyKeyFactory: () => "disk-create-key",
+  }), /remains pending/);
+  const [pending] = await listPendingPersistentDiskCreateV1({ pendingStore, workspaceId });
+  assert.ok(pending);
+  const disk = await sendDurablePersistentDiskCreateV1({
+    pendingStore,
+    lockManager,
+    workspaceId,
+    path: pending.path,
+    requestBody: pending.requestBody,
+    send,
+    expectedPending: pending.expectedPending,
+    idempotencyKeyFactory: () => { throw new Error("replay minted a new key"); },
+  });
+
+  assert.equal(disk.id, "disk_11111111111111111111111111111111");
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests[1], requests[0]);
+  assert.equal(requests[0].path, path);
+  assert.equal(requests[0].body, requestBody);
+  assert.equal(requests[0].headers["Idempotency-Key"], "disk-create-key");
+  assert.equal(
+    (await listPendingPersistentDiskCreateV1({ pendingStore, workspaceId })).length,
+    0,
+  );
+});
+
+test("missing PersistentDisk DTO fields send no request", async () => {
+  let sends = 0;
+  await assert.rejects(sendDurablePersistentDiskCreateV1({
+    pendingStore: new MemoryDurablePendingStore(),
+    lockManager: new MemoryLocks(),
+    workspaceId: "ws_01",
+    path: persistentDiskCreateV1Path("ws_01"),
+    requestBody: '{"durability":"strict","size_bytes":1073741824}',
+    send: async () => { sends += 1; },
+  }), /fields/);
+  assert.equal(sends, 0);
 });
 
 test("commit then lost response replays exact path, body, and key after page restart", async () => {

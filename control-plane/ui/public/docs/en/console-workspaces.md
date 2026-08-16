@@ -35,11 +35,13 @@ An Organization member with `cats:members:manage` can send an email invitation w
 
 The console provides:
 
-- Fleet-independent overview of your Cats, sleeping states, disks, and active Operations.
-- Create, start, suspend, Warm, stop, exec, expose, and destroy actions for Cats.
-- Create, snapshot, mount, unmount, resize, and delete actions for disks.
+- Workspace-scoped Cat and PersistentDisk creation with current product reads.
+- Strict browser-persistent replay of the exact request and Idempotency-Key after an ambiguous create response.
+- Exact accepted Operation identity for Cat create; there is no Operation collection.
 - Near-real-time provisional billing by meter and Cat, with a selected Cat's range total, per-meter totals, over-time spend curves, and bounded period detail.
 - Structured status and error display with automatic session refresh.
+
+Lifecycle and other Cat/Disk mutation controls are absent during the signed runtime cutover. The browser fails those paths locally and does not offer a legacy fallback.
 
 ## Language switching
 

@@ -28,8 +28,10 @@ use cats_blockd::image;
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_object_store_aws_s3::AwsS3BlobStoreFactory;
 use cats_object_store_file::FileBlobStore;
+use cats_storage::authority::VolumeDurability;
 use cats_storage::blob::{BlobStore, Result as BlobResult};
 use cats_storage::{open_blob_store, AdapterConfig, BlobStoreFactory, MetadataStore, VolumeHead};
+use cats_test_support::{prepare_sqlite_authorized_serving, SqliteTestVolumeGrant};
 
 const CHUNK: u64 = cats_api::chunk::CHUNK_SIZE as u64;
 const MIB: f64 = 1024.0 * 1024.0;
@@ -112,7 +114,7 @@ struct Env {
     _dir: tempfile::TempDir,
     root: PathBuf,
     blob: Arc<GoldenRootAccountingBlob>,
-    meta: Arc<dyn MetadataStore>,
+    meta: Arc<SqliteMetadataStore>,
     counters: Arc<Counters>,
 }
 
@@ -123,8 +125,7 @@ fn env(run: &str) -> Env {
         inner: object_store(dir.path(), run),
         counters: counters.clone(),
     });
-    let meta: Arc<dyn MetadataStore> =
-        Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).expect("meta"));
+    let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).expect("meta"));
     Env {
         root: dir.path().to_path_buf(),
         _dir: dir,
@@ -162,12 +163,27 @@ fn attach(env: &Env, volume: &str, size: u64) -> Arc<ChunkEngine> {
         Ok(()) | Err(cats_storage::MetaError::AlreadyExists(_)) => {}
         Err(error) => panic!("create volume: {error}"),
     }
-    let mut cfg = EngineConfig::new(volume, env.root.join(format!("data-{volume}")), volume);
+    let epoch = env.meta.load_head(volume).unwrap().lease_epoch + 1;
+    let data_dir = env.root.join(format!("data-{volume}"));
+    let mut cfg = EngineConfig::new(volume, &data_dir, volume);
     // A benchmark deliberately runs commits that take tens of seconds against a
     // remote store; the 5 s default lease would expire under the copy path and
     // fail the CAS, which is a property of the benchmark, not of the code.
     cfg.lease_ttl_ms = bench_lease_ttl_ms();
-    ChunkEngine::attach(cfg, env.blob.clone(), env.meta.clone()).expect("attach")
+    let (attachment, authority) = prepare_sqlite_authorized_serving(
+        &env.root.join("meta.db"),
+        &data_dir,
+        SqliteTestVolumeGrant::new(
+            volume,
+            volume,
+            epoch,
+            u64::try_from(cfg.lease_ttl_ms).unwrap(),
+            VolumeDurability::Strict,
+        ),
+    )
+    .expect("external grant");
+    ChunkEngine::attach_authorized_serving(cfg, attachment, env.blob.clone(), authority)
+        .expect("attach")
 }
 
 /// The old path: write the image through the engine and commit it.
@@ -185,7 +201,7 @@ fn provision_by_copy(env: &Env, volume: &str, image: &Path, size: u64) {
         offset = end;
     }
     engine.flush().expect("seed flush");
-    engine.detach().unwrap();
+    engine.stop_authorized_serving().unwrap();
 }
 
 /// The new path: reference the already-published image.
@@ -199,7 +215,7 @@ fn provision_by_reference(
     engine
         .provision_from_image(manifest)
         .expect("provision from image");
-    engine.detach().unwrap();
+    engine.stop_authorized_serving().unwrap();
 }
 
 fn head(env: &Env, volume: &str) -> VolumeHead {
@@ -383,7 +399,7 @@ fn first_read_of_a_referenced_chunk_versus_a_private_one() {
             engine.read(chunk * CHUNK, &mut buf).expect("cold read");
         }
         let elapsed = started.elapsed().as_secs_f64();
-        engine.detach().unwrap();
+        engine.stop_authorized_serving().unwrap();
         println!(
             "{:>12} {:>18.1} {:>18.0}",
             if by_reference { "reference" } else { "copy" },

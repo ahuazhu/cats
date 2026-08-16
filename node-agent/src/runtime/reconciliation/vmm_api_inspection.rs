@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 #[cfg(target_os = "linux")]
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
-    HostPath, PrepareDeviceFrontend, RuntimeCheckpoint, RuntimeLaunchIdentity,
+    HostPath, PrepareDeviceFrontend, ProcessState, RuntimeCheckpoint, RuntimeLaunchIdentity,
 };
 use serde::Deserialize;
 
@@ -156,6 +156,7 @@ pub(super) struct VmmPingEvidence {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct VmmInfoEvidence {
+    state: ProcessState,
     vcpus: u32,
     memory_bytes: u64,
     guest_cid: u32,
@@ -183,6 +184,10 @@ impl ExactVmmApiProof {
 
     pub(super) fn info(&self) -> &VmmInfoEvidence {
         &self.info
+    }
+
+    pub(super) fn process_state(&self) -> ProcessState {
+        self.info.state
     }
 
     pub(super) fn assert_current(
@@ -635,7 +640,12 @@ struct VsockConfigWire {
 
 impl VmInfoWire {
     fn exact(self, expected: &VmmApiExpectation) -> Option<VmmInfoEvidence> {
-        if self.state != VmStateWire::Running || self.memory_actual_size != expected.memory_bytes {
+        let state = match self.state {
+            VmStateWire::Running => ProcessState::Running,
+            VmStateWire::Paused => ProcessState::Paused,
+            VmStateWire::Created | VmStateWire::Shutdown => return None,
+        };
+        if self.memory_actual_size != expected.memory_bytes {
             return None;
         }
         let host_mac = self.config.exact(expected)?;
@@ -644,6 +654,7 @@ impl VmInfoWire {
         // configurable device family is closed below through `VmConfig`.
         let _ = self.device_tree;
         Some(VmmInfoEvidence {
+            state,
             vcpus: expected.vcpus,
             memory_bytes: expected.memory_bytes,
             guest_cid: expected.guest_cid,
@@ -2008,6 +2019,31 @@ mod tests {
     }
 
     #[test]
+    fn v53_vm_info_preserves_running_vs_paused_as_physical_evidence() {
+        let expected = expectation();
+        let running = serde_json::from_slice::<VmInfoWire>(&exact_vm_info())
+            .unwrap()
+            .exact(&expected)
+            .unwrap();
+        assert_eq!(running.state, ProcessState::Running);
+
+        let mut paused = serde_json::from_slice::<serde_json::Value>(&exact_vm_info()).unwrap();
+        paused["state"] = serde_json::json!("Paused");
+        let paused = serde_json::from_value::<VmInfoWire>(paused)
+            .unwrap()
+            .exact(&expected)
+            .unwrap();
+        assert_eq!(paused.state, ProcessState::Paused);
+
+        let mut created = serde_json::from_slice::<serde_json::Value>(&exact_vm_info()).unwrap();
+        created["state"] = serde_json::json!("Created");
+        assert!(serde_json::from_value::<VmInfoWire>(created)
+            .unwrap()
+            .exact(&expected)
+            .is_none());
+    }
+
+    #[test]
     fn v53_vm_info_rejects_extra_device_families_and_unknown_device_fields() {
         let expected = expectation();
         let mut extra_family =
@@ -2091,6 +2127,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn fd71_and_sole_holder_are_both_required_for_api_identity() {
+        // The sole-holder proof inspects foreign process descriptors, which
+        // the unprivileged native build-host sandbox cannot do; the Docker
+        // and metal root gates execute the full matrix.
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: process holder proofs require the root gates");
+            return;
+        }
         for duplicate_api_holder in [false, true] {
             let temporary = tempfile::tempdir().unwrap();
             let api_path = temporary.path().join("api.sock");

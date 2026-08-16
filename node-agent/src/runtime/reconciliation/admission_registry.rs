@@ -7,7 +7,7 @@
 //! empty registry and every cell is initialized from a fail-closed snapshot;
 //! neither a stable checkpoint nor an Active route reconstructs admission.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -108,13 +108,36 @@ enum RegistrySlot {
 struct RegistryState {
     next_generation: u64,
     entries: BTreeMap<Id, RegistrySlot>,
+    emergency_route_disable_latched: bool,
+}
+
+/// Serializes an admission publication against an emergency empty-ring close.
+///
+/// The registry mutex remains held from Route Grant verification through the
+/// cell admission, or across the complete gate-open sequencer. An empty-ring
+/// installer therefore either closes an already-published admission or wins
+/// first and prevents that publication from starting.
+pub(crate) struct RouteAdmissionPublicationGuard<'a> {
+    state: MutexGuard<'a, RegistryState>,
+}
+
+impl RouteAdmissionPublicationGuard<'_> {
+    pub(crate) fn cell(&self, cat_id: &Id) -> Option<Arc<AdmissionCell>> {
+        match self.state.entries.get(cat_id) {
+            Some(RegistrySlot::Ready(session)) => Some(Arc::clone(session.cell())),
+            Some(RegistrySlot::Initializing { .. }) | None => None,
+        }
+    }
 }
 
 /// One Node process's complete set of live admission cells.
 ///
-/// Registry locking never covers checkpoint I/O or an AdmissionCell
-/// operation. A not-yet-published slot is unavailable to route lookup and a
-/// failed initializer removes only its own generation.
+/// Ordinary registry mutation never covers checkpoint I/O or an AdmissionCell
+/// operation. The one deliberate exception is
+/// [`RouteAdmissionPublicationGuard`], which serializes a complete gate-open
+/// publication against emergency disable. A not-yet-published slot is
+/// unavailable to route lookup and a failed initializer removes only its own
+/// generation.
 pub(crate) struct AdmissionCellRegistry {
     checkpoint_directory: PathBuf,
     state: Mutex<RegistryState>,
@@ -131,10 +154,28 @@ impl AdmissionCellRegistry {
             state: Mutex::new(RegistryState {
                 next_generation: 1,
                 entries: BTreeMap::new(),
+                emergency_route_disable_latched: false,
             }),
         })
     }
 
+    /// Acquire the process-wide Route admission publication barrier.
+    ///
+    /// `None` is a durable-for-this-process emergency disable. It is cleared
+    /// only by constructing a successor process from a nonempty fixed ring;
+    /// a live process that observed an empty ring must never reopen a gate on
+    /// its own stale Desired state.
+    pub(crate) fn begin_route_admission_publication(
+        &self,
+    ) -> Result<Option<RouteAdmissionPublicationGuard<'_>>, AdmissionRegistryError> {
+        let state = self.lock_mutating()?;
+        if state.emergency_route_disable_latched {
+            return Ok(None);
+        }
+        Ok(Some(RouteAdmissionPublicationGuard { state }))
+    }
+
+    #[cfg(test)]
     pub(crate) fn get(&self, cat_id: &Id) -> Option<Arc<AdmissionCell>> {
         let state = self.lock_observing().ok()?;
         match state.entries.get(cat_id) {
@@ -371,6 +412,35 @@ impl AdmissionCellRegistry {
         // `ready_sessions` uses the observing poison path, which itself
         // closes and clears every reachable Ready slot before returning Err.
     }
+
+    /// Permanently fail-close Route admission in this process.
+    ///
+    /// This is distinct from ordinary scan-error fail-close: installing or
+    /// replaying an emergency empty ring is an authority transition, so a
+    /// later reconciler iteration may not reopen behind the installer's ACK.
+    pub(crate) fn latch_emergency_route_disable(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.emergency_route_disable_latched = true;
+        close_slots(state.entries.values());
+    }
+
+    pub(crate) fn fail_close_cats(&self, cat_ids: &BTreeSet<Id>) {
+        for cat_id in cat_ids {
+            match self.existing_session(cat_id) {
+                Ok(Some(session)) => session.close(),
+                Ok(None) => {}
+                Err(_) => {
+                    // The observing poison/Initializing paths cannot provide
+                    // a trustworthy subset. Close every reachable session.
+                    self.fail_close_all();
+                    return;
+                }
+            }
+        }
+    }
 }
 
 fn take_generation(state: &mut RegistryState) -> Result<u64, AdmissionRegistryError> {
@@ -517,5 +587,48 @@ mod tests {
             second.cell().snapshot().lifecycle_admission(),
             LifecycleAdmission::Closed
         );
+    }
+
+    #[test]
+    fn emergency_disable_closes_the_owned_publication_and_latches_future_opens() {
+        let (root, cat_id, snapshot) = fixture();
+        let registry = AdmissionCellRegistry::new(root.path().to_path_buf());
+        let created = registry
+            .ensure_closed(&cat_id, snapshot, None)
+            .expect("create session");
+        let AdmissionCellSessionLookup::CreatedClosed(session) = created else {
+            panic!("first lookup must create the cell")
+        };
+
+        let publication = registry
+            .begin_route_admission_publication()
+            .expect("lock publication")
+            .expect("nonempty-ring process starts enabled");
+        let cell = publication.cell(&cat_id).expect("published cell");
+        let mut port = cell.port();
+        let closed = port.snapshot();
+        let open = AdmissionSnapshot::new(
+            closed.applied_desired_revision(),
+            closed.spec_digest().clone(),
+            closed.placement().clone(),
+            closed.runtime_incarnation().cloned(),
+            LifecycleAdmission::Open,
+            Vec::new(),
+        );
+        port.open_lifecycle(&closed, &open)
+            .expect("publish admission while barrier is owned");
+        drop(port);
+        drop(publication);
+
+        registry.latch_emergency_route_disable();
+
+        assert_eq!(
+            session.cell().snapshot().lifecycle_admission(),
+            LifecycleAdmission::Closed
+        );
+        assert!(registry
+            .begin_route_admission_publication()
+            .expect("read latched publication state")
+            .is_none());
     }
 }

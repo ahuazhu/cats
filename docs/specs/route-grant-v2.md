@@ -1,7 +1,8 @@
 # Route Grant v2
 
 - 状态：Target contract；shared codec、Control独立Gateway machine resolve transport、Node
-  verification/admission core与Gateway到Node machine tunnel已实现；public proxy仍保持关闭
+  verification/admission core、Gateway到Node machine tunnel、`cats-gatewayd` public proxy composition及
+  revision-1 production artifact/deployment wiring已实现；真实production mTLS E2E与rotation qualification仍开放
 - Authority：[ADR-0041](../decisions/0041-node-verified-route-admission.md)
 - Runtime identity：[Runtime Reconciliation v1](runtime-reconciliation-v1.md)
 - Runtime accepted facts：[Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)
@@ -148,6 +149,27 @@ Guest transport。它不表示用户应用已经监听 `target_port`。应用 he
 WorkOS session，也不替用户应用做 Workspace 成员鉴权。用户的 Authorization、Cookie 和应用
 headers 作为应用数据转发给 Guest。Cats management API 继续使用自己的用户/Workspace 鉴权。
 
+唯一local operational exception是同一listener在完成有界request-head解析后处理exact
+`GET /healthz`：请求必须有一个合法Host、没有body/transfer encoding或WebSocket upgrade，响应固定为
+`200`并`Connection: close`。它只证明Gateway fixed artifacts、TLS clients、cache与listener已完成启动组合，
+不得访问cache、Control、Node或其他外部I/O。其他method、相近path和query仍是普通应用route；带body或
+transfer encoding的`GET /healthz`返回`400`并关闭连接，已缓冲的pipeline bytes不得成为下一请求。
+
+Gateway的public HTTP/1.1 proxy按一个request/一个Node tunnel严格证明response boundary。response head与
+chunk/trailer metadata沿用public head byte cap，拒绝重复或冲突的`Content-Length`/`Transfer-Encoding`；
+HEAD、204/205、304、fixed Content-Length与single canonical chunked分别按其精确边界转发。无长度response只
+能以tunnel EOF定界，完成后必须关闭public connection；`Connection: close`、畸形、截断或response边界后的
+额外tunnel bytes同样关闭且额外bytes不转发。只有self-delimited response后同一单请求tunnel立即证明EOF且
+无extra bytes，才可把public keepalive用于下一次独立resolve/admission。普通HTTP的interim 1xx在v1中fail
+closed；request `Expect`也被拒绝，因此不会破坏普通non-interim路径。WebSocket只先转发upgrade head；只有
+Guest返回exact HTTP/1.1 101、`Connection: Upgrade`与`Upgrade: websocket`后，才转发已缓冲及后续raw bytes。
+非101或畸形upgrade response关闭双方连接并丢弃client pipeline。
+从cache lookup、Node connector/open、request head/body tunnel write、tunnel request half-close，到等待Guest
+response、转发response body与WebSocket raw stream，全阶段都在同一connection task内持续观察public peer
+EOF/error与有界pipeline overflow；命中即取消当前阶段future、drop当前tunnel并释放Node guard与Gateway
+connection permit，且不得继续发送Guest mutation bytes。为下一request预读的public bytes只进入同一有硬上限
+的pipeline buffer，不由detached watcher消费；超限fail closed。
+
 Gateway -> Control Plane resolve 和 Gateway -> Node hop 必须使用独立的 workload machine identity
 并全程加密；Node 同时要求可信 Gateway identity 和有效 Grant。Grant 放在保留的内部字段，进入
 Guest 前删除，不能发送给浏览器。日志、trace、错误页和 qualification evidence 都不能包含 token、
@@ -203,6 +225,11 @@ canonical Ed25519 SPKI digest。method/path精确为`POST /v1/internal/routes/tu
 HTTP/1.1、exact `application/json`、`Connection: upgrade`与
 `Upgrade: cats-route-v2-tunnel`；不接受Authorization、Cookie、content/transfer encoding、条件、
 method override或未知header。TLS/header/body/Guest connect各有独立deadline，connections与tunnels有硬上限。
+
+Gateway公网listener对每个已经缓冲的client egress write使用一个不可续期的absolute backpressure
+deadline：默认`5000 ms`，部署只可配置`1..=60000 ms`；zero、超上限或当前monotonic clock不能表示的值都在
+listener bind前拒绝。partial write进展不能重置deadline，public reader EOF/error/overflow与该write竞速并立即
+取消同task的tunnel/guard/permit；没有待写bytes的空闲WebSocket不启动这个deadline。
 
 request body最多5120 bytes，是canonical JSON：
 
@@ -478,7 +505,9 @@ observation revision，不能把desired revision塞回Grant vector。
 - same-incarnation AdmissionSnapshot的open、install、close、remove、global close、try-close与RequireIdle Busy
   source逐项拒绝Guest IPv4-only drift；两个Active Endpoint下close A不能改变B取得的target；
 - Gateway到Node每个current request最多一次TCP/TLS/HTTP attempt；TLS/HTTP/Guest失败和typed rejection均不
-  自动重放。`101`后的双向EOF/cancel以及Node shutdown都必须有界结束并把guard/permit归零；
+  自动重放。阻塞cache waiter、connector、request head/body write或request half-close时public disconnect必须
+  立即drop同栈future且不再产生Guest bytes；`101`后的双向EOF/cancel以及Node shutdown都必须有界结束并把
+  guard/permit归零；
 - pre-admission stale rejection与新resolve竞争时，旧 digest不能删除新entry；当前POST和WebSocket
   upgrade都不重放；
 - per-replica LRU、negative backoff、singleflight、waiter和resolve semaphore在高基数hostname与慢

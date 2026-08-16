@@ -9,16 +9,15 @@ use cats_api::nodejob::{job_id, NodeJob, NodeJobAction, VolumeGrant};
 use cats_api::resources::ObservedState;
 use cats_node_agent::admission::WakeBudget;
 use cats_node_agent::runtime::NodeRuntime;
-use cats_test_support::{fake_node_config, NodeConfigBuilder};
+use cats_test_support::{fake_node_config, sqlite_node_runtime_blockd_fixture, NodeConfigBuilder};
 
 const SIZE: u64 = 2 * cats_api::chunk::CHUNK_SIZE as u64;
 
 fn runtime_with(dir: &std::path::Path, wake_budget: WakeBudget) -> Arc<NodeRuntime> {
     let builder = NodeConfigBuilder::new(dir, "node_conc").with_lease_ttl_ms(1_500);
-    Arc::new(
-        NodeRuntime::new(fake_node_config!(builder, wake_budget = wake_budget))
-            .expect("open node runtime"),
-    )
+    let mut config = fake_node_config!(builder, wake_budget = wake_budget);
+    config.blockd_bin = sqlite_node_runtime_blockd_fixture(dir, SIZE, 1);
+    Arc::new(NodeRuntime::new(config).expect("open node runtime"))
 }
 
 fn start_job(cat: &str) -> NodeJob {
@@ -34,7 +33,7 @@ fn start_job(cat: &str) -> NodeJob {
                 disk_id: format!("root_{cat}"),
                 volume_id: format!("vol_{cat}"),
                 attachment_id: format!("att_{cat}"),
-                epoch: 0,
+                epoch: 1,
                 size_bytes: SIZE,
                 mount_path: "/".into(),
                 durability: Default::default(),

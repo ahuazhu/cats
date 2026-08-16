@@ -23,7 +23,8 @@ use super::transaction::{AuthorityTransactionError, AuthorityTxResult};
 use super::{internal, Result, Store};
 
 const NODE_IDENTITY_COLUMNS: &str = "
-    node_id, record::text AS record_json, immutable_host_id, credential_id,
+    node_id, record::text AS record_json, host_provider, host_partition,
+    host_account_id, host_region, immutable_host_id, credential_id,
     credential_kind, credential_public_key_spki_sha256, credential_provider,
     credential_principal, credential_lineage_state, state_path_id, state";
 const REGISTRATION_ATTEMPT_COLUMNS: &str = "
@@ -85,6 +86,10 @@ pub(crate) enum AgentRegistrationOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NodeIdentityProjection {
     node_id: String,
+    host_provider: String,
+    host_partition: String,
+    host_account_id: String,
+    host_region: String,
     immutable_host_id: String,
     credential_id: String,
     credential_kind: String,
@@ -125,6 +130,10 @@ impl NodeIdentityProjection {
             };
         Self {
             node_id: record.node_id.to_string(),
+            host_provider: record.provider_scope.provider.to_string(),
+            host_partition: record.provider_scope.partition.to_string(),
+            host_account_id: record.provider_scope.account_id.to_string(),
+            host_region: record.provider_scope.region.to_string(),
             immutable_host_id: record.immutable_host_id.to_string(),
             credential_id: record.credential_id.to_string(),
             credential_kind: credential_kind.to_owned(),
@@ -144,6 +153,10 @@ impl NodeIdentityProjection {
     fn from_row(row: &Row) -> AuthorityTxResult<Self> {
         Ok(Self {
             node_id: row.try_get("node_id")?,
+            host_provider: row.try_get("host_provider")?,
+            host_partition: row.try_get("host_partition")?,
+            host_account_id: row.try_get("host_account_id")?,
+            host_region: row.try_get("host_region")?,
             immutable_host_id: row.try_get("immutable_host_id")?,
             credential_id: row.try_get("credential_id")?,
             credential_kind: closed_text(
@@ -353,15 +366,21 @@ pub(super) fn insert_node_identity_in(
     let projection = NodeIdentityProjection::from_record(identity);
     let inserted = transaction.execute(
         "INSERT INTO node_identities (
-            node_id, record, immutable_host_id, credential_id,
+            node_id, record, host_provider, host_partition, host_account_id,
+            host_region, immutable_host_id, credential_id,
             credential_kind, credential_public_key_spki_sha256,
             credential_provider, credential_principal,
             credential_lineage_state, state_path_id, state
-         ) VALUES ($1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ) VALUES ($1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9, $10,
+                   $11, $12, $13, $14, $15)
          ON CONFLICT DO NOTHING",
         &[
             &projection.node_id,
             &record_json,
+            &projection.host_provider,
+            &projection.host_partition,
+            &projection.host_account_id,
+            &projection.host_region,
             &projection.immutable_host_id,
             &projection.credential_id,
             &projection.credential_kind,
@@ -538,6 +557,11 @@ fn register_agent_session_in(
             )),
         ));
     }
+
+    crate::store::runtime_authority::host_fence_recovery_batch::require_product_mutation_unblocked_in(
+        transaction,
+        &identity.node_id,
+    )?;
 
     if identity.state != NodeIdentityState::Provisioned {
         return Ok(identity_rejected());
@@ -764,6 +788,43 @@ pub(super) fn load_provisioned_identities_after(
                 ));
             }
             Ok(identity)
+        })
+        .collect()
+}
+
+/// Strictly decodes one bounded keyset page of the complete NodeIdentity
+/// history for a fleet-wide verification snapshot. Retired rows remain in
+/// the scan so projection corruption cannot hide behind a state predicate,
+/// but their unbounded history never becomes a fleet cardinality limit.
+pub(super) fn load_identity_history_after_for_fleet_verification(
+    transaction: &mut Transaction<'_>,
+    after: Option<&Id>,
+) -> AuthorityTxResult<Vec<(NodeIdentity, bool, bool)>> {
+    let sql = format!(
+        "SELECT {NODE_IDENTITY_COLUMNS},
+                EXISTS (
+                    SELECT 1 FROM current_agent_sessions AS session
+                     WHERE session.node_id=node_identities.node_id
+                ) AS has_current_session,
+                EXISTS (
+                    SELECT 1 FROM runtime_admission_inventory_states AS inventory
+                     WHERE inventory.node_id=node_identities.node_id
+                ) AS has_admission_inventory
+           FROM node_identities
+          WHERE ($1::TEXT IS NULL OR node_id COLLATE \"C\" > $1 COLLATE \"C\")
+          ORDER BY node_id COLLATE \"C\"
+          LIMIT $2"
+    );
+    let after = after.map(Id::as_str);
+    transaction
+        .query(&sql, &[&after, &PROVISIONED_NODE_ID_QUERY_LIMIT])?
+        .iter()
+        .map(|row| {
+            Ok((
+                decode_identity(row)?,
+                row.try_get("has_current_session")?,
+                row.try_get("has_admission_inventory")?,
+            ))
         })
         .collect()
 }

@@ -90,7 +90,7 @@ blockd adapter只读取当前`volume_id`、不可变`size_bytes`、`admin_state`
 head CAS。它不建权威表，不执行acquire、release、takeover、revoke、resize、delete或snapshot mutation。
 
 本clean-slate release的Volume Authority持久契约只有一个provider-neutral版本常量
-`AUTHORITY_RELEASE_SCHEMA_VERSION = 14`。Control Store是`control_schema_version`与全部DDL的唯一
+`AUTHORITY_RELEASE_SCHEMA_VERSION = 15`。Control Store是`control_schema_version`与全部DDL的唯一
 owner；它的私有`SCHEMA_VERSION`直接引用该常量，不保留第二个literal。target data-plane
 adapter在任何volume read/renew/CAS前只读校验：`control_schema_version`必须存在singleton
 row且version精确等于该常量，然后再验证本节所需的列projection。未打stamp、row缺失、
@@ -661,7 +661,8 @@ socket，两者服务同一个 engine 与同一个 attachment lease。
   generation而没有root hash/object ID不能证明checkpoint指定的image target。任一字段缺失都只表示
   legacy/unproven，不能adopt；control-only模式必须没有device token。scope回显不是systemd authority：
   Node仍须把它与unit的exact PID/start ticks/cgroup membership和同一PID持有的control socket逐项交叉验证。
-- `drain`只在`R == L`后成功；它不释放lease。Node停止blockd后调用MetadataStore的幂等release。
+- `drain`只在`R == L`后成功；它不释放lease。Node停止blockd后通过Volume Authority提交精确、幂等的
+  release transition。
   任一步失败必须可重试，不能清理journal。
 - blockd不执行volume delete。disposable Root必须先停止blockd，再由Node消费
   [Volume Authority §11](volume-authority.md#11-delete)的精确删除授权；只有MetadataStore已返回
@@ -678,16 +679,15 @@ chunk最新的那个对象"。删掉一个chunk的base只留最新delta,会直�
 - **绝不碰 `images/`。**镜像对象属于镜像、被所有从它 provision 的卷共享,删一个卷不能删掉全队列
   的 rootfs(§6.3)。GC只列举和删除本卷前缀下的对象;`ChunkRef`里带image origin的base根本
   不算本卷的对象。第一版不提供Golden Image删除或GC。
-- **必须持有卷租约运行**,这样没有别的写者会在发布 Root 尚未命名的对象。本写者自己的 pending
-  pack 无所谓:恢复会从 pack 文件重放并重新上传被删掉的对象。
+- **必须由typed volume lifecycle/sweeper授权并与卷写入串行化**。执行者要么证明精确active
+  attachment仍是当前writer，要么证明卷已进入禁止新写者的删除阶段；不能从裸owner/epoch参数推断权限。
+  当前writer自己的pending pack仍属于live恢复输入：恢复会从pack文件重放并重新上传尚未被Root命名的对象。
 - **commit record 不删**:它是审计线索、体积极小,清理它属于保留策略而不是垃圾回收。
 - 完全被后来的 delta 覆盖的旧 delta**根本不会进入 Map**:`with_delta` 在追加时就把
   `page_mask` 被新 delta 完全覆盖的旧 delta 丢掉了(它在 hydration 里会被逐字节覆盖,留着只是
   让链更长、冷读更贵、GC 还得当它活着)。
 
-入口有两个:
-
-- `cats-blockd --collect-garbage`:附着、扫一遍、退出,不需要监听套接字。
-- 服务期间**按 `--gc-interval-ms` 定时自动跑**(默认 600000,设 0 关闭)。默认开着,因为没有它
-  被取代的对象会伴随卷的整个生命周期堆积,而**只有持有租约的这个进程有资格扫**。扫描失败只是
-  记一条 warn,下一轮重试,不会挡住 Guest。
+release `cats-blockd`不提供GC CLI、裸attachment epoch入口或进程内定时GC。对象扫描/删除由
+[Volume Authority](volume-authority.md)的typed lifecycle/sweeper effect驱动：输入绑定精确卷状态、完整
+`DiskSnapshotRecord`保留集与幂等完成回执；任一Root或snapshot解码失败即fail closed、零删除。底层
+ChunkStore walker仍是provider-neutral数据面实现，不取得或推导卷所有权。

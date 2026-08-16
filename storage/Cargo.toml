@@ -5,14 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+default = ["proposed-node-residue-reclamation"]
+proposed-node-residue-reclamation = [
+    "cats-api/proposed-node-residue-reclamation",
+]
+
 [dependencies]
 cats-api = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
-
-[dev-dependencies]
 sha2 = { workspace = true }
+thiserror = { workspace = true }
 
 [lints]
 workspace = true

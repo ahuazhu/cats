@@ -1545,6 +1545,14 @@ mod tests {
             decode_route_grant_v2_public_key_ring(noncanonical),
             Err(RouteGrantV2ArtifactError::NonCanonical)
         );
+        // `jq -cS` emits lexicographic object-key order, which is not the
+        // frozen schema order above. Installers must reuse this decoder rather
+        // than bless a second, incompatible representation as canonical.
+        let jq_sorted = br#"{"expected_previous":null,"keys":[{"kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","public_key_spki":"MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To"}],"ring_version":1,"version":1}"#;
+        assert_eq!(
+            decode_route_grant_v2_public_key_ring(jq_sorted),
+            Err(RouteGrantV2ArtifactError::NonCanonical)
+        );
         let duplicate =
             br#"{"version":1,"version":1,"ring_version":1,"expected_previous":null,"keys":[]}"#;
         assert_eq!(

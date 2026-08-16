@@ -77,6 +77,14 @@ pub(crate) struct AuthorizedCatCreateIngress {
 }
 
 impl AuthorizedCatCreateIngress {
+    pub(crate) fn authenticated_workspace_id(&self) -> &Id {
+        &self.idempotency.authenticated_workspace_id
+    }
+
+    pub(crate) fn absolute_deadline(&self) -> Instant {
+        self.absolute_deadline
+    }
+
     #[cfg(test)]
     pub(super) fn idempotency(&self) -> &ApiIdempotencyRequest {
         &self.idempotency
@@ -402,22 +410,43 @@ impl CatCreateService {
             .await
     }
 
+    /// Reads an authenticated request's exact durable result without any
+    /// mutable create admission. Billing may change after the original atomic
+    /// commit, but it cannot hide the covered result from the same
+    /// Workspace/key/fingerprint.
+    pub(crate) async fn replay(
+        &self,
+        ingress: &AuthorizedCatCreateIngress,
+    ) -> std::result::Result<Option<CatCreateHttpResult>, CatCreateServiceError> {
+        if !*self.admission.borrow() {
+            return Err(CatCreateServiceError::TemporarilyUnavailable);
+        }
+        self.fast_replay(ingress).await
+    }
+
+    async fn fast_replay(
+        &self,
+        ingress: &AuthorizedCatCreateIngress,
+    ) -> std::result::Result<Option<CatCreateHttpResult>, CatCreateServiceError> {
+        let fast_request = ingress.idempotency.clone();
+        await_cat_create_before_deadline(
+            ingress.absolute_deadline,
+            self.store
+                .execute(move |store| store.covered_api_result_fast_lookup(&fast_request)),
+        )
+        .await
+        .map(|result| result.map(http_result))
+        .map_err(CatCreateServiceError::from_api)
+    }
+
     async fn create_before_deadline(
         &self,
         ingress: AuthorizedCatCreateIngress,
         absolute_deadline: Instant,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> std::result::Result<CatCreateHttpResult, CatCreateServiceError> {
-        let fast_request = ingress.idempotency.clone();
-        if let Some(result) = await_cat_create_before_deadline(
-            absolute_deadline,
-            self.store
-                .execute(move |store| store.covered_api_result_fast_lookup(&fast_request)),
-        )
-        .await
-        .map_err(CatCreateServiceError::from_api)?
-        {
-            return Ok(http_result(result));
+        if let Some(result) = self.fast_replay(&ingress).await? {
+            return Ok(result);
         }
 
         let manifest = await_cat_create_before_deadline(

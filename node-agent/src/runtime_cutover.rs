@@ -15,6 +15,8 @@
 //! This path does not construct `NodeRuntime`, adopt a legacy ledger, or run a
 //! destructive residue/device sweep.
 
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -43,8 +45,13 @@ use crate::runtime_spine::{
     RuntimeEffectResourceOwner, RuntimeInventoryScanner, RuntimeSpineDeadlinePolicy,
     RuntimeSpineHttpClient, RuntimeSpineRunStep, RuntimeSpineRunner,
 };
+use crate::signed_usage::{
+    run_delivery as run_signed_usage_delivery, run_sampler as run_signed_usage_sampler,
+    MeteredRuntimeDesiredEffect, SignedUsagePipeline,
+};
 
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+const FINAL_USAGE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct SignedRuntimeCutoverConfig {
     pub listen: String,
@@ -81,6 +88,26 @@ pub struct SignedRuntimeCutoverConfig {
 pub(crate) struct RuntimeObservationBarrierForTest {
     reached: tokio::sync::mpsc::UnboundedSender<()>,
     resume: tokio::sync::mpsc::UnboundedReceiver<()>,
+    effect_steps: Option<tokio::sync::mpsc::UnboundedSender<RuntimeEffectStepForTest>>,
+    effect_dispatch_count: Option<Arc<AtomicUsize>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RuntimeEffectStepForTest {
+    ServingAdopted {
+        cat_id: cats_api::runtime_reconciliation::Id,
+    },
+    RefreshInventory {
+        cat_id: cats_api::runtime_reconciliation::Id,
+    },
+    Stopped {
+        cat_id: cats_api::runtime_reconciliation::Id,
+        reason: crate::runtime_spine::RuntimeDesiredEffectStopReason,
+    },
+    SessionReplacementRequired {
+        cat_id: cats_api::runtime_reconciliation::Id,
+    },
 }
 
 #[cfg(test)]
@@ -96,10 +123,66 @@ impl RuntimeObservationBarrierForTest {
             Self {
                 reached,
                 resume: resume_rx,
+                effect_steps: None,
+                effect_dispatch_count: None,
             },
             reached_rx,
             resume,
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn channel_with_effect_steps() -> (
+        Self,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        tokio::sync::mpsc::UnboundedSender<()>,
+        tokio::sync::mpsc::UnboundedReceiver<RuntimeEffectStepForTest>,
+        Arc<AtomicUsize>,
+    ) {
+        let (reached, reached_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (resume, resume_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (effect_steps, effect_steps_rx) = tokio::sync::mpsc::unbounded_channel();
+        let effect_dispatch_count = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                reached,
+                resume: resume_rx,
+                effect_steps: Some(effect_steps),
+                effect_dispatch_count: Some(Arc::clone(&effect_dispatch_count)),
+            },
+            reached_rx,
+            resume,
+            effect_steps_rx,
+            effect_dispatch_count,
+        )
+    }
+
+    fn observe_effect_step(&self, step: &RuntimeSpineRunStep) -> anyhow::Result<()> {
+        let event = match step {
+            RuntimeSpineRunStep::EffectRefreshInventory { cat_id } => {
+                Some(RuntimeEffectStepForTest::RefreshInventory {
+                    cat_id: cat_id.clone(),
+                })
+            }
+            RuntimeSpineRunStep::EffectStopped { cat_id, reason } => {
+                Some(RuntimeEffectStepForTest::Stopped {
+                    cat_id: cat_id.clone(),
+                    reason: reason.clone(),
+                })
+            }
+            RuntimeSpineRunStep::EffectSessionReplacementRequired { cat_id } => {
+                Some(RuntimeEffectStepForTest::SessionReplacementRequired {
+                    cat_id: cat_id.clone(),
+                })
+            }
+            _ => None,
+        };
+        if let (Some(sender), Some(event)) = (&self.effect_steps, event) {
+            sender
+                .send(event)
+                .map_err(|_| anyhow::anyhow!("test effect-step receiver dropped"))?;
+        }
+        Ok(())
     }
 
     async fn wait_after_observation(&mut self) -> anyhow::Result<()> {
@@ -420,6 +503,21 @@ async fn spawn_signed_runtime_cutover_with_overrides(
         .register_until_session(&config.control_plane_url)
         .await
         .context("establish durable Agent session")?;
+    let usage_pipeline = config
+        .metering_cgroup_root
+        .as_deref()
+        .map(|metering_cgroup_root| {
+            SignedUsagePipeline::open(
+                &session,
+                config.agent_registration.runtime_request_signer(),
+                &config.control_plane_url,
+                config.agent_registration.runtime_state_directory().path(),
+                metering_cgroup_root,
+            )
+        })
+        .transpose()
+        .context("compose signed Runtime usage pipeline")?
+        .map(Arc::new);
     #[cfg(not(test))]
     let client = RuntimeSpineHttpClient::for_production(
         &config.control_plane_url,
@@ -457,9 +555,20 @@ async fn spawn_signed_runtime_cutover_with_overrides(
     let effect_network_ip_binary = config.ch_config.ip_bin.clone();
     let effect_kernel_nbd_inventory = kernel_nbd_inventory;
     let effect_kernel_nbd_cleanup_owner = Arc::clone(&kernel_nbd_cleanup_owner);
+    let effect_usage_pipeline = usage_pipeline.clone();
     let runner_effect_resource_owner = resource_owner_override.unwrap_or_else(|| {
         Arc::clone(&kernel_nbd_cleanup_owner) as Arc<dyn RuntimeEffectResourceOwner>
     });
+    #[cfg(test)]
+    let effect_dispatch_count_for_test = config
+        .observation_barrier_for_test
+        .as_ref()
+        .and_then(|barrier| barrier.effect_dispatch_count.clone());
+    #[cfg(test)]
+    let serving_adoption_steps_for_test = config
+        .observation_barrier_for_test
+        .as_ref()
+        .and_then(|barrier| barrier.effect_steps.clone());
     let runner = tokio::task::spawn_blocking(move || {
         #[cfg(not(test))]
         let volume_transition_transport = RuntimeVolumeTransitionHttpClient::for_production(
@@ -482,6 +591,8 @@ async fn spawn_signed_runtime_cutover_with_overrides(
         let volume_evidence: Arc<dyn SignedVolumeEvidencePort> = Arc::new(
             ControlBlockingSignedVolumeEvidenceClient::new(volume_transition_transport.clone()),
         );
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        let residue_authority = volume_transition_transport.clone();
         let acquire = SignedRunningAcquireEffect::new(
             Arc::new(ControlSignedNormalAcquireClient::new(
                 volume_transition_transport,
@@ -495,8 +606,10 @@ async fn spawn_signed_runtime_cutover_with_overrides(
         macro_rules! compose_platform_effect {
             ($process_ports:expr) => {{
                 let process_ports = $process_ports;
-                SignedRunningEffect::platform(
+                let effect = SignedRunningEffect::platform(
                     acquire,
+                    #[cfg(feature = "proposed-node-residue-reclamation")]
+                    residue_authority.clone(),
                     Arc::clone(&effect_volume_authority),
                     effect_blob_store,
                     SignedRunningHostConfig::new(
@@ -517,7 +630,23 @@ async fn spawn_signed_runtime_cutover_with_overrides(
                     effect_prepare_frontend,
                     Arc::clone(&effect_admission_registry),
                 )
-                .context("compose signed Running root provision prefix")
+                .context("compose signed Running root provision prefix")?;
+                #[cfg(test)]
+                let effect = match serving_adoption_steps_for_test.clone() {
+                    Some(sender) => {
+                        effect.with_serving_adoption_observer_for_test(Arc::new(move |cat_id| {
+                            sender
+                                .send(RuntimeEffectStepForTest::ServingAdopted {
+                                    cat_id: cat_id.clone(),
+                                })
+                                .map_err(|_| {
+                                    anyhow::anyhow!("test serving-adoption observer dropped")
+                                })
+                        }))
+                    }
+                    None => effect,
+                };
+                Ok::<_, anyhow::Error>(effect)
             }};
         }
         #[cfg(not(test))]
@@ -530,6 +659,11 @@ async fn spawn_signed_runtime_cutover_with_overrides(
                 None => Arc::new(compose_platform_effect!(effect_root_process_ports
                     .as_ref()
                     .context("test platform composition lacks installed process ports")?)?),
+            };
+        let effect: Arc<dyn crate::runtime_spine::RuntimeDesiredEffect> =
+            match effect_usage_pipeline {
+                Some(usage) => Arc::new(MeteredRuntimeDesiredEffect::new(effect, usage)),
+                None => effect,
             };
         let recovery = match recovery_override {
             Some(recovery) => recovery,
@@ -562,7 +696,7 @@ async fn spawn_signed_runtime_cutover_with_overrides(
             }
         }
         .with_volume_evidence(volume_evidence);
-        RuntimeSpineRunner::new_with_recovery_desired_effects_and_resource_owner(
+        let runner = RuntimeSpineRunner::new_with_recovery_desired_effects_and_resource_owner(
             effect_state_directory,
             session,
             client,
@@ -572,7 +706,18 @@ async fn spawn_signed_runtime_cutover_with_overrides(
             effect,
             runner_effect_resource_owner,
         )
-        .map_err(anyhow::Error::from)
+        .map_err(anyhow::Error::from)?;
+        #[cfg(test)]
+        let runner = {
+            let mut runner = runner;
+            if let Some(dispatch_count) = effect_dispatch_count_for_test {
+                runner
+                    .set_effect_dispatch_count_for_test(dispatch_count)
+                    .map_err(anyhow::Error::from)?;
+            }
+            runner
+        };
+        Ok::<_, anyhow::Error>(runner)
     })
     .await
     .context("join signed Runtime runner construction")??;
@@ -602,21 +747,70 @@ async fn spawn_signed_runtime_cutover_with_overrides(
     // can only request (not await) that shutdown sequence.
     let registration_lease = config.agent_registration;
     let deadline_policy = config.deadline_policy;
+    let runner_usage_pipeline = usage_pipeline;
     #[cfg(test)]
     let observation_barrier_for_test = config.observation_barrier_for_test;
     let runner_task = tokio::spawn(async move {
         let mut runner = runner;
-        let run_result = tokio::select! {
+        let (usage_shutdown, usage_shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut usage_task = runner_usage_pipeline.clone().map(|pipeline| {
+            let sampler = Arc::clone(&pipeline);
+            let sampler_shutdown = usage_shutdown_rx.clone();
+            tokio::spawn(async move {
+                tokio::try_join!(
+                    run_signed_usage_sampler(sampler, sampler_shutdown),
+                    run_signed_usage_delivery(pipeline, usage_shutdown_rx),
+                )?;
+                Ok(())
+            })
+        });
+        let (mut run_result, usage_already_joined) = tokio::select! {
             result = run_signed_spine(
                 &mut runner,
                 &runner_readiness,
                 deadline_policy,
+                runner_usage_pipeline.clone(),
                 #[cfg(test)]
                 observation_barrier_for_test,
-            ) => result,
-            _ = &mut runner_shutdown => Ok(()),
+            ) => (result, false),
+            _ = &mut runner_shutdown => (Ok(()), false),
+            result = wait_usage_task(&mut usage_task) => (result, true),
         };
         runner_readiness.set(false);
+        let _ = usage_shutdown.send(true);
+        if !usage_already_joined {
+            if let Some(task) = usage_task.take() {
+                let usage_result = match task.await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        Err(anyhow::Error::new(error).context("join signed usage shutdown"))
+                    }
+                };
+                if let Err(error) = usage_result {
+                    if run_result.is_ok() {
+                        run_result = Err(error);
+                    }
+                }
+            }
+        }
+        if let Some(pipeline) = runner_usage_pipeline.as_ref() {
+            match tokio::time::timeout(
+                FINAL_USAGE_DELIVERY_TIMEOUT,
+                pipeline.deliver_pending_for_shutdown(),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(
+                    error = format!("{error:#}"),
+                    "final signed usage delivery failed; durable spool retained"
+                ),
+                Err(_) => tracing::warn!(
+                    timeout_ms = FINAL_USAGE_DELIVERY_TIMEOUT.as_millis(),
+                    "final signed usage delivery timed out; durable spool retained"
+                ),
+            }
+        }
         let shutdown_result = runner.shutdown().await;
         drop(registration_lease);
         match (run_result, shutdown_result) {
@@ -649,6 +843,7 @@ async fn run_signed_spine(
     runner: &mut RuntimeSpineRunner,
     readiness: &Readiness,
     deadline_policy: RuntimeSpineDeadlinePolicy,
+    usage_pipeline: Option<Arc<SignedUsagePipeline>>,
     #[cfg(test)] mut observation_barrier_for_test: Option<RuntimeObservationBarrierForTest>,
 ) -> anyhow::Result<()> {
     loop {
@@ -657,8 +852,23 @@ async fn run_signed_spine(
         // a later blocking boundary.
         let deadlines = deadline_policy.deadlines_from(Instant::now())?;
         let step = runner.run_once_with_deadlines(deadlines).await?;
+        if matches!(&step, RuntimeSpineRunStep::ObservationAccepted { .. }) {
+            let observation = runner
+                .accepted_full_observation()
+                .context("accepted full observation did not retain its usage evidence")?;
+            if let Some(pipeline) = usage_pipeline.as_ref() {
+                let pipeline = Arc::clone(pipeline);
+                tokio::task::spawn_blocking(move || pipeline.update_observation(&observation))
+                    .await
+                    .context("join signed usage target update")??;
+            }
+        }
         #[cfg(test)]
         let observation_accepted = matches!(&step, RuntimeSpineRunStep::ObservationAccepted { .. });
+        #[cfg(test)]
+        if let Some(barrier) = observation_barrier_for_test.as_ref() {
+            barrier.observe_effect_step(&step)?;
+        }
         match apply_readiness_policy(step, readiness)? {
             RuntimeLoopAction::Continue => {
                 #[cfg(test)]
@@ -683,6 +893,15 @@ async fn run_signed_spine(
     }
 }
 
+async fn wait_usage_task(
+    task: &mut Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+) -> anyhow::Result<()> {
+    match task {
+        Some(task) => task.await.context("join signed usage task")?,
+        None => std::future::pending().await,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeLoopAction {
     Continue,
@@ -703,6 +922,16 @@ fn apply_readiness_policy(
         }
         RuntimeSpineRunStep::ObservationAccepted { service_ready } => {
             readiness.set(service_ready);
+            Ok(RuntimeLoopAction::Continue)
+        }
+        RuntimeSpineRunStep::PartialObservationAccepted { .. } => {
+            // This result is only produced in the same process after the
+            // mandatory pre-scan proved those Running gates safe to retain.
+            // It may preserve readiness established by a full attestation,
+            // but cannot establish readiness itself: full service admission
+            // also depends on there being no unsettled physical effects. A
+            // predecessor's durable partial request remains
+            // ObservationReplayed and likewise cannot restore readiness.
             Ok(RuntimeLoopAction::Continue)
         }
         RuntimeSpineRunStep::ObservationReplayed
@@ -940,15 +1169,16 @@ mod tests {
                     }
                 })
                 .collect();
-            Ok(RuntimeInventoryScanOutcome::Complete(
+            Ok(RuntimeInventoryScanOutcome::Complete(Box::new(
                 CompleteRuntimeInventory::from_validated_coverage(
                     coverage.finish()?,
                     UnixMillis::new(1_900_000_006_000).unwrap(),
                     RuntimeInventoryKeyRing::Unavailable,
                     runtimes,
                     Vec::new(),
+                    Default::default(),
                 ),
-            ))
+            )))
         }
     }
 
@@ -1372,6 +1602,26 @@ mod tests {
         std::future::pending().await
     }
 
+    /// The composition tests provision the installed `/run/cats` namespaces,
+    /// which requires root. The Docker and metal root gates execute the full
+    /// bodies; the unprivileged native build-host sandbox cannot create the
+    /// installed roots and skips them, matching the runbook contract-test
+    /// precedent for root-only fixtures.
+    #[cfg(target_os = "linux")]
+    fn skip_without_root_installed_namespaces() -> bool {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: installed /run/cats namespaces require the root gates");
+            return true;
+        }
+        false
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn skip_without_root_installed_namespaces() -> bool {
+        false
+    }
+
     fn registration_config(
         state_path: std::path::PathBuf,
     ) -> anyhow::Result<AgentRegistrationConfig> {
@@ -1384,6 +1634,12 @@ mod tests {
             NodeIdentity {
                 version: ContractVersion::V1,
                 node_id: Id::new("node_cutover_a").unwrap(),
+                provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+                    provider: Id::new("test_provider").unwrap(),
+                    partition: Id::new("test_partition").unwrap(),
+                    account_id: Id::new("test_account").unwrap(),
+                    region: Id::new("test_region").unwrap(),
+                },
                 immutable_host_id: Id::new("host_cutover_a").unwrap(),
                 credential_id: signer.credential_id().clone(),
                 credential_binding: CredentialBinding::PublicKey {
@@ -1783,6 +2039,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn production_composition_retires_stale_boot_receipt_before_fresh_full_scan() {
+        if skip_without_root_installed_namespaces() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let state_path = root.path().join("state");
         let desired = stale_boot_composition_desired_spec();
@@ -1874,6 +2133,9 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_acquire_runner_composition_restarts_from_a22_files_and_checkpoint() {
+        if skip_without_root_installed_namespaces() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let state_path = root.path().join("state");
         let desired = composition_desired_spec();
@@ -2087,6 +2349,9 @@ mod tests {
 
     #[tokio::test]
     async fn runner_owns_host_lock_until_all_runtime_workers_are_joined() {
+        if skip_without_root_installed_namespaces() {
+            return;
+        }
         let state_root = tempfile::tempdir().unwrap();
         let state_path = state_root.path().join("state");
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2169,6 +2434,9 @@ mod tests {
 
     #[tokio::test]
     async fn stubborn_effect_child_keeps_readiness_and_host_lease_closed_past_timeout() {
+        if skip_without_root_installed_namespaces() {
+            return;
+        }
         let state_root = tempfile::tempdir().unwrap();
         let state_path = state_root.path().join("state");
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2262,6 +2530,9 @@ mod tests {
 
     #[tokio::test]
     async fn deadline_overflow_fails_before_registration_or_listener_binding() {
+        if skip_without_root_installed_namespaces() {
+            return;
+        }
         let state_root = tempfile::tempdir().unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2310,6 +2581,9 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_acquire_lease_fails_before_registration_or_listener_binding() {
+        if skip_without_root_installed_namespaces() {
+            return;
+        }
         let state_root = tempfile::tempdir().unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2389,7 +2663,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_nonempty_full_acceptance_opens_readiness() {
+    fn full_observation_acceptance_controls_readiness() {
         let readiness = Readiness::closed();
         assert_eq!(
             apply_readiness_policy(
@@ -2407,6 +2681,35 @@ mod tests {
             apply_readiness_policy(
                 RuntimeSpineRunStep::ObservationAccepted {
                     service_ready: true,
+                },
+                &readiness,
+            )
+            .unwrap(),
+            RuntimeLoopAction::Continue
+        );
+        assert!(readiness.is_ready());
+    }
+
+    #[test]
+    fn same_process_retained_partial_acceptance_preserves_readiness() {
+        let readiness = Readiness::closed();
+        assert_eq!(
+            apply_readiness_policy(
+                RuntimeSpineRunStep::PartialObservationAccepted {
+                    degraded_runtimes: 1,
+                },
+                &readiness,
+            )
+            .unwrap(),
+            RuntimeLoopAction::Continue
+        );
+        assert!(!readiness.is_ready());
+
+        readiness.set(true);
+        assert_eq!(
+            apply_readiness_policy(
+                RuntimeSpineRunStep::PartialObservationAccepted {
+                    degraded_runtimes: 0,
                 },
                 &readiness,
             )

@@ -307,6 +307,7 @@ impl Store {
     /// the Node between those operations, after which the stale uncordon would
     /// restore Ready. This method holds the placement lock across both checks
     /// and the state transition.
+    #[cfg(debug_assertions)]
     pub(crate) fn uncordon_node_with_route_grant(
         &self,
         node_id: &str,

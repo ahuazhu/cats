@@ -46,7 +46,6 @@ struct Env {
     owner_directory: PathBuf,
     owner_directory_identity: (u64, u64),
     postgres_url: String,
-    epoch: i64,
     request: ProvisionRootImageRequest,
 }
 
@@ -110,7 +109,6 @@ impl Env {
             owner_directory,
             owner_directory_identity,
             postgres_url,
-            epoch,
             request,
         }
     }
@@ -150,8 +148,6 @@ impl Env {
             .arg(VOLUME_ID)
             .arg("--attachment-id")
             .arg(ATTACHMENT_ID)
-            .arg("--attachment-epoch")
-            .arg(self.epoch.to_string())
             .arg("--control-only")
             .arg("--authorized-control-spec")
             .arg(self.authorized_control_spec())
@@ -305,6 +301,7 @@ fn authorized_attachment(epoch: i64) -> AuthorizedServingAttachment {
             node_id: Id::new("node_a").unwrap(),
             placement_epoch: acquire_request.placement_epoch,
         },
+        object_write_credential: None,
         size_bytes: VOLUME_SIZE,
         durability: VolumeDurability::Strict,
         head: blank_head(),
@@ -532,12 +529,11 @@ fn assert_ok(response: &[u8], request: &ProvisionRootImageRequest) {
 }
 
 #[test]
+#[ignore = "requires the privileged installed-namespace Linux systemd gate"]
 fn control_only_rejects_frontends_and_serves_only_the_typed_effect() {
     let env = Env::new();
     let rejected = Command::new(env!("CARGO_BIN_EXE_cats-blockd"))
         .arg("--control-only")
-        .arg("--attachment-epoch")
-        .arg(env.epoch.to_string())
         .arg("--authorized-control-spec")
         .arg(env.authorized_control_spec())
         .arg("--provision-transition-id")
@@ -561,8 +557,6 @@ fn control_only_rejects_frontends_and_serves_only_the_typed_effect() {
 
     let rejected_legacy_authority = Command::new(env!("CARGO_BIN_EXE_cats-blockd"))
         .arg("--control-only")
-        .arg("--attachment-epoch")
-        .arg(env.epoch.to_string())
         .arg("--authorized-control-spec")
         .arg(env.authorized_control_spec())
         .arg("--provision-transition-id")
@@ -621,6 +615,7 @@ fn control_only_rejects_frontends_and_serves_only_the_typed_effect() {
 }
 
 #[test]
+#[ignore = "requires the privileged installed-namespace Linux systemd gate"]
 fn first_lf_framing_enforces_prefix_crlf_and_payload_cap_before_effect() {
     let env = Env::new();
     let _server = env.spawn(None);
@@ -662,6 +657,7 @@ fn first_lf_framing_enforces_prefix_crlf_and_payload_cap_before_effect() {
 }
 
 #[test]
+#[ignore = "requires the privileged installed-namespace Linux systemd gate"]
 fn receiver_responds_at_first_lf_without_waiting_for_half_close_or_running_tail() {
     let env = Env::new();
     let _server = env.spawn(None);
@@ -692,6 +688,7 @@ fn receiver_responds_at_first_lf_without_waiting_for_half_close_or_running_tail(
 }
 
 #[test]
+#[ignore = "requires the privileged installed-namespace Linux systemd gate"]
 fn stalled_connection_times_out_without_starving_the_next_request() {
     let env = Env::new();
     let _server = env.spawn(None);
@@ -741,6 +738,7 @@ fn stalled_connection_times_out_without_starving_the_next_request() {
 }
 
 #[test]
+#[ignore = "requires the privileged installed-namespace Linux systemd gate"]
 fn every_provision_publication_crash_window_recovers_by_authority_or_exact_replay() {
     for point in [
         "after_provision_leaf_put",

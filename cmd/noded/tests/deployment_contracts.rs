@@ -73,7 +73,7 @@ fn deployment_units_take_the_pinned_guest_cmdline_only_from_the_shared_receipt()
 }
 
 #[test]
-fn node_agent_restart_requires_a_drained_idle_node() {
+fn node_agent_killmode_is_explicit_without_owning_per_cat_services() {
     for unit in [
         "deploy/metal/systemd/cats-noded.service",
         "deploy/aws/metal/cats-worker.service",
@@ -84,9 +84,10 @@ fn node_agent_restart_requires_a_drained_idle_node() {
             .map(str::trim)
             .filter(|line| line.starts_with("KillMode="))
             .collect::<Vec<_>>();
-        assert!(
-            kill_modes.is_empty(),
-            "{unit} must retain systemd's control-group default while V1 cannot safely preserve and re-adopt every child runtime across an agent stop; found {kill_modes:?}"
+        assert_eq!(
+            kill_modes,
+            ["KillMode=control-group"],
+            "{unit} must explicitly reap every process in the Agent service cgroup"
         );
         assert!(
             text.contains("cats=0/orphans=0"),
@@ -112,6 +113,47 @@ fn node_agent_restart_requires_a_drained_idle_node() {
             && restart < later_cordon_guard
             && later_cordon_guard < later_empty_guard,
         "metal restart instructions must limit the direct command to first install and then document the drain/idle guard"
+    );
+
+    let process_owner =
+        read_workspace_file("node-agent/src/runtime/reconciliation/systemd_root_provision.rs");
+    for exact in [
+        "const SYSTEM_SLICE: &str = \"system.slice\";",
+        "const ROOT_PROVISION_KILL_MODE: &str = \"control-group\";",
+        ".arg(format!(\"--slice={SYSTEM_SLICE}\"))",
+        ".arg(format!(\"--property=KillMode={ROOT_PROVISION_KILL_MODE}\"))",
+        ".arg(format!(\"--property=Restart={ROOT_PROVISION_RESTART}\"))",
+    ] {
+        assert!(
+            process_owner.contains(exact),
+            "per-Cat process ownership lost its independent systemd-service contract {exact:?}"
+        );
+    }
+
+    let linux_gate = read_workspace_file("scripts/linux-gate.sh");
+    for exact in [
+        "agent_unit=cats-noded.service",
+        "cat_unit=cats-serving-11111111111111111111111111111111.service",
+        "systemctl stop \"$agent_unit\"",
+        "systemctl restart \"$agent_unit\"",
+        "cat_start_ticks_after_restart",
+        "cat_control_group_after_restart",
+        "systemctl stop \"$cat_unit\"",
+    ] {
+        assert!(
+            linux_gate.contains(exact),
+            "the real PID1 Linux gate lacks the production Agent-stop/restart sibling-adoption probe {exact:?}"
+        );
+    }
+}
+
+#[test]
+fn linux_gate_names_the_serving_pending_pack_restart_adoption_case() {
+    const TEST_NAME: &str = "postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart";
+    let gate = read_workspace_file("scripts/linux-gate.sh");
+    assert!(
+        gate.contains(TEST_NAME),
+        "quality.sh linux does not name the serving/pending-pack restart characterization"
     );
 }
 
@@ -154,12 +196,13 @@ fn production_platform_example_keeps_two_workers_in_distinct_subnets() {
         read_workspace_file("deploy/aws/terraform/stacks/platform/platform.tfvars.example");
     let variables = variables.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        variables.contains("metal_worker_instance_count = 2"),
+        variables.contains("metal_workers = {"),
         "the production example must retain worker capacity after one bare-metal host is lost"
     );
     assert!(
-        variables.contains("metal_worker_names = [\"cats-metal-2\", \"cats-metal-1\"]"),
-        "the imported cats-metal-2 must stay at index 0 while the second stable identity is appended"
+        variables.contains("\"metal-2\" = { subnet_index = 0")
+            && variables.contains("\"metal-1\" = { subnet_index = 1"),
+        "the imported workers must retain their exact stable subnet identities"
     );
 
     let platform = read_workspace_file("deploy/aws/terraform/stacks/platform/main.tf")
@@ -167,9 +210,7 @@ fn production_platform_example_keeps_two_workers_in_distinct_subnets() {
         .collect::<Vec<_>>()
         .join(" ");
     assert!(
-        platform.contains(
-            "subnet_id = module.network.private_subnet_ids[count.index % length(module.network.private_subnet_ids)]"
-        ),
+        platform.contains("subnet_id = module.network.private_subnet_ids[each.value.subnet_index]"),
         "bare-metal workers must be distributed across the configured private subnets"
     );
 
@@ -230,7 +271,8 @@ fn production_worker_release_rejects_and_removes_the_shared_control_bearer() {
         read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
     assert!(deployment.contains("if (keys - [\"CATS_POSTGRES_URL\"]) != []"));
     assert!(deployment.contains("[to_entries[] | \"\\(.key)=\\(.value)\"] | join(\"\\n\")"));
-    assert!(deployment.contains("if (key == \"CATS_AUTH_TOKEN\")"));
+    assert!(deployment
+        .contains("if (key == \"CATS_AUTH_TOKEN\" || key == \"CATS_ROUTE_V2_MACHINE_LISTEN\")"));
 
     let installer = read_workspace_file("deploy/aws/metal/install-worker.sh");
     assert!(installer.contains("$1 != \"CATS_AUTH_TOKEN\""));
@@ -466,6 +508,99 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
     }
 
     let dockerfile = read_workspace_file("deploy/aws/Dockerfile.worker-artifact");
+    let installer = read_workspace_file("deploy/aws/metal/install-worker.sh");
+    let deployment =
+        read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
+    let manual_verifier = read_workspace_file("deploy/aws/tools/verify-manual-release.py");
+    let manual_fixture = read_workspace_file("deploy/aws/tools/manual-release-fixture.py");
+    assert_eq!(
+        dockerfile
+            .matches("COPY --from=builder /out/cats /cats")
+            .count(),
+        1,
+        "worker artifact must publish exactly one Host-local cats provisioner binary"
+    );
+    assert_eq!(
+        installer
+            .matches(
+                "install -m 0755 \"$CATS_REPO/target/release/cats\" \"$CATS_PREFIX/bin/cats\"",
+            )
+            .count(),
+        1,
+        "metal installer must install exactly one Host-local cats provisioner binary"
+    );
+    assert_eq!(
+        deployment
+            .matches("install -D -m 0755 \"$stage_path/cats\" \"${var.install_root}/bin/cats\"",)
+            .count(),
+        1,
+        "Terraform worker transaction must install the bundled cats provisioner binary"
+    );
+    assert_eq!(
+        manual_verifier.matches("    \"cats\",").count(),
+        2,
+        "manual verifier must classify cats as exactly one required executable member"
+    );
+    assert_eq!(
+        manual_fixture.matches("    \"cats\",").count(),
+        2,
+        "manual verifier fixture must mirror cats in its file and executable sets"
+    );
+    for binary in [
+        "cats-runtime-e3-probe",
+        "cats-e3-guest-workload",
+        "cats-usage-schema-v16-verifier",
+        "cats-usage-terminal-receipt-verifier",
+    ] {
+        assert!(
+            dockerfile.contains(&format!("COPY --from=builder /out/{binary} /{binary}")),
+            "worker artifact must publish qualification binary {binary}"
+        );
+        assert!(
+            installer.contains(&format!(
+                "target/release/{binary}\" \"$CATS_PREFIX/bin/{binary}"
+            )),
+            "metal source installer must install qualification binary {binary}"
+        );
+        assert!(
+            deployment.contains(&format!(
+                "\"$stage_path/{binary}\" \"${{var.install_root}}/bin/{binary}"
+            )),
+            "Terraform worker transaction must install qualification binary {binary}"
+        );
+        assert_eq!(
+            deployment.matches(&format!("    \"{binary}\",")).count(),
+            1,
+            "worker installation receipt must fingerprint {binary} exactly once"
+        );
+        assert_eq!(
+            manual_verifier
+                .matches(&format!("    \"{binary}\","))
+                .count(),
+            2,
+            "manual verifier must classify {binary} in its closed file and executable sets"
+        );
+        assert_eq!(
+            manual_fixture
+                .matches(&format!("    \"{binary}\","))
+                .count(),
+            2,
+            "manual release fixture must mirror qualification binary {binary}"
+        );
+    }
+    for receipt_fragment in [
+        "worker-installation-receipt.v1.json",
+        "\"worker_bundle_sha256\": bundle_digest",
+        "\"service\": \"cats-worker.service\"",
+        "host_tool_names = (\"curl\", \"systemctl\", \"journalctl\", \"timeout\")",
+        "os.replace(temporary_name, receipt_path)",
+        "os.fsync(directory_descriptor)",
+    ] {
+        assert!(
+            deployment.contains(receipt_fragment),
+            "Terraform worker receipt lost fragment {receipt_fragment:?}"
+        );
+    }
     for executable_copy in [
         "COPY --chmod=0755 deploy/aws/metal/install-guest-runtime-release.sh /out/install-guest-runtime-release.sh",
         "COPY --from=builder --chmod=0755 /out/install-guest-runtime-release.sh /install-guest-runtime-release.sh",
@@ -492,13 +627,6 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
         );
     }
 
-    let deployment =
-        read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
-    let early_idle_guard = deployment
-        .find(
-            "\"$stage_path/require-idle-worker.sh\" \"$metering_root\" \"${var.install_root}/bin\"",
-        )
-        .expect("worker deployment rejects active Cat processes and live runtime binaries");
     let first_install = deployment
         .find("install -D -m 0755 \"$stage_path/cats-noded\"")
         .expect("worker deployment installs cats-noded");
@@ -514,9 +642,13 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
     let deployment_lock = deployment
         .find("cats_acquire_worker_deployment_lock")
         .expect("worker deployment acquires its Host-global lock");
-    let locked_metering = deployment[deployment_lock..]
-        .find("metering_root=\"$(cats_worker_metering_root cats-worker)\"")
+    let exact_classification = deployment[deployment_lock..]
+        .find("route_v2_install_state=\"$(cats_classify_route_v2_node_r1")
         .map(|offset| deployment_lock + offset)
+        .expect("worker deployment classifies exact Route v2 state under the lock");
+    let locked_metering = deployment[exact_classification..]
+        .find("metering_root=\"$(cats_worker_metering_root cats-worker)\"")
+        .map(|offset| exact_classification + offset)
         .expect("worker deployment recomputes its metering cgroup under the lock");
     let locked_idle_guard = deployment[locked_metering..]
         .find(
@@ -538,10 +670,21 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
     let authorize = deployment
         .find("cats_begin_candidate_lifetime cats-worker \"$release_installer\"")
         .expect("post-mutation worker start authorization and watchdog");
+    let idle_guard =
+        "\"$stage_path/require-idle-worker.sh\" \"$metering_root\" \"${var.install_root}/bin\"";
+    assert_eq!(
+        deployment.matches(idle_guard).count(),
+        1,
+        "physical idle must have one authoritative check under the Host lock"
+    );
     assert!(
-        release_verify < early_idle_guard
-            && early_idle_guard < deployment_lock
-            && deployment_lock < locked_metering
+        !deployment[..deployment_lock].contains(idle_guard),
+        "Route v2 state must be classified under the Host lock before the idle guard queries systemd"
+    );
+    assert!(
+        release_verify < deployment_lock
+            && deployment_lock < exact_classification
+            && exact_classification < locked_metering
             && locked_metering < locked_idle_guard
             && locked_idle_guard < stop
             && stop < prepare
@@ -938,7 +1081,9 @@ impl Drop for DeploymentChild {
 
 #[cfg(target_os = "linux")]
 fn wait_for_file(path: &Path, purpose: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // Pure poll upper bound: a saturated gate host schedules the spawned
+    // deployment shells far more slowly than an idle one.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !path.exists() {
         assert!(
             std::time::Instant::now() < deadline,
@@ -951,7 +1096,7 @@ fn wait_for_file(path: &Path, purpose: &str) {
 
 #[cfg(target_os = "linux")]
 fn wait_for_success(child: &mut std::process::Child, purpose: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         if let Some(status) = child.try_wait().expect("poll deployment child") {
             assert!(status.success(), "{purpose} failed with {status}");
@@ -1976,22 +2121,17 @@ fn worker_release_refuses_live_runtime_binaries_outside_metering_cgroups() {
         "guard must name all runtime pids and the journal hazard: {stderr}"
     );
 
-    for installer_path in [
-        "deploy/aws/metal/install-worker.sh",
-        "deploy/metal/install.sh",
+    for (installer_path, service, expected_guard_count) in [
+        ("deploy/aws/metal/install-worker.sh", "cats-worker", 1),
+        ("deploy/metal/install.sh", "cats-noded", 2),
     ] {
         let installer = read_workspace_file(installer_path);
-        let early_guard = installer
+        let first_guard = installer
             .find("require-idle-worker.sh\"")
             .unwrap_or_else(|| panic!("{installer_path} lost its physical idle guard"));
         let lock = installer
             .find("cats_acquire_worker_deployment_lock")
             .unwrap_or_else(|| panic!("{installer_path} lost its deployment lock"));
-        let service = if installer_path == "deploy/metal/install.sh" {
-            "cats-noded"
-        } else {
-            "cats-worker"
-        };
         let locked_metering = installer[lock..]
             .find(&format!(
                 "metering_root=$(cats_worker_metering_root {service})"
@@ -2006,9 +2146,24 @@ fn worker_release_refuses_live_runtime_binaries_outside_metering_cgroups() {
             .find("cats_gate_node_service")
             .map(|offset| locked_guard + offset)
             .unwrap_or_else(|| panic!("{installer_path} lost its masked stop boundary"));
+        assert_eq!(
+            installer.matches("require-idle-worker.sh\"").count(),
+            expected_guard_count,
+            "{installer_path} has an unexpected number of physical idle checks"
+        );
+        if expected_guard_count == 1 {
+            assert_eq!(
+                first_guard, locked_guard,
+                "{installer_path} must keep its sole authoritative physical idle check under the Host lock"
+            );
+        } else {
+            assert!(
+                first_guard < lock,
+                "{installer_path} must retain its unlocked, non-mutating idle preflight"
+            );
+        }
         assert!(
-            early_guard < lock
-                && lock < locked_metering
+            lock < locked_metering
                 && locked_metering < locked_guard
                 && locked_guard < stop,
             "{installer_path} must re-prove physical idle under the lock immediately before stopping"

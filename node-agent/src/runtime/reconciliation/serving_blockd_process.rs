@@ -8,14 +8,16 @@
 use std::ffi::OsString;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use cats_api::blockd::DurabilityStatus;
 use cats_api::runtime_reconciliation::{
-    ControlHandshakeEvidence, DesiredRuntimeSpec, HostPath, Id, ObservedDevice,
-    ObservedRuntimeStatus, OwnershipTokenEvidence, PrepareDeviceFrontend, PreparedDeviceInput,
-    ProcessEvidence, ProcessRole, ProcessState, RandomId128, ReconcileStep, RemoteHead,
-    RuntimeCheckpoint, ServingAuthorityProvenance, UnixMillis, WireU64,
+    encode_runtime_checkpoint, ControlHandshakeEvidence, DesiredRuntimeSpec, HostPath, Id,
+    ObservedDevice, ObservedRuntimeStatus, OwnershipTokenEvidence, PrepareDeviceFrontend,
+    PreparedDeviceInput, ProcessEvidence, ProcessRole, ProcessState, RandomId128, ReconcileStep,
+    RemoteHead, RuntimeCheckpoint, ServingAuthorityProvenance, UnixMillis, VolumeAuthorityEvidence,
+    WireU64,
 };
 use cats_storage::authority::{
     remote_head_is_same_or_later, validate_authorized_serving_attachment, validate_volume_record,
@@ -32,13 +34,15 @@ use super::authorized_blockd::{
     authorized_blockd_status_is_bound_to_head, retained_authorized_blockd_command,
     validate_running_physical_desired_successor, AuthorizedBlockFrontend, RetainedAuthorizedBlockd,
 };
-use super::blockd_socket_namespace::ExactManagedBlockdSocketOwnerStartAbsence;
+use super::blockd_socket_namespace::{
+    ExactManagedBlockdSocketOwnerStartAbsence, ManagedBlockdSocketOwnerRetirement,
+};
 use super::checkpoint::CurrentCheckpointGuard;
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
 use super::inventory::AuthorizedBlockdInventoryEvidence;
 use super::network::{
-    prepare_device_checkpoint_view, prepare_network_volume_admission_is_exact,
-    prepared_device_input, prepared_device_inputs, prepared_device_set_is_exact,
+    prepare_device_checkpoint_view, prepared_device_input, prepared_device_inputs,
+    prepared_device_set_is_exact,
 };
 use super::prepare_device_retirement::{
     prepare_device_base_admission_is_exact, retirement_authority_lease_is_monotonic, unique_runtime,
@@ -98,6 +102,14 @@ pub(crate) trait ServingBlockdProcessGlobalPort:
         expected: &ServingBlockdExpectation,
         context: &RuntimeDesiredEffectContext,
     ) -> anyhow::Result<ServingBlockdProcessInspection>;
+
+    fn retire_absent_socket_owner(
+        &self,
+        _expected: &ServingBlockdExpectation,
+        _context: &RuntimeDesiredEffectContext,
+    ) -> anyhow::Result<ManagedBlockdSocketOwnerRetirement> {
+        anyhow::bail!("Serving socket-owner retirement requires the production Node-global scanner")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +124,18 @@ pub(crate) enum ServingBlockdProcessInspection {
     Exact(Box<ServingBlockdProcessEvidence>),
     Conflict(ServingBlockdProcessConflict),
     Unavailable,
+}
+
+impl ServingBlockdProcessInspection {
+    /// See [`ServingBlockdProcessEvidence::stable_identity_eq`].
+    pub(crate) fn stable_identity_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Absent, Self::Absent) | (Self::Unavailable, Self::Unavailable) => true,
+            (Self::Exact(first), Self::Exact(second)) => first.stable_identity_eq(second),
+            (Self::Conflict(first), Self::Conflict(second)) => first == second,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +167,105 @@ pub(crate) struct ServingBlockdExpectation {
 }
 
 impl ServingBlockdExpectation {
+    #[cfg(test)]
+    pub(crate) fn from_lifecycle_checkpoint_for_test(
+        checkpoint: &RuntimeCheckpoint,
+        desired: &DesiredRuntimeSpec,
+    ) -> anyhow::Result<Self> {
+        let launch = checkpoint
+            .runtime_launch
+            .identity()
+            .context("lifecycle Serving fixture lacks a retained launch")?;
+        let prepared = launch
+            .devices
+            .first()
+            .context("lifecycle Serving fixture lacks a prepared device")?
+            .clone();
+        let intent = desired
+            .volumes
+            .iter()
+            .find(|intent| intent.volume_id == prepared.volume_id)
+            .context("lifecycle Serving fixture lacks its Desired Volume")?
+            .clone();
+        let (
+            cats_api::runtime_reconciliation::VolumeAcquire::Normal {
+                transition_id,
+                expected_unowned_epoch,
+            },
+            cats_api::runtime_reconciliation::AcquireOrigin::Normal {
+                transition_id: prepared_transition,
+            },
+        ) = (&intent.acquire, &prepared.acquire_origin)
+        else {
+            anyhow::bail!("lifecycle Serving fixture requires one Normal acquire")
+        };
+        anyhow::ensure!(
+            transition_id == prepared_transition,
+            "lifecycle Serving fixture changed its acquire origin"
+        );
+        let lease_expires_at =
+            UnixMillis::new(1_900_000_120_000).expect("fixed lifecycle fixture time is positive");
+        let request = cats_api::runtime_reconciliation::NormalAcquireRequest {
+            volume_id: intent.volume_id.clone(),
+            transition_id: transition_id.clone(),
+            attachment_id: intent.attachment_id.clone(),
+            expected_unowned_epoch: *expected_unowned_epoch,
+            desired_revision: desired.desired_revision,
+            placement_epoch: desired.placement.placement_epoch,
+            lease_duration_ms: 60_000,
+        };
+        let result = cats_api::runtime_reconciliation::NormalAcquireResult {
+            volume_id: intent.volume_id.clone(),
+            transition_id: transition_id.clone(),
+            attachment_id: intent.attachment_id.clone(),
+            resulting_epoch: prepared.attachment_epoch,
+            resulting_head: prepared.expected_head.clone(),
+            lease_expires_at,
+        };
+        let volume = AuthorizedBlockdCheckpoint {
+            version: cats_api::runtime_reconciliation::ContractVersion::V1,
+            desired: desired.clone(),
+            volume: intent.clone(),
+            attachment: cats_storage::authority::AuthorizedServingAttachment {
+                identity: cats_storage::authority::AttachmentLineageIdentity {
+                    volume_id: intent.volume_id.clone(),
+                    attachment_id: intent.attachment_id.clone(),
+                    attachment_epoch: prepared.attachment_epoch,
+                    acquire_origin: prepared.acquire_origin.clone(),
+                    node_id: desired.placement.node_id.clone(),
+                    placement_epoch: desired.placement.placement_epoch,
+                },
+                object_write_credential: None,
+                size_bytes: intent.size_bytes,
+                durability: intent.durability,
+                head: prepared.expected_head.clone(),
+                lease_expires_at,
+                acquire: cats_storage::authority::AuthorizedServingAcquire::Normal {
+                    request,
+                    result,
+                },
+            },
+        };
+        let process = &prepared.serving_process;
+        let executable_path = process.executable_path.clone();
+        Ok(Self {
+            volume,
+            unit_id: process.scope_id.clone(),
+            cgroup_path: HostPath::new(format!("/sys/fs/cgroup/system.slice/{}", process.scope_id))
+                .context("lifecycle Serving fixture has a non-canonical cgroup path")?,
+            executable_path: executable_path.clone(),
+            command_line: vec![OsString::from(executable_path.as_str())],
+            control_socket_path: process.control_socket_path.clone(),
+            data_directory: process.data_directory.clone(),
+            process_identity_token: process.process_identity_token.clone(),
+            device_ownership_token: prepared.ownership_token.clone(),
+            frontend: prepared.frontend.clone(),
+            prepared_device: prepared.clone(),
+            expected_remote_head: prepared.expected_head.clone(),
+            authority_lease_expires_at: lease_expires_at,
+        })
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "inventory closes one prepared device across immutable storage, Desired, authority, and installed process config"
@@ -410,8 +533,69 @@ impl ServingBlockdExpectation {
         Ok(self)
     }
 
+    /// Admission equality for a freshly re-derived expectation: every
+    /// identity field must match the admitted start exactly. The attachment
+    /// lease expiry is deliberately excluded: the admission and the effect
+    /// read the continuously renewed lease at different instants, so any
+    /// equality or ordering requirement between the two reads livelocks the
+    /// serving start. Lease liveness is enforced separately against the
+    /// current authority record.
+    pub(super) fn matches_admitted(&self, admitted: &Self) -> bool {
+        let Self {
+            volume,
+            unit_id,
+            cgroup_path,
+            executable_path,
+            command_line,
+            control_socket_path,
+            data_directory,
+            process_identity_token,
+            device_ownership_token,
+            frontend,
+            prepared_device,
+            expected_remote_head,
+            authority_lease_expires_at: _,
+        } = self;
+        *volume == admitted.volume
+            && *unit_id == admitted.unit_id
+            && *cgroup_path == admitted.cgroup_path
+            && *executable_path == admitted.executable_path
+            && *command_line == admitted.command_line
+            && *control_socket_path == admitted.control_socket_path
+            && *data_directory == admitted.data_directory
+            && *process_identity_token == admitted.process_identity_token
+            && *device_ownership_token == admitted.device_ownership_token
+            && *frontend == admitted.frontend
+            && *prepared_device == admitted.prepared_device
+            // Publishes advance the remote head monotonically between the
+            // admission mint and this recomputation, in either read order;
+            // a same-generation tuple must stay byte-exact.
+            && (cats_storage::authority::remote_head_is_same_or_later(
+                expected_remote_head,
+                &admitted.expected_remote_head,
+            ) || cats_storage::authority::remote_head_is_same_or_later(
+                &admitted.expected_remote_head,
+                expected_remote_head,
+            ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_renewed_lease_for_test(mut self, expiry: UnixMillis) -> Self {
+        self.authority_lease_expires_at = expiry;
+        self
+    }
+
     fn status_is_exact_at_head(&self, status: &DurabilityStatus, head: &RemoteHead) -> bool {
-        let remote_generation = i64::try_from(head.generation.get()).ok().unwrap_or(-1);
+        // The engine's own remote head is the live binding target: the writer
+        // under this exact grant may already have published past the retained
+        // head, so the live head must only be the same or a later generation.
+        let Some(live_head) = status.remote_head.as_ref() else {
+            return false;
+        };
+        if !cats_storage::authority::remote_head_is_same_or_later(live_head, head) {
+            return false;
+        }
+        let remote_generation = i64::try_from(live_head.generation.get()).ok().unwrap_or(-1);
         let generation_gap = status
             .local_durable_generation
             .checked_sub(status.remote_durable_generation);
@@ -421,7 +605,7 @@ impl ServingBlockdExpectation {
             &self.unit_id,
             &self.process_identity_token,
             &self.device_ownership_token,
-            head,
+            live_head,
         ) && status.remote_durable_generation == remote_generation
             && generation_gap.is_some_and(|gap| {
                 gap >= 0
@@ -476,7 +660,13 @@ impl ServingBlockdExpectation {
             && current
                 .lease_expires_at
                 .is_some_and(|expiry| expiry >= self.authority_lease_expires_at)
-            && current.head == self.expected_remote_head
+            // The running writer under this exact grant may already have
+            // published past the retained head; only a same-generation
+            // divergence or a regression is a conflict.
+            && cats_storage::authority::remote_head_is_same_or_later(
+                &current.head,
+                &self.expected_remote_head,
+            )
             && current.last_transition == Some(attachment.expected_last_transition())
     }
 
@@ -826,6 +1016,46 @@ pub(crate) struct ServingBlockdProcessEvidence {
 }
 
 impl ServingBlockdProcessEvidence {
+    /// Double-read stability for the Node-global sweep: every identity field
+    /// must be unchanged between the two reads, while the live engine's
+    /// durability counters legitimately advance (a Relaxed writer retrying
+    /// its background publish mutates them continuously).
+    pub(crate) fn stable_identity_eq(&self, other: &Self) -> bool {
+        let Self {
+            process_id,
+            unit_main_process_id,
+            process_start_time_ticks,
+            executable_path,
+            unit_id,
+            cgroup_path,
+            cgroup_process_ids,
+            command_line,
+            control_socket_path,
+            data_directory,
+            process_identity_token,
+            device_ownership_token,
+            frontend,
+            listener_identity,
+            handshake_peer_process_id,
+            status: _,
+        } = self;
+        *process_id == other.process_id
+            && *unit_main_process_id == other.unit_main_process_id
+            && *process_start_time_ticks == other.process_start_time_ticks
+            && *executable_path == other.executable_path
+            && *unit_id == other.unit_id
+            && *cgroup_path == other.cgroup_path
+            && *cgroup_process_ids == other.cgroup_process_ids
+            && *command_line == other.command_line
+            && *control_socket_path == other.control_socket_path
+            && *data_directory == other.data_directory
+            && *process_identity_token == other.process_identity_token
+            && *device_ownership_token == other.device_ownership_token
+            && *frontend == other.frontend
+            && *listener_identity == other.listener_identity
+            && *handshake_peer_process_id == other.handshake_peer_process_id
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn from_inspected(
         process_id: u32,
@@ -1384,7 +1614,13 @@ pub(crate) struct ServingBlockdStartEffect {
     systemd: RootProvisionSystemdConfig,
     process: Arc<dyn ServingBlockdProcessGlobalPort>,
     submitted_admission: Mutex<Option<RandomId128>>,
+    #[cfg(test)]
+    after_exact_adoption: Option<ServingBlockdAdoptionObserver>,
 }
+
+#[cfg(test)]
+pub(crate) type ServingBlockdAdoptionObserver =
+    Arc<dyn Fn(&Id) -> anyhow::Result<()> + Send + Sync>;
 
 struct AdmittedServingStart<'a> {
     expected: ServingBlockdExpectation,
@@ -1405,7 +1641,18 @@ impl ServingBlockdStartEffect {
             systemd,
             process,
             submitted_admission: Mutex::new(None),
+            #[cfg(test)]
+            after_exact_adoption: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_after_exact_adoption_for_test(
+        mut self,
+        observer: ServingBlockdAdoptionObserver,
+    ) -> Self {
+        self.after_exact_adoption = Some(observer);
+        self
     }
 
     /// Return `None` only after accepted full inventory and the sealed global
@@ -1511,21 +1758,6 @@ impl ServingBlockdStartEffect {
                 return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
             };
             if !admitted_expected.matches_device_contract(&desired.cat_id, device)
-                || observed_devices.is_some()
-                    && !prepare_network_volume_admission_is_exact(
-                        desired,
-                        runtime,
-                        device,
-                        admitted_expected.volume_id(),
-                        runtime
-                            .volumes
-                            .iter()
-                            .find(|volume| volume.volume_id == device.volume_id)
-                            .and_then(|volume| match volume.devices.as_slice() {
-                                [observed] => Some(observed),
-                                _ => None,
-                            }),
-                    )
                 || !accepted_devices_are_compatible(
                     context,
                     runtime,
@@ -1550,7 +1782,7 @@ impl ServingBlockdStartEffect {
                 Err(_) => return Ok(Some(stop_local())),
             };
             let expected = retained.expectation(&self.systemd, desired, &first_authority)?;
-            if &expected != admitted_expected {
+            if !expected.matches_admitted(admitted_expected) {
                 return Ok(Some(stop_local()));
             }
             let Some(first_lease_expiry) = first_authority.lease_expires_at else {
@@ -1596,7 +1828,7 @@ impl ServingBlockdStartEffect {
                 }
                 (Some(admitted), ServingBlockdProcessInspection::Exact(evidence))
                     if evidence.exactly_matches(&entry.expected)
-                        && evidence.as_ref() == admitted.evidence() => {}
+                        && evidence.stable_identity_eq(admitted.evidence()) => {}
                 (_, ServingBlockdProcessInspection::Conflict(_)) => {
                     return Ok(Some(stop_local()));
                 }
@@ -1633,6 +1865,23 @@ impl ServingBlockdStartEffect {
         }
         store.revalidate_current(&stored, &guard)?;
         let Some(selected) = selected_absent else {
+            if let Some(successor) = publisher_clean_checkpoint_successor(
+                &stored,
+                runtime,
+                &serving,
+                &current_authorities,
+            )? {
+                drop(guard);
+                context.check_active()?;
+                store
+                    .replace(&stored, &successor)
+                    .context("publish serving publisher-clean checkpoint successor")?;
+                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            }
+            #[cfg(test)]
+            if let Some(observer) = &self.after_exact_adoption {
+                observer(&desired.cat_id)?;
+            }
             return Ok(None);
         };
         let selected_entry = &serving[selected];
@@ -1698,6 +1947,137 @@ impl ServingBlockdStartEffect {
         );
         Ok(current)
     }
+}
+
+/// A retained serving writer may advance the remote head after a Relaxed
+/// publisher settles its local tail.  The immutable grant remains the origin
+/// authority, while this bounded Runtime checkpoint records the newer launch
+/// head.  Progress is allowed only from one exact full scan that proves every
+/// serving process and lineage fully drained at the independently reread head.
+fn publisher_clean_checkpoint_successor(
+    stored: &StoredCheckpoint,
+    runtime: &ObservedRuntimeStatus,
+    serving: &[AdmittedServingStart<'_>],
+    current_authorities: &[VolumeRecord],
+) -> anyhow::Result<Option<RuntimeCheckpoint>> {
+    let ReconcileStep::PrepareNetwork { devices, .. } = &stored.checkpoint().step else {
+        return Ok(None);
+    };
+    if devices.len() != serving.len() || serving.len() != current_authorities.len() {
+        return Ok(None);
+    }
+
+    let mut advanced = Vec::new();
+    for ((device, entry), current) in devices.iter().zip(serving).zip(current_authorities) {
+        let Some(exact) = entry.admitted_exact else {
+            return Ok(None);
+        };
+        let Some(observed) = runtime
+            .volumes
+            .iter()
+            .find(|volume| volume.volume_id == device.volume_id)
+        else {
+            return Ok(None);
+        };
+        let [lineage] = observed.local_lineages.as_slice() else {
+            return Ok(None);
+        };
+        let VolumeAuthorityEvidence::Owned {
+            attachment_id,
+            attachment_epoch,
+            head,
+        } = &observed.authority
+        else {
+            return Ok(None);
+        };
+        if head != &current.head
+            || attachment_id != &device.attachment_id
+            || *attachment_epoch != device.attachment_epoch
+            || !remote_head_is_same_or_later(&current.head, &device.expected_head)
+            || lineage.attachment_id != device.attachment_id
+            || lineage.attachment_epoch != device.attachment_epoch
+            || lineage.acquire_origin != device.acquire_origin
+            || lineage.local_durable_generation != current.head.generation
+            || lineage.remote_durable_generation != current.head.generation
+            || lineage.pending_pack_count.get() != 0
+            || lineage.fenced
+            || !matches!(
+                lineage.state,
+                cats_api::runtime_reconciliation::LocalLineageState::Active
+            )
+            || !exact
+                .validates_fully_drained_status_at_head(exact.durability_status(), &current.head)
+        {
+            return Ok(None);
+        }
+        if current.head != device.expected_head {
+            advanced.push((device.volume_id.clone(), current.head.clone()));
+        }
+    }
+    if advanced.is_empty() {
+        return Ok(None);
+    }
+
+    let mut successor = stored.checkpoint().clone();
+    let ReconcileStep::PrepareNetwork { devices, .. } = &mut successor.step else {
+        unreachable!("predecessor phase was checked above")
+    };
+    for (volume_id, head) in &advanced {
+        let Some(device) = devices
+            .iter_mut()
+            .find(|device| &device.volume_id == volume_id)
+        else {
+            return Ok(None);
+        };
+        device.expected_head = head.clone();
+
+        let Some(volume) = successor
+            .volumes
+            .iter_mut()
+            .find(|volume| &volume.volume_id == volume_id)
+        else {
+            return Ok(None);
+        };
+        let VolumeAuthorityEvidence::Owned {
+            attachment_id,
+            attachment_epoch,
+            head: checkpoint_head,
+        } = &mut volume.authority
+        else {
+            return Ok(None);
+        };
+        let [lineage] = volume.local_lineages.as_mut_slice() else {
+            return Ok(None);
+        };
+        if attachment_id != &device.attachment_id
+            || *attachment_epoch != device.attachment_epoch
+            || lineage.attachment_id != device.attachment_id
+            || lineage.attachment_epoch != device.attachment_epoch
+            || lineage.acquire_origin != device.acquire_origin
+        {
+            return Ok(None);
+        }
+        *checkpoint_head = head.clone();
+        lineage.local_durable_generation = head.generation;
+        lineage.remote_durable_generation = head.generation;
+        lineage.pending_pack_count = WireU64::new(0).expect("zero fits WireU64");
+    }
+    let wall_clock_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock precedes Unix epoch")?
+        .as_millis();
+    let wall_clock_ms = u64::try_from(wall_clock_ms).context("system time exceeds wire range")?;
+    let minimum = stored
+        .checkpoint()
+        .updated_at_unix_ms
+        .get()
+        .checked_add(1)
+        .context("publisher-clean checkpoint timestamp exhausted")?;
+    successor.updated_at_unix_ms = UnixMillis::new(wall_clock_ms.max(minimum))
+        .context("publisher-clean checkpoint timestamp exceeds the wire range")?;
+    encode_runtime_checkpoint(&successor)
+        .context("publisher-clean checkpoint successor is not canonical V1")?;
+    Ok(Some(successor))
 }
 
 fn public_process_matches(process: &ProcessEvidence, expected: &ServingBlockdExpectation) -> bool {

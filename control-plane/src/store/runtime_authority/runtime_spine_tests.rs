@@ -8,30 +8,34 @@ use cats_api::agent_registration::AuthenticatedNodeCredential;
 use cats_api::error::ErrorCode;
 use cats_api::route_grant_v2::{
     decode_route_resolve_v2_rejection, decode_route_resolve_v2_success,
-    encode_route_resolve_v2_request, RouteResolveV2RejectionCode, RouteResolveV2Request,
-    ROUTE_RESOLVE_V2_PATH, ROUTE_V2_JSON_CONTENT_TYPE,
+    encode_route_resolve_v2_request, RouteGrantV2PublicKeyRingArtifact,
+    RouteResolveV2RejectionCode, RouteResolveV2Request, ROUTE_RESOLVE_V2_PATH,
+    ROUTE_V2_JSON_CONTENT_TYPE,
 };
 use cats_api::runtime_reconciliation::{
     decode_operation, decode_runtime_checkpoint, encode_admission_inventory_attestation,
     encode_agent_session, encode_desired_read_snapshot, encode_node_observation,
-    guest_config_digest, inventory_digest, key_ring_digest, spec_digest, AgentRegistrationAttempt,
-    AgentSession, AllocatableMemoryBytes, AllocatableVcpus, AppliedDesiredEvidence, AsciiText,
-    AssignedKind, AssignedPlacement, BlockedReason, CheckpointEvidence, Condition,
-    ContractErrorDetail, ContractVersion, ControlHandshakeEvidence, CredentialBinding,
-    DesiredRuntimeSpec, EndpointIntent, Epoch, GuestBootId, GuestIpv4Pool, GuestIpv4PoolKind,
-    GuestRuntimeProfileReceipt, GuestTransportEvidence, HostPath, Hostname, HttpProtocol, Id,
-    InventorySource, Ipv4Address, IsolatedIpv4Kind, KeyId, LifecycleAdmission, MacAddress,
-    NetworkConfig, NodeBootId, NodeIdentity, NodeIdentityState, NodeObservation,
-    NodePlacementPolicy, NodeTransportTarget, ObservationInventoryAcceptance, ObservedNetwork,
-    ObservedRouteGate, ObservedRuntimeStatus, ObservedVmShape, Operation, OperationFailure,
-    OperationPhase, OperationTerminal, OwnershipTokenEvidence, PlacementRejectionReason,
-    PreconditionFailureReason, ProcessEvidence, ProcessRole, ProcessState, QuarantineReason,
-    RandomId128, ReadyReason, ReconcileStep, Revision, RouteGateBinding, RouteGateState,
-    RuntimeConfig, RuntimeLaunch, RuntimePlacementBlockFrontend, RuntimePlacementCapabilities,
-    RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport, RuntimePlacementVmm,
-    RuntimeSchedulingState, RuntimeTarget, RuntimeTransition, Sequence, SessionBinding,
-    Sha256Digest, StableState, UnixMillis, WarmSnapshotEvidence, WireU64,
+    guest_config_digest, inventory_digest, key_ring_digest, spec_digest, AcquireOrigin,
+    AgentRegistrationAttempt, AgentSession, AllocatableMemoryBytes, AllocatableVcpus,
+    AppliedDesiredEvidence, AsciiText, AssignedKind, AssignedPlacement, BlockedReason,
+    CheckpointEvidence, Condition, ContractErrorDetail, ContractVersion, ControlHandshakeEvidence,
+    CredentialBinding, DesiredRuntimeSpec, DiskKind, EndpointIntent, Epoch, GuestBootId,
+    GuestIpv4Pool, GuestIpv4PoolKind, GuestRuntimeProfileReceipt, GuestTransportEvidence, HostPath,
+    Hostname, HttpProtocol, Id, InventorySource, Ipv4Address, IsolatedIpv4Kind, KeyId,
+    LifecycleAdmission, LocalLineageState, LocalVolumeLineage, MacAddress, NetworkConfig,
+    NodeBootId, NodeIdentity, NodeIdentityState, NodeObservation, NodePlacementPolicy, NodeResidue,
+    NodeTransportTarget, ObservationInventoryAcceptance, ObservedDiskKind, ObservedNetwork,
+    ObservedRouteGate, ObservedRuntimeStatus, ObservedVmShape, ObservedVolume, Operation,
+    OperationFailure, OperationPhase, OperationTerminal, OwnershipTokenEvidence,
+    PlacementRejectionReason, PreconditionFailureReason, ProcessEvidence, ProcessRole,
+    ProcessState, QuarantineReason, RandomId128, ReadyReason, ReconcileStep, RequireIdleCheckpoint,
+    Revision, RouteGateBinding, RouteGateState, RuntimeConfig, RuntimeLaunch,
+    RuntimePlacementBlockFrontend, RuntimePlacementCapabilities, RuntimePlacementGuestNetwork,
+    RuntimePlacementGuestTransport, RuntimePlacementVmm, RuntimeSchedulingState, RuntimeTarget,
+    RuntimeTransition, Sequence, SessionBinding, Sha256Digest, StableState, UnixMillis,
+    VolumeAcquire, VolumeAuthorityEvidence, WarmSnapshotEvidence, WireU64,
 };
+use cats_storage::authority::{Generation, VolumeAdminState, VolumeRecord};
 
 use super::placement_policy::insert_policy_on_store_for_test;
 use super::product::{CatRecord, EndpointRecord, HostnameDesiredLookup};
@@ -39,8 +43,9 @@ use super::product_rows::{
     insert_cat, insert_desired, insert_endpoint, insert_hostname_lookup, insert_operation,
 };
 use super::route_signer::{RouteGrantV2AuthorityLoad, RouteGrantV2AuthorityRejection};
-use super::rows::database_now;
+use super::rows::{database_now, load_volume_unlocked};
 use super::runtime_spine::{
+    active_lineage_generations_match_for_test, cold_volume_evidence_matches_for_test,
     lock_placement_admission_for_desired_mutation, PlacementAdmissionLoad,
     PlacementAdmissionRejection, RouteRuntimeLoad, RouteRuntimeRejection, RuntimeSpineOutcome,
     RuntimeSpineRejection,
@@ -78,6 +83,59 @@ fn boot(value: u128) -> NodeBootId {
 
 fn digest(byte: u8) -> Sha256Digest {
     Sha256Digest::from_bytes([byte; 32])
+}
+
+#[test]
+fn running_active_lineage_accepts_a_relaxed_local_tail() {
+    let remote = Generation::new(4).unwrap();
+    let local = Generation::new(5).unwrap();
+    assert!(active_lineage_generations_match_for_test(local, remote));
+    assert!(!active_lineage_generations_match_for_test(remote, local));
+}
+
+#[test]
+fn cold_zero_lineage_exception_is_only_fresh_unacquired_persistent_membership() {
+    let workspace = id("ws_cold_membership_unit");
+    let create = super::product_tests::request(
+        &workspace,
+        "cold-membership-unit",
+        41,
+        "cold-membership-unit",
+    );
+    let mut desired = create.candidate.desired;
+    desired.target = RuntimeTarget::Cold;
+    desired.volumes[0].disk_kind = DiskKind::Persistent;
+    let intent = desired.volumes[0].clone();
+    let mut volume = create.candidate.volume;
+    let observed = ObservedVolume {
+        volume_intent_id: Some(intent.volume_intent_id.clone()),
+        disk_id: Some(intent.disk_id.clone()),
+        volume_id: intent.volume_id.clone(),
+        disk_kind: ObservedDiskKind::Persistent,
+        size_bytes: Some(intent.size_bytes),
+        durability: Some(intent.durability),
+        authority: VolumeAuthorityEvidence::Unowned {
+            attachment_epoch: volume.lease_epoch,
+            head: volume.head.clone(),
+        },
+        local_lineages: Vec::new(),
+        devices: Vec::new(),
+    };
+    assert!(cold_volume_evidence_matches_for_test(
+        &observed, &intent, &volume, &desired
+    ));
+
+    let mut root = intent.clone();
+    root.disk_kind = DiskKind::Root;
+    assert!(!cold_volume_evidence_matches_for_test(
+        &observed, &root, &volume, &desired
+    ));
+
+    volume.lease_epoch =
+        cats_api::runtime_reconciliation::FenceEpoch::new(volume.lease_epoch.get() + 1).unwrap();
+    assert!(!cold_volume_evidence_matches_for_test(
+        &observed, &intent, &volume, &desired
+    ));
 }
 
 fn release() -> GuestRuntimeProfileReceipt {
@@ -139,6 +197,12 @@ fn fixture_at(
     let identity = NodeIdentity {
         version: ContractVersion::V1,
         node_id: id("node_a"),
+        provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+            provider: id("test_provider"),
+            partition: id("test_partition"),
+            account_id: id("test_account"),
+            region: id("test_region"),
+        },
         immutable_host_id: id("host_a"),
         credential_id: id("credential_a"),
         credential_binding: CredentialBinding::PublicKey {
@@ -260,7 +324,9 @@ fn cancellation_before_definite_commit_reset_prevents_retry_without_any_row_chan
                  CREATE CONSTRAINT TRIGGER fail_a20_commit_for_test
                    AFTER INSERT ON runtime_desired_read_states
                    DEFERRABLE INITIALLY DEFERRED
-                   FOR EACH ROW EXECUTE FUNCTION fail_a20_commit_for_test();",
+                   FOR EACH ROW EXECUTE FUNCTION fail_a20_commit_for_test();
+                 REVOKE ALL ON FUNCTION count_a20_operation_for_test() FROM PUBLIC;
+                 REVOKE ALL ON FUNCTION fail_a20_commit_for_test() FROM PUBLIC;",
             )
         })
         .unwrap();
@@ -322,7 +388,8 @@ fn cancelling_a_started_http_authority_request_rolls_back_before_commit() {
                  $$ LANGUAGE plpgsql;
                  CREATE TRIGGER pause_runtime_desired_insert
                    BEFORE INSERT ON runtime_desired_read_states
-                   FOR EACH ROW EXECUTE FUNCTION pause_runtime_desired_insert();",
+                   FOR EACH ROW EXECUTE FUNCTION pause_runtime_desired_insert();
+                 REVOKE ALL ON FUNCTION pause_runtime_desired_insert() FROM PUBLIC;",
             )
         })
         .unwrap();
@@ -397,7 +464,8 @@ fn authority_request_uses_its_remaining_deadline_as_the_postgres_timeout() {
                  $$ LANGUAGE plpgsql;
                  CREATE TRIGGER pause_runtime_desired_until_deadline
                    BEFORE INSERT ON runtime_desired_read_states
-                   FOR EACH ROW EXECUTE FUNCTION pause_runtime_desired_until_deadline();",
+                   FOR EACH ROW EXECUTE FUNCTION pause_runtime_desired_until_deadline();
+                 REVOKE ALL ON FUNCTION pause_runtime_desired_until_deadline() FROM PUBLIC;",
             )
         })
         .unwrap();
@@ -430,6 +498,12 @@ fn numbered_identity(index: usize) -> NodeIdentity {
     NodeIdentity {
         version: ContractVersion::V1,
         node_id: id(format!("node_{index:03}")),
+        provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+            provider: id("test_provider"),
+            partition: id("test_partition"),
+            account_id: id("test_account"),
+            region: id("test_region"),
+        },
         immutable_host_id: id(format!("host_{index:03}")),
         credential_id: id(format!("credential_{index:03}")),
         credential_binding: CredentialBinding::PublicKey {
@@ -682,6 +756,96 @@ fn settlement_runtime(
     }
 }
 
+fn suspended_settlement_runtime(desired: &DesiredRuntimeSpec) -> ObservedRuntimeStatus {
+    let incarnation = random(778);
+    let launch = runtime_launch(&incarnation);
+    let RuntimeLaunch::Present(identity) = &launch else {
+        unreachable!("fixture launch is present")
+    };
+    let step = ReconcileStep::Stable {
+        state: StableState::Suspended,
+    };
+    ObservedRuntimeStatus {
+        cat_id: desired.cat_id.clone(),
+        applied_desired: Some(AppliedDesiredEvidence {
+            desired_revision: desired.desired_revision,
+            spec_digest: desired.spec_digest.clone(),
+            placement: desired.placement.clone(),
+            target: RuntimeTarget::Suspended,
+        }),
+        runtime_incarnation: Some(incarnation.clone()),
+        stable_state: Some(StableState::Suspended),
+        step: step.clone(),
+        checkpoint: CheckpointEvidence::Valid {
+            checkpoint_path: HostPath::new("/var/lib/cats/suspended-settlement.json").unwrap(),
+            content_digest: digest(7),
+            version: ContractVersion::V1,
+            cat_id: desired.cat_id.clone(),
+            node_id: desired.placement.node_id.clone(),
+            desired_revision: desired.desired_revision,
+            spec_digest: desired.spec_digest.clone(),
+            placement_epoch: desired.placement.placement_epoch,
+            runtime_incarnation: Some(incarnation.clone()),
+            runtime_launch: Box::new(launch.clone()),
+            stable_state: Some(StableState::Suspended),
+            step: Box::new(step),
+            require_idle: Box::new(RequireIdleCheckpoint::NotApplicable),
+            updated_at_unix_ms: UnixMillis::new(1).unwrap(),
+        },
+        processes: vec![ProcessEvidence {
+            role: ProcessRole::Vmm {
+                runtime_incarnation: incarnation.clone(),
+            },
+            process_id: 102,
+            process_start_time_ticks: WireU64::new(2).unwrap(),
+            executable_path: identity.boot.vmm_executable.path.clone(),
+            scope_id: identity.scope_id.clone(),
+            control_socket_path: identity.api_socket_path.clone(),
+            state: ProcessState::Paused,
+            ownership_token: OwnershipTokenEvidence::Valid {
+                ownership_token: identity.process_identity_token.clone(),
+            },
+            control_handshake: ControlHandshakeEvidence::Verified,
+            observed_vm_shape: Some(ObservedVmShape {
+                vcpus: desired.runtime.vcpus,
+                memory_bytes: desired.runtime.memory_bytes,
+                boot_image_digest: desired.runtime.boot_image_digest.clone(),
+                guest_config_digest: desired.runtime.guest_config_digest.clone(),
+            }),
+        }],
+        volumes: Vec::new(),
+        mounts: Vec::new(),
+        networks: vec![ObservedNetwork {
+            kind: desired.runtime.network_config.kind,
+            network_id: desired.runtime.network_config.network_id.clone(),
+            guest_mac: desired.runtime.network_config.guest_mac.clone(),
+            guest_ipv4: desired.runtime.network_config.guest_ipv4.clone(),
+            prefix_length: desired.runtime.network_config.prefix_length,
+            gateway_ipv4: desired.runtime.network_config.gateway_ipv4.clone(),
+            tap_name: identity.network.tap_name.clone(),
+            ownership_token: OwnershipTokenEvidence::Valid {
+                ownership_token: identity.network.ownership_token.clone(),
+            },
+        }],
+        guest_transport: GuestTransportEvidence::VsockReady {
+            runtime_incarnation: incarnation,
+            guest_cid: identity.guest_cid,
+            guest_port: cats_api::runtime_reconciliation::GUEST_AGENT_VSOCK_PORT_V1,
+            guest_agent_protocol_version: ContractVersion::V1,
+            guest_boot_id: GuestBootId::new("52525252525252525252525252525252").unwrap(),
+        },
+        warm_snapshot: WarmSnapshotEvidence::Absent,
+        lifecycle_admission: LifecycleAdmission::Closed,
+        routes: Vec::new(),
+        platform_guards: 0,
+        conditions: vec![Condition::Ready {
+            reason: ReadyReason::PostconditionSatisfied {
+                target: RuntimeTarget::Suspended,
+            },
+        }],
+    }
+}
+
 fn orphan_runtime(session: &AgentSession, blocked: bool) -> ObservedRuntimeStatus {
     ObservedRuntimeStatus {
         cat_id: id("cat_orphan"),
@@ -783,6 +947,12 @@ pub(super) fn establish_empty_admission_for(
     let identity = NodeIdentity {
         version: ContractVersion::V1,
         node_id: id(format!("node_{suffix}")),
+        provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+            provider: id("test_provider"),
+            partition: id("test_partition"),
+            account_id: id("test_account"),
+            region: id("test_region"),
+        },
         immutable_host_id: id(format!("host_{suffix}")),
         credential_id: id(format!("credential_{suffix}")),
         credential_binding: CredentialBinding::PublicKey {
@@ -809,6 +979,582 @@ pub(super) fn establish_empty_admission_for(
             .unwrap(),
     );
     accept_empty_admission(store, &identity, &authenticated, &policy, &session)
+}
+
+/// Accept a fresh full-inventory ACK for one exact installed Route v2 ring.
+/// This goes through the real Desired-read and observation acceptance path so
+/// rotation and uncordon tests cannot forge an admission projection row.
+pub(super) fn accept_ring_admission_for_test(
+    store: &Store,
+    planned: &super::runtime_spine::PlacementAdmissionSnapshot,
+    ring: &RouteGrantV2PublicKeyRingArtifact,
+    desired_sequence: u64,
+    heartbeat_sequence: u64,
+) -> super::runtime_spine::PlacementAdmissionSnapshot {
+    let authenticated = AuthenticatedNodeCredential::new(
+        planned.node_identity.credential_id.clone(),
+        planned.node_identity.credential_binding.clone(),
+    );
+    let desired = accepted(
+        store
+            .runtime_desired_read(
+                &authenticated,
+                &cats_api::runtime_reconciliation::DesiredReadRequest {
+                    version: ContractVersion::V1,
+                    session: binding(&planned.agent_session),
+                    request_sequence: Sequence::new(desired_sequence).unwrap(),
+                },
+            )
+            .unwrap(),
+    );
+    let mut full = planned.full_inventory_observation.clone();
+    full.observation_id = random(20_000 + u128::from(heartbeat_sequence));
+    full.heartbeat_sequence = Sequence::new(heartbeat_sequence).unwrap();
+    full.observed_at_unix_ms = db_now(store);
+    full.inventory_epoch = Epoch::new(
+        planned
+            .inventory_attestation
+            .inventory_epoch
+            .get()
+            .checked_add(1)
+            .unwrap(),
+    )
+    .unwrap();
+    full.inventory_read_position = Some(desired.read_position);
+    full.key_ring_version = Some(ring.ring_version);
+    full.key_ring_digest = Some(ring.digest().unwrap());
+    full.loaded_kids = ring.keys.iter().map(|entry| entry.kid.clone()).collect();
+    full.inventory_digest = Some(inventory_digest(&full).unwrap());
+    accepted(
+        store
+            .runtime_accept_observation(&authenticated, &full)
+            .unwrap(),
+    );
+    match store
+        .load_placement_admission_snapshot(
+            &planned.node_identity.node_id,
+            &planned.agent_session.guest_config_digest,
+        )
+        .unwrap()
+    {
+        PlacementAdmissionLoad::Accepted(snapshot) => *snapshot,
+        PlacementAdmissionLoad::Rejected(rejection) => {
+            panic!("ring admission unexpectedly rejected: {rejection:?}")
+        }
+    }
+}
+
+/// Establishes a fresh current session and full admission for whatever
+/// complete Desired set PostgreSQL currently assigns to `identity`.
+/// Product mutation tests use this to model a real plan refresh after each
+/// committed revision instead of forging admission rows.
+pub(super) fn refresh_assigned_admission_for_test(
+    store: &Store,
+    identity: &NodeIdentity,
+    release: &GuestRuntimeProfileReceipt,
+    number: u128,
+) -> super::runtime_spine::PlacementAdmissionSnapshot {
+    refresh_assigned_admission_with_residue_for_test(store, identity, release, number, Vec::new())
+}
+
+/// Establish a fresh complete inventory whose exact current Desired set is
+/// terminal Cold. Persistent members whose normal acquire still names the
+/// current Unowned epoch model the no-effect Cold->Cold attach projection and
+/// therefore have no synthetic Released lineage.
+pub(super) fn refresh_assigned_stable_cold_for_test(
+    store: &Store,
+    identity: &NodeIdentity,
+    release: &GuestRuntimeProfileReceipt,
+    number: u128,
+) -> super::runtime_spine::PlacementAdmissionSnapshot {
+    let authenticated = AuthenticatedNodeCredential::new(
+        identity.credential_id.clone(),
+        identity.credential_binding.clone(),
+    );
+    let policy = AgentSessionRegistrationPolicy::from_release_receipt(release).unwrap();
+    let expected_epoch = store
+        .with(|client| {
+            client
+                .query_opt(
+                    "SELECT agent_session_epoch FROM current_agent_sessions WHERE node_id=$1",
+                    &[&identity.node_id.as_str()],
+                )
+                .map(|row| {
+                    row.map(|row| {
+                        let epoch: i64 = row.get(0);
+                        Epoch::new(u64::try_from(epoch).unwrap()).unwrap()
+                    })
+                })
+        })
+        .unwrap();
+    let attempt = registration_attempt(
+        identity,
+        number,
+        expected_epoch,
+        policy.approved_guest_config_digest(),
+    );
+    let session = registered(
+        store
+            .register_agent_session(&authenticated, &attempt, &policy)
+            .unwrap(),
+    );
+    let desired_snapshot = accepted(
+        store
+            .runtime_desired_read(
+                &authenticated,
+                &cats_api::runtime_reconciliation::DesiredReadRequest {
+                    version: ContractVersion::V1,
+                    session: binding(&session),
+                    request_sequence: Sequence::new(1).unwrap(),
+                },
+            )
+            .unwrap(),
+    );
+    let runtimes = desired_snapshot
+        .desired_specs
+        .iter()
+        .map(|desired| {
+            assert_eq!(desired.target, RuntimeTarget::Cold);
+            let mut volumes = desired
+                .volumes
+                .iter()
+                .map(|intent| {
+                    let volume: VolumeRecord = store
+                        .authority_read_snapshot(|transaction| {
+                            load_volume_unlocked(transaction, &intent.volume_id)?.ok_or_else(|| {
+                                cats_api::error::ApiError::internal(
+                                    "stable-Cold test Volume is missing",
+                                )
+                                .into()
+                            })
+                        })
+                        .unwrap();
+                    assert!(matches!(volume.admin_state, VolumeAdminState::Active));
+                    assert!(volume.lease_owner.is_none());
+                    let origin = match &intent.acquire {
+                        VolumeAcquire::Normal { transition_id, .. } => AcquireOrigin::Normal {
+                            transition_id: transition_id.clone(),
+                        },
+                        VolumeAcquire::Takeover { authorization_id } => AcquireOrigin::Takeover {
+                            authorization_id: authorization_id.clone(),
+                        },
+                    };
+                    let no_effect_attach = intent.disk_kind == DiskKind::Persistent
+                        && matches!(
+                            intent.acquire,
+                            VolumeAcquire::Normal {
+                                expected_unowned_epoch,
+                                ..
+                            } if expected_unowned_epoch == volume.lease_epoch
+                        );
+                    let local_lineages = (!no_effect_attach)
+                        .then(|| LocalVolumeLineage {
+                            attachment_id: intent.attachment_id.clone(),
+                            attachment_epoch: volume.lease_epoch,
+                            acquire_origin: origin,
+                            node_id: desired.placement.node_id.clone(),
+                            placement_epoch: desired.placement.placement_epoch,
+                            local_durable_generation: volume.head.generation,
+                            remote_durable_generation: volume.head.generation,
+                            data_directory: HostPath::new(format!(
+                                "/var/lib/cats/volumes/{}",
+                                volume.volume_id
+                            ))
+                            .unwrap(),
+                            pending_pack_count: WireU64::new(0).unwrap(),
+                            fenced: true,
+                            state: LocalLineageState::Released,
+                        })
+                        .into_iter()
+                        .collect();
+                    ObservedVolume {
+                        volume_intent_id: Some(intent.volume_intent_id.clone()),
+                        disk_id: Some(intent.disk_id.clone()),
+                        volume_id: intent.volume_id.clone(),
+                        disk_kind: match intent.disk_kind {
+                            DiskKind::Root => ObservedDiskKind::Root,
+                            DiskKind::Persistent => ObservedDiskKind::Persistent,
+                        },
+                        size_bytes: Some(intent.size_bytes),
+                        durability: Some(intent.durability),
+                        authority: VolumeAuthorityEvidence::Unowned {
+                            attachment_epoch: volume.lease_epoch,
+                            head: volume.head,
+                        },
+                        local_lineages,
+                        devices: Vec::new(),
+                    }
+                })
+                .collect::<Vec<_>>();
+            volumes.sort_by(|left, right| left.volume_id.cmp(&right.volume_id));
+            let step = ReconcileStep::Stable {
+                state: StableState::Cold,
+            };
+            ObservedRuntimeStatus {
+                cat_id: desired.cat_id.clone(),
+                applied_desired: Some(AppliedDesiredEvidence {
+                    desired_revision: desired.desired_revision,
+                    spec_digest: desired.spec_digest.clone(),
+                    placement: desired.placement.clone(),
+                    target: RuntimeTarget::Cold,
+                }),
+                runtime_incarnation: None,
+                stable_state: Some(StableState::Cold),
+                step: step.clone(),
+                checkpoint: CheckpointEvidence::Valid {
+                    checkpoint_path: HostPath::new(format!(
+                        "/var/lib/cats/checkpoints/{}.json",
+                        desired.cat_id
+                    ))
+                    .unwrap(),
+                    content_digest: digest(0xc8),
+                    version: ContractVersion::V1,
+                    cat_id: desired.cat_id.clone(),
+                    node_id: desired.placement.node_id.clone(),
+                    desired_revision: desired.desired_revision,
+                    spec_digest: desired.spec_digest.clone(),
+                    placement_epoch: desired.placement.placement_epoch,
+                    runtime_incarnation: None,
+                    runtime_launch: Box::new(RuntimeLaunch::Absent),
+                    stable_state: Some(StableState::Cold),
+                    step: Box::new(step),
+                    require_idle: Box::new(RequireIdleCheckpoint::NotApplicable),
+                    updated_at_unix_ms: UnixMillis::new(1).unwrap(),
+                },
+                processes: Vec::new(),
+                volumes,
+                mounts: Vec::new(),
+                networks: Vec::new(),
+                guest_transport: GuestTransportEvidence::Unavailable,
+                warm_snapshot: WarmSnapshotEvidence::Absent,
+                lifecycle_admission: LifecycleAdmission::Closed,
+                routes: Vec::new(),
+                platform_guards: 0,
+                conditions: vec![Condition::Ready {
+                    reason: ReadyReason::PostconditionSatisfied {
+                        target: RuntimeTarget::Cold,
+                    },
+                }],
+            }
+        })
+        .collect();
+    let mut full = observation(
+        store,
+        &session,
+        1,
+        1,
+        true,
+        Some(desired_snapshot.read_position),
+        runtimes,
+    );
+    full.inventory_digest = Some(inventory_digest(&full).unwrap());
+    accepted(
+        store
+            .runtime_accept_observation(&authenticated, &full)
+            .unwrap(),
+    );
+    match store
+        .load_placement_admission_snapshot(&identity.node_id, policy.approved_guest_config_digest())
+        .unwrap()
+    {
+        PlacementAdmissionLoad::Accepted(snapshot) => *snapshot,
+        PlacementAdmissionLoad::Rejected(rejection) => {
+            panic!("stable-Cold admission unexpectedly rejected: {rejection:?}")
+        }
+    }
+}
+
+pub(super) fn refresh_assigned_admission_with_residue_for_test(
+    store: &Store,
+    identity: &NodeIdentity,
+    release: &GuestRuntimeProfileReceipt,
+    number: u128,
+    residue: Vec<NodeResidue>,
+) -> super::runtime_spine::PlacementAdmissionSnapshot {
+    let authenticated = AuthenticatedNodeCredential::new(
+        identity.credential_id.clone(),
+        identity.credential_binding.clone(),
+    );
+    let policy = AgentSessionRegistrationPolicy::from_release_receipt(release).unwrap();
+    let expected_epoch = store
+        .with(|client| {
+            client
+                .query_opt(
+                    "SELECT agent_session_epoch FROM current_agent_sessions WHERE node_id=$1",
+                    &[&identity.node_id.as_str()],
+                )
+                .map(|row| {
+                    row.map(|row| {
+                        let epoch: i64 = row.get(0);
+                        Epoch::new(u64::try_from(epoch).unwrap()).unwrap()
+                    })
+                })
+        })
+        .unwrap();
+    let attempt = registration_attempt(
+        identity,
+        number,
+        expected_epoch,
+        policy.approved_guest_config_digest(),
+    );
+    let session = registered(
+        store
+            .register_agent_session(&authenticated, &attempt, &policy)
+            .unwrap(),
+    );
+    let request = cats_api::runtime_reconciliation::DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: binding(&session),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    let snapshot = accepted(
+        store
+            .runtime_desired_read(&authenticated, &request)
+            .unwrap(),
+    );
+    let runtimes = snapshot
+        .desired_specs
+        .iter()
+        .map(|desired| {
+            let mut runtime = orphan_runtime(&session, false);
+            runtime.cat_id = desired.cat_id.clone();
+            runtime.applied_desired = Some(AppliedDesiredEvidence {
+                desired_revision: desired.desired_revision,
+                spec_digest: desired.spec_digest.clone(),
+                placement: desired.placement.clone(),
+                target: desired.target,
+            });
+            runtime
+        })
+        .collect();
+    let mut full = observation(
+        store,
+        &session,
+        1,
+        1,
+        true,
+        Some(snapshot.read_position),
+        runtimes,
+    );
+    full.residue = residue;
+    full.inventory_digest = Some(inventory_digest(&full).unwrap());
+    accepted(
+        store
+            .runtime_accept_observation(&authenticated, &full)
+            .unwrap(),
+    );
+    match store
+        .load_placement_admission_snapshot(&identity.node_id, policy.approved_guest_config_digest())
+        .unwrap()
+    {
+        PlacementAdmissionLoad::Accepted(snapshot) => *snapshot,
+        PlacementAdmissionLoad::Rejected(rejection) => {
+            panic!("assigned admission unexpectedly rejected: {rejection:?}")
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AcceptedRouteRuntimeKind {
+    Running,
+    RequireIdleBusy { gate_closed: bool },
+}
+
+/// Establishes a fresh session/full inventory whose per-Cat route runtime is
+/// suitable for G4 planning.  Unlike `refresh_assigned_admission_for_test`,
+/// this preserves a real Running incarnation and an exact terminal
+/// RequireIdle checkpoint/Condition when requested.
+pub(super) fn refresh_assigned_route_runtime_for_test(
+    store: &Store,
+    identity: &NodeIdentity,
+    release: &GuestRuntimeProfileReceipt,
+    number: u128,
+    kind: AcceptedRouteRuntimeKind,
+) -> super::runtime_spine::PlacementAdmissionSnapshot {
+    let authenticated = AuthenticatedNodeCredential::new(
+        identity.credential_id.clone(),
+        identity.credential_binding.clone(),
+    );
+    let policy = AgentSessionRegistrationPolicy::from_release_receipt(release).unwrap();
+    let expected_epoch = store
+        .with(|client| {
+            client
+                .query_opt(
+                    "SELECT agent_session_epoch FROM current_agent_sessions WHERE node_id=$1",
+                    &[&identity.node_id.as_str()],
+                )
+                .map(|row| {
+                    row.map(|row| {
+                        let epoch: i64 = row.get(0);
+                        Epoch::new(u64::try_from(epoch).unwrap()).unwrap()
+                    })
+                })
+        })
+        .unwrap();
+    let attempt = registration_attempt(
+        identity,
+        number,
+        expected_epoch,
+        policy.approved_guest_config_digest(),
+    );
+    let session = registered(
+        store
+            .register_agent_session(&authenticated, &attempt, &policy)
+            .unwrap(),
+    );
+    let request = cats_api::runtime_reconciliation::DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: binding(&session),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    let snapshot = accepted(
+        store
+            .runtime_desired_read(&authenticated, &request)
+            .unwrap(),
+    );
+    let runtimes = snapshot
+        .desired_specs
+        .iter()
+        .map(|desired| {
+            let mut runtime = route_ready_runtime(desired);
+            let Some(applied) = runtime.applied_desired.as_mut() else {
+                panic!("route-ready fixture has applied Desired");
+            };
+            applied.target = desired.target;
+            if let AcceptedRouteRuntimeKind::RequireIdleBusy { gate_closed } = kind {
+                let RuntimeTransition::RequireIdle {
+                    attempt_id,
+                    source_revision,
+                    source_runtime_incarnation,
+                } = &desired.transition
+                else {
+                    panic!("Busy fixture requires a RequireIdle Desired");
+                };
+                assert_eq!(
+                    runtime.runtime_incarnation.as_ref(),
+                    Some(source_runtime_incarnation),
+                    "fixture source incarnation must remain physically present"
+                );
+                let platform_guards = u32::from(!gate_closed);
+                runtime.platform_guards = platform_guards;
+                runtime.lifecycle_admission = if gate_closed {
+                    LifecycleAdmission::Closed
+                } else {
+                    LifecycleAdmission::Open
+                };
+                for route in &mut runtime.routes {
+                    route.gate = if gate_closed {
+                        RouteGateState::Closed
+                    } else {
+                        RouteGateState::Active
+                    };
+                }
+                let busy = RequireIdleCheckpoint::Busy {
+                    attempt_id: attempt_id.clone(),
+                    source_revision: *source_revision,
+                    source_runtime_incarnation: source_runtime_incarnation.clone(),
+                    gate_closed,
+                    platform_guards,
+                    endpoint_guards: Vec::new(),
+                };
+                let CheckpointEvidence::Valid { require_idle, .. } = &mut runtime.checkpoint else {
+                    panic!("route-ready fixture has a valid checkpoint");
+                };
+                **require_idle = busy;
+                runtime.conditions = vec![Condition::PreconditionFailed {
+                    reason: PreconditionFailureReason::Busy {
+                        attempt_id: attempt_id.clone(),
+                        gate_closed,
+                        platform_guards,
+                        endpoint_guards: Vec::new(),
+                    },
+                }];
+            }
+            runtime
+        })
+        .collect();
+    let full = observation(
+        store,
+        &session,
+        1,
+        1,
+        true,
+        Some(snapshot.read_position),
+        runtimes,
+    );
+    accepted(
+        store
+            .runtime_accept_observation(&authenticated, &full)
+            .unwrap(),
+    );
+    match store
+        .load_placement_admission_snapshot(&identity.node_id, policy.approved_guest_config_digest())
+        .unwrap()
+    {
+        PlacementAdmissionLoad::Accepted(snapshot) => *snapshot,
+        PlacementAdmissionLoad::Rejected(rejection) => {
+            panic!("route runtime admission unexpectedly rejected: {rejection:?}")
+        }
+    }
+}
+
+pub(super) fn replace_agent_session_for_test(
+    store: &Store,
+    planned: &super::runtime_spine::PlacementAdmissionSnapshot,
+    release: &GuestRuntimeProfileReceipt,
+    number: u128,
+) {
+    let authenticated = AuthenticatedNodeCredential::new(
+        planned.node_identity.credential_id.clone(),
+        planned.node_identity.credential_binding.clone(),
+    );
+    let policy = AgentSessionRegistrationPolicy::from_release_receipt(release).unwrap();
+    let attempt = registration_attempt(
+        &planned.node_identity,
+        number,
+        Some(planned.agent_session.agent_session_epoch),
+        policy.approved_guest_config_digest(),
+    );
+    registered(
+        store
+            .register_agent_session(&authenticated, &attempt, &policy)
+            .unwrap(),
+    );
+}
+
+/// Accepts a session-bound partial heartbeat after the full inventory receipt
+/// captured by `planned`. The helper deliberately reports the exact same Cat
+/// membership while omitting the complete-inventory digest/read cursor, so a
+/// product test can prove that source-only mutations neither consume nor
+/// replace the full placement attestation.
+pub(super) fn accept_partial_heartbeat_for_test(
+    store: &Store,
+    planned: &super::runtime_spine::PlacementAdmissionSnapshot,
+) {
+    let authenticated = AuthenticatedNodeCredential::new(
+        planned.node_identity.credential_id.clone(),
+        planned.node_identity.credential_binding.clone(),
+    );
+    let sequence = planned
+        .full_inventory_observation
+        .heartbeat_sequence
+        .get()
+        .checked_add(1)
+        .expect("test heartbeat sequence has room");
+    let partial = observation(
+        store,
+        &planned.agent_session,
+        sequence,
+        planned.inventory_attestation.inventory_epoch.get(),
+        false,
+        None,
+        planned.full_inventory_observation.runtimes.clone(),
+    );
+    accepted(
+        store
+            .runtime_accept_observation(&authenticated, &partial)
+            .unwrap(),
+    );
 }
 
 fn accept_empty_admission(
@@ -849,6 +1595,119 @@ fn accept_empty_admission(
     }
 }
 
+#[test]
+fn fleet_verification_snapshot_retains_exact_full_ack_and_counts_global_desired() {
+    const RING: &[u8] = br#"{"version":1,"ring_version":1,"expected_previous":null,"keys":[{"kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","public_key_spki":"MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To"}]}"#;
+    const SIGNER: &[u8] = br#"{"version":1,"deployment_id":"route_deployment_a","signer_revision":1,"expected_previous":null,"signer":{"state":"active","active_kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","secret_reference_id":"route_secret_a"},"public_key_ring_version":1,"public_key_ring_digest":"sha256:7c7e324d7be6c6ee71735c900ce1041de63af7cc08fb39b6800853f966e81e34"}"#;
+    let (store, identity, authenticated, policy, session) = fixture();
+    let ring = cats_api::route_grant_v2::decode_route_grant_v2_public_key_ring(RING).unwrap();
+    let reference =
+        cats_api::route_grant_v2::decode_route_grant_v2_signer_reference(SIGNER).unwrap();
+    let installed =
+        crate::route_grant_v2::InstalledRouteGrantV2SigningAuthority::from_authority_artifacts(
+            &reference,
+            SIGNER,
+            &ring,
+            Some(include_bytes!(
+                "../../../../tests/fixtures/route_grant_v2_private_ed25519.pem"
+            )),
+            120,
+        )
+        .unwrap();
+    store
+        .install_route_grant_v2_signer_authority(&installed)
+        .unwrap();
+
+    let desired_read = accepted(
+        store
+            .runtime_desired_read(
+                &authenticated,
+                &cats_api::runtime_reconciliation::DesiredReadRequest {
+                    version: ContractVersion::V1,
+                    session: binding(&session),
+                    request_sequence: Sequence::new(1).unwrap(),
+                },
+            )
+            .unwrap(),
+    );
+    let mut full = observation(
+        &store,
+        &session,
+        1,
+        1,
+        true,
+        Some(desired_read.read_position),
+        Vec::new(),
+    );
+    full.key_ring_version = Some(ring.ring_version);
+    full.loaded_kids = ring.keys.iter().map(|key| key.kid.clone()).collect();
+    full.key_ring_digest = Some(ring.digest().unwrap());
+    full.inventory_digest = Some(inventory_digest(&full).unwrap());
+    accepted(
+        store
+            .runtime_accept_observation(&authenticated, &full)
+            .unwrap(),
+    );
+
+    let request = crate::store::transaction::AuthorityRequestContext::new(
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+    );
+    let snapshot = store
+        .fleet_verification_snapshot(&request, policy.approved_guest_config_digest())
+        .unwrap();
+    assert_eq!(snapshot.desired_runtime_count.get(), 0);
+    assert_eq!(snapshot.current_runtime_observation_count.get(), 0);
+    assert_eq!(snapshot.nodes.len(), 1);
+    let inventory = snapshot.nodes[0].inventory.as_ref().unwrap();
+    assert_eq!(inventory.loaded_kids, full.loaded_kids);
+    assert_eq!(inventory.key_ring_digest, full.key_ring_digest);
+    assert_eq!(inventory.runtime_count.get(), 0);
+    assert_eq!(inventory.residue_count.get(), 0);
+    assert_eq!(
+        snapshot
+            .route_signing_authority
+            .as_ref()
+            .unwrap()
+            .signer_reference_sha256,
+        installed.binding().reference_sha256().clone()
+    );
+
+    // A partial heartbeat is newer telemetry but cannot replace or refresh
+    // the retained session-bound complete inventory/key-ring attestation.
+    let partial = observation(&store, &session, 2, 1, false, None, Vec::new());
+    accepted(
+        store
+            .runtime_accept_observation(&authenticated, &partial)
+            .unwrap(),
+    );
+    let after_partial = store
+        .fleet_verification_snapshot(&request, policy.approved_guest_config_digest())
+        .unwrap();
+    assert_eq!(
+        after_partial.nodes[0]
+            .inventory
+            .as_ref()
+            .unwrap()
+            .source_observation_id,
+        full.observation_id
+    );
+
+    // Calibrate the global empty-set probe against a known positive: this
+    // Desired row was not present in the retained assigned snapshot, yet the
+    // fleet-wide count must reveal it and prevent an empty-fleet proof.
+    let workspace = bootstrap_workspace(&store, "fleet-verification");
+    let desired = current_desired(&workspace, &identity.node_id);
+    insert_pending_operation(&store, &desired);
+    assert_eq!(
+        store
+            .fleet_verification_snapshot(&request, policy.approved_guest_config_digest())
+            .unwrap()
+            .desired_runtime_count
+            .get(),
+        1
+    );
+}
+
 fn bind_create_to_admission(
     request: &mut super::product::CoveredCatCreateRequest,
     admission: &super::runtime_spine::PlacementAdmissionSnapshot,
@@ -878,6 +1737,7 @@ fn stale_plan_is_ignored_only_for_a_closed_existing_name_conflict() {
     let admission = accept_empty_admission(&store, &identity, &authenticated, &policy, &session);
     let active_guest_digest = policy.approved_guest_config_digest().clone();
     let workspace = super::product_tests::bootstrap_workspace(&store, "stale-plan-conflict");
+    crate::testsupport::begin_production_qualification_for_product_test(&store, &workspace);
     let mut occupied = super::product_tests::request(&workspace, "occupied", 1, "occupy");
     bind_create_to_admission(&mut occupied, &admission, &active_guest_digest);
     assert_eq!(
@@ -924,6 +1784,7 @@ fn free_name_revalidates_after_a_concurrent_session_replacement() {
     let admission = accept_empty_admission(&store, &identity, &authenticated, &policy, &session);
     let active_guest_digest = policy.approved_guest_config_digest().clone();
     let workspace = super::product_tests::bootstrap_workspace(&store, "admission-race");
+    crate::testsupport::begin_production_qualification_for_product_test(&store, &workspace);
     let mut create = super::product_tests::request(&workspace, "free", 1, "create");
     bind_create_to_admission(&mut create, &admission, &active_guest_digest);
 
@@ -1062,6 +1923,7 @@ fn full_observation_committing_first_invalidates_an_empty_create_plan() {
         Vec::new(),
     );
     let workspace = super::product_tests::bootstrap_workspace(&store, "observation-first");
+    crate::testsupport::begin_production_qualification_for_product_test(&store, &workspace);
     let mut create = super::product_tests::request(&workspace, "free", 1, "create");
     bind_create_to_admission(&mut create, &admission, &active_guest_digest);
 
@@ -1177,6 +2039,7 @@ fn create_committing_first_makes_the_old_empty_cursor_fail_closed() {
         Vec::new(),
     );
     let workspace = super::product_tests::bootstrap_workspace(&store, "create-first");
+    crate::testsupport::begin_production_qualification_for_product_test(&store, &workspace);
     let mut create = super::product_tests::request(&workspace, "free", 1, "create");
     bind_create_to_admission(&mut create, &admission, &active_guest_digest);
 
@@ -1290,6 +2153,7 @@ fn free_name_rejects_candidate_plan_binding_drift_without_writes() {
     let admission = accept_empty_admission(&store, &identity, &authenticated, &policy, &session);
     let active_guest_digest = policy.approved_guest_config_digest().clone();
     let workspace = super::product_tests::bootstrap_workspace(&store, "candidate-binding");
+    crate::testsupport::begin_production_qualification_for_product_test(&store, &workspace);
 
     let mut wrong_node = super::product_tests::request(&workspace, "wrong-node", 1, "wrong-node");
     bind_create_to_admission(&mut wrong_node, &admission, &active_guest_digest);
@@ -1756,6 +2620,52 @@ fn operation_settlement_validates_every_reason_then_selects_first_terminal_atomi
                 }
             )
     ));
+}
+
+#[test]
+fn suspended_ready_observation_cannot_settle_an_operation() {
+    let (store, identity, authenticated, _policy, session) = fixture();
+    let workspace = bootstrap_workspace(&store, "f3c-suspended-disabled");
+    let mut desired = current_desired(&workspace, &identity.node_id);
+    desired.target = RuntimeTarget::Suspended;
+    desired.spec_digest = spec_digest(&desired).unwrap();
+    insert_pending_operation(&store, &desired);
+    let request = cats_api::runtime_reconciliation::DesiredReadRequest {
+        version: ContractVersion::V1,
+        session: binding(&session),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    let snapshot = accepted(
+        store
+            .runtime_desired_read(&authenticated, &request)
+            .unwrap(),
+    );
+    let full = observation(
+        &store,
+        &session,
+        1,
+        1,
+        true,
+        Some(snapshot.read_position),
+        vec![suspended_settlement_runtime(&desired)],
+    );
+    accepted(
+        store
+            .runtime_accept_observation(&authenticated, &full)
+            .unwrap(),
+    );
+
+    let phase: String = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT phase FROM runtime_operations WHERE operation_id='op_settlement'",
+                    &[],
+                )
+                .map(|row| row.get(0))
+        })
+        .unwrap();
+    assert_eq!(phase, "pending");
 }
 
 #[test]
@@ -3082,6 +3992,22 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
         target_port: 8080,
     }];
     desired.spec_digest = spec_digest(&desired).unwrap();
+    let endpoint_id_b = id("ep_route_b");
+    let hostname_b = Hostname::new("route-b.cats.run").unwrap();
+    let mut desired_b = desired.clone();
+    desired_b.cat_id = id("cat_route_b");
+    desired_b.runtime.network_config.network_id = id("net_route_b");
+    desired_b.runtime.network_config.guest_mac = MacAddress::new("02:00:00:00:00:0b").unwrap();
+    desired_b.runtime.network_config.guest_ipv4 = Ipv4Address::new("10.0.0.5").unwrap();
+    desired_b.runtime.network_config.gateway_ipv4 = Ipv4Address::new("10.0.0.6").unwrap();
+    desired_b.endpoints = vec![EndpointIntent {
+        endpoint_id: endpoint_id_b.clone(),
+        hostname: hostname_b.clone(),
+        route_epoch: Epoch::new(8).unwrap(),
+        protocol: HttpProtocol::Http,
+        target_port: 8081,
+    }];
+    desired_b.spec_digest = spec_digest(&desired_b).unwrap();
     store
         .authority_transaction(|transaction| {
             let now = database_now(transaction)?;
@@ -3113,6 +4039,36 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
                     cat_id: desired.cat_id.clone(),
                     endpoint_id: endpoint_id.clone(),
                     desired_revision: desired.desired_revision,
+                },
+            )?;
+            insert_cat(
+                transaction,
+                &CatRecord {
+                    cat_id: desired_b.cat_id.clone(),
+                    workspace_id: workspace.clone(),
+                    name: id("route-cat-b"),
+                    created_at: now,
+                },
+            )?;
+            insert_endpoint(
+                transaction,
+                &EndpointRecord {
+                    endpoint_id: endpoint_id_b.clone(),
+                    workspace_id: workspace.clone(),
+                    cat_id: desired_b.cat_id.clone(),
+                    name: id("web-b"),
+                    created_at: now,
+                },
+            )?;
+            insert_desired(transaction, &desired_b)?;
+            insert_hostname_lookup(
+                transaction,
+                &HostnameDesiredLookup {
+                    hostname: hostname_b.clone(),
+                    workspace_id: workspace.clone(),
+                    cat_id: desired_b.cat_id.clone(),
+                    endpoint_id: endpoint_id_b.clone(),
+                    desired_revision: desired_b.desired_revision,
                 },
             )
         })
@@ -3189,6 +4145,20 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
     let signer_binding = Arc::new(installed_signing_authority.binding().clone());
     let active_kid = route_signer.kid().clone();
     let ring_version = Epoch::new(3).unwrap();
+    let mut runtime_b = route_ready_runtime(&desired_b);
+    let CheckpointEvidence::Valid {
+        checkpoint_path, ..
+    } = &mut runtime_b.checkpoint
+    else {
+        unreachable!()
+    };
+    *checkpoint_path = HostPath::new("/var/lib/cats/checkpoints/cat_route_b.json").unwrap();
+    runtime_b.processes[0].process_id = 102;
+    runtime_b.processes[0].process_start_time_ticks = WireU64::new(2).unwrap();
+    runtime_b.processes[0].scope_id = id("cats-route-b.service");
+    runtime_b.processes[0].control_socket_path =
+        HostPath::new("/run/cats/route-b/vmm.sock").unwrap();
+    runtime_b.networks[0].tap_name = id("tap-route-b");
     let mut full = observation(
         &store,
         &session,
@@ -3196,7 +4166,7 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
         1,
         true,
         Some(desired_snapshot.read_position),
-        vec![route_ready_runtime(&desired)],
+        vec![runtime_b, route_ready_runtime(&desired)],
     );
     full.key_ring_version = Some(ring_version);
     full.loaded_kids = vec![active_kid.clone()];
@@ -3206,6 +4176,59 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
         store
             .runtime_accept_observation(&authenticated, &full)
             .unwrap(),
+    );
+
+    let full_attestation: String = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT attestation::text FROM runtime_admission_inventory_states WHERE node_id=$1",
+                    &[&identity.node_id.as_str()],
+                )
+                .map(|row| row.get(0))
+        })
+        .unwrap();
+    let full_inventory_epoch = full.inventory_epoch;
+    let mut partial_runtime = route_ready_runtime(&desired);
+    partial_runtime.conditions.push(Condition::Degraded {
+        reason: cats_api::runtime_reconciliation::DegradedReason::SourceUnavailable {
+            sources: vec![cats_api::runtime_reconciliation::DegradedSource::Process],
+            since_unix_ms: db_now(&store),
+        },
+    });
+    let partial = observation(
+        &store,
+        &session,
+        2,
+        full_inventory_epoch.get(),
+        false,
+        None,
+        vec![partial_runtime],
+    );
+    let partial_acceptance = accepted(
+        store
+            .runtime_accept_observation(&authenticated, &partial)
+            .unwrap(),
+    );
+    assert_eq!(
+        partial_acceptance.inventory,
+        ObservationInventoryAcceptance::Partial {
+            inventory_epoch: full_inventory_epoch,
+        }
+    );
+    let attestation_after_partial: String = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT attestation::text FROM runtime_admission_inventory_states WHERE node_id=$1",
+                    &[&identity.node_id.as_str()],
+                )
+                .map(|row| row.get(0))
+        })
+        .unwrap();
+    assert_eq!(
+        attestation_after_partial, full_attestation,
+        "partial Degraded heartbeat must not replace the full inventory attestation",
     );
 
     let snapshot = match store
@@ -3230,6 +4253,155 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
         "https://node-a.internal:7301"
     );
     assert!(snapshot.evaluated_at_unix_ms.get() > 0);
+
+    assert!(matches!(
+        store
+            .load_route_grant_v2_authority(
+                &hostname_b,
+                &active_kid,
+                policy.approved_guest_config_digest(),
+            )
+            .unwrap(),
+        RouteGrantV2AuthorityLoad::Ready(_)
+    ));
+    let mut negative_a = route_ready_runtime(&desired);
+    negative_a.lifecycle_admission = LifecycleAdmission::Closed;
+    negative_a.processes.clear();
+    for route in &mut negative_a.routes {
+        route.gate = RouteGateState::Closed;
+        route.cancellation_pending = true;
+    }
+    negative_a.conditions = vec![Condition::Degraded {
+        reason: cats_api::runtime_reconciliation::DegradedReason::SourceUnavailable {
+            sources: vec![cats_api::runtime_reconciliation::DegradedSource::Process],
+            since_unix_ms: db_now(&store),
+        },
+    }];
+    let negative_partial = observation(
+        &store,
+        &session,
+        3,
+        full_inventory_epoch.get(),
+        false,
+        None,
+        vec![negative_a],
+    );
+    accepted(
+        store
+            .runtime_accept_observation(&authenticated, &negative_partial)
+            .unwrap(),
+    );
+    assert_eq!(
+        store
+            .load_route_grant_v2_authority(
+                &hostname,
+                &active_kid,
+                policy.approved_guest_config_digest(),
+            )
+            .unwrap(),
+        RouteGrantV2AuthorityLoad::Rejected(RouteGrantV2AuthorityRejection::Pending),
+        "the exact-negative Cat in a partial must not receive a new Grant",
+    );
+    assert!(matches!(
+        store
+            .load_route_grant_v2_authority(
+                &hostname_b,
+                &active_kid,
+                policy.approved_guest_config_digest(),
+            )
+            .unwrap(),
+        RouteGrantV2AuthorityLoad::Ready(_)
+    ));
+    let omitted_b_source: String = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT source_kind FROM runtime_current_cat_observations
+                      WHERE node_id=$1 AND cat_id=$2",
+                    &[&identity.node_id.as_str(), &desired_b.cat_id.as_str()],
+                )
+                .map(|row| row.get(0))
+        })
+        .unwrap();
+    assert_eq!(
+        omitted_b_source, "full",
+        "an unrelated Cat omitted by a partial retains its accepted full row",
+    );
+
+    let mut partial_b_runtime = route_ready_runtime(&desired_b);
+    partial_b_runtime.conditions.push(Condition::Degraded {
+        reason: cats_api::runtime_reconciliation::DegradedReason::SourceUnavailable {
+            sources: vec![cats_api::runtime_reconciliation::DegradedSource::Network],
+            since_unix_ms: db_now(&store),
+        },
+    });
+    let partial_b = observation(
+        &store,
+        &session,
+        4,
+        full_inventory_epoch.get(),
+        false,
+        None,
+        vec![partial_b_runtime],
+    );
+    accepted(
+        store
+            .runtime_accept_observation(&authenticated, &partial_b)
+            .unwrap(),
+    );
+    assert!(matches!(
+        store
+            .load_route_grant_v2_authority(
+                &hostname_b,
+                &active_kid,
+                policy.approved_guest_config_digest(),
+            )
+            .unwrap(),
+        RouteGrantV2AuthorityLoad::Ready(_)
+    ));
+    assert_eq!(
+        store
+            .load_route_grant_v2_authority(
+                &hostname,
+                &active_kid,
+                policy.approved_guest_config_digest(),
+            )
+            .unwrap(),
+        RouteGrantV2AuthorityLoad::Rejected(RouteGrantV2AuthorityRejection::Pending),
+    );
+
+    let mut restored_a = route_ready_runtime(&desired);
+    restored_a.conditions.push(Condition::Degraded {
+        reason: cats_api::runtime_reconciliation::DegradedReason::SourceUnavailable {
+            sources: vec![cats_api::runtime_reconciliation::DegradedSource::Network],
+            since_unix_ms: db_now(&store),
+        },
+    });
+    let restored_partial = observation(
+        &store,
+        &session,
+        5,
+        full_inventory_epoch.get(),
+        false,
+        None,
+        vec![restored_a],
+    );
+    accepted(
+        store
+            .runtime_accept_observation(&authenticated, &restored_partial)
+            .unwrap(),
+    );
+    assert!(matches!(
+        store
+            .load_route_grant_v2_authority(
+                &hostname,
+                &active_kid,
+                policy.approved_guest_config_digest(),
+            )
+            .unwrap(),
+        RouteGrantV2AuthorityLoad::Ready(_)
+    ));
+
     let unknown = KeyId::new("b".repeat(64)).unwrap();
     assert_eq!(
         store

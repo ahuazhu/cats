@@ -15,6 +15,15 @@ set -euo pipefail
 
 output=${CATS_POSTGRES_URL_FILE:-/run/cats/postgres-url}
 
+[[ -n ${CATS_POSTGRES_SCHEMA:-} ]] || {
+  echo "render-postgres-url needs CATS_POSTGRES_SCHEMA" >&2
+  exit 1
+}
+[[ $CATS_POSTGRES_SCHEMA =~ ^cats_[a-z0-9_]+$ && ${#CATS_POSTGRES_SCHEMA} -le 63 ]] || {
+  echo "CATS_POSTGRES_SCHEMA must be one lowercase cats_* PostgreSQL identifier" >&2
+  exit 1
+}
+
 if [[ -n ${CATS_POSTGRES_SECRET_ARN:-} ]]; then
   for required in aws jq; do
     command -v "$required" >/dev/null 2>&1 || {
@@ -42,11 +51,33 @@ if [[ -n ${CATS_POSTGRES_SECRET_ARN:-} ]]; then
   password=$(jq -er '.password | @uri' <<<"$secret")
   unset secret
 
-  dsn="postgresql://${username}:${password}@${CATS_POSTGRES_HOST}:${CATS_POSTGRES_PORT:-5432}/${CATS_POSTGRES_DATABASE}?sslmode=${CATS_POSTGRES_SSLMODE:-require}"
+  dsn="postgresql://${username}:${password}@${CATS_POSTGRES_HOST}:${CATS_POSTGRES_PORT:-5432}/${CATS_POSTGRES_DATABASE}?sslmode=${CATS_POSTGRES_SSLMODE:-require}&options=-csearch_path%3D${CATS_POSTGRES_SCHEMA}"
 elif [[ -n ${CATS_POSTGRES_URL:-} ]]; then
   # Development, and any host not yet pointed at the managed secret. The DSN is
-  # whatever the environment file says; nothing here rotates.
+  # whatever the environment file says; nothing here rotates. Still require
+  # the exact reviewed search_path so this compatibility path cannot silently
+  # reconnect noded/blockd to public.
   dsn=$CATS_POSTGRES_URL
+  query=${dsn#*\?}
+  [[ $query != "$dsn" ]] || {
+    echo "CATS_POSTGRES_URL lacks the required search_path option" >&2
+    exit 1
+  }
+  option_count=0
+  IFS='&' read -r -a query_parameters <<<"$query"
+  for parameter in "${query_parameters[@]}"; do
+    if [[ $parameter == options=* ]]; then
+      ((option_count += 1))
+      [[ $parameter == "options=-csearch_path%3D${CATS_POSTGRES_SCHEMA}" ]] || {
+        echo "CATS_POSTGRES_URL has a non-canonical PostgreSQL options value" >&2
+        exit 1
+      }
+    fi
+  done
+  [[ $option_count -eq 1 ]] || {
+    echo "CATS_POSTGRES_URL must have exactly one search_path option" >&2
+    exit 1
+  }
 else
   echo "set CATS_POSTGRES_SECRET_ARN (production) or CATS_POSTGRES_URL (development)" >&2
   exit 1

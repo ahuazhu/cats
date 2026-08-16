@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use cats_api::runtime_reconciliation::{
     checkpoint_content_digest, CheckpointEvidence, Epoch, FenceEpoch, GuestDeviceIdentity,
-    HostPath, Id, NodeBootId, NodeObservation, ObservedDevice, OwnershipTokenEvidence,
+    HostPath, Id, NodeBootId, NodeObservation, NodeResidue, ObservedDevice, OwnershipTokenEvidence,
     PrepareDeviceFrontend, PreparedDeviceInput, RandomId128, ReconcileStep, RuntimeCheckpoint,
     RuntimeTarget, RuntimeTransition, Sequence, Sha256Digest, WireU64,
 };
@@ -66,6 +66,10 @@ const CLIENT_CLEANUP_GRACE: Duration = Duration::from_millis(50);
 const MAX_KERNEL_NBD_DEVICE_COUNT: u32 = 1_024 * 64;
 
 pub(crate) mod attach_port_sealed {
+    pub(crate) trait Sealed {}
+}
+
+pub(crate) mod detach_port_sealed {
     pub(crate) trait Sealed {}
 }
 
@@ -455,6 +459,17 @@ impl ExactKernelNbdDeviceProof {
     ) -> bool {
         self.expected.matches_prepared_device(cat_id, prepared)
     }
+
+    pub(crate) fn matches_cleanup_target(
+        &self,
+        cat_id: &Id,
+        volume_id: &Id,
+        ownership_token: &RandomId128,
+    ) -> bool {
+        self.expected.cat_id == *cat_id
+            && self.expected.volume_id == *volume_id
+            && self.expected.ownership_token == *ownership_token
+    }
 }
 
 impl KernelNbdDeviceExpectation {
@@ -501,7 +516,25 @@ pub(crate) struct KernelNbdPoolScanAdmission {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum KernelNbdPoolScanOutcome {
     Complete(KernelNbdPoolScanAdmission),
+    CompleteWithResidue {
+        admission: KernelNbdPoolScanAdmission,
+        residue: Vec<NodeResidue>,
+    },
     Unavailable,
+}
+
+fn kernel_nbd_residue(
+    device_path: &HostPath,
+    expected: Option<&KernelNbdDeviceExpectation>,
+) -> NodeResidue {
+    NodeResidue::KernelNbd {
+        volume_id_hint: expected.map(|expected| expected.volume_id.clone()),
+        guest_device: expected.map(|expected| expected.guest_device.clone()),
+        device_path: device_path.clone(),
+        // The kernel tuple has no ownership-token field. A checkpoint hint is
+        // not physical token evidence, including for a reserved leaked slot.
+        ownership_token: OwnershipTokenEvidence::Missing,
+    }
 }
 
 /// The same closed scan after binding the exact observation bytes accepted by
@@ -801,6 +834,27 @@ pub(crate) trait KernelNbdAttachPort:
         stored: &StoredCheckpoint,
         context: &RuntimeDesiredEffectContext,
     ) -> Result<KernelNbdAttachResult>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KernelNbdDetachResult {
+    SubmittedOrAmbiguous,
+    Conflict,
+    Unavailable,
+}
+
+/// Checkpointed cleanup of one scanner-proven kernel-NBD frontend.
+pub(crate) trait KernelNbdDetachPort:
+    detach_port_sealed::Sealed + Send + Sync + 'static
+{
+    fn detach_checkpointed(
+        &self,
+        volume_id: &Id,
+        ownership_token: &RandomId128,
+        store: &FileCheckpointStore,
+        stored: &StoredCheckpoint,
+        context: &RuntimeDesiredEffectContext,
+    ) -> Result<KernelNbdDetachResult>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1262,6 +1316,116 @@ impl KernelNbdInventoryPort {
             .context("unlock kernel-NBD allocator after StartRuntime revalidation")
     }
 
+    fn detach_checkpointed(
+        &self,
+        submitter: &dyn KernelNbdDetachSubmitPort,
+        volume_id: &Id,
+        ownership_token: &RandomId128,
+        store: &FileCheckpointStore,
+        stored: &StoredCheckpoint,
+        context: &RuntimeDesiredEffectContext,
+    ) -> Result<KernelNbdDetachResult> {
+        context.check_active()?;
+        let cat_id = &stored.checkpoint().cat_id;
+        let accepted = context.accepted_full()?;
+        let pool = context.kernel_nbd_pool()?;
+        if !pool.matches_observation(accepted.observation()) {
+            return Ok(KernelNbdDetachResult::Conflict);
+        }
+        let admitted = match pool.device(cat_id, volume_id) {
+            Some(KernelNbdDeviceScanState::Exact(proof))
+                if proof.matches_cleanup_target(cat_id, volume_id, ownership_token) =>
+            {
+                proof
+            }
+            Some(
+                KernelNbdDeviceScanState::Absent { .. }
+                | KernelNbdDeviceScanState::Exact(_)
+                | KernelNbdDeviceScanState::Leaked { .. }
+                | KernelNbdDeviceScanState::Unavailable { .. },
+            )
+            | None => return Ok(KernelNbdDetachResult::Conflict),
+        };
+
+        let permit = self.lock_and_inspect(context)?;
+        let outcome = (|| {
+            let context_state_root = context
+                .state_directory()
+                .try_clone_directory()
+                .context("retain Desired-effect state root for kernel-NBD detach")?;
+            ensure_same_directory(
+                permit.state_root(),
+                &context_state_root,
+                "kernel-NBD detach and Desired effect use different directories",
+            )?;
+            let namespace = snapshot_runtime_checkpoint_namespace(
+                permit.state_root(),
+                context,
+                accepted.assigned_cats()?,
+                RUNTIME_CHECKPOINT_NAMESPACE_ENTRY_LIMIT,
+            )?
+            .context("kernel-NBD detach requires a complete checkpoint namespace")?;
+            permit.assert_current_publication_paths(&namespace, store)?;
+            if namespace.checkpoint(cat_id) != Some(stored.checkpoint()) {
+                return Ok(KernelNbdDetachResult::Conflict);
+            }
+            let expected = device_expectations_from_namespace(&namespace)?
+                .into_values()
+                .find(|expected| {
+                    expected.cat_id == *cat_id
+                        && expected.volume_id == *volume_id
+                        && expected.ownership_token == *ownership_token
+                });
+            let Some(expected) = expected else {
+                return Ok(KernelNbdDetachResult::Conflict);
+            };
+            if admitted.expected != expected
+                || permit.snapshot().state(&expected.device_path)
+                    != Some(&KernelNbdSlotState::Serving(admitted.client.clone()))
+            {
+                return Ok(KernelNbdDetachResult::Conflict);
+            }
+            admitted.listener().assert_current(context)?;
+            let current = store
+                .assert_current(stored)
+                .context("retain exact lifecycle checkpoint across kernel-NBD detach")?;
+            store.revalidate_current(stored, &current)?;
+            permit.assert_current_publication_paths(&namespace, store)?;
+            context.check_active()?;
+            submitter.poll_reap()?;
+            if submitter.pending_count() > 0 {
+                return Ok(KernelNbdDetachResult::Unavailable);
+            }
+            let submitted = submitter.submit(&self.config, &expected.device_path, context);
+            let still_current = store.revalidate_current(stored, &current).is_ok()
+                && permit
+                    .assert_current_publication_paths(&namespace, store)
+                    .is_ok();
+            Ok(match submitted {
+                KernelNbdDetachSubmitAttempt::NotSubmitted if still_current => {
+                    KernelNbdDetachResult::Unavailable
+                }
+                KernelNbdDetachSubmitAttempt::NotSubmitted => KernelNbdDetachResult::Conflict,
+                KernelNbdDetachSubmitAttempt::Submitted => {
+                    KernelNbdDetachResult::SubmittedOrAmbiguous
+                }
+            })
+        })();
+        let released = permit
+            .release()
+            .context("unlock kernel-NBD allocator after detach");
+        match (outcome, released) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Ok(KernelNbdDetachResult::SubmittedOrAmbiguous), Err(_)) => {
+                Ok(KernelNbdDetachResult::SubmittedOrAmbiguous)
+            }
+            (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(unlock)) => Err(error.context(format!(
+                "kernel-NBD detach allocation unlock also failed: {unlock:#}"
+            ))),
+        }
+    }
+
     #[cfg(test)]
     fn inject_unlock_failures(&mut self, count: usize) {
         self.injected_unlock_failures = count;
@@ -1344,6 +1508,7 @@ impl KernelNbdInventoryPort {
             );
 
             let mut devices_by_key = BTreeMap::new();
+            let mut residue = Vec::new();
             for (device_path, slot) in permit.snapshot().iter() {
                 let reservation = reservations.by_device.get(device_path);
                 let expected = expectations.get(device_path);
@@ -1355,9 +1520,7 @@ impl KernelNbdInventoryPort {
                             return Ok(KernelNbdPoolScanOutcome::Unavailable);
                         }
                         KernelNbdSlotState::Serving(_) | KernelNbdSlotState::Leaked { .. } => {
-                            anyhow::bail!(
-                                "physical kernel-NBD slot has no exact durable reservation"
-                            )
+                            residue.push(kernel_nbd_residue(device_path, None));
                         }
                     }
                     continue;
@@ -1413,6 +1576,9 @@ impl KernelNbdInventoryPort {
                         expected: expected.clone(),
                     },
                 };
+                if matches!(state, KernelNbdDeviceScanState::Leaked { .. }) {
+                    residue.push(kernel_nbd_residue(device_path, Some(expected)));
+                }
                 let key =
                     ManagedServingKey::new(expected.cat_id.clone(), expected.volume_id.clone());
                 anyhow::ensure!(
@@ -1426,9 +1592,14 @@ impl KernelNbdInventoryPort {
             );
             permit.assert_current_scan_paths(&namespace)?;
             context.check_active()?;
-            Ok(KernelNbdPoolScanOutcome::Complete(
-                KernelNbdPoolScanAdmission { devices_by_key },
-            ))
+            let admission = KernelNbdPoolScanAdmission { devices_by_key };
+            Ok(
+                if admission.has_unavailable_device() || residue.is_empty() {
+                    KernelNbdPoolScanOutcome::Complete(admission)
+                } else {
+                    KernelNbdPoolScanOutcome::CompleteWithResidue { admission, residue }
+                },
+            )
         })();
         let released = permit
             .release()
@@ -1792,6 +1963,24 @@ enum KernelNbdClientSubmitAttempt {
     Submitted(KernelNbdClientSubmission),
 }
 
+enum KernelNbdDetachSubmitAttempt {
+    NotSubmitted,
+    Submitted,
+}
+
+trait KernelNbdDetachSubmitPort: Send + Sync + 'static {
+    fn poll_reap(&self) -> Result<()>;
+
+    fn pending_count(&self) -> usize;
+
+    fn submit(
+        &self,
+        config: &KernelNbdInventoryConfig,
+        device_path: &HostPath,
+        context: &RuntimeDesiredEffectContext,
+    ) -> KernelNbdDetachSubmitAttempt;
+}
+
 trait KernelNbdClientSubmitPort: Send + Sync + 'static {
     fn submit(
         &self,
@@ -2097,6 +2286,46 @@ impl KernelNbdClientSubmitPort for PlatformKernelNbdClientSubmitPort {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PlatformKernelNbdDetachSubmitPort {
+    cleanup_owner: Arc<KernelNbdClientCleanupOwner>,
+}
+
+impl KernelNbdDetachSubmitPort for PlatformKernelNbdDetachSubmitPort {
+    fn poll_reap(&self) -> Result<()> {
+        self.cleanup_owner.poll_reap().map(|_| ())
+    }
+
+    fn pending_count(&self) -> usize {
+        self.cleanup_owner.pending_count()
+    }
+
+    fn submit(
+        &self,
+        config: &KernelNbdInventoryConfig,
+        device_path: &HostPath,
+        context: &RuntimeDesiredEffectContext,
+    ) -> KernelNbdDetachSubmitAttempt {
+        if context.check_active().is_err() {
+            return KernelNbdDetachSubmitAttempt::NotSubmitted;
+        }
+        let mut command = Command::new(&config.nbd_client_binary);
+        command
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .arg("-d")
+            .arg(device_path.as_str());
+        match run_bounded_nbd_client(command, context, &self.cleanup_owner) {
+            KernelNbdClientSubmitAttempt::NotSubmitted(_) => {
+                KernelNbdDetachSubmitAttempt::NotSubmitted
+            }
+            KernelNbdClientSubmitAttempt::Submitted(_) => KernelNbdDetachSubmitAttempt::Submitted,
+        }
+    }
+}
+
 /// Installed sealed adapter. It remains deliberately uncomposed until the
 /// serving-blockd listener proof is available to the higher layer.
 #[derive(Debug, Clone)]
@@ -2135,6 +2364,46 @@ impl KernelNbdAttachPort for PlatformKernelNbdAttachPort {
             request,
             listener,
             admitted_exact_devices,
+            store,
+            stored,
+            context,
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PlatformKernelNbdDetachPort {
+    inventory: KernelNbdInventoryPort,
+    submitter: PlatformKernelNbdDetachSubmitPort,
+}
+
+impl PlatformKernelNbdDetachPort {
+    pub(crate) fn new(
+        config: KernelNbdInventoryConfig,
+        cleanup_owner: Arc<KernelNbdClientCleanupOwner>,
+    ) -> Self {
+        Self {
+            inventory: KernelNbdInventoryPort::new(config),
+            submitter: PlatformKernelNbdDetachSubmitPort { cleanup_owner },
+        }
+    }
+}
+
+impl detach_port_sealed::Sealed for PlatformKernelNbdDetachPort {}
+
+impl KernelNbdDetachPort for PlatformKernelNbdDetachPort {
+    fn detach_checkpointed(
+        &self,
+        volume_id: &Id,
+        ownership_token: &RandomId128,
+        store: &FileCheckpointStore,
+        stored: &StoredCheckpoint,
+        context: &RuntimeDesiredEffectContext,
+    ) -> Result<KernelNbdDetachResult> {
+        self.inventory.detach_checkpointed(
+            &self.submitter,
+            volume_id,
+            ownership_token,
             store,
             stored,
             context,
@@ -4102,6 +4371,83 @@ mod tests {
                 .unwrap(),
             KernelNbdPoolScanOutcome::Unavailable
         ));
+    }
+
+    #[test]
+    fn complete_pool_scan_reports_stable_reserved_leak_as_residue() {
+        let fixture = Fixture::new(2);
+        let source = checkpoint("cat_a", "vol_a", "/dev/nbd0", '6');
+        let store =
+            FileCheckpointStore::open(&fixture.state.join(CHECKPOINT_NAMESPACE), &source.cat_id)
+                .unwrap();
+        store.create(&source).unwrap();
+        fs::write(fixture.sys.join("nbd0/size"), b"4096\n").unwrap();
+        let processes = NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+
+        let KernelNbdPoolScanOutcome::CompleteWithResidue { admission, residue } =
+            KernelNbdInventoryPort::new(fixture.config(2))
+                .scan_complete_pool(&inventory_scan_context(&["cat_a"]), &processes)
+                .unwrap()
+        else {
+            panic!("stable reserved leak must remain a complete residue observation")
+        };
+        assert!(matches!(
+            admission
+                .devices_by_key
+                .get(&ManagedServingKey::new(id("cat_a"), id("vol_a"))),
+            Some(KernelNbdDeviceScanState::Leaked {
+                recorded_process_id: None,
+                ..
+            })
+        ));
+        assert_eq!(
+            residue,
+            [NodeResidue::KernelNbd {
+                volume_id_hint: Some(id("vol_a")),
+                guest_device: Some(
+                    prepared_device_inputs(&source).unwrap()[0]
+                        .guest_device
+                        .clone()
+                ),
+                device_path: host("/dev/nbd0"),
+                ownership_token: OwnershipTokenEvidence::Missing,
+            }]
+        );
+    }
+
+    #[test]
+    fn complete_pool_scan_reports_stable_unreserved_serving_slot_as_residue() {
+        let fixture = Fixture::new(1);
+        fs::create_dir(fixture.state.join(CHECKPOINT_NAMESPACE)).unwrap();
+        fixture.serving(0, 42, "/run/cats/orphan.sock");
+        let processes = NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+
+        let KernelNbdPoolScanOutcome::CompleteWithResidue { admission, residue } =
+            KernelNbdInventoryPort::new(fixture.config(1))
+                .scan_complete_pool(&inventory_scan_context(&[]), &processes)
+                .unwrap()
+        else {
+            panic!("stable unreserved serving NBD must remain complete residue")
+        };
+        assert!(admission.devices_by_key.is_empty());
+        assert_eq!(
+            residue,
+            [NodeResidue::KernelNbd {
+                volume_id_hint: None,
+                guest_device: None,
+                device_path: host("/dev/nbd0"),
+                ownership_token: OwnershipTokenEvidence::Missing,
+            }]
+        );
+        assert!(fixture.sys.join("nbd0/pid").exists());
     }
 
     #[test]

@@ -19,6 +19,103 @@ variable "control_plane_image" {
   }
 }
 
+variable "gateway_image" {
+  description = "Immutable cats-gatewayd container image, including its sha256 digest."
+  type        = string
+
+  validation {
+    condition     = can(regex("@sha256:[0-9a-f]{64}$", var.gateway_image))
+    error_message = "gateway_image must be pinned by sha256 digest."
+  }
+}
+
+variable "object_write_gateway_image" {
+  description = "Immutable image containing /usr/local/bin/cats-object-write-gatewayd, pinned by sha256 digest."
+  type        = string
+
+  validation {
+    condition     = can(regex("@sha256:[0-9a-f]{64}$", var.object_write_gateway_image))
+    error_message = "object_write_gateway_image must be pinned by sha256 digest."
+  }
+}
+
+variable "object_write_gateway_replicas" {
+  description = "Active-active ObjectWrite Gateway replica count sharing PostgreSQL and one EFS access point."
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.object_write_gateway_replicas >= 2 && floor(var.object_write_gateway_replicas) == var.object_write_gateway_replicas
+    error_message = "object_write_gateway_replicas must be an integer of at least 2."
+  }
+}
+
+variable "object_write_gateway_tls_secret_name" {
+  description = "Pre-created immutable two-file Secret containing the release-bound internal server certificate and private key."
+  type        = string
+
+  validation {
+    condition = (
+      can(regex("^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$", var.object_write_gateway_tls_secret_name)) &&
+      endswith(var.object_write_gateway_tls_secret_name, "-r1")
+    )
+    error_message = "object_write_gateway_tls_secret_name must be a Kubernetes DNS-subdomain ending in -r1."
+  }
+}
+
+variable "object_write_gateway_nlb_security_group_id" {
+  description = "Platform-owned internal NLB SG with ingress from only the exact metal worker SG."
+  type        = string
+
+  validation {
+    condition     = can(regex("^sg-[0-9a-f]{8,17}$", var.object_write_gateway_nlb_security_group_id))
+    error_message = "object_write_gateway_nlb_security_group_id must be one explicit AWS security group ID."
+  }
+}
+
+variable "object_write_gateway_private_subnet_ids" {
+  description = "Exact private subnets in which EKS Auto Mode creates the internal ObjectWrite NLB."
+  type        = list(string)
+
+  validation {
+    condition = (
+      length(var.object_write_gateway_private_subnet_ids) >= 2 &&
+      alltrue([for subnet_id in var.object_write_gateway_private_subnet_ids : can(regex("^subnet-[0-9a-f]{8,17}$", subnet_id))])
+    )
+    error_message = "object_write_gateway_private_subnet_ids must contain at least two explicit AWS subnet IDs."
+  }
+}
+
+variable "object_write_spool_file_system_id" {
+  description = "Platform-owned encrypted EFS file system for durable pre-accept and accepted spools."
+  type        = string
+
+  validation {
+    condition     = can(regex("^fs-[0-9a-f]{8,17}$", var.object_write_spool_file_system_id))
+    error_message = "object_write_spool_file_system_id must be one explicit EFS file system ID."
+  }
+}
+
+variable "object_write_spool_access_point_id" {
+  description = "Platform-owned EFS access point rooted at /object-write-spools as uid/gid 10001."
+  type        = string
+
+  validation {
+    condition     = can(regex("^fsap-[0-9a-f]{8,17}$", var.object_write_spool_access_point_id))
+    error_message = "object_write_spool_access_point_id must be one explicit EFS access point ID."
+  }
+}
+
+variable "object_write_provider_partition" {
+  description = "Provisioned AWS partition bound into every ObjectWrite authority."
+  type        = string
+}
+
+variable "object_write_provider_account_id" {
+  description = "Provisioned AWS account bound into every ObjectWrite authority."
+  type        = string
+}
+
 variable "control_plane_replicas" {
   description = "Number of active-active control-plane API replicas; singleton loops elect independently through PostgreSQL."
   type        = number
@@ -28,6 +125,69 @@ variable "control_plane_replicas" {
     condition     = var.control_plane_replicas >= 2 && floor(var.control_plane_replicas) == var.control_plane_replicas
     error_message = "control_plane_replicas must be an integer of at least 2."
   }
+}
+
+variable "gateway_replicas" {
+  description = "Number of active-active public Route v2 Gateway replicas."
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.gateway_replicas >= 2 && floor(var.gateway_replicas) == var.gateway_replicas
+    error_message = "gateway_replicas must be an integer of at least 2."
+  }
+}
+
+variable "route_v2_control_artifact_secret_name" {
+  description = "Name of a pre-created immutable Kubernetes Secret containing the exact eight-file Control Route v2 artifact set. Terraform never receives its bytes."
+  type        = string
+
+  validation {
+    condition = (
+      can(regex("^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$", var.route_v2_control_artifact_secret_name)) &&
+      endswith(var.route_v2_control_artifact_secret_name, "-r${var.route_v2_control_artifact_signer_revision}")
+    )
+    error_message = "route_v2_control_artifact_secret_name must be a Kubernetes DNS-subdomain name ending in the exact positive -r<route_v2_control_artifact_signer_revision> suffix."
+  }
+}
+
+variable "route_v2_control_artifact_signer_revision" {
+  description = "Positive signer revision encoded by the staged Control descriptor and immutable Secret name."
+  type        = number
+
+  validation {
+    condition     = var.route_v2_control_artifact_signer_revision > 0 && floor(var.route_v2_control_artifact_signer_revision) == var.route_v2_control_artifact_signer_revision
+    error_message = "route_v2_control_artifact_signer_revision must be a positive integer."
+  }
+}
+
+variable "route_v2_control_artifact_secret_sha256" {
+  description = "Canonical sha256:<64-lowerhex> digest of the reviewed immutable Control Secret manifest; never secret bytes."
+  type        = string
+
+  validation {
+    condition     = can(regex("^sha256:[0-9a-f]{64}$", var.route_v2_control_artifact_secret_sha256))
+    error_message = "route_v2_control_artifact_secret_sha256 must be canonical sha256:<64-lowerhex>."
+  }
+}
+
+variable "route_v2_gateway_artifact_secret_name" {
+  description = "Name of a pre-created immutable Kubernetes Secret containing exactly the fixed three Gateway Route v2 artifacts. Its one server CA bundle must validate both Control and Node chains."
+  type        = string
+
+  validation {
+    condition = (
+      can(regex("^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$", var.route_v2_gateway_artifact_secret_name)) &&
+      endswith(var.route_v2_gateway_artifact_secret_name, "-r1")
+    )
+    error_message = "route_v2_gateway_artifact_secret_name must be a Kubernetes DNS-subdomain name ending in -r1; rotation is outside the initial G2 deployment contract."
+  }
+}
+
+variable "maintenance_mode" {
+  description = "Close public ingress and keep cats-controld at zero replicas during a reviewed destructive maintenance window."
+  type        = bool
+  default     = false
 }
 
 variable "runtime_secret_data" {
@@ -133,6 +293,16 @@ variable "storage_postgres_url" {
       strcontains(var.storage_postgres_url, "sslmode=verify-full")
     )
     error_message = "storage_postgres_url must be a PostgreSQL URL with an explicit TLS sslmode."
+  }
+}
+
+variable "control_postgres_schema" {
+  description = "Exact fresh cats_* schema selected as search_path by every control metadata client."
+  type        = string
+
+  validation {
+    condition     = can(regex("^cats_[a-z0-9_]+$", var.control_postgres_schema)) && length(var.control_postgres_schema) <= 63
+    error_message = "control_postgres_schema must be one lowercase cats_* PostgreSQL identifier no longer than 63 bytes."
   }
 }
 
@@ -320,7 +490,7 @@ variable "rds_ca_pem" {
 variable "auto_warm_after_seconds" {
   description = "Seconds before an eligible Suspended Cat becomes Warm; zero disables the transition."
   type        = number
-  default     = 600
+  default     = 0
 
   validation {
     condition     = var.auto_warm_after_seconds >= 0 && floor(var.auto_warm_after_seconds) == var.auto_warm_after_seconds
@@ -342,7 +512,7 @@ variable "auto_cold_after_seconds" {
 variable "enable_public_ingress" {
   description = "Create the EKS Auto Mode ALB ingress resources."
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "ingress_class_name" {
@@ -415,6 +585,21 @@ variable "control_plane_hosts" {
   validation {
     condition     = length(var.control_plane_hosts) == length(toset(var.control_plane_hosts))
     error_message = "control_plane_hosts must not contain duplicates."
+  }
+}
+
+variable "endpoint_wildcard_host" {
+  description = "Wildcard public hostname routed only to cats-gatewayd."
+  type        = string
+  default     = "*.cats.run"
+
+  validation {
+    condition = (
+      startswith(var.endpoint_wildcard_host, "*.") &&
+      length(trimprefix(var.endpoint_wildcard_host, "*.")) > 0 &&
+      !contains(var.control_plane_hosts, var.endpoint_wildcard_host)
+    )
+    error_message = "endpoint_wildcard_host must be a wildcard hostname distinct from control_plane_hosts."
   }
 }
 

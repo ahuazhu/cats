@@ -1,10 +1,14 @@
 //! Shared fail-closed readers for the one installed runtime release.
 
 use std::fs::File;
-use std::io::{Read as _, Seek as _};
+use std::io::{self, Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
-use std::{ffi::CString, os::fd::AsRawFd as _, os::fd::FromRawFd as _};
+use std::{
+    collections::BTreeSet,
+    ffi::{CStr, CString},
+    os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _},
+};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -16,6 +20,10 @@ use crate::gateway_workload_identity::{
     GATEWAY_CLIENT_CA_BUNDLE_MAX_WIRE_BYTES, GATEWAY_CLIENT_CA_BUNDLE_PATH,
     GATEWAY_WORKLOAD_IDENTITY_AUTHORITY_MAX_WIRE_BYTES, GATEWAY_WORKLOAD_IDENTITY_AUTHORITY_PATH,
 };
+use crate::production_mutation_admission::{
+    decode_production_cutover_operator_trust_bundle, ProductionCutoverOperatorTrustBundle,
+    PRODUCTION_MUTATION_ADMISSION_REQUEST_MAX_WIRE_BYTES,
+};
 use crate::route_grant_v2::{
     decode_route_grant_v2_public_key_ring, decode_route_grant_v2_signer_reference,
     RouteGrantV2PublicKeyRingArtifact, RouteGrantV2SignerReference, RouteGrantV2SignerSelection,
@@ -25,6 +33,10 @@ use crate::route_grant_v2::{
     ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH, ROUTE_GRANT_V2_SIGNER_PRIVATE_KEY_PATH,
     ROUTE_GRANT_V2_SIGNER_REFERENCE_PATH, ROUTE_V2_CERTIFICATE_MAX_WIRE_BYTES,
     ROUTE_V2_PRIVATE_KEY_MAX_WIRE_BYTES,
+};
+use crate::route_signing_operator::{
+    decode_route_v2_rotation_operator_trust, RouteV2RotationOperatorTrust,
+    ROUTE_V2_ROTATION_OPERATOR_TRUST_MAX_WIRE_BYTES, ROUTE_V2_ROTATION_OPERATOR_TRUST_PATH,
 };
 use crate::runtime_reconciliation::{
     decode_guest_runtime_profile_receipt, decode_runtime_provisioner_trust_bundle, ContractVersion,
@@ -41,6 +53,10 @@ pub const GUEST_INITRAMFS_PATH: &str = "/opt/cats/guest/initramfs.img";
 pub const GUEST_RUNTIME_PROFILE_RECEIPT_ENV: &str = "CATS_GUEST_RUNTIME_PROFILE_RECEIPT_FILE";
 pub const RUNTIME_PROVISIONER_TRUST_PATH: &str =
     "/etc/cats/identity/runtime-provisioner-trust.v1.json";
+pub const PRODUCTION_CUTOVER_OPERATOR_TRUST_PATH: &str =
+    "/etc/cats/production-cutover-operator-trust.v1.json";
+pub const PRODUCTION_CUTOVER_OPERATOR_TRUST_ENV: &str =
+    "CATS_PRODUCTION_CUTOVER_OPERATOR_TRUST_FILE";
 pub const GUEST_RUNTIME_RELEASE_MANIFEST_MAX_BYTES: usize = 4_096;
 pub const GUEST_BOOT_MEMBER_MAX_BYTES: usize = 536_870_912;
 
@@ -79,9 +95,31 @@ pub struct InstalledRuntimeProvisionerTrustBundle {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledProductionCutoverOperatorTrustBundle {
+    bundle: ProductionCutoverOperatorTrustBundle,
+    exact_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledRouteGrantV2PublicKeyRing {
     ring: RouteGrantV2PublicKeyRingArtifact,
     exact_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledRouteV2RotationOperatorTrust {
+    trust: RouteV2RotationOperatorTrust,
+    exact_bytes: Vec<u8>,
+}
+
+impl InstalledRouteV2RotationOperatorTrust {
+    pub fn trust(&self) -> &RouteV2RotationOperatorTrust {
+        &self.trust
+    }
+
+    pub fn exact_bytes(&self) -> &[u8] {
+        &self.exact_bytes
+    }
 }
 
 /// Read-only state of the one fixed Node public-ring artifact.
@@ -136,10 +174,22 @@ pub struct InstalledGatewayMachineArtifacts {
 /// Startup-pinned Node Route v2 verification and mTLS server material.
 pub struct InstalledNodeRouteV2MachineArtifacts {
     ring: InstalledRouteGrantV2PublicKeyRing,
+    rotation_operator_trust: InstalledRouteV2RotationOperatorTrust,
     gateway_client_ca_bundle_pem: Vec<u8>,
+    node_server_ca_bundle_pem: Vec<u8>,
     server_certificate_pem: Vec<u8>,
     server_private_key_pem: Vec<u8>,
 }
+
+#[cfg(unix)]
+const NODE_ROUTE_V2_MACHINE_ARTIFACT_NAMES: [&str; 6] = [
+    "gateway-client-ca-bundle.pem",
+    "node-machine-server-certificate.pem",
+    "node-machine-server-private-key.pem",
+    "node-server-ca-bundle.pem",
+    "public-key-ring.v1.json",
+    "rotation-operator-trust.v1.json",
+];
 
 /// Startup-pinned Gateway identity and trust material for the Node hop.
 pub struct InstalledGatewayNodeRouteV2MachineArtifacts {
@@ -154,6 +204,7 @@ impl std::fmt::Debug for InstalledNodeRouteV2MachineArtifacts {
             .debug_struct("InstalledNodeRouteV2MachineArtifacts")
             .field("ring", &self.ring)
             .field("gateway_client_ca_bundle_pem", &"[redacted]")
+            .field("node_server_ca_bundle_pem", &"[redacted]")
             .field("server_certificate_pem", &"[redacted]")
             .field("server_private_key_pem", &"[redacted]")
             .finish()
@@ -176,8 +227,16 @@ impl InstalledNodeRouteV2MachineArtifacts {
         &self.ring
     }
 
+    pub fn rotation_operator_trust(&self) -> &InstalledRouteV2RotationOperatorTrust {
+        &self.rotation_operator_trust
+    }
+
     pub fn gateway_client_ca_bundle_pem(&self) -> &[u8] {
         &self.gateway_client_ca_bundle_pem
+    }
+
+    pub fn node_server_ca_bundle_pem(&self) -> &[u8] {
+        &self.node_server_ca_bundle_pem
     }
 
     pub fn server_certificate_pem(&self) -> &[u8] {
@@ -286,6 +345,16 @@ impl InstalledRuntimeProvisionerTrustBundle {
     }
 }
 
+impl InstalledProductionCutoverOperatorTrustBundle {
+    pub fn bundle(&self) -> &ProductionCutoverOperatorTrustBundle {
+        &self.bundle
+    }
+
+    pub fn exact_bytes(&self) -> &[u8] {
+        &self.exact_bytes
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestRuntimeBootContract {
     kernel: GuestRuntimeReleaseMember,
@@ -356,10 +425,14 @@ pub enum RuntimeArtifactError {
     WrongReceiptPath,
     #[error("Runtime provisioner trust path must be the canonical installed path")]
     WrongProvisionerTrustPath,
+    #[error("Production cutover operator trust path must be the canonical installed path")]
+    WrongProductionCutoverOperatorTrustPath,
     #[error("Route Grant v2 public-key ring path must be the canonical installed path")]
     WrongRouteGrantV2PublicKeyRingPath,
     #[error("Route Grant v2 signer paths must be the canonical installed paths")]
     WrongRouteGrantV2SignerPath,
+    #[error("Route v2 rotation operator trust path must be the canonical installed path")]
+    WrongRouteV2RotationOperatorTrustPath,
     #[error("Gateway machine artifact paths must be the canonical installed paths")]
     WrongGatewayMachineArtifactPath,
     #[error("Node Route v2 machine artifact paths must be the canonical installed paths")]
@@ -376,10 +449,14 @@ pub enum RuntimeArtifactError {
     InvalidReceipt,
     #[error("Runtime provisioner trust bundle is invalid")]
     InvalidProvisionerTrust,
+    #[error("Production cutover operator trust bundle is invalid")]
+    InvalidProductionCutoverOperatorTrust,
     #[error("Route Grant v2 public-key ring is invalid")]
     InvalidRouteGrantV2PublicKeyRing,
     #[error("Route Grant v2 signer artifact set is invalid")]
     InvalidRouteGrantV2Signer,
+    #[error("Route v2 rotation operator trust is invalid")]
+    InvalidRouteV2RotationOperatorTrust,
     #[error("Gateway machine artifact set is invalid")]
     InvalidGatewayMachineArtifacts,
     #[error("Node Route v2 machine artifact set is invalid")]
@@ -556,6 +633,21 @@ pub fn load_installed_node_route_v2_machine_artifacts(
     load_installed_node_route_v2_machine_artifacts_platform()
 }
 
+/// Load a root-owned revision-1 Node Route v2 artifact candidate before its
+/// one-time publication at the fixed installed path.
+///
+/// The caller may select only the staging directory. Every path component is
+/// opened descriptor-relative without following symlinks, and the directory
+/// must contain exactly the six Node artifacts with the same ownership,
+/// mode, link-count, size and canonical-wire contracts used at daemon startup.
+/// TLS composition remains a Node concern and is validated by
+/// `cats-node-agent` before an installer may publish these bytes.
+pub fn load_initial_node_route_v2_machine_artifact_candidate(
+    directory: &Path,
+) -> Result<InstalledNodeRouteV2MachineArtifacts, RuntimeArtifactError> {
+    load_initial_node_route_v2_machine_artifact_candidate_platform(directory)
+}
+
 /// Load the fixed Gateway client identity and Node-server trust root used by
 /// the production Gateway-to-Node hop.
 pub fn load_installed_gateway_node_route_v2_machine_artifacts(
@@ -587,11 +679,84 @@ fn load_installed_node_route_v2_machine_artifacts_platform(
 }
 
 #[cfg(unix)]
+fn load_initial_node_route_v2_machine_artifact_candidate_platform(
+    directory: &Path,
+) -> Result<InstalledNodeRouteV2MachineArtifacts, RuntimeArtifactError> {
+    use std::path::Component;
+
+    if !directory.is_absolute() {
+        return Err(filesystem_error(directory));
+    }
+    let mut owned_components = Vec::new();
+    for component in directory.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(value) => {
+                let value = value.to_str().ok_or_else(|| filesystem_error(directory))?;
+                owned_components.push(value.to_owned());
+            }
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                return Err(filesystem_error(directory));
+            }
+        }
+    }
+    if owned_components.is_empty() {
+        return Err(filesystem_error(directory));
+    }
+    let components = owned_components
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    load_initial_node_route_v2_machine_artifact_candidate_from(
+        Path::new("/"),
+        &components,
+        InstalledDirectoryOwner::Root,
+        InstalledFileContract::root(0o644),
+        InstalledFileContract::root(0o600),
+    )
+}
+
+#[cfg(unix)]
+fn load_initial_node_route_v2_machine_artifact_candidate_from(
+    canonical_root: &Path,
+    components: &[&str],
+    owner: InstalledDirectoryOwner,
+    public: InstalledFileContract,
+    private: InstalledFileContract,
+) -> Result<InstalledNodeRouteV2MachineArtifacts, RuntimeArtifactError> {
+    let retained = open_installed_directory_from(
+        canonical_root,
+        components,
+        InstalledDirectoryMode::Exact(0o700),
+        owner,
+    )?;
+    let artifacts = load_node_route_v2_machine_artifacts_from(&retained, public, private)?;
+    if artifacts.ring().ring().ring_version.get() != 1
+        || artifacts.ring().ring().expected_previous.is_some()
+    {
+        return Err(RuntimeArtifactError::InvalidNodeRouteV2MachineArtifacts);
+    }
+    Ok(artifacts)
+}
+
+#[cfg(not(unix))]
+fn load_initial_node_route_v2_machine_artifact_candidate_platform(
+    _directory: &Path,
+) -> Result<InstalledNodeRouteV2MachineArtifacts, RuntimeArtifactError> {
+    Err(RuntimeArtifactError::UnsupportedPlatform)
+}
+
+#[cfg(unix)]
 fn load_node_route_v2_machine_artifacts_from(
     directory: &InstalledDirectoryPath,
     public: InstalledFileContract,
     private: InstalledFileContract,
 ) -> Result<InstalledNodeRouteV2MachineArtifacts, RuntimeArtifactError> {
+    ensure_exact_directory_entries(
+        directory.final_descriptor(),
+        directory.final_display(),
+        &NODE_ROUTE_V2_MACHINE_ARTIFACT_NAMES,
+    )?;
     let ring_file = read_pinned_installed_file_at_with_contract(
         directory.final_descriptor(),
         "public-key-ring.v1.json",
@@ -599,10 +764,24 @@ fn load_node_route_v2_machine_artifacts_from(
         ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES,
         public,
     )?;
+    let rotation_operator_file = read_pinned_installed_file_at_with_contract(
+        directory.final_descriptor(),
+        "rotation-operator-trust.v1.json",
+        Path::new(ROUTE_V2_ROTATION_OPERATOR_TRUST_PATH),
+        ROUTE_V2_ROTATION_OPERATOR_TRUST_MAX_WIRE_BYTES,
+        public,
+    )?;
     let client_ca_file = read_pinned_installed_file_at_with_contract(
         directory.final_descriptor(),
         "gateway-client-ca-bundle.pem",
         Path::new(GATEWAY_CLIENT_CA_BUNDLE_PATH),
+        GATEWAY_CLIENT_CA_BUNDLE_MAX_WIRE_BYTES,
+        public,
+    )?;
+    let node_server_ca_file = read_pinned_installed_file_at_with_contract(
+        directory.final_descriptor(),
+        "node-server-ca-bundle.pem",
+        Path::new(NODE_ROUTE_V2_SERVER_CA_BUNDLE_PATH),
         GATEWAY_CLIENT_CA_BUNDLE_MAX_WIRE_BYTES,
         public,
     )?;
@@ -621,15 +800,73 @@ fn load_node_route_v2_machine_artifacts_from(
         private,
     )?;
     let fresh = directory.reopen_canonical_path()?;
+    ensure_exact_directory_entries(
+        directory.final_descriptor(),
+        directory.final_display(),
+        &NODE_ROUTE_V2_MACHINE_ARTIFACT_NAMES,
+    )?;
+    ensure_exact_directory_entries(
+        &fresh,
+        directory.final_display(),
+        &NODE_ROUTE_V2_MACHINE_ARTIFACT_NAMES,
+    )?;
     ring_file.revalidate_from(&fresh, ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES, public)?;
+    rotation_operator_file.revalidate_from(
+        &fresh,
+        ROUTE_V2_ROTATION_OPERATOR_TRUST_MAX_WIRE_BYTES,
+        public,
+    )?;
     client_ca_file.revalidate_from(&fresh, GATEWAY_CLIENT_CA_BUNDLE_MAX_WIRE_BYTES, public)?;
+    node_server_ca_file.revalidate_from(&fresh, GATEWAY_CLIENT_CA_BUNDLE_MAX_WIRE_BYTES, public)?;
     server_certificate_file.revalidate_from(&fresh, ROUTE_V2_CERTIFICATE_MAX_WIRE_BYTES, public)?;
     server_private_key_file.revalidate_from(
         &fresh,
         ROUTE_V2_PRIVATE_KEY_MAX_WIRE_BYTES,
         private,
     )?;
+    // Close the transaction after the individual re-reads as well. An entry
+    // inserted, removed, or basename-replaced during those reads must not land
+    // between the earlier closed-set snapshot and the returned pinned bytes.
+    let closing = directory.reopen_canonical_path()?;
+    ensure_exact_directory_entries(
+        directory.final_descriptor(),
+        directory.final_display(),
+        &NODE_ROUTE_V2_MACHINE_ARTIFACT_NAMES,
+    )?;
+    ensure_exact_directory_entries(
+        &closing,
+        directory.final_display(),
+        &NODE_ROUTE_V2_MACHINE_ARTIFACT_NAMES,
+    )?;
+    ring_file.revalidate_from(&closing, ROUTE_GRANT_V2_ARTIFACT_MAX_WIRE_BYTES, public)?;
+    rotation_operator_file.revalidate_from(
+        &closing,
+        ROUTE_V2_ROTATION_OPERATOR_TRUST_MAX_WIRE_BYTES,
+        public,
+    )?;
+    client_ca_file.revalidate_from(&closing, GATEWAY_CLIENT_CA_BUNDLE_MAX_WIRE_BYTES, public)?;
+    node_server_ca_file.revalidate_from(
+        &closing,
+        GATEWAY_CLIENT_CA_BUNDLE_MAX_WIRE_BYTES,
+        public,
+    )?;
+    server_certificate_file.revalidate_from(
+        &closing,
+        ROUTE_V2_CERTIFICATE_MAX_WIRE_BYTES,
+        public,
+    )?;
+    server_private_key_file.revalidate_from(
+        &closing,
+        ROUTE_V2_PRIVATE_KEY_MAX_WIRE_BYTES,
+        private,
+    )?;
+    ensure_exact_directory_entries(
+        &closing,
+        directory.final_display(),
+        &NODE_ROUTE_V2_MACHINE_ARTIFACT_NAMES,
+    )?;
     if client_ca_file.exact_bytes().is_empty()
+        || node_server_ca_file.exact_bytes().is_empty()
         || server_certificate_file.exact_bytes().is_empty()
         || server_private_key_file.exact_bytes().is_empty()
     {
@@ -637,15 +874,69 @@ fn load_node_route_v2_machine_artifacts_from(
     }
     let ring = decode_route_grant_v2_public_key_ring(ring_file.exact_bytes())
         .map_err(|_| RuntimeArtifactError::InvalidNodeRouteV2MachineArtifacts)?;
+    let rotation_operator_trust =
+        decode_route_v2_rotation_operator_trust(rotation_operator_file.exact_bytes())
+            .map_err(|_| RuntimeArtifactError::InvalidNodeRouteV2MachineArtifacts)?;
     Ok(InstalledNodeRouteV2MachineArtifacts {
         ring: InstalledRouteGrantV2PublicKeyRing {
             ring,
             exact_bytes: ring_file.into_exact_bytes(),
         },
+        rotation_operator_trust: InstalledRouteV2RotationOperatorTrust {
+            trust: rotation_operator_trust,
+            exact_bytes: rotation_operator_file.into_exact_bytes(),
+        },
         gateway_client_ca_bundle_pem: client_ca_file.into_exact_bytes(),
+        node_server_ca_bundle_pem: node_server_ca_file.into_exact_bytes(),
         server_certificate_pem: server_certificate_file.into_exact_bytes(),
         server_private_key_pem: server_private_key_file.into_exact_bytes(),
     })
+}
+
+/// Load the one public trust artifact that authenticates Route v2 rotation
+/// commands on Control. A path argument exists only to prove that startup did
+/// not accept an alternate operator authority.
+pub fn load_installed_route_v2_rotation_operator_trust(
+    selected_path: &Path,
+) -> Result<InstalledRouteV2RotationOperatorTrust, RuntimeArtifactError> {
+    if selected_path != Path::new(ROUTE_V2_ROTATION_OPERATOR_TRUST_PATH) {
+        return Err(RuntimeArtifactError::WrongRouteV2RotationOperatorTrustPath);
+    }
+    load_installed_route_v2_rotation_operator_trust_platform()
+}
+
+#[cfg(unix)]
+fn load_installed_route_v2_rotation_operator_trust_platform(
+) -> Result<InstalledRouteV2RotationOperatorTrust, RuntimeArtifactError> {
+    let directory = open_installed_directory(
+        &["etc", "cats", "route-v2"],
+        InstalledDirectoryMode::Exact(0o700),
+    )?;
+    let file = read_pinned_installed_file_at_with_contract(
+        directory.final_descriptor(),
+        "rotation-operator-trust.v1.json",
+        Path::new(ROUTE_V2_ROTATION_OPERATOR_TRUST_PATH),
+        ROUTE_V2_ROTATION_OPERATOR_TRUST_MAX_WIRE_BYTES,
+        InstalledFileContract::root(0o644),
+    )?;
+    let fresh = directory.reopen_canonical_path()?;
+    file.revalidate_from(
+        &fresh,
+        ROUTE_V2_ROTATION_OPERATOR_TRUST_MAX_WIRE_BYTES,
+        InstalledFileContract::root(0o644),
+    )?;
+    let trust = decode_route_v2_rotation_operator_trust(file.exact_bytes())
+        .map_err(|_| RuntimeArtifactError::InvalidRouteV2RotationOperatorTrust)?;
+    Ok(InstalledRouteV2RotationOperatorTrust {
+        trust,
+        exact_bytes: file.into_exact_bytes(),
+    })
+}
+
+#[cfg(not(unix))]
+fn load_installed_route_v2_rotation_operator_trust_platform(
+) -> Result<InstalledRouteV2RotationOperatorTrust, RuntimeArtifactError> {
+    Err(RuntimeArtifactError::UnsupportedPlatform)
 }
 
 #[cfg(not(unix))]
@@ -1007,6 +1298,46 @@ pub fn load_installed_runtime_provisioner_trust_bundle(
     load_installed_runtime_provisioner_trust_bundle_platform(selected_path)
 }
 
+/// Read and pin the independent E13 offline-operator public trust before the
+/// administrator listener or any Store-backed admission command can run.
+pub fn load_installed_production_cutover_operator_trust_bundle(
+    selected_path: &Path,
+) -> Result<InstalledProductionCutoverOperatorTrustBundle, RuntimeArtifactError> {
+    if selected_path != Path::new(PRODUCTION_CUTOVER_OPERATOR_TRUST_PATH) {
+        return Err(RuntimeArtifactError::WrongProductionCutoverOperatorTrustPath);
+    }
+    load_installed_production_cutover_operator_trust_bundle_platform(selected_path)
+}
+
+#[cfg(unix)]
+fn load_installed_production_cutover_operator_trust_bundle_platform(
+    path: &Path,
+) -> Result<InstalledProductionCutoverOperatorTrustBundle, RuntimeArtifactError> {
+    let cats_directory = open_installed_directory(
+        &["etc", "cats"],
+        InstalledDirectoryMode::ProvisionerIdentity,
+    )?;
+    let exact_bytes = read_exact_installed_file_at(
+        cats_directory.final_descriptor(),
+        "production-cutover-operator-trust.v1.json",
+        path,
+        PRODUCTION_MUTATION_ADMISSION_REQUEST_MAX_WIRE_BYTES,
+    )?;
+    let bundle = decode_production_cutover_operator_trust_bundle(&exact_bytes)
+        .map_err(|_| RuntimeArtifactError::InvalidProductionCutoverOperatorTrust)?;
+    Ok(InstalledProductionCutoverOperatorTrustBundle {
+        bundle,
+        exact_bytes,
+    })
+}
+
+#[cfg(not(unix))]
+fn load_installed_production_cutover_operator_trust_bundle_platform(
+    _path: &Path,
+) -> Result<InstalledProductionCutoverOperatorTrustBundle, RuntimeArtifactError> {
+    Err(RuntimeArtifactError::UnsupportedPlatform)
+}
+
 #[cfg(unix)]
 fn load_installed_runtime_provisioner_trust_bundle_platform(
     path: &Path,
@@ -1331,6 +1662,14 @@ impl InstalledDirectoryPath {
             .descriptor
     }
 
+    fn final_display(&self) -> &Path {
+        &self
+            .directories
+            .last()
+            .expect("an installed directory path always retains its root")
+            .display
+    }
+
     /// Reopen the fixed lexical path from its root and prove that every
     /// retained directory still names the same stable inode. This is the
     /// final check of one read transaction, not a persistent filesystem watch.
@@ -1376,6 +1715,120 @@ impl InstalledDirectoryPath {
 
         Ok(fresh.pop().expect("the fresh path always retains its root"))
     }
+}
+
+#[cfg(unix)]
+fn ensure_exact_directory_entries(
+    directory: &File,
+    display: &Path,
+    expected: &[&str],
+) -> Result<(), RuntimeArtifactError> {
+    let mut stream =
+        InstalledDirectoryStream::open(directory).map_err(|_| filesystem_error(display))?;
+    let mut names = BTreeSet::new();
+    while let Some(name) = stream.next().map_err(|_| filesystem_error(display))? {
+        let name = String::from_utf8(name).map_err(|_| filesystem_error(display))?;
+        if !names.insert(name) || names.len() > expected.len() {
+            return Err(filesystem_error(display));
+        }
+    }
+    let expected = expected
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<BTreeSet<_>>();
+    if names != expected {
+        return Err(filesystem_error(display));
+    }
+    Ok(())
+}
+
+/// Independent descriptor-relative directory enumeration. `readdir(NULL)`
+/// is EOF only when errno remains zero, so an I/O failure can never look like
+/// a successfully closed artifact set.
+#[cfg(unix)]
+struct InstalledDirectoryStream(*mut libc::DIR);
+
+#[cfg(unix)]
+impl InstalledDirectoryStream {
+    fn open(directory: &File) -> io::Result<Self> {
+        let duplicate = open_directory_at(directory, ".", Path::new("."))
+            .map_err(|_| io::Error::other("open artifact directory"))?
+            .into_raw_fd();
+        // SAFETY: `duplicate` is a fresh owned directory descriptor.
+        let stream = unsafe { libc::fdopendir(duplicate) };
+        if stream.is_null() {
+            let source = io::Error::last_os_error();
+            // SAFETY: fdopendir failed and did not consume `duplicate`.
+            unsafe { libc::close(duplicate) };
+            return Err(source);
+        }
+        Ok(Self(stream))
+    }
+
+    fn next(&mut self) -> io::Result<Option<Vec<u8>>> {
+        loop {
+            installed_directory_set_errno(0);
+            // SAFETY: this value exclusively owns the live DIR pointer.
+            let entry = unsafe { libc::readdir(self.0) };
+            if entry.is_null() {
+                let error = installed_directory_errno();
+                return if error == 0 {
+                    Ok(None)
+                } else {
+                    Err(io::Error::from_raw_os_error(error))
+                };
+            }
+            // SAFETY: readdir returned one live dirent; copy the name before
+            // the next call invalidates that storage.
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            return Ok(Some(name.to_vec()));
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for InstalledDirectoryStream {
+    fn drop(&mut self) {
+        // SAFETY: this value owns the non-null DIR pointer exactly once.
+        unsafe { libc::closedir(self.0) };
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn installed_directory_set_errno(value: libc::c_int) {
+    // SAFETY: libc exposes the calling thread's errno cell.
+    unsafe { *libc::__errno_location() = value };
+}
+
+#[cfg(target_os = "linux")]
+fn installed_directory_errno() -> libc::c_int {
+    // SAFETY: libc exposes the calling thread's errno cell.
+    unsafe { *libc::__errno_location() }
+}
+
+#[cfg(target_os = "macos")]
+fn installed_directory_set_errno(value: libc::c_int) {
+    // SAFETY: libc exposes the calling thread's errno cell.
+    unsafe { *libc::__error() = value };
+}
+
+#[cfg(target_os = "macos")]
+fn installed_directory_errno() -> libc::c_int {
+    // SAFETY: libc exposes the calling thread's errno cell.
+    unsafe { *libc::__error() }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn installed_directory_set_errno(_value: libc::c_int) {}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn installed_directory_errno() -> libc::c_int {
+    // Other Unix targets are not part of the production matrix. Fail closed
+    // on a null `readdir` result; Linux and macOS distinguish EOF exactly.
+    libc::EIO
 }
 
 #[cfg(unix)]
@@ -1996,6 +2449,7 @@ mod tests {
     const RECEIPT: &[u8] = br#"{"guest_agent_protocol_version":1,"initramfs_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","kernel_cmdline":"console=ttyS0 root=/dev/vda rw clocksource=kvm-clock","kernel_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","version":1}"#;
     const MANIFEST: &[u8] = br#"{"guest_runtime_profile":{"path":"guest-runtime-profile.v1.json","sha256":"sha256:dae6f9b08706e17d03cbeece8141fef960185fe0758f80f999f9f2218d43e10a","size_bytes":301},"initramfs":{"path":"guest/initramfs.img","sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111","size_bytes":8388608},"kernel":{"path":"guest/vmlinuz","sha256":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size_bytes":16777216},"version":1}"#;
     const ROUTE_RING: &[u8] = br#"{"version":1,"ring_version":1,"expected_previous":null,"keys":[{"kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","public_key_spki":"MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To"}]}"#;
+    const ROTATION_OPERATOR_TRUST: &[u8] = br#"{"version":1,"authority_id":"route_rotation_authority_a","route_deployment_id":"route_deployment_a","release_commit_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","threshold":1,"credentials":[{"credential_id":"route_rotation_operator_a","public_key_spki":"MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To","public_key_spki_sha256":"sha256:2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99"}]}"#;
     const ROUTE_SIGNER: &[u8] = br#"{"version":1,"deployment_id":"route_deployment_a","signer_revision":1,"expected_previous":null,"signer":{"state":"active","active_kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","secret_reference_id":"route_secret_a"},"public_key_ring_version":1,"public_key_ring_digest":"sha256:7c7e324d7be6c6ee71735c900ce1041de63af7cc08fb39b6800853f966e81e34"}"#;
     const ROUTE_PRIVATE_KEY: &[u8] =
         include_bytes!("../../tests/fixtures/route_grant_v2_private_ed25519.pem");
@@ -2097,9 +2551,17 @@ mod tests {
     fn write_test_node_route_v2_machine_artifacts(directory: &Path) {
         use std::os::unix::fs::PermissionsExt as _;
 
-        write_test_route_artifacts(directory, false);
+        std::fs::create_dir(directory).unwrap();
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         for (basename, bytes, mode) in [
+            ("public-key-ring.v1.json", ROUTE_RING, 0o644),
+            (
+                "rotation-operator-trust.v1.json",
+                ROTATION_OPERATOR_TRUST,
+                0o644,
+            ),
             ("gateway-client-ca-bundle.pem", TEST_CLIENT_CA, 0o644),
+            ("node-server-ca-bundle.pem", TEST_CLIENT_CA, 0o644),
             (
                 "node-machine-server-certificate.pem",
                 TEST_SERVER_CERTIFICATE,
@@ -2196,6 +2658,27 @@ mod tests {
         use std::os::unix::fs::MetadataExt as _;
 
         let metadata = std::fs::metadata(directory.join("signer.v1.json")).unwrap();
+        (
+            InstalledFileContract {
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+                mode: 0o644,
+            },
+            InstalledFileContract {
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+                mode: 0o600,
+            },
+        )
+    }
+
+    #[cfg(unix)]
+    fn test_node_route_contracts(
+        directory: &Path,
+    ) -> (InstalledFileContract, InstalledFileContract) {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = std::fs::metadata(directory.join("public-key-ring.v1.json")).unwrap();
         (
             InstalledFileContract {
                 uid: metadata.uid(),
@@ -2337,6 +2820,14 @@ mod tests {
         assert!(matches!(
             load_installed_runtime_provisioner_trust_bundle(Path::new("relative.json")),
             Err(RuntimeArtifactError::WrongProvisionerTrustPath)
+        ));
+    }
+
+    #[test]
+    fn production_cutover_trust_path_rejects_every_alternate_before_filesystem_access() {
+        assert!(matches!(
+            load_installed_production_cutover_operator_trust_bundle(Path::new("relative.json")),
+            Err(RuntimeArtifactError::WrongProductionCutoverOperatorTrustPath)
         ));
     }
 
@@ -2940,30 +3431,100 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn node_route_v2_machine_reader_pins_closed_set_and_private_mode() {
+    fn node_route_v2_machine_reader_allows_sibling_temp_but_pins_exact_catalog() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let temp = tempfile::tempdir().unwrap();
         let directory_path = temp.path().join("route-v2");
         write_test_node_route_v2_machine_artifacts(&directory_path);
-        let (public_contract, private_contract) = test_route_contracts(&directory_path);
+        let sibling_temp = temp.path().join(concat!(
+            ".route-v2.public-key-ring.v1.2.",
+            "0000000000000000000000000000000000000000000000000000000000000000.tmp"
+        ));
+        std::fs::write(&sibling_temp, b"partial ring publication").unwrap();
+        std::fs::set_permissions(&sibling_temp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (public_contract, private_contract) = test_node_route_contracts(&directory_path);
         let retained = open_test_route_directory(temp.path());
         let installed =
             load_node_route_v2_machine_artifacts_from(&retained, public_contract, private_contract)
                 .unwrap();
         assert_eq!(installed.ring().exact_bytes(), ROUTE_RING);
         assert_eq!(installed.gateway_client_ca_bundle_pem(), TEST_CLIENT_CA);
+        assert_eq!(installed.node_server_ca_bundle_pem(), TEST_CLIENT_CA);
         assert_eq!(installed.server_certificate_pem(), TEST_SERVER_CERTIFICATE);
         assert_eq!(installed.server_private_key_pem(), TEST_SERVER_PRIVATE_KEY);
         let debug = format!("{installed:?}");
         assert!(debug.contains("[redacted]"));
         assert!(!debug.contains("BEGIN PRIVATE KEY"));
 
+        std::fs::write(directory_path.join("unexpected.pem"), b"unexpected").unwrap();
+        std::fs::set_permissions(
+            directory_path.join("unexpected.pem"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(matches!(
+            load_node_route_v2_machine_artifacts_from(&retained, public_contract, private_contract),
+            Err(RuntimeArtifactError::Filesystem { .. })
+        ));
+        std::fs::remove_file(directory_path.join("unexpected.pem")).unwrap();
+
         let key_path = directory_path.join("node-machine-server-private-key.pem");
         std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(matches!(
             load_node_route_v2_machine_artifacts_from(&retained, public_contract, private_contract,),
             Err(RuntimeArtifactError::Filesystem { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_node_route_v2_candidate_accepts_only_the_frozen_revision_one_wire() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory_path = temp.path().join("route-v2");
+        write_test_node_route_v2_machine_artifacts(&directory_path);
+        let (public, private) = test_node_route_contracts(&directory_path);
+        let metadata = std::fs::metadata(temp.path()).unwrap();
+        use std::os::unix::fs::MetadataExt as _;
+        let owner = InstalledDirectoryOwner::Exact {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        };
+        let loaded = load_initial_node_route_v2_machine_artifact_candidate_from(
+            temp.path(),
+            &["route-v2"],
+            owner,
+            public,
+            private,
+        )
+        .unwrap();
+        assert_eq!(loaded.ring().exact_bytes(), ROUTE_RING);
+
+        let ring_path = directory_path.join("public-key-ring.v1.json");
+        let jq_sorted = br#"{"expected_previous":null,"keys":[{"kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","public_key_spki":"MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To"}],"ring_version":1,"version":1}"#;
+        std::fs::write(&ring_path, jq_sorted).unwrap();
+        assert!(matches!(
+            load_initial_node_route_v2_machine_artifact_candidate_from(
+                temp.path(),
+                &["route-v2"],
+                owner,
+                public,
+                private,
+            ),
+            Err(RuntimeArtifactError::InvalidNodeRouteV2MachineArtifacts)
+        ));
+
+        let successor = br#"{"version":1,"ring_version":2,"expected_previous":{"ring_version":1,"key_ring_digest":"sha256:7c7e324d7be6c6ee71735c900ce1041de63af7cc08fb39b6800853f966e81e34"},"keys":[{"kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","public_key_spki":"MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To"}]}"#;
+        std::fs::write(&ring_path, successor).unwrap();
+        assert!(matches!(
+            load_initial_node_route_v2_machine_artifact_candidate_from(
+                temp.path(),
+                &["route-v2"],
+                owner,
+                public,
+                private,
+            ),
+            Err(RuntimeArtifactError::InvalidNodeRouteV2MachineArtifacts)
         ));
     }
 

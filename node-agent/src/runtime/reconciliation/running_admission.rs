@@ -7,7 +7,7 @@
 //! the only constructor for that token; the Desired effect must still repeat
 //! the complete physical proof immediately before its local gate mutation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -157,6 +157,19 @@ impl RunningTailScanAdmission {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.ready.is_empty() && self.retiring.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn route_retirement_mode_for_test(
+        &self,
+        cat_id: &Id,
+    ) -> Option<RouteRetirementMode> {
+        self.retiring.get(cat_id).map(|entry| entry.mode)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_ready_for_test(&self, cat_id: &Id) -> bool {
+        self.ready.contains_key(cat_id)
     }
 
     #[allow(
@@ -1102,7 +1115,10 @@ fn exact_require_idle_source_snapshot(
 }
 
 impl RuntimePreScanAdmission for RunningAdmissionPreScan {
-    fn reconcile(&self, context: RuntimePreScanAdmissionContext) -> anyhow::Result<()> {
+    fn reconcile(
+        &self,
+        context: RuntimePreScanAdmissionContext,
+    ) -> anyhow::Result<crate::runtime_spine::RuntimePreScanAdmissionOutcome> {
         let result = (|| {
             context.check_active()?;
             let desired_specs = &context.coordinates().desired.desired_specs;
@@ -1112,12 +1128,29 @@ impl RuntimePreScanAdmission for RunningAdmissionPreScan {
                     .find(|desired| desired.cat_id == cat_id);
                 self.reconcile_session(&context, desired, &session)?;
             }
-            Ok(())
+            let retained =
+                self.registry
+                    .ready_sessions()?
+                    .into_iter()
+                    .filter_map(|(cat_id, session)| {
+                        (session.cell().snapshot().lifecycle_admission()
+                            == LifecycleAdmission::Open)
+                            .then_some(cat_id)
+                    });
+            Ok(
+                crate::runtime_spine::RuntimePreScanAdmissionOutcome::retained_running_cats(
+                    retained,
+                ),
+            )
         })();
         if result.is_err() {
             self.registry.fail_close_all();
         }
         result
+    }
+
+    fn fail_close_cats(&self, cat_ids: &BTreeSet<Id>) {
+        self.registry.fail_close_cats(cat_ids);
     }
 
     fn fail_close_all(&self) {
@@ -1241,6 +1274,10 @@ impl RunningAdmissionEffect {
         let result = match action {
             RunningTailAction::OpenLifecycle => {
                 let _node_global_effect = context.lock_node_global_effect()?;
+                let Some(_route_publication) = self.registry.begin_route_admission_publication()?
+                else {
+                    return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                };
                 let times = next_persist_times(&stored)?;
                 Some(
                     GateSequencer::new(session.checkpoint_store(), &mut port)
@@ -1292,6 +1329,10 @@ impl RunningAdmissionEffect {
             }
             RunningTailAction::InstallGate(endpoint_id) => {
                 let _node_global_effect = context.lock_node_global_effect()?;
+                let Some(_route_publication) = self.registry.begin_route_admission_publication()?
+                else {
+                    return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                };
                 let times = next_persist_times(&stored)?;
                 Some(
                     GateSequencer::new(session.checkpoint_store(), &mut port)
@@ -1502,6 +1543,10 @@ impl RunningAdmissionEffect {
             }
             RouteRetirementAction::InstallGate(endpoint_id) => {
                 let _node_global_effect = context.lock_node_global_effect()?;
+                let Some(_route_publication) = self.registry.begin_route_admission_publication()?
+                else {
+                    return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                };
                 sequencer.install_gate_with_barrier(
                     &stored,
                     desired,
@@ -3827,6 +3872,29 @@ mod tests {
                 .snapshot()
                 .lifecycle_admission(),
             LifecycleAdmission::Open
+        );
+    }
+
+    #[test]
+    fn emergency_disabled_zero_endpoint_effect_remains_fail_closed() {
+        let fixture = Fixture::new(0);
+        let registry = fixture.registry();
+        registry.latch_emergency_route_disable();
+        let effect = RunningAdmissionEffect::new(Arc::clone(&registry));
+
+        assert_eq!(
+            effect
+                .try_apply(&fixture.context(&registry, true), &fixture.desired)
+                .expect("disabled zero-Endpoint Running tail stays bounded"),
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+        );
+        assert_eq!(
+            registry
+                .get(&fixture.desired.cat_id)
+                .expect("registered fail-closed cell")
+                .snapshot()
+                .lifecycle_admission(),
+            LifecycleAdmission::Closed
         );
     }
 

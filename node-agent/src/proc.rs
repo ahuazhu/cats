@@ -387,8 +387,7 @@ fn sample_exe(_pid: u32) -> Option<PathBuf> {
 /// line on whitespace. Splitting after the *last* `)` is the documented way to
 /// parse this file. Getting it wrong yields a plausible but wrong start time,
 /// which would later let a recycled pid pass for a surviving process.
-#[cfg(any(target_os = "linux", test))]
-fn parse_start_ticks(stat: &str) -> Option<u64> {
+pub(crate) fn parse_start_ticks(stat: &str) -> Option<u64> {
     // Everything after the comm field starts at field 3 (`state`), so field 22
     // is at index 19.
     let (_, after_comm) = stat.rsplit_once(')')?;

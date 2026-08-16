@@ -64,11 +64,11 @@ Control additionally requires the provisioner-owned root:root 0644 regular file
 leaves the fixed 30-second A23 commit-resolution join window intact.
 
 Each initial cordoned A23 policy also carries the operator-reviewed canonical
-`node_transport_target` (`https://<lowercase-dns-name>:<explicit-port>`). The deployment provisioner/admin owns
+`node_transport_target` (`https://<lowercase-dns-name>:7444` for the production Route v2 machine listener). The deployment provisioner/admin owns
 that value; `cats-noded`, its observation, source address and legacy `nodes.agent_url` cannot publish or override it.
 Rotate the target only through a successor policy while the Node is cordoned and has no assigned Desired runtimes.
-The matching Control rollout requires exact clean-slate Store authority schema version 14; every earlier version is
-rejected rather than altered in place, so create or recreate the empty version-14 schema before any new Control
+The matching Control rollout requires exact clean-slate Store authority schema version 15; every earlier version is
+rejected rather than altered in place, so create or recreate the empty version-15 schema before any new Control
 replica starts.
 
 The installer holds one `/run/lock/cats/worker-deployment.lock` descriptor from Node stop through every installed
@@ -110,13 +110,21 @@ Running-only completion claim does not supply an in-place lifecycle drain; if
 the Node is not already empty, stop and use a separately qualified migration
 or replacement procedure.
 
-The signed cutover launches VMM and blockd processes in independently owned
-per-Cat systemd units and reconstructs them under the Host lock, checkpoint and
-complete-inventory contracts. That mechanism is implemented, but no current
-clean SHA has yet passed the combined systemd 255 + KVM/Cloud Hypervisor
-qualification. Until it does, this runbook keeps the conservative empty-Node
-rule; the agent unit's own `KillMode=control-group` is not evidence that a
-particular release safely preserves or adopts every child.
+The signed cutover launches VMM and blockd processes as PID-1-owned sibling
+transient services in `system.slice`, not as processes in the `cats-noded`
+service cgroup. The Agent units therefore explicitly retain
+`KillMode=control-group`: a hard Agent stop reaps any Agent-cgroup helpers,
+while the independently owned per-Cat services remain available for Host-lock,
+checkpoint and complete-inventory adoption. Every per-Cat unit independently
+uses `KillMode=control-group`, so an exact lifecycle stop reaps that Cat's
+whole process group rather than leaving a helper behind. This systemd topology
+only preserves the physical candidate; adoption still requires the exact
+checkpoint, grant/epoch/attachment lineage and provider-private process proof.
+
+No current clean SHA has yet passed the combined systemd 255 + KVM/Cloud
+Hypervisor qualification. Until it does, this runbook keeps the conservative
+empty-Node rule; `KillMode` alone is not evidence that a particular release
+safely preserves or adopts a runtime or its pending data.
 
 ## Cluster configuration
 
@@ -145,7 +153,7 @@ RootDisk expands online at first boot; provision at least 1 GiB for normal use.
 legacy create/exec/Suspend/Warm/Cold/destroy APIs and produced the retained
 physical evidence below. The production clean-slate route map deliberately
 does not expose those legacy APIs, so running this script from the current
-branch is not a qualification for schema 14 or the signed Runtime cutover.
+branch is not a qualification for schema 15 or the signed Runtime cutover.
 
 The historical harness checked create, Guest/systemd readiness, networking,
 durable writes, Suspend/Resume, Warm snapshot/restore, Cold boot and destroy

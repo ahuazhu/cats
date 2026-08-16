@@ -178,6 +178,7 @@ impl Drop for CheckpointWriterLock {
 /// cross-process lock remains held for the same interval.
 pub(super) struct CurrentCheckpointGuard<'a> {
     _writer: MutexGuard<'a, ()>,
+    owner: &'a Mutex<()>,
 }
 
 /// Descriptor-retained form of one exact current Runtime checkpoint.
@@ -563,6 +564,22 @@ impl FileCheckpointStore {
         self.persist(ExpectedTarget::Exact(expected), checkpoint)
     }
 
+    /// Replaces an exact checkpoint while the caller retains the writer/CAS
+    /// guard returned by [`Self::assert_current`].
+    pub(super) fn replace_current(
+        &self,
+        expected: &StoredCheckpoint,
+        checkpoint: &RuntimeCheckpoint,
+        current: &CurrentCheckpointGuard<'_>,
+    ) -> Result<StoredCheckpoint, CheckpointStoreError> {
+        if !std::ptr::eq(current.owner, &self.writer_serialization) {
+            return Err(CheckpointStoreError::ConcurrentUpdate {
+                path: self.target_path.clone(),
+            });
+        }
+        self.persist_locked(ExpectedTarget::Exact(expected), checkpoint)
+    }
+
     /// Assert that `expected` is still the exact visible target and keep both
     /// the store's process-wide `flock` and its in-process writer
     /// serialization held until the returned guard is dropped.
@@ -576,7 +593,10 @@ impl FileCheckpointStore {
             }
         })?;
         self.verify_expected(ExpectedTarget::Exact(expected))?;
-        Ok(CurrentCheckpointGuard { _writer: writer })
+        Ok(CurrentCheckpointGuard {
+            _writer: writer,
+            owner: &self.writer_serialization,
+        })
     }
 
     /// Revalidate the lexical target while the caller still holds the exact
@@ -1073,6 +1093,14 @@ impl FileCheckpointStore {
                 path: self.target_path.clone(),
             }
         })?;
+        self.persist_locked(expected, checkpoint)
+    }
+
+    fn persist_locked(
+        &self,
+        expected: ExpectedTarget<'_>,
+        checkpoint: &RuntimeCheckpoint,
+    ) -> Result<StoredCheckpoint, CheckpointStoreError> {
         if checkpoint.cat_id != self.cat_id {
             return Err(CheckpointStoreError::WrongCat {
                 expected: self.cat_id.clone(),

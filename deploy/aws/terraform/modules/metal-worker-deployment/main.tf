@@ -1,9 +1,8 @@
 data "aws_partition" "current" {}
 
 locals {
-  resource_name                 = "${var.name_prefix}-${var.environment}-worker"
-  artifact_key                  = "worker/${var.worker_bundle_sha256}/cats-worker.tar.zst"
-  route_grant_public_key_base64 = base64encode(var.route_grant_public_key_pem)
+  resource_name = "${var.name_prefix}-${var.environment}-worker"
+  artifact_key  = "worker/${var.worker_bundle_sha256}/cats-worker.tar.zst"
   tags = merge(var.tags, {
     Component   = "metal-worker-deployment"
     Environment = var.environment
@@ -14,10 +13,17 @@ locals {
   # Non-secret worker configuration, used only to seed a host that has no
   # worker.env yet. Secrets never appear here: they arrive through Secrets
   # Manager and are merged over this by the overlay below.
-  worker_base_environment = join("\n", [
-    for key in sort(keys(var.worker_base_environment)) :
-    "${key}=${var.worker_base_environment[key]}"
-  ])
+  worker_base_environment = join("\n", concat(
+    [
+      for key in sort(keys(var.worker_base_environment)) :
+      "${key}=${var.worker_base_environment[key]}"
+    ],
+    [
+      "CATS_CHUNKSTORE_PREFIX=${var.chunkstore_prefix}",
+      "CATS_POSTGRES_SCHEMA=${var.control_postgres_schema}",
+      "CATS_ROUTE_V2_ROTATION_ORIGIN=${var.route_v2_rotation_origin}",
+    ],
+  ))
 
   # Non-secret configuration Terraform owns outright, merged onto an existing
   # worker.env on every deployment rather than only seeding a new one.
@@ -29,6 +35,11 @@ locals {
     [
       for key in sort(keys(var.worker_managed_environment)) :
       "${key}=${var.worker_managed_environment[key]}"
+    ],
+    [
+      "CATS_CHUNKSTORE_PREFIX=${var.chunkstore_prefix}",
+      "CATS_POSTGRES_SCHEMA=${var.control_postgres_schema}",
+      "CATS_ROUTE_V2_ROTATION_ORIGIN=${var.route_v2_rotation_origin}",
     ],
     var.database_master_user_secret_arn == null ? [] : [
       "CATS_POSTGRES_SECRET_ARN=${var.database_master_user_secret_arn}",
@@ -71,7 +82,7 @@ locals {
     # jq was already being used below without ever being checked for. It is
     # also what render-postgres-url uses to read the managed secret.
     # curl talks to IMDS when a fresh host derives its advertise address.
-    for required in aws jq zstd tar sha256sum findmnt curl base64 openssl flock stat systemd-run; do
+    for required in aws jq zstd tar sha256sum findmnt curl base64 cmp flock stat systemd-run systemctl journalctl timeout python3 readlink; do
       command -v "$required" >/dev/null 2>&1 || {
         echo "worker deployment needs $required on the host" >&2
         exit 1
@@ -84,8 +95,8 @@ locals {
     runtime_overlay=""
     environment_temp=""
     seed_temp=""
-    route_grant_key_temp=""
-    route_grant_key_fingerprint=""
+    route_v2_secret=""
+    route_v2_stage=""
     archive_entries=""
     release_transaction_active=0
     release_installer=""
@@ -99,11 +110,14 @@ locals {
       fi
       rm -rf -- "$stage_path"
       rm -f -- "$artifact_path"
-      for temporary_path in "$runtime_secret" "$runtime_overlay" "$environment_temp" "$seed_temp" "$route_grant_key_temp" "$archive_entries"; do
+      for temporary_path in "$runtime_secret" "$runtime_overlay" "$environment_temp" "$seed_temp" "$route_v2_secret" "$archive_entries"; do
         if [ -n "$temporary_path" ]; then
           rm -f -- "$temporary_path"
         fi
       done
+      if [ -n "$route_v2_stage" ]; then
+        rm -rf -- "$route_v2_stage"
+      fi
       exit "$status"
     }
     trap cleanup EXIT
@@ -121,6 +135,7 @@ locals {
     tar --zstd -tvf "$artifact_path" | awk 'substr($1,1,1) !~ /^[-d]$/ { exit 1 }'
     tar --zstd -xf "$artifact_path" -C "$stage_path"
     . "$stage_path/worker-deployment-transaction.sh"
+    . "$stage_path/install-route-v2-node-r1.sh"
     "$stage_path/install-guest-runtime-release.sh" verify \
       "$stage_path/guest-runtime-release.v1"
     # The validator is itself part of the digest-checked, preflighted bundle.
@@ -129,65 +144,86 @@ locals {
     # installed-file mutation.
     "$stage_path/validate-node-identity-installation.sh"
 
-    cgroup_mount="$(findmnt --noheadings --first-only --types cgroup2 --output TARGET)"
+    # Fetch the closed Node Route v2 artifact set before the first Cats
+    # installed-file mutation. Terraform and the SSM command carry only the
+    # opaque secret ARN; private bytes remain in root-only files and pipes,
+    # never argv, env or logs. The explicit IAM statement below grants this
+    # revision-1 secret and no other Route v2 secret.
+    route_v2_secret="$(mktemp /run/cats-route-v2-secret.XXXXXX)"
+    route_v2_stage="$(mktemp -d /run/cats-route-v2-stage.XXXXXX)"
+    chmod 0600 "$route_v2_secret"
+    chmod 0700 "$route_v2_stage"
+    aws secretsmanager get-secret-value \
+      --secret-id "${var.route_v2_node_artifact_secret_arn}" \
+      --version-id "${var.route_v2_node_artifact_secret_version_id}" \
+      --query SecretString \
+      --output text > "$route_v2_secret"
+    jq -e '
+      type == "object" and
+      keys == [
+        "gateway_client_ca_bundle_pem_b64",
+        "node_machine_server_certificate_pem_b64",
+        "node_machine_server_private_key_pem_b64",
+        "node_server_ca_bundle_pem_b64",
+        "public_key_ring_v1_json_b64",
+        "rotation_operator_trust_v1_json_b64"
+      ] and
+      all(.[]; type == "string" and length > 0)
+    ' "$route_v2_secret" >/dev/null
 
-    # ControlGroup is only populated once the unit has actually run. On a first
-    # install it is empty, and `test -n` then killed the association with no
-    # message at all -- the deployment had only ever met hosts where the service
-    # had already started. Slice is populated while the unit is merely loaded,
-    # and gives the same path systemd will use.
-    service_cgroup="$(systemctl show cats-worker --property ControlGroup --value)"
-    if [ -z "$service_cgroup" ]; then
-      service_slice="$(systemctl show cats-worker --property Slice --value)"
-      test -n "$service_slice"
-      service_cgroup="/$service_slice/cats-worker.service"
-    fi
-    test -n "$cgroup_mount"
-    test -n "$service_cgroup"
-    metering_root="$${cgroup_mount}$${service_cgroup}/metering"
-
-    # A worker release is an operator-controlled drain boundary. Killing a
-    # Cloud Hypervisor while its kernel-NBD backend is still publishing can
-    # leave an uninterruptible VMM thread in the delegated cgroup and prevent
-    # systemd from starting the replacement worker. A live cats-blockd is not
-    # metered and so is invisible to the cgroup walk, yet stopping the unit
-    # would kill it along with any unpublished journal it holds (issue #98);
-    # the guard therefore also scans the process table for the installed
-    # runtime binaries. Fail before changing any installed file unless the
-    # target node is already drained and cordoned.
-    "$stage_path/require-idle-worker.sh" "$metering_root" "${var.install_root}/bin"
-
-    # Validate verification material before changing any installed binary.
-    # The public half is intentionally separate from worker.env: PEM is
-    # multiline, non-secret, and must never be confused with the shared
-    # service token. Terraform rewrites it on every drained deployment.
-    route_grant_key_temp="$(mktemp /var/tmp/cats-route-grant-public.XXXXXX)"
-    printf '%s' '${local.route_grant_public_key_base64}' | base64 --decode > "$route_grant_key_temp"
-    openssl pkey -pubin -in "$route_grant_key_temp" -text_pub -noout \
-      | grep -q '^ED25519 Public-Key:'
-    route_grant_key_fingerprint="$(
-      openssl pkey -pubin -in "$route_grant_key_temp" -outform DER \
-        | sha256sum \
-        | awk '{print $1}'
-    )"
-    printf '%s' "$route_grant_key_fingerprint" | grep -Eq '^[0-9a-f]{64}$'
+    decode_route_v2_artifact() {
+      field=$1
+      destination=$2
+      mode=$3
+      jq -er --arg field "$field" '.[$field]' "$route_v2_secret" \
+        | base64 --decode > "$destination"
+      test -s "$destination"
+      chmod "$mode" "$destination"
+    }
+    decode_route_v2_artifact public_key_ring_v1_json_b64 "$route_v2_stage/public-key-ring.v1.json" 0644
+    decode_route_v2_artifact rotation_operator_trust_v1_json_b64 "$route_v2_stage/rotation-operator-trust.v1.json" 0644
+    decode_route_v2_artifact gateway_client_ca_bundle_pem_b64 "$route_v2_stage/gateway-client-ca-bundle.pem" 0644
+    decode_route_v2_artifact node_machine_server_certificate_pem_b64 "$route_v2_stage/node-machine-server-certificate.pem" 0644
+    decode_route_v2_artifact node_machine_server_private_key_pem_b64 "$route_v2_stage/node-machine-server-private-key.pem" 0600
+    decode_route_v2_artifact node_server_ca_bundle_pem_b64 "$route_v2_stage/node-server-ca-bundle.pem" 0644
+    "$stage_path/cats-route-v2-node-r1-validator" --directory "$route_v2_stage"
 
     # One Host-global open-file-description lock spans the entire mutation,
     # candidate start/readiness proof, and commit/rollback boundary.
     test "${var.install_root}" = /opt/cats
+    # Host-lifetime prerequisites come from the host bootstrap, not this
+    # release transaction. cats-worker.service consumes both at start; fail
+    # here on a fresh host instead of crash-looping the unit later.
+    test -s /etc/cats/rds-ca.pem
+    test -x "${var.install_root}/bin/cloud-hypervisor"
     release_installer="${var.install_root}/bin/install-guest-runtime-release"
     cats_acquire_worker_deployment_lock
 
-    # Before publishing an activation journal, close both ways the cached old
+    # Recheck the immutable initial state under the Host-global lock before the
+    # first systemd query. Concurrent installers can only converge on exact
+    # replay; conflicting bytes fail without a service mutation.
+    route_v2_install_state="$(cats_classify_route_v2_node_r1 \
+      "$stage_path/cats-route-v2-node-r1-validator" \
+      "$route_v2_stage" /etc/cats/route-v2)"
+    case "$route_v2_install_state" in absent|exact) ;; *) exit 1 ;; esac
+
+    # Only after that classification may the installer query systemd. Before
+    # publishing an activation journal, close both ways the cached old
     # unit could start: a runtime mask covers this boot, while the fsynced new
     # unit/recovery helper covers a reboot. Only then may prepare expose a
-    # candidate release identity. The unlocked idle check above is only an
-    # early preflight: recompute the cgroup path after serialization and prove
-    # physical idle again immediately before the masked stop.
+    # candidate release identity. Prove physical idle immediately before the
+    # masked stop.
     metering_root="$(cats_worker_metering_root cats-worker)"
     "$stage_path/require-idle-worker.sh" "$metering_root" "${var.install_root}/bin"
     cats_gate_node_service cats-worker
     cats_worker_deployment_crash_probe after-mask-worker
+
+    if [ "$route_v2_install_state" = absent ]; then
+      cats_publish_route_v2_node_r1 \
+        "$stage_path/cats-route-v2-node-r1-validator" \
+        "$route_v2_stage" /etc/cats/route-v2
+      cats_worker_deployment_crash_probe after-install-route-v2-artifacts
+    fi
     install -D -m 0755 "$stage_path/install-guest-runtime-release.sh" "$release_installer"
     cats_worker_deployment_crash_probe after-install-release-installer
     install -D -m 0755 "$stage_path/worker-deployment-transaction.sh" "${var.install_root}/bin/worker-deployment-transaction"
@@ -207,36 +243,219 @@ locals {
     "$release_installer" prepare "$stage_path/guest-runtime-release.v1"
     cats_worker_deployment_crash_probe after-installer-return
 
+    # The fixed receipt describes the currently installed bytes. Invalidate an
+    # older receipt before the first binary replacement so a crash cannot leave
+    # stale evidence claiming that the previous bundle is still installed.
+    worker_installation_receipt="${var.install_root}/release/worker-installation-receipt.v1.json"
+    rm -f -- "$worker_installation_receipt"
+    sync -f "${var.install_root}/release"
+    cats_worker_deployment_crash_probe after-invalidate-worker-installation-receipt
+
     # -D creates the parent directory. Without it a host that has never been
     # touched by install.sh fails here: /opt/cats/bin does not exist yet, and
     # the association only ever ran against hosts that had been set up by hand.
+    install -D -m 0755 "$stage_path/cats" "${var.install_root}/bin/cats"
+    cats_worker_deployment_crash_probe after-install-cats-cli
     install -D -m 0755 "$stage_path/cats-noded" "${var.install_root}/bin/cats-noded"
     cats_worker_deployment_crash_probe after-install-cats-noded
+    install -D -m 0755 "$stage_path/cats-route-v2-node-r1-validator" "${var.install_root}/bin/cats-route-v2-node-r1-validator"
+    cats_worker_deployment_crash_probe after-install-cats-route-v2-node-r1-validator
     install -D -m 0755 "$stage_path/cats-vmm-launcher" "${var.install_root}/bin/cats-vmm-launcher"
     cats_worker_deployment_crash_probe after-install-cats-vmm-launcher
+    install -D -m 0755 "$stage_path/cats-runtime-e3-probe" "${var.install_root}/bin/cats-runtime-e3-probe"
+    cats_worker_deployment_crash_probe after-install-cats-runtime-e3-probe
+    install -D -m 0755 "$stage_path/cats-usage-schema-v16-verifier" "${var.install_root}/bin/cats-usage-schema-v16-verifier"
+    cats_worker_deployment_crash_probe after-install-cats-usage-schema-v16-verifier
+    install -D -m 0755 "$stage_path/cats-usage-terminal-receipt-verifier" "${var.install_root}/bin/cats-usage-terminal-receipt-verifier"
+    cats_worker_deployment_crash_probe after-install-cats-usage-terminal-receipt-verifier
     install -D -m 0755 "$stage_path/cats-blockd" "${var.install_root}/bin/cats-blockd"
     cats_worker_deployment_crash_probe after-install-cats-blockd
     install -D -m 0755 "$stage_path/cats-guest-agent" "${var.install_root}/bin/cats-guest-agent"
     cats_worker_deployment_crash_probe after-install-cats-guest-agent
+    install -D -m 0755 "$stage_path/cats-e3-guest-workload" "${var.install_root}/bin/cats-e3-guest-workload"
+    cats_worker_deployment_crash_probe after-install-cats-e3-guest-workload
     install -D -m 0755 "$stage_path/update-guest-seed.sh" "${var.install_root}/bin/update-guest-seed"
     cats_worker_deployment_crash_probe after-install-guest-seed-updater
     install -D -m 0755 "$stage_path/require-idle-worker.sh" "${var.install_root}/bin/require-idle-worker"
     cats_worker_deployment_crash_probe after-install-idle-guard
     install -D -m 0755 "$stage_path/render-postgres-url.sh" "${var.install_root}/bin/render-postgres-url"
     cats_worker_deployment_crash_probe after-install-postgres-renderer
+    install -D -m 0755 "$stage_path/setup-guest-network.sh" "${var.install_root}/bin/setup-guest-network"
+    cats_worker_deployment_crash_probe after-install-guest-network-setup
     install -m 0644 "$stage_path/cats-postgres-url.service" /etc/systemd/system/cats-postgres-url.service
     cats_worker_deployment_crash_probe after-install-postgres-unit
     install -m 0644 "$stage_path/cats-postgres-url.timer" /etc/systemd/system/cats-postgres-url.timer
     cats_worker_deployment_crash_probe after-install-postgres-timer
 
-    install -D -o root -g root -m 0644 "$route_grant_key_temp" /etc/cats/route-grant-public.pem
-    cats_worker_deployment_crash_probe after-install-route-key
-    installed_route_grant_key_fingerprint="$(
-      openssl pkey -pubin -in /etc/cats/route-grant-public.pem -outform DER \
-        | sha256sum \
-        | awk '{print $1}'
-    )"
-    test "$installed_route_grant_key_fingerprint" = "$route_grant_key_fingerprint"
+    curl_path="$(readlink -f "$(command -v curl)")"
+    systemctl_path="$(readlink -f "$(command -v systemctl)")"
+    journalctl_path="$(readlink -f "$(command -v journalctl)")"
+    timeout_path="$(readlink -f "$(command -v timeout)")"
+    sync -f "${var.install_root}/bin"
+    python3 - \
+      "$worker_installation_receipt" \
+      "sha256:${var.worker_bundle_sha256}" \
+      "${var.install_root}" \
+      "$curl_path" "$systemctl_path" "$journalctl_path" "$timeout_path" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import tempfile
+
+
+def same_metadata(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        left.st_dev,
+        left.st_ino,
+        left.st_mode,
+        left.st_uid,
+        left.st_gid,
+        left.st_nlink,
+        left.st_size,
+        left.st_mtime_ns,
+        left.st_ctime_ns,
+    ) == (
+        right.st_dev,
+        right.st_ino,
+        right.st_mode,
+        right.st_uid,
+        right.st_gid,
+        right.st_nlink,
+        right.st_size,
+        right.st_mtime_ns,
+        right.st_ctime_ns,
+    )
+
+
+def fingerprint(path: Path, *, installed_member: bool) -> dict[str, object]:
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode) or before.st_size <= 0:
+        raise SystemExit(f"receipt input is not a non-empty regular file: {path}")
+    if before.st_uid != 0 or before.st_gid != 0 or stat.S_IMODE(before.st_mode) & 0o022:
+        raise SystemExit(f"receipt input is not root-owned and write-protected: {path}")
+    if installed_member and (
+        before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) != 0o755
+    ):
+        raise SystemExit(f"installed worker member metadata is invalid: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    digest = hashlib.sha256()
+    try:
+        opened = os.fstat(descriptor)
+        if not same_metadata(before, opened):
+            raise SystemExit(f"receipt input changed before read: {path}")
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise SystemExit(f"receipt input ended during read: {path}")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise SystemExit(f"receipt input grew during read: {path}")
+        if installed_member:
+            os.fsync(descriptor)
+        after = os.fstat(descriptor)
+        if not same_metadata(opened, after):
+            raise SystemExit(f"receipt input changed during read: {path}")
+    finally:
+        os.close(descriptor)
+    return {
+        "path": str(path),
+        "sha256": "sha256:" + digest.hexdigest(),
+        "size_bytes": before.st_size,
+    }
+
+
+if os.geteuid() != 0:
+    raise SystemExit("worker installation receipt must be written by root")
+receipt_path = Path(sys.argv[1])
+bundle_digest = sys.argv[2]
+install_root = Path(sys.argv[3])
+if re.fullmatch(r"sha256:[0-9a-f]{64}", bundle_digest) is None:
+    raise SystemExit("worker bundle digest is invalid")
+
+member_names = (
+    "cats",
+    "cats-noded",
+    "cats-route-v2-node-r1-validator",
+    "cats-vmm-launcher",
+    "cats-runtime-e3-probe",
+    "cats-usage-schema-v16-verifier",
+    "cats-usage-terminal-receipt-verifier",
+    "cats-blockd",
+    "cats-guest-agent",
+    "cats-e3-guest-workload",
+)
+members = {
+    name: fingerprint(install_root / "bin" / name, installed_member=True)
+    for name in member_names
+}
+host_tool_names = ("curl", "systemctl", "journalctl", "timeout")
+host_tools = {
+    name: fingerprint(Path(path), installed_member=False)
+    for name, path in zip(host_tool_names, sys.argv[4:8])
+}
+receipt = {
+    "host_tools": host_tools,
+    "members": members,
+    "service": "cats-worker.service",
+    "version": 1,
+    "worker_bundle_sha256": bundle_digest,
+}
+raw = json.dumps(
+    receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+).encode("utf-8")
+
+receipt_parent_metadata = receipt_path.parent.lstat()
+if (
+    not stat.S_ISDIR(receipt_parent_metadata.st_mode)
+    or stat.S_ISLNK(receipt_parent_metadata.st_mode)
+    or receipt_parent_metadata.st_uid != 0
+    or receipt_parent_metadata.st_gid != 0
+    or stat.S_IMODE(receipt_parent_metadata.st_mode) & 0o022
+):
+    raise SystemExit("worker installation receipt parent is not a protected real directory")
+temporary_descriptor, temporary_name = tempfile.mkstemp(
+    prefix=".worker-installation-receipt.", dir=receipt_path.parent
+)
+try:
+    os.fchmod(temporary_descriptor, 0o600)
+    os.fchown(temporary_descriptor, 0, 0)
+    view = memoryview(raw)
+    while view:
+        written = os.write(temporary_descriptor, view)
+        if written <= 0:
+            raise OSError("short write while publishing worker installation receipt")
+        view = view[written:]
+    os.fsync(temporary_descriptor)
+    os.close(temporary_descriptor)
+    temporary_descriptor = -1
+    os.replace(temporary_name, receipt_path)
+    directory_descriptor = os.open(
+        receipt_path.parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+except BaseException:
+    if temporary_descriptor >= 0:
+        os.close(temporary_descriptor)
+    try:
+        os.unlink(temporary_name)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+    cats_worker_deployment_crash_probe after-publish-worker-installation-receipt
+
     runtime_secret="$(mktemp /var/tmp/cats-worker-runtime.XXXXXX)"
     runtime_overlay="$(mktemp /var/tmp/cats-worker-overlay.XXXXXX)"
     aws secretsmanager get-secret-value \
@@ -293,9 +512,10 @@ CATS_BASE_ENVIRONMENT
       {
         key = $0
         sub(/=.*/, "", key)
-        if (key == "CATS_AUTH_TOKEN") {
+        if (key == "CATS_AUTH_TOKEN" || key == "CATS_ROUTE_V2_MACHINE_LISTEN") {
           # Signed Agent registration is the only production Node credential.
-          # A rolling cutover must remove a bearer left by an older release.
+          # A rolling cutover must remove a bearer or listener override left
+          # by an older release; the production unit passes literal 7444.
           next
         } else if (key == "CATS_METERING_CGROUP_ROOT") {
           print "CATS_METERING_CGROUP_ROOT=" metering_root
@@ -355,7 +575,7 @@ CATS_BASE_ENVIRONMENT
     cats_commit_candidate "$release_installer"
     release_transaction_active=0
     cats_worker_deployment_crash_probe after-release-commit
-    echo "Route Grant verifier key: $installed_route_grant_key_fingerprint"
+    echo "Route v2 Node artifact set installed from the scoped secret reference"
     "${var.install_root}/bin/cats-noded" --help | grep -q -- "--metering-cgroup-root"
     # Secret version ${aws_secretsmanager_secret_version.worker_runtime.version_id}
   SCRIPT
@@ -507,6 +727,12 @@ data "aws_iam_policy_document" "artifact_reader" {
     sid       = "ReadWorkerRuntimeSecret"
     actions   = ["secretsmanager:GetSecretValue"]
     resources = [aws_secretsmanager_secret.worker_runtime.arn]
+  }
+
+  statement {
+    sid       = "ReadRouteV2NodeArtifactSecret"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [var.route_v2_node_artifact_secret_arn]
   }
 
   # render-postgres-url reads the database password from the one place that

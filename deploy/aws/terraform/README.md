@@ -65,10 +65,59 @@ assume. Apply it directly after bootstrap:
 cd deploy/aws/terraform/stacks/platform
 cp backend.hcl.example backend.hcl
 cp platform.tfvars.example platform.auto.tfvars
+../../check-platform-tfvars.sh platform.auto.tfvars
 terraform init -backend-config=backend.hcl
+terraform plan -refresh-only -out=platform-refresh.tfplan
+terraform show platform-refresh.tfplan
 terraform plan -out=platform.tfplan
+terraform show platform.tfplan
 terraform apply platform.tfplan
 ```
+
+Production `*.auto.tfvars` stay private and are not repository artifacts. Before
+every platform plan, the preflight above requires the operator-supplied file to
+preserve one NAT gateway per availability zone. Correct any older private file
+that still says `one_nat_gateway_per_az = false`, then review the refresh-only
+and normal saved plans and stop if either proposes any NAT gateway or
+private-route change.
+
+The following platform transitions require exact review.
+
+**Worker identity is a stable map, not a slot.** The production state was
+imported with `aws_instance.metal_worker[0]` = `metal-2` and
+`aws_instance.metal_worker[1]` = `metal-1`. The checked-in `moved` blocks
+preserve exactly that mapping. Before the first apply with this configuration,
+replace the old private count/list inputs with the exact `metal_workers` map in
+`platform.tfvars.example`, keeping `metal-2.root_volume_encrypted = false` and
+`metal-1.root_volume_encrypted = true`. Save and review the ordinary plan: it
+must contain neither worker replacement nor worker deletion. Apply that same
+saved plan to record the stable addresses, then export the deployment input:
+
+```sh
+terraform output -json metal_worker_instance_ids
+```
+
+Copy the resulting exact two-entry map, without renaming keys, to the
+production-infrastructure stack's `metal_worker_instances`. Its next saved plan
+must contain one SSM association for each of `metal-2` and `metal-1`.
+
+`metal-2` has the one known unencrypted legacy root. Terraform deliberately
+does not ignore that attribute and cannot make `prevent_destroy` conditional.
+Do not change it during the address migration above. In the approved
+maintenance window, first stop or isolate the empty Host and arrange its fresh
+A23 NodeIdentity/Route credentials, then change only
+`metal-2.root_volume_encrypted` from `false` to `true` and create the explicit
+saved plan:
+
+```sh
+terraform plan -out=metal-2-root-encryption.tfplan
+terraform show metal-2-root-encryption.tfplan
+```
+
+Independent review must find exactly one replacement,
+`aws_instance.metal_worker["metal-2"]`, and no change to
+`aws_instance.metal_worker["metal-1"]`. Apply only that exact saved plan. Keep
+the value `true` afterward; reverting it would request another replacement.
 
 Four things about this stack are easy to get wrong.
 
@@ -125,10 +174,23 @@ cluster through an explicit EKS access entry.
 
 ## Usage infrastructure
 
+Before the cutover window, complete the tracked SNS output/input seam, confirm
+the recipient out of band, run the fail-closed live preflight and retain one
+controlled delivery test as described in the
+[alarm recipient runbook](../alarm-recipients-runbook.md). Terraform cannot
+infer subscription confirmation from a created subscription resource. Both
+production states require the same explicit AWS account, partition and region;
+the AWS provider allowlist and plan-time identity reads enforce them. Platform
+recipient keys are opaque stable IDs and values are sensitive. If an earlier
+state used an email address as the `for_each` key, follow the runbook's reviewed
+state-move/import procedure before applying; otherwise Terraform will propose a
+subscription replacement.
+
 Copy the examples outside source control, replace the bucket name, then:
 
 ```sh
-export TF_VAR_route_grant_public_key_pem="$(cat /approved/path/route-grant-public.pem)"
+export TF_VAR_route_v2_node_artifact_secret_arn='arn:aws:secretsmanager:us-east-1:123456789012:secret:cats-production-route-v2-node-r1-ABC123'
+export TF_VAR_route_v2_node_artifact_secret_version_id='EXACT_32_TO_64_CHARACTER_VERSION_ID'
 cd deploy/aws/terraform/stacks/production-infrastructure
 cp backend.hcl.example backend.hcl
 cp production.tfvars.example production.auto.tfvars
@@ -211,6 +273,12 @@ export TF_VAR_usage_postgres_url='postgresql://...'
 export TF_VAR_rds_ca_pem='-----BEGIN CERTIFICATE-----...'
 export TF_VAR_stripe_secret_key='sk_live_...'
 export TF_VAR_stripe_webhook_secret='whsec_...'
+# Opaque names of pre-created immutable Secrets; their Route v2 bytes never
+# become Terraform inputs or state.
+export TF_VAR_route_v2_control_artifact_secret_name='cats-route-v2-control-r1'
+export TF_VAR_route_v2_control_artifact_signer_revision='1'
+export TF_VAR_route_v2_control_artifact_secret_sha256='sha256:REPLACE_WITH_CONTROL_SECRET_MANIFEST_64_LOWERHEX'
+export TF_VAR_route_v2_gateway_artifact_secret_name='cats-route-v2-gateway-r1'
 
 cd deploy/aws/terraform/stacks/production-application
 cp backend.hcl.example backend.hcl
@@ -222,7 +290,53 @@ terraform apply production.tfplan
 
 Terraform's `sensitive` flag only redacts normal CLI output. Secret values still
 exist in state and in saved plans, which is why both require the same access
-control as production credentials.
+control as production credentials. Route v2 therefore uses only pre-created
+immutable Secret names/ARNs here. The application Secret key sets and the
+worker Secrets Manager JSON shape are documented in
+[`../README.md`](../README.md#route-v2-artifact-delivery); never replace those
+references with PEM/JSON/private-key Terraform variables.
+
+### First clean-slate maintenance/reset
+
+The production-application stack exposes `maintenance_mode`. A reviewed plan
+with it set to `true` removes public ingress/DNS and scales `cats-controld` to
+zero without creating kubectl drift. After the old writers are positively
+stopped or isolated, review a second plan that points the terminal release at
+disjoint fresh control/usage schemas, ChunkStore prefix or bucket, Kinesis
+stream, DynamoDB checkpoint table and immutable usage archive. Set
+`maintenance_mode = false` only in that reviewed fresh-target plan, while
+keeping the separate `enable_public_ingress = false`. Both ingress inputs
+default Closed. Starting fresh Control replicas does not itself open public or
+mutation admission.
+
+The destructive reset is a post-green retirement, not a prerequisite for
+starting the fresh release. The separate fail-closed executor requires the
+fresh deployment to be fully available, the exact release qualification to be
+green and every old writer to remain stopped or isolated. Before
+`apply --execute` publishes its immutable start receipt, retirement may be
+cancelled and all old resources remain untouched. It never accepts `public` or
+another shared PostgreSQL schema as a deletion target; legacy data there stays
+retained for a later exact table-level retirement. The two-phase commands,
+fresh-target evidence schema, exact old-resource deletion and receipt contract
+are documented in
+[`production-clean-slate-reset.md`](../production-clean-slate-reset.md).
+Every S3 operation also binds `--expected-bucket-owner` to the same 12-digit
+account proven by STS; bucket name and region alone are not destructive
+authority.
+The post-green document is exact-reset-bound and has a 15-minute pre-start
+freshness window. Its old-writer strings only bind the separately retained,
+parseable E13 positive-stop/isolation manifest; they are not proof by
+themselves, and production execute remains Blocked until that manifest is
+independently verified. After `reset-started`, repeat the same reviewed
+`apply --execute` to forward-resume the immutable stage chain; another plan,
+evidence digest or target set fails closed.
+This exact reset binary still mechanically blocks production execute before any
+AWS/PostgreSQL call because E13 positive-stop, E9 signed final usage
+epoch/barrier and cross-component Closed-admission proof formats have not been
+accepted. Terraform does not satisfy or bypass those proofs. Canonical JSON is
+the immutable receipt authority; a missing derived SHA sidecar is repaired from
+exact JSON without repeating an effect.
+The executor never runs as part of Terraform apply or normal release CI.
 
 ### Route admission
 
@@ -245,12 +359,13 @@ versioned Terraform state remains restricted infrastructure evidence; it is not 
 as product data and is not deleted by the cutover.
 
 The old regional Route Grant cache and Gateway-only Pod Identity have been
-removed. The production stack does not deploy `cats-gatewayd`, publish Endpoint
-wildcard DNS or route wildcard ingress. ADR-0041, the Node admission core and
-Gateway-to-Node machine tunnel exist in code, but this Terraform stack still
-does not install their signing ring, Gateway/Node mTLS artifacts or public
-proxy; workers remain gate-closed until those artifacts and the qualification
-matrix land together.
+removed. The production stack now deploys the Route v2-only `cats-gatewayd`,
+publishes Endpoint wildcard DNS and routes wildcard ingress to that service.
+It references the immutable revision-1 Control and Gateway artifact Secrets;
+the infrastructure stack references one exact revision-1 Node artifact Secret
+version. Terraform never accepts their private bytes. This is initial
+distribution only: G3 still owns signer/ring rotation, overlap, reload and
+acknowledged rollout.
 
 The first qualified ADR-0040/0041 clean-slate deployment follows the single ordered runbook in
 [Operations and HA §8](../../../docs/operations-ha.md#8-首次终态部署). The Terraform plan used there
@@ -282,15 +397,15 @@ PostgreSQL.
 ### Automatic main deployment
 
 `Deploy production` starts after the `CI` workflow succeeds for a `main`
-commit. It builds and pushes the control-plane image, pins the registry digest,
-creates a saved application plan, applies that exact plan and waits for both
-Deployments to report the same immutable image reference. A failed build,
-plan, apply or rollout records a failed GitHub deployment.
+commit. It builds and pushes separate control-plane and Gateway images, pins
+both registry digests, creates a saved application plan, applies that exact
+plan and verifies each Deployment against its own immutable image reference. A
+failed build, plan, apply or rollout records a failed GitHub deployment.
 
-That workflow updates the Terraform-managed control-plane application; its
-green result is not the missing production-public-spawn PostgreSQL/Linux
-runtime E2E and does not qualify a nonempty worker, public Route v2 ingress or
-the signed full lifecycle.
+That workflow updates the Terraform-managed Control and Gateway applications;
+its green result is not the missing production-public-spawn PostgreSQL/Linux
+runtime E2E and does not qualify a nonempty worker or the signed full
+lifecycle.
 
 Configure these non-secret repository variables:
 
@@ -298,7 +413,12 @@ Configure these non-secret repository variables:
 - `EKS_CLUSTER_NAME`;
 - `TF_STATE_BUCKET` and `TF_STATE_APPLICATION_KEY`;
 - `PRODUCTION_TFVARS_B64`, the Base64 encoding of the private non-secret
-  application tfvars with `kubeconfig_*` and both image inputs omitted.
+  application tfvars with `kubeconfig_*` and all deployment-built image inputs
+  omitted;
+- `ROUTE_V2_CONTROL_ARTIFACT_SECRET_NAME` and
+  `ROUTE_V2_GATEWAY_ARTIFACT_SECRET_NAME`, opaque immutable revision-1 Secret
+  names. Before planning, the workflow verifies their exact key sets without
+  printing or persisting Secret data.
 
 The workflow does not copy production credentials into GitHub. After assuming
 the branch-pinned role, it reads the existing Terraform-managed `cats-runtime`
@@ -315,14 +435,16 @@ HA drill uses the same runner when it maps the PostgreSQL advisory-lock owner to
 a control-plane Pod. This avoids `kubectl` attach fallback replaying a fast
 command's output in either safety gate. A missing version table is the reviewed
 fresh-schema case; cluster, scheduling, authentication and query failures all
-fail closed. `cats-controld` opens only exact clean-slate authority schema 14;
+fail closed. `cats-controld` opens only exact clean-slate authority schema 15;
 it does not migrate an earlier stamp or partial catalog in place.
 The disruptive drill separately uploads fixed-rate public-probe results and
 Pod/EndpointSlice transition evidence; those artifacts contain no Secret
 values or response bodies and are retained for 30 days for failure correlation.
 
-Terraform deliberately creates no Gateway Secret, ServiceAccount, Deployment,
-Service, Pod Identity or DynamoDB Route mirror in this release.
+Terraform deliberately creates neither Route v2 private bytes nor a DynamoDB
+Route mirror. It deploys the Gateway ServiceAccount, Deployment and Service,
+while a root-only provisioning channel creates the two immutable Kubernetes
+Secrets before this workflow runs.
 
 ## Metal worker deployment boundary
 
@@ -410,4 +532,10 @@ terraform -chdir=deploy/aws/terraform/stacks/production-payments init -backend=f
 terraform -chdir=deploy/aws/terraform/stacks/production-payments validate
 terraform -chdir=deploy/aws/terraform/stacks/production-application init -backend=false
 terraform -chdir=deploy/aws/terraform/stacks/production-application validate
+terraform -chdir=deploy/aws/terraform/modules/usage-infrastructure init -backend=false
+terraform -chdir=deploy/aws/terraform/modules/usage-infrastructure test
+terraform -chdir=deploy/aws/terraform/stacks/production-infrastructure test
+python3 deploy/aws/terraform/test-alert-recipient-privacy.py
+python3 deploy/aws/preflight-alarm-recipients-fixture.py
+python3 deploy/aws/run-controlled-alarm-recipient-test-fixture.py
 ```

@@ -37,7 +37,8 @@ use super::authorized_blockd::{
 use super::blockd_socket_namespace::ManagedBlockdSocketOwnerRetirement;
 use super::clean_slate_probes::CHECKPOINT_NAMESPACE;
 use super::kernel_nbd::{
-    KernelNbdAttachEffect, KernelNbdClientCleanupOwner, KernelNbdInventoryConfig,
+    KernelNbdAttachEffect, KernelNbdClientCleanupOwner, KernelNbdDetachPort,
+    KernelNbdInventoryConfig, PlatformKernelNbdDetachPort,
 };
 use super::network::PrepareNetworkReservationEffect;
 use super::prepare_device_retirement::PrepareDeviceTargetRetirementEffect;
@@ -46,6 +47,8 @@ use super::root_provision_process::{
     RootProvisionAbsencePurpose, RootProvisionManagedStopInspection,
     RootProvisionProcessGlobalPort, RootProvisionRetirementAdmission,
 };
+#[cfg(test)]
+use super::serving_blockd_process::ServingBlockdAdoptionObserver;
 use super::serving_blockd_process::{ServingBlockdProcessGlobalPort, ServingBlockdStartEffect};
 use super::serving_handoff::{
     target_control_process_launch_identity, ReopenedTargetControlAuthorization,
@@ -60,6 +63,7 @@ use super::signed_running::{
 };
 use super::vmm_process::VmmProcessGlobalPort;
 use super::vmm_start_runtime_effect::{StartRuntimePhysicalEffect, StartRuntimeReservationEffect};
+use super::LifecycleStepEffect;
 use super::{
     ensure_root_provision_process_from_persisted_checkpoint_with_socket_absence,
     AuthorizedBlockdStore, FileCheckpointStore, PersistentFilesystemEffect,
@@ -143,6 +147,7 @@ pub(crate) struct SignedRootProvisionEffect {
 /// earlier state stays with the acquire/stale planner.
 pub(crate) struct SignedRunningEffect {
     running_admission: Option<RunningAdmissionEffect>,
+    lifecycle: Option<LifecycleStepEffect>,
     acquire: SignedRunningAcquireEffect,
     provision: SignedRootProvisionEffect,
     handoff: ServingHandoffEffect,
@@ -212,8 +217,14 @@ impl SignedRunningProcessPorts {
 }
 
 impl SignedRunningEffect {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "production composition keeps each signed authority and physical port explicit"
+    )]
     pub(crate) fn platform(
         acquire: SignedRunningAcquireEffect,
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        residue_authority: super::RuntimeVolumeTransitionHttpClient,
         authority: Arc<dyn VolumeDataAuthority>,
         blob: Arc<dyn BlobStore>,
         host: SignedRunningHostConfig,
@@ -250,16 +261,22 @@ impl SignedRunningEffect {
             systemd.clone(),
             Arc::clone(&process_ports.serving_global),
         );
+        let kernel_nbd_detach = kernel_nbd_inventory.clone().map(|config| {
+            Arc::new(PlatformKernelNbdDetachPort::new(
+                config,
+                Arc::clone(&kernel_nbd_cleanup_owner),
+            )) as Arc<dyn KernelNbdDetachPort>
+        });
         let kernel_nbd_attach = kernel_nbd_inventory.clone().map(|config| {
             KernelNbdAttachEffect::platform(
                 Arc::clone(&authority),
                 config,
-                kernel_nbd_cleanup_owner,
+                Arc::clone(&kernel_nbd_cleanup_owner),
             )
         });
         let prepare_network = Arc::new(PrepareNetworkReservationEffect::new(
             state_directory.clone(),
-            network_ip_binary,
+            network_ip_binary.clone(),
             Arc::clone(&authority),
             Arc::clone(&process_ports.serving_global),
         )?);
@@ -301,6 +318,16 @@ impl SignedRunningEffect {
         )?;
         Ok(Self {
             running_admission: Some(running_admission),
+            lifecycle: Some(LifecycleStepEffect::platform(
+                network_ip_binary,
+                acquire.lifecycle_volume_port(),
+                Arc::clone(&authority),
+                Arc::clone(&process_ports.serving_global),
+                Arc::clone(&process_ports.vmm_global),
+                kernel_nbd_detach,
+                #[cfg(feature = "proposed-node-residue-reclamation")]
+                residue_authority,
+            )),
             acquire,
             provision: SignedRootProvisionEffect::platform(
                 Arc::clone(&authority),
@@ -327,6 +354,18 @@ impl SignedRunningEffect {
             physical_start_runtime: Some(physical_start_runtime),
         })
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_serving_adoption_observer_for_test(
+        mut self,
+        observer: ServingBlockdAdoptionObserver,
+    ) -> Self {
+        self.serving_process = self
+            .serving_process
+            .take()
+            .map(|effect| effect.with_after_exact_adoption_for_test(observer));
+        self
+    }
 }
 
 impl RuntimeDesiredEffect for SignedRunningEffect {
@@ -340,6 +379,11 @@ impl RuntimeDesiredEffect for SignedRunningEffect {
                 return Ok(outcome);
             }
             if let Some(outcome) = running_admission.try_apply(&context, desired)? {
+                return Ok(outcome);
+            }
+        }
+        if let Some(lifecycle) = &self.lifecycle {
+            if let Some(outcome) = lifecycle.try_apply(&context, desired)? {
                 return Ok(outcome);
             }
         }
@@ -2275,6 +2319,7 @@ mod tests {
             };
             let attachment = AuthorizedServingAttachment {
                 identity: identity.clone(),
+                object_write_credential: None,
                 size_bytes: volume.size_bytes,
                 durability: volume.durability,
                 head: blank.clone(),
@@ -2720,6 +2765,7 @@ mod tests {
             .unwrap();
             SignedRunningEffect {
                 running_admission: None,
+                lifecycle: None,
                 acquire,
                 provision: self.effect_with_ports(process, retirement, request),
                 handoff,

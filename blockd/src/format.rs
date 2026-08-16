@@ -11,7 +11,11 @@ use cats_api::runtime_reconciliation::AcquireOrigin;
 pub const LEAF_MAGIC: &[u8; 8] = b"CATSLEAF";
 pub const ROOT_MAGIC: &[u8; 8] = b"CATSROOT";
 pub const PACK_MAGIC: &[u8; 8] = b"CATSPACK";
-pub(crate) const ENCODED_PACK_PREFIX_LEN: usize = 8 + 2 + 4;
+/// Fixed bytes preceding the length-delimited JSON header of one pending pack.
+///
+/// Inventory readers use this prefix to bound the header before allocating;
+/// accepting the header never validates or consumes the payload.
+pub const ENCODED_PACK_PREFIX_LEN: usize = 8 + 2 + 4;
 pub const BITMAP_MAGIC: &[u8; 8] = b"CATSDRTY";
 pub const FORMAT_VERSION: u16 = 1;
 pub const TARGET_PACK_FORMAT_VERSION: u16 = 2;
@@ -534,7 +538,12 @@ pub fn encoded_pack_len(header: &PackHeader, payload_len: usize) -> Option<usize
         .checked_add(payload_len)
 }
 
-pub(crate) fn encoded_pack_header_len(prefix: &[u8]) -> Result<usize, FormatError> {
+/// Returns the complete encoded header length from one fixed pack prefix.
+///
+/// Callers must impose their own allocation cap before reading the returned
+/// number of bytes and then pass the complete header to
+/// [`decode_pack_header`].
+pub fn encoded_pack_header_len(prefix: &[u8]) -> Result<usize, FormatError> {
     let mut remaining = prefix;
     if take(&mut remaining, 8, "pack")? != PACK_MAGIC {
         return Err(FormatError::Malformed("pack"));
@@ -549,7 +558,10 @@ pub(crate) fn encoded_pack_header_len(prefix: &[u8]) -> Result<usize, FormatErro
         .ok_or(FormatError::Malformed("pack"))
 }
 
-pub(crate) fn decode_pack_header(buf: &[u8]) -> Result<(PackHeader, usize), FormatError> {
+/// Decodes and validates the length-delimited header at the start of a pack.
+/// The returned offset is the first payload byte; the payload itself is not
+/// read or validated by this function.
+pub fn decode_pack_header(buf: &[u8]) -> Result<(PackHeader, usize), FormatError> {
     let mut remaining = buf;
     let encoded_header_len = encoded_pack_header_len(buf)?;
     let _prefix = take(&mut remaining, ENCODED_PACK_PREFIX_LEN, "pack")?;

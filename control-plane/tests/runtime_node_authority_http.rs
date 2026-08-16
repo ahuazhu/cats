@@ -27,9 +27,7 @@ use cats_api::runtime_reconciliation::{
 use cats_control_plane::controller::AutoTierPolicy;
 use cats_control_plane::server::{spawn, Config, Handle};
 use cats_control_plane::store::DsnSource;
-use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_metering::SqliteUsageStore;
-use cats_storage::MetadataStore;
 use reqwest::{Method, RequestBuilder, StatusCode};
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -130,20 +128,21 @@ impl Context {
         }));
         let dir = tempfile::tempdir().unwrap();
         let usage = Arc::new(SqliteUsageStore::open(&dir.path().join("usage.db")).unwrap());
-        let storage_meta: Arc<dyn MetadataStore> =
-            Arc::new(SqliteMetadataStore::open(&dir.path().join("storage.db")).unwrap());
         let server = spawn(Config {
             listen: "127.0.0.1:0".into(),
             control_store_dsn: DsnSource::Literal(control_store_dsn),
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: usage,
-            storage_meta,
+            #[cfg(debug_assertions)]
+            retired_storage_meta_for_tests: None,
             image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
             auth_token: SERVICE_TOKEN.into(),
             guest_runtime_profile_receipt:
                 cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
             runtime_provisioner_trust_bundle: trust_bundle,
+            production_cutover_operator_trust_bundle:
+                cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
             route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
             admin_token: ADMIN_TOKEN.into(),
             workos: None,
@@ -241,6 +240,12 @@ fn identity() -> NodeIdentity {
     NodeIdentity {
         version: ContractVersion::V1,
         node_id: id("node_http_a"),
+        provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+            provider: id("test_provider"),
+            partition: id("test_partition"),
+            account_id: id("test_account"),
+            region: id("test_region"),
+        },
         immutable_host_id: id("host_http_a"),
         credential_id: id("node_credential_http_a"),
         credential_binding: CredentialBinding::PublicKey {

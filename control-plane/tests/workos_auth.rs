@@ -619,13 +619,15 @@ impl Ctx {
             control_store_ca_file: None,
             usage_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
             credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
-            storage_meta,
+            retired_storage_meta_for_tests: Some(storage_meta),
             image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
             auth_token: "service-token".into(),
             guest_runtime_profile_receipt:
                 cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
             runtime_provisioner_trust_bundle:
                 cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
+            production_cutover_operator_trust_bundle:
+                cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
             route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
             admin_token: "admin-token".into(),
             workos: Some(Arc::new(workos)),

@@ -7,8 +7,8 @@
 //!
 //! ```sh
 //! sudo modprobe nbd nbds_max=8
-//! cargo build -p cats-blockd-daemon
-//! sudo -E CATS_NBD_TEST_BLOCKD_BIN=target/debug/cats-blockd \
+//! cargo build -p cats-blockd --example sqlite_nbd_test_server
+//! sudo -E CATS_NBD_TEST_BLOCKD_BIN=target/debug/examples/sqlite_nbd_test_server \
 //!     CATS_NBD_TEST_DEVICES=8 \
 //!     cargo test -p cats-e2e --test nbd_leak_reclaim -- --ignored --nocapture
 //! ```
@@ -24,10 +24,12 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_node_agent::ch::{
     leaked_nbd_device_count, nbd_attach, nbd_detach, reclaim_leaked_nbd_devices, BlockPath,
     ChConfig,
 };
+use cats_storage::MetadataStore;
 
 const VOLUME_BYTES: u64 = 1024 * 1024 * 1024;
 
@@ -104,27 +106,22 @@ impl Blockd {
     fn spawn(binary: &Path, id: &str) -> Result<Self> {
         let dir = tempfile::tempdir()?;
         let socket = dir.path().join("nbd.sock");
+        let volume_id = format!("vol_{id}");
+        let attachment_id = format!("att_{id}");
+        let metadata_path = dir.path().join("meta.db");
+        let metadata = SqliteMetadataStore::open(&metadata_path)?;
+        metadata.create_volume(&volume_id, VOLUME_BYTES)?;
+        cats_test_support::install_sqlite_grant(&metadata_path, &volume_id, &attachment_id, 1)
+            .map_err(anyhow::Error::msg)?;
         let child = Command::new(binary)
-            .arg("--volume-id")
-            .arg(format!("vol_{id}"))
-            .arg("--attachment-id")
-            .arg(format!("att_{id}"))
-            .arg("--lease-ttl-ms")
+            .arg(&volume_id)
+            .arg(&attachment_id)
+            .arg("1")
             .arg("5000")
-            .arg("--data-dir")
             .arg(dir.path().join("data"))
-            .arg("--metadata-store-adapter")
-            .arg("sqlite")
-            .arg("--metadata-store-option")
-            .arg(format!("path={}", dir.path().join("meta.db").display()))
-            .arg("--object-store-adapter")
-            .arg("file")
-            .arg("--object-store-option")
-            .arg(format!("root={}", dir.path().join("blob").display()))
-            .arg("--listen-unix")
+            .arg(&metadata_path)
+            .arg(dir.path().join("blob"))
             .arg(&socket)
-            .arg("--create-volume-size")
-            .arg(VOLUME_BYTES.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()

@@ -21,10 +21,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use cats_api::guest::GuestShellFrame;
-use cats_api::metering::{
-    CatUsageCheckpoint, IngestUsageCheckpointsRequest, UsageMetric,
-    MAX_USAGE_CHECKPOINTS_PER_REQUEST, MAX_USAGE_INGEST_BODY_BYTES,
-};
+use cats_api::metering::{CatUsageCheckpoint, UsageMetric};
 use cats_api::nodejob::{JobPhase, NodeJob};
 use cats_api::oci::{DeployOciRequest, OciDeployment};
 use cats_api::requests::{
@@ -41,7 +38,15 @@ use crate::runtime::{
     allocated_tree_bytes, CatTelemetryTarget, NodeConfig, NodeRuntime, ProxyTarget,
     RuntimeActivityGuard, UsageFinalizer,
 };
+use crate::usage_delivery::{deliver_usage_batches, session_binding, UsageDeliveryState};
 use crate::usage_spool::UsageSpool;
+
+/// How often abandoned per-Cat runtime directories are reclaimed and recounted.
+const RUNTIME_RESIDUE_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Independent retry cadence for the retired development runtime's durable
+/// usage outbox. Production uses the signed Runtime pipeline.
+const USAGE_DELIVERY_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -107,281 +112,21 @@ fn check_auth(cfg: &ServerConfig, headers: &HeaderMap) -> Result<(), StatusCode>
 
 impl NodeState {
     async fn deliver_pending_usage(&self) -> anyhow::Result<()> {
+        let session = session_binding(&self.agent_session);
+        let signer = self.cfg.agent_registration.runtime_request_signer();
         deliver_usage_batches(
             &self.client,
             &format!(
-                "{}/v1/internal/usage/checkpoints",
-                self.cfg.control_plane_url.trim_end_matches('/')
+                "{}{}",
+                self.cfg.control_plane_url.trim_end_matches('/'),
+                cats_api::metering::USAGE_CHECKPOINTS_PATH
             ),
-            &self.cfg.auth_token,
-            &self.cfg.node.node_id,
+            &signer,
+            &session,
             &self.usage_pipeline.spool,
             &self.usage_pipeline.delivery,
         )
         .await
-    }
-}
-
-/// Use half the server's explicit JSON limit. The budget covers the complete
-/// serialized request, not just the checkpoint objects, and leaves room for
-/// intermediary behavior that is stricter than the final Axum extractor.
-const USAGE_REQUEST_TARGET_BYTES: usize = MAX_USAGE_INGEST_BODY_BYTES / 2;
-const USAGE_DELIVERY_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-const USAGE_DELIVERY_MAX_BACKOFF: Duration = Duration::from_secs(60);
-
-/// Bound on how much of a rejection body is quoted into an error. Enough for
-/// the control plane's structured message, short enough that remote input
-/// cannot flood the journal.
-const MAX_INGEST_ERROR_DETAIL_CHARS: usize = 512;
-
-/// How often abandoned per-Cat runtime directories are reclaimed and recounted.
-///
-/// Slow on purpose. Every pass walks the state directory and probes a Unix
-/// socket per abandoned Cat, and what it is chasing accumulates over days: the
-/// host that motivated it had collected 49 directories, the oldest five over
-/// five days old (issue #99). A tighter cadence would buy nothing but I/O.
-const RUNTIME_RESIDUE_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
-
-/// How often the uploader drains the spool when nothing nudges it.
-///
-/// Independent of the heartbeat interval on purpose: billing tolerates delay,
-/// liveness does not, so the two cadences must not be the same knob.
-const USAGE_DELIVERY_INTERVAL: Duration = Duration::from_secs(1);
-
-#[derive(Debug)]
-struct UsageDeliveryState {
-    request_budget_bytes: usize,
-    /// A response timeout is a soft capacity signal, so it lowers this AIMD
-    /// window without changing the hard serialized-byte budget. Keeping the
-    /// two dimensions separate guarantees that a later, larger checkpoint can
-    /// still be sent by itself.
-    max_checkpoints_per_request: usize,
-    consecutive_failures: u32,
-    retry_not_before: Option<Instant>,
-}
-
-impl Default for UsageDeliveryState {
-    fn default() -> Self {
-        Self {
-            request_budget_bytes: USAGE_REQUEST_TARGET_BYTES,
-            max_checkpoints_per_request: MAX_USAGE_CHECKPOINTS_PER_REQUEST,
-            consecutive_failures: 0,
-            retry_not_before: None,
-        }
-    }
-}
-
-impl UsageDeliveryState {
-    fn retry_delay(&self, now: Instant) -> Option<Duration> {
-        self.retry_not_before
-            .and_then(|deadline| deadline.checked_duration_since(now))
-    }
-
-    fn record_idle(&mut self) {
-        self.consecutive_failures = 0;
-        self.retry_not_before = None;
-    }
-
-    fn record_success(&mut self) {
-        self.record_idle();
-        if self.max_checkpoints_per_request < MAX_USAGE_CHECKPOINTS_PER_REQUEST {
-            // Additive recovery avoids permanently pinning throughput to one
-            // tiny request after a transient slow response. It also avoids
-            // immediately returning to the exact oversized batch that just
-            // timed out.
-            let growth = (self.max_checkpoints_per_request / 8).max(1);
-            self.max_checkpoints_per_request = self
-                .max_checkpoints_per_request
-                .saturating_add(growth)
-                .min(MAX_USAGE_CHECKPOINTS_PER_REQUEST);
-        }
-    }
-
-    fn record_failure(&mut self, now: Instant) -> Duration {
-        let exponent = self.consecutive_failures.min(6);
-        let multiplier = 1_u32 << exponent;
-        let delay = USAGE_DELIVERY_INITIAL_BACKOFF
-            .saturating_mul(multiplier)
-            .min(USAGE_DELIVERY_MAX_BACKOFF);
-        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        self.retry_not_before = now.checked_add(delay);
-        delay
-    }
-
-    fn shrink_after_payload_too_large(
-        &mut self,
-        node_id: &str,
-        rejected: &[CatUsageCheckpoint],
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            rejected.len() > 1,
-            "control plane rejected one usage checkpoint as payload too large; the queue head was retained"
-        );
-        let smaller_count = rejected.len() / 2;
-        let smaller = IngestUsageCheckpointsRequest {
-            node_id: node_id.to_string(),
-            checkpoints: rejected[..smaller_count].to_vec(),
-        };
-        let smaller_bytes = serde_json::to_vec(&smaller)?.len();
-        anyhow::ensure!(
-            smaller_bytes < self.request_budget_bytes,
-            "usage request split did not reduce the request budget"
-        );
-        self.request_budget_bytes = smaller_bytes;
-        Ok(())
-    }
-
-    fn shrink_after_timeout(&mut self, rejected: &[CatUsageCheckpoint]) -> bool {
-        if rejected.len() <= 1 {
-            return false;
-        }
-        self.max_checkpoints_per_request = (rejected.len() / 2).max(1);
-        true
-    }
-}
-
-async fn deliver_usage_batches(
-    client: &reqwest::Client,
-    endpoint: &str,
-    auth_token: &str,
-    node_id: &str,
-    spool: &UsageSpool,
-    delivery: &tokio::sync::Mutex<UsageDeliveryState>,
-) -> anyhow::Result<()> {
-    // Every periodic or lifecycle-triggered uploader wakeup shares one ordered
-    // delivery lane. Holding an async mutex across the request is intentional;
-    // a std mutex is not held across await, and later batches cannot overtake
-    // earlier ones.
-    let mut delivery = delivery.lock().await;
-    if spool.is_empty()? {
-        delivery.record_idle();
-        return Ok(());
-    }
-    if let Some(delay) = delivery.retry_delay(Instant::now()) {
-        anyhow::bail!(
-            "usage delivery is backing off for another {} ms",
-            delay.as_millis()
-        );
-    }
-
-    loop {
-        let pending_checkpoints = match spool.peek_request_batch(
-            node_id,
-            delivery.max_checkpoints_per_request,
-            delivery.request_budget_bytes,
-        ) {
-            Ok(checkpoints) => checkpoints,
-            Err(error) => {
-                let delay = delivery.record_failure(Instant::now());
-                return Err(error).context(format!(
-                    "build bounded usage request; retrying after {} ms",
-                    delay.as_millis()
-                ));
-            }
-        };
-        if pending_checkpoints.is_empty() {
-            delivery.record_idle();
-            return Ok(());
-        }
-        let request = IngestUsageCheckpointsRequest {
-            node_id: node_id.to_string(),
-            checkpoints: pending_checkpoints.clone(),
-        };
-        let request_json = serde_json::to_vec(&request)?;
-        anyhow::ensure!(
-            request_json.len() <= delivery.request_budget_bytes,
-            "usage request serialized to {} bytes above its {}-byte budget",
-            request_json.len(),
-            delivery.request_budget_bytes
-        );
-        let response = match client
-            .post(endpoint)
-            .bearer_auth(auth_token)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(request_json)
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                // A response timeout after connecting is often a batch-size
-                // signal: the server accepted the request but could not durably
-                // ingest it inside our deadline. Retain the whole prefix and
-                // halve only the next wire request. Connect timeouts instead
-                // describe reachability and cannot be improved by splitting.
-                // The response can be lost after a successful commit, so this
-                // retry remains safe only because ingestion deduplicates the
-                // stable checkpoint event IDs.
-                let shrunk = error.is_timeout()
-                    && !error.is_connect()
-                    && delivery.shrink_after_timeout(&pending_checkpoints);
-                let delay = delivery.record_failure(Instant::now());
-                let capacity_detail = if shrunk {
-                    format!(
-                        "; reduced the next batch to at most {} checkpoints",
-                        delivery.max_checkpoints_per_request
-                    )
-                } else {
-                    String::new()
-                };
-                return Err(error).context(format!(
-                    "send durable usage checkpoints{capacity_detail}; retrying after {} ms",
-                    delay.as_millis(),
-                ));
-            }
-        };
-        if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
-            if pending_checkpoints.len() == 1 {
-                let delay = delivery.record_failure(Instant::now());
-                anyhow::bail!(
-                    "control plane rejected one usage checkpoint as payload too large; the queue head was retained and will retry after {} ms",
-                    delay.as_millis()
-                );
-            }
-            delivery.shrink_after_payload_too_large(node_id, &pending_checkpoints)?;
-            continue;
-        }
-        if !response.status().is_success() {
-            let status = response.status();
-            let shrunk = matches!(
-                status,
-                StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT
-            ) && delivery.shrink_after_timeout(&pending_checkpoints);
-            // Carry the control plane's reason. It names the offending
-            // checkpoint and what is wrong with it, which is the difference
-            // between "the batch is rejected" and knowing that one specific Cat
-            // changed owner. Checkpoints carry no credentials, so the body is
-            // safe to log; bound it anyway because it is remote input.
-            let detail = response.text().await.unwrap_or_default();
-            let detail = detail.trim();
-            let detail: String = detail.chars().take(MAX_INGEST_ERROR_DETAIL_CHARS).collect();
-            let delay = delivery.record_failure(Instant::now());
-            let capacity_detail = if shrunk {
-                format!(
-                    "; reduced the next batch to at most {} checkpoints",
-                    delivery.max_checkpoints_per_request
-                )
-            } else {
-                String::new()
-            };
-            if detail.is_empty() {
-                anyhow::bail!(
-                    "usage ingestion returned {status}{capacity_detail}; retrying after {} ms",
-                    delay.as_millis()
-                );
-            }
-            anyhow::bail!(
-                "usage ingestion returned {status}: {detail}{capacity_detail}; retrying after {} ms",
-                delay.as_millis()
-            );
-        }
-
-        let event_ids = pending_checkpoints
-            .iter()
-            .map(|checkpoint| checkpoint.event_id.clone())
-            .collect::<Vec<_>>();
-        spool.acknowledge(&event_ids)?;
-        delivery.record_success();
     }
 }
 
@@ -913,17 +658,48 @@ mod proxy_websocket_tests {
 
 #[cfg(test)]
 mod usage_delivery_tests {
-    use super::{deliver_usage_batches, UsageDeliveryState};
+    use super::{deliver_usage_batches as signed_deliver_usage_batches, UsageDeliveryState};
     use crate::usage_spool::UsageSpool;
     use axum::body::Bytes;
     use axum::extract::State;
     use axum::http::StatusCode;
+    use axum::response::{IntoResponse, Response};
     use axum::routing::post;
     use axum::Router;
-    use cats_api::metering::{CatUsageCheckpoint, IngestUsageCheckpointsRequest, UsageMetric};
+    use cats_api::agent_registration::{Ed25519RequestSigner, JSON_CONTENT_TYPE};
+    use cats_api::metering::{
+        CatUsageCheckpoint, IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse,
+        UsageMetric,
+    };
+    use cats_api::runtime_reconciliation::{Epoch, Id, NodeBootId, RandomId128, SessionBinding};
+    use ring::rand::SystemRandom;
+    use ring::signature::Ed25519KeyPair;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
+
+    async fn deliver_usage_batches(
+        client: &reqwest::Client,
+        endpoint: &str,
+        _retired_auth_token: &str,
+        _node_id: &str,
+        spool: &UsageSpool,
+        delivery: &tokio::sync::Mutex<UsageDeliveryState>,
+    ) -> anyhow::Result<()> {
+        let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let signer = Ed25519RequestSigner::from_pkcs8_der(
+            Id::new("credential-a").unwrap(),
+            document.as_ref(),
+        )
+        .unwrap();
+        let session = SessionBinding {
+            node_id: Id::new("node-a").unwrap(),
+            node_boot_id: NodeBootId::new("11111111111111111111111111111111").unwrap(),
+            agent_instance_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
+            agent_session_epoch: Epoch::new(1).unwrap(),
+        };
+        signed_deliver_usage_batches(client, endpoint, &signer, &session, spool, delivery).await
+    }
 
     #[derive(Clone, Default)]
     struct MockIngestion {
@@ -938,27 +714,53 @@ mod usage_delivery_tests {
         accepted: Arc<Mutex<Vec<String>>>,
     }
 
-    async fn ingest(State(state): State<MockIngestion>, body: Bytes) -> StatusCode {
-        let request: IngestUsageCheckpointsRequest = serde_json::from_slice(&body).unwrap();
-        state.requests.lock().unwrap().push(
-            request
-                .checkpoints
-                .iter()
-                .map(|checkpoint| checkpoint.event_id.clone())
+    fn accepted_response(status: StatusCode, event_ids: Vec<String>) -> Response {
+        let response = IngestUsageCheckpointsResponse {
+            accepted: u64::try_from(event_ids.len()).unwrap(),
+            duplicates: 0,
+            rejected: Vec::new(),
+            results: event_ids
+                .into_iter()
+                .map(|event_id| cats_api::metering::UsageCheckpointIngestResult {
+                    event_id,
+                    outcome: cats_api::metering::UsageCheckpointIngestOutcome::Accepted,
+                    reason: None,
+                })
                 .collect(),
-        );
-        state
+        };
+        (
+            status,
+            [(axum::http::header::CONTENT_TYPE, JSON_CONTENT_TYPE)],
+            serde_json::to_vec(&response).unwrap(),
+        )
+            .into_response()
+    }
+
+    async fn ingest(State(state): State<MockIngestion>, body: Bytes) -> Response {
+        let request: IngestUsageCheckpointsRequest = serde_json::from_slice(&body).unwrap();
+        let event_ids = request
+            .checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.event_id.clone())
+            .collect::<Vec<_>>();
+        state.requests.lock().unwrap().push(event_ids.clone());
+        let status = state
             .responses
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or(StatusCode::OK)
+            .unwrap_or(StatusCode::OK);
+        if status.is_success() {
+            accepted_response(status, event_ids)
+        } else {
+            status.into_response()
+        }
     }
 
     async fn ingest_with_size_dependent_timeout(
         State(state): State<TimeoutSensitiveIngestion>,
         body: Bytes,
-    ) -> StatusCode {
+    ) -> Response {
         let request: IngestUsageCheckpointsRequest = serde_json::from_slice(&body).unwrap();
         let event_ids = request
             .checkpoints
@@ -971,7 +773,14 @@ mod usage_delivery_tests {
         } else {
             state.accepted.lock().unwrap().extend(event_ids);
         }
-        StatusCode::OK
+        accepted_response(
+            StatusCode::OK,
+            request
+                .checkpoints
+                .into_iter()
+                .map(|checkpoint| checkpoint.event_id)
+                .collect(),
+        )
     }
 
     /// Answers every request with one status and one body, for asserting what
@@ -1032,6 +841,7 @@ mod usage_delivery_tests {
             cat_id: "cat-a".to_string(),
             cat_generation: 1,
             metric: UsageMetric::CpuUsec,
+            epoch_marker: cats_api::metering::UsageEpochMarker::Open,
             cumulative_quantity: u128::from(sequence),
         }
     }
@@ -1684,7 +1494,12 @@ impl HostTelemetrySampler {
         if !due {
             return Ok(Vec::new());
         }
-        match sample.accumulator.checkpoint() {
+        let checkpoints = if force_checkpoint {
+            sample.accumulator.final_checkpoint()
+        } else {
+            sample.accumulator.checkpoint()
+        };
+        match checkpoints {
             Ok(checkpoints) => {
                 sample.last_checkpoint_at = Some(now);
                 Ok(checkpoints.into())
@@ -2092,6 +1907,7 @@ mod telemetry_tests {
                     cat_id: "cat-a".to_string(),
                     cat_generation: 1,
                     metric: UsageMetric::CpuUsec,
+                    epoch_marker: cats_api::metering::UsageEpochMarker::Open,
                     cumulative_quantity: u128::from(sequence) * 100,
                 };
                 checkpoint.event_id = deterministic_event_id(&checkpoint);

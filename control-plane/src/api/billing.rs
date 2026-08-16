@@ -1,11 +1,14 @@
 use super::*;
 
 struct BillingProjection {
+    billing_account_id: String,
+    account_id: String,
     signup_credit_nanos: i128,
     credit_nanos: i128,
     usage_nanos: u128,
     available_nanos: i128,
     latest_interval_end_unix_ms: Option<i64>,
+    rate_card_id: String,
     stripe_customer_id: Option<String>,
 }
 
@@ -44,7 +47,7 @@ async fn billing_projection(state: &AppState, workspace: &str) -> ApiResult<Bill
     let usage = state
         .usage
         .query_totals(&MeterUsageQuery {
-            billing_account_id: ledger.billing_account_id,
+            billing_account_id: ledger.billing_account_id.clone(),
             workspace_id: None,
             attributed_cat_id: None,
             interval_start_unix_ms: 0,
@@ -70,11 +73,14 @@ async fn billing_projection(state: &AppState, workspace: &str) -> ApiResult<Bill
         .checked_sub(usage_signed)
         .ok_or_else(|| ApiError::internal("available balance overflow"))?;
     Ok(BillingProjection {
+        billing_account_id: ledger.billing_account_id,
+        account_id: ledger.account_id,
         signup_credit_nanos: ledger.signup_credit_nanos,
         credit_nanos: credit.credit_nanos,
         usage_nanos,
         available_nanos,
         latest_interval_end_unix_ms: usage.latest_interval_end_unix_ms,
+        rate_card_id: rate_card.id,
         stripe_customer_id: credit.stripe_customer_id,
     })
 }
@@ -93,55 +99,77 @@ pub(super) async fn require_funded(state: &AppState, workspace: &str) -> ApiResu
     Ok(())
 }
 
-pub(crate) async fn enforce_exhausted_billing_accounts(state: &AppState) -> ApiResult<()> {
-    let active_cats = state
+pub(crate) async fn enforce_exhausted_billing_accounts(
+    state: &AppState,
+    cursor: &mut Option<cats_api::runtime_reconciliation::Id>,
+    resolution_owner: &crate::store::runtime_authority::SystemDesiredMutationResolutionOwner,
+) -> ApiResult<()> {
+    const PAGE_SIZE: usize = 128;
+    let after = cursor.clone();
+    let candidates = state
         .store
-        .execute(|store| {
-            store
-                .list_all_cats()?
-                .into_iter()
-                .filter(|cat| cat.desired_state == DesiredState::Running)
-                .map(|cat| {
-                    let account_id = store.workspace_by_id(&cat.workspace_id)?.account_id;
-                    Ok((cat, account_id))
-                })
-                .collect::<Result<Vec<_>, ApiError>>()
-        })
+        .execute(move |store| store.billing_desired_candidates_after(after.as_ref(), PAGE_SIZE))
         .await?;
-    let accounts = active_cats
-        .iter()
-        .map(|(cat, account_id)| (account_id.clone(), cat.workspace_id.clone()))
-        .collect::<BTreeMap<_, _>>();
+    if candidates.is_empty() {
+        // A process-local cursor is only a fairness hint. Leadership takeover
+        // restarts at the beginning, while exact revision CAS makes rechecks
+        // side-effect free.
+        *cursor = None;
+        return Ok(());
+    }
+    *cursor = candidates.last().map(|candidate| candidate.cat_id.clone());
+
+    let mut accounts = BTreeMap::new();
+    for candidate in &candidates {
+        let workspace_id = candidate.workspace_id.clone();
+        let ledger = state
+            .store
+            .execute(move |store| store.billing_ledger_for_workspace(workspace_id.as_str()))
+            .await?;
+        accounts
+            .entry(ledger.account_id)
+            .or_insert((candidate.workspace_id.clone(), Vec::new()))
+            .1
+            .push(candidate.clone());
+    }
     let mut changed = false;
-    for (account_id, workspace) in accounts {
-        let projection = billing_projection(state, &workspace).await?;
+    for (_account_id, (workspace, account_candidates)) in accounts {
+        let projection = billing_projection(state, workspace.as_str()).await?;
         if projection.available_nanos > 0 {
             continue;
         }
-        for (cat, _) in active_cats
-            .iter()
-            .filter(|(_, cat_account_id)| cat_account_id == &account_id)
-        {
-            let billing_account = billing_account_id_for_workspace(state, &workspace).await?;
-            let cat_id = cat.id.clone();
+        let decision = crate::store::runtime_authority::BillingExhaustionDecision {
+            billing_account_id: projection.billing_account_id.clone(),
+            account_id: projection.account_id.clone(),
+            credit_nanos: projection.credit_nanos,
+            usage_nanos: projection.usage_nanos,
+            usage_visible_through_unix_ms: projection.latest_interval_end_unix_ms,
+            rate_card_id: projection.rate_card_id.clone(),
+        };
+        for candidate in account_candidates {
+            let billing_account = projection.billing_account_id.clone();
+            let cat_id = candidate.cat_id.clone();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
             match state
                 .store
-                .execute(move |store| {
-                    store.set_desired(&cat_id, DesiredState::Cold, None, "cat.credit_exhausted")
-                })
+                .commit_billing_exhaustion(candidate, decision.clone(), deadline, resolution_owner)
                 .await
             {
-                Ok(_) => {
+                Ok(crate::store::runtime_authority::SystemDesiredMutationCommit::Changed) => {
                     changed = true;
                     tracing::warn!(
                         billing_account = %billing_account,
-                        cat_id = %cat.id,
+                        cat_id = %cat_id,
                         "prepaid balance exhausted; converging Cat to Cold"
                     );
                 }
+                Ok(
+                    crate::store::runtime_authority::SystemDesiredMutationCommit::Replayed
+                    | crate::store::runtime_authority::SystemDesiredMutationCommit::Stale,
+                ) => {}
                 Err(error) => {
                     tracing::warn!(
-                        cat_id = %cat.id,
+                        cat_id = %cat_id,
                         error = %error,
                         "could not apply exhausted-credit Cold state"
                     );

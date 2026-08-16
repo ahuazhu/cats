@@ -5,25 +5,33 @@ use super::*;
 /// every singleton.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SingletonRole {
+    RuntimeSweeper,
+    /// Retired command-dispatch controller role used only by its test harness.
+    /// It deliberately shares the production sweeper lock so both authorities
+    /// can never run against one schema if composition regresses.
     Reconciler,
     BillingEnforcer,
     UsageProjector,
+    VolumeDeleteSweeper,
 }
 
 impl SingletonRole {
     fn lock_key(self) -> i32 {
         match self {
-            Self::Reconciler => 420_201,
+            Self::RuntimeSweeper | Self::Reconciler => 420_201,
             Self::BillingEnforcer => 420_202,
             Self::UsageProjector => 420_203,
+            Self::VolumeDeleteSweeper => 420_204,
         }
     }
 
     pub(crate) fn name(self) -> &'static str {
         match self {
+            Self::RuntimeSweeper => "runtime-sweeper",
             Self::Reconciler => "reconciler",
             Self::BillingEnforcer => "billing-enforcer",
             Self::UsageProjector => "usage-projector",
+            Self::VolumeDeleteSweeper => "volume-delete-sweeper",
         }
     }
 }
@@ -72,6 +80,14 @@ impl SingletonSession {
                 .map_err(internal)
                 .map(|_| ())
         })
+    }
+
+    /// Destroy the PostgreSQL client on the dedicated leadership executor.
+    /// Unlike `Drop`, this is joinable: graceful singleton shutdown must not
+    /// return while advisory-lock release is still queued as cleanup work.
+    pub(crate) fn close_now(mut self) {
+        drop(self.client.take());
+        drop(self.connection_budget.take());
     }
 }
 

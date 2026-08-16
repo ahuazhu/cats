@@ -324,18 +324,19 @@ resource "aws_eks_pod_identity_association" "pipeline" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "write_throttled" {
-  alarm_name          = "${local.resource_name}-write-throttled"
-  alarm_description   = "Usage checkpoint publication exceeded provisioned Kinesis capacity."
-  namespace           = "AWS/Kinesis"
-  metric_name         = "WriteProvisionedThroughputExceeded"
-  statistic           = "Sum"
-  period              = 60
-  evaluation_periods  = 1
-  comparison_operator = "GreaterThanThreshold"
-  threshold           = 0
-  treat_missing_data  = "notBreaching"
-  alarm_actions       = var.alarm_action_arns
-  ok_actions          = var.alarm_action_arns
+  alarm_name                = "${local.resource_name}-write-throttled"
+  alarm_description         = "Usage checkpoint publication exceeded provisioned Kinesis capacity."
+  namespace                 = "AWS/Kinesis"
+  metric_name               = "WriteProvisionedThroughputExceeded"
+  statistic                 = "Sum"
+  period                    = 60
+  evaluation_periods        = 1
+  comparison_operator       = "GreaterThanThreshold"
+  threshold                 = 0
+  treat_missing_data        = "notBreaching"
+  alarm_actions             = var.alarm_action_arns
+  ok_actions                = var.alarm_action_arns
+  insufficient_data_actions = []
 
   dimensions = {
     StreamName = aws_kinesis_stream.usage.name
@@ -345,18 +346,19 @@ resource "aws_cloudwatch_metric_alarm" "write_throttled" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "read_throttled" {
-  alarm_name          = "${local.resource_name}-read-throttled"
-  alarm_description   = "Usage consumers exceeded provisioned Kinesis read capacity."
-  namespace           = "AWS/Kinesis"
-  metric_name         = "ReadProvisionedThroughputExceeded"
-  statistic           = "Sum"
-  period              = 60
-  evaluation_periods  = 1
-  comparison_operator = "GreaterThanThreshold"
-  threshold           = 0
-  treat_missing_data  = "notBreaching"
-  alarm_actions       = var.alarm_action_arns
-  ok_actions          = var.alarm_action_arns
+  alarm_name                = "${local.resource_name}-read-throttled"
+  alarm_description         = "Usage consumers exceeded provisioned Kinesis read capacity."
+  namespace                 = "AWS/Kinesis"
+  metric_name               = "ReadProvisionedThroughputExceeded"
+  statistic                 = "Sum"
+  period                    = 60
+  evaluation_periods        = 1
+  comparison_operator       = "GreaterThanThreshold"
+  threshold                 = 0
+  treat_missing_data        = "notBreaching"
+  alarm_actions             = var.alarm_action_arns
+  ok_actions                = var.alarm_action_arns
+  insufficient_data_actions = []
 
   dimensions = {
     StreamName = aws_kinesis_stream.usage.name
@@ -366,18 +368,19 @@ resource "aws_cloudwatch_metric_alarm" "read_throttled" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "consumer_lag" {
-  alarm_name          = "${local.resource_name}-consumer-lag"
-  alarm_description   = "Usage projector lag exceeded the provisional billing freshness target."
-  namespace           = "AWS/Kinesis"
-  metric_name         = "GetRecords.IteratorAgeMilliseconds"
-  statistic           = "Maximum"
-  period              = 60
-  evaluation_periods  = 2
-  comparison_operator = "GreaterThanThreshold"
-  threshold           = var.consumer_lag_alarm_threshold_ms
-  treat_missing_data  = "notBreaching"
-  alarm_actions       = var.alarm_action_arns
-  ok_actions          = var.alarm_action_arns
+  alarm_name                = "${local.resource_name}-consumer-lag"
+  alarm_description         = "Usage projector lag exceeded the provisional billing freshness target."
+  namespace                 = "AWS/Kinesis"
+  metric_name               = "GetRecords.IteratorAgeMilliseconds"
+  statistic                 = "Maximum"
+  period                    = 60
+  evaluation_periods        = 2
+  comparison_operator       = "GreaterThanThreshold"
+  threshold                 = var.consumer_lag_alarm_threshold_ms
+  treat_missing_data        = "notBreaching"
+  alarm_actions             = var.alarm_action_arns
+  ok_actions                = var.alarm_action_arns
+  insufficient_data_actions = []
 
   dimensions = {
     StreamName = aws_kinesis_stream.usage.name

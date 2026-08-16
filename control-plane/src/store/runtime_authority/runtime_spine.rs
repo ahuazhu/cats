@@ -24,7 +24,9 @@ use cats_api::runtime_reconciliation::{
     Sequence, SessionBinding, StableState, UnixMillis, VolumeAuthorityEvidence, WireU64,
     DESIRED_READ_SNAPSHOT_MAX_WIRE_BYTES,
 };
-use cats_storage::authority::{DeleteCompletionReceipt, VolumeAdminState, VolumeDurability};
+use cats_storage::authority::{
+    DeleteCompletionReceipt, Generation, VolumeAdminState, VolumeDurability,
+};
 use postgres::{Row, Transaction};
 
 use super::pg_codec::PgBigInt;
@@ -32,6 +34,10 @@ use super::product::{persistent_initialization_matches_mount, DiskAdminState, Di
 use super::product_rows::{
     load_assigned_desired_for_update, load_assigned_desired_unlocked, load_desired_for_update,
     load_disk_by_id_for_update, load_pending_operation_by_cat_for_update, update_operation,
+};
+use super::route_epoch_engine::{
+    busy_evidence_matches, open_busy_proof_matches, RequireIdleBusyEvidence,
+    RequireIdleGateOutcome, RequireIdleOpenBusyProof,
 };
 use super::rows::{database_now, load_delete_completion_for_update, load_volume_for_update};
 use crate::store::agent_sessions::{
@@ -122,6 +128,7 @@ pub(crate) struct PlacementAdmissionSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlacementAdmissionRejection {
     IdentityNotProvisioned,
+    HostRecoveryActive,
     SessionMissing,
     SessionExpired,
     GuestConfigMismatch,
@@ -186,10 +193,10 @@ struct ObservationReceiveState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct AdmissionInventoryState {
-    attestation: AdmissionInventoryAttestation,
-    full_observation: NodeObservation,
-    assigned_snapshot: DesiredReadSnapshot,
+pub(super) struct AdmissionInventoryState {
+    pub(super) attestation: AdmissionInventoryAttestation,
+    pub(super) full_observation: NodeObservation,
+    pub(super) assigned_snapshot: DesiredReadSnapshot,
 }
 
 /// Context validation has two deliberately separate failure channels: a
@@ -671,13 +678,13 @@ enum ObservationSourceKind {
     Partial,
 }
 
-struct CurrentCatObservation {
-    runtime: ObservedRuntimeStatus,
-    session: SessionBinding,
-    inventory_epoch: Epoch,
-    source_observation_id: RandomId128,
-    heartbeat_sequence: Sequence,
-    accepted_at_unix_ms: UnixMillis,
+pub(super) struct CurrentCatRuntime {
+    pub(super) runtime: ObservedRuntimeStatus,
+    pub(super) session: SessionBinding,
+    pub(super) inventory_epoch: Epoch,
+    pub(super) source_observation_id: RandomId128,
+    pub(super) heartbeat_sequence: Sequence,
+    pub(super) accepted_at_unix_ms: UnixMillis,
     source_kind: ObservationSourceKind,
 }
 
@@ -815,6 +822,12 @@ where
     if identity.state != NodeIdentityState::Provisioned {
         return Ok(PlacementAdmissionLoad::Rejected(
             PlacementAdmissionRejection::IdentityNotProvisioned,
+        ));
+    }
+    checkpoint(transaction)?;
+    if super::host_fence_recovery_batch::product_admission_is_blocked_in(transaction, node_id)? {
+        return Ok(PlacementAdmissionLoad::Rejected(
+            PlacementAdmissionRejection::HostRecoveryActive,
         ));
     }
     // Stored assigned-set overflow/corruption is fatal even when the session
@@ -2207,12 +2220,28 @@ fn stable_postcondition_satisfied(
     runtime: &ObservedRuntimeStatus,
     desired: &DesiredRuntimeSpec,
 ) -> AuthorityTxResult<bool> {
+    let full_residue_empty = match inventory {
+        ValidatedInventory::Full { .. } => observation.residue.is_empty(),
+        ValidatedInventory::Partial { inventory } => inventory.full_observation.residue.is_empty(),
+    };
+    if !logical_stable_postcondition_satisfied(observation, runtime, desired, full_residue_empty) {
+        return Ok(false);
+    }
+    database_postcondition_satisfied(transaction, runtime, desired)
+}
+
+fn logical_stable_postcondition_satisfied(
+    observation: &NodeObservation,
+    runtime: &ObservedRuntimeStatus,
+    desired: &DesiredRuntimeSpec,
+    full_residue_empty: bool,
+) -> bool {
     if runtime
         .applied_desired
         .as_ref()
         .is_none_or(|applied| applied.target != desired.target)
     {
-        return Ok(false);
+        return false;
     }
     let stable_target = runtime.stable_state.map(|state| match state {
         StableState::Running => RuntimeTarget::Running,
@@ -2240,19 +2269,76 @@ fn stable_postcondition_satisfied(
                 StableState::Deleted => RuntimeTarget::Deleted,
             })
     );
-    let full_residue_empty = match inventory {
-        ValidatedInventory::Full { .. } => observation.residue.is_empty(),
-        ValidatedInventory::Partial { inventory } => inventory.full_observation.residue.is_empty(),
-    };
-    let logical = ready
+    ready
         && stable_target == Some(desired.target)
         && step_matches
         && desired.placement.node_id == observation.node_id
         && full_residue_empty
-        && (desired.target == RuntimeTarget::Running || runtime.platform_guards == 0);
-    if !logical {
+        && (desired.target == RuntimeTarget::Running || runtime.platform_guards == 0)
+}
+
+/// Read-only preflight for the clean-slate PersistentDisk action. The covered
+/// commit repeats this test and the database postcondition under the exact
+/// Node/Volume/Disk/Desired locks; callers must not treat this optimization as
+/// mutation authority.
+pub(super) fn placement_admission_observes_stable_cold(
+    admission: &PlacementAdmissionSnapshot,
+    desired: &DesiredRuntimeSpec,
+) -> bool {
+    if desired.target != RuntimeTarget::Cold
+        || !admission.full_inventory_observation.complete_inventory
+        || admission
+            .assigned_desired_specs
+            .iter()
+            .filter(|assigned| assigned.cat_id == desired.cat_id)
+            .count()
+            != 1
+        || admission
+            .assigned_desired_specs
+            .iter()
+            .find(|assigned| assigned.cat_id == desired.cat_id)
+            != Some(desired)
+    {
+        return false;
+    }
+    let observation = &admission.full_inventory_observation;
+    let mut runtimes = observation
+        .runtimes
+        .iter()
+        .filter(|runtime| runtime.cat_id == desired.cat_id);
+    let Some(runtime) = runtimes.next() else {
+        return false;
+    };
+    if runtimes.next().is_some()
+        || runtime.applied_desired.as_ref() != Some(&applied_projection(desired))
+    {
+        return false;
+    }
+    logical_stable_postcondition_satisfied(
+        observation,
+        runtime,
+        desired,
+        observation.residue.is_empty(),
+    )
+}
+
+/// Final attach/detach authority check. It consumes no boolean proof: the
+/// accepted full observation, current Desired and locked product/Volume rows
+/// are compared field-for-field by the same settlement oracle as Operations.
+pub(super) fn placement_admission_has_stable_cold_in(
+    transaction: &mut Transaction<'_>,
+    admission: &PlacementAdmissionSnapshot,
+    desired: &DesiredRuntimeSpec,
+) -> AuthorityTxResult<bool> {
+    if !placement_admission_observes_stable_cold(admission, desired) {
         return Ok(false);
     }
+    let runtime = admission
+        .full_inventory_observation
+        .runtimes
+        .iter()
+        .find(|runtime| runtime.cat_id == desired.cat_id)
+        .ok_or_else(|| corrupt("stable-Cold admission lost its exact runtime"))?;
     database_postcondition_satisfied(transaction, runtime, desired)
 }
 
@@ -2270,6 +2356,13 @@ fn database_postcondition_satisfied(
         LifecycleAdmission::Closed
     };
     if runtime.lifecycle_admission != expected_admission {
+        return Ok(false);
+    }
+    // Suspended/Resume is intentionally unavailable in the first release:
+    // the frozen checkpoint protocol has PauseRuntime but no ResumeRuntime
+    // token. Never let a pre-existing or synthetic Ready observation complete a
+    // newly delivered Suspended Operation while the product ingress is off.
+    if desired.target == RuntimeTarget::Suspended {
         return Ok(false);
     }
     // Warm success requires a locked Control snapshot record. That authority
@@ -2536,14 +2629,15 @@ fn active_volume_evidence_matches(
     volume: &cats_storage::authority::VolumeRecord,
     desired: &DesiredRuntimeSpec,
 ) -> bool {
+    // Running retains the exact active writer and may have an unpublished
+    // Relaxed local tail (L > R), unlike the released Cold/Deleted evidence
+    // checked separately below. Suspended is rejected before this helper.
     let durable_generation_matches =
         |lineage: &cats_api::runtime_reconciliation::LocalVolumeLineage| {
-            if desired.target == RuntimeTarget::Suspended {
-                lineage.local_durable_generation == lineage.remote_durable_generation
-                    && lineage.pending_pack_count.get() == 0
-            } else {
-                lineage.local_durable_generation >= lineage.remote_durable_generation
-            }
+            active_lineage_generations_match(
+                lineage.local_durable_generation,
+                lineage.remote_durable_generation,
+            )
         };
     let lineage_matches = observed.local_lineages.len() == 1
         && observed.local_lineages.first().is_some_and(|lineage| {
@@ -2603,14 +2697,25 @@ fn active_volume_evidence_matches(
         && runtime.processes.len() == desired.volumes.len() + 1
 }
 
+fn active_lineage_generations_match(local: Generation, remote: Generation) -> bool {
+    local >= remote
+}
+
+#[cfg(test)]
+pub(super) fn active_lineage_generations_match_for_test(
+    local: Generation,
+    remote: Generation,
+) -> bool {
+    active_lineage_generations_match(local, remote)
+}
+
 fn cold_volume_evidence_matches(
     observed: &cats_api::runtime_reconciliation::ObservedVolume,
     intent: &cats_api::runtime_reconciliation::VolumeIntent,
     volume: &cats_storage::authority::VolumeRecord,
     desired: &DesiredRuntimeSpec,
 ) -> bool {
-    observed.devices.is_empty()
-        && observed.local_lineages.len() == 1
+    let released_lineage = observed.local_lineages.len() == 1
         && observed.local_lineages.first().is_some_and(|lineage| {
             lineage.attachment_id == intent.attachment_id
                 && lineage.attachment_epoch == volume.lease_epoch
@@ -2622,7 +2727,34 @@ fn cold_volume_evidence_matches(
                 && lineage.pending_pack_count.get() == 0
                 && lineage.fenced
                 && lineage.state == LocalLineageState::Released
-        })
+        });
+    // A Cold->Cold attach has deliberately performed no acquire and created
+    // no local frontend or data directory. Its current normal-acquire
+    // predecessor epoch is therefore still the exact Unowned epoch. Accept
+    // that physical absence only for PersistentDisk; after any real acquire
+    // and release the Volume epoch advances, so this branch closes and the
+    // ordinary fenced Released lineage is required.
+    let never_acquired_persistent_absence = intent.disk_kind
+        == cats_api::runtime_reconciliation::DiskKind::Persistent
+        && observed.local_lineages.is_empty()
+        && matches!(
+            intent.acquire,
+            cats_api::runtime_reconciliation::VolumeAcquire::Normal {
+                expected_unowned_epoch,
+                ..
+            } if expected_unowned_epoch == volume.lease_epoch
+        );
+    observed.devices.is_empty() && (released_lineage || never_acquired_persistent_absence)
+}
+
+#[cfg(test)]
+pub(super) fn cold_volume_evidence_matches_for_test(
+    observed: &cats_api::runtime_reconciliation::ObservedVolume,
+    intent: &cats_api::runtime_reconciliation::VolumeIntent,
+    volume: &cats_storage::authority::VolumeRecord,
+    desired: &DesiredRuntimeSpec,
+) -> bool {
+    cold_volume_evidence_matches(observed, intent, volume, desired)
 }
 
 fn acquire_origin_matches(
@@ -2941,7 +3073,7 @@ fn upsert_observation_receive_state(
     Ok(())
 }
 
-fn load_admission_inventory_state_for_update(
+pub(super) fn load_admission_inventory_state_for_update(
     transaction: &mut Transaction<'_>,
     node_id: &Id,
 ) -> AuthorityTxResult<Option<AdmissionInventoryState>> {
@@ -2961,7 +3093,7 @@ fn load_admission_inventory_state_for_update(
         .transpose()
 }
 
-fn load_admission_inventory_state_unlocked(
+pub(super) fn load_admission_inventory_state_unlocked(
     transaction: &mut Transaction<'_>,
     node_id: &Id,
 ) -> AuthorityTxResult<Option<AdmissionInventoryState>> {
@@ -3164,7 +3296,7 @@ fn load_current_cat_observation(
     transaction: &mut Transaction<'_>,
     node_id: &Id,
     cat_id: &Id,
-) -> AuthorityTxResult<Option<CurrentCatObservation>> {
+) -> AuthorityTxResult<Option<CurrentCatRuntime>> {
     let Some(row) = transaction.query_opt(
         "SELECT runtime_record::text AS runtime_json, node_id, cat_id,
                 node_boot_id, agent_instance_id, agent_session_epoch,
@@ -3177,6 +3309,10 @@ fn load_current_cat_observation(
     else {
         return Ok(None);
     };
+    decode_current_cat_runtime(&row).map(Some)
+}
+
+fn decode_current_cat_runtime(row: &Row) -> AuthorityTxResult<CurrentCatRuntime> {
     let runtime_json: String = row.try_get("runtime_json")?;
     let runtime: ObservedRuntimeStatus = serde_json::from_str(&runtime_json).map_err(corrupt)?;
     let projected_node_id =
@@ -3207,7 +3343,7 @@ fn load_current_cat_observation(
     if runtime.cat_id != projected_cat_id {
         return Err(corrupt("per-Cat runtime JSON/projection mismatch"));
     }
-    Ok(Some(CurrentCatObservation {
+    Ok(CurrentCatRuntime {
         runtime,
         session,
         inventory_epoch,
@@ -3215,7 +3351,155 @@ fn load_current_cat_observation(
         heartbeat_sequence,
         accepted_at_unix_ms,
         source_kind,
-    }))
+    })
+}
+
+/// Repeatable-read planner projection for G4.  This is not commit authority:
+/// an old-epoch Busy exception is revalidated under the A1 mutation lock
+/// prefix before the successor Desired can commit.
+#[allow(
+    dead_code,
+    reason = "G4 Store planners are composed by the parallel A2/A3 slices"
+)]
+pub(super) fn load_current_cat_runtime_unlocked(
+    transaction: &mut Transaction<'_>,
+    node_id: &Id,
+    cat_id: &Id,
+) -> AuthorityTxResult<Option<CurrentCatRuntime>> {
+    load_current_cat_observation(transaction, node_id, cat_id)
+}
+
+/// Commit-side G4 proof consumption.  The caller already holds the affected
+/// NodeIdentity union; locking the current session and per-Cat observation
+/// here serializes session replacement and a later accepted observation
+/// before A1 acquires Cat/Desired/product locks.
+pub(super) fn validate_require_idle_open_busy_proof_in(
+    transaction: &mut Transaction<'_>,
+    expected_current: &DesiredRuntimeSpec,
+    proof: &RequireIdleOpenBusyProof,
+) -> AuthorityTxResult<bool> {
+    if proof.node_id != expected_current.placement.node_id {
+        return Ok(false);
+    }
+    let Some(session) = load_current_session_for_update(transaction, &proof.node_id)? else {
+        return Ok(false);
+    };
+    if session.agent_session_epoch != proof.agent_session_epoch {
+        return Ok(false);
+    }
+    let Some(observed) =
+        load_current_cat_runtime_for_update(transaction, &proof.node_id, &expected_current.cat_id)?
+    else {
+        return Ok(false);
+    };
+    if observed.session != session_binding(&session) {
+        return Ok(false);
+    }
+    Ok(open_busy_proof_matches(expected_current, &observed, proof))
+}
+
+/// Revalidates the Running source of a new one-shot RequireIdle attempt under
+/// the current AgentSession and per-Cat observation locks.  The attempt ID is
+/// a stable system-domain identity; the runtime incarnation is the physical
+/// compare condition that prevents a stale planner from targeting a replaced
+/// runtime.
+pub(super) fn validate_require_idle_attempt_source_in(
+    transaction: &mut Transaction<'_>,
+    expected_current: &DesiredRuntimeSpec,
+    source_runtime_incarnation: &RandomId128,
+) -> AuthorityTxResult<bool> {
+    if expected_current.target != RuntimeTarget::Running {
+        return Ok(false);
+    }
+    let node_id = &expected_current.placement.node_id;
+    let Some(session) = load_current_session_for_update(transaction, node_id)? else {
+        return Ok(false);
+    };
+    let Some(observed) =
+        load_current_cat_runtime_for_update(transaction, node_id, &expected_current.cat_id)?
+    else {
+        return Ok(false);
+    };
+    if observed.session != session_binding(&session) {
+        return Ok(false);
+    }
+    let expected_applied = AppliedDesiredEvidence {
+        desired_revision: expected_current.desired_revision,
+        spec_digest: expected_current.spec_digest.clone(),
+        placement: expected_current.placement.clone(),
+        target: expected_current.target,
+    };
+    Ok(
+        observed.runtime.applied_desired.as_ref() == Some(&expected_applied)
+            && observed.runtime.stable_state == Some(StableState::Running)
+            && observed.runtime.runtime_incarnation.as_ref() == Some(source_runtime_incarnation)
+            && observed.runtime.lifecycle_admission == LifecycleAdmission::Open,
+    )
+}
+
+/// Commit-side validator for the system-domain Busy source.  Unlike the
+/// narrow old-epoch exception above, this accepts both Busy outcomes and
+/// returns the gate classification derived from the exact stored fact.
+#[allow(
+    dead_code,
+    reason = "the A3 common system-domain commit consumes this G4 validator after branch composition"
+)]
+pub(super) fn validate_require_idle_busy_evidence_in(
+    transaction: &mut Transaction<'_>,
+    expected_current: &DesiredRuntimeSpec,
+    evidence: &RequireIdleBusyEvidence,
+) -> AuthorityTxResult<Option<RequireIdleGateOutcome>> {
+    if evidence.node_id != expected_current.placement.node_id {
+        return Ok(None);
+    }
+    let Some(session) = load_current_session_for_update(transaction, &evidence.node_id)? else {
+        return Ok(None);
+    };
+    if session.agent_session_epoch != evidence.agent_session_epoch {
+        return Ok(None);
+    }
+    let Some(observed) = load_current_cat_runtime_for_update(
+        transaction,
+        &evidence.node_id,
+        &expected_current.cat_id,
+    )?
+    else {
+        return Ok(None);
+    };
+    if observed.session != session_binding(&session) {
+        return Ok(None);
+    }
+    Ok(busy_evidence_matches(expected_current, &observed, evidence))
+}
+
+fn load_current_cat_runtime_for_update(
+    transaction: &mut Transaction<'_>,
+    node_id: &Id,
+    cat_id: &Id,
+) -> AuthorityTxResult<Option<CurrentCatRuntime>> {
+    let Some(row) = transaction.query_opt(
+        "SELECT runtime_record::text AS runtime_json, node_id, cat_id,
+                node_boot_id, agent_instance_id, agent_session_epoch,
+                inventory_epoch, source_observation_id, heartbeat_sequence,
+                accepted_at_unix_ms, source_kind
+           FROM runtime_current_cat_observations
+          WHERE node_id=$1 AND cat_id=$2 FOR UPDATE",
+        &[&node_id.as_str(), &cat_id.as_str()],
+    )?
+    else {
+        return Ok(None);
+    };
+    decode_current_cat_runtime(&row).map(Some)
+}
+
+pub(super) fn load_product_cat_observation(
+    transaction: &mut Transaction<'_>,
+    node_id: &Id,
+    cat_id: &Id,
+) -> AuthorityTxResult<Option<(ObservedRuntimeStatus, UnixMillis)>> {
+    load_current_cat_observation(transaction, node_id, cat_id).map(|observation| {
+        observation.map(|observation| (observation.runtime, observation.accepted_at_unix_ms))
+    })
 }
 
 fn upsert_cat_observation(

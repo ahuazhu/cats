@@ -7,9 +7,90 @@ variable "environment" {
   type = string
 }
 
+variable "expected_account_id" {
+  description = "Exact AWS account containing the worker and its Route v2 artifact secret."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[0-9]{12}$", var.expected_account_id))
+    error_message = "expected_account_id must be an explicit 12-digit AWS account ID."
+  }
+}
+
+variable "expected_aws_partition" {
+  description = "Exact AWS partition containing the worker and its Route v2 artifact secret."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition = contains([
+      "aws",
+      "aws-cn",
+      "aws-iso",
+      "aws-iso-b",
+      "aws-iso-e",
+      "aws-iso-f",
+      "aws-us-gov",
+    ], var.expected_aws_partition)
+    error_message = "expected_aws_partition must name one supported AWS partition."
+  }
+}
+
+variable "aws_region" {
+  description = "Exact AWS region containing the worker and its Route v2 artifact secret."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+$", var.aws_region))
+    error_message = "aws_region must be an explicit AWS region name."
+  }
+}
+
 variable "artifact_bucket_name" {
   description = "Globally unique bucket for immutable worker deployment bundles and SSM output."
   type        = string
+}
+
+variable "chunkstore_prefix" {
+  description = "Exact canonical object-key prefix shared with cats-controld and usage IAM."
+  type        = string
+
+  validation {
+    condition = (
+      var.chunkstore_prefix != "" &&
+      !startswith(var.chunkstore_prefix, "/") &&
+      !endswith(var.chunkstore_prefix, "/") &&
+      !strcontains(var.chunkstore_prefix, "..") &&
+      !strcontains(var.chunkstore_prefix, "//") &&
+      can(regex("^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$", var.chunkstore_prefix))
+    )
+    error_message = "chunkstore_prefix must be one non-empty relative canonical prefix."
+  }
+}
+
+variable "control_postgres_schema" {
+  description = "Exact fresh cats_* PostgreSQL schema shared by controld, noded and every blockd."
+  type        = string
+
+  validation {
+    condition     = can(regex("^cats_[a-z0-9_]+$", var.control_postgres_schema)) && length(var.control_postgres_schema) <= 63
+    error_message = "control_postgres_schema must be one lowercase cats_* PostgreSQL identifier no longer than 63 bytes."
+  }
+}
+
+variable "route_v2_rotation_origin" {
+  description = "Exact independent server-authenticated HTTPS origin for Route v2 ring delivery while Control readiness is closed."
+  type        = string
+
+  validation {
+    condition = (
+      can(regex("^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?:[1-9][0-9]{0,4}$", var.route_v2_rotation_origin)) &&
+      !strcontains(var.route_v2_rotation_origin, "..")
+    )
+    error_message = "route_v2_rotation_origin must be one canonical HTTPS DNS origin with an explicit port."
+  }
 }
 
 variable "worker_bundle_path" {
@@ -112,18 +193,30 @@ variable "worker_runtime_secret_data" {
   }
 }
 
-variable "route_grant_public_key_pem" {
-  description = "Ed25519 public key installed on every worker for Endpoint Route Grant verification."
+variable "route_v2_node_artifact_secret_arn" {
+  description = "ARN of the pre-created Secrets Manager value containing the exact five base64-encoded Node Route v2 artifacts. Terraform receives only the ARN."
   type        = string
 
   validation {
     condition = (
-      var.route_grant_public_key_pem == "" || (
-        startswith(trimspace(var.route_grant_public_key_pem), "-----BEGIN PUBLIC KEY-----") &&
-        endswith(trimspace(var.route_grant_public_key_pem), "-----END PUBLIC KEY-----")
-      )
+      startswith(
+        var.route_v2_node_artifact_secret_arn,
+        "arn:${var.expected_aws_partition}:secretsmanager:${var.aws_region}:${var.expected_account_id}:secret:${var.name_prefix}-${var.environment}-route-v2-node-r1-",
+      ) &&
+      length(var.route_v2_node_artifact_secret_arn) == length("arn:${var.expected_aws_partition}:secretsmanager:${var.aws_region}:${var.expected_account_id}:secret:${var.name_prefix}-${var.environment}-route-v2-node-r1-") + 6 &&
+      can(regex("[A-Za-z0-9]{6}$", var.route_v2_node_artifact_secret_arn))
     )
-    error_message = "route_grant_public_key_pem must be a PEM public key."
+    error_message = "route_v2_node_artifact_secret_arn must identify the exact <name-prefix>-<environment>-route-v2-node-r1 secret in the expected partition, account, and region; rotation is outside the initial G2 contract."
+  }
+}
+
+variable "route_v2_node_artifact_secret_version_id" {
+  description = "Exact immutable Secrets Manager version ID selected for the revision-1 Node Route v2 artifact secret."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9-]{32,64}$", var.route_v2_node_artifact_secret_version_id))
+    error_message = "route_v2_node_artifact_secret_version_id must be a 32-64 character Secrets Manager version ID."
   }
 }
 
@@ -153,7 +246,8 @@ variable "worker_managed_environment" {
     deployment, unlike worker_base_environment which only seeds a host that has
     no file yet. Use it for values that must reach an existing host --
     CATS_POSTGRES_HOST, CATS_POSTGRES_PORT, CATS_POSTGRES_DATABASE,
-    CATS_POSTGRES_SSLMODE, CATS_POSTGRES_SESSION_SETUP.
+    CATS_POSTGRES_SSLMODE, CATS_POSTGRES_SESSION_SETUP. CATS_POSTGRES_SCHEMA
+    comes only from control_postgres_schema.
     CATS_POSTGRES_SECRET_ARN is added automatically from
     database_master_user_secret_arn.
   EOT
@@ -172,14 +266,17 @@ variable "worker_managed_environment" {
       toset(keys(var.worker_managed_environment)),
       toset([
         "CATS_AUTH_TOKEN",
+        "CATS_CHUNKSTORE_PREFIX",
         "CATS_POSTGRES_URL",
         "CATS_POSTGRES_SECRET_ARN",
+        "CATS_POSTGRES_SCHEMA",
         "CATS_METERING_CGROUP_ROOT",
         "CATS_NODE_ID",
         "CATS_NODE_ADVERTISE_URL",
+        "CATS_ROUTE_V2_MACHINE_LISTEN",
       ]),
     )) == 0
-    error_message = "CATS_AUTH_TOKEN is forbidden on signed workers; CATS_POSTGRES_SECRET_ARN goes through database_master_user_secret_arn so the matching IAM statement is emitted with it; CATS_METERING_CGROUP_ROOT is discovered on the host; node identity is per worker and this map is rewritten fleet-wide on every deployment."
+    error_message = "CATS_AUTH_TOKEN is forbidden on signed workers; CATS_CHUNKSTORE_PREFIX and CATS_POSTGRES_SCHEMA come only from their reviewed exact inputs; CATS_POSTGRES_SECRET_ARN goes through database_master_user_secret_arn so the matching IAM statement is emitted with it; CATS_METERING_CGROUP_ROOT is discovered on the host; node identity is per worker; the Route v2 listener is fixed by the production unit."
   }
 
   validation {
@@ -238,9 +335,9 @@ variable "worker_base_environment" {
   validation {
     condition = length(setintersection(
       toset(keys(var.worker_base_environment)),
-      toset(["CATS_AUTH_TOKEN", "CATS_POSTGRES_URL"]),
+      toset(["CATS_AUTH_TOKEN", "CATS_CHUNKSTORE_PREFIX", "CATS_POSTGRES_SCHEMA", "CATS_POSTGRES_URL"]),
     )) == 0
-    error_message = "CATS_AUTH_TOKEN is forbidden on signed workers; the retired CATS_POSTGRES_URL compatibility value may only use worker_runtime_secret_data."
+    error_message = "CATS_AUTH_TOKEN is forbidden on signed workers; CATS_CHUNKSTORE_PREFIX and CATS_POSTGRES_SCHEMA come only from their reviewed exact inputs; the retired CATS_POSTGRES_URL compatibility value may only use worker_runtime_secret_data."
   }
 
   # Everything in this map reaches every fresh host identically, and a second
@@ -248,8 +345,8 @@ variable "worker_base_environment" {
   validation {
     condition = length(setintersection(
       toset(keys(var.worker_base_environment)),
-      toset(["CATS_NODE_ID", "CATS_NODE_ADVERTISE_URL"]),
+      toset(["CATS_NODE_ID", "CATS_NODE_ADVERTISE_URL", "CATS_ROUTE_V2_MACHINE_LISTEN"]),
     )) == 0
-    error_message = "Node identity is provisioner-owned artifact data; environment and IMDS values are forbidden."
+    error_message = "Node identity is provisioner-owned artifact data and the Route v2 listener is fixed by the production unit; environment and IMDS overrides are forbidden."
   }
 }

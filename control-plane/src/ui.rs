@@ -16,6 +16,8 @@ const COMMON_JS: &str = include_str!("../ui/common.js");
 const USER_JS: &str = include_str!("../ui/user.js");
 const ADMIN_JS: &str = include_str!("../ui/admin.js");
 const CAT_CREATE_V2_JS: &str = include_str!("../ui/cat-create-v2.mjs");
+const PERSISTENT_DISK_CREATE_V1_JS: &str = include_str!("../ui/persistent-disk-create-v1.mjs");
+const RUNTIME_PRODUCT_LOAD_JS: &str = include_str!("../ui/runtime-product-load.mjs");
 
 const PUBLIC_CSS: &str = include_str!("../ui/public/public.css");
 const LANDING_EN: &str = include_str!("../ui/public/landing-en.html");
@@ -28,7 +30,7 @@ const WEB_MANIFEST: &str = include_str!("../ui/public/site.webmanifest");
 
 const PUBLIC_ORIGIN: &str = "https://cats.run";
 const OPS_ORIGIN: &str = "https://ops.cats.run";
-const LAST_MODIFIED: &str = "2026-07-25";
+const LAST_MODIFIED: &str = "2026-08-13";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Locale {
@@ -129,8 +131,8 @@ const DOCS: [DocPage; 10] = [
         slug: "getting-started",
         title_en: "Getting started",
         title_zh: "快速入门",
-        description_en: "Build and configure the Cats CLI, create a durable Linux microVM, run commands, manage sleep, and clean up safely.",
-        description_zh: "构建并配置 Cats CLI，创建持久 Linux microVM，执行命令、管理休眠并安全清理资源。",
+        description_en: "Create and inspect a durable Cat with the current console or CLI and recover an ambiguous create response.",
+        description_zh: "用当前控制台或 CLI 创建并查看持久 Cat，并恢复不明确的 Create 响应。",
         body_en: include_str!("../ui/public/docs/en/getting-started.html"),
         body_zh: include_str!("../ui/public/docs/zh-CN/getting-started.html"),
     },
@@ -138,8 +140,8 @@ const DOCS: [DocPage; 10] = [
         slug: "cats-lifecycle",
         title_en: "Cats and lifecycle",
         title_zh: "Cat 与生命周期",
-        description_en: "Learn the exact Running, Suspended, Warm, and Cold semantics, durability gates, auto-suspend, fallback, and deletion behavior.",
-        description_zh: "了解 Running、Suspended、Warm、Cold 的准确语义、持久性门禁、自动休眠、回退与删除行为。",
+        description_en: "Learn the exact Running, Suspended, Warm, and Cold semantics and the current lifecycle mutation boundary.",
+        description_zh: "了解 Running、Suspended、Warm、Cold 的准确语义与当前 Lifecycle Mutation 边界。",
         body_en: include_str!("../ui/public/docs/en/cats-lifecycle.html"),
         body_zh: include_str!("../ui/public/docs/zh-CN/cats-lifecycle.html"),
     },
@@ -147,8 +149,8 @@ const DOCS: [DocPage; 10] = [
         slug: "storage-disks",
         title_en: "Storage and disks",
         title_zh: "存储与磁盘",
-        description_en: "Use Cats RootDisk and RWO PersistentDisk resources, snapshots, resize, mount, fencing, FLUSH, and safe deletion.",
-        description_zh: "使用 Cats RootDisk、RWO PersistentDisk、快照、扩容、挂载、Fencing、FLUSH 与安全删除。",
+        description_en: "Create immutable-capacity RootDisk and RWO PersistentDisk resources and understand fencing and FLUSH durability.",
+        description_zh: "创建容量不可变的 RootDisk 与 RWO PersistentDisk，并理解 Fencing 和 FLUSH Durability。",
         body_en: include_str!("../ui/public/docs/en/storage-disks.html"),
         body_zh: include_str!("../ui/public/docs/zh-CN/storage-disks.html"),
     },
@@ -156,8 +158,8 @@ const DOCS: [DocPage; 10] = [
         slug: "endpoints",
         title_en: "Endpoints and networking",
         title_zh: "Endpoint 与网络",
-        description_en: "Expose Guest ports through stable Cats Endpoints, choose wake behavior, understand routing safety, and check current networking availability.",
-        description_zh: "通过稳定 Cats Endpoint 暴露 Guest 端口，选择唤醒行为，理解路由安全与当前网络能力边界。",
+        description_en: "Understand the target Endpoint admission model and the current release boundary.",
+        description_zh: "理解目标 Endpoint Admission Model 与当前 Release 边界。",
         body_en: include_str!("../ui/public/docs/en/endpoints.html"),
         body_zh: include_str!("../ui/public/docs/zh-CN/endpoints.html"),
     },
@@ -165,8 +167,8 @@ const DOCS: [DocPage; 10] = [
         slug: "cli-reference",
         title_en: "CLI reference",
         title_zh: "CLI 参考",
-        description_en: "Reference for Cats CLI WorkOS login, Workspace selection, global options, Cat, disk, endpoint, Operation, and auto-suspend commands.",
-        description_zh: "Cats CLI WorkOS 登录、Workspace 选择、全局选项以及 Cat、磁盘、Endpoint、Operation 与自动休眠命令参考。",
+        description_en: "Reference for the WorkOS, Workspace, Cat, PersistentDisk, and exact Operation commands shipped by this release.",
+        description_zh: "本 Release 发布的 WorkOS、Workspace、Cat、PersistentDisk 与精确 Operation 命令参考。",
         body_en: include_str!("../ui/public/docs/en/cli-reference.html"),
         body_zh: include_str!("../ui/public/docs/zh-CN/cli-reference.html"),
     },
@@ -201,8 +203,8 @@ const DOCS: [DocPage; 10] = [
         slug: "operations-troubleshooting",
         title_en: "Operations and troubleshooting",
         title_zh: "Operation 与故障排查",
-        description_en: "Track asynchronous Cats Operations, understand structured errors, diagnose lifecycle, disk, endpoint, and auto-suspend failures, and collect safe evidence.",
-        description_zh: "跟踪异步 Cats Operation，理解结构化错误，排查生命周期、磁盘、Endpoint 与自动休眠故障，并收集安全证据。",
+        description_en: "Track exact accepted Operations, understand structured errors, respect the cutover boundary, and collect safe evidence.",
+        description_zh: "跟踪精确的已接受 Operation，理解结构化错误，遵守 Cutover 边界并收集安全证据。",
         body_en: include_str!("../ui/public/docs/en/operations-troubleshooting.html"),
         body_zh: include_str!("../ui/public/docs/zh-CN/operations-troubleshooting.html"),
     },
@@ -905,6 +907,17 @@ pub async fn cat_create_v2_script() -> Response {
     console_asset("text/javascript; charset=utf-8", CAT_CREATE_V2_JS)
 }
 
+pub async fn persistent_disk_create_v1_script() -> Response {
+    console_asset(
+        "text/javascript; charset=utf-8",
+        PERSISTENT_DISK_CREATE_V1_JS,
+    )
+}
+
+pub async fn runtime_product_load_script() -> Response {
+    console_asset("text/javascript; charset=utf-8", RUNTIME_PRODUCT_LOAD_JS)
+}
+
 pub async fn public_styles() -> Response {
     public_asset("text/css; charset=utf-8", PUBLIC_CSS)
 }
@@ -983,7 +996,7 @@ mod tests {
 
     use super::{
         not_found, ADMIN_GUIDE, ADMIN_HTML, ADMIN_JS, CAT_CREATE_V2_JS, COMMON_JS, DOCS, I18N_JS,
-        LANDING_EN, LANDING_ZH, USER_HTML, USER_JS,
+        LANDING_EN, LANDING_ZH, RUNTIME_PRODUCT_LOAD_JS, USER_HTML, USER_JS,
     };
 
     #[tokio::test]
@@ -1100,39 +1113,41 @@ mod tests {
             .nth(1)
             .and_then(|source| source.split("function render()").next())
             .expect("loadAll is present");
-        for contract in [
-            "state.cats = []",
-            "state.disks = []",
-            "state.operations = []",
-        ] {
+        for contract in ["result.cats", "result.disks", "state.operations = []"] {
             assert!(
                 load_all.contains(contract),
                 "missing local reset {contract:?}"
             );
         }
-        assert!(
-            !load_all.contains("authenticatedRequest("),
-            "background refresh must not probe a closed authority projection"
-        );
         for contract in [
             "window.setInterval(",
             "!document.hidden",
             "loadAll({ quiet: true })",
-            "state.loading",
+            "state.activeWorkspaceId",
+            "new AbortController()",
+            "runtimeProductLoadGeneration",
+            "requestPage: authenticatedRequest",
+            "cancelRuntimeProductLoad()",
         ] {
             assert!(
                 USER_JS.contains(contract),
                 "missing polling contract: {contract}"
             );
         }
+        assert!(!USER_JS.contains("apiFetch("));
+        assert!(!USER_JS.contains("state.workspaceId"));
+        assert!(RUNTIME_PRODUCT_LOAD_JS.contains("export async function loadAll"));
     }
 
     #[test]
-    fn shipped_consoles_expose_only_v2_create_across_the_closed_authority_boundary() {
+    fn shipped_console_exposes_only_exact_creates_and_reads_across_the_closed_authority_boundary() {
         for contract in [
             "buildCatCreateV2Request",
             "sendDurableCatCreateV2",
             "resumePendingCatCreates",
+            "buildPersistentDiskCreateV1Request",
+            "sendDurablePersistentDiskCreateV1",
+            "resumePendingPersistentDiskCreates",
             "bootImageDigest: values.get(\"boot_image_digest\")",
             "durability: values.get(\"durability\")",
         ] {
@@ -1163,8 +1178,8 @@ mod tests {
             "name=\"memory_mib\"",
             "name=\"root_gib\"",
             "name=\"durability\"",
-            "data-view=\"cats\" hidden",
-            "data-view=\"disks\" hidden",
+            "data-view=\"cats\">",
+            "data-view=\"disks\">",
             "data-view=\"operations\" hidden",
         ] {
             assert!(
@@ -1184,9 +1199,15 @@ mod tests {
         assert!(create_handler.contains("sendPendingCatCreate("));
         assert!(USER_JS.contains("request.expectedPending"));
         assert!(
-            USER_JS.matches("resumePendingCatCreates()").count() >= 4,
+            USER_JS.matches("resumePendingProductCreates()").count() >= 4,
             "pending create recovery must be wired into initialization, Workspace switching, and refresh"
         );
+        for retired_control in ["data-cat-action", "data-disk-action", "#exec-form"] {
+            assert!(
+                !USER_JS.contains(retired_control),
+                "release console retained retired control {retired_control:?}"
+            );
+        }
         for retired_create_field in [
             "values.get(\"image\")",
             "auto_suspend: true",
@@ -1314,19 +1335,6 @@ mod tests {
             "status.deleting",
             "kind.root",
             "kind.persistent",
-            "user.action.exec",
-            "user.action.suspend",
-            "user.action.warm",
-            "user.action.stop",
-            "user.action.resume",
-            "user.action.start",
-            "user.action.expose",
-            "user.action.destroy",
-            "user.action.snapshot",
-            "user.action.unmount",
-            "user.action.mount",
-            "user.action.resize",
-            "user.action.delete",
             "admin.action.cordon",
             "admin.action.drain",
             "admin.action.fence",
@@ -1386,9 +1394,10 @@ mod tests {
         }
         for current_contract in [
             "cats login",
-            "--no-auto-suspend",
             "CATS_WORKSPACE",
-            "/v1/me",
+            "boot_image_digest",
+            "size_bytes",
+            "Idempotency-Key",
         ] {
             assert!(
                 all_user_content.contains(current_contract),

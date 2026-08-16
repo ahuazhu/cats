@@ -30,6 +30,42 @@ pub enum BlobError {
 
 pub type Result<T> = std::result::Result<T, BlobError>;
 
+/// One bounded page from the beginning of an exact object prefix.
+///
+/// Delete reconciliation deliberately does not expose provider continuation
+/// tokens.  It deletes this page and then lists from the beginning again, so
+/// an interrupted pass never persists provider-specific cursor state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobListPage {
+    pub keys: Vec<String>,
+    pub is_truncated: bool,
+}
+
+/// One bounded LIST result whose adapter contract guarantees a fresh,
+/// linearizable view after DELETE.
+///
+/// This capability is deliberately distinct from [`BlobListPage`]. An
+/// eventually-consistent or otherwise unqualified adapter may support normal
+/// listing, but it cannot authorize a destructive reconciliation receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualifiedDeleteListPage {
+    page: BlobListPage,
+}
+
+impl QualifiedDeleteListPage {
+    /// Stamp a page only when the adapter's provider contract guarantees
+    /// strong read-after-delete and LIST consistency for the exact prefix.
+    pub fn from_strongly_consistent_adapter(page: BlobListPage) -> Self {
+        Self { page }
+    }
+
+    pub fn into_page(self) -> BlobListPage {
+        self.page
+    }
+}
+
+pub const BLOB_LIST_PAGE_MAX_KEYS: usize = 1_000;
+
 /// Validate the portable key subset shared by every blob-store adapter.
 pub fn validate_key(key: &str) -> Result<()> {
     if key.is_empty()
@@ -91,8 +127,85 @@ pub trait BlobStore: Send + Sync {
     }
     fn exists(&self, key: &str) -> Result<bool>;
     fn delete(&self, key: &str) -> Result<()>;
+    /// Idempotent delete bounded by one caller-owned absolute deadline.
+    /// Production adapters override this so transport, credential refresh,
+    /// retries and response reads all share that deadline.
+    fn delete_until(&self, key: &str, deadline: Instant) -> Result<()> {
+        if Instant::now() >= deadline {
+            return Err(deadline_error(key, "delete"));
+        }
+        self.delete(key)?;
+        if Instant::now() > deadline {
+            return Err(deadline_error(key, "delete"));
+        }
+        Ok(())
+    }
     /// Return sorted keys below `prefix`.
     fn list(&self, prefix: &str) -> Result<Vec<String>>;
+
+    /// Return at most `maximum` sorted keys from the beginning of `prefix`.
+    ///
+    /// Adapters must override this method so the provider response and local
+    /// allocation are genuinely bounded. The default fails closed instead of
+    /// implementing a misleading `list`-then-truncate allocation.
+    fn list_bounded(&self, prefix: &str, maximum: usize) -> Result<BlobListPage> {
+        validate_list_maximum(prefix, maximum)?;
+        Err(BlobError::Backend {
+            key: prefix.to_string(),
+            message: "blob adapter does not implement a resource-bounded LIST".into(),
+        })
+    }
+
+    /// Destructive, strongly-consistent bounded LIST under one absolute
+    /// deadline. The default is intentionally unqualified: normal LIST
+    /// support is not evidence that an empty result may settle deletion.
+    fn list_for_delete_bounded_until(
+        &self,
+        prefix: &str,
+        _maximum: usize,
+        _deadline: Instant,
+    ) -> Result<QualifiedDeleteListPage> {
+        Err(BlobError::Backend {
+            key: prefix.to_string(),
+            message: "blob adapter is not qualified for destructive LIST consistency".into(),
+        })
+    }
+}
+
+fn deadline_error(key: &str, operation: &str) -> BlobError {
+    BlobError::Backend {
+        key: key.to_string(),
+        message: format!("{operation} deadline elapsed"),
+    }
+}
+
+pub fn validate_list_maximum(prefix: &str, maximum: usize) -> Result<()> {
+    if !(1..=BLOB_LIST_PAGE_MAX_KEYS).contains(&maximum) {
+        return Err(BlobError::InvalidKey {
+            key: prefix.to_string(),
+            message: format!("list page maximum must be in 1..={BLOB_LIST_PAGE_MAX_KEYS}"),
+        });
+    }
+    Ok(())
+}
+
+pub fn validate_list_result(prefix: &str, keys: &[String]) -> Result<()> {
+    if prefix.is_empty() || prefix.starts_with('/') {
+        return Err(BlobError::InvalidKey {
+            key: prefix.to_string(),
+            message: "expected a non-empty relative prefix".into(),
+        });
+    }
+    for key in keys {
+        validate_key(key)?;
+        if !key.starts_with(prefix) {
+            return Err(BlobError::Backend {
+                key: prefix.to_string(),
+                message: format!("LIST returned key outside the requested prefix: {key}"),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Provider-neutral fault decorator used by crash and retry tests.
@@ -152,7 +265,25 @@ impl BlobStore for FaultyBlobStore {
         self.inner.delete(key)
     }
 
+    fn delete_until(&self, key: &str, deadline: Instant) -> Result<()> {
+        self.inner.delete_until(key, deadline)
+    }
+
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
         self.inner.list(prefix)
+    }
+
+    fn list_bounded(&self, prefix: &str, maximum: usize) -> Result<BlobListPage> {
+        self.inner.list_bounded(prefix, maximum)
+    }
+
+    fn list_for_delete_bounded_until(
+        &self,
+        prefix: &str,
+        maximum: usize,
+        deadline: Instant,
+    ) -> Result<QualifiedDeleteListPage> {
+        self.inner
+            .list_for_delete_bounded_until(prefix, maximum, deadline)
     }
 }

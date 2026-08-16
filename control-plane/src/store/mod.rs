@@ -19,6 +19,7 @@ mod executor;
 mod leadership;
 mod metrics;
 mod nodes;
+mod object_write_gateway_client;
 mod oci;
 mod operations;
 mod rows;
@@ -43,8 +44,19 @@ mod agent_session_tests;
 
 pub(crate) use leadership::SingletonSession;
 pub use leadership::{OciDeploymentLease, SingletonRole};
+pub use object_write_gateway_client::{
+    ObjectWriteGatewayClient, OBJECT_WRITE_GATEWAY_POSTGRES_ROLE,
+    OBJECT_WRITE_GATEWAY_PROTOCOL_VERSION_V1,
+};
 pub use oci::{OciDeploymentClaim, OCI_DEPLOY_OPERATION_KIND};
 pub use rows::{parse_desired, parse_observed, parse_wake};
+pub use runtime_authority::host_fence_provider_queue::{
+    HostFenceProviderClaimV1, HostFenceProviderObjectCutoffV1, HostFenceProviderQueueClient,
+    HostFenceProviderQueueRecordV1, HostFenceProviderQueueStateV1, PgObjectWriteCutoffPort,
+    HOST_FENCE_PROVIDER_EVIDENCE_MAX_BYTES, HOST_FENCE_PROVIDER_LEASE_MAX_MS,
+    HOST_FENCE_PROVIDER_POSTGRES_ROLE, HOST_FENCE_PROVIDER_QUEUE_VERSION_V1,
+    HOST_FENCE_PROVIDER_REQUEST_MAX_BYTES,
+};
 pub use work::WorkLeaseGuard;
 
 use rows::{
@@ -421,7 +433,7 @@ fn drop_on_executor<T: Send + 'static>(
     }
 }
 
-fn drop_on_normal_executor(value: Client) {
+fn drop_on_normal_executor<T: Send + 'static>(value: T) {
     drop_on_executor(value, control_store_executor, metrics::ExecutorKind::Normal);
 }
 
@@ -658,6 +670,64 @@ impl Store {
                     )));
                 }
             };
+        let store = Arc::clone(self);
+        execute_on(
+            control_store_executor()?,
+            CONTROL_STORE_QUEUE_CAPACITY,
+            metrics::ExecutorKind::Normal,
+            move || {
+                let _admission = admission;
+                let _lane = lane_permit;
+                operation(&store)
+            },
+        )
+        .await
+    }
+
+    /// Own one request-scoped Store job through settlement.
+    ///
+    /// Cancellation can withdraw the job while it is still waiting for a
+    /// connection lane. Once submitted to the blocking executor, this future
+    /// deliberately keeps awaiting it: the transaction's
+    /// `AuthorityRequestContext` checkpoints cancel queued/page work, while
+    /// the async owner prevents a claimed closure from becoming detached.
+    pub(crate) async fn execute_authority_request_owned<T: Send + 'static>(
+        self: &Arc<Self>,
+        request: &transaction::AuthorityRequestContext,
+        operation: impl FnOnce(&Arc<Store>) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let _latency = metrics::RequestTimer::new(metrics::ExecutorKind::Normal);
+        let admission = try_admit_control_store_work()?;
+        let lane = control_store_lane(self);
+        let lane_permit = {
+            let acquire = lane.acquire_owned();
+            let timeout = tokio::time::sleep(CONTROL_STORE_LANE_ACQUIRE_TIMEOUT);
+            tokio::pin!(acquire);
+            tokio::pin!(timeout);
+            tokio::select! {
+                biased;
+                () = request.cancelled() => {
+                    return Err(ApiError::unavailable(
+                        "control-store request was cancelled before lane ownership",
+                    ));
+                }
+                () = &mut timeout => {
+                    metrics::record_lane_acquire_timeout();
+                    return Err(ApiError::unavailable(format!(
+                        "control-store connection lane was unavailable for {} seconds",
+                        CONTROL_STORE_LANE_ACQUIRE_TIMEOUT.as_secs()
+                    )));
+                }
+                result = &mut acquire => result.map_err(|_| {
+                    ApiError::unavailable("control-store connection lane is shutting down")
+                })?,
+            }
+        };
+        if request.is_cancelled_or_expired() {
+            return Err(ApiError::unavailable(
+                "control-store request was cancelled before executor submission",
+            ));
+        }
         let store = Arc::clone(self);
         execute_on(
             control_store_executor()?,
@@ -1085,6 +1155,51 @@ pub(crate) async fn execute_leadership<T: Send + 'static>(
         operation,
     )
     .await
+}
+
+/// Run connection/session destruction on the leadership executor and do not
+/// return until it has physically completed. Cleanup admission is reserved
+/// from ordinary leadership work; temporary saturation waits instead of
+/// dropping an advisory-lock owner into an unjoinable fallback.
+pub(crate) async fn execute_leadership_cleanup(
+    operation: impl FnOnce() + Send + 'static,
+) -> Result<()> {
+    execute_leadership_cleanup_on(control_store_leadership_executor()?, operation).await
+}
+
+async fn execute_leadership_cleanup_on(
+    executor: &executor::BlockingExecutor,
+    operation: impl FnOnce() + Send + 'static,
+) -> Result<()> {
+    type CleanupJob = Box<dyn FnOnce() + Send + 'static>;
+
+    let (completed, completion) = tokio::sync::oneshot::channel();
+    let mut cleanup: CleanupJob = Box::new(move || {
+        operation();
+        let _ = completed.send(());
+    });
+    let mut recorded_saturation = false;
+    loop {
+        match executor.try_execute_cleanup(cleanup) {
+            Ok(()) => break,
+            Err(executor::CleanupSubmitError::Full(returned)) => {
+                cleanup = returned;
+                if !recorded_saturation {
+                    metrics::record_rejection(metrics::RejectionKind::LeadershipCleanup);
+                    recorded_saturation = true;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            Err(executor::CleanupSubmitError::Shutdown(_)) => {
+                return Err(ApiError::unavailable(
+                    "control-store leadership cleanup executor is shutting down",
+                ));
+            }
+        }
+    }
+    completion.await.map_err(|_| {
+        ApiError::internal("control-store leadership cleanup failed before completion")
+    })
 }
 
 async fn execute_on<T: Send + 'static>(

@@ -379,9 +379,21 @@ impl<'de> Deserialize<'de> for Sha256Digest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ProviderScope {
+    pub provider: Id,
+    pub partition: Id,
+    pub account_id: Id,
+    pub region: Id,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeIdentity {
     pub version: ContractVersion,
     pub node_id: Id,
+    /// Provider scope plus `immutable_host_id` is the complete immutable Host
+    /// identity. Provider instance IDs are never interpreted globally.
+    pub provider_scope: ProviderScope,
     pub immutable_host_id: Id,
     pub credential_id: Id,
     pub credential_binding: CredentialBinding,
@@ -1603,6 +1615,7 @@ pub struct VolumeTakeoverAuthorization {
     pub volume_id: Id,
     pub expected_attachment_id: Id,
     pub expected_epoch: FenceEpoch,
+    pub expected_head: RemoteHead,
     pub new_attachment_id: Id,
     pub desired_revision: Revision,
     pub new_placement_epoch: Epoch,
@@ -1844,6 +1857,120 @@ pub struct RuntimeVolumeTransitionEvidenceSuccess {
     pub current_volume: Option<VolumeRecord>,
     pub delete_completion: Option<DeleteCompletionReceipt>,
     pub direct_successor_authorization: Option<AuthorizationRecord>,
+}
+
+/// Immutable, complete Control receipt which created one serving attachment.
+///
+/// The residue contract carries this exact value (plus its domain-separated
+/// digest) instead of reconstructing authority from path or identifier hints.
+#[cfg(feature = "proposed-node-residue-reclamation")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AuthorizedServingAcquire {
+    Normal {
+        request: NormalAcquireRequest,
+        result: NormalAcquireResult,
+    },
+    Takeover {
+        authorization: VolumeTakeoverAuthorization,
+        receipt: TakeoverConsumedReceipt,
+    },
+}
+
+/// One exact local block-data lineage presented for read-only reclaim
+/// qualification.  This is physical evidence, not ownership authority.  The
+/// Control Plane must bind it to the current PostgreSQL authority snapshot and
+/// return one of the closed proofs below before the Node may delete any byte.
+#[cfg(feature = "proposed-node-residue-reclamation")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResidueDataDirectoryLineage {
+    pub workspace_id: Id,
+    pub cat_id: Id,
+    pub disk_id: Id,
+    pub disk_kind: DiskKind,
+    pub volume_id: Id,
+    pub attachment_id: Id,
+    pub attachment_epoch: FenceEpoch,
+    pub acquire_origin: AcquireOrigin,
+    pub node_id: Id,
+    /// Current Desired coordinate under which Control is asked to qualify
+    /// reclamation. The immutable acquire receipt below carries its own
+    /// historical revision and placement.
+    pub desired_revision: Revision,
+    pub spec_digest: Sha256Digest,
+    pub placement: AssignedPlacement,
+    pub placement_epoch: Epoch,
+    pub acquisition: AuthorizedServingAcquire,
+    pub acquisition_digest: Sha256Digest,
+    pub local_durable_generation: Generation,
+    pub remote_durable_generation: Generation,
+    pub remote_head: RemoteHead,
+    pub pending_pack_count: WireU64,
+    pub fenced: bool,
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeResidueAuthorityRequest {
+    pub version: ContractVersion,
+    pub session: SessionBinding,
+    pub lineage: ResidueDataDirectoryLineage,
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeResidueAuthoritySuccess {
+    pub version: ContractVersion,
+    pub session: SessionBinding,
+    pub lineage: ResidueDataDirectoryLineage,
+    pub outcome: RuntimeResidueAuthorityOutcome,
+}
+
+/// A read-only Control decision from one repeatable-read authority snapshot.
+/// `Retained` is diagnostic only.  `Reclaimable` contains the complete proof
+/// that a Node must independently validate against its retained descriptor.
+#[cfg(feature = "proposed-node-residue-reclamation")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RuntimeResidueAuthorityOutcome {
+    Retained {
+        reason: ResidueAuthorityRetentionReason,
+    },
+    Reclaimable {
+        proof: Box<ResidueReclaimProof>,
+    },
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResidueAuthorityRetentionReason {
+    NoAuthorityRecord,
+    CurrentOrNewerOwner,
+    ReleaseNotRecorded,
+    DeleteIncomplete,
+    LineageMismatch,
+    UniqueLocalTail,
+    UnsupportedDiskKind,
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ResidueReclaimProof {
+    OrdinaryRelease {
+        current_volume: VolumeRecord,
+    },
+    NormalDeleteCompletion {
+        completion: DeleteCompletionReceipt,
+    },
+    DisposableRootDeleteCompletion {
+        completion: DeleteCompletionReceipt,
+        consumed_authorization: AuthorizationRecord,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2276,8 +2403,16 @@ pub enum NodeResidue {
         ownership_token: OwnershipTokenEvidence,
     },
     DataDirectory {
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        cat_id_hint: Option<Id>,
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        disk_id_hint: Option<Id>,
         volume_id_hint: Option<Id>,
         data_directory: HostPath,
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        allocated_bytes: WireU64,
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        retention_reason: DataDirectoryRetentionReason,
         ownership_token: OwnershipTokenEvidence,
         lineage: ResidueLineageEvidence,
     },
@@ -2307,13 +2442,40 @@ pub enum NodeResidue {
 pub enum ResidueLineageEvidence {
     Unreadable,
     Readable {
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        lineage: Box<ResidueDataDirectoryLineage>,
+        #[cfg(not(feature = "proposed-node-residue-reclamation"))]
         attachment_id_hint: Option<Id>,
+        #[cfg(not(feature = "proposed-node-residue-reclamation"))]
         attachment_epoch_hint: Option<FenceEpoch>,
+        #[cfg(not(feature = "proposed-node-residue-reclamation"))]
         local_durable_generation: Generation,
+        #[cfg(not(feature = "proposed-node-residue-reclamation"))]
         remote_durable_generation: Generation,
+        #[cfg(not(feature = "proposed-node-residue-reclamation"))]
         pending_pack_count: WireU64,
+        #[cfg(not(feature = "proposed-node-residue-reclamation"))]
         fenced: bool,
     },
+}
+
+/// Scanner/reconciler explanation for keeping one directory.  This field is
+/// observation-only and is deliberately absent from every reclaim proof.
+#[cfg(feature = "proposed-node-residue-reclamation")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DataDirectoryRetentionReason {
+    CurrentDesiredAttachment,
+    SupersededDesiredAttachment,
+    UnassignedCat,
+    UnreadableIdentity,
+    IncompletePhysicalInventory,
+    AuthorityProofPending,
+    AuthorityDoesNotAuthorizeReclaim,
+    UniqueLocalTail,
+    PersistentDiskRetained,
+    RootDiskRetained,
+    ExactReclaimPending,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3026,6 +3188,10 @@ pub enum ContractName {
     RuntimeVolumeTransitionSuccess,
     RuntimeVolumeTransitionEvidenceRequest,
     RuntimeVolumeTransitionEvidenceSuccess,
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    RuntimeResidueAuthorityRequest,
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    RuntimeResidueAuthoritySuccess,
     RuntimeVolumeTransitionError,
     Operation,
     ContractError,

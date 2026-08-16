@@ -41,12 +41,19 @@ impl RuntimeOperationsTableLockForTest {
                 .get(0);
             ready_tx.send(()).unwrap();
 
-            let deadline = Instant::now() + Duration::from_secs(5);
+            // Pure poll upper bound; a saturated gate host (late in the
+            // full suite, with a bloated shared PostgreSQL catalog) can take
+            // far longer than an idle one to schedule the handler onto the
+            // lock. The poll exits as soon as the handler blocks.
+            let deadline = Instant::now() + Duration::from_secs(90);
             loop {
                 if release_rx.try_recv().is_ok() {
                     client.batch_execute("ROLLBACK").unwrap();
                     return;
                 }
+                // Background sweepers also scan runtime_operations; only the
+                // handler's by-id Operation read proves the claimed request
+                // reached the lock barrier, so bind the waiter to its query.
                 let blocked: bool = client
                     .query_one(
                         "SELECT EXISTS (
@@ -55,10 +62,16 @@ impl RuntimeOperationsTableLockForTest {
                               JOIN pg_class relation ON relation.oid=waiting.relation
                               JOIN pg_namespace namespace
                                 ON namespace.oid=relation.relnamespace
+                              JOIN pg_stat_activity activity
+                                ON activity.pid=waiting.pid
                              WHERE waiting.pid<>$1 AND NOT waiting.granted
                                AND waiting.locktype='relation'
                                AND namespace.nspname=current_schema()
                                AND relation.relname='runtime_operations'
+                               AND (activity.query LIKE
+                                   '%workspace_id COLLATE \"C\"=$1 AND operation_id COLLATE \"C\"=$2%'
+                                 OR activity.query LIKE
+                                   '%FROM runtime_operations WHERE operation_id=$1%')
                          )",
                         &[&own_pid],
                     )
@@ -86,7 +99,7 @@ impl RuntimeOperationsTableLockForTest {
 
     pub async fn wait_until_query_blocked(&mut self) {
         assert!(
-            tokio::time::timeout(Duration::from_secs(6), &mut self.blocked)
+            tokio::time::timeout(Duration::from_secs(100), &mut self.blocked)
                 .await
                 .expect("runtime Operation query did not reach the PostgreSQL lock barrier")
                 .expect("runtime_operations table-lock worker stopped"),
@@ -197,6 +210,271 @@ pub fn test_runtime_provisioner_trust_bundle(
     }
 }
 
+/// Independent E13 offline-operator public trust for server tests.
+pub fn test_production_cutover_operator_trust_bundle(
+) -> cats_api::production_mutation_admission::ProductionCutoverOperatorTrustBundle {
+    use cats_api::production_mutation_admission::{
+        ProductionCutoverAwsPartition, ProductionCutoverAwsRoleScope,
+        ProductionCutoverOperatorCredential, ProductionCutoverOperatorTrustBundle,
+    };
+    use cats_api::runtime_reconciliation::{Base64UrlNoPad, ContractVersion, Id, WireU64};
+
+    ProductionCutoverOperatorTrustBundle {
+        version: ContractVersion::V1,
+        deployment_id: Id::new("deployment_a").expect("valid test deployment ID"),
+        release_id: Id::new("release_a").expect("valid test release ID"),
+        source_commit_sha: "a".repeat(40),
+        signature_threshold: WireU64::new(1).expect("valid test threshold"),
+        credentials: vec![ProductionCutoverOperatorCredential {
+            credential_id: Id::new("cutover_a").expect("valid test credential ID"),
+            public_key_spki: Base64UrlNoPad::new(
+                "MCowBQYDK2VwAyEA11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+            )
+            .expect("canonical test Ed25519 SPKI"),
+            scope: ProductionCutoverAwsRoleScope {
+                aws_partition: ProductionCutoverAwsPartition::Aws,
+                account_id: "123456789012".to_owned(),
+                role_arn: "arn:aws:iam::123456789012:role/cats-production-cutover".to_owned(),
+            },
+        }],
+    }
+}
+
+/// Enter the exact workspace-scoped ADR-0052 Qualification mode through the
+/// same dedicated signature verifier and Store CAS used by production.
+///
+/// This is deliberately an explicit fixture action after Account/Workspace
+/// provisioning. It is neither an automatic schema default nor a Store
+/// bypass, and it cannot construct a final `Open` binding.
+#[cfg(any(test, debug_assertions, feature = "test-support"))]
+pub fn begin_production_qualification_for_product_test(
+    store: &crate::store::Store,
+    workspace_id: &cats_api::runtime_reconciliation::Id,
+) -> cats_api::production_mutation_admission::ProductionQualificationAdmissionBinding {
+    use cats_api::production_mutation_admission::{
+        ProductionCutoverAwsPartition, ProductionMutationAdmissionBinding,
+        ProductionMutationAdmissionCommand, ProductionMutationAdmissionMode,
+        ProductionMutationAdmissionMutation, ProductionMutationAdmissionStoredOutcome,
+        ProductionQualificationAdmissionBinding, PRODUCTION_QUALIFICATION_MUTATION_CLASSES,
+    };
+    use cats_api::runtime_reconciliation::{
+        ContractVersion, Epoch, Id, RandomId128, Sha256Digest, UnixMillis, WireU64,
+    };
+    use sha2::{Digest as _, Sha256};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let cats_account_id: String = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT account_id FROM workspaces WHERE id=$1",
+                    &[&workspace_id.as_str()],
+                )
+                .map(|row| row.get(0))
+        })
+        .expect("load exact qualification Account/Workspace scope");
+    let mut state = store
+        .production_mutation_admission_state()
+        .expect("discover default-Closed qualification admission state");
+    if state.mode == ProductionMutationAdmissionMode::Qualification {
+        let ProductionMutationAdmissionBinding::Qualification(installed) = state
+            .binding
+            .as_ref()
+            .expect("Qualification mode has a binding")
+        else {
+            panic!("Qualification mode did not carry a Qualification binding")
+        };
+        if &installed.workspace_id == workspace_id {
+            return installed.clone();
+        }
+        end_production_qualification_for_product_test(store);
+        state = store
+            .production_mutation_admission_state()
+            .expect("discover Closed state after test Qualification End");
+    }
+    assert_eq!(state.mode, ProductionMutationAdmissionMode::Closed);
+    let now = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock is after the epoch")
+            .as_millis(),
+    )
+    .expect("test time fits u64");
+    let digest = |byte: char| {
+        Sha256Digest::new(format!("sha256:{}", byte.to_string().repeat(64)))
+            .expect("test digest is valid")
+    };
+    let binding = ProductionQualificationAdmissionBinding {
+        qualification_id: Id::new(format!("qualification_{workspace_id}"))
+            .expect("valid test qualification ID"),
+        deployment_id: Id::new("deployment_a").expect("valid test deployment ID"),
+        release_id: Id::new("release_a").expect("valid test release ID"),
+        source_commit_sha: "a".repeat(40),
+        control_schema_version: WireU64::new(16).expect("valid schema version"),
+        source_manifest_sha256: digest('0'),
+        source_bundle_sha256: digest('1'),
+        build_receipt_sha256: digest('2'),
+        release_manifest_sha256: digest('3'),
+        worker_bundle_sha256: digest('4'),
+        qualification_catalog_sha256: digest('5'),
+        qualification_cell_manifest_sha256: digest('6'),
+        aws_partition: ProductionCutoverAwsPartition::Aws,
+        aws_account_id: "123456789012".to_owned(),
+        aws_region: "us-east-1".to_owned(),
+        cell_id: Id::new("test-cell-a").expect("valid test cell ID"),
+        cell_namespace: "cats-qualification".to_owned(),
+        cats_account_id: Id::new(cats_account_id).expect("valid Cats account ID"),
+        workspace_id: workspace_id.clone(),
+        allowed_mutation_classes: PRODUCTION_QUALIFICATION_MUTATION_CLASSES.to_vec(),
+        qualification_expires_at_unix_ms: UnixMillis::new(now + 60 * 60 * 1_000)
+            .expect("valid qualification expiry"),
+    };
+    let command_id = RandomId128::new(hex::encode(
+        &Sha256::digest(format!("{workspace_id}:{}", state.revision.get()).as_bytes())[..16],
+    ))
+    .expect("valid deterministic test command ID");
+    let command = ProductionMutationAdmissionCommand {
+        version: ContractVersion::V1,
+        command_id,
+        issued_at_unix_ms: UnixMillis::new(now).expect("valid issued time"),
+        expires_at_unix_ms: UnixMillis::new(now + 60_000).expect("valid command expiry"),
+        operator: test_production_cutover_sts_principal(),
+        expected_revision: Epoch::new(state.revision.get()).expect("positive state revision"),
+        mutation: ProductionMutationAdmissionMutation::BeginQualification {
+            binding: binding.clone(),
+        },
+    };
+    let receipt = apply_production_admission_for_product_test(store, &command, now);
+    assert!(matches!(
+        receipt.outcome,
+        ProductionMutationAdmissionStoredOutcome::Applied { ref state }
+            if state.mode == ProductionMutationAdmissionMode::Qualification
+                && state.binding.as_ref()
+                    == Some(&cats_api::production_mutation_admission::ProductionMutationAdmissionBinding::Qualification(binding.clone()))
+    ));
+    binding
+}
+
+/// Leave an installed test Qualification through the official signed End CAS.
+/// Disposable product fixtures use this only when they intentionally move the
+/// singleton to another exact Workspace scope.
+#[cfg(any(test, debug_assertions, feature = "test-support"))]
+pub fn end_production_qualification_for_product_test(store: &crate::store::Store) {
+    use cats_api::production_mutation_admission::{
+        ProductionMutationAdmissionBinding, ProductionMutationAdmissionCommand,
+        ProductionMutationAdmissionMode, ProductionMutationAdmissionMutation,
+        ProductionMutationAdmissionStoredOutcome,
+    };
+    use cats_api::runtime_reconciliation::{ContractVersion, Epoch, RandomId128, UnixMillis};
+    use sha2::{Digest as _, Sha256};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let state = store
+        .production_mutation_admission_state()
+        .expect("discover installed test Qualification");
+    let ProductionMutationAdmissionBinding::Qualification(binding) = state
+        .binding
+        .clone()
+        .expect("test Qualification has a binding")
+    else {
+        panic!("test Qualification did not carry a Qualification binding")
+    };
+    assert_eq!(state.mode, ProductionMutationAdmissionMode::Qualification);
+    let now = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock is after the epoch")
+            .as_millis(),
+    )
+    .expect("test time fits u64");
+    let command_id = RandomId128::new(hex::encode(
+        &Sha256::digest(
+            format!("end:{}:{}", binding.qualification_id, state.revision.get()).as_bytes(),
+        )[..16],
+    ))
+    .expect("valid deterministic test End command ID");
+    let command = ProductionMutationAdmissionCommand {
+        version: ContractVersion::V1,
+        command_id,
+        issued_at_unix_ms: UnixMillis::new(now).expect("valid issued time"),
+        expires_at_unix_ms: UnixMillis::new(now + 60_000).expect("valid command expiry"),
+        operator: test_production_cutover_sts_principal(),
+        expected_revision: Epoch::new(state.revision.get()).expect("positive state revision"),
+        mutation: ProductionMutationAdmissionMutation::EndQualification { binding },
+    };
+    let receipt = apply_production_admission_for_product_test(store, &command, now);
+    assert!(matches!(
+        receipt.outcome,
+        ProductionMutationAdmissionStoredOutcome::Applied { ref state }
+            if state.mode == ProductionMutationAdmissionMode::Closed
+    ));
+}
+
+#[cfg(any(test, debug_assertions, feature = "test-support"))]
+fn test_production_cutover_sts_principal(
+) -> cats_api::production_mutation_admission::ProductionCutoverStsPrincipal {
+    use cats_api::production_mutation_admission::{
+        ProductionCutoverAwsPartition, ProductionCutoverStsPrincipal,
+    };
+
+    ProductionCutoverStsPrincipal {
+        aws_partition: ProductionCutoverAwsPartition::Aws,
+        account_id: "123456789012".to_owned(),
+        role_arn: "arn:aws:iam::123456789012:role/cats-production-cutover".to_owned(),
+        principal_arn:
+            "arn:aws:sts::123456789012:assumed-role/cats-production-cutover/test-session".to_owned(),
+    }
+}
+
+#[cfg(any(test, debug_assertions, feature = "test-support"))]
+fn apply_production_admission_for_product_test(
+    store: &crate::store::Store,
+    command: &cats_api::production_mutation_admission::ProductionMutationAdmissionCommand,
+    now_unix_ms: u64,
+) -> cats_api::production_mutation_admission::ProductionMutationAdmissionCommandReceipt {
+    use cats_api::agent_registration::Ed25519RequestSigner;
+    use cats_api::production_mutation_admission::{
+        encode_production_mutation_admission_command, sign_production_mutation_admission_command,
+        verify_production_mutation_admission_command,
+    };
+    use cats_api::runtime_reconciliation::Id;
+
+    let body = encode_production_mutation_admission_command(command)
+        .expect("canonical test production admission command");
+    let mut pkcs8 =
+        hex::decode("302e020100300506032b657004220420").expect("valid test PKCS#8 prefix");
+    pkcs8.extend_from_slice(
+        &hex::decode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+            .expect("valid test Ed25519 seed"),
+    );
+    let signer = Ed25519RequestSigner::from_pkcs8_der(
+        Id::new("cutover_a").expect("valid test credential ID"),
+        &pkcs8,
+    )
+    .expect("valid test cutover signer");
+    let trust = test_production_cutover_operator_trust_bundle();
+    let proof = sign_production_mutation_admission_command(&trust, &signer, &body)
+        .expect("sign test production admission command");
+    let principal = verify_production_mutation_admission_command(
+        &trust,
+        &proof.credential_id,
+        &proof.signature,
+        &body,
+        now_unix_ms,
+    )
+    .expect("verify test production admission command through production verifier");
+    let request = crate::store::AuthorityRequestContext::new(
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    );
+    let outcome = store
+        .apply_production_mutation_admission_command_request(&principal, command, &request)
+        .expect("apply test production admission through production Store");
+    let crate::store::runtime_authority::production_mutation_admission::ProductionMutationAdmissionCommandStoreOutcome::Stored(receipt) = outcome else {
+        panic!("test production admission command was not stored: {outcome:?}");
+    };
+    receipt
+}
+
 /// Seed a disposable schema with a typed provisioner-trust revision before a
 /// server using the next revision is started.
 pub fn seed_runtime_provisioner_trust_bundle(
@@ -234,6 +512,119 @@ pub fn route_grant_signer() -> Arc<crate::route_grant::RouteGrantSigner> {
         )
         .expect("test Route Grant key is valid"),
     )
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+const TEST_ROUTE_V2_SIGNER_REFERENCE: &[u8] = br#"{"version":1,"deployment_id":"route_deployment_a","signer_revision":1,"expected_previous":null,"signer":{"state":"active","active_kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","secret_reference_id":"route_secret_a"},"public_key_ring_version":1,"public_key_ring_digest":"sha256:7c7e324d7be6c6ee71735c900ce1041de63af7cc08fb39b6800853f966e81e34"}"#;
+#[cfg(any(debug_assertions, feature = "test-support"))]
+const TEST_ROUTE_V2_PUBLIC_KEY_RING: &[u8] = br#"{"version":1,"ring_version":1,"expected_previous":null,"keys":[{"kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","public_key_spki":"MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To"}]}"#;
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+fn route_v2_signing_authority_fixture() -> anyhow::Result<(
+    Arc<crate::route_grant_v2::InstalledRouteGrantV2SigningAuthority>,
+    cats_api::route_grant_v2::RouteGrantV2PublicKeyRingArtifact,
+)> {
+    use cats_api::route_grant_v2::{
+        decode_route_grant_v2_public_key_ring, decode_route_grant_v2_signer_reference,
+    };
+
+    let signer_reference = decode_route_grant_v2_signer_reference(TEST_ROUTE_V2_SIGNER_REFERENCE)?;
+    let public_key_ring = decode_route_grant_v2_public_key_ring(TEST_ROUTE_V2_PUBLIC_KEY_RING)?;
+    let signing_authority = Arc::new(
+        crate::route_grant_v2::InstalledRouteGrantV2SigningAuthority::from_authority_artifacts(
+            &signer_reference,
+            TEST_ROUTE_V2_SIGNER_REFERENCE,
+            &public_key_ring,
+            Some(include_bytes!(
+                "../../tests/fixtures/route_grant_v2_private_ed25519.pem"
+            )),
+            120,
+        )?,
+    );
+    Ok((signing_authority, public_key_ring))
+}
+
+/// PostgreSQL backend PID for the ordinary single-connection control Store.
+/// Integration concurrency tests use it only to distinguish one claimed
+/// production request from unrelated sessions in the same disposable server.
+pub async fn control_store_backend_pid(store: &Arc<crate::store::Store>) -> i32 {
+    store
+        .execute(|store| {
+            store.with(|client| {
+                client
+                    .query_one("SELECT pg_backend_pid()", &[])
+                    .map(|row| row.get(0))
+            })
+        })
+        .await
+        .expect("read test control Store backend PID")
+}
+
+#[cfg(any(debug_assertions, feature = "test-support"))]
+fn route_v2_gateway_machine_fixture_inner(
+    listen: impl Into<String>,
+) -> anyhow::Result<(
+    crate::server::GatewayMachineConfig,
+    cats_api::route_grant_v2::RouteGrantV2PublicKeyRingArtifact,
+)> {
+    use cats_api::gateway_workload_identity::{
+        GatewayWorkloadCredentialPolicy, GatewayWorkloadCredentialScope,
+        GatewayWorkloadIdentityAuthority,
+    };
+    use cats_api::runtime_reconciliation::{Base64UrlNoPad, ContractVersion, Epoch, Id};
+    let (signing_authority, public_key_ring) = route_v2_signing_authority_fixture()?;
+    let gateway_authority = GatewayWorkloadIdentityAuthority {
+        version: ContractVersion::V1,
+        authority_id: Id::new("gateway_authority_route_e2e")
+            .expect("test Gateway authority ID is valid"),
+        fleet_id: Id::new("fleet_route_e2e").expect("test Gateway fleet ID is valid"),
+        policy_revision: Epoch::new(1).expect("test Gateway policy revision is positive"),
+        expected_previous: None,
+        credentials: vec![GatewayWorkloadCredentialPolicy {
+            credential_id: Id::new("gateway_credential_route_e2e")
+                .expect("test Gateway credential ID is valid"),
+            public_key_spki: Base64UrlNoPad::new(
+                "MCowBQYDK2VwAyEAFqokynUVEeIXMF7pBwDCDQn6N97Q4hJUz7DUbPlbJu8",
+            )
+            .expect("test Gateway credential SPKI is canonical"),
+            scope: GatewayWorkloadCredentialScope::Fleet,
+        }],
+    };
+    let tls_config = crate::gateway_machine::GatewayMachineTlsConfig::from_pem_for_test(
+        include_bytes!("../tests/fixtures/gateway_machine_ca_certificate.pem"),
+        include_bytes!("../tests/fixtures/gateway_machine_server_certificate.pem"),
+        include_bytes!("../tests/fixtures/gateway_machine_server_private_key.pem"),
+    )?;
+    let config = crate::server::GatewayMachineConfig::from_test_composition(
+        listen,
+        gateway_authority,
+        tls_config,
+        signing_authority,
+    )?;
+    Ok((config, public_key_ring))
+}
+
+/// Compose the real isolated Control Route v2 listener with the shared r1
+/// signer and mTLS fixtures, and return the exact ring a Node must ACK. This
+/// debug-only surface cannot become a production signer-install authority.
+#[cfg(debug_assertions)]
+pub fn route_v2_gateway_machine_fixture(
+    listen: impl Into<String>,
+) -> anyhow::Result<(
+    crate::server::GatewayMachineConfig,
+    cats_api::route_grant_v2::RouteGrantV2PublicKeyRingArtifact,
+)> {
+    route_v2_gateway_machine_fixture_inner(listen)
+}
+
+/// Compose the real isolated Control Route v2 listener with the shared r1
+/// signer and mTLS fixtures. This test-only feature avoids adding any
+/// caller-selected artifact path or credential input to production startup.
+#[cfg(feature = "test-support")]
+pub fn route_v2_gateway_machine_config(
+    listen: impl Into<String>,
+) -> anyhow::Result<crate::server::GatewayMachineConfig> {
+    route_v2_gateway_machine_fixture_inner(listen).map(|(config, _)| config)
 }
 
 /// Base DSN of the disposable test server.
@@ -922,6 +1313,379 @@ pub async fn corrupt_runtime_operation_projection_for_test(
         })
         .await
         .expect("corrupt isolated test Operation projection");
+}
+
+/// Move one Cat Desired through a fully closed disposable-Root completion and
+/// one independent PersistentDisk to Deleting. The Root Disk/Volume rows are
+/// then swept exactly as the terminal production lifecycle permits.
+pub async fn set_runtime_product_read_states_for_test(
+    store: &Arc<crate::store::Store>,
+    cat_id: cats_api::runtime_reconciliation::Id,
+    disk_id: cats_api::runtime_reconciliation::Id,
+) {
+    use cats_api::runtime_reconciliation::{
+        decode_desired_runtime_spec, encode_desired_runtime_spec, spec_digest, Epoch, RandomId128,
+        RuntimeTarget, Sha256Digest, UnixMillis, VolumeDisposition,
+    };
+    use cats_storage::authority::{
+        complete_disposable_root_delete, consume_disposable_root_delete, normal_acquire,
+        AuthorizationRecord, AuthorizationState, DisposableDeleteIsolationBasis,
+        DisposableRootDeleteAuthorization, NormalAcquireRequest, VolumeAuthorization, VolumeRecord,
+    };
+
+    store
+        .execute(move |store| {
+            store.with(|client| {
+                let mut transaction = client.transaction()?;
+                let desired_json: String = transaction
+                    .query_one(
+                        "SELECT record::text FROM desired_runtime_specs WHERE cat_id=$1",
+                        &[&cat_id.as_str()],
+                    )?
+                    .get(0);
+                let mut desired = decode_desired_runtime_spec(desired_json.as_bytes())
+                    .expect("test DesiredRuntimeSpec is valid");
+                let root = desired.volumes[0].clone();
+                let delete_id =
+                    cats_api::runtime_reconciliation::Id::new("delete_read_test").unwrap();
+                desired.target = RuntimeTarget::Deleted;
+                desired.volumes[0].disposition = VolumeDisposition::DeleteDisposableRoot {
+                    delete_id: delete_id.clone(),
+                };
+                desired.spec_digest = Sha256Digest::from_bytes([0; 32]);
+                desired.spec_digest = spec_digest(&desired).expect("Deleted test Desired is valid");
+                let encoded = String::from_utf8(
+                    encode_desired_runtime_spec(&desired).expect("encode Deleted test Desired"),
+                )
+                .expect("runtime wire JSON is UTF-8");
+                let changed = transaction.execute(
+                    "UPDATE desired_runtime_specs
+                        SET record=$2::TEXT::jsonb, target='deleted', spec_digest=$3
+                      WHERE cat_id=$1",
+                    &[&cat_id.as_str(), &encoded, &desired.spec_digest.as_str()],
+                )?;
+                assert_eq!(changed, 1, "test Cat Desired must already exist");
+
+                let volume_json: String = transaction
+                    .query_one(
+                        "SELECT record::text FROM volume_records WHERE volume_id=$1",
+                        &[&root.volume_id.as_str()],
+                    )?
+                    .get(0);
+                let unowned: VolumeRecord =
+                    serde_json::from_str(&volume_json).expect("test Root Volume is valid");
+                let cats_api::runtime_reconciliation::VolumeAcquire::Normal {
+                    transition_id,
+                    expected_unowned_epoch,
+                } = &root.acquire
+                else {
+                    panic!("initial test Root must use normal acquire")
+                };
+                let (owned, _) = normal_acquire(
+                    &unowned,
+                    &NormalAcquireRequest {
+                        volume_id: root.volume_id.clone(),
+                        transition_id: transition_id.clone(),
+                        attachment_id: root.attachment_id.clone(),
+                        expected_unowned_epoch: *expected_unowned_epoch,
+                        desired_revision: desired.desired_revision,
+                        placement_epoch: desired.placement.placement_epoch,
+                        lease_duration_ms: 30_000,
+                    },
+                    UnixMillis::new(10_000).unwrap(),
+                )
+                .expect("test Root normal acquire is valid");
+                let authorization_id =
+                    cats_api::runtime_reconciliation::Id::new("authorization_read_test").unwrap();
+                let original = AuthorizationRecord {
+                    authorization: VolumeAuthorization::DisposableRootDelete(
+                        DisposableRootDeleteAuthorization {
+                            authorization_id: authorization_id.clone(),
+                            authorized_node_id: desired.placement.node_id.clone(),
+                            delete_id: delete_id.clone(),
+                            disk_id: root.disk_id.clone(),
+                            volume_id: root.volume_id.clone(),
+                            cat_id: desired.cat_id.clone(),
+                            desired_revision: desired.desired_revision,
+                            placement_epoch: desired.placement.placement_epoch,
+                            expected_attachment_id: root.attachment_id.clone(),
+                            expected_epoch: owned.lease_epoch,
+                            expected_head: owned.head.clone(),
+                            isolation_basis: DisposableDeleteIsolationBasis::RuntimeStopped {
+                                node_id: desired.placement.node_id.clone(),
+                                agent_session_epoch: Epoch::new(1).unwrap(),
+                                runtime_incarnation: RandomId128::new(
+                                    "91919191919191919191919191919191",
+                                )
+                                .unwrap(),
+                                observation_id: RandomId128::new(
+                                    "92929292929292929292929292929292",
+                                )
+                                .unwrap(),
+                            },
+                            not_after: UnixMillis::new(50_000).unwrap(),
+                        },
+                    ),
+                    state: AuthorizationState::Unconsumed,
+                };
+                let (deleting, consumed, consumed_receipt) = consume_disposable_root_delete(
+                    &owned,
+                    None,
+                    &original,
+                    &authorization_id,
+                    UnixMillis::new(20_000).unwrap(),
+                )
+                .expect("test disposable Root authorization is valid");
+                let completion = complete_disposable_root_delete(
+                    &deleting,
+                    &consumed,
+                    UnixMillis::new(40_000).unwrap(),
+                )
+                .expect("test disposable Root completion is valid");
+                let authorization_json = serde_json::to_string(&consumed)
+                    .expect("encode test disposable Root authorization");
+                let completion_json = serde_json::to_string(&completion)
+                    .expect("encode test disposable Root completion");
+                let desired_revision =
+                    i64::try_from(desired.desired_revision.get()).expect("test revision fits PG");
+                let placement_epoch = i64::try_from(desired.placement.placement_epoch.get())
+                    .expect("test placement epoch fits PG");
+                let expected_head_generation = i64::try_from(owned.head.generation.get())
+                    .expect("test expected head generation fits PG");
+                let expected_head_root_hash =
+                    owned.head.root_hash.as_ref().map(ToString::to_string);
+                let expected_head_root_object_id =
+                    owned.head.root_object_id.as_ref().map(ToString::to_string);
+                let consumed_at = i64::try_from(consumed_receipt.consumed_at.get())
+                    .expect("test consumed time fits PG");
+                assert_eq!(
+                    transaction.execute(
+                        "INSERT INTO volume_authorizations (
+                            authorization_id, record, kind, authorized_node_id,
+                            host_fence_event_id, volume_id, state,
+                            desired_revision, placement_epoch, lease_duration_ms,
+                            expected_head_generation, expected_head_root_hash,
+                            expected_head_root_object_id, not_after, consumed_at
+                         ) VALUES (
+                            $1, $2::TEXT::jsonb, 'disposable_root_delete', $3,
+                            NULL, $4, 'consumed', $5, $6, NULL, $7, $8, $9,
+                            $10, $11
+                         )",
+                        &[
+                            &authorization_id.as_str(),
+                            &authorization_json,
+                            &desired.placement.node_id.as_str(),
+                            &root.volume_id.as_str(),
+                            &desired_revision,
+                            &placement_epoch,
+                            &expected_head_generation,
+                            &expected_head_root_hash,
+                            &expected_head_root_object_id,
+                            &50_000_i64,
+                            &consumed_at,
+                        ],
+                    )?,
+                    1
+                );
+                let cats_storage::authority::DeleteCompletionReceipt::DisposableRoot {
+                    deleting_epoch,
+                    deleting_head,
+                    completed_at,
+                    ..
+                } = &completion
+                else {
+                    unreachable!()
+                };
+                let deleting_epoch =
+                    i64::try_from(deleting_epoch.get()).expect("test deleting epoch fits PG");
+                let head_generation = i64::try_from(deleting_head.generation.get())
+                    .expect("test head generation fits PG");
+                let completed_at =
+                    i64::try_from(completed_at.get()).expect("test completion time fits PG");
+                assert_eq!(
+                    transaction.execute(
+                        "INSERT INTO delete_completion_receipts (
+                            delete_id, record, kind, disk_id, volume_id,
+                            authorization_id, prior_attachment_id, deleting_epoch,
+                            head_generation, head_root_hash, head_root_object_id,
+                            completed_at
+                         ) VALUES (
+                            $1, $2::TEXT::jsonb, 'disposable_root', $3, $4,
+                            $5, $6, $7, $8, $9, $10, $11
+                         )",
+                        &[
+                            &delete_id.as_str(),
+                            &completion_json,
+                            &root.disk_id.as_str(),
+                            &root.volume_id.as_str(),
+                            &authorization_id.as_str(),
+                            &root.attachment_id.as_str(),
+                            &deleting_epoch,
+                            &head_generation,
+                            &deleting_head.root_hash.as_ref().map(ToString::to_string),
+                            &deleting_head
+                                .root_object_id
+                                .as_ref()
+                                .map(ToString::to_string),
+                            &completed_at,
+                        ],
+                    )?,
+                    1
+                );
+                assert_eq!(
+                    transaction.execute(
+                        "DELETE FROM disk_records WHERE disk_id=$1",
+                        &[&root.disk_id.as_str()],
+                    )?,
+                    1
+                );
+                assert_eq!(
+                    transaction.execute(
+                        "DELETE FROM volume_records WHERE volume_id=$1",
+                        &[&root.volume_id.as_str()],
+                    )?,
+                    1
+                );
+
+                let changed = transaction.execute(
+                    "UPDATE disk_records
+                        SET record=jsonb_set(
+                                record,
+                                '{admin_state}',
+                                '{\"kind\":\"deleting\",\"delete_id\":\"delete_read_test\"}'::jsonb
+                            ),
+                            admin_state='deleting', delete_id='delete_read_test'
+                      WHERE disk_id=$1",
+                    &[&disk_id.as_str()],
+                )?;
+                assert_eq!(changed, 1, "test PersistentDisk must already exist");
+                transaction.commit()
+            })
+        })
+        .await
+        .expect("set isolated runtime product read states");
+}
+
+/// Reintroduce one swept Root Volume only through the canonical JSON delete
+/// lineage. Scalar identity and delete projections deliberately name unrelated
+/// values, so the public read must cover all projection reachability paths.
+pub async fn corrupt_deleted_root_volume_residual_for_test(
+    store: &Arc<crate::store::Store>,
+    persistent_disk_id: cats_api::runtime_reconciliation::Id,
+) {
+    store
+        .execute(move |store| {
+            store.with(|client| {
+                let changed = client.execute(
+                    "INSERT INTO volume_records (
+                        volume_id, record, size_bytes, durability, admin_state,
+                        delete_id, head_generation, head_root_hash,
+                        head_root_object_id, lease_owner, lease_epoch,
+                        lease_expires_at, last_transition_kind,
+                        last_transition_id, transition_desired_revision,
+                        transition_placement_epoch, transition_lease_duration_ms,
+                        owner_binding, owner_node_id
+                     ) SELECT
+                        'volume_hidden_read_residual',
+                        jsonb_set(
+                            jsonb_set(
+                                volume.record,
+                                '{volume_id}',
+                                to_jsonb('volume_hidden_read_residual'::TEXT),
+                                FALSE
+                            ),
+                            '{admin_state}',
+                            '{\"kind\":\"deleting\",\"delete_id\":\"delete_read_test\"}'::jsonb,
+                            FALSE
+                        ),
+                        volume.size_bytes, volume.durability, volume.admin_state,
+                        volume.delete_id, volume.head_generation,
+                        volume.head_root_hash, volume.head_root_object_id,
+                        volume.lease_owner, volume.lease_epoch,
+                        volume.lease_expires_at, volume.last_transition_kind,
+                        volume.last_transition_id,
+                        volume.transition_desired_revision,
+                        volume.transition_placement_epoch,
+                        volume.transition_lease_duration_ms,
+                        volume.owner_binding, volume.owner_node_id
+                       FROM volume_records volume
+                       JOIN disk_records disk ON disk.volume_id=volume.volume_id
+                      WHERE disk.disk_id=$1",
+                    &[&persistent_disk_id.as_str()],
+                )?;
+                assert_eq!(changed, 1, "test PersistentDisk Volume must exist");
+                Ok(())
+            })
+        })
+        .await
+        .expect("insert isolated hidden Root Volume residual");
+}
+
+pub async fn remove_deleted_root_volume_residual_for_test(store: &Arc<crate::store::Store>) {
+    store
+        .execute(move |store| {
+            store.with(|client| {
+                let changed = client.execute(
+                    "DELETE FROM volume_records
+                      WHERE volume_id='volume_hidden_read_residual'",
+                    &[],
+                )?;
+                assert_eq!(changed, 1, "test hidden Root Volume residual must exist");
+                Ok(())
+            })
+        })
+        .await
+        .expect("remove isolated hidden Root Volume residual");
+}
+
+/// Break only one scalar authorization projection after a valid completed
+/// Root sweep, so a public read must fail closed and poison local readiness.
+pub async fn corrupt_deleted_root_authorization_projection_for_test(
+    store: &Arc<crate::store::Store>,
+) {
+    store
+        .execute(move |store| {
+            store.with(|client| {
+                let changed = client.execute(
+                    "UPDATE volume_authorizations
+                        SET desired_revision=desired_revision+1
+                      WHERE authorization_id='authorization_read_test'",
+                    &[],
+                )?;
+                assert_eq!(changed, 1, "test disposable authorization must exist");
+                Ok(())
+            })
+        })
+        .await
+        .expect("corrupt isolated disposable Root authorization projection");
+}
+
+/// Put one Cat's JSON workspace and ID projections on the far side of a
+/// keyset cursor while its scalar projections remain on the near side. The
+/// row must still be reachable through the bounded record/record list index.
+pub async fn corrupt_runtime_cat_list_boundary_for_test(
+    store: &Arc<crate::store::Store>,
+    cat_id: cats_api::runtime_reconciliation::Id,
+    claimed_workspace_id: cats_api::runtime_reconciliation::Id,
+) {
+    store
+        .execute(move |store| {
+            store.with(|client| {
+                let changed = client.execute(
+                    "UPDATE cat_records
+                        SET record=jsonb_set(
+                            jsonb_set(record, '{workspace_id}', to_jsonb($2::TEXT)),
+                            '{cat_id}', to_jsonb('cat_zz'::TEXT)
+                        )
+                      WHERE cat_id=$1",
+                    &[&cat_id.as_str(), &claimed_workspace_id.as_str()],
+                )?;
+                assert_eq!(changed, 1, "test Cat must already exist");
+                Ok(())
+            })
+        })
+        .await
+        .expect("corrupt isolated Cat list projections across cursor boundary");
 }
 
 /// Expire one isolated test session while preserving every JSON/projection

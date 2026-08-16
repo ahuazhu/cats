@@ -2645,6 +2645,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn fd64_retains_original_launch_across_admission_gate_and_stable_checkpoint_cas() {
+        // The production ancestry contract requires root-owned scratch; the
+        // Docker and metal root gates execute the full body.
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: root-owned VMM runtime ancestry requires the root gates");
+            return;
+        }
         for tail in [
             RunningTail::OpenAdmission,
             RunningTail::InstallGate,
@@ -2661,6 +2668,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn fd64_rejects_receipt_old_bytes_and_current_retained_identity_drift() {
+        // The production ancestry contract requires root-owned scratch; the
+        // Docker and metal root gates execute the full body.
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: root-owned VMM runtime ancestry requires the root gates");
+            return;
+        }
         assert!(matches!(
             inspect_after_checkpoint_cas(RunningTail::OpenAdmission, false, false, true),
             VmmRuntimePathInspection::Conflict
@@ -2706,6 +2720,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn retained_runtime_path_allows_sibling_children_in_the_same_live_ancestor() {
+        // The production ancestry contract requires root-owned scratch; the
+        // Docker and metal root gates execute the full body.
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: root-owned VMM runtime ancestry requires the root gates");
+            return;
+        }
         let (_temporary, ancestor, retained) = pinned_runtime_path_fixture();
         let original = ancestor.metadata().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -2734,6 +2755,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn retained_runtime_path_rejects_an_ancestor_pathname_replacement() {
+        // The production ancestry contract requires root-owned scratch; the
+        // Docker and metal root gates execute the full body.
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: root-owned VMM runtime ancestry requires the root gates");
+            return;
+        }
         let (_temporary, ancestor, retained) = pinned_runtime_path_fixture();
         let saved = ancestor.with_extension("saved");
         std::fs::rename(&ancestor, &saved).unwrap();

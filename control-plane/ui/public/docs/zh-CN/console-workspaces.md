@@ -35,11 +35,13 @@ CLI、控制台和 HTTP API 都把该边界称为 *Workspace*：资源归属于�
 
 控制台提供：
 
-- 当前工作区的 Cats、休眠状态、磁盘与活跃 Operation 概览。
-- Cat 的创建、启动、Suspend、Warm、Stop、Exec、Expose 与 Destroy。
-- 磁盘的创建、Snapshot、Mount、Unmount、Resize 与 Delete。
+- Workspace-scoped Cat 与 PersistentDisk Create，以及当前 Product Read。
+- Create 响应不明确时，对精确 Request 与 Idempotency-Key 执行浏览器持久化重放。
+- Cat Create 接受后返回精确 Operation Identity；没有 Operation Collection。
 - 按 Meter 与 Cat 展示准实时预估账单，并可查看指定 Cat 的范围总额、分项汇总、费用随时间变化曲线与有界时段详单。
 - 结构化状态/错误展示与自动 Session Refresh。
+
+Signed Runtime Cutover 期间不展示 Lifecycle 或其他 Cat/Disk Mutation Control。浏览器会在本地拒绝这些路径，也不提供 Legacy Fallback。
 
 ## 语言切换
 

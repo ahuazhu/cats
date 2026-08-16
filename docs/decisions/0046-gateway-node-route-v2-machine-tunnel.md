@@ -61,14 +61,15 @@ Control resolve已经由current PostgreSQL Gateway credential签发Grant。若Gr
 
 ## 当前实现边界
 
-Node machine listener、Gateway client primitive、fixed artifact readers和`noded`显式配置后的runtime
-composition已经实现。
-`cats-gatewayd`的public listener仍有意关闭：本ADR不组成public SNI/Host listener、Control resolve client、
-cache到public proxy的完整流水线，也不恢复legacy ingress。未配置production machine artifacts时没有Node
-listener；`None`是明确的closed composition。现有shipped metal installer/systemd仍只携带已退役
-single-key文件，尚无production CA/private-key authority或secret reference可原子安装本ADR的ring/mTLS
-closed set；因此这些部署模板不传`--route-v2-machine-listen`，worker继续运行但Node ingress保持关闭。
-旧`--route-grant-public-key-file`参数在`noded`中保持inert且绝不作为v2 authority读取。
+Node machine listener、Gateway client primitive、fixed artifact readers、`noded`显式配置后的runtime
+composition，以及`cats-gatewayd`的Control resolve→bounded cache→public Host listener→Node tunnel
+byte proxy已经实现；HTTP与WebSocket当前请求都只尝试一次且不恢复legacy ingress。production模板通过
+pre-created immutable Secret name/ARN分发Control七件、Node四件与Gateway固定三件closed set；private bytes
+不进入Terraform state、argv、environment或log。Kubernetes init renderer把projected symlink source复制成
+reader要求的root-owned real files，Control/Gateway分别打开7443/8080，Node打开独立7444 listener，ALB wildcard
+只指向`cats-gatewayd`。Gateway唯一`node-server-ca-bundle.pem`同时验证Control与Node server chain，没有第四
+artifact或独立Control CA artifact。未配置machine listener的非production组合仍以`None`明确保持Closed；
+production systemd已删除旧`--route-grant-public-key-file`参数。
 
 ## 后果
 

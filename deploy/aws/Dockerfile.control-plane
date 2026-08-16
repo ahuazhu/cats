@@ -11,15 +11,22 @@ COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
+ARG CATS_RELEASE_COMMIT_SHA
+ENV CATS_RELEASE_COMMIT_SHA=${CATS_RELEASE_COMMIT_SHA}
 COPY --from=planner /src/recipe.json recipe.json
 RUN cargo chef cook --locked --release --recipe-path recipe.json \
     -p cats-control-plane-daemon
 
 COPY . .
-RUN cargo build --locked --release \
+RUN test "${CATS_RELEASE_COMMIT_SHA}" != "" \
+    && printf '%s' "${CATS_RELEASE_COMMIT_SHA}" | grep -Eq '^[0-9a-f]{40}$' \
+    && cargo build --locked --release \
       -p cats-control-plane-daemon \
+      -p cats-object-write-gatewayd \
     && strip target/release/cats-controld \
-    && install -D -m 0755 target/release/cats-controld /out/cats-controld
+    && strip target/release/cats-object-write-gatewayd \
+    && install -D -m 0755 target/release/cats-controld /out/cats-controld \
+    && install -D -m 0755 target/release/cats-object-write-gatewayd /out/cats-object-write-gatewayd
 
 FROM debian:bookworm-slim AS runtime
 
@@ -31,6 +38,9 @@ RUN apt-get update \
     && install -d -o 0 -g 0 -m 0755 /etc/cats/identity
 
 COPY --from=builder /out/cats-controld /usr/local/bin/cats-controld
+# The object-write gateway Deployment runs this same image with an explicit
+# command; the binary must ship here or that pod can never start.
+COPY --from=builder /out/cats-object-write-gatewayd /usr/local/bin/cats-object-write-gatewayd
 # Produced once by the Guest release job and shared byte-for-byte with the
 # worker bundle. A missing payload is a build failure, never a runtime default.
 COPY --chown=0:0 --chmod=0644 guest-runtime-release.v1/guest-runtime-profile.v1.json /opt/cats/release/guest-runtime-profile.v1.json

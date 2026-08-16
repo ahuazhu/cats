@@ -16,20 +16,19 @@ cats operation wait OPERATION_ID</code></pre>
   <tr><td><code>unavailable</code></td><td>Temporary dependency failure</td><td>Retry with bounded backoff and inspect the Operation.</td></tr>
 </tbody></table>
 
-<h2 id="cat-not-ready">Cat does not become Ready</h2>
+<h2 id="cat-not-ready">Cat does not become Ready after create</h2>
 <ol>
-  <li>Run <code>cats get NAME --json</code> and note desired/observed state and node.</li>
+  <li>Run <code>cats get CAT_ID --json</code> and note desired/observed state and node.</li>
   <li>Inspect the accepted Operation by ID and its terminal result or error.</li>
   <li>Operators check node heartbeat, blockd/Guest readiness, console output, and attachment epoch.</li>
   <li>If Suspended/Warm restore failed, verify the controller converged to Cold fallback instead of remaining in an intermediate state.</li>
 </ol>
 
-<h2 id="disk-busy">Disk cannot mount, resize, or delete</h2>
-<p>Run <code>cats disk get NAME</code>. A PersistentDisk can have only one active read-write Attachment. Unmount it cleanly before moving or deleting it, and follow the current runtime precondition for resize. Never bypass a fencing conflict.</p>
+<h2 id="disk-busy">A Disk mutation is unavailable</h2>
+<p>Run <code>cats disk get DISK_ID</code> to inspect the current projection. Attachment, snapshot, capacity change, and deletion are outside the release product surface. Do not probe a legacy route or bypass an authority/fencing conflict.</p>
 
-<h2 id="auto-suspend">Auto-suspend does not trigger</h2>
-<pre><code>cats sleep status dev</code></pre>
-<p>Check active platform/Guest leases, Guest signal freshness, and the printed reason. A stale signal intentionally fails awake. Confirm that long-running applications release expired work and that no shell, exec, deploy, or gateway activation lease remains.</p>
+<h2 id="lifecycle-unavailable">A lifecycle command is unavailable</h2>
+<p>Lifecycle and Guest-command clients are intentionally absent during the signed runtime cutover. Preserve the accepted create Operation ID and current Cat projection; do not substitute an old command or route.</p>
 
 <h2 id="control-plane">Control plane is unreachable</h2>
 <p>Existing Running Cats may continue because API processes are not in the Guest I/O hot path. New lifecycle changes and durable root publication may be delayed or fail closed. Do not claim a FLUSH succeeded while the authoritative metadata CAS is unavailable.</p>

@@ -635,6 +635,47 @@ async fn cleanup_has_reserved_capacity_and_runs_before_queued_requests() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn joinable_leadership_cleanup_waits_for_saturated_reserved_capacity() {
+    let executor = BlockingExecutor::new(
+        "cats-control-pg-joinable-cleanup-test",
+        Limits {
+            workers: 1,
+            queue_capacity: 1,
+            cleanup_capacity: 1,
+        },
+    )
+    .unwrap();
+    let (release_active, wait_for_release) = mpsc::channel();
+    let active = executor
+        .try_execute(move || wait_for_release.recv().unwrap())
+        .unwrap();
+    while executor.snapshot().active != 1 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        executor.try_execute_cleanup(|| {}).is_ok(),
+        "the first cleanup fills the reserved queue"
+    );
+    assert_eq!(executor.snapshot().cleanup_queued, 1);
+
+    let physically_closed = Arc::new(AtomicUsize::new(0));
+    let completed = Arc::clone(&physically_closed);
+    let mut cleanup = Box::pin(execute_leadership_cleanup_on(&executor, move || {
+        completed.store(1, Ordering::SeqCst);
+    }));
+    tokio::select! {
+        result = &mut cleanup => panic!("joinable cleanup bypassed saturation: {result:?}"),
+        () = tokio::time::sleep(Duration::from_millis(50)) => {}
+    }
+    assert_eq!(physically_closed.load(Ordering::SeqCst), 0);
+
+    release_active.send(()).unwrap();
+    cleanup.await.unwrap();
+    assert_eq!(physically_closed.load(Ordering::SeqCst), 1);
+    active.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn poisoned_store_mutex_still_releases_the_physical_connection() {
     let url = crate::testsupport::isolated_control_store_url();
     let store = Store::connect(&url, None).unwrap();
@@ -1526,6 +1567,76 @@ async fn two_replicas_recover_after_established_connections_are_severed() {
     assert!(snapshot.normal.active <= CONTROL_STORE_BLOCKING_WORKERS);
     assert!(snapshot.normal.queued <= CONTROL_STORE_QUEUE_CAPACITY);
     assert!(snapshot.admission_depth <= snapshot.admission_capacity);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn managed_usage_projector_shutdown_joins_before_standby_takeover() {
+    let dsn = crate::testsupport::isolated_control_store_url();
+    let leader_store = Arc::new(Store::connect(&dsn, None).unwrap());
+    let standby_store = Arc::new(Store::connect(&dsn, None).unwrap());
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let starts = Arc::new(AtomicUsize::new(0));
+    let events = Arc::new(Mutex::new(Vec::new()));
+
+    let leader =
+        crate::server::spawn_managed_singleton_task(leader_store, SingletonRole::UsageProjector, {
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            let starts = Arc::clone(&starts);
+            let events = Arc::clone(&events);
+            move || {
+                run_pending_test_role(
+                    "leader",
+                    Arc::clone(&active),
+                    Arc::clone(&max_active),
+                    Arc::clone(&starts),
+                    Arc::clone(&events),
+                )
+            }
+        });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while starts.load(Ordering::SeqCst) != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the managed UsageProjector must acquire leadership");
+
+    let standby =
+        crate::server::spawn_singleton_task(standby_store, SingletonRole::UsageProjector, {
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            let starts = Arc::clone(&starts);
+            let events = Arc::clone(&events);
+            move || {
+                run_pending_test_role(
+                    "standby",
+                    Arc::clone(&active),
+                    Arc::clone(&max_active),
+                    Arc::clone(&starts),
+                    Arc::clone(&events),
+                )
+            }
+        });
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(starts.load(Ordering::SeqCst), 1, "the standby is fenced");
+
+    leader.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while starts.load(Ordering::SeqCst) != 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the standby must acquire after joined projector shutdown");
+    assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        ["leader:start", "leader:stop", "standby:start"]
+    );
+    standby.abort();
+    let _ = standby.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -48,7 +48,10 @@ use super::clean_slate_probes::{
 use super::clean_slate_probes::{
     runtime_checkpoint_recovery_set, InstalledStaleBootVmmRecoveryPorts,
 };
+#[cfg(feature = "proposed-node-residue-reclamation")]
+use super::recover_lifecycle_release_from_authority;
 use super::serving_handoff::ServingHandoffStore;
+use super::DisposableRootDeleteAttempt;
 #[cfg(test)]
 use super::RootProvisionProcessRetirementPort;
 use super::{
@@ -94,6 +97,29 @@ pub(crate) trait SignedNormalAcquirePort: Send + Sync + 'static {
         deadline: Instant,
     ) -> Result<NormalReleaseAttempt, NormalAcquireClientError>;
 
+    fn lifecycle_release(
+        &self,
+        _request: &RuntimeVolumeTransitionRequest,
+        _volume: &VolumeIntent,
+        _expected_head: &RemoteHead,
+        _accepted: &NormalAcquireAcceptedContext,
+        _deadline: Instant,
+    ) -> Result<NormalReleaseAttempt, NormalAcquireClientError> {
+        Ok(NormalReleaseAttempt::StopForLocalContract)
+    }
+
+    fn delete_disposable_root(
+        &self,
+        _request: &RuntimeVolumeTransitionRequest,
+        _volume: &VolumeIntent,
+        _expected_epoch: FenceEpoch,
+        _expected_head: &RemoteHead,
+        _accepted: &NormalAcquireAcceptedContext,
+        _deadline: Instant,
+    ) -> Result<DisposableRootDeleteAttempt, NormalAcquireClientError> {
+        Ok(DisposableRootDeleteAttempt::StopForLocalContract)
+    }
+
     fn commit_initialized(
         &self,
         request: &RuntimeVolumeTransitionRequest,
@@ -103,6 +129,84 @@ pub(crate) trait SignedNormalAcquirePort: Send + Sync + 'static {
     ) -> Result<super::CommitInitializedAttempt, NormalAcquireClientError> {
         let _ = (request, volume, accepted, deadline);
         Err(NormalAcquireClientError::InvalidVolumeBinding)
+    }
+}
+
+/// Lifecycle-only signed A22 surface.  The lifecycle dispatcher cannot call
+/// Running acquire/takeover/provision methods through this capability.
+pub(crate) trait SignedLifecycleVolumePort: Send + Sync + 'static {
+    fn release(
+        &self,
+        request: &RuntimeVolumeTransitionRequest,
+        volume: &VolumeIntent,
+        expected_head: &RemoteHead,
+        accepted: &NormalAcquireAcceptedContext,
+        deadline: Instant,
+    ) -> Result<NormalReleaseAttempt, NormalAcquireClientError>;
+
+    fn delete_disposable_root(
+        &self,
+        request: &RuntimeVolumeTransitionRequest,
+        volume: &VolumeIntent,
+        expected_epoch: FenceEpoch,
+        expected_head: &RemoteHead,
+        accepted: &NormalAcquireAcceptedContext,
+        deadline: Instant,
+    ) -> Result<DisposableRootDeleteAttempt, NormalAcquireClientError>;
+
+    fn recover_authorization(
+        &self,
+        request: &RuntimeVolumeTransitionEvidenceRequest,
+        deadline: Instant,
+    ) -> Result<VolumeEvidenceRecovery, super::VolumeEvidenceClientError>;
+}
+
+struct SignedLifecycleVolumeAdapter {
+    inner: Arc<dyn SignedNormalAcquirePort>,
+    evidence: Option<Arc<dyn SignedVolumeEvidencePort>>,
+}
+
+impl SignedLifecycleVolumePort for SignedLifecycleVolumeAdapter {
+    fn release(
+        &self,
+        request: &RuntimeVolumeTransitionRequest,
+        volume: &VolumeIntent,
+        expected_head: &RemoteHead,
+        accepted: &NormalAcquireAcceptedContext,
+        deadline: Instant,
+    ) -> Result<NormalReleaseAttempt, NormalAcquireClientError> {
+        self.inner
+            .lifecycle_release(request, volume, expected_head, accepted, deadline)
+    }
+
+    fn delete_disposable_root(
+        &self,
+        request: &RuntimeVolumeTransitionRequest,
+        volume: &VolumeIntent,
+        expected_epoch: FenceEpoch,
+        expected_head: &RemoteHead,
+        accepted: &NormalAcquireAcceptedContext,
+        deadline: Instant,
+    ) -> Result<DisposableRootDeleteAttempt, NormalAcquireClientError> {
+        self.inner.delete_disposable_root(
+            request,
+            volume,
+            expected_epoch,
+            expected_head,
+            accepted,
+            deadline,
+        )
+    }
+
+    fn recover_authorization(
+        &self,
+        request: &RuntimeVolumeTransitionEvidenceRequest,
+        deadline: Instant,
+    ) -> Result<VolumeEvidenceRecovery, super::VolumeEvidenceClientError> {
+        let Some(evidence) = &self.evidence else {
+            return Ok(VolumeEvidenceRecovery::AuthorizationEvidenceUnavailable);
+        };
+        evidence.recover_authorization(request, deadline)
     }
 }
 
@@ -142,6 +246,44 @@ where
             self,
             request,
             volume,
+            expected_head,
+            accepted,
+            deadline,
+        )
+    }
+
+    fn lifecycle_release(
+        &self,
+        request: &RuntimeVolumeTransitionRequest,
+        volume: &VolumeIntent,
+        expected_head: &RemoteHead,
+        accepted: &NormalAcquireAcceptedContext,
+        deadline: Instant,
+    ) -> Result<NormalReleaseAttempt, NormalAcquireClientError> {
+        ControlSignedNormalAcquireClient::lifecycle_release(
+            self,
+            request,
+            volume,
+            expected_head,
+            accepted,
+            deadline,
+        )
+    }
+
+    fn delete_disposable_root(
+        &self,
+        request: &RuntimeVolumeTransitionRequest,
+        volume: &VolumeIntent,
+        expected_epoch: FenceEpoch,
+        expected_head: &RemoteHead,
+        accepted: &NormalAcquireAcceptedContext,
+        deadline: Instant,
+    ) -> Result<DisposableRootDeleteAttempt, NormalAcquireClientError> {
+        ControlSignedNormalAcquireClient::delete_disposable_root(
+            self,
+            request,
+            volume,
+            expected_epoch,
             expected_head,
             accepted,
             deadline,
@@ -505,6 +647,106 @@ impl SignedRunningPublicationRecovery {
         })
     }
 
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    fn recover_released_data_directory_prefix(
+        &self,
+        context: &RuntimePreScanRecoveryContext,
+        cat_id: &Id,
+        retained: &super::residue_reclaim::RetainedEmptyDataDirectoryPrefix,
+    ) -> anyhow::Result<RuntimePreScanRecoveryOutcome> {
+        let desired = context
+            .coordinates()
+            .desired
+            .desired_specs
+            .iter()
+            .find(|desired| &desired.cat_id == cat_id)
+            .context("released data-prefix Cat is absent from current Desired")?;
+        let checkpoint_directory = context.state_directory().path().join(CHECKPOINT_NAMESPACE);
+        let store =
+            FileCheckpointStore::open_preserving_checkpoint_temp(&checkpoint_directory, cat_id)
+                .context("open released data-prefix checkpoint store")?;
+        let Some(stored) = store
+            .load()
+            .context("load released data-prefix checkpoint")?
+        else {
+            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+        };
+        let ReconcileStep::CleanupRelease { cleanup } = &stored.checkpoint().step else {
+            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+        };
+        let CleanupTarget::Volume { volume_id, .. } = &cleanup.target else {
+            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+        };
+        let Some(expected_generation) = cleanup
+            .volume_release
+            .as_ref()
+            .map(|replay| replay.generation)
+        else {
+            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+        };
+        context.check_active()?;
+        let record = match self.authority.load_volume(volume_id) {
+            Ok(record) => record,
+            Err(_) => return Ok(RuntimePreScanRecoveryOutcome::NoChange),
+        };
+        if record.head.generation != expected_generation {
+            return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+        }
+        if let Some(volume) = desired
+            .volumes
+            .iter()
+            .find(|volume| &volume.volume_id == volume_id)
+        {
+            let request = release_transition_request(desired, cleanup.clone());
+            let recovery =
+                recover_lifecycle_release_from_authority(&request, volume, &record.head, &record);
+            if !matches!(recovery, Ok(NormalReleaseAuthorityRecovery::Released(_))) {
+                return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+            }
+        } else {
+            if !super::lifecycle_steps::cold_membership_detach_cleanup_checkpoint_is_supported(
+                desired,
+                stored.checkpoint(),
+            ) {
+                return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+            }
+            let Some(checkpointed) = stored
+                .checkpoint()
+                .volumes
+                .iter()
+                .find(|volume| &volume.volume_id == volume_id)
+            else {
+                return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+            };
+            if !super::lifecycle_steps::released_cache_record_matches_checkpoint(
+                &record,
+                checkpointed,
+            ) || !super::lifecycle_steps::released_cache_record_matches_cleanup_checkpoint(
+                &record,
+                stored.checkpoint(),
+            ) {
+                return Ok(RuntimePreScanRecoveryOutcome::NoChange);
+            }
+        }
+        let current = store
+            .assert_current(&stored)
+            .context("retain released data-prefix checkpoint")?;
+        context.check_active()?;
+        store
+            .revalidate_current(&stored, &current)
+            .context("revalidate released data-prefix checkpoint before unlink")?;
+        let physical = context.inventory_context();
+        retained
+            .reclaim_after_exact_release(&physical)
+            .context("remove exact empty released data-directory prefix")?;
+        store
+            .revalidate_current(&stored, &current)
+            .context("revalidate released data-prefix checkpoint after unlink")?;
+        Ok(RuntimePreScanRecoveryOutcome::Recovered {
+            cat_id: cat_id.clone(),
+        })
+    }
+
     fn recover_root_provision_stop_receipt(
         &self,
         context: &RuntimePreScanRecoveryContext,
@@ -643,6 +885,10 @@ impl RuntimePreScanRecovery for SignedRunningPublicationRecovery {
             LocalPublicationRecoveryEvidence::AuthorizedBlockd { cat_id } => {
                 self.recover_authorized_blockd(&context, &cat_id, false)
             }
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            LocalPublicationRecoveryEvidence::ReleasedDataDirectoryPrefix { cat_id, retained } => {
+                self.recover_released_data_directory_prefix(&context, &cat_id, retained.as_ref())
+            }
             LocalPublicationRecoveryEvidence::AuthorizedBlockdTakeoverPublication { cat_id } => {
                 self.recover_authorized_blockd(&context, &cat_id, true)
             }
@@ -748,6 +994,13 @@ impl SignedRunningAcquireEffect {
 
     pub(crate) fn volume_transition_port(&self) -> Arc<dyn SignedNormalAcquirePort> {
         Arc::clone(&self.volume_transition)
+    }
+
+    pub(crate) fn lifecycle_volume_port(&self) -> Arc<dyn SignedLifecycleVolumePort> {
+        Arc::new(SignedLifecycleVolumeAdapter {
+            inner: Arc::clone(&self.volume_transition),
+            evidence: self.volume_evidence.clone(),
+        })
     }
 
     #[cfg(test)]
@@ -3077,6 +3330,9 @@ fn attachment_from_checkpoint_acquire(
             node_id: checkpoint.node_id.clone(),
             placement_epoch: checkpoint.placement_epoch,
         },
+        // Node-side object-write credential registration is not composed
+        // yet; qualified object-write publish paths fail closed on None.
+        object_write_credential: None,
         size_bytes: record.size_bytes,
         durability: record.durability,
         head: result.resulting_head.clone(),
@@ -3138,6 +3394,9 @@ fn attachment_from_current_desired(
             node_id: desired.placement.node_id.clone(),
             placement_epoch: desired.placement.placement_epoch,
         },
+        // Node-side object-write credential registration is not composed
+        // yet; qualified object-write publish paths fail closed on None.
+        object_write_credential: None,
         size_bytes: record.size_bytes,
         durability: record.durability,
         head: result.resulting_head.clone(),
@@ -3285,6 +3544,9 @@ fn takeover_attachment_from_signed_evidence(
             node_id: desired.placement.node_id.clone(),
             placement_epoch: desired.placement.placement_epoch,
         },
+        // Node-side object-write credential registration is not composed
+        // yet; qualified object-write publish paths fail closed on None.
+        object_write_credential: None,
         size_bytes: volume.size_bytes,
         durability: volume.durability,
         // This publication is the immutable R0 acquire artifact. A signed
@@ -5395,6 +5657,7 @@ mod tests {
             volume_id: volume.volume_id.clone(),
             expected_attachment_id: id("att-root-old"),
             expected_epoch: fence(9),
+            expected_head: existing_head.clone(),
             new_attachment_id: volume.attachment_id.clone(),
             desired_revision: desired.desired_revision,
             new_placement_epoch: desired.placement.placement_epoch,
@@ -5547,6 +5810,7 @@ mod tests {
             volume_id: volume.volume_id.clone(),
             expected_attachment_id: id("old-root-attachment"),
             expected_epoch: fence(7),
+            expected_head: head.clone(),
             new_attachment_id: volume.attachment_id.clone(),
             desired_revision: desired.desired_revision,
             new_placement_epoch: desired.placement.placement_epoch,
@@ -5961,6 +6225,7 @@ mod tests {
             volume_id: persistent.volume_id.clone(),
             expected_attachment_id: id("att-persistent-old"),
             expected_epoch: fence(7),
+            expected_head: blank_head(),
             new_attachment_id: persistent.attachment_id.clone(),
             desired_revision: desired.desired_revision,
             new_placement_epoch: desired.placement.placement_epoch,
@@ -11814,6 +12079,7 @@ mod tests {
                 node_id: desired.placement.node_id.clone(),
                 placement_epoch: desired.placement.placement_epoch,
             },
+            object_write_credential: None,
             size_bytes: volume.size_bytes,
             durability: volume.durability,
             head: blank_head(),
@@ -11852,6 +12118,7 @@ mod tests {
             volume_id: volume.volume_id.clone(),
             expected_attachment_id: prior_attachment_id.clone(),
             expected_epoch: prior_epoch,
+            expected_head: blank_head(),
             new_attachment_id: volume.attachment_id.clone(),
             desired_revision: desired.desired_revision,
             new_placement_epoch: desired.placement.placement_epoch,
@@ -11941,9 +12208,14 @@ mod tests {
         head: RemoteHead,
     ) {
         attachment.head = head.clone();
-        let AuthorizedServingAcquire::Takeover { receipt, .. } = &mut attachment.acquire else {
+        let AuthorizedServingAcquire::Takeover {
+            authorization,
+            receipt,
+        } = &mut attachment.acquire
+        else {
             panic!("takeover fixture must retain a takeover attachment")
         };
+        authorization.expected_head = head.clone();
         receipt.resulting_head = head.clone();
         record.head = head.clone();
         let VolumeAuthorityEvidence::Owned {
@@ -11956,6 +12228,11 @@ mod tests {
         let VolumeEvidenceRecovery::Validated { evidence, decision } = evidence else {
             panic!("takeover fixture must retain validated evidence")
         };
+        if let cats_api::runtime_reconciliation::VolumeAuthorization::Takeover(inner) =
+            &mut evidence.authorization.authorization
+        {
+            inner.expected_head = head.clone();
+        }
         let AuthorizationState::Consumed(stored) = &mut evidence.authorization.state else {
             panic!("takeover fixture authorization must remain consumed")
         };

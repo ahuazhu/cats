@@ -1,6 +1,7 @@
 //! Durable usage delivery remains independent after the legacy heartbeat and
 //! work-status transports have been removed.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -15,7 +16,9 @@ use cats_api::agent_registration::{
     verify_request_proof, Ed25519RequestSigner, JSON_CONTENT_TYPE, NODE_CREDENTIAL_ID_HEADER,
     NODE_PUBLIC_KEY_SPKI_HEADER, NODE_SIGNATURE_HEADER, REGISTRATION_PATH,
 };
-use cats_api::metering::{CatUsageCheckpoint, UsageMetric};
+use cats_api::metering::{
+    CatUsageCheckpoint, IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse, UsageMetric,
+};
 use cats_api::nodejob::{job_id, NodeJob, NodeJobAction, VolumeGrant};
 use cats_api::resources::ObservedState;
 use cats_api::runtime_reconciliation::{
@@ -29,11 +32,13 @@ use cats_node_agent::runtime::NodeRuntime;
 use cats_node_agent::server::{spawn, ServerConfig};
 use cats_node_agent::usage_spool::UsageSpool;
 use cats_storage::MetadataStore;
-use cats_test_support::{fake_node_config, NodeConfigBuilder, TempDirFixture};
+use cats_test_support::{fake_node_config, workspace_example, NodeConfigBuilder, TempDirFixture};
 
 const HEARTBEAT_MS: u64 = 200;
 const WORK_PRODUCER_CAT: &str = "cat_work_producer";
 const WORK_PRODUCER_GENERATION: i64 = 1;
+const WORK_PRODUCER_ATTACHMENT_EPOCH: i64 = 1;
+const WORK_PRODUCER_VOLUME_BYTES: u64 = 2 * cats_api::chunk::CHUNK_SIZE as u64;
 
 /// Longer than any plausible lease, so if liveness is coupled to upload at all
 /// the heartbeat gap becomes unmistakable rather than marginal.
@@ -66,9 +71,30 @@ async fn mock_usage_hang(State(cp): State<MockControlPlane>) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-async fn mock_usage_ok(State(cp): State<MockControlPlane>) -> StatusCode {
+async fn mock_usage_ok(State(cp): State<MockControlPlane>, body: Bytes) -> Response {
     cp.usage_attempts.fetch_add(1, Ordering::SeqCst);
-    StatusCode::NO_CONTENT
+    let request: IngestUsageCheckpointsRequest = serde_json::from_slice(&body).unwrap();
+    (
+        [("content-type", JSON_CONTENT_TYPE)],
+        serde_json::to_vec(&IngestUsageCheckpointsResponse {
+            accepted: u64::try_from(request.checkpoints.len()).unwrap(),
+            duplicates: 0,
+            rejected: Vec::new(),
+            results: request
+                .checkpoints
+                .into_iter()
+                .map(
+                    |checkpoint| cats_api::metering::UsageCheckpointIngestResult {
+                        event_id: checkpoint.event_id,
+                        outcome: cats_api::metering::UsageCheckpointIngestOutcome::Accepted,
+                        reason: None,
+                    },
+                )
+                .collect(),
+        })
+        .unwrap(),
+    )
+        .into_response()
 }
 
 async fn mock_registration(
@@ -174,6 +200,7 @@ fn seed_spool(state_dir: &std::path::Path) {
             cat_id: "cat_seed".into(),
             cat_generation: 1,
             metric: UsageMetric::CpuUsec,
+            epoch_marker: cats_api::metering::UsageEpochMarker::Open,
             cumulative_quantity: 1_000,
         }])
         .unwrap();
@@ -182,6 +209,7 @@ fn seed_spool(state_dir: &std::path::Path) {
 async fn start_agent(
     dir: &TempDirFixture,
     control_plane_url: String,
+    blockd_fixture: Option<PathBuf>,
 ) -> cats_node_agent::server::Handle {
     let state_dir = dir.path().join("node-a");
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -204,6 +232,12 @@ async fn start_agent(
         NodeIdentity {
             version: ContractVersion::V1,
             node_id: Id::new("node_a").unwrap(),
+            provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+                provider: Id::new("test_provider").unwrap(),
+                partition: Id::new("test_partition").unwrap(),
+                account_id: Id::new("test_account").unwrap(),
+                region: Id::new("test_region").unwrap(),
+            },
             immutable_host_id: Id::new("host_a").unwrap(),
             credential_id: signer.credential_id().clone(),
             credential_binding: CredentialBinding::PublicKey {
@@ -222,6 +256,9 @@ async fn start_agent(
         fake_node_config!(
             NodeConfigBuilder::new(dir.path(), "node_a".to_string()).with_state_dir(state_dir)
         );
+    if let Some(blockd_fixture) = blockd_fixture {
+        node_config.blockd_bin = blockd_fixture;
+    }
     node_config.state_dir = registration.runtime_state_directory();
     spawn(ServerConfig {
         listen: "127.0.0.1:0".into(),
@@ -242,6 +279,145 @@ async fn start_agent(
     .unwrap()
 }
 
+/// The production blockd deliberately has no legacy volume-creation or
+/// unsigned-serving mode. This launcher accepts only the exact FakeVmm test
+/// argv, then `exec`s the repository's explicit SQLite authorized-serving test
+/// program so the tracked child PID remains the actual NBD server. The fixture
+/// validates the legacy control/budget arguments but intentionally exposes only
+/// NBD: this test tears down through `Discard`, while its control-plane oracle
+/// is the independently calibrated Guest work target rather than blockd status.
+fn prepare_work_producer_blockd_fixture(root: &Path) -> PathBuf {
+    let metadata_path = root.join("meta.db");
+    let metadata = SqliteMetadataStore::open(&metadata_path).unwrap();
+    metadata
+        .create_volume("vol_work_producer", WORK_PRODUCER_VOLUME_BYTES)
+        .unwrap();
+
+    let fixture_dir = root.join("work-producer-blockd-fixture");
+    std::fs::create_dir_all(&fixture_dir).unwrap();
+    let server_link = fixture_dir.join("sqlite-nbd-test-server");
+    std::os::unix::fs::symlink(
+        workspace_example("cats-blockd", "sqlite_nbd_test_server"),
+        &server_link,
+    )
+    .unwrap();
+    let launcher = fixture_dir.join("cats-blockd");
+    let script = r#"#!/bin/sh
+set -eu
+
+die() {
+  printf '%s\n' "$1" >&2
+  exit 64
+}
+
+volume_id=
+data_dir=
+attachment_id=
+metadata_adapter=
+object_adapter=
+nbd_socket=
+lease_ttl_ms=
+control_socket=
+metadata_path=
+blob_root=
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --volume-id)
+      [ -z "$volume_id" ] && [ "$#" -ge 2 ] || die 'invalid volume-id argument'
+      volume_id=$2
+      shift 2
+      ;;
+    --data-dir)
+      [ -z "$data_dir" ] && [ "$#" -ge 2 ] || die 'invalid data-dir argument'
+      data_dir=$2
+      shift 2
+      ;;
+    --attachment-id)
+      [ -z "$attachment_id" ] && [ "$#" -ge 2 ] || die 'invalid attachment-id argument'
+      attachment_id=$2
+      shift 2
+      ;;
+    --metadata-store-adapter)
+      [ -z "$metadata_adapter" ] && [ "$#" -ge 2 ] || die 'invalid metadata adapter argument'
+      metadata_adapter=$2
+      shift 2
+      ;;
+    --object-store-adapter)
+      [ -z "$object_adapter" ] && [ "$#" -ge 2 ] || die 'invalid object adapter argument'
+      object_adapter=$2
+      shift 2
+      ;;
+    --listen-unix)
+      [ -z "$nbd_socket" ] && [ "$#" -ge 2 ] || die 'invalid NBD socket argument'
+      nbd_socket=$2
+      shift 2
+      ;;
+    --lease-ttl-ms)
+      [ -z "$lease_ttl_ms" ] && [ "$#" -ge 2 ] || die 'invalid lease TTL argument'
+      lease_ttl_ms=$2
+      shift 2
+      ;;
+    --listen-control)
+      [ -z "$control_socket" ] && [ "$#" -ge 2 ] || die 'invalid control socket argument'
+      control_socket=$2
+      shift 2
+      ;;
+    --metadata-store-option)
+      [ -z "$metadata_path" ] && [ "$#" -ge 2 ] || die 'invalid metadata option'
+      case "$2" in
+        path=*) metadata_path=${2#path=} ;;
+        *) die 'unexpected metadata option' ;;
+      esac
+      shift 2
+      ;;
+    --object-store-option)
+      [ -z "$blob_root" ] && [ "$#" -ge 2 ] || die 'invalid object option'
+      case "$2" in
+        root=*) blob_root=${2#root=} ;;
+        *) die 'unexpected object option' ;;
+      esac
+      shift 2
+      ;;
+    --max-staged-bytes|--max-staged-packs|--max-local-bytes)
+      [ "$#" -ge 2 ] || die 'missing bounded-storage argument'
+      case "$2" in
+        ''|*[!0-9]*) die 'invalid bounded-storage argument' ;;
+      esac
+      shift 2
+      ;;
+    *)
+      die "unexpected FakeVmm blockd argument: $1"
+      ;;
+  esac
+done
+
+[ "$metadata_adapter" = sqlite ] || die 'FakeVmm fixture requires SQLite metadata'
+[ "$object_adapter" = file ] || die 'FakeVmm fixture requires file object storage'
+[ -n "$volume_id" ] || die 'missing volume ID'
+[ -n "$data_dir" ] || die 'missing data directory'
+[ -n "$attachment_id" ] || die 'missing attachment ID'
+[ -n "$nbd_socket" ] || die 'missing NBD socket'
+[ -n "$lease_ttl_ms" ] || die 'missing lease TTL'
+[ -n "$control_socket" ] || die 'missing control socket identity'
+[ -n "$metadata_path" ] || die 'missing metadata path'
+[ -n "$blob_root" ] || die 'missing object root'
+
+exec "${0%/*}/sqlite-nbd-test-server" \
+  "$volume_id" "$attachment_id" "@ATTACHMENT_EPOCH@" "$lease_ttl_ms" \
+  "$data_dir" "$metadata_path" "$blob_root" "$nbd_socket"
+"#
+    .replace(
+        "@ATTACHMENT_EPOCH@",
+        &WORK_PRODUCER_ATTACHMENT_EPOCH.to_string(),
+    );
+    std::fs::write(&launcher, script).unwrap();
+    let mut permissions = std::fs::metadata(&launcher).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&launcher, permissions).unwrap();
+    launcher
+}
+
 fn start_work_producer_job() -> NodeJob {
     NodeJob {
         job_id: job_id(WORK_PRODUCER_CAT, WORK_PRODUCER_GENERATION, "start_cat"),
@@ -255,8 +431,8 @@ fn start_work_producer_job() -> NodeJob {
                 disk_id: "root_work_producer".into(),
                 volume_id: "vol_work_producer".into(),
                 attachment_id: "att_work_producer".into(),
-                epoch: 0,
-                size_bytes: 2 * cats_api::chunk::CHUNK_SIZE as u64,
+                epoch: WORK_PRODUCER_ATTACHMENT_EPOCH,
+                size_bytes: WORK_PRODUCER_VOLUME_BYTES,
                 mount_path: "/".into(),
                 durability: Default::default(),
             }],
@@ -425,7 +601,7 @@ async fn start_running_work_producer(
 async fn a_hanging_usage_upload_does_not_delay_the_heartbeat() {
     let dir = TempDirFixture::new();
     let (cp, url) = start_mock(true).await;
-    let _agent = start_agent(&dir, url).await;
+    let _agent = start_agent(&dir, url, None).await;
 
     // Enough ticks that a single coupled upload would be obvious: with the old
     // inline call the second heartbeat would not arrive for 10 s.
@@ -443,7 +619,8 @@ async fn a_hanging_usage_upload_does_not_delay_the_heartbeat() {
 async fn usage_upload_runs_on_its_own_channel() {
     let dir = TempDirFixture::new();
     let (cp, url) = start_mock(false).await;
-    let agent = start_agent(&dir, url).await;
+    let blockd_fixture = prepare_work_producer_blockd_fixture(dir.path());
+    let agent = start_agent(&dir, url, Some(blockd_fixture)).await;
     let producer = start_running_work_producer(&agent).await;
 
     tokio::time::sleep(Duration::from_millis(HEARTBEAT_MS * 10)).await;
@@ -458,13 +635,10 @@ async fn usage_upload_runs_on_its_own_channel() {
 #[test]
 fn panicking_calibration_reaps_its_exact_fakevmm_children() {
     let dir = TempDirFixture::new();
-    let runtime = Arc::new(
-        NodeRuntime::new(fake_node_config!(NodeConfigBuilder::new(
-            dir.path(),
-            "node_panic_cleanup",
-        )))
-        .unwrap(),
-    );
+    let mut node_config =
+        fake_node_config!(NodeConfigBuilder::new(dir.path(), "node_panic_cleanup",));
+    node_config.blockd_bin = prepare_work_producer_blockd_fixture(dir.path());
+    let runtime = Arc::new(NodeRuntime::new(node_config).unwrap());
     let observed_pids = Arc::new(Mutex::new(None));
     let capture = Arc::clone(&observed_pids);
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {

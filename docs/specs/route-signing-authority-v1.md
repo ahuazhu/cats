@@ -1,7 +1,8 @@
 # Route v2 Signing Authority v1
 
-- 状态：Frozen target contract；artifact codecs/readers、PG initial/current binding、Control machine
-  resolve current compare与Node installed-ring observation已实现，installer和持久rotation rollout尚未实现
+- 状态：Frozen contract；artifact codecs/readers、PG exact lineage/current binding、Control machine resolve
+  current compare、Node durable successor installer及schema 15持久rotation/revocation state machine已实现；
+  ADR尚未授予production caller/transport触发该Store transition的权限，因此production invocation保持关闭
 - 决策：[ADR-0044](../decisions/0044-independent-route-v2-signing-authority.md)
 - Grant 与 admission：[Route Grant v2](route-grant-v2.md)
 - Node observation：[Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)
@@ -84,7 +85,8 @@ Ed25519 SPKI DER（`302a300506032b6570032100 || raw-32-byte-key`），普通 SHA
 
 revision 1必须`expected_previous=null`；revision N>1必须携带N-1的exact version/digest。gap、rollback、
 same version different digest、错previous、超八把、非严格排序、重复SPKI/kid或kid/SPKI不等都拒绝，旧
-ring继续有效。空ring是合法加载结果但不接受任何Grant；它与artifact unavailable不同。
+ring继续有效。空ring是合法加载结果但不接受任何Grant；它与artifact unavailable不同。revision 1可为空；
+successor空ring只用于§5的持久emergency disable/close步骤。
 
 Node installer必须先在同filesystem temporary file完整验证candidate和expected-previous，再fsync file、
 atomic rename到fixed path并fsync parent，最后才原子swap进程内整环。crash在rename前保留old；rename后restart
@@ -92,7 +94,11 @@ atomic rename到fixed path并fsync parent，最后才原子swap进程内整环�
 `ring_version`、`key_ring_digest`和sorted `loaded_kids`。production scanner 现已从固定路径每轮只读一次，
 把artifact构造成完整in-process verifier replacement后投影该exact observation；artifact缺席只投影
 unavailable，存在但partial/corrupt/unsafe/读取不稳定时
-整轮不提交 full observation，且 deadline/cancel 后的 late result 不缓存。installer 仍未实现。
+整轮不提交 full observation，且 deadline/cancel 后的 late result 不缓存。successor installer使用同一
+cancellation/publication CAS；只有fixed file完成temp fsync、rename、parent fsync且in-process verifier原子swap后才返回ACK。
+安装或replay空ring还必须在返回ACK前调用同一production composition的`AdmissionCellRegistry::fail_close_all`；
+它关闭新admission并取消现有guard，restart仍按既有规则从Closed开始。后续full inventory以gate Closed、guard归零
+和exact empty-ring observation证明该reachable Node已闭门。
 
 ## 4. Control signer descriptor
 
@@ -139,7 +145,10 @@ exact bytes SHA-256 是
 以`deployment_id + signer_revision + expected_previous`做exact CAS并永久保存每个revision/digest、
 secret-reference/kid lineage；same exact revision replay零写，same revision不同bytes、gap、stale、曾retire
 的reference/kid复用全部fail startup。当前initial-install slice只接受revision 1/null previous或其exact
-零写replay；即使本地artifact是合法successor也不会自动推进PG current。successor/rotation writer仍未实现。
+零写replay；即使本地artifact是合法successor也不会自动推进PG current。后续revision只由typed rotation/
+revocation transition在singleton lock内推进；调用者不能提供ACK布尔值、private bytes或时间。该Store边界
+本身不建立operator principal、wire protocol或DSN权限；A23与startup artifact均不得调用它，在另有Accepted
+authority前production没有触发入口。
 
 每次resolve的单一PG signer snapshot最终还必须比较进程内`deployment_id/signer_revision/reference digest/
 active kid/secret reference`与current persisted state。旧replica即使仍能访问旧private file也只能返回503。
@@ -163,16 +172,20 @@ disabled、stale或投影损坏时，触发请求返回503，同时永久关闭�
    equality仍不可retire。此间只能在old private仍存在且overlap ring仍发布时回切。
 4. deadline后发布只含new的下一ring revision；已有overlap ACK的Node仍可接new token，移除artifact逐Node
    原子加载。再次等待全部schedulable Node exact ACK。
-5. signer CAS确认retention、new-only published pointer及全部ACK后永久retire old kid/reference lineage；随后
-   secret channel才可删除old private material。public/private deletion不能提前，也不靠文件缺席推断retire。
+5. signer CAS确认retention、new-only published pointer及全部ACK后永久retire old kid/reference lineage；
+   secret channel只能以该持久retired lineage为前提删除old private material。public/private deletion不能提前，
+   也不靠文件缺席推断retire。
 
 resolve只为其同一fresh observation ring中含current active kid的Node签发。因此staging期间old-only和overlap
 Node可继续接old token；switch后任何回退到old-only artifact的Node立即不可签发。ring version/digest主要是
 rotation/uncordon ACK CAS，不是第二份Endpoint authority。
 
-泄漏或不明状态使用新descriptor revision把`signer.state=disabled`持久化；从该linearization point起所有
-replica停止签发。reachable Node先关闭全部Route admission并drain/fence streams；不可达Host必须provider/BMC
-隔离，不能以TTL或删public key替代。部署fresh key/ring、取得全量ACK并以新revision activate后才重开。
+泄漏或不明状态使用新descriptor revision与一个empty exact-successor ring在同一事务把
+`signer.state=disabled`持久化；从该linearization point起所有replica停止签发。reachable Node通过durable
+installer逐个安装该empty ring，并在ACK前关闭全部Route admission及取消/排空streams；不可达Host必须
+provider/BMC隔离，不能以TTL或仅删public key替代。fresh ring必须是该empty ring的exact successor；每个
+未fence的provisioned Node取得fresh全量ACK且accepted inventory证明全部gate Closed、guard归零后，才允许
+以新revision activate，之后另由既有Desired route-epoch规则重开。
 
 ## 6. Deployment shape
 
@@ -195,6 +208,6 @@ replica停止签发。reachable Node先关闭全部Route admission并drain/fence
 | signer pair | active kid在exact ring；private->SPKI->kid exact；mismatch/wrong algorithm/malformed PEM不构造signer；disabled不读private |
 | separation | A19/A23/V1 keys、shared bearer、header identity均不能构造descriptor、signer或ring ACK |
 | persisted initial/current | initial null previous；exact replay零写；same-revision conflict和合法successor均不从startup推进；immutable exact bytes/current projection/key+secret lineage；old/local mismatch current compare后503 |
-| rotation（future） | overlap ACK -> switch -> 305s retention -> remove ACK -> retire；边界相等不retire；old-only restart switch后不签发；uncordon需要current ACK |
-| revocation（future） | disable先于新签发停止；reachable close/drain、unreachable fence；fresh全量ACK后才resume；existing stream不因删key被伪装终止 |
+| rotation | overlap ACK -> switch -> strict >305s retention -> remove ACK -> retire；边界相等不retire；old-only restart switch后不签发；uncordon需要current ACK；并发replica只提交一个exact successor，stale retry零写 |
+| revocation | persisted disable+empty successor先于新签发停止；empty-ring installer在ACK前reachable close/drain、unreachable HostFence；每个reachable provisioned Node fresh全量ACK且Closed/guard=0后才activate；retired lineage是secret删除前提 |
 | deploy（future） | Terraform plan/state无private PEM；只含reference/public ring/IAM；secret bytes不进argv/env/log；projected symlink不能冒充real installed file |

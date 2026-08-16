@@ -11,6 +11,16 @@ locals {
     "app.kubernetes.io/managed-by" = "terraform"
   }
 
+  effective_control_plane_replicas        = var.maintenance_mode ? 0 : var.control_plane_replicas
+  effective_gateway_replicas              = var.maintenance_mode ? 0 : var.gateway_replicas
+  effective_object_write_gateway_replicas = var.maintenance_mode ? 0 : var.object_write_gateway_replicas
+  effective_public_ingress                = var.enable_public_ingress && !var.maintenance_mode
+
+  # These immutable pre-created Secrets carry two different SECURITY DEFINER
+  # caller roles. Terraform receives only their fixed names, never either DSN.
+  object_write_gateway_postgres_secret_name = "cats-object-write-gateway-postgres"
+  host_fence_provider_postgres_secret_name  = "cats-host-fence-provider-postgres"
+
   runtime_secret_data = merge(
     var.runtime_secret_data,
     {
@@ -40,16 +50,35 @@ locals {
 
   rds_ca_pem = "${trimspace(var.rds_ca_pem)}\n"
 
-  # Public Endpoint ingress stays absent until the Route Grant v2 signer,
-  # bounded per-replica cache and Node admission gate are composed. Exposing
-  # the old Gateway here would make a healthy ALB target serve V1 authority.
-  ingress_routes = [
-    for host in var.control_plane_hosts : {
-      host         = host
-      service_name = "cats-controld"
-      service_port = 7300
-    }
-  ]
+  # Control hosts retain their exact API routing. The one wildcard Endpoint
+  # host is admitted only by the terminal Route v2 Gateway; it never reaches a
+  # legacy in-process Gateway or a Control public handler.
+  ingress_routes = concat(
+    [
+      for host in var.control_plane_hosts : {
+        host         = host
+        service_name = "cats-controld"
+        service_port = 7300
+      }
+    ],
+    [{
+      host         = var.endpoint_wildcard_host
+      service_name = "cats-gatewayd"
+      service_port = 8080
+    }],
+  )
+}
+
+# This state/plan object is deliberately non-secret. It makes a reviewed saved
+# plan bind the immutable Secret identity, manifest digest, and descriptor
+# revision as one rollout coordinate; the secret-channel bytes never enter
+# Terraform state.
+resource "terraform_data" "route_v2_control_artifact" {
+  input = {
+    secret_name     = var.route_v2_control_artifact_secret_name
+    secret_sha256   = var.route_v2_control_artifact_secret_sha256
+    signer_revision = var.route_v2_control_artifact_signer_revision
+  }
 }
 
 check "public_target_drain_fits_termination_grace" {
@@ -78,6 +107,23 @@ check "usage_delivery_configuration" {
   }
 }
 
+check "control_postgres_search_path" {
+  assert {
+    condition = (
+      length(regexall("(^|[?&])options=", var.storage_postgres_url)) == 1 &&
+      length(regexall("(^|[?&])options=-csearch_path%3D${var.control_postgres_schema}(&|$)", var.storage_postgres_url)) == 1
+    )
+    error_message = "storage_postgres_url must select exactly control_postgres_schema through one canonical options=-csearch_path%3D<schema> query item."
+  }
+}
+
+check "provider_database_credentials_are_separate" {
+  assert {
+    condition     = local.object_write_gateway_postgres_secret_name != local.host_fence_provider_postgres_secret_name
+    error_message = "ObjectWrite Gateway and HostFence provider must use distinct dedicated PostgreSQL role Secrets."
+  }
+}
+
 check "stripe_configuration" {
   assert {
     condition = !var.stripe_enabled || (
@@ -103,7 +149,7 @@ resource "kubernetes_namespace_v1" "cats" {
   metadata {
     name = var.namespace
     labels = merge(local.labels, {
-      "cats.run/ingress" = "enabled"
+      "cats.run/ingress" = local.effective_public_ingress ? "enabled" : "disabled"
     })
   }
 }
@@ -118,6 +164,87 @@ resource "kubernetes_service_account_v1" "control_plane" {
   }
 
   automount_service_account_token = false
+}
+
+resource "kubernetes_service_account_v1" "gateway" {
+  metadata {
+    name      = "cats-gatewayd"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels = merge(local.labels, {
+      "app.kubernetes.io/name" = "cats-gatewayd"
+    })
+  }
+
+  automount_service_account_token = false
+}
+
+resource "kubernetes_service_account_v1" "object_write_gateway" {
+  metadata {
+    name      = "cats-object-write-gateway"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels = merge(local.labels, {
+      "app.kubernetes.io/name" = "cats-object-write-gateway"
+    })
+  }
+
+  # EKS Pod Identity injects its own short-lived projected token. The default
+  # Kubernetes API token is neither needed nor mounted.
+  automount_service_account_token = false
+}
+
+# Terraform receives only the immutable Secret name. Certificate/private-key
+# bytes are release artifacts and never enter state.
+resource "kubernetes_persistent_volume_v1" "object_write_spool" {
+  metadata {
+    name = "cats-object-write-spool"
+    labels = merge(local.labels, {
+      "app.kubernetes.io/name" = "cats-object-write-gateway"
+    })
+  }
+
+  spec {
+    capacity = {
+      storage = "1Ti"
+    }
+    access_modes                     = ["ReadWriteMany"]
+    persistent_volume_reclaim_policy = "Retain"
+    storage_class_name               = ""
+    mount_options                    = ["tls", "iam"]
+
+    persistent_volume_source {
+      csi {
+        driver        = "efs.csi.aws.com"
+        volume_handle = "${var.object_write_spool_file_system_id}::${var.object_write_spool_access_point_id}"
+        volume_attributes = {
+          encryptInTransit = "true"
+        }
+      }
+    }
+  }
+}
+
+resource "kubernetes_persistent_volume_claim_v1" "object_write_spool" {
+  metadata {
+    name      = "cats-object-write-spool"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels = merge(local.labels, {
+      "app.kubernetes.io/name" = "cats-object-write-gateway"
+    })
+  }
+
+  spec {
+    access_modes       = ["ReadWriteMany"]
+    storage_class_name = ""
+    volume_name        = kubernetes_persistent_volume_v1.object_write_spool.metadata[0].name
+
+    resources {
+      requests = {
+        storage = "1Ti"
+      }
+    }
+  }
+
+  wait_until_bound = true
 }
 
 resource "kubernetes_secret_v1" "runtime" {
@@ -186,7 +313,7 @@ resource "kubernetes_deployment_v1" "control_plane" {
   }
 
   spec {
-    replicas = var.control_plane_replicas
+    replicas = local.effective_control_plane_replicas
 
     strategy {
       type = "RollingUpdate"
@@ -209,10 +336,13 @@ resource "kubernetes_deployment_v1" "control_plane" {
           "app.kubernetes.io/name" = "cats-controld"
         })
         annotations = {
-          "cats.run/runtime-secret-sha256"            = sha256(jsonencode(local.runtime_secret_data))
-          "cats.run/route-grant-key-sha256"           = sha256("${var.route_grant_private_key_pem}\n${var.route_grant_public_key_pem}")
-          "cats.run/runtime-provisioner-trust-sha256" = sha256(var.runtime_provisioner_trust_bundle_json)
-          "cats.run/rds-ca-sha256"                    = sha256(local.rds_ca_pem)
+          "cats.run/runtime-secret-sha256"                   = sha256(jsonencode(local.runtime_secret_data))
+          "cats.run/route-grant-key-sha256"                  = sha256("${var.route_grant_private_key_pem}\n${var.route_grant_public_key_pem}")
+          "cats.run/route-v2-control-artifact-secret"        = terraform_data.route_v2_control_artifact.output.secret_name
+          "cats.run/route-v2-control-artifact-secret-sha256" = terraform_data.route_v2_control_artifact.output.secret_sha256
+          "cats.run/route-v2-control-signer-revision"        = tostring(terraform_data.route_v2_control_artifact.output.signer_revision)
+          "cats.run/runtime-provisioner-trust-sha256"        = sha256(var.runtime_provisioner_trust_bundle_json)
+          "cats.run/rds-ca-sha256"                           = sha256(local.rds_ca_pem)
         }
       }
 
@@ -252,6 +382,56 @@ resource "kubernetes_deployment_v1" "control_plane" {
           }
         }
 
+        # Kubernetes Secret projections expose symlink entries, while the
+        # frozen installed-artifact reader requires one real root-owned 0700
+        # directory with single-link regular files. Copy the closed key set to
+        # an in-memory emptyDir before the main process starts. The projected
+        # source is never mounted into the main container.
+        init_container {
+          name              = "route-v2-artifact-renderer"
+          image             = var.control_plane_image
+          image_pull_policy = "IfNotPresent"
+          command           = ["/bin/sh", "-ceu"]
+          args = [<<-EOT
+            expected='gateway-workload-authority.v1.json gateway-client-ca-bundle.pem control-machine-server-certificate.pem control-machine-server-private-key.pem signer.v1.json public-key-ring.v1.json rotation-operator-trust.v1.json signer-private-key.pem'
+            actual_count=$(find -L /var/run/cats/route-v2-source -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')
+            test "$actual_count" = 8
+            install -d -o 0 -g 0 -m 0700 /etc/cats/route-v2
+            for name in $expected; do
+              test -f "/var/run/cats/route-v2-source/$name"
+              mode=0644
+              case "$name" in
+                control-machine-server-private-key.pem|signer-private-key.pem) mode=0600 ;;
+              esac
+              install -o 0 -g 0 -m "$mode" "/var/run/cats/route-v2-source/$name" "/etc/cats/route-v2/$name"
+            done
+            sync /etc/cats/route-v2
+          EOT
+          ]
+
+          security_context {
+            allow_privilege_escalation = false
+            read_only_root_filesystem  = true
+            run_as_non_root            = false
+            run_as_user                = 0
+
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+
+          volume_mount {
+            name       = "route-v2-control-artifact-source"
+            mount_path = "/var/run/cats/route-v2-source"
+            read_only  = true
+          }
+
+          volume_mount {
+            name       = "route-v2-control-artifacts"
+            mount_path = "/etc/cats/route-v2"
+          }
+        }
+
         container {
           name              = "controld"
           image             = var.control_plane_image
@@ -265,20 +445,16 @@ resource "kubernetes_deployment_v1" "control_plane" {
           args = [
             "--listen",
             "0.0.0.0:7300",
+            "--route-v2-machine-listen",
+            "0.0.0.0:7443",
+            "--route-v2-rotation-listen",
+            "0.0.0.0:7444",
             "--control-store-url-file",
             "/etc/cats/runtime/CATS_POSTGRES_URL",
             "--guest-runtime-profile-receipt-file",
             "/opt/cats/release/guest-runtime-profile.v1.json",
             "--runtime-provisioner-trust-file",
             "/etc/cats/identity/runtime-provisioner-trust.v1.json",
-            "--metadata-store-adapter",
-            "postgres",
-            "--metadata-store-option",
-            "ca-file=/etc/cats/rds-ca.pem",
-            "--metadata-store-option",
-            "url-file=/etc/cats/runtime/CATS_POSTGRES_URL",
-            "--metadata-store-option",
-            "session-setup=${var.storage_postgres_session_setup}",
             "--object-store-adapter",
             "aws-s3",
             "--object-store-option",
@@ -332,6 +508,16 @@ resource "kubernetes_deployment_v1" "control_plane" {
             container_port = 7300
           }
 
+          port {
+            name           = "route-v2"
+            container_port = 7443
+          }
+
+          port {
+            name           = "route-rotation"
+            container_port = 7444
+          }
+
           resources {
             requests = {
               cpu    = "100m"
@@ -379,8 +565,8 @@ resource "kubernetes_deployment_v1" "control_plane" {
           security_context {
             allow_privilege_escalation = false
             read_only_root_filesystem  = true
-            run_as_non_root            = true
-            run_as_user                = 10001
+            run_as_non_root            = false
+            run_as_user                = 0
 
             capabilities {
               drop = ["ALL"]
@@ -405,6 +591,12 @@ resource "kubernetes_deployment_v1" "control_plane" {
           volume_mount {
             name       = "route-grant-signing"
             mount_path = "/etc/cats/route-grant"
+            read_only  = true
+          }
+
+          volume_mount {
+            name       = "route-v2-control-artifacts"
+            mount_path = "/etc/cats/route-v2"
             read_only  = true
           }
 
@@ -441,6 +633,24 @@ resource "kubernetes_deployment_v1" "control_plane" {
         }
 
         volume {
+          name = "route-v2-control-artifact-source"
+
+          secret {
+            secret_name  = terraform_data.route_v2_control_artifact.output.secret_name
+            default_mode = "0400"
+            optional     = false
+          }
+        }
+
+        volume {
+          name = "route-v2-control-artifacts"
+
+          empty_dir {
+            medium = "Memory"
+          }
+        }
+
+        volume {
           name = "runtime-provisioner-trust"
 
           config_map {
@@ -463,7 +673,7 @@ resource "kubernetes_pod_disruption_budget_v1" "control_plane" {
   }
 
   spec {
-    min_available = "1"
+    min_available = var.maintenance_mode ? "0" : "1"
 
     selector {
       match_labels = {
@@ -493,8 +703,673 @@ resource "kubernetes_service_v1" "control_plane" {
   }
 }
 
+# Machine-only mTLS listener. It is intentionally a distinct ClusterIP
+# Service: no public Ingress rule can route to this port.
+resource "kubernetes_service_v1" "control_plane_route_v2" {
+  metadata {
+    name      = "cats-controld-route-v2"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels = merge(local.labels, {
+      "app.kubernetes.io/name" = "cats-controld"
+    })
+  }
+
+  spec {
+    selector = {
+      "app.kubernetes.io/name" = "cats-controld"
+    }
+
+    port {
+      name        = "route-v2"
+      port        = 7443
+      target_port = "route-v2"
+    }
+  }
+}
+
+# Signed Route rotation and public successor/current discovery remain reachable
+# while a disabled Control replica intentionally fails its public readiness
+# probe. This server-authenticated TLS Service has no public Ingress and does
+# not carry the mandatory Gateway client-certificate principal.
+resource "kubernetes_service_v1" "control_plane_route_v2_rotation" {
+  metadata {
+    name      = "cats-controld-route-rotation"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels = merge(local.labels, {
+      "app.kubernetes.io/name" = "cats-controld"
+    })
+  }
+
+  spec {
+    publish_not_ready_addresses = true
+
+    selector = {
+      "app.kubernetes.io/name" = "cats-controld"
+    }
+
+    port {
+      name        = "route-rotation"
+      port        = 7444
+      target_port = "route-rotation"
+    }
+  }
+}
+
+
+resource "kubernetes_deployment_v1" "object_write_gateway" {
+  metadata {
+    name      = "cats-object-write-gateway"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels = merge(local.labels, {
+      "app.kubernetes.io/name" = "cats-object-write-gateway"
+    })
+  }
+
+  spec {
+    replicas = local.effective_object_write_gateway_replicas
+
+    strategy {
+      type = "RollingUpdate"
+
+      rolling_update {
+        max_surge       = "1"
+        max_unavailable = "0"
+      }
+    }
+
+    selector {
+      match_labels = {
+        "app.kubernetes.io/name" = "cats-object-write-gateway"
+      }
+    }
+
+    template {
+      metadata {
+        labels = merge(local.labels, {
+          "app.kubernetes.io/name" = "cats-object-write-gateway"
+        })
+        annotations = {
+          "cats.run/object-write-tls-artifact-secret" = var.object_write_gateway_tls_secret_name
+          "cats.run/object-write-spool-access-point"  = var.object_write_spool_access_point_id
+          "cats.run/rds-ca-sha256"                    = sha256(local.rds_ca_pem)
+        }
+      }
+
+      spec {
+        automount_service_account_token  = false
+        enable_service_links             = false
+        service_account_name             = kubernetes_service_account_v1.object_write_gateway.metadata[0].name
+        termination_grace_period_seconds = 120
+
+        node_selector = {
+          "kubernetes.io/arch" = "amd64"
+        }
+
+        affinity {
+          pod_anti_affinity {
+            required_during_scheduling_ignored_during_execution {
+              topology_key = "kubernetes.io/hostname"
+
+              label_selector {
+                match_labels = {
+                  "app.kubernetes.io/name" = "cats-object-write-gateway"
+                }
+              }
+            }
+          }
+        }
+
+        topology_spread_constraint {
+          max_skew           = 1
+          topology_key       = "topology.kubernetes.io/zone"
+          when_unsatisfiable = "DoNotSchedule"
+
+          label_selector {
+            match_labels = {
+              "app.kubernetes.io/name" = "cats-object-write-gateway"
+            }
+          }
+        }
+
+        # Projected Secrets are symlink trees. Render the closed two-file TLS
+        # artifact into a private in-memory directory before gateway startup so
+        # the process opens stable regular files and never sees a hot rotation.
+        init_container {
+          name              = "object-write-tls-renderer"
+          image             = var.object_write_gateway_image
+          image_pull_policy = "IfNotPresent"
+          command           = ["/bin/sh", "-ceu"]
+          args = [<<-EOT
+            expected='object-write-server-certificate.pem object-write-server-private-key.pem'
+            actual_count=$(find -L /var/run/cats/object-write-tls-source -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')
+            test "$actual_count" = 2
+            install -d -o 0 -g 0 -m 0700 /etc/cats/object-write-tls
+            for name in $expected; do
+              test -f "/var/run/cats/object-write-tls-source/$name"
+              mode=0644
+              test "$name" != object-write-server-private-key.pem || mode=0600
+              install -o 0 -g 0 -m "$mode" "/var/run/cats/object-write-tls-source/$name" "/etc/cats/object-write-tls/$name"
+            done
+            sync /etc/cats/object-write-tls
+          EOT
+          ]
+
+          security_context {
+            allow_privilege_escalation = false
+            read_only_root_filesystem  = true
+            run_as_non_root            = false
+            run_as_user                = 0
+
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+
+          volume_mount {
+            name       = "object-write-tls-source"
+            mount_path = "/var/run/cats/object-write-tls-source"
+            read_only  = true
+          }
+
+          volume_mount {
+            name       = "object-write-tls"
+            mount_path = "/etc/cats/object-write-tls"
+          }
+        }
+
+        container {
+          name              = "object-write-gateway"
+          image             = var.object_write_gateway_image
+          image_pull_policy = "IfNotPresent"
+          command           = ["/usr/local/bin/cats-object-write-gatewayd"]
+          args = [
+            "--listen",
+            "0.0.0.0:7443",
+            "--control-store-url-file",
+            "/run/cats/object-write-gateway/postgres/url",
+            "--control-store-ca-file",
+            "/etc/cats/rds-ca.pem",
+            "--control-store-schema",
+            var.control_postgres_schema,
+            "--server-certificate-file",
+            "/etc/cats/object-write-tls/object-write-server-certificate.pem",
+            "--server-private-key-file",
+            "/etc/cats/object-write-tls/object-write-server-private-key.pem",
+            "--durable-spool-root",
+            "/var/lib/cats/object-write-spool",
+            "--provider",
+            "aws",
+            "--partition",
+            var.object_write_provider_partition,
+            "--account-id",
+            var.object_write_provider_account_id,
+            "--region",
+            var.chunkstore_region,
+            "--bucket",
+            var.chunkstore_bucket_name,
+            "--prefix",
+            var.chunkstore_prefix,
+            "--object-store-scope-id",
+            "arn:${var.object_write_provider_partition}:s3:::${var.chunkstore_bucket_name}/${var.chunkstore_prefix}",
+          ]
+
+          port {
+            name           = "https"
+            container_port = 7443
+            protocol       = "TCP"
+          }
+
+          resources {
+            requests = {
+              cpu    = "250m"
+              memory = "256Mi"
+            }
+            limits = {
+              cpu    = "2"
+              memory = "1Gi"
+            }
+          }
+
+          startup_probe {
+            http_get {
+              path   = "/healthz"
+              port   = "https"
+              scheme = "HTTPS"
+            }
+            failure_threshold = 30
+            period_seconds    = 5
+          }
+
+          readiness_probe {
+            http_get {
+              path   = "/healthz"
+              port   = "https"
+              scheme = "HTTPS"
+            }
+            period_seconds = 5
+          }
+
+          liveness_probe {
+            http_get {
+              path   = "/healthz"
+              port   = "https"
+              scheme = "HTTPS"
+            }
+            period_seconds = 15
+          }
+
+          security_context {
+            allow_privilege_escalation = false
+            read_only_root_filesystem  = true
+            run_as_non_root            = false
+            run_as_user                = 0
+
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+
+          volume_mount {
+            name       = "object-write-database"
+            mount_path = "/run/cats/object-write-gateway/postgres"
+            read_only  = true
+          }
+
+          volume_mount {
+            name       = "rds-ca"
+            mount_path = "/etc/cats/rds-ca.pem"
+            sub_path   = "rds-ca.pem"
+            read_only  = true
+          }
+
+          volume_mount {
+            name       = "object-write-tls"
+            mount_path = "/etc/cats/object-write-tls"
+            read_only  = true
+          }
+
+          volume_mount {
+            name       = "object-write-spool"
+            mount_path = "/var/lib/cats/object-write-spool"
+          }
+        }
+
+        volume {
+          name = "object-write-database"
+
+          secret {
+            secret_name  = local.object_write_gateway_postgres_secret_name
+            default_mode = "0400"
+            optional     = false
+
+            items {
+              key  = "url"
+              path = "url"
+              mode = "0400"
+            }
+          }
+        }
+
+        volume {
+          name = "rds-ca"
+
+          config_map {
+            name = kubernetes_config_map_v1.rds_ca.metadata[0].name
+          }
+        }
+
+        volume {
+          name = "object-write-tls-source"
+
+          secret {
+            secret_name  = var.object_write_gateway_tls_secret_name
+            default_mode = "0400"
+            optional     = false
+          }
+        }
+
+        volume {
+          name = "object-write-tls"
+
+          empty_dir {
+            medium = "Memory"
+          }
+        }
+
+        volume {
+          name = "object-write-spool"
+
+          persistent_volume_claim {
+            claim_name = kubernetes_persistent_volume_claim_v1.object_write_spool.metadata[0].name
+            read_only  = false
+          }
+        }
+      }
+    }
+  }
+
+  wait_for_rollout = true
+}
+
+resource "kubernetes_pod_disruption_budget_v1" "object_write_gateway" {
+  metadata {
+    name      = "cats-object-write-gateway"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels    = local.labels
+  }
+
+  spec {
+    min_available = var.maintenance_mode ? "0" : "1"
+
+    selector {
+      match_labels = {
+        "app.kubernetes.io/name" = "cats-object-write-gateway"
+      }
+    }
+  }
+}
+
+# The NLB is VPC-internal and carries TCP unchanged: TLS terminates only in the
+# Pod against the release-bound node-server-CA leaf. Its custom frontend SG is
+# provisioned in the platform state with exactly one worker-SG ingress rule.
+resource "kubernetes_service_v1" "object_write_gateway" {
+  metadata {
+    name      = "cats-object-write-gateway"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels = merge(local.labels, {
+      "app.kubernetes.io/name" = "cats-object-write-gateway"
+    })
+    annotations = {
+      "service.beta.kubernetes.io/aws-load-balancer-scheme"                              = "internal"
+      "service.beta.kubernetes.io/aws-load-balancer-nlb-target-type"                     = "ip"
+      "service.beta.kubernetes.io/aws-load-balancer-security-groups"                     = var.object_write_gateway_nlb_security_group_id
+      "service.beta.kubernetes.io/aws-load-balancer-manage-backend-security-group-rules" = "true"
+      "service.beta.kubernetes.io/aws-load-balancer-subnets"                             = join(",", var.object_write_gateway_private_subnet_ids)
+      "service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol"                = "TCP"
+    }
+  }
+
+  spec {
+    selector = {
+      "app.kubernetes.io/name" = "cats-object-write-gateway"
+    }
+    type                = "LoadBalancer"
+    load_balancer_class = "eks.amazonaws.com/nlb"
+
+    port {
+      name        = "tls"
+      port        = 443
+      target_port = "https"
+      protocol    = "TCP"
+    }
+  }
+
+  wait_for_load_balancer = true
+}
+
+resource "kubernetes_deployment_v1" "gateway" {
+  metadata {
+    name      = "cats-gatewayd"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels = merge(local.labels, {
+      "app.kubernetes.io/name" = "cats-gatewayd"
+    })
+  }
+
+  spec {
+    replicas = local.effective_gateway_replicas
+
+    strategy {
+      type = "RollingUpdate"
+
+      rolling_update {
+        max_surge       = "1"
+        max_unavailable = "0"
+      }
+    }
+
+    selector {
+      match_labels = {
+        "app.kubernetes.io/name" = "cats-gatewayd"
+      }
+    }
+
+    template {
+      metadata {
+        labels = merge(local.labels, {
+          "app.kubernetes.io/name" = "cats-gatewayd"
+        })
+        annotations = {
+          # The immutable, versioned Secret name is the rollout identity. Its
+          # bytes never enter Terraform state or Pod environment variables.
+          "cats.run/route-v2-gateway-artifact-secret" = var.route_v2_gateway_artifact_secret_name
+        }
+      }
+
+      spec {
+        automount_service_account_token  = false
+        enable_service_links             = false
+        service_account_name             = kubernetes_service_account_v1.gateway.metadata[0].name
+        termination_grace_period_seconds = local.public_target_termination_grace_period_seconds
+
+        node_selector = {
+          "kubernetes.io/arch" = "amd64"
+        }
+
+        affinity {
+          pod_anti_affinity {
+            required_during_scheduling_ignored_during_execution {
+              topology_key = "kubernetes.io/hostname"
+
+              label_selector {
+                match_labels = {
+                  "app.kubernetes.io/name" = "cats-gatewayd"
+                }
+              }
+            }
+          }
+        }
+
+        topology_spread_constraint {
+          max_skew           = 1
+          topology_key       = "kubernetes.io/hostname"
+          when_unsatisfiable = "DoNotSchedule"
+
+          label_selector {
+            match_labels = {
+              "app.kubernetes.io/name" = "cats-gatewayd"
+            }
+          }
+        }
+
+        init_container {
+          name              = "route-v2-artifact-renderer"
+          image             = var.gateway_image
+          image_pull_policy = "IfNotPresent"
+          command           = ["/bin/sh", "-ceu"]
+          args = [<<-EOT
+            expected='node-server-ca-bundle.pem gateway-machine-client-certificate.pem gateway-machine-client-private-key.pem'
+            actual_count=$(find -L /var/run/cats/route-v2-source -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')
+            test "$actual_count" = 3
+            install -d -o 0 -g 0 -m 0700 /etc/cats/route-v2
+            for name in $expected; do
+              test -f "/var/run/cats/route-v2-source/$name"
+              mode=0644
+              test "$name" != gateway-machine-client-private-key.pem || mode=0600
+              install -o 0 -g 0 -m "$mode" "/var/run/cats/route-v2-source/$name" "/etc/cats/route-v2/$name"
+            done
+            sync /etc/cats/route-v2
+          EOT
+          ]
+
+          security_context {
+            allow_privilege_escalation = false
+            read_only_root_filesystem  = true
+            run_as_non_root            = false
+            run_as_user                = 0
+
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+
+          volume_mount {
+            name       = "route-v2-gateway-artifact-source"
+            mount_path = "/var/run/cats/route-v2-source"
+            read_only  = true
+          }
+
+          volume_mount {
+            name       = "route-v2-gateway-artifacts"
+            mount_path = "/etc/cats/route-v2"
+          }
+        }
+
+        container {
+          name              = "gatewayd"
+          image             = var.gateway_image
+          image_pull_policy = "IfNotPresent"
+          command           = ["/usr/local/bin/cats-gatewayd"]
+          args = [
+            "--listen",
+            "0.0.0.0:8080",
+            "--control-plane-url",
+            "https://${kubernetes_service_v1.control_plane_route_v2.metadata[0].name}.${var.namespace}.svc.cluster.local:7443",
+          ]
+
+          port {
+            name           = "http"
+            container_port = 8080
+          }
+
+          resources {
+            requests = {
+              cpu    = "100m"
+              memory = "128Mi"
+            }
+            limits = {
+              cpu    = "1"
+              memory = "512Mi"
+            }
+          }
+
+          lifecycle {
+            pre_stop {
+              exec {
+                command = ["/bin/sh", "-c", "sleep ${local.public_target_pre_stop_delay_seconds}"]
+              }
+            }
+          }
+
+          startup_probe {
+            http_get {
+              path = "/healthz"
+              port = "http"
+            }
+            failure_threshold = 30
+            period_seconds    = 5
+          }
+
+          readiness_probe {
+            http_get {
+              path = "/healthz"
+              port = "http"
+            }
+            period_seconds = 5
+          }
+
+          liveness_probe {
+            http_get {
+              path = "/healthz"
+              port = "http"
+            }
+            period_seconds = 15
+          }
+
+          security_context {
+            allow_privilege_escalation = false
+            read_only_root_filesystem  = true
+            run_as_non_root            = false
+            run_as_user                = 0
+
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+
+          volume_mount {
+            name       = "route-v2-gateway-artifacts"
+            mount_path = "/etc/cats/route-v2"
+            read_only  = true
+          }
+        }
+
+        volume {
+          name = "route-v2-gateway-artifact-source"
+
+          secret {
+            secret_name  = var.route_v2_gateway_artifact_secret_name
+            default_mode = "0400"
+            optional     = false
+          }
+        }
+
+        volume {
+          name = "route-v2-gateway-artifacts"
+
+          empty_dir {
+            medium = "Memory"
+          }
+        }
+      }
+    }
+  }
+
+  wait_for_rollout = true
+}
+
+resource "kubernetes_pod_disruption_budget_v1" "gateway" {
+  metadata {
+    name      = "cats-gatewayd"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels    = local.labels
+  }
+
+  spec {
+    min_available = var.maintenance_mode ? "0" : "1"
+
+    selector {
+      match_labels = {
+        "app.kubernetes.io/name" = "cats-gatewayd"
+      }
+    }
+  }
+}
+
+resource "kubernetes_service_v1" "gateway" {
+  metadata {
+    name      = "cats-gatewayd"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels = merge(local.labels, {
+      "app.kubernetes.io/name" = "cats-gatewayd"
+    })
+  }
+
+  spec {
+    selector = {
+      "app.kubernetes.io/name" = "cats-gatewayd"
+    }
+
+    port {
+      name        = "http"
+      port        = 8080
+      target_port = "http"
+    }
+  }
+}
+
 resource "kubernetes_manifest" "ingress_class_params" {
-  for_each = var.enable_public_ingress ? toset(["enabled"]) : toset([])
+  for_each = local.effective_public_ingress ? toset(["enabled"]) : toset([])
 
   manifest = {
     apiVersion = "eks.amazonaws.com/v1"
@@ -532,7 +1407,7 @@ resource "kubernetes_manifest" "ingress_class_params" {
 }
 
 resource "kubernetes_ingress_class_v1" "public" {
-  count = var.enable_public_ingress ? 1 : 0
+  count = local.effective_public_ingress ? 1 : 0
 
   metadata {
     name   = var.ingress_class_name
@@ -553,7 +1428,7 @@ resource "kubernetes_ingress_class_v1" "public" {
 }
 
 resource "kubernetes_ingress_v1" "public" {
-  count = var.enable_public_ingress ? 1 : 0
+  count = local.effective_public_ingress ? 1 : 0
 
   metadata {
     name      = "cats-public"
@@ -597,7 +1472,10 @@ resource "kubernetes_ingress_v1" "public" {
     }
   }
 
-  depends_on = [kubernetes_deployment_v1.control_plane]
+  depends_on = [
+    kubernetes_deployment_v1.control_plane,
+    kubernetes_deployment_v1.gateway,
+  ]
 }
 
 # In-cluster reconciliation of the database credential (ADR-0029, #77).
@@ -678,6 +1556,7 @@ resource "kubernetes_cron_job_v1" "credential_refresher" {
 
   spec {
     schedule                      = var.credential_refresher_schedule
+    suspend                       = var.maintenance_mode
     concurrency_policy            = "Forbid"
     starting_deadline_seconds     = 300
     successful_jobs_history_limit = 3

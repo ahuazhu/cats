@@ -5,6 +5,16 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+default = ["proposed-node-residue-reclamation"]
+proposed-node-residue-reclamation = [
+    "cats-api/proposed-node-residue-reclamation",
+    "cats-storage/proposed-node-residue-reclamation",
+]
+# Explicitly opt-in fixture composition for cross-crate E2E tests. Release
+# binaries do not enable this feature.
+test-support = []
+
 [dependencies]
 cats-api = { workspace = true }
 cats-metering = { workspace = true }

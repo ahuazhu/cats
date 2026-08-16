@@ -289,6 +289,66 @@ fn state_survives_a_reconnect() {
 }
 
 #[test]
+fn read_only_schema_verifier_requires_exact_preexisting_shape_without_repair() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let dsn = DsnSource::Literal(url.clone());
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let schema: String = admin
+        .query_one("SELECT current_schema()", &[])
+        .unwrap()
+        .get(0);
+
+    let absent_error = Store::verify_existing_schema(&dsn, None, &schema).unwrap_err();
+    assert_eq!(absent_error.code, ErrorCode::FailedPrecondition);
+    assert!(absent_error.to_string().contains("refusing installation"));
+    let marker_absent: bool = admin
+        .query_one("SELECT to_regclass('control_schema_version') IS NULL", &[])
+        .unwrap()
+        .get(0);
+    assert!(marker_absent, "read-only verification must not install DDL");
+
+    drop(Store::connect_from(&dsn, None).unwrap());
+    Store::verify_existing_schema(&dsn, None, &schema).unwrap();
+    let wrong_schema_error = Store::verify_existing_schema(&dsn, None, "cats_wrong").unwrap_err();
+    assert_eq!(wrong_schema_error.code, ErrorCode::FailedPrecondition);
+    assert!(wrong_schema_error
+        .to_string()
+        .contains("expected exact schema"));
+
+    admin
+        .batch_execute(
+            "ALTER TABLE route_v2_rotation_operator_authority
+                 DROP CONSTRAINT route_v2_rotation_operator_trust_sha_ck",
+        )
+        .unwrap();
+    let drift_error = Store::verify_existing_schema(&dsn, None, &schema).unwrap_err();
+    assert_eq!(drift_error.code, ErrorCode::FailedPrecondition);
+    assert!(
+        drift_error
+            .to_string()
+            .contains("route_v2_rotation_operator_trust_sha_ck"),
+        "{drift_error}"
+    );
+    let constraint_absent: bool = admin
+        .query_one(
+            "SELECT NOT EXISTS (
+                SELECT 1
+                  FROM pg_constraint constraint_row
+                  JOIN pg_class source ON source.oid=constraint_row.conrelid
+                  JOIN pg_namespace namespace_row ON namespace_row.oid=source.relnamespace
+                 WHERE namespace_row.nspname=current_schema()
+                   AND constraint_row.conname='route_v2_rotation_operator_trust_sha_ck')",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(
+        constraint_absent,
+        "read-only verification must not repair drift"
+    );
+}
+
+#[test]
 fn reconnect_rereads_a_dsn_file() {
     let first_url = crate::testsupport::isolated_control_store_url();
     let second_url = crate::testsupport::isolated_control_store_url();
@@ -566,14 +626,19 @@ fn oci_owner_lock_distinguishes_a_live_replica_from_a_dead_one() {
 #[test]
 fn singleton_roles_elect_independently_and_release_on_session_drop() {
     let (first, second) = test_store_pair();
-    let mut first_reconciler = first.singleton_session(SingletonRole::Reconciler).unwrap();
+    let mut first_reconciler = first
+        .singleton_session(SingletonRole::RuntimeSweeper)
+        .unwrap();
     let mut second_reconciler = second.singleton_session(SingletonRole::Reconciler).unwrap();
     let mut second_billing = second
         .singleton_session(SingletonRole::BillingEnforcer)
         .unwrap();
 
     assert!(first_reconciler.try_acquire().unwrap());
-    assert!(!second_reconciler.try_acquire().unwrap());
+    assert!(
+        !second_reconciler.try_acquire().unwrap(),
+        "retired Controller and production sweeper must share one exclusion lock"
+    );
     assert!(
         second_billing.try_acquire().unwrap(),
         "one role's leader must not make every other role a hot standby"
@@ -604,7 +669,7 @@ async fn singleton_task_cancellation_aborts_old_leader_before_failover() {
     let starts = Arc::new(AtomicUsize::new(0));
 
     let first_task =
-        crate::server::spawn_singleton_task(Arc::new(first), SingletonRole::Reconciler, {
+        crate::server::spawn_singleton_task(Arc::new(first), SingletonRole::BillingEnforcer, {
             let active = active.clone();
             let max_active = max_active.clone();
             let starts = starts.clone();
@@ -635,7 +700,7 @@ async fn singleton_task_cancellation_aborts_old_leader_before_failover() {
     .expect("the first replica should acquire leadership");
 
     let second_task =
-        crate::server::spawn_singleton_task(Arc::new(second), SingletonRole::Reconciler, {
+        crate::server::spawn_singleton_task(Arc::new(second), SingletonRole::BillingEnforcer, {
             let active = active.clone();
             let max_active = max_active.clone();
             let starts = starts.clone();
@@ -883,7 +948,7 @@ fn refuses_an_old_stamp_without_repairing_its_shape() {
 
 #[test]
 fn refuses_current_stamp_without_node_transport_target_projection() {
-    assert_eq!(SCHEMA_VERSION, 14);
+    assert_eq!(SCHEMA_VERSION, 16);
     let url = crate::testsupport::isolated_control_store_url();
     drop(Store::connect(&url, None).unwrap());
     {
@@ -1133,6 +1198,33 @@ fn refuses_missing_or_replaced_authorization_indexes_without_repair() {
 }
 
 #[test]
+fn refuses_expression_index_with_wrong_catalog_collation_without_repair() {
+    let url = crate::testsupport::isolated_control_store_url();
+    drop(Store::connect(&url, None).unwrap());
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let changed = admin
+        .execute(
+            "UPDATE pg_index
+                SET indcollation=(
+                    'pg_catalog.\"POSIX\"'::regcollation::OID::TEXT
+                )::OIDVECTOR
+              WHERE indexrelid='volume_records_record_volume'::regclass",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+
+    let Err(error) = Store::connect(&url, None) else {
+        panic!("a stamped expression index with wrong collation must fail closed");
+    };
+    assert_eq!(error.code, ErrorCode::FailedPrecondition);
+    assert!(
+        error.to_string().contains("volume_records_record_volume"),
+        "operator must see the wrong expression index, got: {error}"
+    );
+}
+
+#[test]
 fn refuses_missing_runtime_operation_lookup_indexes_without_repair() {
     for index in [
         "runtime_operations_lookup_scalar_scalar",
@@ -1361,6 +1453,106 @@ fn route_v2_signer_catalog_is_exact_and_current_stamp_rejects_drift() {
              ALTER TABLE route_v2_signing_authority
                  ADD CONSTRAINT route_v2_signing_authority_selection_ck
                  CHECK (signer_state IN ('active', 'disabled'))",
+        ),
+    ] {
+        let drift_url = crate::testsupport::isolated_control_store_url();
+        drop(Store::connect(&drift_url, None).unwrap());
+        let mut drift_admin = postgres::Client::connect(&drift_url, postgres::NoTls).unwrap();
+        drift_admin.batch_execute(ddl).unwrap();
+        let Err(error) = Store::connect(&drift_url, None) else {
+            panic!("a current stamp with changed {catalog_object} must fail closed");
+        };
+        assert_eq!(error.code, ErrorCode::FailedPrecondition);
+        assert!(error.to_string().contains(catalog_object), "{error}");
+    }
+}
+
+#[test]
+fn route_v2_rotation_catalog_is_exact_and_current_stamp_rejects_drift() {
+    fn is_rotation_table(table: &str) -> bool {
+        matches!(
+            table,
+            "route_v2_rotation_operator_authority"
+                | "route_v2_rotation_operator_credentials"
+                | "route_v2_signing_command_receipts"
+                | "route_v2_public_ring_deliveries"
+        )
+    }
+
+    let url = crate::testsupport::isolated_control_store_url();
+    drop(Store::connect(&url, None).unwrap());
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let check_constraints = super::schema::REQUIRED_CHECK_CONSTRAINTS
+        .iter()
+        .filter(|(table, _, _)| is_rotation_table(table))
+        .collect::<Vec<_>>();
+    assert_eq!(check_constraints.len(), 32);
+    for (table, constraint, expected_definition) in check_constraints {
+        let definition: String = admin
+            .query_one(
+                "SELECT pg_get_constraintdef(catalog_constraint.oid, FALSE)
+                   FROM pg_constraint catalog_constraint
+                   JOIN pg_class source ON source.oid=catalog_constraint.conrelid
+                   JOIN pg_namespace source_namespace
+                     ON source_namespace.oid=source.relnamespace
+                  WHERE source_namespace.nspname=current_schema()
+                    AND source.relname=$1 AND catalog_constraint.conname=$2",
+                &[table, constraint],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(&definition, expected_definition, "{constraint}");
+    }
+
+    let foreign_keys = super::schema::REQUIRED_FOREIGN_KEYS
+        .iter()
+        .filter(|(table, _, _)| is_rotation_table(table))
+        .collect::<Vec<_>>();
+    assert_eq!(foreign_keys.len(), 5);
+    for (table, constraint, expected_definition) in foreign_keys {
+        let definition: String = admin
+            .query_one(
+                "SELECT pg_get_constraintdef(catalog_constraint.oid, FALSE)
+                   FROM pg_constraint catalog_constraint
+                   JOIN pg_class source ON source.oid=catalog_constraint.conrelid
+                   JOIN pg_namespace source_namespace
+                     ON source_namespace.oid=source.relnamespace
+                  WHERE source_namespace.nspname=current_schema()
+                    AND source.relname=$1 AND catalog_constraint.conname=$2",
+                &[table, constraint],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(&definition, expected_definition, "{constraint}");
+    }
+
+    for (catalog_object, ddl) in [
+        (
+            "route_v2_rotation_operator_release_sha_ck",
+            "ALTER TABLE route_v2_rotation_operator_authority
+                 DROP CONSTRAINT route_v2_rotation_operator_release_sha_ck;
+             ALTER TABLE route_v2_rotation_operator_authority
+                 ADD CONSTRAINT route_v2_rotation_operator_release_sha_ck
+                 CHECK (release_commit_sha <> '')",
+        ),
+        (
+            "route_v2_rotation_operator_credential_authority_fkey",
+            "ALTER TABLE route_v2_rotation_operator_credentials
+                 DROP CONSTRAINT route_v2_rotation_operator_credential_authority_fkey",
+        ),
+        (
+            "route_v2_rotation_operator_identity_key",
+            "ALTER TABLE route_v2_rotation_operator_authority
+                 DROP CONSTRAINT route_v2_rotation_operator_identity_key;
+             CREATE INDEX route_v2_rotation_operator_identity_key
+                 ON route_v2_rotation_operator_authority(
+                     authority_id, route_deployment_id,
+                     release_commit_sha, trust_sha256)",
+        ),
+        (
+            "route_v2_public_ring_delivery_is_immutable",
+            "ALTER TABLE route_v2_public_ring_deliveries
+                 DISABLE TRIGGER route_v2_public_ring_delivery_is_immutable",
         ),
     ] {
         let drift_url = crate::testsupport::isolated_control_store_url();
@@ -1903,7 +2095,7 @@ fn a_fenced_node_identity_cannot_reregister_or_heartbeat_back_to_ready() {
 }
 
 #[test]
-fn last_guest_work_release_is_immediately_suspend_eligible() {
+fn default_endpoint_update_reuses_the_default_route() {
     let store = test_store();
     let workspace = bootstrap_workspace(&store, "alpha");
     let (cat, _, _) = create_test_cat(&store, &workspace, "worker").unwrap();
@@ -1931,44 +2123,40 @@ fn last_guest_work_release_is_immediately_suspend_eligible() {
     let (route, _) = store.resolve_route(&updated.hostname).unwrap();
     assert_eq!(route.target_port, 3000);
     assert_eq!(route.epoch, 1);
+}
+
+#[test]
+fn automatic_suspend_is_disabled_for_an_idle_running_cat() {
+    let store = test_store();
+    let workspace = bootstrap_workspace(&store, "auto-suspend-disabled");
+    let (cat, _, _) = create_test_cat(&store, &workspace, "idle").unwrap();
     store
         .register_node("node-1", "http://node", "http://gateway", 4, 8192, false)
         .unwrap();
     store.set_placement(&cat.id, Some("node-1")).unwrap();
     store.set_observed(&cat.id, ObservedState::Running).unwrap();
-    let status = |sequence, leases| NodeWorkStatusRequest {
-        node_id: "node-1".into(),
-        cat_id: cat.id.clone(),
-        generation: 1,
-        guest_source_epoch: "guest-boot-1".into(),
-        guest_lease_sequence: sequence,
-        leases,
-    };
     store
-        .ingest_guest_work(&status(
-            1,
-            vec![GuestWorkLease {
-                id: "lease-1".into(),
-                label: "user-job".into(),
-                remaining_ttl_ms: 5_000,
-            }],
-        ))
+        .ingest_guest_work(&NodeWorkStatusRequest {
+            node_id: "node-1".into(),
+            cat_id: cat.id.clone(),
+            generation: 1,
+            guest_source_epoch: "guest-boot-1".into(),
+            guest_lease_sequence: 1,
+            leases: vec![],
+        })
         .unwrap();
-    assert!(store.try_auto_suspend(&cat.id, 5_000).unwrap().is_none());
-    assert_eq!(
-        store.work_status(&cat.id, 5_000).unwrap().reason,
-        "active_work"
-    );
+    let operation_count = store.list_operations(&workspace.id).unwrap().len();
 
-    store.ingest_guest_work(&status(2, vec![])).unwrap();
-    let operation = store
-        .try_auto_suspend(&cat.id, 5_000)
-        .unwrap()
-        .expect("last release should trigger suspend without an idle timer");
-    assert_eq!(operation.kind, "cat.auto_suspend");
-    let sleeping = store.must_get_cat_by_id(&cat.id).unwrap();
-    assert_eq!(sleeping.desired_state, DesiredState::Suspended);
-    assert_eq!(sleeping.generation, 2);
+    assert!(store.try_auto_suspend(&cat.id, 5_000).unwrap().is_none());
+
+    let unchanged = store.must_get_cat_by_id(&cat.id).unwrap();
+    assert_eq!(unchanged.desired_state, DesiredState::Running);
+    assert_eq!(unchanged.observed_state, ObservedState::Running);
+    assert_eq!(unchanged.generation, 1);
+    assert_eq!(
+        store.list_operations(&workspace.id).unwrap().len(),
+        operation_count
+    );
 }
 
 #[test]
@@ -2368,7 +2556,7 @@ fn uncordon_rechecks_the_fingerprint_after_a_concurrent_key_change() {
 }
 
 #[test]
-fn gateway_work_blocks_auto_suspend_and_wake_is_singleflight() {
+fn gateway_work_lease_can_be_shortened_and_released() {
     let store = test_store();
     let workspace = bootstrap_workspace(&store, "alpha");
     let (cat, _, _) = create_test_cat(&store, &workspace, "web").unwrap();
@@ -2391,7 +2579,10 @@ fn gateway_work_blocks_auto_suspend_and_wake_is_singleflight() {
     let lease = store
         .acquire_work(&cat.id, WorkKind::Gateway, "request-1", "GET /", 5_000)
         .unwrap();
-    assert!(store.try_auto_suspend(&cat.id, 5_000).unwrap().is_none());
+    assert_eq!(
+        store.work_status(&cat.id, 5_000).unwrap().active_work_count,
+        1
+    );
     let shortened = store
         .acquire_work(&cat.id, WorkKind::Gateway, "request-1", "handoff", 100)
         .unwrap();
@@ -2404,13 +2595,10 @@ fn gateway_work_blocks_auto_suspend_and_wake_is_singleflight() {
         "renewal must be able to shorten a wake lease to its handoff window"
     );
     store.release_work(&shortened.id).unwrap();
-    store.try_auto_suspend(&cat.id, 5_000).unwrap().unwrap();
-
-    let first = store.ensure_desired_running(&cat.id).unwrap();
-    let second = store.ensure_desired_running(&cat.id).unwrap();
-    assert!(first.is_some());
-    assert!(second.is_none());
-    assert_eq!(store.must_get_cat_by_id(&cat.id).unwrap().generation, 3);
+    assert_eq!(
+        store.work_status(&cat.id, 5_000).unwrap().active_work_count,
+        0
+    );
 }
 
 #[test]
@@ -2433,7 +2621,9 @@ fn guest_work_cancels_an_inflight_suspend_without_generation_drift() {
         leases,
     };
     store.ingest_guest_work(&report(0, vec![])).unwrap();
-    let auto = store.try_auto_suspend(&cat.id, 5_000).unwrap().unwrap();
+    let auto = store
+        .set_desired(&cat.id, DesiredState::Suspended, None, "cat.auto_suspend")
+        .unwrap();
     assert_eq!(auto.resource_generation, 2);
     store
         .set_observed(&cat.id, ObservedState::Suspending)
@@ -2482,9 +2672,8 @@ fn guest_work_from_the_retained_runtime_survives_cancel_first_ordering() {
         })
         .unwrap());
     let auto = store
-        .try_auto_suspend(&cat.id, 60_000)
-        .unwrap()
-        .expect("fresh empty work should begin auto-suspend");
+        .set_desired(&cat.id, DesiredState::Suspended, None, "cat.auto_suspend")
+        .unwrap();
     store
         .set_observed(&cat.id, ObservedState::Suspending)
         .unwrap();
@@ -2712,9 +2901,8 @@ fn stale_guest_work_cannot_cancel_a_newer_cold_during_inflight_suspend() {
         })
         .unwrap());
     let auto = lifecycle_store
-        .try_auto_suspend(&cat.id, 60_000)
-        .unwrap()
-        .expect("fresh empty work should begin auto-suspend");
+        .set_desired(&cat.id, DesiredState::Suspended, None, "cat.auto_suspend")
+        .unwrap();
     assert_eq!(auto.resource_generation, 2);
     lifecycle_store
         .set_observed(&cat.id, ObservedState::Suspending)
@@ -2930,9 +3118,8 @@ fn guest_work_and_rejected_suspend_cancellation_share_cat_first_lock_order() {
         })
         .unwrap());
     let auto = setup
-        .try_auto_suspend(&cat.id, 60_000)
-        .unwrap()
-        .expect("fresh empty work should begin auto-suspend");
+        .set_desired(&cat.id, DesiredState::Suspended, None, "cat.auto_suspend")
+        .unwrap();
     assert_eq!(auto.resource_generation, 2);
     setup
         .set_observed(&cat.id, ObservedState::Suspending)
@@ -2983,84 +3170,6 @@ fn guest_work_and_rejected_suspend_cancellation_share_cat_first_lock_order() {
         observer.get_operation(&auto.id).unwrap().phase,
         OperationPhase::Failed
     );
-    assert_eq!(
-        observer
-            .work_status(&cat.id, 60_000)
-            .unwrap()
-            .active_work_count,
-        1
-    );
-}
-
-#[test]
-fn guest_work_and_auto_suspend_share_cat_first_lock_order() {
-    let _serial = serialize_structural_postgres_lock_test();
-    let url = crate::testsupport::isolated_control_store_url();
-    let setup = concurrency_store(&url);
-    let ingest_store = concurrency_store(&url);
-    let auto_store = concurrency_store(&url);
-    let blocker_store = concurrency_store(&url);
-    let observer = concurrency_store(&url);
-    let guest_pid = backend_pid(&ingest_store);
-    let auto_pid = backend_pid(&auto_store);
-    let workspace = bootstrap_workspace(&setup, "guest-auto-suspend-lock-order");
-    let (cat, _, create) =
-        create_test_cat(&setup, &workspace, "guest-auto-suspend-lock-order").unwrap();
-    setup
-        .register_node("node-1", "http://node", "http://gateway", 4, 8192, false)
-        .unwrap();
-    setup.set_placement(&cat.id, Some("node-1")).unwrap();
-    setup.set_observed(&cat.id, ObservedState::Running).unwrap();
-    setup.finish_operation(&create.id, None).unwrap();
-    assert!(!setup
-        .ingest_guest_work(&NodeWorkStatusRequest {
-            node_id: "node-1".into(),
-            cat_id: cat.id.clone(),
-            generation: 1,
-            guest_source_epoch: "guest-boot-1".into(),
-            guest_lease_sequence: 0,
-            leases: vec![],
-        })
-        .unwrap());
-    seed_expired_guest_lease(&setup, &cat.id);
-
-    let (blocker, release_blocker, blocker_pid) = hold_work_sources_table(blocker_store);
-    let report_cat_id = cat.id.clone();
-    let guest = std::thread::spawn(move || {
-        ingest_store.ingest_guest_work(&NodeWorkStatusRequest {
-            node_id: "node-1".into(),
-            cat_id: report_cat_id,
-            generation: 1,
-            guest_source_epoch: "guest-boot-1".into(),
-            guest_lease_sequence: 1,
-            leases: vec![GuestWorkLease {
-                id: "active-request".into(),
-                label: "active-request".into(),
-                remaining_ttl_ms: 30_000,
-            }],
-        })
-    });
-    assert!(
-        wait_until_blocked_by(&observer, guest_pid, blocker_pid),
-        "Guest work never acquired the Cat before reaching its source row"
-    );
-
-    let auto_cat_id = cat.id.clone();
-    let auto = std::thread::spawn(move || auto_store.try_auto_suspend(&auto_cat_id, 60_000));
-    let auto_waited_on_guest = wait_until_blocked_by(&observer, auto_pid, guest_pid);
-    release_blocker.send(()).unwrap();
-    blocker.join().unwrap();
-    assert!(
-        auto_waited_on_guest,
-        "auto-suspend never queued behind Guest Cat authority"
-    );
-    assert!(!guest.join().unwrap().unwrap());
-    assert!(auto.join().unwrap().unwrap().is_none());
-
-    let current = observer.must_get_cat_by_id(&cat.id).unwrap();
-    assert_eq!(current.desired_state, DesiredState::Running);
-    assert_eq!(current.observed_state, ObservedState::Running);
-    assert_eq!(current.generation, 1);
     assert_eq!(
         observer
             .work_status(&cat.id, 60_000)
@@ -3202,6 +3311,14 @@ fn automatic_deeper_tiers_use_persisted_state_age_and_respect_work() {
             .auto_tier_candidates(Some(1_000), Some(1_000))
             .unwrap();
         assert_eq!(candidates, vec![cat.id.clone()]);
+        assert!(store
+            .auto_tier_candidates(None, Some(1_000))
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .try_auto_tier(&cat.id, None, Some(1_000))
+            .unwrap()
+            .is_none());
         let warm = store
             .try_auto_tier(&cat.id, Some(1_000), Some(1_000))
             .unwrap()

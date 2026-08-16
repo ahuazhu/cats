@@ -217,6 +217,8 @@ pub enum CacheRefreshStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RefreshForLaterOutcome {
+    pub request_kind: RequestKind,
+    pub rejection: RefreshableRejection,
     pub current_request: CurrentRequestDisposition,
     pub cache: CacheRefreshStatus,
 }
@@ -649,10 +651,10 @@ impl RouteCache {
     /// to reject the current HTTP request or WebSocket upgrade without replay.
     pub async fn refresh_for_later(
         &self,
-        _request_kind: RequestKind,
+        request_kind: RequestKind,
         hostname: &str,
         rejected_digest: GrantDigest,
-        _rejection: RefreshableRejection,
+        rejection: RefreshableRejection,
     ) -> RefreshForLaterOutcome {
         let cache = match self.compare_and_delete(hostname, rejected_digest) {
             Ok(false) => CacheRefreshStatus::DigestDidNotMatch,
@@ -664,6 +666,8 @@ impl RouteCache {
             },
         };
         RefreshForLaterOutcome {
+            request_kind,
+            rejection,
             current_request: CurrentRequestDisposition::RejectWithoutReplay,
             cache,
         }

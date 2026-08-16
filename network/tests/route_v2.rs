@@ -444,6 +444,8 @@ async fn signer_switch_to_node_acked_kid_needs_no_gateway_ring_update() {
         refreshed.current_request,
         CurrentRequestDisposition::RejectWithoutReplay
     );
+    assert_eq!(refreshed.request_kind, RequestKind::Http);
+    assert_eq!(refreshed.rejection, RefreshableRejection::Expired);
     assert_eq!(refreshed.cache, CacheRefreshStatus::RefreshedPositive);
     assert_eq!(cache.cached_digest("app.cats.run"), Some(new_digest));
     let CacheLookup::Positive(cached_new) = cache.lookup("app.cats.run").await.unwrap() else {
@@ -463,6 +465,14 @@ async fn signer_switch_to_node_acked_kid_needs_no_gateway_ring_update() {
     assert_eq!(
         delayed_old_rejection.current_request,
         CurrentRequestDisposition::RejectWithoutReplay
+    );
+    assert_eq!(
+        delayed_old_rejection.request_kind,
+        RequestKind::WebSocketUpgrade
+    );
+    assert_eq!(
+        delayed_old_rejection.rejection,
+        RefreshableRejection::BindingMismatch
     );
     assert_eq!(
         delayed_old_rejection.cache,

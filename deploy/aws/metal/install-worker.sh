@@ -19,27 +19,64 @@ GUEST_RUNTIME_RELEASE_SOURCE=${CATS_GUEST_RUNTIME_RELEASE_DIR:-}
 # Validate every required operator input before apt, build, installed-file or
 # systemd mutation. Staging closes the validate/use race if the supplied path
 # is replaced while this long-running bootstrap builds the Guest image.
-ROUTE_GRANT_PUBLIC_KEY_SOURCE=${CATS_ROUTE_GRANT_PUBLIC_KEY_FILE:-}
-[[ -n $ROUTE_GRANT_PUBLIC_KEY_SOURCE ]] || {
-  echo "CATS_ROUTE_GRANT_PUBLIC_KEY_FILE is required" >&2
+ROUTE_V2_NODE_ARTIFACT_SOURCE=${CATS_ROUTE_V2_NODE_ARTIFACT_DIR:-}
+[[ -n $ROUTE_V2_NODE_ARTIFACT_SOURCE ]] || {
+  echo "CATS_ROUTE_V2_NODE_ARTIFACT_DIR is required" >&2
   exit 1
 }
-[[ -f $ROUTE_GRANT_PUBLIC_KEY_SOURCE ]] || {
-  echo "Route Grant public key is not a regular file: $ROUTE_GRANT_PUBLIC_KEY_SOURCE" >&2
+[[ $ROUTE_V2_NODE_ARTIFACT_SOURCE == /* && -d $ROUTE_V2_NODE_ARTIFACT_SOURCE && ! -L $ROUTE_V2_NODE_ARTIFACT_SOURCE ]] || {
+  echo "CATS_ROUTE_V2_NODE_ARTIFACT_DIR must be an absolute real directory" >&2
   exit 1
 }
-ROUTE_GRANT_PUBLIC_KEY_STAGE=$(mktemp)
-cleanup_route_grant_key() {
-  rm -f -- "$ROUTE_GRANT_PUBLIC_KEY_STAGE"
+for required in cmp find install stat wc; do
+  command -v "$required" >/dev/null 2>&1 || {
+    echo "worker deployment needs $required before Route v2 artifact validation" >&2
+    exit 1
+  }
+done
+# Keep transient private material on the boot-scoped tmpfs. The final fixed
+# private key is durable root-only state; staging copies must not survive a
+# Host reboot if the installer is killed before its EXIT trap runs.
+ROUTE_V2_NODE_ARTIFACT_STAGE=$(mktemp -d /run/cats-route-v2-stage.XXXXXX)
+chmod 0700 "$ROUTE_V2_NODE_ARTIFACT_STAGE"
+cleanup_route_v2_artifacts() {
+  rm -rf -- "$ROUTE_V2_NODE_ARTIFACT_STAGE"
 }
-trap cleanup_route_grant_key EXIT
-install -m 0600 "$ROUTE_GRANT_PUBLIC_KEY_SOURCE" "$ROUTE_GRANT_PUBLIC_KEY_STAGE"
-"$CATS_REPO/deploy/aws/metal/validate-route-grant-public-key.sh" \
-  "$ROUTE_GRANT_PUBLIC_KEY_STAGE"
-
+trap cleanup_route_v2_artifacts EXIT
+route_v2_expected=(
+  public-key-ring.v1.json
+  rotation-operator-trust.v1.json
+  gateway-client-ca-bundle.pem
+  node-machine-server-certificate.pem
+  node-machine-server-private-key.pem
+  node-server-ca-bundle.pem
+)
+[[ $(find "$ROUTE_V2_NODE_ARTIFACT_SOURCE" -mindepth 1 -maxdepth 1 | wc -l) -eq 6 ]] || {
+  echo "Node Route v2 artifact source contains an unexpected entry" >&2
+  exit 1
+}
+[[ $(find "$ROUTE_V2_NODE_ARTIFACT_SOURCE" -mindepth 1 -maxdepth 1 -type f -links 1 | wc -l) -eq 6 ]] || {
+  echo "Node Route v2 artifact source must contain exactly six single-link regular files" >&2
+  exit 1
+}
+for name in "${route_v2_expected[@]}"; do
+  [[ -f $ROUTE_V2_NODE_ARTIFACT_SOURCE/$name && ! -L $ROUTE_V2_NODE_ARTIFACT_SOURCE/$name ]] || {
+    echo "missing Node Route v2 artifact: $name" >&2
+    exit 1
+  }
+  mode=0644
+  [[ $name != node-machine-server-private-key.pem ]] || mode=0600
+  install -o root -g root -m "$mode" \
+    "$ROUTE_V2_NODE_ARTIFACT_SOURCE/$name" "$ROUTE_V2_NODE_ARTIFACT_STAGE/$name"
+  [[ -s $ROUTE_V2_NODE_ARTIFACT_STAGE/$name ]] || {
+    echo "empty Node Route v2 artifact: $name" >&2
+    exit 1
+  }
+done
 "$CATS_REPO/deploy/aws/metal/validate-node-identity-installation.sh"
 . "$CATS_REPO/deploy/aws/metal/worker-deployment-transaction.sh"
-for required in flock stat curl openssl findmnt systemd-run systemd-tmpfiles; do
+. "$CATS_REPO/deploy/aws/metal/install-route-v2-node-r1.sh"
+for required in flock stat curl openssl cmp wc findmnt systemd-run systemd-tmpfiles; do
   command -v "$required" >/dev/null 2>&1 || {
     echo "worker deployment needs $required" >&2
     exit 1
@@ -64,13 +101,12 @@ if ! command -v cargo >/dev/null; then
 fi
 
 (cd "$CATS_REPO" && cargo build --locked --release \
-  -p cats-node-agent-daemon -p cats-blockd-daemon -p cats-guest-agent)
+  -p cats-cli -p cats-node-agent-daemon -p cats-blockd-daemon -p cats-guest-agent)
+"$CATS_REPO/target/release/cats-route-v2-node-r1-validator" \
+  --directory "$ROUTE_V2_NODE_ARTIFACT_STAGE"
 
 release_installer="$CATS_REPO/deploy/aws/metal/install-guest-runtime-release.sh"
 "$release_installer" verify "$GUEST_RUNTIME_RELEASE_SOURCE"
-metering_root=$(cats_worker_metering_root cats-worker)
-"$CATS_REPO/deploy/aws/metal/require-idle-worker.sh" \
-  "$metering_root" "$CATS_PREFIX/bin"
 release_transaction_active=0
 deployment_cleanup() {
   status=$?
@@ -80,22 +116,36 @@ deployment_cleanup() {
     cats_stop_node_service cats-worker >/dev/null 2>&1 || true
     "$release_installer" rollback >/dev/null 2>&1 || true
   fi
-  cleanup_route_grant_key
+  cleanup_route_v2_artifacts
   exit "$status"
 }
 trap deployment_cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 cats_acquire_worker_deployment_lock
-# The unlocked check above is only an early, non-mutating preflight. Recompute
-# the cgroup path after serialization and prove physical idle again immediately
-# before masking/stopping the service, because another deployment may have
-# started runtime children while this process waited for the Host lock.
+# Classify only while holding the Host-global lock, immediately before any
+# systemctl or installed-file mutation. A second installer that won the lock
+# while this bootstrap built can therefore yield only exact replay or a
+# fail-closed conflict.
+ROUTE_V2_INSTALL_STATE=$(cats_classify_route_v2_node_r1 \
+  "$CATS_REPO/target/release/cats-route-v2-node-r1-validator" \
+  "$ROUTE_V2_NODE_ARTIFACT_STAGE" /etc/cats/route-v2)
+[[ $ROUTE_V2_INSTALL_STATE == absent || $ROUTE_V2_INSTALL_STATE == exact ]]
+# Only after the artifact state is classified under the Host lock may systemd
+# be queried. Prove physical idle immediately before masking/stopping so a
+# worker deployment cannot race a runtime child.
 metering_root=$(cats_worker_metering_root cats-worker)
 "$CATS_REPO/deploy/aws/metal/require-idle-worker.sh" \
   "$metering_root" "$CATS_PREFIX/bin"
 cats_gate_node_service cats-worker
 cats_worker_deployment_crash_probe after-mask-worker
+
+if [[ $ROUTE_V2_INSTALL_STATE == absent ]]; then
+  cats_publish_route_v2_node_r1 \
+    "$CATS_REPO/target/release/cats-route-v2-node-r1-validator" \
+    "$ROUTE_V2_NODE_ARTIFACT_STAGE" /etc/cats/route-v2
+  cats_worker_deployment_crash_probe after-install-route-v2-artifacts
+fi
 
 # Establish the reboot recovery gate before the release journal or any state
 # filesystem mutation. The runtime mask covers this boot; fsynced installed
@@ -177,17 +227,26 @@ install -o root -g root -m 0755 \
   "$CATS_PREFIX/bin/provision-vmm-socket-namespaces"
 "$CATS_PREFIX/bin/provision-vmm-socket-namespaces"
 cats_worker_deployment_crash_probe after-provision-vmm-socket-namespaces
-install -o root -g root -m 0644 "$ROUTE_GRANT_PUBLIC_KEY_STAGE" \
-  /etc/cats/route-grant-public.pem
-cats_worker_deployment_crash_probe after-install-route-key
+install -m 0755 "$CATS_REPO/target/release/cats" "$CATS_PREFIX/bin/cats"
+cats_worker_deployment_crash_probe after-install-cats-cli
 install -m 0755 "$CATS_REPO/target/release/cats-noded" "$CATS_PREFIX/bin/cats-noded"
 cats_worker_deployment_crash_probe after-install-cats-noded
+install -m 0755 "$CATS_REPO/target/release/cats-route-v2-node-r1-validator" "$CATS_PREFIX/bin/cats-route-v2-node-r1-validator"
+cats_worker_deployment_crash_probe after-install-cats-route-v2-node-r1-validator
 install -m 0755 "$CATS_REPO/target/release/cats-vmm-launcher" "$CATS_PREFIX/bin/cats-vmm-launcher"
 cats_worker_deployment_crash_probe after-install-cats-vmm-launcher
+install -m 0755 "$CATS_REPO/target/release/cats-runtime-e3-probe" "$CATS_PREFIX/bin/cats-runtime-e3-probe"
+cats_worker_deployment_crash_probe after-install-cats-runtime-e3-probe
+install -m 0755 "$CATS_REPO/target/release/cats-usage-schema-v16-verifier" "$CATS_PREFIX/bin/cats-usage-schema-v16-verifier"
+cats_worker_deployment_crash_probe after-install-cats-usage-schema-v16-verifier
+install -m 0755 "$CATS_REPO/target/release/cats-usage-terminal-receipt-verifier" "$CATS_PREFIX/bin/cats-usage-terminal-receipt-verifier"
+cats_worker_deployment_crash_probe after-install-cats-usage-terminal-receipt-verifier
 install -m 0755 "$CATS_REPO/target/release/cats-blockd" "$CATS_PREFIX/bin/cats-blockd"
 cats_worker_deployment_crash_probe after-install-cats-blockd
 install -m 0755 "$CATS_REPO/target/release/cats-guest-agent" "$CATS_PREFIX/bin/cats-guest-agent"
 cats_worker_deployment_crash_probe after-install-cats-guest-agent
+install -m 0755 "$CATS_REPO/target/release/cats-e3-guest-workload" "$CATS_PREFIX/bin/cats-e3-guest-workload"
+cats_worker_deployment_crash_probe after-install-cats-e3-guest-workload
 if [[ ! -x "$CATS_PREFIX/bin/cloud-hypervisor" ]]; then
   curl -fsSL -o "$CATS_PREFIX/bin/cloud-hypervisor" \
     "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/$CATS_CH_VERSION/cloud-hypervisor-static"
@@ -231,7 +290,8 @@ if [[ -f /etc/cats/worker.env ]]; then
   # Signed Agent registration replaced the Host-wide shared Control bearer.
   # Remove a value retained by an older install before the candidate can run.
   worker_env_temp=$(mktemp /etc/cats/.worker.env.XXXXXX)
-  awk -F= '$1 != "CATS_AUTH_TOKEN"' /etc/cats/worker.env > "$worker_env_temp"
+  awk -F= '$1 != "CATS_AUTH_TOKEN" && $1 != "CATS_ROUTE_V2_MACHINE_LISTEN"' \
+    /etc/cats/worker.env > "$worker_env_temp"
   chown root:root "$worker_env_temp"
   chmod 0600 "$worker_env_temp"
   mv -f -- "$worker_env_temp" /etc/cats/worker.env

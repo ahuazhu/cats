@@ -117,13 +117,15 @@ impl Cluster {
                 credit_store: Arc::new(
                     SqliteUsageStore::open(&dir.path().join("control.db")).unwrap(),
                 ),
-                storage_meta,
+                retired_storage_meta_for_tests: Some(storage_meta),
                 image_blob: Arc::new(FileBlobStore::open(dir.path().join("image-blob")).unwrap()),
                 auth_token: SERVICE_TOKEN.into(),
                 guest_runtime_profile_receipt:
                     cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
                 runtime_provisioner_trust_bundle:
                     cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
+                production_cutover_operator_trust_bundle:
+                    cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
                 route_grant_signer: Arc::new(
                     cats_control_plane::route_grant::RouteGrantSigner::from_ed25519_pem(
                         ROUTE_GRANT_PRIVATE_KEY,
@@ -206,6 +208,12 @@ impl Cluster {
         let identity = NodeIdentity {
             version: ContractVersion::V1,
             node_id: Id::new(id.to_string()).unwrap(),
+            provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+                provider: Id::new("test_provider").unwrap(),
+                partition: Id::new("test_partition").unwrap(),
+                account_id: Id::new("test_account").unwrap(),
+                region: Id::new("test_region").unwrap(),
+            },
             immutable_host_id: Id::new(format!("host_{id}")).unwrap(),
             credential_id: signer.credential_id().clone(),
             credential_binding: CredentialBinding::PublicKey {

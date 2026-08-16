@@ -12,17 +12,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
-    checkpoint_content_digest, AppliedDesiredEvidence, CheckpointEvidence, Condition,
-    DesiredRuntimeSpec, GuestTransportEvidence, HostPath, Id, InventorySource,
-    LastVolumeTransition, LifecycleAdmission, LocalLineageState, LocalVolumeLineage,
-    ObservedDevice, ObservedRuntimeStatus, ObservedVolume, ProcessEvidence, ProgressingReason,
-    ReconcileStep, RequireIdleCheckpoint, RuntimeCheckpoint, RuntimeTarget, UnixMillis,
-    VolumeAdminState, VolumeAuthorityEvidence, WarmSnapshotEvidence, WireU64,
+    checkpoint_content_digest, sort_node_residue_canonically, AppliedDesiredEvidence,
+    CheckpointEvidence, Condition, DesiredRuntimeSpec, GuestTransportEvidence, HostPath, Id,
+    InventorySource, LastVolumeTransition, LifecycleAdmission, LocalLineageState,
+    LocalVolumeLineage, NodeResidue, ObservedDevice, ObservedRuntimeStatus, ObservedVolume,
+    ProcessEvidence, ProgressingReason, ReadyReason, ReconcileStep, RequireIdleCheckpoint,
+    RuntimeCheckpoint, RuntimeTarget, Sha256Digest, StableState, UnixMillis, VolumeAdminState,
+    VolumeAuthorityEvidence, WarmSnapshotEvidence, WireU64, NODE_OBSERVATION_MAX_RESIDUE_ITEMS,
+};
+#[cfg(feature = "proposed-node-residue-reclamation")]
+use cats_api::runtime_reconciliation::{
+    residue_acquisition_digest, DataDirectoryRetentionReason, ResidueDataDirectoryLineage,
+    ResidueLineageEvidence,
 };
 use cats_storage::{
     authority::{
         remote_head_is_same_or_later, validate_authorized_serving_attachment,
-        validate_volume_record, AuthorizedServingAcquire, VolumeRecord,
+        validate_authorized_serving_record, validate_volume_record, AuthorizedServingAcquire,
+        VolumeRecord,
     },
     BlobStore,
 };
@@ -40,6 +47,11 @@ use super::{
     classify_superseded_route_retirement,
     guest_ready::{GuestReadyTransportPort, PlatformGuestReadyTransportPort},
     kernel_nbd::{KernelNbdInventoryPort, KernelNbdPoolScanOutcome},
+    lifecycle_steps::{
+        cold_membership_detach_cleanup_checkpoint_is_supported,
+        cold_membership_detach_cleanup_is_supported, cold_membership_rebind_is_supported,
+        current_cold_checkpoint_postcondition_is_exact,
+    },
     network::{
         prepare_device_checkpoint_view, prepared_device_inputs, NodeGlobalNetworkScanAdmission,
     },
@@ -81,8 +93,28 @@ const REQUIRED_SOURCES: [InventorySource; 11] = [
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InventoryAbsence {
     Empty,
+    /// A complete source enumeration containing physical resources which do
+    /// not belong to an accepted runtime.  Residue is observation, not an
+    /// absence proof and never authorizes scanner-side cleanup.
+    Residue(Vec<NodeResidue>),
     RuntimeCheckpoints(BTreeMap<Id, RuntimeCheckpointInventoryEvidence>),
+    RuntimeCheckpointsWithResidue {
+        checkpoints: BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+        residue: Vec<NodeResidue>,
+    },
+    /// Canonical assigned checkpoint files which were readable but could not
+    /// be decoded or bound to that filename's exact Desired. They belong to
+    /// the Cat projection, never to top-level residue at the same path.
+    RuntimeCheckpointsWithCorrupt {
+        checkpoints: BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+        corrupt_checkpoints: BTreeMap<Id, Sha256Digest>,
+        residue: Vec<NodeResidue>,
+    },
     AuthorizedBlockd(BTreeMap<Id, BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>),
+    AuthorizedBlockdWithResidue {
+        blockds: BTreeMap<Id, BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
+        residue: Vec<NodeResidue>,
+    },
     /// The metadata source contains exactly the Desired-bound volume facts
     /// supplied here and no discovered local-only candidate. These are not
     /// physical residue: a newly assigned Cat must be able to report its
@@ -118,11 +150,18 @@ pub struct RuntimeCheckpointInventoryEvidence {
 pub enum AuthorizedBlockdControlState {
     NotStarted,
     ExactControlOnlyEmpty,
+    /// A durable `CleanupRelease::Volume` remains current and the immutable
+    /// launch checkpoint is the final local restart anchor. Some earlier
+    /// descriptor-relative unlinks may already have completed.
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    ReclaimInProgress,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizedBlockdInventoryEvidence {
     pub data_directory: HostPath,
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    pub allocated_bytes: WireU64,
     pub checkpoint: AuthorizedBlockdCheckpoint,
     pub binding: DesiredCheckpointBinding,
     /// Closed provider-private evidence. This is deliberately not projected
@@ -142,6 +181,11 @@ pub struct AuthorizedBlockdInventoryEvidence {
     /// It is an additional allowlist member only while the corresponding
     /// RootControl expectation is physically absent.
     pub(crate) stop_receipt_socket: Option<StopReceiptSocketAdmission>,
+    /// Descriptor chain retained by the DataDirectory scanner. Public
+    /// observations cannot construct or reopen this provider-private delete
+    /// admission.
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    pub(crate) reclaim: Arc<super::residue_reclaim::RetainedDataDirectory>,
 }
 
 /// Provider-private authority evidence retained until the local attachment
@@ -175,7 +219,18 @@ pub(crate) mod root_process_inventory_bridge_sealed {
 #[derive(Debug)]
 pub(crate) enum RootProcessInventoryBridgeOutcome {
     Complete(NodeGlobalManagedProcessScanAdmission),
-    Unavailable,
+    CompleteWithResidue {
+        admission: NodeGlobalManagedProcessScanAdmission,
+        systemd: Vec<NodeResidue>,
+        processes: Vec<NodeResidue>,
+        control_sockets: Vec<NodeResidue>,
+    },
+    Unavailable {
+        /// Per-Cat exact Running negatives learned before a later member of
+        /// the closed process scan became unavailable. These are safe only
+        /// for fail-closing local admission; they never complete inventory.
+        exact_running_negative_cats: BTreeSet<Id>,
+    },
 }
 
 /// Joint Systemd/process/control-socket inspection. It consumes expectations
@@ -216,6 +271,10 @@ pub(crate) mod network_inventory_bridge_sealed {
 #[derive(Debug)]
 pub(crate) enum NetworkInventoryBridgeOutcome {
     Complete(NodeGlobalNetworkScanAdmission),
+    CompleteWithResidue {
+        admission: NodeGlobalNetworkScanAdmission,
+        residue: Vec<NodeResidue>,
+    },
     Unavailable,
 }
 
@@ -416,9 +475,12 @@ impl CleanSlateInventoryScanner {
 
 struct InventoryProbeAggregation {
     unavailable_sources: Vec<InventorySource>,
+    residue_sources: BTreeSet<InventorySource>,
     volumes_by_cat: BTreeMap<Id, Vec<AuthorityVolumeInventoryEvidence>>,
     checkpoints_by_cat: BTreeMap<Id, RuntimeCheckpointInventoryEvidence>,
+    corrupt_checkpoints_by_cat: BTreeMap<Id, Sha256Digest>,
     blockd_by_cat: BTreeMap<Id, BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
+    residue: Vec<NodeResidue>,
     coverage: InventoryCoverageAggregator,
 }
 
@@ -426,11 +488,49 @@ impl InventoryProbeAggregation {
     fn new() -> Self {
         Self {
             unavailable_sources: Vec::new(),
+            residue_sources: BTreeSet::new(),
             volumes_by_cat: BTreeMap::new(),
             checkpoints_by_cat: BTreeMap::new(),
+            corrupt_checkpoints_by_cat: BTreeMap::new(),
             blockd_by_cat: BTreeMap::new(),
+            residue: Vec::new(),
             coverage: InventoryCoverageAggregator::new(),
         }
+    }
+}
+
+fn append_residue_or_mark_incomplete(
+    aggregate: &mut InventoryProbeAggregation,
+    source: InventorySource,
+    mut residue: Vec<NodeResidue>,
+) {
+    if residue.is_empty() {
+        return;
+    }
+    if aggregate
+        .residue
+        .len()
+        .checked_add(residue.len())
+        .is_none_or(|total| total > NODE_OBSERVATION_MAX_RESIDUE_ITEMS)
+    {
+        if !aggregate.unavailable_sources.contains(&source) {
+            aggregate.unavailable_sources.push(source);
+        }
+        return;
+    }
+    aggregate.residue_sources.insert(source);
+    aggregate.residue.append(&mut residue);
+}
+
+fn incomplete_inventory(
+    mut unavailable_sources: Vec<InventorySource>,
+    exact_physical_negative_cats: BTreeSet<Id>,
+) -> RuntimeInventoryScanOutcome {
+    unavailable_sources.sort();
+    unavailable_sources.dedup();
+    RuntimeInventoryScanOutcome::Incomplete {
+        unavailable_sources,
+        exact_physical_negative_cats,
     }
 }
 
@@ -447,6 +547,9 @@ fn inspect_inventory_probe(
         .with_context(|| format!("prove {:?} inventory is absent", probe.source()))?
     {
         InventoryAbsence::Empty => {}
+        InventoryAbsence::Residue(residue) => {
+            append_residue_or_mark_incomplete(aggregate, probe.source(), residue)
+        }
         InventoryAbsence::RuntimeCheckpoints(checkpoints) => {
             anyhow::ensure!(
                 probe.source() == InventorySource::Checkpoint,
@@ -461,6 +564,55 @@ fn inspect_inventory_probe(
                     "checkpoint inventory duplicated one Cat"
                 );
             }
+        }
+        InventoryAbsence::RuntimeCheckpointsWithResidue {
+            checkpoints,
+            residue,
+        } => {
+            anyhow::ensure!(
+                probe.source() == InventorySource::Checkpoint,
+                "only the checkpoint source may report Runtime checkpoints"
+            );
+            for (cat_id, checkpoint) in checkpoints {
+                anyhow::ensure!(
+                    aggregate
+                        .checkpoints_by_cat
+                        .insert(cat_id, checkpoint)
+                        .is_none(),
+                    "checkpoint inventory duplicated one Cat"
+                );
+            }
+            append_residue_or_mark_incomplete(aggregate, probe.source(), residue);
+        }
+        InventoryAbsence::RuntimeCheckpointsWithCorrupt {
+            checkpoints,
+            corrupt_checkpoints,
+            residue,
+        } => {
+            anyhow::ensure!(
+                probe.source() == InventorySource::Checkpoint,
+                "only the checkpoint source may report Runtime checkpoints"
+            );
+            for (cat_id, checkpoint) in checkpoints {
+                anyhow::ensure!(
+                    aggregate
+                        .checkpoints_by_cat
+                        .insert(cat_id, checkpoint)
+                        .is_none(),
+                    "checkpoint inventory duplicated one Cat"
+                );
+            }
+            for (cat_id, digest) in corrupt_checkpoints {
+                anyhow::ensure!(
+                    !aggregate.checkpoints_by_cat.contains_key(&cat_id)
+                        && aggregate
+                            .corrupt_checkpoints_by_cat
+                            .insert(cat_id, digest)
+                            .is_none(),
+                    "checkpoint inventory duplicated one Cat"
+                );
+            }
+            append_residue_or_mark_incomplete(aggregate, probe.source(), residue);
         }
         InventoryAbsence::AuthorizedBlockd(blockds) => {
             anyhow::ensure!(
@@ -481,6 +633,27 @@ fn inspect_inventory_probe(
                     );
                 }
             }
+        }
+        InventoryAbsence::AuthorizedBlockdWithResidue { blockds, residue } => {
+            anyhow::ensure!(
+                probe.source() == InventorySource::DataDirectory,
+                "only the data-directory source may report authorized blockd lineage"
+            );
+            for (cat_id, by_volume) in blockds {
+                let target = aggregate.blockd_by_cat.entry(cat_id.clone()).or_default();
+                for (volume_id, blockd) in by_volume {
+                    anyhow::ensure!(
+                        blockd.checkpoint.desired.cat_id == cat_id
+                            && blockd.checkpoint.attachment.identity.volume_id == volume_id,
+                        "data-directory inventory is indexed by another Cat or Volume"
+                    );
+                    anyhow::ensure!(
+                        target.insert(volume_id, blockd).is_none(),
+                        "data-directory inventory duplicated one Cat/Volume"
+                    );
+                }
+            }
+            append_residue_or_mark_incomplete(aggregate, probe.source(), residue);
         }
         InventoryAbsence::DesiredVolumes(observed) => {
             anyhow::ensure!(
@@ -516,6 +689,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
         let mut node_global_process_admission = None;
         let mut node_global_network_admission = None;
         let mut kernel_nbd_pool_admission = None;
+        let mut exact_physical_negative_cats = BTreeSet::new();
         if let Some(bridge) = &self.root_process_bridge {
             // The process expectation cannot be derived until all three data
             // authorities have completed. Read each prerequisite exactly
@@ -533,9 +707,10 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 inspect_inventory_probe(probe, &context, &mut aggregate)?;
             }
             if !aggregate.unavailable_sources.is_empty() {
-                return Ok(RuntimeInventoryScanOutcome::Incomplete {
-                    unavailable_sources: aggregate.unavailable_sources,
-                });
+                return Ok(incomplete_inventory(
+                    aggregate.unavailable_sources,
+                    exact_physical_negative_cats,
+                ));
             }
 
             let root_expected = root_process_expectations(
@@ -584,12 +759,43 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 &context,
             )? {
                 RootProcessInventoryBridgeOutcome::Complete(admission) => {
+                    exact_physical_negative_cats = admission.exact_running_negative_cats();
                     processes_by_cat = admission.process_projections();
                     serving_devices_by_cat = admission.vhost_device_projections();
                     serving_status_by_cat = admission.serving_status_projections();
                     node_global_process_admission = Some(admission);
                 }
-                RootProcessInventoryBridgeOutcome::Unavailable => {
+                RootProcessInventoryBridgeOutcome::CompleteWithResidue {
+                    admission,
+                    systemd,
+                    processes,
+                    control_sockets,
+                } => {
+                    exact_physical_negative_cats = admission.exact_running_negative_cats();
+                    processes_by_cat = admission.process_projections();
+                    serving_devices_by_cat = admission.vhost_device_projections();
+                    serving_status_by_cat = admission.serving_status_projections();
+                    node_global_process_admission = Some(admission);
+                    append_residue_or_mark_incomplete(
+                        &mut aggregate,
+                        InventorySource::Systemd,
+                        systemd,
+                    );
+                    append_residue_or_mark_incomplete(
+                        &mut aggregate,
+                        InventorySource::Process,
+                        processes,
+                    );
+                    append_residue_or_mark_incomplete(
+                        &mut aggregate,
+                        InventorySource::ControlSocket,
+                        control_sockets,
+                    );
+                }
+                RootProcessInventoryBridgeOutcome::Unavailable {
+                    exact_running_negative_cats,
+                } => {
+                    exact_physical_negative_cats = exact_running_negative_cats;
                     aggregate.unavailable_sources.extend([
                         InventorySource::Systemd,
                         InventorySource::Process,
@@ -597,39 +803,76 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                     ]);
                 }
             }
-            context
-                .remaining()
-                .context("root-process inventory bridge deadline expired after inspection")?;
+            if context.remaining().is_err() {
+                aggregate.unavailable_sources.extend([
+                    InventorySource::Systemd,
+                    InventorySource::Process,
+                    InventorySource::ControlSocket,
+                ]);
+                return Ok(incomplete_inventory(
+                    aggregate.unavailable_sources,
+                    exact_physical_negative_cats,
+                ));
+            }
             if let Some(kernel_nbd) = &self.kernel_nbd_port {
-                let managed_processes = node_global_process_admission.as_ref().context(
-                    "kernel-NBD pool scan lacks its same-pass managed-process admission",
-                )?;
-                match kernel_nbd.scan_complete_pool(&context, managed_processes)? {
-                    KernelNbdPoolScanOutcome::Complete(admission) => {
-                        if admission.has_unavailable_device() {
+                if let Some(managed_processes) = node_global_process_admission.as_ref() {
+                    match kernel_nbd.scan_complete_pool(&context, managed_processes)? {
+                        KernelNbdPoolScanOutcome::Complete(admission) => {
+                            if admission.has_unavailable_device() {
+                                aggregate
+                                    .unavailable_sources
+                                    .push(InventorySource::BlockFrontend);
+                            }
+                            for (cat_id, projections) in admission.device_projections() {
+                                for (volume_id, device) in projections {
+                                    anyhow::ensure!(
+                                        serving_devices_by_cat
+                                            .entry(cat_id.clone())
+                                            .or_default()
+                                            .insert(volume_id, device)
+                                            .is_none(),
+                                        "managed frontend scan projects two devices for one Volume"
+                                    );
+                                }
+                            }
+                            kernel_nbd_pool_admission = Some(admission);
+                        }
+                        KernelNbdPoolScanOutcome::CompleteWithResidue { admission, residue } => {
+                            debug_assert!(!admission.has_unavailable_device());
+                            for (cat_id, projections) in admission.device_projections() {
+                                for (volume_id, device) in projections {
+                                    anyhow::ensure!(
+                                        serving_devices_by_cat
+                                            .entry(cat_id.clone())
+                                            .or_default()
+                                            .insert(volume_id, device)
+                                            .is_none(),
+                                        "managed frontend scan projects two devices for one Volume"
+                                    );
+                                }
+                            }
+                            kernel_nbd_pool_admission = Some(admission);
+                            append_residue_or_mark_incomplete(
+                                &mut aggregate,
+                                InventorySource::BlockFrontend,
+                                residue,
+                            );
+                        }
+                        KernelNbdPoolScanOutcome::Unavailable => {
                             aggregate
                                 .unavailable_sources
                                 .push(InventorySource::BlockFrontend);
                         }
-                        for (cat_id, projections) in admission.device_projections() {
-                            for (volume_id, device) in projections {
-                                anyhow::ensure!(
-                                    serving_devices_by_cat
-                                        .entry(cat_id.clone())
-                                        .or_default()
-                                        .insert(volume_id, device)
-                                        .is_none(),
-                                    "managed frontend scan projects two devices for one Volume"
-                                );
-                            }
-                        }
-                        kernel_nbd_pool_admission = Some(admission);
                     }
-                    KernelNbdPoolScanOutcome::Unavailable => {
-                        aggregate
-                            .unavailable_sources
-                            .push(InventorySource::BlockFrontend);
-                    }
+                } else {
+                    // A failed process bridge has already made this scan
+                    // incomplete. Kernel-NBD proof is a join with that exact
+                    // same-pass admission, so touching the pool cannot restore
+                    // completeness and must not replace an earlier exact VMM
+                    // negative with a scanner error.
+                    aggregate
+                        .unavailable_sources
+                        .push(InventorySource::BlockFrontend);
                 }
             }
             if processes_by_cat.keys().any(|cat_id| {
@@ -649,14 +892,15 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 // the same scan did not also prove the exact empty control-only
                 // engine state, keep every involved source unavailable and do
                 // not let the proof reach wire projection.
-                return Ok(RuntimeInventoryScanOutcome::Incomplete {
-                    unavailable_sources: vec![
+                return Ok(incomplete_inventory(
+                    vec![
                         InventorySource::Systemd,
                         InventorySource::Process,
                         InventorySource::ControlSocket,
                         InventorySource::DataDirectory,
                     ],
-                });
+                    exact_physical_negative_cats,
+                ));
             }
             for source in [
                 InventorySource::Systemd,
@@ -693,6 +937,15 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                     networks_by_cat = admission.network_projections();
                     node_global_network_admission = Some(admission);
                 }
+                NetworkInventoryBridgeOutcome::CompleteWithResidue { admission, residue } => {
+                    networks_by_cat = admission.network_projections();
+                    node_global_network_admission = Some(admission);
+                    append_residue_or_mark_incomplete(
+                        &mut aggregate,
+                        InventorySource::Network,
+                        residue,
+                    );
+                }
                 NetworkInventoryBridgeOutcome::Unavailable => {
                     aggregate.unavailable_sources.push(InventorySource::Network);
                 }
@@ -702,9 +955,10 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 .context("network inventory bridge deadline expired after inspection")?;
         }
         if !aggregate.unavailable_sources.is_empty() {
-            return Ok(RuntimeInventoryScanOutcome::Incomplete {
-                unavailable_sources: aggregate.unavailable_sources,
-            });
+            return Ok(incomplete_inventory(
+                aggregate.unavailable_sources,
+                exact_physical_negative_cats,
+            ));
         }
 
         let mut running_tail_admission = None;
@@ -1015,13 +1269,26 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             blob: self.blob.as_deref(),
             deadline: context.deadline(),
         };
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        let mut data_directory_reclaim_admission =
+            super::DataDirectoryReclaimScanAdmission::default();
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        let reclaim_sources_are_closed = aggregate.residue.is_empty();
         let mut runtimes = context
             .coordinates()
             .desired
             .desired_specs
             .iter()
             .map(|desired| {
-                runtime_from_inventory(
+                let checkpoint = RuntimeCheckpointProjectionInput::from_parts(
+                    aggregate.checkpoints_by_cat.remove(&desired.cat_id),
+                    aggregate.corrupt_checkpoints_by_cat.remove(&desired.cat_id),
+                )?;
+                let blockds = aggregate
+                    .blockd_by_cat
+                    .remove(&desired.cat_id)
+                    .unwrap_or_default();
+                let mut runtime = runtime_from_inventory(
                     desired,
                     inventory_epoch,
                     &projection,
@@ -1029,11 +1296,8 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                         .volumes_by_cat
                         .remove(&desired.cat_id)
                         .unwrap_or_default(),
-                    aggregate.checkpoints_by_cat.remove(&desired.cat_id),
-                    aggregate
-                        .blockd_by_cat
-                        .remove(&desired.cat_id)
-                        .unwrap_or_default(),
+                    checkpoint,
+                    blockds.clone(),
                     RuntimeManagedProjection {
                         processes: processes_by_cat.remove(&desired.cat_id).unwrap_or_default(),
                         serving_devices: serving_devices_by_cat
@@ -1044,7 +1308,18 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                             .unwrap_or_default(),
                         networks: networks_by_cat.remove(&desired.cat_id).unwrap_or_default(),
                     },
-                )
+                )?;
+                #[cfg(feature = "proposed-node-residue-reclamation")]
+                if reclaim_sources_are_closed {
+                    project_exact_released_data_directory(
+                        desired,
+                        &mut runtime,
+                        &blockds,
+                        &mut aggregate.residue,
+                        &mut data_directory_reclaim_admission,
+                    )?;
+                }
+                Ok(runtime)
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         if let Some(tail) = &running_tail_admission {
@@ -1052,9 +1327,11 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                 tail.project_runtime(runtime)?;
             }
         }
+        canonicalize_residue(&mut aggregate.residue)?;
         anyhow::ensure!(
             aggregate.volumes_by_cat.is_empty()
                 && aggregate.checkpoints_by_cat.is_empty()
+                && aggregate.corrupt_checkpoints_by_cat.is_empty()
                 && aggregate.blockd_by_cat.is_empty()
                 && processes_by_cat.is_empty()
                 && serving_devices_by_cat.is_empty()
@@ -1063,20 +1340,187 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             "inventory named a Cat outside Desired"
         );
 
-        Ok(RuntimeInventoryScanOutcome::Complete(
-            CompleteRuntimeInventory::from_validated_coverage(
-                coverage,
-                observed_at_unix_ms,
-                key_ring,
-                runtimes,
-                Vec::new(),
-            )
-            .with_node_global_process_admission(node_global_process_admission)
-            .with_node_global_network_admission(node_global_network_admission)
-            .with_kernel_nbd_pool_admission(kernel_nbd_pool_admission)
-            .with_running_tail_admission(running_tail_admission),
-        ))
+        let inventory = CompleteRuntimeInventory::from_validated_coverage(
+            coverage,
+            observed_at_unix_ms,
+            key_ring,
+            runtimes,
+            aggregate.residue,
+            aggregate.residue_sources,
+        )
+        .with_node_global_process_admission(node_global_process_admission)
+        .with_node_global_network_admission(node_global_network_admission)
+        .with_kernel_nbd_pool_admission(kernel_nbd_pool_admission)
+        .with_running_tail_admission(running_tail_admission);
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        let inventory = inventory.with_data_directory_reclaim_admission(
+            (!data_directory_reclaim_admission.is_empty())
+                .then_some(data_directory_reclaim_admission),
+        );
+        Ok(RuntimeInventoryScanOutcome::Complete(Box::new(inventory)))
     }
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+fn project_exact_released_data_directory(
+    desired: &DesiredRuntimeSpec,
+    runtime: &mut ObservedRuntimeStatus,
+    blockds: &BTreeMap<Id, AuthorizedBlockdInventoryEvidence>,
+    residue: &mut Vec<NodeResidue>,
+    admission: &mut super::DataDirectoryReclaimScanAdmission,
+) -> anyhow::Result<()> {
+    if !matches!(desired.target, RuntimeTarget::Cold | RuntimeTarget::Deleted) {
+        return Ok(());
+    }
+    let ReconcileStep::CleanupRelease { cleanup } = &runtime.step else {
+        return Ok(());
+    };
+    let (
+        cats_api::runtime_reconciliation::CleanupTarget::Volume {
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+        },
+        Some(replay),
+    ) = (&cleanup.target, &cleanup.volume_release)
+    else {
+        return Ok(());
+    };
+    if !runtime.processes.is_empty()
+        || !runtime.mounts.is_empty()
+        || !runtime.networks.is_empty()
+        || !matches!(runtime.guest_transport, GuestTransportEvidence::Unavailable)
+        || !matches!(runtime.warm_snapshot, WarmSnapshotEvidence::Absent)
+    {
+        return Ok(());
+    }
+    let Some(blockd) = blockds.get(volume_id) else {
+        return Ok(());
+    };
+    let current_intent = desired
+        .volumes
+        .iter()
+        .find(|intent| intent.volume_id == *volume_id);
+    let detached_intent = current_intent.is_none().then(|| {
+        blockd.checkpoint.desired.volumes.iter().find(|intent| {
+            intent.volume_id == *volume_id
+                && intent.disk_kind == cats_api::runtime_reconciliation::DiskKind::Persistent
+                && intent.attachment_id == *attachment_id
+        })
+    });
+    let Some(intent) = current_intent.or_else(|| detached_intent.flatten()) else {
+        return Ok(());
+    };
+    let detached_membership_cleanup = current_intent.is_none()
+        && matches!(
+            replay.disposition,
+            cats_api::runtime_reconciliation::VolumeDisposition::DetachRetained
+        )
+        && matches!(
+            &runtime.checkpoint,
+            CheckpointEvidence::Valid {
+                desired_revision,
+                spec_digest,
+                ..
+            } if desired_revision < &desired.desired_revision
+                && spec_digest != &desired.spec_digest
+        )
+        && runtime.volumes.len() == desired.volumes.len().saturating_add(1)
+        && !desired
+            .volumes
+            .iter()
+            .any(|candidate| candidate.volume_id == *volume_id);
+    if current_intent.is_none() && !detached_membership_cleanup {
+        return Ok(());
+    }
+    let Some(volume) = runtime
+        .volumes
+        .iter_mut()
+        .find(|volume| volume.volume_id == *volume_id)
+    else {
+        return Ok(());
+    };
+    let VolumeAuthorityEvidence::Unowned {
+        attachment_epoch: released_epoch,
+        head: release_head,
+    } = &volume.authority
+    else {
+        return Ok(());
+    };
+    let [lineage] = volume.local_lineages.as_slice() else {
+        return Ok(());
+    };
+    let attachment = &blockd.checkpoint.attachment;
+    if volume.devices.is_empty()
+        && attachment_id == &attachment.identity.attachment_id
+        && *attachment_epoch == attachment.identity.attachment_epoch
+        && attachment_epoch
+            .get()
+            .checked_add(1)
+            .and_then(cats_api::runtime_reconciliation::FenceEpoch::new)
+            == Some(*released_epoch)
+        && release_head.generation == replay.generation
+        && lineage.attachment_id == *attachment_id
+        && lineage.attachment_epoch == *attachment_epoch
+        && lineage.data_directory == blockd.data_directory
+        && lineage.local_durable_generation == lineage.remote_durable_generation
+        && lineage.pending_pack_count.get() == 0
+        && lineage.fenced
+        && lineage.state == LocalLineageState::Released
+    {
+        let exact = ResidueDataDirectoryLineage {
+            workspace_id: desired.workspace_id.clone(),
+            cat_id: desired.cat_id.clone(),
+            disk_id: intent.disk_id.clone(),
+            disk_kind: intent.disk_kind,
+            volume_id: volume_id.clone(),
+            attachment_id: attachment_id.clone(),
+            attachment_epoch: *attachment_epoch,
+            acquire_origin: attachment.identity.acquire_origin.clone(),
+            node_id: attachment.identity.node_id.clone(),
+            desired_revision: desired.desired_revision,
+            spec_digest: desired.spec_digest.clone(),
+            placement: desired.placement.clone(),
+            placement_epoch: attachment.identity.placement_epoch,
+            acquisition: attachment.acquire.clone(),
+            acquisition_digest: residue_acquisition_digest(&attachment.acquire)?,
+            local_durable_generation: lineage.local_durable_generation,
+            remote_durable_generation: lineage.remote_durable_generation,
+            remote_head: release_head.clone(),
+            pending_pack_count: lineage.pending_pack_count,
+            fenced: true,
+        };
+        let observed = NodeResidue::DataDirectory {
+            cat_id_hint: Some(desired.cat_id.clone()),
+            disk_id_hint: Some(intent.disk_id.clone()),
+            volume_id_hint: Some(volume_id.clone()),
+            data_directory: blockd.data_directory.clone(),
+            allocated_bytes: blockd.allocated_bytes,
+            retention_reason: DataDirectoryRetentionReason::ExactReclaimPending,
+            ownership_token: cats_api::runtime_reconciliation::OwnershipTokenEvidence::Missing,
+            lineage: ResidueLineageEvidence::Readable {
+                lineage: Box::new(exact),
+            },
+        };
+        admission.insert(
+            desired.cat_id.clone(),
+            volume_id.clone(),
+            observed.clone(),
+            Arc::clone(&blockd.reclaim),
+        )?;
+        residue.push(observed);
+        volume.local_lineages.clear();
+    }
+    Ok(())
+}
+
+fn canonicalize_residue(residue: &mut [NodeResidue]) -> anyhow::Result<()> {
+    sort_node_residue_canonically(residue);
+    anyhow::ensure!(
+        residue.windows(2).all(|pair| pair[0] != pair[1]),
+        "inventory duplicated one Node residue"
+    );
+    Ok(())
 }
 
 pub(super) fn vmm_process_expectations(
@@ -1501,15 +1945,41 @@ struct RuntimeManagedProjection {
     networks: Vec<cats_api::runtime_reconciliation::ObservedNetwork>,
 }
 
+enum RuntimeCheckpointProjectionInput {
+    Missing,
+    Valid(Box<RuntimeCheckpointInventoryEvidence>),
+    Corrupt(Sha256Digest),
+}
+
+impl RuntimeCheckpointProjectionInput {
+    fn from_parts(
+        checkpoint: Option<RuntimeCheckpointInventoryEvidence>,
+        corrupt_digest: Option<Sha256Digest>,
+    ) -> anyhow::Result<Self> {
+        match (checkpoint, corrupt_digest) {
+            (None, None) => Ok(Self::Missing),
+            (Some(checkpoint), None) => Ok(Self::Valid(Box::new(checkpoint))),
+            (None, Some(digest)) => Ok(Self::Corrupt(digest)),
+            (Some(_), Some(_)) => anyhow::bail!("checkpoint inventory duplicated one Cat"),
+        }
+    }
+}
+
 fn runtime_from_inventory(
     desired: &DesiredRuntimeSpec,
     inventory_epoch: cats_api::runtime_reconciliation::Epoch,
     projection: &InventoryProjectionContext<'_>,
     mut volume_evidence: Vec<AuthorityVolumeInventoryEvidence>,
-    checkpoint: Option<RuntimeCheckpointInventoryEvidence>,
+    checkpoint_input: RuntimeCheckpointProjectionInput,
     blockds: BTreeMap<Id, AuthorizedBlockdInventoryEvidence>,
     mut managed: RuntimeManagedProjection,
 ) -> anyhow::Result<ObservedRuntimeStatus> {
+    let (checkpoint, corrupt_checkpoint_digest) = match checkpoint_input {
+        RuntimeCheckpointProjectionInput::Missing => (None, None),
+        RuntimeCheckpointProjectionInput::Valid(checkpoint) => (Some(*checkpoint), None),
+        RuntimeCheckpointProjectionInput::Corrupt(digest) => (None, Some(digest)),
+    };
+    let corrupt_checkpoint_present = corrupt_checkpoint_digest.is_some();
     let checkpoint_path = runtime_checkpoint_path(projection.checkpoint_directory, &desired.cat_id);
     let checkpoint_path = HostPath::new(
         checkpoint_path
@@ -1520,6 +1990,53 @@ fn runtime_from_inventory(
     .ok_or_else(|| anyhow::anyhow!("checkpoint path is not a valid HostPath"))?;
 
     for blockd in blockds.values() {
+        if checkpoint.is_none() {
+            anyhow::ensure!(
+                corrupt_checkpoint_present
+                    && blockd.binding == DesiredCheckpointBinding::Current
+                    && blockd.checkpoint.desired == *desired,
+                "local blockd lineage without a valid Runtime checkpoint is not exact current-Cat evidence"
+            );
+            let attachment = &blockd.checkpoint.attachment;
+            let volume_evidence = volume_evidence
+                .iter_mut()
+                .find(|volume| volume.observed.volume_id == attachment.identity.volume_id)
+                .context("authorized blockd lineage lacks its authority Volume")?;
+            validate_authorized_serving_record(&volume_evidence.record, attachment, None)
+                .context("corrupt-checkpoint Cat has non-exact local blockd lineage")?;
+            let volume = &mut volume_evidence.observed;
+            anyhow::ensure!(
+                matches!(
+                    &volume.authority,
+                    VolumeAuthorityEvidence::Owned {
+                        attachment_id,
+                        attachment_epoch,
+                        head,
+                    } if attachment_id == &attachment.identity.attachment_id
+                        && *attachment_epoch == attachment.identity.attachment_epoch
+                        && head == &attachment.head
+                ) && volume.local_lineages.is_empty()
+                    && managed
+                        .serving_status
+                        .remove(&attachment.identity.volume_id)
+                        .is_none(),
+                "corrupt-checkpoint Cat cannot attribute a live or conflicting blockd lineage"
+            );
+            volume.local_lineages.push(LocalVolumeLineage {
+                attachment_id: attachment.identity.attachment_id.clone(),
+                attachment_epoch: attachment.identity.attachment_epoch,
+                acquire_origin: attachment.identity.acquire_origin.clone(),
+                node_id: attachment.identity.node_id.clone(),
+                placement_epoch: attachment.identity.placement_epoch,
+                local_durable_generation: attachment.head.generation,
+                remote_durable_generation: attachment.head.generation,
+                data_directory: blockd.data_directory.clone(),
+                pending_pack_count: WireU64::new(0).expect("zero fits WireU64"),
+                fenced: false,
+                state: LocalLineageState::Active,
+            });
+            continue;
+        }
         anyhow::ensure!(
             checkpoint.is_some(),
             "authorized blockd lineage lacks its Runtime checkpoint"
@@ -1578,20 +2095,23 @@ fn runtime_from_inventory(
                     .as_ref()
                     .is_some_and(|release| release.generation == head.generation)
             }
+            // The serving writer under this same grant may already have
+            // published past the checkpointed head; a later durable write
+            // advances it, while a same-generation tuple must stay byte-exact.
             (
                 ReconcileStep::PrepareDevice { devices },
                 VolumeAuthorityEvidence::Owned { head, .. },
             ) => devices
                 .iter()
                 .find(|device| device.volume_id == volume.volume_id)
-                .is_some_and(|device| &device.expected_head == head),
+                .is_some_and(|device| remote_head_is_same_or_later(head, &device.expected_head)),
             (
                 ReconcileStep::PrepareNetwork { devices, .. },
                 VolumeAuthorityEvidence::Owned { head, .. },
             ) => devices
                 .iter()
                 .find(|device| device.volume_id == volume.volume_id)
-                .is_some_and(|device| &device.expected_head == head),
+                .is_some_and(|device| remote_head_is_same_or_later(head, &device.expected_head)),
             (ReconcileStep::Quarantined, VolumeAuthorityEvidence::Owned { head, .. }) => {
                 runtime_checkpoint.volumes.iter().any(|checkpoint_volume| {
                     checkpoint_volume.volume_id == volume.volume_id
@@ -1660,8 +2180,30 @@ fn runtime_from_inventory(
                     attachment_epoch,
                     head,
                 },
-            ) => cleanup_release_matches_released_authority(
-                cleanup,
+            ) => {
+                cleanup_release_matches_released_authority(
+                    cleanup,
+                    attachment,
+                    *attachment_epoch,
+                    head,
+                ) || cold_membership_cleanup_matches_released_attachment(
+                    desired,
+                    runtime_checkpoint,
+                    attachment,
+                    *attachment_epoch,
+                    head,
+                )
+            }
+            (
+                ReconcileStep::Stable {
+                    state: StableState::Cold,
+                },
+                VolumeAuthorityEvidence::Unowned {
+                    attachment_epoch,
+                    head,
+                },
+            ) => stable_cold_checkpoint_matches_released_attachment(
+                runtime_checkpoint,
                 attachment,
                 *attachment_epoch,
                 head,
@@ -1686,10 +2228,12 @@ fn runtime_from_inventory(
         );
         let current_attachment_is_exact = authority_owner_or_exact_release_matches(
             &volume.authority,
+            desired,
             runtime_checkpoint,
             attachment,
         ) && authority_record_matches_local_attachment(
             authority_record,
+            desired,
             runtime_checkpoint,
             attachment,
         ) && authoritative_head_is_adoptable;
@@ -1797,20 +2341,50 @@ fn runtime_from_inventory(
     let unsupported_superseded = checkpoint.as_ref().is_some_and(|evidence| {
         evidence.binding == DesiredCheckpointBinding::Superseded
             && !superseded_checkpoint_has_supported_replan(desired, &evidence.checkpoint, &volumes)
+            && !cold_membership_rebind_is_supported(desired, &evidence.checkpoint, &volumes)
+            && !cold_membership_detach_cleanup_is_supported(desired, &evidence.checkpoint, &volumes)
+    });
+    let stable_cold_checkpoint = checkpoint.as_ref().is_some_and(|evidence| {
+        matches!(
+            evidence.checkpoint.step,
+            ReconcileStep::Stable {
+                state: StableState::Cold
+            }
+        )
+    });
+    let current_cold_postcondition_exact = checkpoint.as_ref().is_some_and(|evidence| {
+        evidence.binding == DesiredCheckpointBinding::Current
+            && current_cold_checkpoint_postcondition_is_exact(
+                desired,
+                &evidence.checkpoint,
+                &volumes,
+            )
+            && managed.processes.is_empty()
+            && managed.networks.is_empty()
+    });
+    let current_cold_postcondition_mismatch = checkpoint.as_ref().is_some_and(|evidence| {
+        evidence.binding == DesiredCheckpointBinding::Current
+            && matches!(
+                evidence.checkpoint.step,
+                ReconcileStep::Stable {
+                    state: StableState::Cold
+                }
+            )
+            && !current_cold_postcondition_exact
     });
     let definite_release_rejected = checkpoint
         .as_ref()
         .is_some_and(|evidence| evidence.definite_release_rejected);
-    let closed_takeover_history = volumes.iter().any(|volume| {
-        volume.local_lineages.iter().any(|lineage| {
-            lineage.state == LocalLineageState::Released
-                && matches!(
-                    lineage.acquire_origin,
-                    cats_api::runtime_reconciliation::AcquireOrigin::Takeover { .. }
-                )
-        })
-    });
-
+    let closed_takeover_history = !stable_cold_checkpoint
+        && volumes.iter().any(|volume| {
+            volume.local_lineages.iter().any(|lineage| {
+                lineage.state == LocalLineageState::Released
+                    && matches!(
+                        lineage.acquire_origin,
+                        cats_api::runtime_reconciliation::AcquireOrigin::Takeover { .. }
+                    )
+            })
+        });
     let (step, checkpoint_evidence, runtime_incarnation, stable_state, lifecycle_admission) =
         match checkpoint {
             Some(inventory_checkpoint) => {
@@ -1842,11 +2416,21 @@ fn runtime_from_inventory(
                     require_idle: Box::new(checkpoint.require_idle.clone()),
                     updated_at_unix_ms: checkpoint.updated_at_unix_ms,
                 };
+                let projected_stable_state = if matches!(
+                    &checkpoint.step,
+                    ReconcileStep::Stable {
+                        state: StableState::Cold
+                    }
+                ) {
+                    current_cold_postcondition_exact.then_some(StableState::Cold)
+                } else {
+                    checkpoint.stable_state
+                };
                 (
                     checkpoint.step,
                     evidence,
                     checkpoint.runtime_incarnation,
-                    checkpoint.stable_state,
+                    projected_stable_state,
                     if checkpoint_binding == DesiredCheckpointBinding::Superseded {
                         LifecycleAdmission::Closed
                     } else {
@@ -1854,6 +2438,17 @@ fn runtime_from_inventory(
                     },
                 )
             }
+            None if corrupt_checkpoint_digest.is_some() => (
+                ReconcileStep::InspectInventory { inventory_epoch },
+                CheckpointEvidence::Corrupt {
+                    checkpoint_path,
+                    raw_content_digest: corrupt_checkpoint_digest
+                        .expect("branch established corrupt checkpoint evidence"),
+                },
+                None,
+                None,
+                LifecycleAdmission::Closed,
+            ),
             None => {
                 anyhow::ensure!(
                     blockds.is_empty(),
@@ -1871,14 +2466,22 @@ fn runtime_from_inventory(
         };
 
     let frozen_contract_stop = matches!(&step, ReconcileStep::Quarantined)
+        || corrupt_checkpoint_present
         || unsupported_superseded
+        || current_cold_postcondition_mismatch
         || definite_release_rejected
         || closed_takeover_history
         || (matches!(&step, ReconcileStep::CleanupRelease { .. })
             && volumes.iter().any(|volume| {
                 matches!(&volume.authority, VolumeAuthorityEvidence::Unowned { .. })
             }));
-    let conditions = if frozen_contract_stop {
+    let conditions = if current_cold_postcondition_exact {
+        vec![Condition::Ready {
+            reason: ReadyReason::PostconditionSatisfied {
+                target: RuntimeTarget::Cold,
+            },
+        }]
+    } else if frozen_contract_stop {
         // A superseded checkpoint and a completed release are still exact
         // physical evidence, but neither is itself a terminal typed reason.
         // V1's persisted Quarantined step also lacks the reason required by
@@ -1918,17 +2521,60 @@ fn runtime_from_inventory(
 
 fn authority_record_matches_local_attachment(
     record: &VolumeRecord,
+    desired: &DesiredRuntimeSpec,
     checkpoint: &RuntimeCheckpoint,
     attachment: &cats_storage::authority::AuthorizedServingAttachment,
 ) -> bool {
     if record.lease_owner.is_none() {
-        // Released local bytes may remain only behind an exact cleanup or a
-        // durable closed quarantine. The metadata probe validates the release
-        // marker before constructing the former projection.
-        return matches!(
+        let stable_cold_release = matches!(
             checkpoint.step,
-            ReconcileStep::CleanupRelease { .. } | ReconcileStep::Quarantined
+            ReconcileStep::Stable {
+                state: StableState::Cold
+            }
+        ) && stable_cold_checkpoint_matches_released_attachment(
+            checkpoint,
+            attachment,
+            record.lease_epoch,
+            &record.head,
+        ) && matches!(
+            &record.last_transition,
+            Some(LastVolumeTransition::Release { request, result })
+                if request.volume_id == attachment.identity.volume_id
+                    && request.attachment_id == attachment.identity.attachment_id
+                    && request.expected_epoch == attachment.identity.attachment_epoch
+                    && result.volume_id == attachment.identity.volume_id
+                    && result.released_attachment_id == attachment.identity.attachment_id
+                    && result.resulting_epoch == record.lease_epoch
+                    && result.resulting_head == record.head
         );
+        // Released local bytes may remain only behind an exact cleanup, a
+        // durable closed quarantine, or the exact fenced R == L lineage of a
+        // Stable Cold checkpoint. The latter remains cache, never an owner.
+        let cold_membership_detach_release =
+            cold_membership_detach_cleanup_checkpoint_is_supported(desired, checkpoint)
+                && checkpoint.volumes.iter().any(|volume| {
+                    volume.volume_id == attachment.identity.volume_id
+                        && cold_checkpoint_volume_matches_released_attachment(
+                            volume,
+                            attachment,
+                            record.lease_epoch,
+                            &record.head,
+                        )
+                })
+                && volume_record_has_exact_release(record, attachment);
+        return validate_volume_record(record).is_ok()
+            && validate_authorized_serving_attachment(attachment).is_ok()
+            && record.volume_id == attachment.identity.volume_id
+            && record.size_bytes == attachment.size_bytes
+            && record.durability == attachment.durability
+            && matches!(record.admin_state, VolumeAdminState::Active)
+            && record.lease_expires_at.is_none()
+            && (matches!(
+                checkpoint.step,
+                ReconcileStep::CleanupRelease { .. } | ReconcileStep::Quarantined
+            ) || stable_cold_release)
+            && (!cold_membership_detach_cleanup_checkpoint_is_supported(desired, checkpoint)
+                || cold_membership_detach_release);
     }
 
     validate_volume_record(record).is_ok()
@@ -1947,6 +2593,24 @@ fn authority_record_matches_local_attachment(
             .is_some_and(|expiry| expiry >= attachment.lease_expires_at)
         && remote_head_is_same_or_later(&record.head, &attachment.head)
         && record.last_transition == Some(attachment.expected_last_transition())
+}
+
+fn volume_record_has_exact_release(
+    record: &VolumeRecord,
+    attachment: &cats_storage::authority::AuthorizedServingAttachment,
+) -> bool {
+    matches!(
+        &record.last_transition,
+        Some(LastVolumeTransition::Release { request, result })
+            if request.volume_id == attachment.identity.volume_id
+                && request.attachment_id == attachment.identity.attachment_id
+                && request.expected_epoch == attachment.identity.attachment_epoch
+                && result.volume_id == attachment.identity.volume_id
+                && result.transition_id == request.transition_id
+                && result.released_attachment_id == attachment.identity.attachment_id
+                && result.resulting_epoch == record.lease_epoch
+                && result.resulting_head == record.head
+    )
 }
 
 pub(crate) fn checkpoint_prepared_volume_matches_blockd(
@@ -2179,12 +2843,27 @@ fn current_checkpoint_adopts_blockd(
                         && lineage.placement_epoch == attachment.identity.placement_epoch
                 })
         }),
+        ReconcileStep::Stable {
+            state: StableState::Cold,
+        } => checkpoint.volumes.iter().any(|volume| {
+            volume.volume_id == attachment.identity.volume_id
+                && volume.local_lineages.iter().any(|lineage| {
+                    lineage.attachment_id == attachment.identity.attachment_id
+                        && lineage.attachment_epoch == attachment.identity.attachment_epoch
+                        && lineage.acquire_origin == attachment.identity.acquire_origin
+                        && lineage.node_id == attachment.identity.node_id
+                        && lineage.placement_epoch == attachment.identity.placement_epoch
+                        && lineage.state == LocalLineageState::Released
+                        && lineage.fenced
+                })
+        }),
         _ => false,
     }
 }
 
 fn authority_owner_or_exact_release_matches(
     authority: &VolumeAuthorityEvidence,
+    desired: &DesiredRuntimeSpec,
     checkpoint: &RuntimeCheckpoint,
     attachment: &cats_storage::authority::AuthorizedServingAttachment,
 ) -> bool {
@@ -2207,6 +2886,12 @@ fn authority_owner_or_exact_release_matches(
                     attachment,
                     *attachment_epoch,
                     head,
+                ) || cold_membership_cleanup_matches_released_attachment(
+                    desired,
+                    checkpoint,
+                    attachment,
+                    *attachment_epoch,
+                    head,
                 )
             }
             ReconcileStep::Quarantined => checkpoint.volumes.iter().any(|volume| {
@@ -2218,6 +2903,14 @@ fn authority_owner_or_exact_release_matches(
                     } if checkpoint_epoch == attachment_epoch && checkpoint_head == head
                 )
             }),
+            ReconcileStep::Stable {
+                state: StableState::Cold,
+            } => stable_cold_checkpoint_matches_released_attachment(
+                checkpoint,
+                attachment,
+                *attachment_epoch,
+                head,
+            ),
             _ => false,
         },
         _ => false,
@@ -2249,6 +2942,101 @@ fn cleanup_release_matches_released_authority(
         && attachment_id == &attachment.identity.attachment_id
         && *attachment_epoch == attachment.identity.attachment_epoch
         && replay.generation == head.generation
+}
+
+fn cold_membership_cleanup_matches_released_attachment(
+    desired: &DesiredRuntimeSpec,
+    checkpoint: &RuntimeCheckpoint,
+    attachment: &cats_storage::authority::AuthorizedServingAttachment,
+    resulting_epoch: cats_api::runtime_reconciliation::FenceEpoch,
+    head: &cats_api::runtime_reconciliation::RemoteHead,
+) -> bool {
+    cold_membership_detach_cleanup_checkpoint_is_supported(desired, checkpoint)
+        && checkpoint
+            .volumes
+            .iter()
+            .filter(|volume| volume.volume_id == attachment.identity.volume_id)
+            .collect::<Vec<_>>()
+            .as_slice()
+            .first()
+            .is_some_and(|volume| {
+                checkpoint
+                    .volumes
+                    .iter()
+                    .filter(|candidate| candidate.volume_id == volume.volume_id)
+                    .count()
+                    == 1
+                    && cold_checkpoint_volume_matches_released_attachment(
+                        volume,
+                        attachment,
+                        resulting_epoch,
+                        head,
+                    )
+            })
+}
+
+fn stable_cold_checkpoint_matches_released_attachment(
+    checkpoint: &RuntimeCheckpoint,
+    attachment: &cats_storage::authority::AuthorizedServingAttachment,
+    resulting_epoch: cats_api::runtime_reconciliation::FenceEpoch,
+    head: &cats_api::runtime_reconciliation::RemoteHead,
+) -> bool {
+    if checkpoint.stable_state != Some(StableState::Cold)
+        || !matches!(
+            checkpoint.step,
+            ReconcileStep::Stable {
+                state: StableState::Cold
+            }
+        )
+        || attachment
+            .identity
+            .attachment_epoch
+            .get()
+            .checked_add(1)
+            .is_none_or(|next| next != resulting_epoch.get())
+        || !remote_head_is_same_or_later(head, &attachment.head)
+    {
+        return false;
+    }
+    let mut matching = checkpoint
+        .volumes
+        .iter()
+        .filter(|volume| volume.volume_id == attachment.identity.volume_id);
+    let Some(volume) = matching.next() else {
+        return false;
+    };
+    if matching.next().is_some() {
+        return false;
+    }
+    cold_checkpoint_volume_matches_released_attachment(volume, attachment, resulting_epoch, head)
+}
+
+fn cold_checkpoint_volume_matches_released_attachment(
+    volume: &ObservedVolume,
+    attachment: &cats_storage::authority::AuthorizedServingAttachment,
+    resulting_epoch: cats_api::runtime_reconciliation::FenceEpoch,
+    head: &cats_api::runtime_reconciliation::RemoteHead,
+) -> bool {
+    let [lineage] = volume.local_lineages.as_slice() else {
+        return false;
+    };
+    matches!(
+        &volume.authority,
+        VolumeAuthorityEvidence::Unowned {
+            attachment_epoch,
+            head: checkpoint_head,
+        } if *attachment_epoch == resulting_epoch && checkpoint_head == head
+    ) && lineage.attachment_id == attachment.identity.attachment_id
+        && lineage.attachment_epoch == attachment.identity.attachment_epoch
+        && lineage.acquire_origin == attachment.identity.acquire_origin
+        && lineage.node_id == attachment.identity.node_id
+        && lineage.placement_epoch == attachment.identity.placement_epoch
+        && lineage.local_durable_generation == head.generation
+        && lineage.remote_durable_generation == head.generation
+        && lineage.pending_pack_count.get() == 0
+        && lineage.fenced
+        && lineage.state == LocalLineageState::Released
+        && volume.devices.is_empty()
 }
 
 /// Sidecar-free structural gate used before a previous-boot VMM receipt may
@@ -2679,6 +3467,12 @@ pub(super) fn validate_scanned_checkpoint(
         {
             validate_current_cleanup_checkpoint(desired, checkpoint, cleanup, blockds)?;
         }
+        ReconcileStep::CleanupRelease { .. }
+            if binding == DesiredCheckpointBinding::Superseded
+                && cold_membership_detach_cleanup_checkpoint_is_supported(desired, checkpoint) =>
+        {
+            validate_cold_membership_detach_cleanup_checkpoint(checkpoint, blockds)?;
+        }
         ReconcileStep::Quarantined if binding == DesiredCheckpointBinding::Current => {
             anyhow::ensure!(
                 checkpoint
@@ -2688,7 +3482,64 @@ pub(super) fn validate_scanned_checkpoint(
                 "quarantined pre-launch checkpoint contains a device"
             );
         }
+        ReconcileStep::Stable {
+            state: StableState::Cold,
+        } => validate_stable_cold_checkpoint(checkpoint, blockds)?,
         _ => anyhow::bail!("pre-launch scanner encountered an unsupported Runtime step"),
+    }
+    Ok(())
+}
+
+fn validate_cold_membership_detach_cleanup_checkpoint(
+    checkpoint: &RuntimeCheckpoint,
+    blockds: Option<&BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
+) -> anyhow::Result<()> {
+    let expected_blockds: BTreeSet<&Id> = checkpoint
+        .volumes
+        .iter()
+        .filter(|volume| !volume.local_lineages.is_empty())
+        .map(|volume| &volume.volume_id)
+        .collect();
+    let actual_blockds: BTreeSet<&Id> = blockds
+        .into_iter()
+        .flat_map(|by_volume| by_volume.keys())
+        .collect();
+    let target = super::lifecycle_steps::cold_membership_cleanup_target(checkpoint)
+        .context("Cold detach cleanup checkpoint lacks target")?;
+    let mut post_reclaim_blockds = expected_blockds.clone();
+    post_reclaim_blockds.remove(target);
+    anyhow::ensure!(
+        expected_blockds == actual_blockds || post_reclaim_blockds == actual_blockds,
+        "Cold detach cleanup checkpoint and retained cache set differ"
+    );
+    for volume in checkpoint
+        .volumes
+        .iter()
+        .filter(|volume| !volume.local_lineages.is_empty())
+    {
+        let Some(blockd) = blockds.and_then(|by_volume| by_volume.get(&volume.volume_id)) else {
+            anyhow::ensure!(
+                &volume.volume_id == target,
+                "Cold detach cleanup lost a non-target retained cache"
+            );
+            continue;
+        };
+        let VolumeAuthorityEvidence::Unowned {
+            attachment_epoch,
+            head,
+        } = &volume.authority
+        else {
+            anyhow::bail!("Cold detach cleanup lineage is not Unowned")
+        };
+        anyhow::ensure!(
+            cold_checkpoint_volume_matches_released_attachment(
+                volume,
+                &blockd.checkpoint.attachment,
+                *attachment_epoch,
+                head,
+            ),
+            "Cold detach cleanup retained cache identity is stale"
+        );
     }
     Ok(())
 }
@@ -2699,8 +3550,16 @@ fn scanned_checkpoint_phase_envelope_is_valid(checkpoint: &RuntimeCheckpoint) ->
             checkpoint.runtime_incarnation.as_ref() == Some(&launch.runtime_incarnation)
         }
         None => {
+            let stable_absent_is_valid = checkpoint.stable_state.is_none()
+                || (checkpoint.stable_state == Some(StableState::Cold)
+                    && matches!(
+                        checkpoint.step,
+                        ReconcileStep::Stable {
+                            state: StableState::Cold
+                        }
+                    ));
             checkpoint.runtime_incarnation.is_none()
-                && checkpoint.stable_state.is_none()
+                && stable_absent_is_valid
                 && checkpoint.networks.is_empty()
                 && checkpoint.lifecycle_admission == LifecycleAdmission::Closed
                 && checkpoint.route_gates.is_empty()
@@ -2710,6 +3569,83 @@ fn scanned_checkpoint_phase_envelope_is_valid(checkpoint: &RuntimeCheckpoint) ->
                 )
         }
     }
+}
+
+fn validate_stable_cold_checkpoint(
+    checkpoint: &RuntimeCheckpoint,
+    blockds: Option<&BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        checkpoint.stable_state == Some(StableState::Cold)
+            && checkpoint.runtime_incarnation.is_none()
+            && checkpoint.runtime_launch.identity().is_none()
+            && checkpoint.processes.is_empty()
+            && !checkpoint.volumes.is_empty()
+            && checkpoint.mounts.is_empty()
+            && checkpoint.networks.is_empty()
+            && matches!(
+                checkpoint.guest_transport,
+                GuestTransportEvidence::Unavailable
+            )
+            && matches!(checkpoint.warm_snapshot, WarmSnapshotEvidence::Absent)
+            && checkpoint.lifecycle_admission == LifecycleAdmission::Closed
+            && checkpoint.route_gates.is_empty()
+            && matches!(
+                checkpoint.require_idle,
+                RequireIdleCheckpoint::NotApplicable
+            ),
+        "Stable Cold checkpoint retains a live physical envelope"
+    );
+    let expected_blockds: BTreeSet<&Id> = checkpoint
+        .volumes
+        .iter()
+        .filter(|volume| !volume.local_lineages.is_empty())
+        .map(|volume| &volume.volume_id)
+        .collect();
+    let actual_blockds: BTreeSet<&Id> = blockds
+        .into_iter()
+        .flat_map(|by_volume| by_volume.keys())
+        .collect();
+    anyhow::ensure!(
+        expected_blockds == actual_blockds,
+        "Stable Cold checkpoint and retained cache lineage set differ"
+    );
+    for volume in &checkpoint.volumes {
+        let VolumeAuthorityEvidence::Unowned {
+            attachment_epoch,
+            head,
+        } = &volume.authority
+        else {
+            anyhow::bail!("Stable Cold checkpoint retains a non-Unowned Volume")
+        };
+        anyhow::ensure!(
+            volume.devices.is_empty()
+                && (volume.disk_kind != cats_api::runtime_reconciliation::ObservedDiskKind::Root
+                    || head.generation.get() > 0),
+            "Stable Cold checkpoint retains a device or blank Root"
+        );
+        match volume.local_lineages.as_slice() {
+            [] => {}
+            [lineage] => {
+                let blockd = blockds
+                    .and_then(|by_volume| by_volume.get(&volume.volume_id))
+                    .context("Stable Cold released lineage lacks retained cache evidence")?;
+                let attachment = &blockd.checkpoint.attachment;
+                anyhow::ensure!(
+                    lineage.data_directory == blockd.data_directory
+                        && stable_cold_checkpoint_matches_released_attachment(
+                            checkpoint,
+                            attachment,
+                            *attachment_epoch,
+                            head,
+                        ),
+                    "Stable Cold retained cache lineage is stale or ambiguous"
+                );
+            }
+            _ => anyhow::bail!("Stable Cold checkpoint has duplicate local lineages"),
+        }
+    }
+    Ok(())
 }
 
 fn validate_current_prepared_checkpoint(
@@ -2882,9 +3818,9 @@ mod tests {
         decode_desired_read_snapshot, decode_runtime_checkpoint, encode_node_observation,
         encode_runtime_checkpoint, inventory_digest, spec_digest, AssignedKind, AssignedPlacement,
         ContractVersion, DesiredRuntimeSpec, Epoch, Id, InventorySource, Ipv4Address,
-        IsolatedIpv4Kind, KeyId, MacAddress, NetworkConfig, NodeObservation, RandomId128,
-        ReconcileStep, Revision, RuntimeConfig, RuntimeTarget, RuntimeTransition, SessionBinding,
-        Sha256Digest, StableState,
+        IsolatedIpv4Kind, KeyId, MacAddress, NetworkConfig, NodeObservation,
+        OwnershipTokenEvidence, RandomId128, ReconcileStep, Revision, RuntimeConfig, RuntimeTarget,
+        RuntimeTransition, SessionBinding, Sha256Digest, StableState,
     };
     #[cfg(target_os = "linux")]
     use cats_api::runtime_reconciliation::{decode_desired_runtime_spec, RuntimeLaunch};
@@ -2894,6 +3830,42 @@ mod tests {
 
     const SNAPSHOT: &[u8] = br#"{"desired_specs":[],"expires_at_unix_ms":1720000030000,"issued_at_unix_ms":1720000000000,"read_position":12,"request_sequence":1,"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"version":1}"#;
     const ACTIVE_ROUTE_RING: &[u8] = br#"{"version":1,"ring_version":1,"expected_previous":null,"keys":[{"kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","public_key_spki":"MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To"}]}"#;
+
+    #[test]
+    fn residue_aggregation_never_builds_item_4097_across_sources() {
+        let residue = |index| NodeResidue::ControlSocket {
+            socket_path: HostPath::new(format!("/tmp/residue-{index}")).unwrap(),
+            role_hint: None,
+            ownership_token: OwnershipTokenEvidence::Missing,
+        };
+        let mut aggregate = InventoryProbeAggregation::new();
+        append_residue_or_mark_incomplete(
+            &mut aggregate,
+            InventorySource::Checkpoint,
+            (0..NODE_OBSERVATION_MAX_RESIDUE_ITEMS - 1)
+                .map(residue)
+                .collect(),
+        );
+        append_residue_or_mark_incomplete(
+            &mut aggregate,
+            InventorySource::DataDirectory,
+            vec![residue(NODE_OBSERVATION_MAX_RESIDUE_ITEMS - 1)],
+        );
+        assert_eq!(aggregate.residue.len(), NODE_OBSERVATION_MAX_RESIDUE_ITEMS);
+        assert!(aggregate.unavailable_sources.is_empty());
+
+        append_residue_or_mark_incomplete(
+            &mut aggregate,
+            InventorySource::Network,
+            vec![residue(NODE_OBSERVATION_MAX_RESIDUE_ITEMS)],
+        );
+        assert_eq!(
+            aggregate.residue.len(),
+            NODE_OBSERVATION_MAX_RESIDUE_ITEMS,
+            "item 4097 must not enter the wire projection"
+        );
+        assert_eq!(aggregate.unavailable_sources, [InventorySource::Network]);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -3292,8 +4264,51 @@ mod tests {
         .unwrap();
         assert!(matches!(
             scanner.scan_complete(context()).unwrap(),
-            RuntimeInventoryScanOutcome::Incomplete { unavailable_sources }
+            RuntimeInventoryScanOutcome::Incomplete {
+                unavailable_sources,
+                ..
+            }
                 if unavailable_sources == [InventorySource::MetadataStore]
+        ));
+    }
+
+    #[test]
+    fn complete_residue_is_reported_canonically_without_becoming_absence() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut all = probes(None, &calls);
+        let process = all
+            .iter_mut()
+            .find(|probe| probe.source() == InventorySource::ControlSocket)
+            .unwrap();
+        *process = Arc::new(Probe {
+            source: InventorySource::ControlSocket,
+            result: InventoryAbsence::Residue(vec![
+                NodeResidue::ControlSocket {
+                    socket_path: HostPath::new("/run/cats/z.sock").unwrap(),
+                    role_hint: None,
+                    ownership_token:
+                        cats_api::runtime_reconciliation::OwnershipTokenEvidence::Missing,
+                },
+                NodeResidue::ControlSocket {
+                    socket_path: HostPath::new("/run/cats/a.sock").unwrap(),
+                    role_hint: None,
+                    ownership_token:
+                        cats_api::runtime_reconciliation::OwnershipTokenEvidence::Missing,
+                },
+            ]),
+            calls: Arc::clone(&calls),
+        });
+        let scanner = CleanSlateInventoryScanner::new(PathBuf::from("/checkpoints"), all).unwrap();
+        let RuntimeInventoryScanOutcome::Complete(inventory) =
+            scanner.scan_complete(context()).unwrap()
+        else {
+            panic!("a completely enumerated residue source must remain a complete scan")
+        };
+        assert_eq!(inventory.residue().len(), 2);
+        assert!(matches!(
+            &inventory.residue()[0],
+            NodeResidue::ControlSocket { socket_path, .. }
+                if socket_path.as_str() == "/run/cats/a.sock"
         ));
     }
 

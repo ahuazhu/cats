@@ -17,10 +17,15 @@ use aws_sdk_kinesis::primitives::Blob;
 use aws_sdk_kinesis::types::ShardIteratorType;
 use aws_sdk_s3::primitives::ByteStream;
 use cats_metering::{
-    AttributedCheckpoint, IngestOutcome, MeteringError, UsageAttribution, UsageQuery, UsageStore,
-    UsageStoreFuture, UsageView,
+    sha256_prefixed, target_terminal_marker, target_terminal_request_sha256,
+    validate_target_terminal_receipt, validate_target_terminal_request, ArchivedUsageCheckpoint,
+    ArchivedUsageTerminalBarrier, AttributedCheckpoint, IngestOutcome, MeteringError,
+    UsageAttribution, UsageQuery, UsageSourceTerminalReceipt, UsageStore, UsageStoreFuture,
+    UsageStreamRecord, UsageTargetBinding, UsageTargetTerminalReceipt, UsageTargetTerminalRequest,
+    UsageTerminalPrepareOutcome, UsageTerminalShardTarget, UsageView,
 };
 use futures_util::{stream::FuturesUnordered, FutureExt, StreamExt};
+use sha2::{Digest, Sha256};
 
 const KINESIS_RECORD_LIMIT: usize = 1_048_576;
 const ARCHIVE_BATCH_MAX_BYTES: usize = 4 * 1_048_576;
@@ -45,12 +50,13 @@ fn kinesis_read_pacer() -> tokio::time::Interval {
 
 struct PendingRecord {
     sequence_number: String,
-    envelope: AttributedCheckpoint,
+    record: UsageStreamRecord,
 }
 
 struct ArchiveBatch {
     key: String,
     payload: Vec<u8>,
+    sha256: String,
     last_sequence_number: String,
 }
 
@@ -87,6 +93,10 @@ pub struct AwsUsageStreamStore {
     s3: aws_sdk_s3::Client,
     dynamodb: aws_sdk_dynamodb::Client,
     config: AwsUsageStreamConfig,
+    /// Serializes marker placement against producer PutRecord. The persisted
+    /// target operation seeds this gate on restart, so retirement cannot
+    /// accidentally reopen after process loss.
+    terminal_gate: tokio::sync::RwLock<bool>,
 }
 
 impl AwsUsageStreamStore {
@@ -95,6 +105,12 @@ impl AwsUsageStreamStore {
         config: AwsUsageStreamConfig,
     ) -> Result<Arc<Self>> {
         config.validate()?;
+        let target_terminal_active = projection
+            .active_target_terminal()
+            .await
+            .map_err(anyhow::Error::new)
+            .context("discover persisted Usage target terminal gate")?
+            .is_some();
         let sdk_config = aws_config::defaults(BehaviorVersion::latest())
             .region(aws_config::Region::new(config.region.clone()))
             .load()
@@ -105,6 +121,7 @@ impl AwsUsageStreamStore {
             s3: aws_sdk_s3::Client::new(&sdk_config),
             dynamodb: aws_sdk_dynamodb::Client::new(&sdk_config),
             config,
+            terminal_gate: tokio::sync::RwLock::new(target_terminal_active),
         }))
     }
 
@@ -196,8 +213,9 @@ impl AwsUsageStreamStore {
                 .await
                 .context("read usage Kinesis records")?;
             for record in output.records() {
-                let envelope: AttributedCheckpoint = serde_json::from_slice(record.data().as_ref())
-                    .context("decode attributed usage checkpoint from Kinesis")?;
+                let stream_record: UsageStreamRecord =
+                    serde_json::from_slice(record.data().as_ref())
+                        .context("decode usage stream record from Kinesis")?;
                 if pending.is_empty() {
                     pending_since = Some(std::time::Instant::now());
                 }
@@ -206,12 +224,16 @@ impl AwsUsageStreamStore {
                     .context("usage archive batch byte count overflow")?;
                 pending.push(PendingRecord {
                     sequence_number: record.sequence_number().to_string(),
-                    envelope,
+                    record: stream_record,
                 });
             }
+            let terminal_barrier_seen = pending
+                .iter()
+                .any(|record| matches!(&record.record, UsageStreamRecord::TerminalBarrier(_)));
             let archive_due = !pending.is_empty()
                 && (pending.len() >= ARCHIVE_BATCH_MAX_RECORDS
                     || pending_bytes >= ARCHIVE_BATCH_MAX_BYTES
+                    || terminal_barrier_seen
                     || pending_since
                         .is_some_and(|started| started.elapsed() >= ARCHIVE_BATCH_MAX_AGE));
             if archive_due {
@@ -240,7 +262,15 @@ impl AwsUsageStreamStore {
             return Ok(None);
         };
         self.archive(&batch.key, batch.payload).await?;
-        apply_projection(self.projection.as_ref(), records).await?;
+        apply_projection(
+            self.projection.as_ref(),
+            records,
+            &self.config.stream_name,
+            &self.config.archive_bucket,
+            &batch.key,
+            &batch.sha256,
+        )
+        .await?;
         Ok(Some(batch.last_sequence_number))
     }
 
@@ -332,6 +362,522 @@ impl AwsUsageStreamStore {
             .context("save usage projector checkpoint")?;
         Ok(())
     }
+
+    /// Return the exact open-shard routing targets used to construct a target
+    /// terminal request. A stream with any closed shard is refused: a reshard
+    /// must settle before this closed-set protocol can begin.
+    pub async fn terminal_shard_targets(
+        &self,
+    ) -> cats_metering::Result<Vec<UsageTerminalShardTarget>> {
+        self.list_stable_open_shards(&self.config.stream_name).await
+    }
+
+    /// Persist the closed source set, close producer ingress, then place one
+    /// deterministic marker into every exact old-stream shard. A response-loss
+    /// retry writes the same marker payload and remains safe; the projector
+    /// chooses the earliest archived instance.
+    pub async fn begin_target_terminal_operation(
+        &self,
+        request: &UsageTargetTerminalRequest,
+    ) -> cats_metering::Result<UsageTerminalPrepareOutcome> {
+        validate_target_terminal_request(request)?;
+        self.verify_terminal_request_live(request).await?;
+
+        // An ingest holds the read side through its PutRecord. Once this write
+        // lock is acquired, every record it accepted is ordered before the
+        // marker and every later ingest observes the closed bit.
+        let mut terminal_gate = self.terminal_gate.write().await;
+        self.verify_terminal_request_live(request).await?;
+        let prepared = match self.projection.prepare_target_terminal(request).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // Store errors can hide a committed response. Close locally
+                // before discovery; a false-negative availability stop is
+                // safer than admitting a record on the wrong side of markers.
+                if matches!(error, MeteringError::Store(_)) {
+                    *terminal_gate = true;
+                    if let Some(state) = self.projection.active_target_terminal().await? {
+                        if state.request == *request
+                            && state.request_sha256 == target_terminal_request_sha256(request)?
+                        {
+                            UsageTerminalPrepareOutcome::ExactReplay
+                        } else {
+                            return Err(error);
+                        }
+                    } else {
+                        return Err(error);
+                    }
+                } else {
+                    return Err(error);
+                }
+            }
+        };
+        *terminal_gate = true;
+
+        for shard in &request.shards {
+            let marker = target_terminal_marker(request, &shard.shard_id)?;
+            let payload = serde_json::to_vec(&UsageStreamRecord::TerminalBarrier(marker.clone()))?;
+            if payload.len() > KINESIS_RECORD_LIMIT {
+                return Err(MeteringError::Invalid(
+                    "Usage terminal marker exceeds the Kinesis record limit".into(),
+                ));
+            }
+            let output = self
+                .kinesis
+                .put_record()
+                .stream_name(&request.old_target.stream_name)
+                .partition_key(&marker.marker_id)
+                .explicit_hash_key(&shard.explicit_hash_key)
+                .data(Blob::new(payload))
+                .send()
+                .await
+                .map_err(|error| {
+                    MeteringError::Store(format!(
+                        "put Usage terminal marker for shard {}: {error}",
+                        shard.shard_id
+                    ))
+                })?;
+            if output.shard_id() != shard.shard_id {
+                return Err(MeteringError::Conflict(format!(
+                    "Usage terminal marker for {} landed in foreign shard {}",
+                    shard.shard_id,
+                    output.shard_id()
+                )));
+            }
+        }
+
+        // Catch a reshard or identity replacement concurrent with marker
+        // placement. The operation stays safely closed and can be investigated;
+        // no receipt is manufactured from this call.
+        self.verify_terminal_request_live(request).await?;
+        Ok(prepared)
+    }
+
+    /// Discover whether every exact marker is archived/projected and its
+    /// DynamoDB shard checkpoint has advanced. On closure, write the canonical
+    /// receipt to Object-Locked S3 first and insert-only PostgreSQL second.
+    pub async fn complete_target_terminal_operation(
+        &self,
+        request: &UsageTargetTerminalRequest,
+    ) -> cats_metering::Result<Option<UsageTargetTerminalReceipt>> {
+        validate_target_terminal_request(request)?;
+        let terminal_gate = self.terminal_gate.read().await;
+        if !*terminal_gate {
+            return Err(MeteringError::Conflict(
+                "Usage target terminal operation has not closed producer ingress".into(),
+            ));
+        }
+        self.verify_terminal_request_live(request).await?;
+
+        let terminal_epoch_id = request.terminal_epoch_id.to_string();
+        let state = self
+            .projection
+            .target_terminal_state(&terminal_epoch_id)
+            .await?
+            .ok_or_else(|| {
+                MeteringError::Conflict(
+                    "Usage target terminal operation has no prepared projection".into(),
+                )
+            })?;
+        let request_sha256 = target_terminal_request_sha256(request)?;
+        if state.request != *request || state.request_sha256 != request_sha256 {
+            return Err(MeteringError::Conflict(
+                "Usage target terminal discovery request does not match the prepared operation"
+                    .into(),
+            ));
+        }
+
+        if let Some(receipt) = state.receipt {
+            validate_target_terminal_receipt(&receipt)?;
+            self.verify_target_receipt_object(&receipt).await?;
+            return Ok(Some(receipt));
+        }
+        if state.barriers.len() != request.shards.len() {
+            return Ok(None);
+        }
+        for barrier in &state.barriers {
+            let Some(checkpoint) = self
+                .load_checkpoint(&barrier.marker.shard_id)
+                .await
+                .map_err(|error| {
+                    MeteringError::Store(format!("load terminal projector checkpoint: {error}"))
+                })?
+            else {
+                return Ok(None);
+            };
+            if !canonical_decimal_at_least(&checkpoint, &barrier.archive.sequence_number)? {
+                return Ok(None);
+            }
+        }
+
+        // Verify the topology and provider identities again after observing
+        // catch-up; otherwise a concurrent reshard could turn an old snapshot
+        // of the shard set into a false global barrier.
+        self.verify_terminal_request_live(request).await?;
+        let mut source_receipts = Vec::with_capacity(request.sources.len());
+        for source in &request.sources {
+            let receipt = self
+                .projection
+                .source_terminal_receipt(&source.source_id, &source.source_epoch)
+                .await?
+                .ok_or_else(|| {
+                    MeteringError::Conflict(format!(
+                        "source {}/{} lost its terminal receipt",
+                        source.source_id, source.source_epoch
+                    ))
+                })?;
+            let actual_sha256 = sha256_prefixed(&serde_json::to_vec(&receipt)?);
+            if actual_sha256 != source.receipt_sha256 {
+                return Err(MeteringError::Conflict(format!(
+                    "source {}/{} terminal receipt digest changed",
+                    source.source_id, source.source_epoch
+                )));
+            }
+            source_receipts.push(receipt);
+        }
+        let receipt = UsageTargetTerminalReceipt {
+            contract_version: 1,
+            request: request.clone(),
+            request_sha256,
+            source_receipts,
+            barriers: state.barriers,
+        };
+        validate_target_terminal_receipt(&receipt)?;
+        self.put_target_receipt_object(&receipt).await?;
+        self.projection.commit_target_terminal(&receipt).await?;
+
+        // Both writes are response-loss replayable. Rediscovery proves the PG
+        // side contains the exact bytes just compared with immutable S3.
+        let committed = self
+            .projection
+            .target_terminal_state(&terminal_epoch_id)
+            .await?
+            .and_then(|state| state.receipt)
+            .ok_or_else(|| {
+                MeteringError::Store(
+                    "Usage target terminal receipt commit was not discoverable".into(),
+                )
+            })?;
+        if committed != receipt {
+            return Err(MeteringError::Conflict(
+                "Usage target terminal receipt discovery returned conflicting bytes".into(),
+            ));
+        }
+        self.verify_target_receipt_object(&committed).await?;
+        Ok(Some(committed))
+    }
+
+    async fn verify_terminal_request_live(
+        &self,
+        request: &UsageTargetTerminalRequest,
+    ) -> cats_metering::Result<()> {
+        if self.config.region != request.old_target.aws_region
+            || self.config.stream_name != request.old_target.stream_name
+            || self.config.checkpoint_table != request.old_target.checkpoint_table_name
+            || self.config.archive_bucket != request.old_target.archive_bucket_name
+        {
+            return Err(MeteringError::Invalid(
+                "terminal old target does not match the running Usage adapter".into(),
+            ));
+        }
+        self.verify_target_resources(&request.old_target).await?;
+        self.verify_target_resources(&request.fresh_target).await?;
+        let actual_shards = self
+            .list_stable_open_shards(&request.old_target.stream_name)
+            .await?;
+        if actual_shards != request.shards {
+            return Err(MeteringError::Conflict(
+                "old Usage stream shard set or hash ranges changed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn verify_target_resources(
+        &self,
+        target: &UsageTargetBinding,
+    ) -> cats_metering::Result<()> {
+        if target.aws_region != self.config.region {
+            return Err(MeteringError::Invalid(
+                "Usage target region does not match the configured AWS client".into(),
+            ));
+        }
+        let stream = self
+            .kinesis
+            .describe_stream_summary()
+            .stream_name(&target.stream_name)
+            .send()
+            .await
+            .map_err(|error| {
+                MeteringError::Store(format!(
+                    "describe Usage Kinesis stream {}: {error}",
+                    target.stream_name
+                ))
+            })?;
+        let stream = stream.stream_description_summary().ok_or_else(|| {
+            MeteringError::Store("Kinesis omitted the Usage stream summary".into())
+        })?;
+        if stream.stream_arn() != target.stream_arn || stream.stream_status().as_str() != "ACTIVE" {
+            return Err(MeteringError::Conflict(format!(
+                "Usage Kinesis stream {} identity or state changed",
+                target.stream_name
+            )));
+        }
+
+        let table = self
+            .dynamodb
+            .describe_table()
+            .table_name(&target.checkpoint_table_name)
+            .send()
+            .await
+            .map_err(|error| {
+                MeteringError::Store(format!(
+                    "describe Usage checkpoint table {}: {error}",
+                    target.checkpoint_table_name
+                ))
+            })?;
+        let table = table.table().ok_or_else(|| {
+            MeteringError::Store("DynamoDB omitted the Usage checkpoint table description".into())
+        })?;
+        if table.table_arn() != Some(target.checkpoint_table_arn.as_str())
+            || table.table_status().map(|status| status.as_str()) != Some("ACTIVE")
+        {
+            return Err(MeteringError::Conflict(format!(
+                "Usage checkpoint table {} identity or state changed",
+                target.checkpoint_table_name
+            )));
+        }
+
+        let bucket = self
+            .s3
+            .head_bucket()
+            .bucket(&target.archive_bucket_name)
+            .expected_bucket_owner(&target.aws_account_id)
+            .send()
+            .await
+            .map_err(|error| {
+                MeteringError::Store(format!(
+                    "head Usage archive bucket {}: {error}",
+                    target.archive_bucket_name
+                ))
+            })?;
+        if bucket.bucket_region() != Some(target.aws_region.as_str()) {
+            return Err(MeteringError::Conflict(format!(
+                "Usage archive bucket {} region changed",
+                target.archive_bucket_name
+            )));
+        }
+        let lock = self
+            .s3
+            .get_object_lock_configuration()
+            .bucket(&target.archive_bucket_name)
+            .expected_bucket_owner(&target.aws_account_id)
+            .send()
+            .await
+            .map_err(|error| {
+                MeteringError::Store(format!(
+                    "read Usage archive bucket {} Object Lock: {error}",
+                    target.archive_bucket_name
+                ))
+            })?;
+        let retention = lock
+            .object_lock_configuration()
+            .filter(|configuration| {
+                configuration
+                    .object_lock_enabled()
+                    .is_some_and(|enabled| enabled.as_str() == "Enabled")
+            })
+            .and_then(|configuration| configuration.rule())
+            .and_then(|rule| rule.default_retention())
+            .ok_or_else(|| {
+                MeteringError::Conflict(format!(
+                    "Usage archive bucket {} has no default Object Lock retention",
+                    target.archive_bucket_name
+                ))
+            })?;
+        let mode_is_valid = retention
+            .mode()
+            .is_some_and(|mode| matches!(mode.as_str(), "GOVERNANCE" | "COMPLIANCE"));
+        let period_is_valid = matches!(
+            (retention.days(), retention.years()),
+            (Some(days), None) if days > 0
+        ) || matches!(
+            (retention.days(), retention.years()),
+            (None, Some(years)) if years > 0
+        );
+        if !mode_is_valid || !period_is_valid {
+            return Err(MeteringError::Conflict(format!(
+                "Usage archive bucket {} Object Lock retention is invalid",
+                target.archive_bucket_name
+            )));
+        }
+        Ok(())
+    }
+
+    async fn list_stable_open_shards(
+        &self,
+        stream_name: &str,
+    ) -> cats_metering::Result<Vec<UsageTerminalShardTarget>> {
+        let mut next_token = None::<String>;
+        let mut targets = Vec::new();
+        loop {
+            let mut request = self.kinesis.list_shards();
+            request = if let Some(token) = next_token.take() {
+                request.next_token(token)
+            } else {
+                request.stream_name(stream_name)
+            };
+            let output = request.send().await.map_err(|error| {
+                MeteringError::Store(format!(
+                    "list terminal shards for Usage stream {stream_name}: {error}"
+                ))
+            })?;
+            for shard in output.shards() {
+                let sequence_range = shard.sequence_number_range().ok_or_else(|| {
+                    MeteringError::Store(format!(
+                        "Kinesis shard {} omitted its sequence range",
+                        shard.shard_id()
+                    ))
+                })?;
+                if sequence_range.ending_sequence_number().is_some() {
+                    return Err(MeteringError::Conflict(format!(
+                        "Usage stream contains closed shard {}; reshard is not terminal-stable",
+                        shard.shard_id()
+                    )));
+                }
+                let hash_range = shard.hash_key_range().ok_or_else(|| {
+                    MeteringError::Store(format!(
+                        "Kinesis shard {} omitted its hash-key range",
+                        shard.shard_id()
+                    ))
+                })?;
+                targets.push(UsageTerminalShardTarget {
+                    shard_id: shard.shard_id().to_string(),
+                    explicit_hash_key: hash_range.starting_hash_key().to_string(),
+                });
+            }
+            next_token = output.next_token().map(ToString::to_string);
+            if next_token.is_none() {
+                break;
+            }
+        }
+        targets.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
+        if targets.is_empty() {
+            return Err(MeteringError::Conflict(
+                "Usage stream has no open terminal shards".into(),
+            ));
+        }
+        if targets
+            .windows(2)
+            .any(|pair| pair[0].shard_id == pair[1].shard_id)
+        {
+            return Err(MeteringError::Store(
+                "Kinesis returned a duplicate Usage shard identity".into(),
+            ));
+        }
+        Ok(targets)
+    }
+
+    fn target_receipt_key(receipt: &UsageTargetTerminalReceipt) -> String {
+        format!("terminal/v1/{}.json", receipt.request.terminal_epoch_id)
+    }
+
+    async fn put_target_receipt_object(
+        &self,
+        receipt: &UsageTargetTerminalReceipt,
+    ) -> cats_metering::Result<()> {
+        let key = Self::target_receipt_key(receipt);
+        let payload = serde_json::to_vec(receipt)?;
+        let put = self
+            .s3
+            .put_object()
+            .bucket(&receipt.request.old_target.archive_bucket_name)
+            .key(&key)
+            .content_type("application/json")
+            .expected_bucket_owner(&receipt.request.old_target.aws_account_id)
+            .if_none_match("*")
+            .body(ByteStream::from(payload.clone()))
+            .send()
+            .await;
+        if put.is_ok() {
+            return Ok(());
+        }
+        let existing = self
+            .read_target_receipt_object(receipt)
+            .await
+            .map_err(|error| {
+                MeteringError::Store(format!(
+                    "write immutable Usage target receipt {key}, then discover postcondition: {error}"
+                ))
+            })?;
+        if existing != payload {
+            return Err(MeteringError::Conflict(format!(
+                "immutable Usage target receipt object {key} has conflicting bytes"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn verify_target_receipt_object(
+        &self,
+        receipt: &UsageTargetTerminalReceipt,
+    ) -> cats_metering::Result<()> {
+        let expected = serde_json::to_vec(receipt)?;
+        let actual = self.read_target_receipt_object(receipt).await?;
+        if actual != expected || sha256_prefixed(&actual) != sha256_prefixed(&expected) {
+            return Err(MeteringError::Conflict(format!(
+                "immutable Usage target receipt object {} conflicts with PostgreSQL",
+                Self::target_receipt_key(receipt)
+            )));
+        }
+        Ok(())
+    }
+
+    async fn read_target_receipt_object(
+        &self,
+        receipt: &UsageTargetTerminalReceipt,
+    ) -> cats_metering::Result<Vec<u8>> {
+        let key = Self::target_receipt_key(receipt);
+        let object = self
+            .s3
+            .get_object()
+            .bucket(&receipt.request.old_target.archive_bucket_name)
+            .key(&key)
+            .expected_bucket_owner(&receipt.request.old_target.aws_account_id)
+            .send()
+            .await
+            .map_err(|error| {
+                MeteringError::Store(format!(
+                    "read immutable Usage target receipt {key}: {error}"
+                ))
+            })?;
+        object
+            .body
+            .collect()
+            .await
+            .map(|body| body.into_bytes().to_vec())
+            .map_err(|error| {
+                MeteringError::Store(format!(
+                    "collect immutable Usage target receipt {key}: {error}"
+                ))
+            })
+    }
+}
+
+fn canonical_decimal_at_least(actual: &str, expected: &str) -> cats_metering::Result<bool> {
+    for (name, value) in [("actual", actual), ("expected", expected)] {
+        if value.is_empty()
+            || value.len() > 78
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+            || value.len() > 1 && value.starts_with('0')
+        {
+            return Err(MeteringError::Store(format!(
+                "{name} Usage sequence number is not canonical unsigned decimal"
+            )));
+        }
+    }
+    Ok(actual.len() > expected.len()
+        || actual.len() == expected.len() && actual.as_bytes() >= expected.as_bytes())
 }
 
 async fn run_shard_workers<I, F, Fut>(shards: I, mut make_worker: F) -> Result<()>
@@ -355,33 +901,50 @@ where
     Ok(())
 }
 
-async fn apply_projection(projection: &dyn UsageStore, records: &[PendingRecord]) -> Result<()> {
+async fn apply_projection(
+    projection: &dyn UsageStore,
+    records: &[PendingRecord],
+    stream_name: &str,
+    archive_bucket: &str,
+    archive_key: &str,
+    archive_sha256: &str,
+) -> Result<()> {
     for record in records {
-        match projection.ingest(&record.envelope).await {
-            Ok(_) => {}
-            Err(
-                error @ (MeteringError::Invalid(_)
-                | MeteringError::Conflict(_)
-                | MeteringError::Overflow
-                | MeteringError::Serialization(_)),
-            ) => {
-                let checkpoint = &record.envelope.checkpoint;
-                tracing::error!(
-                    event_id = %checkpoint.event_id,
-                    source_id = %checkpoint.source_id,
-                    source_epoch = %checkpoint.source_epoch,
-                    sequence = checkpoint.sequence,
-                    metric = checkpoint.metric.slug(),
-                    %error,
-                    "permanently invalid usage checkpoint remains in the immutable archive; skipping PostgreSQL projection"
-                );
-            }
-            Err(error @ MeteringError::Store(_)) => {
-                return Err(anyhow::anyhow!(error)).context("apply usage checkpoint projection");
-            }
-        }
+        let archive = cats_metering::UsageArchiveEvidence {
+            stream_name: stream_name.to_string(),
+            archive_bucket: archive_bucket.to_string(),
+            shard_id: archive_shard_id(archive_key)?.to_string(),
+            sequence_number: record.sequence_number.clone(),
+            archive_key: archive_key.to_string(),
+            archive_sha256: archive_sha256.to_string(),
+        };
+        match &record.record {
+            UsageStreamRecord::Checkpoint(value) => projection
+                .project_archived(&ArchivedUsageCheckpoint {
+                    value: value.as_ref().clone(),
+                    archive,
+                })
+                .await
+                .map_err(anyhow::Error::new)
+                .context("apply archived usage checkpoint projection")?,
+            UsageStreamRecord::TerminalBarrier(marker) => projection
+                .project_terminal_barrier(&ArchivedUsageTerminalBarrier {
+                    marker: marker.clone(),
+                    archive,
+                })
+                .await
+                .map_err(anyhow::Error::new)
+                .context("apply archived Usage terminal barrier projection")?,
+        };
     }
     Ok(())
+}
+
+fn archive_shard_id(key: &str) -> Result<&str> {
+    key.split('/')
+        .find_map(|component| component.strip_prefix("shard="))
+        .filter(|value| !value.is_empty())
+        .context("usage archive key has no shard identity")
 }
 
 fn encode_archive_batch(shard_id: &str, records: &[PendingRecord]) -> Result<Option<ArchiveBatch>> {
@@ -391,17 +954,22 @@ fn encode_archive_batch(shard_id: &str, records: &[PendingRecord]) -> Result<Opt
     let last = records.last().context("usage archive batch vanished")?;
     let mut payload = Vec::new();
     for record in records {
-        serde_json::to_writer(&mut payload, &record.envelope)
-            .context("encode attributed usage checkpoint for archive batch")?;
+        serde_json::to_writer(&mut payload, &record.record)
+            .context("encode usage stream record for archive batch")?;
         payload.push(b'\n');
     }
-    let day = first.envelope.checkpoint.observed_at_unix_ms / 86_400_000;
+    let day = match &first.record {
+        UsageStreamRecord::Checkpoint(value) => value.checkpoint.observed_at_unix_ms / 86_400_000,
+        UsageStreamRecord::TerminalBarrier(_) => 0,
+    };
+    let sha256 = format!("sha256:{}", hex::encode(Sha256::digest(&payload)));
     Ok(Some(ArchiveBatch {
         key: format!(
             "raw/day={day}/shard={shard_id}/{}-{}.ndjson",
             first.sequence_number, last.sequence_number
         ),
         payload,
+        sha256,
         last_sequence_number: last.sequence_number.clone(),
     }))
 }
@@ -412,7 +980,14 @@ impl UsageStore for AwsUsageStreamStore {
         value: &'a AttributedCheckpoint,
     ) -> UsageStoreFuture<'a, IngestOutcome> {
         Box::pin(async move {
-            let payload = serde_json::to_vec(value)?;
+            let terminal_gate = self.terminal_gate.read().await;
+            if *terminal_gate {
+                return Err(MeteringError::Conflict(
+                    "old Usage target is closed for terminal projection".into(),
+                ));
+            }
+            let payload =
+                serde_json::to_vec(&UsageStreamRecord::Checkpoint(Box::new(value.clone())))?;
             if payload.len() > KINESIS_RECORD_LIMIT {
                 return Err(cats_metering::MeteringError::Invalid(
                     "attributed checkpoint exceeds the Kinesis record limit".to_string(),
@@ -426,6 +1001,7 @@ impl UsageStore for AwsUsageStreamStore {
                 .send()
                 .await
                 .map_err(|error| cats_metering::MeteringError::Store(error.to_string()))?;
+            drop(terminal_gate);
             Ok(IngestOutcome::Accepted)
         })
     }
@@ -441,6 +1017,70 @@ impl UsageStore for AwsUsageStreamStore {
     ) -> UsageStoreFuture<'a, Option<UsageAttribution>> {
         self.projection
             .source_epoch_attribution(source_id, source_epoch)
+    }
+
+    fn project_archived<'a>(
+        &'a self,
+        value: &'a ArchivedUsageCheckpoint,
+    ) -> UsageStoreFuture<'a, IngestOutcome> {
+        self.projection.project_archived(value)
+    }
+
+    fn source_terminal_receipt<'a>(
+        &'a self,
+        source_id: &'a str,
+        source_epoch: &'a str,
+    ) -> UsageStoreFuture<'a, Option<UsageSourceTerminalReceipt>> {
+        self.projection
+            .source_terminal_receipt(source_id, source_epoch)
+    }
+
+    fn active_target_terminal<'a>(
+        &'a self,
+    ) -> UsageStoreFuture<'a, Option<cats_metering::UsageTargetTerminalState>> {
+        self.projection.active_target_terminal()
+    }
+
+    fn begin_target_terminal<'a>(
+        &'a self,
+        request: &'a UsageTargetTerminalRequest,
+    ) -> UsageStoreFuture<'a, UsageTerminalPrepareOutcome> {
+        Box::pin(async move { self.begin_target_terminal_operation(request).await })
+    }
+
+    fn complete_target_terminal<'a>(
+        &'a self,
+        request: &'a UsageTargetTerminalRequest,
+    ) -> UsageStoreFuture<'a, Option<UsageTargetTerminalReceipt>> {
+        Box::pin(async move { self.complete_target_terminal_operation(request).await })
+    }
+
+    fn prepare_target_terminal<'a>(
+        &'a self,
+        request: &'a UsageTargetTerminalRequest,
+    ) -> UsageStoreFuture<'a, UsageTerminalPrepareOutcome> {
+        self.projection.prepare_target_terminal(request)
+    }
+
+    fn project_terminal_barrier<'a>(
+        &'a self,
+        barrier: &'a ArchivedUsageTerminalBarrier,
+    ) -> UsageStoreFuture<'a, IngestOutcome> {
+        self.projection.project_terminal_barrier(barrier)
+    }
+
+    fn target_terminal_state<'a>(
+        &'a self,
+        terminal_epoch_id: &'a str,
+    ) -> UsageStoreFuture<'a, Option<cats_metering::UsageTargetTerminalState>> {
+        self.projection.target_terminal_state(terminal_epoch_id)
+    }
+
+    fn commit_target_terminal<'a>(
+        &'a self,
+        receipt: &'a UsageTargetTerminalReceipt,
+    ) -> UsageStoreFuture<'a, UsageTerminalPrepareOutcome> {
+        self.projection.commit_target_terminal(receipt)
     }
 }
 
@@ -607,7 +1247,9 @@ mod tests {
     fn pending(sequence_number: &str, observed_at_unix_ms: i64) -> PendingRecord {
         PendingRecord {
             sequence_number: sequence_number.to_string(),
-            envelope: serde_json::from_value(serde_json::json!({
+            record: serde_json::from_value(serde_json::json!({
+                "kind": "checkpoint",
+                "value": {
                 "checkpoint": {
                     "event_id": format!("event-{sequence_number}"),
                     "source_id": "node/metal-1/cat/cat-1",
@@ -617,7 +1259,16 @@ mod tests {
                     "cat_id": "cat-1",
                     "cat_generation": 1,
                     "metric": "cpu_usec",
+                    "epoch_marker": "open",
                     "cumulative_quantity": sequence_number
+                },
+                "source_binding": {
+                    "node_id": "metal-1",
+                    "node_boot_id": "11111111111111111111111111111111",
+                    "agent_instance_id": "22222222222222222222222222222222",
+                    "agent_epoch": 1,
+                    "desired_revision": 1,
+                    "runtime_incarnation": "33333333333333333333333333333333"
                 },
                 "attribution": {
                     "billing_account_id": "billing_account/workspace_default",
@@ -625,6 +1276,7 @@ mod tests {
                     "resource_type": "cat",
                     "resource_id": "cat-1",
                     "attributed_cat_id": "cat-1"
+                }
                 }
             }))
             .unwrap(),
@@ -680,13 +1332,13 @@ mod tests {
             .payload
             .split(|byte| *byte == b'\n')
             .filter(|line| !line.is_empty())
-            .map(|line| serde_json::from_slice::<AttributedCheckpoint>(line).unwrap())
+            .map(|line| serde_json::from_slice::<UsageStreamRecord>(line).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(
             decoded,
             records
                 .iter()
-                .map(|record| record.envelope.clone())
+                .map(|record| record.record.clone())
                 .collect::<Vec<_>>()
         );
     }
@@ -709,10 +1361,14 @@ mod tests {
         // depending on whether a Kinesis response carried records.
         let first = pacer.tick().await;
         let second = pacer.tick().await;
-        assert_eq!(
-            second.duration_since(first),
-            KINESIS_READ_INTERVAL,
-            "the pacer did not schedule consecutive Kinesis reads one second apart"
+        // The pacer must pay at least the full interval between reads. The
+        // upper bound only rejects a runaway clock: scheduler lag under gate
+        // load legitimately stretches the observed gap past exact equality.
+        let elapsed = second.duration_since(first);
+        assert!(
+            elapsed >= KINESIS_READ_INTERVAL
+                && elapsed < KINESIS_READ_INTERVAL + std::time::Duration::from_millis(500),
+            "the pacer did not schedule consecutive Kinesis reads about one second apart: {elapsed:?}"
         );
     }
 
@@ -763,18 +1419,42 @@ mod tests {
         ) -> UsageStoreFuture<'a, Option<UsageAttribution>> {
             Box::pin(async { unreachable!("projection tests do not query attribution") })
         }
+
+        fn project_archived<'a>(
+            &'a self,
+            value: &'a ArchivedUsageCheckpoint,
+        ) -> UsageStoreFuture<'a, IngestOutcome> {
+            self.ingest(&value.value)
+        }
+
+        fn source_terminal_receipt<'a>(
+            &'a self,
+            _source_id: &'a str,
+            _source_epoch: &'a str,
+        ) -> UsageStoreFuture<'a, Option<UsageSourceTerminalReceipt>> {
+            Box::pin(async { Ok(None) })
+        }
     }
 
     #[tokio::test]
-    async fn permanent_checkpoint_failure_does_not_block_the_shard() {
+    async fn permanent_checkpoint_failure_stops_the_shard_before_false_ack() {
         let projection = RecordingProjection::new(Some(2), None);
         let records = [
             pending("1", 86_400_000),
             pending("2", 86_400_010),
             pending("3", 86_400_020),
         ];
-        apply_projection(&projection, &records).await.unwrap();
-        assert_eq!(*projection.attempted.lock().unwrap(), vec![1, 2, 3]);
+        apply_projection(
+            &projection,
+            &records,
+            "usage-stream",
+            "usage-archive",
+            "raw/day=1/shard=shard-1/1-3.ndjson",
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(*projection.attempted.lock().unwrap(), vec![1, 2]);
     }
 
     #[tokio::test]
@@ -785,10 +1465,19 @@ mod tests {
             pending("2", 86_400_010),
             pending("3", 86_400_020),
         ];
-        let error = apply_projection(&projection, &records).await.unwrap_err();
+        let error = apply_projection(
+            &projection,
+            &records,
+            "usage-stream",
+            "usage-archive",
+            "raw/day=1/shard=shard-1/1-3.ndjson",
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .await
+        .unwrap_err();
         assert!(error
             .to_string()
-            .contains("apply usage checkpoint projection"));
+            .contains("apply archived usage checkpoint projection"));
         assert_eq!(*projection.attempted.lock().unwrap(), vec![1, 2]);
     }
 }

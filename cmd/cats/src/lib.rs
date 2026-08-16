@@ -1,7 +1,6 @@
-//! `cats` CLI: the command-line user surface. Commands express intent against
-//! the same versioned API as the web consoles; mutations return operations
-//! that the CLI waits on by default (`--no-wait` to skip). No storage/node
-//! internals ever appear here.
+//! `cats` CLI: the command-line user surface. The release exposes the same
+//! exact Cat/PersistentDisk creates and bounded reads as the web console, plus
+//! exact Operation lookup. No storage/node internals appear here.
 
 mod auth;
 #[cfg(unix)]
@@ -15,6 +14,7 @@ mod cat_create_pending;
 mod cat_create_pending_unsupported_compile_shape;
 mod config;
 mod credential_store;
+mod fleet_verify;
 #[cfg(unix)]
 mod runtime_node_admin;
 #[cfg(not(unix))]
@@ -26,6 +26,14 @@ mod runtime_node_admin;
 #[cfg(all(test, unix))]
 #[path = "runtime_node_admin_unsupported.rs"]
 mod runtime_node_admin_unsupported_compile_shape;
+#[cfg(unix)]
+mod runtime_provisioner;
+#[cfg(not(unix))]
+#[path = "runtime_provisioner_unsupported.rs"]
+mod runtime_provisioner;
+#[cfg(all(test, unix))]
+#[path = "runtime_provisioner_unsupported.rs"]
+mod runtime_provisioner_unsupported_compile_shape;
 mod shell;
 #[cfg(unix)]
 mod stable_unix_fs;
@@ -38,8 +46,12 @@ use cats_api::cat_create::{
     decode_cat_create_v2_accepted_response, CatCreateV2AcceptedResponse, CatCreateV2Request,
 };
 use cats_api::persistent_disk::{
-    PersistentDiskCreateV1Request, PERSISTENT_DISK_NAME_CONFLICT_BODY,
+    decode_persistent_disk_binding_v2_accepted_response, PersistentDiskBindingV2AcceptedResponse,
+    PersistentDiskBindingV2Request, PersistentDiskCreateV1Request,
+    PERSISTENT_DISK_BINDING_CONFLICT_BODY, PERSISTENT_DISK_BINDING_PRECONDITION_BODY,
+    PERSISTENT_DISK_NAME_CONFLICT_BODY,
 };
+use cats_api::runtime_product_reads::{CatReadV2, DiskReadV2, ProductReadPage};
 use cats_api::runtime_reconciliation::{
     decode_operation as decode_runtime_operation, encode_operation as encode_runtime_operation,
     Id as RuntimeId, Operation as RuntimeOperation, OperationPhase as RuntimeOperationPhase,
@@ -118,13 +130,15 @@ pub enum Command {
         /// writes, so choose `strict` when that is not acceptable.
         #[arg(long, default_value = "strict", value_parser = ["strict", "relaxed"])]
         durability: String,
+        /// Resolve only an already-durable Cat-create request. Used by the
+        /// production cutover runner after an interrupted stdout capture.
+        #[arg(long, hide = true)]
+        existing_pending_only: bool,
     },
     /// List cats.
-    #[command(hide = true)]
     Ls,
-    /// Show one cat.
-    #[command(hide = true)]
-    Get { name: String },
+    /// Show one cat by immutable ID.
+    Get { id: String },
     /// Start (or wake) a cat.
     #[command(hide = true)]
     Start { name: String },
@@ -215,7 +229,6 @@ pub enum Command {
         never: bool,
     },
     /// Disk management.
-    #[command(hide = true)]
     Disk {
         #[command(subcommand)]
         cmd: DiskCommand,
@@ -306,16 +319,36 @@ pub enum DiskCommand {
     },
     Ls,
     Get {
-        name: String,
+        /// Immutable Disk ID.
+        id: String,
     },
-    Resize {
-        name: String,
+    /// Attach a PersistentDisk to the complete Desired volume set of a Cold Cat.
+    Attach {
+        /// Immutable Disk ID.
+        disk: String,
+        /// Immutable Cat ID.
         #[arg(long)]
-        size: String,
+        cat: String,
+        /// Absolute non-root path inside the Guest.
+        #[arg(long)]
+        mount_path: String,
     },
+    /// Detach one exact Cat and Guest-path binding while both remain Cold.
+    Detach {
+        /// Immutable Disk ID.
+        disk: String,
+        /// Immutable Cat ID.
+        #[arg(long)]
+        cat: String,
+        /// Exact absolute Guest path used by the current binding.
+        #[arg(long)]
+        mount_path: String,
+    },
+    #[command(hide = true)]
     Delete {
         name: String,
     },
+    #[command(hide = true)]
     Snapshot(SnapshotArgs),
 }
 
@@ -347,6 +380,24 @@ pub enum AdminCommand {
     Login,
     /// Remove the independent fleet-administrator session.
     Logout,
+    /// Prove that an explicitly named production fleet is registered and empty.
+    FleetVerify {
+        /// One expected provisioned Node ID. Repeat for every Node.
+        #[arg(long = "expected-node", required = true)]
+        expected_nodes: Vec<String>,
+        /// Exact canonical Route Grant v2 public-key ring artifact.
+        #[arg(long = "key-ring")]
+        key_ring: std::path::PathBuf,
+        /// Qualified 40-lowercase-hex release commit expected on Control.
+        #[arg(long = "release-commit")]
+        release_commit: String,
+        /// Absolute polling budget in seconds.
+        #[arg(long, default_value_t = 120)]
+        timeout_seconds: u64,
+        /// Delay between non-ready snapshots.
+        #[arg(long, default_value_t = 1_000)]
+        poll_interval_ms: u64,
+    },
     /// Show fleet health, lifecycle and capacity counters.
     #[command(hide = true)]
     Monitoring,
@@ -372,6 +423,281 @@ pub enum AdminCommand {
         provisioner_private_key_file: Option<std::path::PathBuf>,
         #[command(subcommand)]
         cmd: RuntimeNodeCommand,
+    },
+    /// Prepare and verify deployment-provisioner authority artifacts offline.
+    RuntimeProvisioner {
+        #[command(subcommand)]
+        cmd: RuntimeProvisionerCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RuntimeProvisionerCommand {
+    /// Generate or offline-verify the central A23 trust bundle.
+    Trust {
+        #[command(subcommand)]
+        cmd: RuntimeProvisionerTrustCommand,
+    },
+    /// Prepare, export or activate the fixed Host-local Node identity set.
+    NodeIdentity {
+        #[command(subcommand)]
+        cmd: RuntimeProvisionerNodeIdentityCommand,
+    },
+    /// Generate or verify the closed initial Route v2 credential transaction.
+    #[command(name = "route-v2-r1")]
+    RouteV2R1 {
+        #[command(subcommand)]
+        cmd: RuntimeProvisionerRouteV2R1Command,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RuntimeProvisionerTrustCommand {
+    /// Idempotently generate a revision-1/null-previous bundle and PKCS#8 v2 key.
+    Generate {
+        #[arg(long)]
+        deployment_id: String,
+        #[arg(long)]
+        credential_id: String,
+        #[arg(long)]
+        private_key_out: std::path::PathBuf,
+        #[arg(long)]
+        trust_bundle_out: std::path::PathBuf,
+    },
+    /// Verify canonical bytes, strict PKCS#8 v2 and the exact SPKI binding offline.
+    Verify {
+        #[arg(long)]
+        credential_id: String,
+        #[arg(long)]
+        private_key: std::path::PathBuf,
+        #[arg(long)]
+        trust_bundle: std::path::PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RuntimeProvisionerNodeIdentityCommand {
+    /// Create the durable initial recovery set without contacting Control.
+    Prepare {
+        #[arg(long)]
+        node_id: String,
+        /// Cloud provider of the Host (for example `aws`). Together with the
+        /// partition, account, region and immutable Host ID this forms the
+        /// complete immutable Host identity.
+        #[arg(long)]
+        host_provider: String,
+        #[arg(long)]
+        host_partition: String,
+        #[arg(long)]
+        host_account_id: String,
+        #[arg(long)]
+        host_region: String,
+        #[arg(long)]
+        immutable_host_id: String,
+        #[arg(long)]
+        state_path_id: String,
+        #[arg(long)]
+        credential_id: String,
+    },
+    /// Write the canonical public NodeIdentity recovery artifact to stdout.
+    Export,
+    /// Activate only after a canonical successful official-CLI apply result.
+    Activate {
+        #[arg(long)]
+        apply_result: std::path::PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RuntimeProvisionerRouteV2R1Command {
+    /// Generate one root-only revision-1 candidate and provider input set.
+    Generate {
+        /// Absolute absent or exact-replay output directory.
+        #[arg(long)]
+        output: std::path::PathBuf,
+        /// Every reviewed Node machine-listener DNS name (repeatable).
+        #[arg(long = "node-server-dns", required = true)]
+        node_server_dns: Vec<String>,
+        /// Immutable Control Secret name ending in `-r1`.
+        #[arg(long)]
+        control_secret_name: String,
+        /// Immutable Gateway Secret name ending in `-r1`.
+        #[arg(long)]
+        gateway_secret_name: String,
+        /// Scoped Secrets Manager name ending in `-route-v2-node-r1`.
+        #[arg(long)]
+        node_secret_name: String,
+        /// Exact lowercase source commit shared by Control and Node binaries.
+        #[arg(long)]
+        release_commit_sha: String,
+        /// Absolute trusted OpenSSL executable used only by this offline operator.
+        #[arg(long, default_value = "/usr/bin/openssl")]
+        openssl: std::path::PathBuf,
+    },
+    /// Revalidate an existing root-only revision-1 candidate offline.
+    Verify {
+        /// Absolute root-only candidate directory.
+        #[arg(long)]
+        input: std::path::PathBuf,
+        /// Every reviewed Node machine-listener DNS name (repeatable).
+        #[arg(long = "node-server-dns", required = true)]
+        node_server_dns: Vec<String>,
+        /// Immutable Control Secret name ending in `-r1`.
+        #[arg(long)]
+        control_secret_name: String,
+        /// Immutable Gateway Secret name ending in `-r1`.
+        #[arg(long)]
+        gateway_secret_name: String,
+        /// Scoped Secrets Manager name ending in `-route-v2-node-r1`.
+        #[arg(long)]
+        node_secret_name: String,
+        /// Exact lowercase source commit shared by Control and Node binaries.
+        #[arg(long)]
+        release_commit_sha: String,
+    },
+    /// Sign one canonical typed rotation command with the offline operator key.
+    SignCommand {
+        /// Absolute root-only revision-1 candidate directory.
+        #[arg(long)]
+        input: std::path::PathBuf,
+        /// Absolute canonical unsigned command-payload JSON file (mode 0644).
+        #[arg(long)]
+        payload: std::path::PathBuf,
+        /// Absolute absent or exact-replay signed command JSON file (mode 0644).
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
+    /// Generate a complete r1-to-r8 rotation, disable and recovery artifact set.
+    PrepareRotationRecovery {
+        /// Absolute root-only revision-1 candidate directory.
+        #[arg(long)]
+        input: std::path::PathBuf,
+        /// Absolute absent or exact-replay root-only recovery output directory.
+        #[arg(long)]
+        output: std::path::PathBuf,
+        /// Qualification run ID embedded in the one composed command bundle.
+        #[arg(long)]
+        run_id: String,
+    },
+    /// Revalidate a complete r1-to-r8 recovery artifact set offline.
+    VerifyRotationRecovery {
+        /// Absolute root-only revision-1 candidate directory.
+        #[arg(long)]
+        input: std::path::PathBuf,
+        /// Absolute root-only recovery output directory.
+        #[arg(long)]
+        output: std::path::PathBuf,
+        /// Qualification run ID embedded in the command bundle.
+        #[arg(long)]
+        run_id: String,
+    },
+    /// Fresh-sign one prepared recovery phase into a durable replay file.
+    SignRotationRecoveryPhase {
+        /// Absolute root-only revision-1 candidate directory.
+        #[arg(long)]
+        input: std::path::PathBuf,
+        /// Absolute root-only prepared recovery artifact directory.
+        #[arg(long)]
+        recovery: std::path::PathBuf,
+        /// Exact prepared phase name.
+        #[arg(long)]
+        phase: String,
+        /// Absolute absent or exact-replay root-only pending command file.
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
+    /// Verify a restarted Control process loaded PostgreSQL current exactly.
+    VerifyRotationCurrent {
+        /// Absolute root-only revision-1 candidate directory.
+        #[arg(long)]
+        input: std::path::PathBuf,
+        /// Absolute root-only prepared recovery artifact directory.
+        #[arg(long)]
+        recovery: std::path::PathBuf,
+        /// Exact expected signer revision in the prepared recovery lineage.
+        #[arg(long)]
+        signer_revision: u64,
+        /// Root-only canonical current-binding discovery response.
+        #[arg(long)]
+        discovery: std::path::PathBuf,
+        /// Absolute absent or exact-replay root-only verification receipt.
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
+    /// Fresh-sign one staged unsigned recovery phase without a private bundle tree.
+    SignPreparedRotationPhase {
+        /// Fixed root-only operator trust JSON.
+        #[arg(long)]
+        trust: std::path::PathBuf,
+        /// Independent root-only offline operator PKCS#8 v2 PEM.
+        #[arg(long)]
+        operator_private_key: std::path::PathBuf,
+        /// Root-only unsigned seven-phase command bundle.
+        #[arg(long)]
+        command_bundle: std::path::PathBuf,
+        /// Exact prepared phase name.
+        #[arg(long)]
+        phase: String,
+        /// Absolute absent or exact-replay root-only pending command file.
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
+    /// Verify staged current discovery against one unsigned recovery phase.
+    VerifyPreparedRotationCurrent {
+        /// Fixed root-only operator trust JSON.
+        #[arg(long)]
+        trust: std::path::PathBuf,
+        /// Root-only unsigned seven-phase command bundle.
+        #[arg(long)]
+        command_bundle: std::path::PathBuf,
+        /// Exact expected signer revision.
+        #[arg(long)]
+        signer_revision: u64,
+        /// Root-only canonical current-binding discovery response.
+        #[arg(long)]
+        discovery: std::path::PathBuf,
+        /// Absolute absent or exact-replay root-only verification receipt.
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
+    /// Sign one deployment-side post-apply receipt in an independent domain.
+    SignControlRolloutApplyReceipt {
+        /// Fixed owner-controlled operator trust JSON (release 0644 or staged 0600).
+        #[arg(long)]
+        trust: std::path::PathBuf,
+        /// Root-only operator PKCS#8 v2 PEMs needed by the trust threshold.
+        #[arg(long = "operator-private-key", required = true)]
+        operator_private_keys: Vec<std::path::PathBuf>,
+        /// Canonical unsigned apply-receipt payload produced after fresh discovery.
+        #[arg(long)]
+        payload: std::path::PathBuf,
+        /// Absolute absent or exact-replay root-only signed receipt file.
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
+    /// Verify one immutable deployment receipt against its exact recovery phase.
+    VerifyControlRolloutApplyReceipt {
+        /// Fixed owner-controlled operator trust JSON (release 0644 or staged 0600).
+        #[arg(long)]
+        trust: std::path::PathBuf,
+        /// Root-only unsigned seven-phase command bundle.
+        #[arg(long)]
+        command_bundle: std::path::PathBuf,
+        /// Exact prepared phase name expected next by the worker.
+        #[arg(long)]
+        phase: String,
+        /// Exact qualification catalog digest bound by this run.
+        #[arg(long)]
+        qualification_catalog_sha256: String,
+        /// Exact reviewed saved-plan file digest frozen for this phase.
+        #[arg(long)]
+        saved_plan_sha256: String,
+        /// Root-only canonical signed apply receipt fetched from the inbox.
+        #[arg(long)]
+        receipt: std::path::PathBuf,
+        /// Absolute absent or exact-replay root-only verification receipt.
+        #[arg(long)]
+        output: std::path::PathBuf,
     },
 }
 
@@ -676,8 +1002,56 @@ impl Client {
         )
     }
 
+    fn send_persistent_disk_binding(
+        &self,
+        pending: &cat_create_pending::PreparedPersistentDiskBinding,
+    ) -> Result<ExactCreateHttpResponse> {
+        pending.assert_current()?;
+        anyhow::ensure!(
+            pending.origin() == self.base && pending.workspace_id() == self.workspace_id,
+            "pending PersistentDisk-binding request is bound to a different API origin or Workspace"
+        );
+        self.send_exact_create(
+            "PersistentDisk-binding",
+            pending.origin(),
+            pending.target(),
+            pending.content_type(),
+            pending.idempotency_key(),
+            pending.body()?,
+        )
+    }
+
     fn get(&self, path: &str) -> Result<serde_json::Value> {
         self.send(self.http.get(self.url(path)))
+    }
+
+    fn get_all_product_pages<T: serde::de::DeserializeOwned>(
+        &self,
+        collection: &str,
+    ) -> Result<Vec<T>> {
+        let mut items = Vec::new();
+        let mut cursor = None;
+        let mut seen = std::collections::BTreeSet::new();
+        loop {
+            let path = match cursor.as_deref() {
+                Some(cursor) => format!("{collection}?limit=100&cursor={cursor}"),
+                None => format!("{collection}?limit=100"),
+            };
+            let page: ProductReadPage<T> = serde_json::from_value(self.get(&path)?)?;
+            anyhow::ensure!(
+                page.next_cursor.is_none() || !page.items.is_empty(),
+                "product collection returned a cursor without an item"
+            );
+            items.extend(page.items);
+            let Some(next) = page.next_cursor else {
+                return Ok(items);
+            };
+            anyhow::ensure!(
+                seen.insert(next.clone()),
+                "product collection cursor repeated"
+            );
+            cursor = Some(next);
+        }
     }
 
     fn post(&self, path: &str, body: Option<serde_json::Value>) -> Result<serde_json::Value> {
@@ -949,6 +1323,37 @@ fn print_cat(cat: &Cat, json_mode: bool) {
     }
 }
 
+fn print_runtime_cat(cat: &CatReadV2, json_mode: bool) {
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(cat).unwrap());
+    } else {
+        let observed = cat
+            .observed
+            .as_ref()
+            .and_then(|observed| observed.stable_state)
+            .map(|state| format!("{state:?}").to_lowercase())
+            .unwrap_or_else(|| "unknown".to_owned());
+        println!(
+            "{:<16} id={:<38} {:>4} cpu {:>6} MiB desired={:<9} observed={:<9} node={}",
+            cat.name,
+            cat.id,
+            cat.desired.vcpus,
+            cat.desired.memory_bytes >> 20,
+            format!("{:?}", cat.desired.target).to_lowercase(),
+            observed,
+            cat.desired.node_id,
+        );
+    }
+}
+
+fn runtime_product_item_id<'a>(value: &'a str, prefix: &str, resource: &str) -> Result<&'a str> {
+    anyhow::ensure!(
+        RuntimeId::new(value.to_owned()).is_some() && value.starts_with(prefix),
+        "{resource} item key must be an immutable {prefix} ID"
+    );
+    Ok(value)
+}
+
 const RUNTIME_CUTOVER_UNSUPPORTED: &str =
     "is unavailable until its signed runtime-authority projection lands; no HTTP request was sent";
 
@@ -958,7 +1363,7 @@ const RUNTIME_CUTOVER_UNSUPPORTED: &str =
 /// turning an unsupported invocation into outbound traffic.
 fn runtime_cutover_unsupported(command: &Command) -> Option<&'static str> {
     match command {
-        Command::Ls | Command::Get { .. } => Some("Cat read/list"),
+        Command::Ls | Command::Get { .. } => None,
         Command::Start { .. }
         | Command::Stop { .. }
         | Command::Suspend { .. }
@@ -973,6 +1378,12 @@ fn runtime_cutover_unsupported(command: &Command) -> Option<&'static str> {
         | Command::Expiry { .. } => Some("Cat lifecycle"),
         Command::Disk {
             cmd: DiskCommand::Create { .. },
+        } => None,
+        Command::Disk {
+            cmd: DiskCommand::Ls | DiskCommand::Get { .. },
+        } => None,
+        Command::Disk {
+            cmd: DiskCommand::Attach { .. } | DiskCommand::Detach { .. },
         } => None,
         Command::Disk { .. } | Command::Mount { .. } | Command::Unmount { .. } => {
             Some("PersistentDisk")
@@ -994,7 +1405,12 @@ fn runtime_cutover_unsupported(command: &Command) -> Option<&'static str> {
         | Command::Token { .. }
         | Command::Create { .. }
         | Command::Admin {
-            cmd: AdminCommand::Login | AdminCommand::Logout | AdminCommand::RuntimeNode { .. },
+            cmd:
+                AdminCommand::Login
+                | AdminCommand::Logout
+                | AdminCommand::FleetVerify { .. }
+                | AdminCommand::RuntimeNode { .. }
+                | AdminCommand::RuntimeProvisioner { .. },
         } => None,
     }
 }
@@ -1131,6 +1547,25 @@ pub fn run(cli: Cli) -> Result<()> {
         }
         Command::Admin {
             cmd:
+                AdminCommand::FleetVerify {
+                    expected_nodes,
+                    key_ring,
+                    release_commit,
+                    timeout_seconds,
+                    poll_interval_ms,
+                },
+        } => {
+            return fleet_verify::run(
+                &cli,
+                expected_nodes,
+                key_ring,
+                release_commit,
+                *timeout_seconds,
+                *poll_interval_ms,
+            );
+        }
+        Command::Admin {
+            cmd:
                 AdminCommand::RuntimeNode {
                     deployment_id,
                     provisioner_credential_id,
@@ -1145,6 +1580,9 @@ pub fn run(cli: Cli) -> Result<()> {
             };
             return runtime_node_admin::run(&cli, &authority, cmd);
         }
+        Command::Admin {
+            cmd: AdminCommand::RuntimeProvisioner { cmd },
+        } => return runtime_provisioner::run(&cli, cmd),
         _ => {}
     }
     if let Some(surface) = runtime_cutover_unsupported(&cli.command) {
@@ -1214,6 +1652,7 @@ pub fn run(cli: Cli) -> Result<()> {
             memory,
             root_size,
             durability,
+            existing_pending_only,
         } => {
             let durability = match durability.as_str() {
                 "strict" => cats_api::runtime_reconciliation::Durability::Strict,
@@ -1230,14 +1669,34 @@ pub fn run(cli: Cli) -> Result<()> {
             )
             .context("invalid Cat-create request")?;
             let request_body = serde_json::to_vec(&body)?;
-            let pending = cat_create_pending::PreparedCatCreate::prepare(
-                &client.base,
-                &client.workspace_id,
-                &request_body,
-            )
-            .context(
-                "could not durably prepare Cat-create recovery state; no HTTP request was sent",
-            )?;
+            let pending = if *existing_pending_only {
+                match cat_create_pending::PreparedCatCreate::prepare_existing(
+                    &client.base,
+                    &client.workspace_id,
+                    &request_body,
+                )
+                .context("could not inspect exact Cat-create recovery state")?
+                {
+                    Some(pending) => pending,
+                    None => {
+                        if cli.json {
+                            println!("{{\"pending_cat_create\":false}}")
+                        } else {
+                            println!("no matching pending Cat-create request")
+                        }
+                        return Ok(());
+                    }
+                }
+            } else {
+                cat_create_pending::PreparedCatCreate::prepare(
+                    &client.base,
+                    &client.workspace_id,
+                    &request_body,
+                )
+                .context(
+                    "could not durably prepare Cat-create recovery state; no HTTP request was sent",
+                )?
+            };
             let response = client.send_cat_create(&pending).with_context(|| {
                 format!(
                     "Cat-create response is ambiguous; the exact path, body, and Idempotency-Key remain pending at {}",
@@ -1291,27 +1750,20 @@ pub fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Ls => {
-            let v = client.get("/cats")?;
-            let list: ListResponse<Cat> = serde_json::from_value(v)?;
+            let cats: Vec<CatReadV2> = client.get_all_product_pages("/cats")?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&list.items).unwrap());
+                println!("{}", serde_json::to_string_pretty(&cats).unwrap());
             } else {
-                for cat in &list.items {
-                    print_cat(cat, false);
+                for cat in &cats {
+                    print_runtime_cat(cat, false);
                 }
             }
             Ok(())
         }
-        Command::Get { name } => {
-            let cat: Cat = serde_json::from_value(client.get(&format!("/cats/{name}"))?)?;
-            print_cat(&cat, cli.json);
-            if !cli.json {
-                let endpoints: ListResponse<Endpoint> =
-                    serde_json::from_value(client.get(&format!("/cats/{name}/endpoints"))?)?;
-                if let Some(endpoint) = endpoints.items.iter().find(|ep| ep.name == "web") {
-                    println!("URL: https://{}", endpoint.hostname);
-                }
-            }
+        Command::Get { id } => {
+            let id = runtime_product_item_id(id, "cat_", "Cat")?;
+            let cat: CatReadV2 = serde_json::from_value(client.get(&format!("/cats/{id}"))?)?;
+            print_runtime_cat(&cat, cli.json);
             Ok(())
         }
         Command::Start { name } => {
@@ -1522,18 +1974,8 @@ pub fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Disk { cmd } => run_disk(&client, &cli, cmd),
-        Command::Mount { disk, cat, at } => {
-            client.post(
-                &format!("/disks/{disk}/actions/mount"),
-                Some(json!({ "cat_id": cat, "mount_at": at })),
-            )?;
-            println!("mounted {disk} into {cat} at {at}");
-            Ok(())
-        }
-        Command::Unmount { disk } => {
-            client.post(&format!("/disks/{disk}/actions/unmount"), Some(json!({})))?;
-            println!("unmounted {disk}");
-            Ok(())
+        Command::Mount { .. } | Command::Unmount { .. } => {
+            bail!("retired mount/unmount authority is unavailable; use `cats disk attach` or `cats disk detach`")
         }
         Command::Expose {
             cat,
@@ -1806,8 +2248,11 @@ fn run_admin(client: &Client, cli: &Cli, cmd: &AdminCommand) -> Result<()> {
             }
             Ok(())
         }
-        AdminCommand::RuntimeNode { .. } => {
+        AdminCommand::RuntimeNode { .. } | AdminCommand::FleetVerify { .. } => {
             unreachable!("Runtime Node authority commands bypass workspace API construction")
+        }
+        AdminCommand::RuntimeProvisioner { .. } => {
+            unreachable!("Runtime provisioner commands bypass workspace API construction")
         }
         AdminCommand::Login | AdminCommand::Logout => {
             unreachable!("fleet administrator login commands bypass workspace API construction")
@@ -1905,27 +2350,46 @@ fn run_disk(client: &Client, cli: &Cli, cmd: &DiskCommand) -> Result<()> {
             }
         }
         DiskCommand::Ls => {
-            let v = client.get("/disks")?;
-            let list: ListResponse<Disk> = serde_json::from_value(v)?;
-            for d in &list.items {
-                print_disk(d, cli.json);
+            let disks: Vec<DiskReadV2> = client.get_all_product_pages("/disks")?;
+            if cli.json {
+                println!("{}", runtime_disk_list_json(&disks)?);
+            } else {
+                for disk in &disks {
+                    print_runtime_disk(disk, false);
+                }
             }
             Ok(())
         }
-        DiskCommand::Get { name } => {
-            let disk: Disk = serde_json::from_value(client.get(&format!("/disks/{name}"))?)?;
-            print_disk(&disk, cli.json);
+        DiskCommand::Get { id } => {
+            let id = runtime_product_item_id(id, "disk_", "Disk")?;
+            let disk: DiskReadV2 = serde_json::from_value(client.get(&format!("/disks/{id}"))?)?;
+            print_runtime_disk(&disk, cli.json);
             Ok(())
         }
-        DiskCommand::Resize { name, size } => {
-            let v = client.post(
-                &format!("/disks/{name}/actions/resize"),
-                Some(json!({ "size_bytes": parse_size(size)? })),
-            )?;
-            let disk: Disk = serde_json::from_value(v)?;
-            print_disk(&disk, cli.json);
-            Ok(())
-        }
+        DiskCommand::Attach {
+            disk,
+            cat,
+            mount_path,
+        } => run_persistent_disk_binding(
+            client,
+            cli,
+            disk,
+            cat,
+            mount_path,
+            cat_create_pending::PersistentDiskBindingAction::Attach,
+        ),
+        DiskCommand::Detach {
+            disk,
+            cat,
+            mount_path,
+        } => run_persistent_disk_binding(
+            client,
+            cli,
+            disk,
+            cat,
+            mount_path,
+            cat_create_pending::PersistentDiskBindingAction::Detach,
+        ),
         DiskCommand::Delete { name } => {
             client.send(client.http.delete(client.url(&format!("/disks/{name}"))))?;
             println!("deleted {name}");
@@ -1935,6 +2399,122 @@ fn run_disk(client: &Client, cli: &Cli, cmd: &DiskCommand) -> Result<()> {
             let v = client.post(&format!("/disks/{}/snapshots", args.name), Some(json!({})))?;
             println!("{}", serde_json::to_string_pretty(&v).unwrap());
             Ok(())
+        }
+    }
+}
+
+fn run_persistent_disk_binding(
+    client: &Client,
+    cli: &Cli,
+    disk: &str,
+    cat: &str,
+    mount_path: &str,
+    action: cat_create_pending::PersistentDiskBindingAction,
+) -> Result<()> {
+    let disk = runtime_product_item_id(disk, "disk_", "Disk")?;
+    let cat = runtime_product_item_id(cat, "cat_", "Cat")?;
+    let request = PersistentDiskBindingV2Request {
+        cat_id: RuntimeId::new(cat.to_owned()).context("invalid immutable Cat ID")?,
+        mount_path: cats_api::runtime_reconciliation::HostPath::new(mount_path.to_owned())
+            .context("invalid absolute Guest mount path")?,
+    };
+    request
+        .validate()
+        .context("invalid PersistentDisk-binding request")?;
+    let request_body = serde_json::to_vec(&request)?;
+    let pending = cat_create_pending::PreparedPersistentDiskBinding::prepare(
+        &client.base,
+        &client.workspace_id,
+        disk,
+        action,
+        &request_body,
+    )
+    .with_context(|| {
+        format!(
+            "could not durably prepare PersistentDisk-{} recovery state; no HTTP request was sent",
+            action.as_str()
+        )
+    })?;
+    anyhow::ensure!(
+        pending.disk_id().as_str() == disk
+            && pending.action() == action
+            && pending.request()? == request,
+        "persisted PersistentDisk-binding request changed before send"
+    );
+    let response = client
+        .send_persistent_disk_binding(&pending)
+        .with_context(|| {
+            format!(
+                "PersistentDisk-{} response is ambiguous; the exact path, body, and Idempotency-Key remain pending at {}",
+                action.as_str(),
+                pending.pending_path().display()
+            )
+        })?;
+    match classify_persistent_disk_binding_response(&response) {
+        PersistentDiskBindingResponseClassification::Accepted(accepted) => {
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&accepted)?);
+            } else {
+                println!(
+                    "PersistentDisk {disk} {} accepted for Cat {cat} at {mount_path} (Desired revision {}, operation {})",
+                    action.as_str(),
+                    accepted.desired_revision.get(),
+                    accepted.operation_id,
+                );
+            }
+            std::io::stdout().flush().with_context(|| {
+                format!(
+                    "flush accepted PersistentDisk-{} Operation before cleanup",
+                    action.as_str()
+                )
+            })?;
+            pending.clear().with_context(|| {
+                format!(
+                    "PersistentDisk-{} committed and was reported, but its pending recovery state could not be durably cleared",
+                    action.as_str()
+                )
+            })?;
+            Ok(())
+        }
+        PersistentDiskBindingResponseClassification::Conflict => {
+            pending.clear().with_context(|| {
+                format!(
+                    "PersistentDisk-{} conflict is terminal, but its pending recovery state could not be durably cleared",
+                    action.as_str()
+                )
+            })?;
+            bail!(
+                "PersistentDisk {} does not have the exact requested Cat and mount-path binding (Conflict)",
+                action.as_str()
+            )
+        }
+        PersistentDiskBindingResponseClassification::FailedPrecondition => {
+            pending.clear().with_context(|| {
+                format!(
+                    "PersistentDisk-{} failed precondition is terminal, but its pending recovery state could not be durably cleared",
+                    action.as_str()
+                )
+            })?;
+            bail!(
+                "PersistentDisk {} requires an exact settled Cold Cat and unowned disk (FailedPrecondition)",
+                action.as_str()
+            )
+        }
+        PersistentDiskBindingResponseClassification::Nonterminal => {
+            let detail = serde_json::from_slice::<cats_api::error::ErrorBody>(&response.body)
+                .map(|error| format!("{} ({:?})", error.message, error.code))
+                .unwrap_or_else(|_| {
+                    format!(
+                        "HTTP {}: {}",
+                        response.status,
+                        String::from_utf8_lossy(&response.body)
+                    )
+                });
+            bail!(
+                "PersistentDisk-{} response was not an exact terminal result ({detail}); replay the same command to reuse the pending Idempotency-Key at {}",
+                action.as_str(),
+                pending.pending_path().display()
+            )
         }
     }
 }
@@ -1951,6 +2531,36 @@ fn print_disk(d: &Disk, json_mode: bool) {
             format!("{:?}", d.state).to_lowercase(),
             d.durability.as_str(),
             d.bound_cat_id.as_deref().unwrap_or("-")
+        );
+    }
+}
+
+fn runtime_disk_list_json(disks: &[DiskReadV2]) -> serde_json::Result<String> {
+    serde_json::to_string_pretty(disks)
+}
+
+fn print_runtime_disk(disk: &DiskReadV2, json_mode: bool) {
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(disk).unwrap());
+    } else {
+        let kind = match disk.kind {
+            cats_api::runtime_product_reads::DiskReadKind::Root { .. } => "root",
+            cats_api::runtime_product_reads::DiskReadKind::Persistent => "persistent",
+        };
+        let bound_cat = disk
+            .binding
+            .as_ref()
+            .map(|binding| binding.cat_id.as_str())
+            .unwrap_or("-");
+        println!(
+            "{:<16} id={:<38} {:>8} MiB kind={:<10} admin={:<8} durability={:<7} cat={}",
+            disk.name,
+            disk.id,
+            disk.size_bytes >> 20,
+            kind,
+            format!("{:?}", disk.admin_state).to_lowercase(),
+            format!("{:?}", disk.durability).to_lowercase(),
+            bound_cat,
         );
     }
 }
@@ -2005,6 +2615,39 @@ enum PersistentDiskCreateResponseClassification {
     Created(Disk),
     NameConflict,
     Nonterminal,
+}
+
+enum PersistentDiskBindingResponseClassification {
+    Accepted(PersistentDiskBindingV2AcceptedResponse),
+    Conflict,
+    FailedPrecondition,
+    Nonterminal,
+}
+
+fn classify_persistent_disk_binding_response(
+    response: &ExactCreateHttpResponse,
+) -> PersistentDiskBindingResponseClassification {
+    let exact_json_identity = response.content_types.as_slice() == [b"application/json"]
+        && response.content_encodings.is_empty();
+    if !exact_json_identity {
+        return PersistentDiskBindingResponseClassification::Nonterminal;
+    }
+    if response.status == reqwest::StatusCode::ACCEPTED {
+        if let Ok(accepted) = decode_persistent_disk_binding_v2_accepted_response(&response.body) {
+            if serde_json::to_vec(&accepted).ok().as_deref() == Some(response.body.as_slice()) {
+                return PersistentDiskBindingResponseClassification::Accepted(accepted);
+            }
+        }
+    } else if response.status == reqwest::StatusCode::CONFLICT
+        && response.body == PERSISTENT_DISK_BINDING_CONFLICT_BODY
+    {
+        return PersistentDiskBindingResponseClassification::Conflict;
+    } else if response.status == reqwest::StatusCode::PRECONDITION_FAILED
+        && response.body == PERSISTENT_DISK_BINDING_PRECONDITION_BODY
+    {
+        return PersistentDiskBindingResponseClassification::FailedPrecondition;
+    }
+    PersistentDiskBindingResponseClassification::Nonterminal
 }
 
 fn classify_persistent_disk_create_response(
@@ -2235,6 +2878,45 @@ mod tests {
         ));
         let cli = Cli::parse_from(["cats", "mount", "data", "--cat", "dev", "--at", "/data"]);
         assert!(matches!(cli.command, Command::Mount { .. }));
+        let cli = Cli::parse_from([
+            "cats",
+            "disk",
+            "attach",
+            "disk_01",
+            "--cat",
+            "cat_01",
+            "--mount-path",
+            "/srv/data",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::Disk {
+                cmd: DiskCommand::Attach {
+                    disk,
+                    cat,
+                    mount_path,
+                }
+            } if disk == "disk_01" && cat == "cat_01" && mount_path == "/srv/data"
+        ));
+        let cli = Cli::parse_from([
+            "cats",
+            "disk",
+            "detach",
+            "disk_01",
+            "--cat",
+            "cat_01",
+            "--mount-path",
+            "/srv/data",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::Disk {
+                cmd: DiskCommand::Detach { .. }
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["cats", "disk", "detach", "disk_01", "--cat", "cat_01",]).is_err()
+        );
         let cli = Cli::parse_from(["cats", "admin", "node", "drain", "node-a"]);
         assert!(matches!(
             cli.command,
@@ -2318,6 +3000,27 @@ mod tests {
                 cmd: AdminCommand::Logout
             }
         ));
+        let fleet_verify = Cli::parse_from([
+            "cats",
+            "admin",
+            "fleet-verify",
+            "--expected-node",
+            "node_a",
+            "--key-ring",
+            "route-ring.json",
+            "--release-commit",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--timeout-seconds",
+            "60",
+            "--poll-interval-ms",
+            "10",
+        ]);
+        assert!(matches!(
+            fleet_verify.command,
+            Command::Admin {
+                cmd: AdminCommand::FleetVerify { .. }
+            }
+        ));
         let machine = Cli::parse_from([
             "cats",
             "admin",
@@ -2358,6 +3061,172 @@ mod tests {
             "policy.json",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn cli_exposes_the_closed_route_v2_revision_one_credential_workflow() {
+        use clap::Parser;
+
+        assert!(Cli::try_parse_from([
+            "cats",
+            "admin",
+            "runtime-provisioner",
+            "route-v2-r1",
+            "generate",
+            "--output",
+            "/approved/route-v2-r1",
+            "--node-server-dns",
+            "metal-1.internal",
+            "--control-secret-name",
+            "cats-route-v2-control-r1",
+            "--gateway-secret-name",
+            "cats-route-v2-gateway-r1",
+            "--node-secret-name",
+            "cats-production-route-v2-node-r1",
+            "--release-commit-sha",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--openssl",
+            "/usr/bin/openssl",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "cats",
+            "admin",
+            "runtime-provisioner",
+            "route-v2-r1",
+            "sign-command",
+            "--input",
+            "/approved/route-v2-r1",
+            "--payload",
+            "/approved/command-payload.json",
+            "--output",
+            "/approved/signed-command.json",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "cats",
+            "admin",
+            "runtime-provisioner",
+            "route-v2-r1",
+            "prepare-rotation-recovery",
+            "--input",
+            "/approved/route-v2-r1",
+            "--output",
+            "/approved/route-v2-recovery",
+            "--run-id",
+            "qualification_run_a",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "cats",
+            "admin",
+            "runtime-provisioner",
+            "route-v2-r1",
+            "sign-rotation-recovery-phase",
+            "--input",
+            "/approved/route-v2-r1",
+            "--recovery",
+            "/approved/route-v2-recovery",
+            "--phase",
+            "disable",
+            "--output",
+            "/approved/pending/disable.command.json",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "cats",
+            "admin",
+            "runtime-provisioner",
+            "route-v2-r1",
+            "verify-rotation-current",
+            "--input",
+            "/approved/route-v2-r1",
+            "--recovery",
+            "/approved/route-v2-recovery",
+            "--signer-revision",
+            "8",
+            "--discovery",
+            "/approved/current-r8.json",
+            "--output",
+            "/approved/current-r8.receipt.json",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "cats",
+            "admin",
+            "runtime-provisioner",
+            "route-v2-r1",
+            "sign-prepared-rotation-phase",
+            "--trust",
+            "/etc/cats/route-v2/rotation-operator-trust.v1.json",
+            "--operator-private-key",
+            "/approved/rotation-operator-private-key.pem",
+            "--command-bundle",
+            "/approved/rotation-recovery-command-bundle.v1.json",
+            "--phase",
+            "disable",
+            "--output",
+            "/approved/pending/disable.command.json",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "cats",
+            "admin",
+            "runtime-provisioner",
+            "route-v2-r1",
+            "verify-prepared-rotation-current",
+            "--trust",
+            "/etc/cats/route-v2/rotation-operator-trust.v1.json",
+            "--command-bundle",
+            "/approved/rotation-recovery-command-bundle.v1.json",
+            "--signer-revision",
+            "8",
+            "--discovery",
+            "/approved/current-r8.json",
+            "--output",
+            "/approved/current-r8.receipt.json",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "cats",
+            "admin",
+            "runtime-provisioner",
+            "route-v2-r1",
+            "sign-control-rollout-apply-receipt",
+            "--trust",
+            "/etc/cats/route-v2/rotation-operator-trust.v1.json",
+            "--operator-private-key",
+            "/approved/operator-a.pem",
+            "--operator-private-key",
+            "/approved/operator-b.pem",
+            "--payload",
+            "/approved/apply/publish_overlap.payload.json",
+            "--output",
+            "/approved/apply/publish_overlap.signed.json",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "cats",
+            "admin",
+            "runtime-provisioner",
+            "route-v2-r1",
+            "verify-control-rollout-apply-receipt",
+            "--trust",
+            "/etc/cats/route-v2/rotation-operator-trust.v1.json",
+            "--command-bundle",
+            "/approved/rotation-recovery-command-bundle.v1.json",
+            "--phase",
+            "publish_overlap",
+            "--qualification-catalog-sha256",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--saved-plan-sha256",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--receipt",
+            "/approved/inbox/publish_overlap.signed.json",
+            "--output",
+            "/approved/verified/publish_overlap.receipt.json",
+        ])
+        .is_ok());
     }
 
     fn read_request(stream: &mut std::net::TcpStream) -> (String, Vec<u8>) {
@@ -2566,6 +3435,54 @@ mod tests {
             .unwrap();
         assert_eq!(operation, expected);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn disk_ls_json_is_one_parseable_document_after_two_pages() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for (expected_path, body) in [
+                (
+                    "GET /v1/workspaces/ws_01/disks?limit=100 HTTP/1.1",
+                    br#"{"items":[{"version":1,"id":"disk_01","workspace_id":"ws_01","name":"one","size_bytes":1048576,"durability":"strict","created_at_unix_ms":1,"kind":{"kind":"persistent"},"admin_state":"active","binding":null}],"next_cursor":"cursor_01"}"#.as_slice(),
+                ),
+                (
+                    "GET /v1/workspaces/ws_01/disks?limit=100&cursor=cursor_01 HTTP/1.1",
+                    br#"{"items":[{"version":1,"id":"disk_02","workspace_id":"ws_01","name":"two","size_bytes":2097152,"durability":"relaxed","created_at_unix_ms":2,"kind":{"kind":"persistent"},"admin_state":"deleting","binding":null}],"next_cursor":null}"#.as_slice(),
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (headers, request_body) = read_request(&mut stream);
+                assert!(request_body.is_empty());
+                assert_eq!(headers.lines().next().unwrap(), expected_path);
+                assert_eq!(
+                    request_header(&headers, "authorization"),
+                    "Bearer test-token"
+                );
+                write_runtime_operation_response(&mut stream, body, None);
+            }
+        });
+
+        let items: Vec<DiskReadV2> = runtime_test_client(base)
+            .get_all_product_pages("/disks")
+            .unwrap();
+        assert_eq!(items.len(), 2);
+        let document = runtime_disk_list_json(&items).unwrap();
+        let reparsed: Vec<DiskReadV2> = serde_json::from_str(&document).unwrap();
+        assert_eq!(reparsed, items);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn product_item_keys_are_resource_typed_immutable_ids() {
+        assert_eq!(
+            runtime_product_item_id("cat_01", "cat_", "Cat").unwrap(),
+            "cat_01"
+        );
+        assert!(runtime_product_item_id("demo", "cat_", "Cat").is_err());
+        assert!(runtime_product_item_id("disk_01", "cat_", "Cat").is_err());
+        assert!(runtime_product_item_id("cat_01/operations", "cat_", "Cat").is_err());
     }
 
     #[test]
@@ -2826,6 +3743,72 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn persistent_disk_binding_sends_only_exact_attach_and_detach_requests() {
+        use clap::Parser as _;
+        use std::io::Write as _;
+
+        for verb in ["attach", "detach"] {
+            let state_directory = tempfile::tempdir().unwrap();
+            let state_root = state_directory.path().canonicalize().unwrap().join("state");
+            let _state_guard = cat_create_pending::TestPersistentDiskBindingStateRootGuard::set(
+                state_root.clone(),
+            );
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let captured = read_request(&mut stream);
+                let response = br#"{"desired_revision":7,"operation_id":"op_01"}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.len()
+                )
+                .unwrap();
+                stream.write_all(response).unwrap();
+                stream.flush().unwrap();
+                captured
+            });
+            let base = format!("http://{address}");
+            let cli = Cli::parse_from([
+                "cats",
+                "--api-url",
+                &base,
+                "--token",
+                "test-token",
+                "--workspace",
+                "ws_01",
+                "disk",
+                verb,
+                "disk_01",
+                "--cat",
+                "cat_01",
+                "--mount-path",
+                "/srv/data",
+            ]);
+            run(cli).unwrap();
+            let (headers, body) = server.join().unwrap();
+            assert_eq!(
+                headers.lines().next().unwrap(),
+                format!("POST /v1/workspaces/ws_01/disks/disk_01/actions/{verb} HTTP/1.1")
+            );
+            assert_eq!(request_header(&headers, "content-type"), "application/json");
+            assert!(request_header(&headers, "idempotency-key").starts_with("cli-"));
+            assert_eq!(body, br#"{"cat_id":"cat_01","mount_path":"/srv/data"}"#);
+            assert!(!headers.contains("/actions/mount"));
+            assert!(!headers.contains("/actions/unmount"));
+            assert!(std::fs::read_dir(state_root).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".pending.json")
+            }));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn cat_create_restart_process_helper() {
         use clap::Parser as _;
 
@@ -2888,6 +3871,41 @@ mod tests {
             "1GiB",
             "--durability",
             "strict",
+        ]);
+        match mode.to_string_lossy().as_ref() {
+            "lost" => {
+                let error = run(cli).expect_err("the committed response is deliberately dropped");
+                assert!(error.to_string().contains("ambiguous"), "{error:#}");
+            }
+            "replay" => run(cli).unwrap(),
+            unexpected => panic!("unexpected helper mode {unexpected}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_disk_binding_restart_process_helper() {
+        use clap::Parser as _;
+
+        let Some(mode) = std::env::var_os("CATS_TEST_PERSISTENT_DISK_BINDING_HELPER_MODE") else {
+            return;
+        };
+        let base = std::env::var("CATS_TEST_PERSISTENT_DISK_BINDING_HELPER_BASE").unwrap();
+        let cli = Cli::parse_from([
+            "cats",
+            "--api-url",
+            &base,
+            "--token",
+            "test-token",
+            "--workspace",
+            "ws_01",
+            "disk",
+            "attach",
+            "disk_01",
+            "--cat",
+            "cat_01",
+            "--mount-path",
+            "/srv/data",
         ]);
         match mode.to_string_lossy().as_ref() {
             "lost" => {
@@ -3096,6 +4114,106 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn persistent_disk_binding_response_loss_replays_one_operation_exactly() {
+        use std::collections::HashMap;
+        use std::io::Write as _;
+        use std::process::Command as ProcessCommand;
+
+        let state_directory = tempfile::tempdir().unwrap();
+        let state_root = state_directory.path().canonicalize().unwrap().join("state");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server_state_root = state_root.clone();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            let mut results = HashMap::new();
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (headers, body) = read_request(&mut stream);
+                assert!(std::fs::read_dir(&server_state_root).unwrap().any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with(".pending.json")
+                }));
+                let first_line = headers.lines().next().unwrap().to_owned();
+                let key = request_header(&headers, "Idempotency-Key");
+                requests.push((first_line, body, key.clone()));
+                let response = results.entry(key).or_insert_with(|| {
+                    br#"{"desired_revision":7,"operation_id":"op_01"}"#.to_vec()
+                });
+                if attempt == 0 {
+                    // Desired+Operation+stored response committed; no response
+                    // bytes reach the first process.
+                    drop(stream);
+                    continue;
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.len()
+                )
+                .unwrap();
+                stream.write_all(response).unwrap();
+                stream.flush().unwrap();
+            }
+            (requests, results.len())
+        });
+
+        let helper = "tests::persistent_disk_binding_restart_process_helper";
+        let executable = std::env::current_exe().unwrap();
+        let invoke = |mode: &str| {
+            ProcessCommand::new(&executable)
+                .args(["--exact", helper, "--nocapture"])
+                .env("CATS_TEST_PERSISTENT_DISK_BINDING_HELPER_MODE", mode)
+                .env("CATS_TEST_PERSISTENT_DISK_BINDING_HELPER_BASE", &base)
+                .env("CATS_TEST_PERSISTENT_DISK_BINDING_STATE_ROOT", &state_root)
+                .output()
+                .unwrap()
+        };
+        let lost = invoke("lost");
+        assert!(
+            lost.status.success(),
+            "lost-response helper failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&lost.stdout),
+            String::from_utf8_lossy(&lost.stderr)
+        );
+        let replay = invoke("replay");
+        assert!(
+            replay.status.success(),
+            "replay helper failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&replay.stdout),
+            String::from_utf8_lossy(&replay.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&replay.stdout).contains("Desired revision 7, operation op_01")
+        );
+
+        let (requests, result_count) = server.join().unwrap();
+        assert_eq!(result_count, 1);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+        assert_eq!(
+            requests[0].0,
+            "POST /v1/workspaces/ws_01/disks/disk_01/actions/attach HTTP/1.1"
+        );
+        assert_eq!(
+            requests[0].1,
+            br#"{"cat_id":"cat_01","mount_path":"/srv/data"}"#
+        );
+        assert!(requests[0].2.starts_with("cli-"));
+        assert!(std::fs::read_dir(&state_root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".pending.json")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn exact_name_conflict_is_terminal_and_durably_clears_pending_state() {
         use clap::Parser as _;
         use std::io::Write as _;
@@ -3135,6 +4253,105 @@ mod tests {
         server.join().unwrap();
         assert!(std::fs::read_dir(state_root).unwrap().all(|entry| {
             !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".pending.json")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_disk_binding_fixed_results_clear_but_nonterminal_response_stays_pending() {
+        use clap::Parser as _;
+        use std::io::Write as _;
+
+        let invoke = |base: &str| {
+            Cli::parse_from([
+                "cats",
+                "--api-url",
+                base,
+                "--token",
+                "test-token",
+                "--workspace",
+                "ws_01",
+                "disk",
+                "attach",
+                "disk_01",
+                "--cat",
+                "cat_01",
+                "--mount-path",
+                "/srv/data",
+            ])
+        };
+
+        for (status_line, body, expected_error) in [
+            (
+                "409 Conflict",
+                PERSISTENT_DISK_BINDING_CONFLICT_BODY,
+                "Conflict",
+            ),
+            (
+                "412 Precondition Failed",
+                PERSISTENT_DISK_BINDING_PRECONDITION_BODY,
+                "FailedPrecondition",
+            ),
+        ] {
+            let state_directory = tempfile::tempdir().unwrap();
+            let state_root = state_directory.path().canonicalize().unwrap().join("state");
+            let _state_guard = cat_create_pending::TestPersistentDiskBindingStateRootGuard::set(
+                state_root.clone(),
+            );
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_request(&mut stream);
+                write!(
+                    stream,
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(body).unwrap();
+                stream.flush().unwrap();
+            });
+            let error = run(invoke(&base)).unwrap_err().to_string();
+            assert!(error.contains(expected_error), "{error}");
+            server.join().unwrap();
+            assert!(std::fs::read_dir(&state_root).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".pending.json")
+            }));
+        }
+
+        let state_directory = tempfile::tempdir().unwrap();
+        let state_root = state_directory.path().canonicalize().unwrap().join("state");
+        let _state_guard =
+            cat_create_pending::TestPersistentDiskBindingStateRootGuard::set(state_root.clone());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            let body = br#"{"code":"unavailable","message":"retry"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+            stream.flush().unwrap();
+        });
+        let error = run(invoke(&base)).unwrap_err().to_string();
+        assert!(error.contains("not an exact terminal result"), "{error}");
+        server.join().unwrap();
+        assert!(std::fs::read_dir(&state_root).unwrap().any(|entry| {
+            entry
                 .unwrap()
                 .file_name()
                 .to_string_lossy()
@@ -3191,6 +4408,64 @@ mod tests {
         assert!(matches!(
             classify_cat_create_response(&compressed),
             CatCreateResponseClassification::Nonterminal
+        ));
+    }
+
+    #[test]
+    fn persistent_disk_binding_response_classification_is_exact_and_closed() {
+        let response = |status, body: &[u8]| ExactCreateHttpResponse {
+            status,
+            content_types: vec![b"application/json".to_vec()],
+            content_encodings: Vec::new(),
+            body: body.to_vec(),
+        };
+        let accepted = br#"{"desired_revision":7,"operation_id":"op_01"}"#.as_slice();
+        assert!(matches!(
+            classify_persistent_disk_binding_response(&response(
+                reqwest::StatusCode::ACCEPTED,
+                accepted,
+            )),
+            PersistentDiskBindingResponseClassification::Accepted(_)
+        ));
+        assert!(matches!(
+            classify_persistent_disk_binding_response(&response(
+                reqwest::StatusCode::CONFLICT,
+                PERSISTENT_DISK_BINDING_CONFLICT_BODY,
+            )),
+            PersistentDiskBindingResponseClassification::Conflict
+        ));
+        assert!(matches!(
+            classify_persistent_disk_binding_response(&response(
+                reqwest::StatusCode::PRECONDITION_FAILED,
+                PERSISTENT_DISK_BINDING_PRECONDITION_BODY,
+            )),
+            PersistentDiskBindingResponseClassification::FailedPrecondition
+        ));
+        for closed in [
+            response(reqwest::StatusCode::OK, accepted),
+            response(
+                reqwest::StatusCode::ACCEPTED,
+                br#"{ "desired_revision":7,"operation_id":"op_01"}"#,
+            ),
+            response(
+                reqwest::StatusCode::CONFLICT,
+                br#"{"code":"conflict","message":"different"}"#,
+            ),
+            response(
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                br#"{"code":"unavailable","message":"retry"}"#,
+            ),
+        ] {
+            assert!(matches!(
+                classify_persistent_disk_binding_response(&closed),
+                PersistentDiskBindingResponseClassification::Nonterminal
+            ));
+        }
+        let mut compressed = response(reqwest::StatusCode::ACCEPTED, accepted);
+        compressed.content_encodings.push(b"gzip".to_vec());
+        assert!(matches!(
+            classify_persistent_disk_binding_response(&compressed),
+            PersistentDiskBindingResponseClassification::Nonterminal
         ));
     }
 
@@ -3263,8 +4538,6 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let commands: &[&[&str]] = &[
-            &["ls"],
-            &["get", "app"],
             &["start", "app"],
             &["stop", "app"],
             &["suspend", "app"],
@@ -3285,9 +4558,6 @@ mod tests {
             &["sleep", "off", "app"],
             &["sleep", "status", "app"],
             &["expiry", "app"],
-            &["disk", "ls"],
-            &["disk", "get", "data"],
-            &["disk", "resize", "data", "--size", "2GiB"],
             &["disk", "delete", "data"],
             &["disk", "snapshot", "data"],
             &["mount", "data", "--cat", "app"],
@@ -3337,22 +4607,51 @@ mod tests {
     }
 
     #[test]
+    fn disk_resize_is_not_a_cli_command() {
+        use clap::Parser;
+
+        let parsed = Cli::try_parse_from(["cats", "disk", "resize", "data", "--size", "2GiB"]);
+        assert!(
+            parsed.is_err(),
+            "immutable volume capacity still has a CLI mutation"
+        );
+    }
+
+    #[test]
     fn shipped_help_hides_every_closed_authority_command_and_legacy_create_flag() {
         use clap::CommandFactory;
 
         let mut root = Cli::command();
         let root_help = root.render_long_help().to_string();
         for command in [
-            "ls", "get", "start", "stop", "suspend", "resume", "warm", "sync", "destroy", "exec",
-            "deploy", "shell", "sleep", "expiry", "disk", "mount", "unmount", "expose", "endpoint",
+            "start", "stop", "suspend", "resume", "warm", "sync", "destroy", "exec", "deploy",
+            "shell", "sleep", "expiry", "mount", "unmount", "expose", "endpoint",
         ] {
             assert!(
                 !root_help.contains(&format!("\n  {command} ")),
                 "retired command {command:?} remains visible in root help"
             );
         }
+        for read in ["ls", "get", "disk"] {
+            assert!(
+                root_help.contains(&format!("\n  {read} ")),
+                "production read command {read:?} is hidden from root help"
+            );
+        }
         assert!(root_help.contains("\n  operation "));
         assert!(!root_help.contains("--no-wait"));
+
+        let mut disk = Cli::command()
+            .find_subcommand("disk")
+            .expect("Disk command")
+            .clone();
+        let disk_help = disk.render_long_help().to_string();
+        for supported in ["create", "ls", "get"] {
+            assert!(disk_help.contains(&format!("\n  {supported} ")));
+        }
+        for retired in ["resize", "delete", "snapshot"] {
+            assert!(!disk_help.contains(&format!("\n  {retired} ")));
+        }
 
         let mut operation = Cli::command()
             .find_subcommand("operation")
@@ -3388,6 +4687,31 @@ mod tests {
             );
         }
         assert!(admin_help.contains("runtime-node"));
+    }
+
+    #[test]
+    fn served_getting_started_examples_are_accepted_by_the_shipped_parser() {
+        use clap::Parser;
+
+        const CREATE: &str = "cats create dev --boot-image-digest sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --cpus 2 --memory 2GiB --root-size 1GiB --durability strict";
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for relative in [
+            "control-plane/ui/public/docs/en/getting-started.md",
+            "control-plane/ui/public/docs/en/getting-started.html",
+            "control-plane/ui/public/docs/zh-CN/getting-started.md",
+            "control-plane/ui/public/docs/zh-CN/getting-started.html",
+        ] {
+            let path = workspace.join(relative);
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            assert!(
+                source.contains(CREATE),
+                "served documentation {relative} lost the copyable create command"
+            );
+            Cli::try_parse_from(CREATE.split_whitespace()).unwrap_or_else(|error| {
+                panic!("served documentation {relative} has an invalid create command: {error}")
+            });
+        }
     }
 
     #[test]

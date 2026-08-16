@@ -25,11 +25,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, Read, Write};
 use std::net::Ipv4Addr;
-use std::os::fd::AsRawFd as _;
-#[cfg(target_os = "linux")]
-use std::os::fd::FromRawFd as _;
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -40,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use cats_api::runtime_reconciliation::{
-    IsolatedIpv4Kind, NetworkConfig, RandomId128, RuntimeNetworkIdentity,
+    Id, IsolatedIpv4Kind, NetworkConfig, RandomId128, RuntimeNetworkIdentity,
     GUEST_DEVICE_SERIAL_MAX_BYTES_V1,
 };
 
@@ -1138,6 +1136,15 @@ pub(crate) struct HostNetworkSnapshot {
     links: BTreeMap<String, HostNetworkLinkSnapshot>,
 }
 
+/// Stable Cats TAP identity which is not backed by a durable reservation.
+/// This is inventory evidence only; it carries no removal authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostNetworkResidue {
+    pub(crate) network_id: Id,
+    pub(crate) tap_name: Id,
+    pub(crate) ownership_token: RandomId128,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReservedHostNetworkState {
     Absent,
@@ -1283,6 +1290,58 @@ impl HostNetworkSnapshot {
             );
         }
         Ok(())
+    }
+
+    /// Classify every well-formed, stable Cats TAP outside the durable
+    /// reservation set. A partial identity or a collision with any retained
+    /// identity is uncertainty, not residue.
+    pub(crate) fn unreserved_managed_networks<'a>(
+        &self,
+        reserved: impl IntoIterator<Item = &'a RuntimeNetworkIdentity>,
+    ) -> Result<Vec<HostNetworkResidue>> {
+        let mut durable_by_tap = BTreeMap::new();
+        let mut durable_networks = BTreeSet::new();
+        let mut durable_tokens = BTreeSet::new();
+        for identity in reserved {
+            let network = ChNetwork {
+                tap: identity.tap_name.as_str().to_owned(),
+                ownership_token: identity.ownership_token.clone(),
+                config: identity.network_config.clone(),
+            };
+            validate_network_plan(&network)?;
+            anyhow::ensure!(
+                durable_by_tap
+                    .insert(network.tap.clone(), network.clone())
+                    .is_none()
+                    && durable_networks.insert(network.config.network_id.clone())
+                    && durable_tokens.insert(network.ownership_token.clone()),
+                "durable Host network reservations repeat one identity"
+            );
+        }
+
+        let mut residue = Vec::new();
+        for (tap_name, (network_id, ownership_token, address)) in self.managed_networks()? {
+            if let Some(expected) = durable_by_tap.get(&tap_name) {
+                anyhow::ensure!(
+                    expected.config.network_id == network_id
+                        && expected.ownership_token == ownership_token
+                        && Ipv4Cidr::parse(&host_cidr(expected))? == address,
+                    "physical Cats TAP conflicts with its durable reservation"
+                );
+                continue;
+            }
+            anyhow::ensure!(
+                !durable_networks.contains(&network_id)
+                    && !durable_tokens.contains(&ownership_token),
+                "unreserved physical Cats TAP collides with a durable identity"
+            );
+            residue.push(HostNetworkResidue {
+                network_id,
+                tap_name: Id::new(tap_name).context("managed TAP name is not a wire Id")?,
+                ownership_token,
+            });
+        }
+        Ok(residue)
     }
 
     /// Close every durable reservation against the complete Host IPv4 set.
@@ -1618,13 +1677,13 @@ fn ipv4_addresses(output: &[u8]) -> Result<Vec<HostIpv4Address>> {
 /// Return false only when the exact tap name is absent. A present tap with a
 /// different/missing token is foreign residue and must fail closed.
 fn exact_network_exists(
-    cfg: &ChConfig,
+    ip_bin: &Path,
     network: &ChNetwork,
     context: &IpCommandContext<'_>,
 ) -> Result<bool> {
     let output = run_ip_command(
         context,
-        &cfg.ip_bin,
+        ip_bin,
         &["-d", "link", "show", "dev", &network.tap],
     )
     .with_context(|| format!("inspect Host tap {}", network.tap))?;
@@ -1709,7 +1768,7 @@ pub(crate) fn prepare_network_with_tap_port(
     let desired_cidr = Ipv4Cidr::parse(&host_cidr).context("parse checkpointed Host IPv4 CIDR")?;
     let context = IpCommandContext::Desired(effect_context);
 
-    if exact_network_exists(cfg, network, &context)? {
+    if exact_network_exists(&cfg.ip_bin, network, &context)? {
         let addresses = run_ip_command(
             &context,
             &cfg.ip_bin,
@@ -1808,7 +1867,7 @@ pub fn remove_network(cfg: &ChConfig, network: &ChNetwork) -> Result<()> {
     let context = IpCommandContext::Standalone {
         deadline: Instant::now() + STANDALONE_IP_COMMAND_TIMEOUT,
     };
-    if exact_network_exists(cfg, network, &context)? {
+    if exact_network_exists(&cfg.ip_bin, network, &context)? {
         ip_status(
             &context,
             &cfg.ip_bin,
@@ -1818,28 +1877,81 @@ pub fn remove_network(cfg: &ChConfig, network: &ChNetwork) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn remove_network_bounded(
+    ip_bin: &Path,
+    network: &ChNetwork,
+    effect_context: &RuntimeDesiredEffectContext,
+) -> Result<()> {
+    anyhow::ensure!(ip_bin.is_absolute(), "Host ip binary must be absolute");
+    validate_network_plan(network)?;
+    let context = IpCommandContext::Desired(effect_context);
+    if exact_network_exists(ip_bin, network, &context)? {
+        context.check_active()?;
+        ip_status(&context, ip_bin, &["link", "delete", "dev", &network.tap])?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // CH API socket: minimal HTTP/1.1 over a unix stream.
 // ---------------------------------------------------------------------------
 
 pub fn ch_api(sock: &Path, method: &str, path: &str, body: Option<&str>) -> Result<(u16, String)> {
-    let mut stream = UnixStream::connect(sock)
+    ch_api_bounded(sock, method, path, body, Duration::from_secs(60))
+}
+
+fn ch_api_bounded(
+    sock: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    timeout: Duration,
+) -> Result<(u16, String)> {
+    anyhow::ensure!(!timeout.is_zero(), "CH API timeout is zero");
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .context("CH API deadline overflow")?;
+    ch_api_until(sock, method, path, body, deadline, &|| Ok(()))
+}
+
+fn ch_api_until(
+    sock: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    deadline: Instant,
+    check_active: &dyn Fn() -> Result<()>,
+) -> Result<(u16, String)> {
+    check_active_until(deadline, check_active)?;
+    let mut stream = connect_unix_until(sock, deadline, check_active)
         .with_context(|| format!("connect CH api socket {}", sock.display()))?;
-    stream.set_read_timeout(Some(Duration::from_secs(60)))?;
     let body = body.unwrap_or("");
     let req = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    stream.write_all(req.as_bytes())?;
+    write_all_until(&mut stream, req.as_bytes(), deadline, check_active)?;
 
     // Cloud Hypervisor keeps its API connections alive even when the client
     // asks for `Connection: close`. Read the HTTP message according to its
     // Content-Length instead of waiting for EOF (which otherwise turns every
     // successful API call into a read timeout).
-    let mut reader = BufReader::new(stream);
-    let mut status_line = String::new();
-    reader.read_line(&mut status_line)?;
+    let mut response = Vec::new();
+    let header_end = loop {
+        if let Some(end) = http_header_end(&response) {
+            break end;
+        }
+        anyhow::ensure!(
+            response.len() <= 64 * 1024,
+            "oversized CH api response headers"
+        );
+        read_more_until(&mut stream, &mut response, deadline, check_active)?;
+    };
+    anyhow::ensure!(header_end <= 64 * 1024, "oversized CH api response headers");
+    let headers = std::str::from_utf8(&response[..header_end])
+        .context("CH api response headers are not UTF-8")?;
+    let mut lines = headers.lines();
+    let status_line = lines.next().context("missing CH api response status")?;
     let status: u16 = status_line
         .split_whitespace()
         .nth(1)
@@ -1847,19 +1959,7 @@ pub fn ch_api(sock: &Path, method: &str, path: &str, body: Option<&str>) -> Resu
         .context("malformed CH api response")?;
 
     let mut content_length = None;
-    let mut header_bytes = status_line.len();
-    loop {
-        let mut line = String::new();
-        let read = reader.read_line(&mut line)?;
-        anyhow::ensure!(read > 0, "truncated CH api response headers");
-        header_bytes += read;
-        anyhow::ensure!(
-            header_bytes <= 64 * 1024,
-            "oversized CH api response headers"
-        );
-        if line == "\r\n" || line == "\n" {
-            break;
-        }
+    for line in lines {
         if let Some((name, value)) = line.split_once(':') {
             if name.eq_ignore_ascii_case("content-length") {
                 content_length = Some(
@@ -1872,10 +1972,211 @@ pub fn ch_api(sock: &Path, method: &str, path: &str, body: Option<&str>) -> Resu
         }
     }
 
-    let mut payload = vec![0; content_length.unwrap_or(0)];
-    reader.read_exact(&mut payload)?;
-    let payload = String::from_utf8(payload).context("CH api response body is not UTF-8")?;
+    let content_length = content_length.unwrap_or(0);
+    let message_end = header_end
+        .checked_add(content_length)
+        .context("CH api response length overflow")?;
+    while response.len() < message_end {
+        read_more_until(&mut stream, &mut response, deadline, check_active)?;
+    }
+    let payload = String::from_utf8(response[header_end..message_end].to_vec())
+        .context("CH api response body is not UTF-8")?;
     Ok((status, payload))
+}
+
+fn connect_unix_until(
+    sock: &Path,
+    deadline: Instant,
+    check_active: &dyn Fn() -> Result<()>,
+) -> Result<UnixStream> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = sock.as_os_str().as_bytes();
+    anyhow::ensure!(!path.contains(&0), "CH API socket path contains NUL");
+    // SAFETY: socket returns a new owned descriptor or a negative errno.
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error()).context("create CH API unix socket");
+    }
+    // SAFETY: `raw` was just returned as an owned descriptor.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: fcntl operates on the live descriptor retained by `fd`.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error()).context("inspect CH API socket flags");
+    }
+    // SAFETY: fcntl operates on the live descriptor retained by `fd`.
+    let nonblocking =
+        unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if nonblocking < 0 {
+        return Err(io::Error::last_os_error()).context("make CH API socket nonblocking");
+    }
+    // SAFETY: fcntl operates on the live descriptor retained by `fd`.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error()).context("make CH API socket close-on-exec");
+    }
+
+    // SAFETY: zero is a valid initial representation for sockaddr_un; the
+    // family and pathname are filled before the address reaches the kernel.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    anyhow::ensure!(
+        path.len() < address.sun_path.len(),
+        "CH API socket path is too long"
+    );
+    for (destination, source) in address.sun_path.iter_mut().zip(path.iter().copied()) {
+        *destination = source as libc::c_char;
+    }
+    let address_length = std::mem::offset_of!(libc::sockaddr_un, sun_path)
+        .checked_add(path.len())
+        .and_then(|length| length.checked_add(1))
+        .and_then(|length| libc::socklen_t::try_from(length).ok())
+        .context("CH API socket address length overflow")?;
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    {
+        address.sun_len = u8::try_from(address_length).context("CH API socket address too long")?;
+    }
+    check_active_until(deadline, check_active)?;
+    // SAFETY: `address` is initialized for `address_length`; the kernel does
+    // not retain the pointer after connect returns.
+    let result = unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            std::ptr::addr_of!(address).cast::<libc::sockaddr>(),
+            address_length,
+        )
+    };
+    if result != 0 {
+        let source = io::Error::last_os_error();
+        if !matches!(
+            source.raw_os_error(),
+            Some(libc::EINPROGRESS) | Some(libc::EALREADY) | Some(libc::EAGAIN)
+        ) {
+            return Err(source).context("start nonblocking CH API connect");
+        }
+        wait_fd_until(fd.as_raw_fd(), libc::POLLOUT, deadline, check_active)?;
+        let mut socket_error: libc::c_int = 0;
+        let mut socket_error_length =
+            libc::socklen_t::try_from(std::mem::size_of_val(&socket_error))
+                .context("CH API socket error length overflow")?;
+        // SAFETY: both output pointers are valid for their declared lengths.
+        if unsafe {
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                std::ptr::addr_of_mut!(socket_error).cast(),
+                &mut socket_error_length,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error()).context("finish CH API connect");
+        }
+        if socket_error != 0 {
+            return Err(io::Error::from_raw_os_error(socket_error))
+                .context("finish CH API connect");
+        }
+    }
+    check_active_until(deadline, check_active)?;
+    Ok(UnixStream::from(fd))
+}
+
+fn write_all_until(
+    stream: &mut UnixStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+    check_active: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    while !bytes.is_empty() {
+        check_active_until(deadline, check_active)?;
+        match stream.write(bytes) {
+            Ok(0) => bail!("truncated CH API request write"),
+            Ok(written) => bytes = &bytes[written..],
+            Err(source) if source.kind() == io::ErrorKind::Interrupted => {}
+            Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
+                wait_fd_until(stream.as_raw_fd(), libc::POLLOUT, deadline, check_active)?;
+            }
+            Err(source) => return Err(source).context("write CH API request"),
+        }
+    }
+    check_active_until(deadline, check_active)?;
+    Ok(())
+}
+
+fn read_more_until(
+    stream: &mut UnixStream,
+    response: &mut Vec<u8>,
+    deadline: Instant,
+    check_active: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    let mut buffer = [0_u8; 4096];
+    loop {
+        check_active_until(deadline, check_active)?;
+        match stream.read(&mut buffer) {
+            Ok(0) => bail!("truncated CH api response"),
+            Ok(read) => {
+                response.extend_from_slice(&buffer[..read]);
+                check_active_until(deadline, check_active)?;
+                return Ok(());
+            }
+            Err(source) if source.kind() == io::ErrorKind::Interrupted => {}
+            Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
+                wait_fd_until(stream.as_raw_fd(), libc::POLLIN, deadline, check_active)?;
+            }
+            Err(source) => return Err(source).context("read CH API response"),
+        }
+    }
+}
+
+fn wait_fd_until(
+    fd: libc::c_int,
+    events: libc::c_short,
+    deadline: Instant,
+    check_active: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    const CANCELLATION_POLL: Duration = Duration::from_millis(10);
+    loop {
+        check_active_until(deadline, check_active)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait = remaining.min(CANCELLATION_POLL);
+        let millis = wait.as_millis().max(1).min(i32::MAX as u128) as libc::c_int;
+        let mut descriptor = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        // SAFETY: poll receives one valid pollfd and retains no pointer.
+        let result = unsafe { libc::poll(&mut descriptor, 1, millis) };
+        if result > 0 {
+            anyhow::ensure!(
+                descriptor.revents & libc::POLLNVAL == 0,
+                "CH API socket became invalid"
+            );
+            return Ok(());
+        }
+        if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return Err(io::Error::last_os_error()).context("poll CH API socket");
+        }
+    }
+}
+
+fn check_active_until(deadline: Instant, check_active: &dyn Fn() -> Result<()>) -> Result<()> {
+    check_active()?;
+    anyhow::ensure!(Instant::now() < deadline, "CH API deadline expired");
+    Ok(())
+}
+
+fn http_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+        .or_else(|| {
+            bytes
+                .windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|position| position + 2)
+        })
 }
 
 pub fn ch_api_ok(sock: &Path, method: &str, path: &str, body: Option<&str>) -> Result<()> {
@@ -2721,6 +3022,21 @@ pub fn pause(api_sock: &Path) -> Result<()> {
     ch_api_ok(api_sock, "PUT", "/api/v1/vm.pause", None)
 }
 
+pub(crate) fn pause_bounded(api_sock: &Path, context: &RuntimeDesiredEffectContext) -> Result<()> {
+    let (status, payload) = ch_api_until(
+        api_sock,
+        "PUT",
+        "/api/v1/vm.pause",
+        None,
+        context.deadline(),
+        &|| context.check_active(),
+    )?;
+    if !(200..300).contains(&status) {
+        bail!("CH PUT /api/v1/vm.pause -> {status}: {payload}");
+    }
+    Ok(())
+}
+
 pub fn resume(api_sock: &Path) -> Result<()> {
     ch_api_ok(api_sock, "PUT", "/api/v1/vm.resume", None)
 }
@@ -2752,6 +3068,7 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
 
     #[derive(Debug, Clone, Copy)]
@@ -3197,6 +3514,30 @@ mod tests {
             tap_name: Id::new("catold000001").unwrap(),
             ownership_token: RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
         }
+    }
+
+    #[test]
+    fn stable_unreserved_cats_tap_retains_exact_residue_identity() {
+        let network = incumbent_network();
+        let alias = network_alias(&ChNetwork {
+            tap: network.tap_name.as_str().to_owned(),
+            ownership_token: network.ownership_token.clone(),
+            config: network.network_config.clone(),
+        });
+        let (links, addresses) = incumbent_link_json(&alias, "10.240.0.1");
+        let snapshot = network_snapshot(links, addresses).unwrap();
+
+        let residue = snapshot
+            .unreserved_managed_networks(std::iter::empty())
+            .unwrap();
+        assert_eq!(
+            residue,
+            [HostNetworkResidue {
+                network_id: network.network_config.network_id,
+                tap_name: network.tap_name,
+                ownership_token: network.ownership_token,
+            }]
+        );
     }
 
     fn incumbent_link_json(alias: &str, address: &str) -> (serde_json::Value, serde_json::Value) {
@@ -4044,5 +4385,100 @@ exit 0\n",
         assert_eq!(body, r#"{"ok":true}"#);
         release_tx.send(()).unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn ch_api_drip_response_cannot_refresh_the_absolute_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("ch-api-drip.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}";
+            for byte in response {
+                if stream.write_all(std::slice::from_ref(byte)).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        let started = Instant::now();
+        let result = ch_api_until(
+            &sock,
+            "PUT",
+            "/api/v1/vm.pause",
+            None,
+            started + Duration::from_millis(45),
+            &|| Ok(()),
+        );
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_millis(250));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn ch_api_cancellation_interrupts_poll_and_client_thread_joins() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("ch-api-cancel.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            accepted_tx.send(()).unwrap();
+            let mut byte = [0; 1];
+            while stream.read(&mut byte).unwrap_or(0) != 0 {}
+        });
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let client_cancelled = Arc::clone(&cancelled);
+        let client_sock = sock.clone();
+        let client = std::thread::spawn(move || {
+            ch_api_until(
+                &client_sock,
+                "PUT",
+                "/api/v1/vm.pause",
+                None,
+                Instant::now() + Duration::from_secs(2),
+                &|| {
+                    anyhow::ensure!(
+                        !client_cancelled.load(Ordering::Acquire),
+                        "test cancellation"
+                    );
+                    Ok(())
+                },
+            )
+        });
+        accepted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        cancelled.store(true, Ordering::Release);
+        let result = client.join().unwrap();
+        assert!(result.is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn ch_api_connect_backlog_obeys_the_same_absolute_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("ch-api-backlog.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        // SAFETY: listener owns this live AF_UNIX descriptor. Lowering the
+        // backlog affects only this private test socket.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+        let _filler = UnixStream::connect(&sock).unwrap();
+
+        let started = Instant::now();
+        let result = ch_api_until(
+            &sock,
+            "PUT",
+            "/api/v1/vm.pause",
+            None,
+            started + Duration::from_millis(45),
+            &|| Ok(()),
+        );
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_millis(250));
     }
 }

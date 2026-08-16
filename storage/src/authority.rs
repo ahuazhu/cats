@@ -6,6 +6,13 @@
 
 use std::collections::BTreeSet;
 
+use cats_api::object_write_gateway::ObjectWriteCredentialReference;
+#[cfg(feature = "proposed-node-residue-reclamation")]
+pub use cats_api::runtime_reconciliation::{
+    residue_acquisition_digest, AuthorizedServingAcquire, DiskKind,
+    ResidueAuthorityRetentionReason, ResidueDataDirectoryLineage, ResidueReclaimProof,
+    RuntimeResidueAuthorityOutcome, WireU64,
+};
 pub use cats_api::runtime_reconciliation::{
     AcquireOrigin, AsciiText, AuthorizationConsumedReceipt, AuthorizationRecord,
     AuthorizationState, BeginDeleteRequest, BeginDeleteResult,
@@ -17,6 +24,8 @@ pub use cats_api::runtime_reconciliation::{
     VolumeTakeoverAuthorization,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::trusted_host_fence::{validate_trusted_host_fence_event_v1, TrustedHostFenceEventV1};
 
 const MAX_INTEGER: u64 = i64::MAX as u64;
 
@@ -43,6 +52,16 @@ pub struct AttachmentLineageIdentity {
 #[serde(deny_unknown_fields)]
 pub struct AuthorizedServingAttachment {
     pub identity: AttachmentLineageIdentity,
+    /// Public binding only. The matching attachment-scoped private key lives
+    /// in a separate root-only artifact and never enters this receipt.
+    /// `None` means no object-write credential is bound to this attachment;
+    /// every qualified object-write publish path must fail closed on it.
+    /// Node-side credential generation and A19 registration are not composed
+    /// yet (see DEFERRED), so ordinary serving attachments carry `None`.
+    /// The canonical encoding omits an unbound credential entirely, keeping
+    /// pre-field frozen artifacts byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_write_credential: Option<ObjectWriteCredentialReference>,
     pub size_bytes: u64,
     pub durability: VolumeDurability,
     pub head: RemoteHead,
@@ -50,9 +69,10 @@ pub struct AuthorizedServingAttachment {
     pub acquire: AuthorizedServingAcquire,
 }
 
-/// Immutable, thick authority that created one serving attachment.  Normal
+/// Immutable, thick authority that created one serving attachment. Normal
 /// acquire keeps its exact request/result pair; takeover keeps the complete
-/// consumed authorization and receipt rather than a lossy result projection.
+/// consumed authorization and receipt rather than a lossy projection.
+#[cfg(not(feature = "proposed-node-residue-reclamation"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuthorizedServingAcquire {
@@ -227,11 +247,20 @@ pub fn validate_authorized_serving_record(
 ) -> Result<()> {
     validate_authorized_serving_attachment(attachment)?;
     validate_volume_record(record)?;
+    // The exact owner under the exact epoch may have published past the
+    // frozen attachment head, so a strictly newer generation is the expected
+    // evolution of this same grant; only an equal-generation divergence or a
+    // regression below the frozen head is unknown state.
+    let head_is_current = if record.head.generation == attachment.head.generation {
+        record.head == attachment.head
+    } else {
+        record.head.generation > attachment.head.generation
+    };
     if record.volume_id != attachment.identity.volume_id
         || record.size_bytes != attachment.size_bytes
         || record.durability != attachment.durability
         || !matches!(record.admin_state, VolumeAdminState::Active)
-        || record.head != attachment.head
+        || !head_is_current
         || record.lease_owner.as_ref() != Some(&attachment.identity.attachment_id)
         || record.lease_epoch != attachment.identity.attachment_epoch
         || expected_expiry.is_some_and(|expiry| record.lease_expires_at != Some(expiry))
@@ -266,7 +295,7 @@ pub fn validate_authorized_serving_record(
 /// Sharing this release number lets the adapter reject an unstamped or
 /// incompatible authority shape without importing the product store or
 /// duplicating its schema.
-pub const AUTHORITY_RELEASE_SCHEMA_VERSION: i64 = 14;
+pub const AUTHORITY_RELEASE_SCHEMA_VERSION: i64 = 16;
 
 /// Maximum number of currently-owned Volume authority rows one Node snapshot
 /// may return. Runtime Reconciliation admits at most 1,024 Cats with at most
@@ -726,6 +755,100 @@ pub fn validate_volume_transition_evidence_bundle(
     .ok_or(AuthorityError::BackendUnknown)
 }
 
+/// Classifies one exact local lineage against one repeatable-read authority
+/// snapshot.  A retained outcome is diagnostic and never authorizes I/O; the
+/// three reclaimable arms are independently closed by the public wire codec.
+#[cfg(feature = "proposed-node-residue-reclamation")]
+pub fn classify_residue_reclaim_authority(
+    lineage: &ResidueDataDirectoryLineage,
+    current_volume: Option<&VolumeRecord>,
+    delete_completion: Option<&DeleteCompletionReceipt>,
+    consumed_authorization: Option<&AuthorizationRecord>,
+) -> Result<RuntimeResidueAuthorityOutcome> {
+    if current_volume.is_some_and(|record| validate_volume_record(record).is_err())
+        || delete_completion
+            .is_some_and(|receipt| validate_delete_completion_receipt(receipt).is_err())
+        || consumed_authorization
+            .is_some_and(|record| validate_authorization_record(record).is_err())
+        || (current_volume.is_some() && delete_completion.is_some())
+    {
+        return Err(AuthorityError::BackendUnknown);
+    }
+    if current_volume.is_some_and(|record| record.volume_id != lineage.volume_id)
+        || delete_completion.is_some_and(|receipt| match receipt {
+            DeleteCompletionReceipt::Normal { request, .. } => {
+                request.volume_id != lineage.volume_id
+            }
+            DeleteCompletionReceipt::DisposableRoot { volume_id, .. } => {
+                volume_id != &lineage.volume_id
+            }
+        })
+    {
+        return Err(AuthorityError::BackendUnknown);
+    }
+
+    let proof = match (current_volume, delete_completion) {
+        (Some(record), None) => Some(ResidueReclaimProof::OrdinaryRelease {
+            current_volume: record.clone(),
+        }),
+        (None, Some(completion @ DeleteCompletionReceipt::Normal { .. })) => {
+            if consumed_authorization.is_some() {
+                return Err(AuthorityError::BackendUnknown);
+            }
+            Some(ResidueReclaimProof::NormalDeleteCompletion {
+                completion: completion.clone(),
+            })
+        }
+        (None, Some(completion @ DeleteCompletionReceipt::DisposableRoot { .. })) => {
+            consumed_authorization.map(|authorization| {
+                ResidueReclaimProof::DisposableRootDeleteCompletion {
+                    completion: completion.clone(),
+                    consumed_authorization: authorization.clone(),
+                }
+            })
+        }
+        (None, None) => {
+            if consumed_authorization.is_some() {
+                return Err(AuthorityError::BackendUnknown);
+            }
+            None
+        }
+        (Some(_), Some(_)) => unreachable!("conflicting snapshot rejected above"),
+    };
+    if let Some(proof) = proof {
+        if cats_api::runtime_reconciliation::residue_reclaim_proof_is_closed(lineage, &proof) {
+            return Ok(RuntimeResidueAuthorityOutcome::Reclaimable {
+                proof: Box::new(proof),
+            });
+        }
+    }
+
+    let disposable_completion = matches!(
+        delete_completion,
+        Some(DeleteCompletionReceipt::DisposableRoot { .. })
+    );
+    let reason = if disposable_completion && lineage.disk_kind != DiskKind::Root {
+        ResidueAuthorityRetentionReason::UnsupportedDiskKind
+    } else if disposable_completion && consumed_authorization.is_none() {
+        ResidueAuthorityRetentionReason::DeleteIncomplete
+    } else if lineage.local_durable_generation > lineage.remote_durable_generation {
+        ResidueAuthorityRetentionReason::UniqueLocalTail
+    } else if current_volume.is_some_and(|record| record.lease_owner.is_some()) {
+        ResidueAuthorityRetentionReason::CurrentOrNewerOwner
+    } else if current_volume
+        .is_some_and(|record| matches!(record.admin_state, VolumeAdminState::Deleting { .. }))
+    {
+        ResidueAuthorityRetentionReason::DeleteIncomplete
+    } else if current_volume.is_some() {
+        ResidueAuthorityRetentionReason::ReleaseNotRecorded
+    } else if delete_completion.is_some() {
+        ResidueAuthorityRetentionReason::LineageMismatch
+    } else {
+        ResidueAuthorityRetentionReason::NoAuthorityRecord
+    };
+    Ok(RuntimeResidueAuthorityOutcome::Retained { reason })
+}
+
 pub fn validate_host_fence_event(event: &HostFenceEvent) -> Result<()> {
     if let HostIsolationState::HostDestroyed { receipt } = &event.isolation_state {
         if event.state == HostFenceEventState::Rejoined
@@ -952,14 +1075,67 @@ pub fn consume_takeover(
     authorization_id: &Id,
     db_now: UnixMillis,
 ) -> Result<(VolumeRecord, AuthorizationRecord, TakeoverResult)> {
-    validate_volume_record(record)?;
     validate_host_fence_event(event)?;
+    consume_takeover_bound_to_event(
+        record,
+        &event.event_id,
+        if event.state == HostFenceEventState::Active {
+            TakeoverFenceAdmission::LegacyActive
+        } else {
+            TakeoverFenceAdmission::LegacyClosed
+        },
+        authorization_record,
+        authorization_id,
+        db_now,
+    )
+}
+
+/// Consumes an authorization derived by the terminal V1 Host recovery writer.
+///
+/// Unlike the retired `Active/Rejoined` authority, this event is an immutable
+/// D2 fact and therefore has no reopen state. The authorization deadline and
+/// exact Volume owner/epoch/head tuple remain mandatory for first consume.
+pub fn consume_trusted_takeover_v1(
+    record: &VolumeRecord,
+    event: &TrustedHostFenceEventV1,
+    authorization_record: &AuthorizationRecord,
+    authorization_id: &Id,
+    db_now: UnixMillis,
+) -> Result<(VolumeRecord, AuthorizationRecord, TakeoverResult)> {
+    validate_trusted_host_fence_event_v1(event)
+        .map_err(|_| AuthorityError::InvalidAuthorization)?;
+    consume_takeover_bound_to_event(
+        record,
+        &event.event_id,
+        TakeoverFenceAdmission::TrustedTerminalV1,
+        authorization_record,
+        authorization_id,
+        db_now,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TakeoverFenceAdmission {
+    LegacyActive,
+    LegacyClosed,
+    TrustedTerminalV1,
+}
+
+fn consume_takeover_bound_to_event(
+    record: &VolumeRecord,
+    event_id: &Id,
+    event_admission: TakeoverFenceAdmission,
+    authorization_record: &AuthorizationRecord,
+    authorization_id: &Id,
+    db_now: UnixMillis,
+) -> Result<(VolumeRecord, AuthorizationRecord, TakeoverResult)> {
+    validate_volume_record(record)?;
     validate_authorization_record(authorization_record)?;
     let VolumeAuthorization::Takeover(authorization) = &authorization_record.authorization else {
         return Err(AuthorityError::InvalidAuthorization);
     };
     if &authorization.authorization_id != authorization_id
-        || authorization.host_fence_event_id != event.event_id
+        || &authorization.host_fence_event_id != event_id
         || authorization.volume_id != record.volume_id
     {
         return Err(AuthorityError::InvalidAuthorization);
@@ -976,13 +1152,16 @@ pub fn consume_takeover(
         ));
     }
 
-    if event.state != HostFenceEventState::Active || db_now > authorization.not_after {
+    if matches!(event_admission, TakeoverFenceAdmission::LegacyClosed)
+        || db_now > authorization.not_after
+    {
         return Err(AuthorityError::InvalidAuthorization);
     }
     let lease_expires_at = checked_expiry(db_now, authorization.lease_duration_ms)?;
     if !matches!(record.admin_state, VolumeAdminState::Active)
         || record.lease_owner.as_ref() != Some(&authorization.expected_attachment_id)
         || record.lease_epoch != authorization.expected_epoch
+        || record.head != authorization.expected_head
     {
         return Err(AuthorityError::InvalidAuthorization);
     }
@@ -1340,6 +1519,7 @@ fn validate_begin_delete_pair(
 }
 
 fn validate_takeover_authorization(authorization: &VolumeTakeoverAuthorization) -> Result<()> {
+    validate_stored_head(&authorization.expected_head)?;
     if authorization.new_attachment_id == authorization.expected_attachment_id {
         return Err(AuthorityError::InvalidAuthorization);
     }
@@ -1360,7 +1540,7 @@ fn validate_takeover_receipt(
         || receipt.volume_id != authorization.volume_id
         || receipt.new_attachment_id != authorization.new_attachment_id
         || receipt.resulting_epoch != stored_next_epoch(authorization.expected_epoch)?
-        || !remote_head_is_valid(&receipt.resulting_head)
+        || receipt.resulting_head != authorization.expected_head
         || receipt.consumed_at > authorization.not_after
         || checked_expiry(receipt.consumed_at, authorization.lease_duration_ms).is_err()
     {

@@ -23,12 +23,17 @@ pub const DESIRED_RUNTIME_SPEC_MAX_WIRE_BYTES: usize = 1_048_576;
 pub const RUNTIME_CHECKPOINT_MAX_WIRE_BYTES: usize = 4_194_304;
 pub const NODE_CLEANUP_CHECKPOINT_MAX_WIRE_BYTES: usize = 65_536;
 pub const NODE_OBSERVATION_MAX_WIRE_BYTES: usize = 8_388_608;
+pub const NODE_OBSERVATION_MAX_RESIDUE_ITEMS: usize = 4_096;
 pub const OBSERVATION_ACCEPTANCE_MAX_WIRE_BYTES: usize = 16_384;
 pub const RUNTIME_SPINE_ERROR_MAX_WIRE_BYTES: usize = 20_480;
 pub const RUNTIME_VOLUME_TRANSITION_REQUEST_MAX_WIRE_BYTES: usize = 16_384;
 pub const RUNTIME_VOLUME_TRANSITION_SUCCESS_MAX_WIRE_BYTES: usize = 16_384;
 pub const RUNTIME_VOLUME_TRANSITION_EVIDENCE_REQUEST_MAX_WIRE_BYTES: usize = 4_096;
 pub const RUNTIME_VOLUME_TRANSITION_EVIDENCE_SUCCESS_MAX_WIRE_BYTES: usize = 32_768;
+#[cfg(feature = "proposed-node-residue-reclamation")]
+pub const RUNTIME_RESIDUE_AUTHORITY_REQUEST_MAX_WIRE_BYTES: usize = 16_384;
+#[cfg(feature = "proposed-node-residue-reclamation")]
+pub const RUNTIME_RESIDUE_AUTHORITY_SUCCESS_MAX_WIRE_BYTES: usize = 65_536;
 pub const RUNTIME_VOLUME_TRANSITION_ERROR_MAX_WIRE_BYTES: usize = 20_480;
 pub const OPERATION_MAX_WIRE_BYTES: usize = 65_536;
 pub const CONTRACT_ERROR_MAX_WIRE_BYTES: usize = 16_384;
@@ -2208,6 +2213,7 @@ fn takeover_authorization_fields() -> Vec<Field> {
         field("volume_id", id()),
         field("expected_attachment_id", id()),
         field("expected_epoch", wire_u64()),
+        field("expected_head", remote_head_schema()),
         field("new_attachment_id", id()),
         field("desired_revision", revision()),
         field("new_placement_epoch", epoch()),
@@ -2476,6 +2482,77 @@ fn runtime_volume_transition_evidence_success_schema() -> Schema {
             "direct_successor_authorization",
             nullable(authorization_record_schema()),
         ),
+    ])
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+fn residue_reclaim_proof_schema() -> Schema {
+    union(
+        "kind",
+        vec![
+            variant(
+                "ordinary_release",
+                vec![field("current_volume", volume_record_schema())],
+            ),
+            variant(
+                "normal_delete_completion",
+                vec![field("completion", delete_completion_receipt_schema())],
+            ),
+            variant(
+                "disposable_root_delete_completion",
+                vec![
+                    field("completion", delete_completion_receipt_schema()),
+                    field("consumed_authorization", authorization_record_schema()),
+                ],
+            ),
+        ],
+    )
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+fn runtime_residue_authority_outcome_schema() -> Schema {
+    union(
+        "kind",
+        vec![
+            variant(
+                "retained",
+                vec![field(
+                    "reason",
+                    closed(&[
+                        "no_authority_record",
+                        "current_or_newer_owner",
+                        "release_not_recorded",
+                        "delete_incomplete",
+                        "lineage_mismatch",
+                        "unique_local_tail",
+                        "unsupported_disk_kind",
+                    ]),
+                )],
+            ),
+            variant(
+                "reclaimable",
+                vec![field("proof", residue_reclaim_proof_schema())],
+            ),
+        ],
+    )
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+fn runtime_residue_authority_request_schema() -> Schema {
+    object(vec![
+        field("version", version()),
+        field("session", session_binding_schema()),
+        field("lineage", residue_data_directory_lineage_schema()),
+    ])
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+fn runtime_residue_authority_success_schema() -> Schema {
+    object(vec![
+        field("version", version()),
+        field("session", session_binding_schema()),
+        field("lineage", residue_data_directory_lineage_schema()),
+        field("outcome", runtime_residue_authority_outcome_schema()),
     ])
 }
 
@@ -3204,6 +3281,56 @@ fn route_binding_evidence_schema() -> Schema {
     )
 }
 
+#[cfg(feature = "proposed-node-residue-reclamation")]
+fn residue_data_directory_lineage_schema() -> Schema {
+    object(vec![
+        field("workspace_id", id()),
+        field("cat_id", id()),
+        field("disk_id", id()),
+        field("disk_kind", closed(&["root", "persistent"])),
+        field("volume_id", id()),
+        field("attachment_id", id()),
+        field("attachment_epoch", wire_u64()),
+        field("acquire_origin", acquire_origin_schema()),
+        field("node_id", id()),
+        field("desired_revision", revision()),
+        field("spec_digest", digest()),
+        field("placement", assigned_placement_schema()),
+        field("placement_epoch", epoch()),
+        field("acquisition", authorized_serving_acquire_schema()),
+        field("acquisition_digest", digest()),
+        field("local_durable_generation", wire_u64()),
+        field("remote_durable_generation", wire_u64()),
+        field("remote_head", remote_head_schema()),
+        field("pending_pack_count", wire_u64()),
+        field("fenced", Schema::Bool),
+    ])
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+fn authorized_serving_acquire_schema() -> Schema {
+    union(
+        "kind",
+        vec![
+            variant(
+                "normal",
+                vec![
+                    field("request", normal_acquire_request_schema()),
+                    field("result", normal_acquire_result_schema()),
+                ],
+            ),
+            variant(
+                "takeover",
+                vec![
+                    field("authorization", object(takeover_authorization_fields())),
+                    field("receipt", object(takeover_consumed_receipt_fields())),
+                ],
+            ),
+        ],
+    )
+}
+
+#[cfg(not(feature = "proposed-node-residue-reclamation"))]
 fn residue_lineage_schema() -> Schema {
     union(
         "kind",
@@ -3222,6 +3349,59 @@ fn residue_lineage_schema() -> Schema {
             ),
         ],
     )
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+fn residue_lineage_schema() -> Schema {
+    union(
+        "kind",
+        vec![
+            variant("unreadable", vec![]),
+            variant(
+                "readable",
+                vec![field("lineage", residue_data_directory_lineage_schema())],
+            ),
+        ],
+    )
+}
+
+#[cfg(not(feature = "proposed-node-residue-reclamation"))]
+fn data_directory_residue_fields() -> Vec<Field> {
+    vec![
+        field("volume_id_hint", nullable(id())),
+        field("data_directory", string(StringRule::HostPath)),
+        field("ownership_token", ownership_token_schema()),
+        field("lineage", residue_lineage_schema()),
+    ]
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+fn data_directory_residue_fields() -> Vec<Field> {
+    vec![
+        field("cat_id_hint", nullable(id())),
+        field("disk_id_hint", nullable(id())),
+        field("volume_id_hint", nullable(id())),
+        field("data_directory", string(StringRule::HostPath)),
+        field("allocated_bytes", wire_u64()),
+        field(
+            "retention_reason",
+            closed(&[
+                "current_desired_attachment",
+                "superseded_desired_attachment",
+                "unassigned_cat",
+                "unreadable_identity",
+                "incomplete_physical_inventory",
+                "authority_proof_pending",
+                "authority_does_not_authorize_reclaim",
+                "unique_local_tail",
+                "persistent_disk_retained",
+                "root_disk_retained",
+                "exact_reclaim_pending",
+            ]),
+        ),
+        field("ownership_token", ownership_token_schema()),
+        field("lineage", residue_lineage_schema()),
+    ]
 }
 
 fn residue_checkpoint_schema() -> Schema {
@@ -3315,15 +3495,7 @@ fn node_residue_schema() -> Schema {
                     field("ownership_token", ownership_token_schema()),
                 ],
             ),
-            variant(
-                "data_directory",
-                vec![
-                    field("volume_id_hint", nullable(id())),
-                    field("data_directory", string(StringRule::HostPath)),
-                    field("ownership_token", ownership_token_schema()),
-                    field("lineage", residue_lineage_schema()),
-                ],
-            ),
+            variant("data_directory", data_directory_residue_fields()),
             variant(
                 "mount",
                 vec![
@@ -3911,7 +4083,10 @@ fn node_observation_schema() -> Schema {
         field("key_ring_digest", nullable(digest())),
         field("loaded_kids", array(string(StringRule::KeyId), 64)),
         field("runtimes", array(observed_runtime_schema(), 1024)),
-        field("residue", array(node_residue_schema(), 4096)),
+        field(
+            "residue",
+            array(node_residue_schema(), NODE_OBSERVATION_MAX_RESIDUE_ITEMS),
+        ),
     ])
 }
 
@@ -4024,6 +4199,10 @@ fn contract_name_schema() -> Schema {
         "runtime_volume_transition_success",
         "runtime_volume_transition_evidence_request",
         "runtime_volume_transition_evidence_success",
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        "runtime_residue_authority_request",
+        #[cfg(feature = "proposed-node-residue-reclamation")]
+        "runtime_residue_authority_success",
         "runtime_volume_transition_error",
         "operation",
         "contract_error",
@@ -4348,6 +4527,15 @@ fn node_identity_schema() -> Schema {
     object(vec![
         field("version", version()),
         field("node_id", id()),
+        field(
+            "provider_scope",
+            object(vec![
+                field("provider", id()),
+                field("partition", id()),
+                field("account_id", id()),
+                field("region", id()),
+            ]),
+        ),
         field("immutable_host_id", id()),
         field("credential_id", id()),
         field("credential_binding", credential_binding_schema()),
@@ -4699,6 +4887,12 @@ static RUNTIME_VOLUME_TRANSITION_EVIDENCE_REQUEST_SCHEMA: LazyLock<Schema> =
     LazyLock::new(runtime_volume_transition_evidence_request_schema);
 static RUNTIME_VOLUME_TRANSITION_EVIDENCE_SUCCESS_SCHEMA: LazyLock<Schema> =
     LazyLock::new(runtime_volume_transition_evidence_success_schema);
+#[cfg(feature = "proposed-node-residue-reclamation")]
+static RUNTIME_RESIDUE_AUTHORITY_REQUEST_SCHEMA: LazyLock<Schema> =
+    LazyLock::new(runtime_residue_authority_request_schema);
+#[cfg(feature = "proposed-node-residue-reclamation")]
+static RUNTIME_RESIDUE_AUTHORITY_SUCCESS_SCHEMA: LazyLock<Schema> =
+    LazyLock::new(runtime_residue_authority_success_schema);
 static RUNTIME_VOLUME_TRANSITION_ERROR_SCHEMA: LazyLock<Schema> =
     LazyLock::new(runtime_volume_transition_error_schema);
 static OPERATION_SCHEMA: LazyLock<Schema> = LazyLock::new(operation_schema);
@@ -5112,6 +5306,32 @@ pub fn decode_runtime_volume_transition_evidence_success(
     )
 }
 
+#[cfg(feature = "proposed-node-residue-reclamation")]
+pub fn decode_runtime_residue_authority_request(
+    bytes: &[u8],
+) -> Result<RuntimeResidueAuthorityRequest, ContractError> {
+    decode(
+        bytes,
+        ContractName::RuntimeResidueAuthorityRequest,
+        RUNTIME_RESIDUE_AUTHORITY_REQUEST_MAX_WIRE_BYTES,
+        &RUNTIME_RESIDUE_AUTHORITY_REQUEST_SCHEMA,
+        validate_runtime_residue_authority_request,
+    )
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+pub fn decode_runtime_residue_authority_success(
+    bytes: &[u8],
+) -> Result<RuntimeResidueAuthoritySuccess, ContractError> {
+    decode(
+        bytes,
+        ContractName::RuntimeResidueAuthoritySuccess,
+        RUNTIME_RESIDUE_AUTHORITY_SUCCESS_MAX_WIRE_BYTES,
+        &RUNTIME_RESIDUE_AUTHORITY_SUCCESS_SCHEMA,
+        validate_runtime_residue_authority_success,
+    )
+}
+
 pub fn decode_runtime_volume_transition_error(
     bytes: &[u8],
 ) -> Result<RuntimeVolumeTransitionError, ContractError> {
@@ -5335,6 +5555,28 @@ pub fn encode_runtime_volume_transition_evidence_success(
         value,
         ContractName::RuntimeVolumeTransitionEvidenceSuccess,
         decode_runtime_volume_transition_evidence_success,
+    )
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+pub fn encode_runtime_residue_authority_request(
+    value: &RuntimeResidueAuthorityRequest,
+) -> Result<Vec<u8>, ContractError> {
+    encode(
+        value,
+        ContractName::RuntimeResidueAuthorityRequest,
+        decode_runtime_residue_authority_request,
+    )
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+pub fn encode_runtime_residue_authority_success(
+    value: &RuntimeResidueAuthoritySuccess,
+) -> Result<Vec<u8>, ContractError> {
+    encode(
+        value,
+        ContractName::RuntimeResidueAuthoritySuccess,
+        decode_runtime_residue_authority_success,
     )
 }
 
@@ -5665,17 +5907,19 @@ fn authorization_record_valid(record: &AuthorizationRecord) -> bool {
     match (&record.authorization, &record.state) {
         (VolumeAuthorization::Takeover(authorization), AuthorizationState::Unconsumed) => {
             authorization.new_attachment_id != authorization.expected_attachment_id
+                && remote_head_valid(&authorization.expected_head)
         }
         (VolumeAuthorization::Takeover(authorization), AuthorizationState::Consumed(receipt)) => {
             match receipt.as_ref() {
                 AuthorizationConsumedReceipt::Takeover(receipt) => {
                     authorization.new_attachment_id != authorization.expected_attachment_id
+                        && remote_head_valid(&authorization.expected_head)
                         && receipt.authorization_id == authorization.authorization_id
                         && receipt.host_fence_event_id == authorization.host_fence_event_id
                         && receipt.volume_id == authorization.volume_id
                         && receipt.new_attachment_id == authorization.new_attachment_id
                         && valid_next_epoch(authorization.expected_epoch, receipt.resulting_epoch)
-                        && remote_head_valid(&receipt.resulting_head)
+                        && receipt.resulting_head == authorization.expected_head
                         && receipt.consumed_at <= authorization.not_after
                         && receipt
                             .consumed_at
@@ -6156,6 +6400,243 @@ fn validate_runtime_volume_transition_evidence_success(
         candidates.push(Candidate::at(&path, MalformedProblem::InvalidValue));
     }
 
+    if let Some(candidate) = choose(candidates) {
+        return Err(malformed(contract, candidate));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+fn residue_acquisition_is_exact(lineage: &ResidueDataDirectoryLineage) -> bool {
+    let receipt_is_exact = match (&lineage.acquire_origin, &lineage.acquisition) {
+        (
+            AcquireOrigin::Normal { transition_id },
+            AuthorizedServingAcquire::Normal { request, result },
+        ) => {
+            request.volume_id == lineage.volume_id
+                && request.transition_id == *transition_id
+                && request.attachment_id == lineage.attachment_id
+                && request.placement_epoch == lineage.placement_epoch
+                && result.volume_id == lineage.volume_id
+                && result.transition_id == *transition_id
+                && result.attachment_id == lineage.attachment_id
+                && valid_next_epoch(request.expected_unowned_epoch, result.resulting_epoch)
+                && result.resulting_epoch == lineage.attachment_epoch
+                && result.lease_expires_at.get() >= request.lease_duration_ms
+                && remote_head_same_or_later(&lineage.remote_head, &result.resulting_head)
+        }
+        (
+            AcquireOrigin::Takeover { authorization_id },
+            AuthorizedServingAcquire::Takeover {
+                authorization,
+                receipt,
+            },
+        ) => {
+            authorization.authorization_id == *authorization_id
+                && authorization.authorized_node_id == lineage.node_id
+                && authorization.volume_id == lineage.volume_id
+                && authorization.new_attachment_id != authorization.expected_attachment_id
+                && remote_head_valid(&authorization.expected_head)
+                && authorization.new_attachment_id == lineage.attachment_id
+                && authorization.new_placement_epoch == lineage.placement_epoch
+                && receipt.authorization_id == authorization.authorization_id
+                && receipt.host_fence_event_id == authorization.host_fence_event_id
+                && receipt.volume_id == authorization.volume_id
+                && receipt.new_attachment_id == authorization.new_attachment_id
+                && valid_next_epoch(authorization.expected_epoch, receipt.resulting_epoch)
+                && receipt.resulting_epoch == lineage.attachment_epoch
+                && receipt.resulting_head == authorization.expected_head
+                && receipt.consumed_at <= authorization.not_after
+                && receipt
+                    .consumed_at
+                    .get()
+                    .checked_add(authorization.lease_duration_ms)
+                    .is_some_and(|value| value <= MAX_WIRE_INTEGER)
+                && remote_head_same_or_later(&lineage.remote_head, &receipt.resulting_head)
+        }
+        _ => false,
+    };
+    receipt_is_exact
+        && super::canonical::residue_acquisition_digest(&lineage.acquisition)
+            .is_ok_and(|digest| digest == lineage.acquisition_digest)
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+fn residue_lineage_valid(lineage: &ResidueDataDirectoryLineage) -> bool {
+    lineage.attachment_epoch.get() > 0
+        && !lineage.node_id.as_str().is_empty()
+        && lineage.placement.node_id == lineage.node_id
+        && residue_acquisition_is_exact(lineage)
+        && lineage.remote_head.generation == lineage.remote_durable_generation
+        && remote_head_valid(&lineage.remote_head)
+        && lineage.local_durable_generation >= lineage.remote_durable_generation
+        && ((lineage.local_durable_generation == lineage.remote_durable_generation
+            && lineage.pending_pack_count.get() == 0)
+            || (lineage.local_durable_generation > lineage.remote_durable_generation
+                && lineage.pending_pack_count.get() > 0))
+}
+
+/// Context-free closure for the only three authority proofs which may qualify
+/// an exact retained data-directory lineage for deletion.  Filesystem
+/// descriptor identity and live-owner absence remain Node-local preconditions.
+#[cfg(feature = "proposed-node-residue-reclamation")]
+pub fn residue_reclaim_proof_is_closed(
+    lineage: &ResidueDataDirectoryLineage,
+    proof: &ResidueReclaimProof,
+) -> bool {
+    if !residue_lineage_valid(lineage) {
+        return false;
+    }
+    match proof {
+        ResidueReclaimProof::OrdinaryRelease { current_volume } => {
+            if lineage.local_durable_generation != lineage.remote_durable_generation
+                || !volume_record_valid(current_volume)
+                || current_volume.volume_id != lineage.volume_id
+            {
+                return false;
+            }
+            matches!(
+                &current_volume.last_transition,
+                Some(LastVolumeTransition::Release { request, result })
+                    if request.volume_id == lineage.volume_id
+                        && request.attachment_id == lineage.attachment_id
+                        && request.expected_epoch == lineage.attachment_epoch
+                        && result.released_attachment_id == lineage.attachment_id
+                        && remote_head_same_or_later(
+                            &result.resulting_head,
+                            &lineage.remote_head,
+                        )
+            )
+        }
+        ResidueReclaimProof::NormalDeleteCompletion { completion } => {
+            if lineage.local_durable_generation != lineage.remote_durable_generation
+                || !delete_completion_valid(completion)
+            {
+                return false;
+            }
+            matches!(
+                completion,
+                DeleteCompletionReceipt::Normal {
+                    request,
+                    deleting_head,
+                    ..
+                } if request.disk_id == lineage.disk_id
+                    && request.volume_id == lineage.volume_id
+                    && valid_next_epoch(
+                        lineage.attachment_epoch,
+                        request.expected_unowned_epoch,
+                    )
+                    && remote_head_same_or_later(deleting_head, &lineage.remote_head)
+            )
+        }
+        ResidueReclaimProof::DisposableRootDeleteCompletion {
+            completion,
+            consumed_authorization,
+        } => {
+            if lineage.disk_kind != DiskKind::Root
+                || !delete_completion_valid(completion)
+                || !authorization_record_valid(consumed_authorization)
+            {
+                return false;
+            }
+            let (
+                DeleteCompletionReceipt::DisposableRoot {
+                    disk_id,
+                    volume_id,
+                    delete_id,
+                    authorization_id,
+                    prior_attachment_id,
+                    deleting_epoch,
+                    deleting_head,
+                    completed_at,
+                    ..
+                },
+                VolumeAuthorization::DisposableRootDelete(authorization),
+                AuthorizationState::Consumed(consumed),
+            ) = (
+                completion,
+                &consumed_authorization.authorization,
+                &consumed_authorization.state,
+            )
+            else {
+                return false;
+            };
+            let AuthorizationConsumedReceipt::BeginDisposableDelete(consumed) = consumed.as_ref()
+            else {
+                return false;
+            };
+            disk_id == &lineage.disk_id
+                && volume_id == &lineage.volume_id
+                && prior_attachment_id == &lineage.attachment_id
+                && delete_id == &authorization.delete_id
+                && delete_id == &consumed.delete_id
+                && authorization_id == &authorization.authorization_id
+                && authorization.authorized_node_id == lineage.node_id
+                && authorization.disk_id == lineage.disk_id
+                && authorization.volume_id == lineage.volume_id
+                && authorization.cat_id == lineage.cat_id
+                && authorization.desired_revision == lineage.desired_revision
+                && authorization.expected_attachment_id == lineage.attachment_id
+                && authorization.expected_epoch == lineage.attachment_epoch
+                && authorization.placement_epoch == lineage.placement.placement_epoch
+                && authorization.expected_head == lineage.remote_head
+                && consumed.resulting_epoch == *deleting_epoch
+                && consumed.resulting_head == *deleting_head
+                && completed_at >= &consumed.consumed_at
+                && valid_next_epoch(lineage.attachment_epoch, *deleting_epoch)
+        }
+    }
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+fn validate_runtime_residue_authority_request(
+    request: &RuntimeResidueAuthorityRequest,
+) -> Result<(), ContractError> {
+    let contract = ContractName::RuntimeResidueAuthorityRequest;
+    let mut candidates = Vec::new();
+    if request.session.node_id != request.lineage.node_id
+        || request.session.node_id != request.lineage.placement.node_id
+    {
+        candidates.push(Candidate::at(
+            &path(&["lineage", "node_id"]),
+            MalformedProblem::InvalidValue,
+        ));
+    }
+    if !residue_lineage_valid(&request.lineage) {
+        candidates.push(Candidate::at(
+            &path(&["lineage"]),
+            MalformedProblem::InvalidValue,
+        ));
+    }
+    if let Some(candidate) = choose(candidates) {
+        return Err(malformed(contract, candidate));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+fn validate_runtime_residue_authority_success(
+    success: &RuntimeResidueAuthoritySuccess,
+) -> Result<(), ContractError> {
+    let contract = ContractName::RuntimeResidueAuthoritySuccess;
+    let mut candidates = Vec::new();
+    if (success.session.node_id != success.lineage.node_id
+        || success.session.node_id != success.lineage.placement.node_id)
+        || !residue_lineage_valid(&success.lineage)
+    {
+        candidates.push(Candidate::at(
+            &path(&["lineage"]),
+            MalformedProblem::InvalidValue,
+        ));
+    }
+    if let RuntimeResidueAuthorityOutcome::Reclaimable { proof } = &success.outcome {
+        if !residue_reclaim_proof_is_closed(&success.lineage, proof) {
+            candidates.push(Candidate::at(
+                &path(&["outcome", "proof"]),
+                MalformedProblem::InvalidValue,
+            ));
+        }
+    }
     if let Some(candidate) = choose(candidates) {
         return Err(malformed(contract, candidate));
     }
@@ -7365,6 +7846,9 @@ fn prepared_volume_is_exact(
         DiskKind::Root => observed.disk_kind == ObservedDiskKind::Root,
         DiskKind::Persistent => observed.disk_kind == ObservedDiskKind::Persistent,
     };
+    // The serving writer under this same grant may already have published
+    // past the prepared head: a strictly newer generation is the expected
+    // evolution, while a same-generation tuple must stay byte-exact.
     let authority_is_exact = matches!(
         &observed.authority,
         VolumeAuthorityEvidence::Owned {
@@ -7373,8 +7857,14 @@ fn prepared_volume_is_exact(
             head,
         } if attachment_id == &input.attachment_id
             && attachment_epoch == &input.attachment_epoch
-            && head == &input.expected_head
+            && (head.generation > input.expected_head.generation
+                || head == &input.expected_head)
     );
+    // The lineage identity is pinned exactly, while the live durability
+    // coordinates are pinned monotonically: once the serving writer attaches,
+    // a Relaxed FLUSH legitimately advances the local generation past the
+    // provisioned head while pending packs hold the unpublished window, so an
+    // equality pin would make that flagship state unobservable on the wire.
     let lineage_is_exact = matches!(
         observed.local_lineages.as_slice(),
         [lineage]
@@ -7383,10 +7873,9 @@ fn prepared_volume_is_exact(
                 && lineage.acquire_origin == input.acquire_origin
                 && lineage.node_id == *node_id
                 && lineage.placement_epoch == *placement_epoch
-                && lineage.local_durable_generation == input.expected_head.generation
-                && lineage.remote_durable_generation == input.expected_head.generation
+                && lineage.remote_durable_generation >= input.expected_head.generation
+                && lineage.local_durable_generation >= lineage.remote_durable_generation
                 && lineage.data_directory == input.serving_process.data_directory
-                && lineage.pending_pack_count.get() == 0
                 && !lineage.fenced
                 && lineage.state == LocalLineageState::Active
     );
@@ -8727,6 +9216,14 @@ fn residue_key(residue: &NodeResidue) -> Vec<SortPart> {
     key
 }
 
+/// Orders closed residue observations exactly as the NodeObservation wire
+/// validator requires. Producers use this instead of reimplementing the
+/// heterogeneous numeric/byte ordering and accidentally emitting a payload
+/// that their own decoder rejects.
+pub fn sort_node_residue_canonically(residue: &mut [NodeResidue]) {
+    residue.sort_by_key(residue_key);
+}
+
 fn collect_checkpoint_arrays(checkpoint: &RuntimeCheckpoint) -> Vec<Candidate> {
     let mut output = Vec::new();
     collect_step_arrays(&checkpoint.step, &path(&["step"]), &mut output);
@@ -9764,8 +10261,32 @@ fn collect_node_residue_cross(
     path: &[PathSegment],
     output: &mut Vec<Candidate>,
 ) {
+    #[cfg(not(feature = "proposed-node-residue-reclamation"))]
     if let NodeResidue::DataDirectory { lineage, .. } = residue {
         collect_residue_lineage_cross(lineage, &child(path, "lineage"), output);
+    }
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    if let NodeResidue::DataDirectory {
+        cat_id_hint,
+        disk_id_hint,
+        volume_id_hint,
+        lineage,
+        ..
+    } = residue
+    {
+        collect_residue_lineage_cross(lineage, &child(path, "lineage"), output);
+        if let ResidueLineageEvidence::Readable { lineage } = lineage {
+            if cat_id_hint.as_ref().is_some_and(|id| id != &lineage.cat_id)
+                || disk_id_hint
+                    .as_ref()
+                    .is_some_and(|id| id != &lineage.disk_id)
+                || volume_id_hint
+                    .as_ref()
+                    .is_some_and(|id| id != &lineage.volume_id)
+            {
+                output.push(Candidate::at(path, MalformedProblem::InvalidValue));
+            }
+        }
     }
 }
 
@@ -9774,6 +10295,7 @@ fn collect_residue_lineage_cross(
     path: &[PathSegment],
     output: &mut Vec<Candidate>,
 ) {
+    #[cfg(not(feature = "proposed-node-residue-reclamation"))]
     if let ResidueLineageEvidence::Readable {
         attachment_id_hint,
         attachment_epoch_hint,
@@ -9785,6 +10307,12 @@ fn collect_residue_lineage_cross(
         if attachment_id_hint.is_some() != attachment_epoch_hint.is_some()
             || local_durable_generation.get() < remote_durable_generation.get()
         {
+            output.push(Candidate::at(path, MalformedProblem::InvalidValue));
+        }
+    }
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    if let ResidueLineageEvidence::Readable { lineage } = lineage {
+        if !residue_lineage_valid(lineage) {
             output.push(Candidate::at(path, MalformedProblem::InvalidValue));
         }
     }

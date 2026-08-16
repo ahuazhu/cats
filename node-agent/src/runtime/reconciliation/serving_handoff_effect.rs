@@ -2141,6 +2141,7 @@ mod tests {
                         volume.guest_device.serial.as_str()
                     )),
                     expected_epoch,
+                    expected_head: current_head.clone(),
                     new_attachment_id: volume.attachment_id.clone(),
                     desired_revision: desired.desired_revision,
                     new_placement_epoch: desired.placement.placement_epoch,
@@ -2178,6 +2179,7 @@ mod tests {
                 node_id: desired.placement.node_id.clone(),
                 placement_epoch: desired.placement.placement_epoch,
             },
+            object_write_credential: None,
             size_bytes: volume.size_bytes,
             durability: volume.durability,
             head: current_head,

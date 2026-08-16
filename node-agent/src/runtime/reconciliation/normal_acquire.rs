@@ -13,20 +13,28 @@ use cats_api::agent_registration::{
     Ed25519RequestSigner, JSON_CONTENT_TYPE, NODE_AUTHENTICATE_CHALLENGE,
     NODE_CREDENTIAL_ID_HEADER, NODE_PUBLIC_KEY_SPKI_HEADER, NODE_SIGNATURE_HEADER,
 };
+#[cfg(feature = "proposed-node-residue-reclamation")]
+use cats_api::runtime_reconciliation::{
+    decode_runtime_residue_authority_success, encode_runtime_residue_authority_request,
+    ContractVersion, NodeResidue, ResidueLineageEvidence, RuntimeResidueAuthorityRequest,
+    RuntimeResidueAuthoritySuccess, RUNTIME_RESIDUE_AUTHORITY_PATH,
+    RUNTIME_RESIDUE_AUTHORITY_SUCCESS_MAX_WIRE_BYTES,
+};
 use cats_api::runtime_reconciliation::{
     decode_runtime_volume_transition_error, decode_runtime_volume_transition_success,
     encode_runtime_volume_transition_request, AcquireOrigin, AdmissionInventoryAttestation,
-    AgentSession, CleanupRelease, CleanupTarget, ContractErrorDetail, ContractName, DiskKind,
-    FilesystemInitialization, LastVolumeTransition, NormalAcquireRequest, NormalAcquireResult,
-    PersistentFilesystemBinding, PersistentInitializationReceipt, ReleaseRequest, ReleaseResult,
-    RemoteHead, RuntimeSpineHttpProblem, RuntimeVolumeAuthorityRejection,
-    RuntimeVolumeAuthorizationRejection, RuntimeVolumeTransition, RuntimeVolumeTransitionError,
-    RuntimeVolumeTransitionErrorDetail, RuntimeVolumeTransitionOutcome,
-    RuntimeVolumeTransitionPreconditionProblem, RuntimeVolumeTransitionRequest, SessionBinding,
-    VolumeAccess, VolumeAcquire, VolumeAcquireRequest, VolumeAdminState, VolumeDisposition,
-    VolumeIntent, VolumeLeaseGrant, VolumeRecord, RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY,
-    RUNTIME_INTERNAL_ROUTE_NOT_FOUND_ROBOTS, RUNTIME_SPINE_METHOD,
-    RUNTIME_VOLUME_TRANSITION_ERROR_MAX_WIRE_BYTES, RUNTIME_VOLUME_TRANSITION_EVIDENCE_PATH,
+    AgentSession, BeginDisposableDeleteConsumedReceipt, CleanupRelease, CleanupTarget,
+    ContractErrorDetail, ContractName, DiskKind, FilesystemInitialization, LastVolumeTransition,
+    NormalAcquireRequest, NormalAcquireResult, PersistentFilesystemBinding,
+    PersistentInitializationReceipt, ReleaseRequest, ReleaseResult, RemoteHead,
+    RuntimeSpineHttpProblem, RuntimeVolumeAuthorityRejection, RuntimeVolumeAuthorizationRejection,
+    RuntimeVolumeTransition, RuntimeVolumeTransitionError, RuntimeVolumeTransitionErrorDetail,
+    RuntimeVolumeTransitionOutcome, RuntimeVolumeTransitionPreconditionProblem,
+    RuntimeVolumeTransitionRequest, SessionBinding, VolumeAccess, VolumeAcquire,
+    VolumeAcquireRequest, VolumeAdminState, VolumeDisposition, VolumeIntent, VolumeLeaseGrant,
+    VolumeRecord, RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY, RUNTIME_INTERNAL_ROUTE_NOT_FOUND_ROBOTS,
+    RUNTIME_SPINE_METHOD, RUNTIME_VOLUME_TRANSITION_ERROR_MAX_WIRE_BYTES,
+    RUNTIME_VOLUME_TRANSITION_EVIDENCE_PATH,
     RUNTIME_VOLUME_TRANSITION_EVIDENCE_SUCCESS_MAX_WIRE_BYTES, RUNTIME_VOLUME_TRANSITION_PATH,
     RUNTIME_VOLUME_TRANSITION_SUCCESS_MAX_WIRE_BYTES,
 };
@@ -137,6 +145,34 @@ pub enum NormalReleaseAttempt {
     StopForLocalContract,
     StopForDeploymentMismatch,
     Ambiguous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DisposableRootDeleteAttempt {
+    Deleting(Box<BeginDisposableDeleteConsumedReceipt>),
+    RetryExact,
+    RefreshInventory,
+    ReplanDesired,
+    SessionReplacementRequired,
+    IdentityRepairRequired,
+    AuthorizationRejected(RuntimeVolumeAuthorizationRejection),
+    StopForLocalContract,
+    StopForDeploymentMismatch,
+    Ambiguous,
+}
+
+/// Closed outcomes for the residue-qualification query. Only an exact,
+/// validated success may carry reclaim authority. Authentication and Node
+/// identity failures are surfaced separately so the caller can repair the
+/// credential or replace the ineligible identity without treating either as
+/// ordinary transport ambiguity.
+#[cfg(feature = "proposed-node-residue-reclamation")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeResidueAuthorityAttempt {
+    Qualified(Box<RuntimeResidueAuthoritySuccess>),
+    ReauthenticationRequired,
+    IdentityReplacementRequired,
+    Retain,
 }
 
 /// The exact accepted A20 context against which a closed A22 rejection can be
@@ -339,6 +375,125 @@ where
         }
     }
 
+    /// Signed release for the post-Running lifecycle suffix. Unlike the
+    /// pre-launch stale-Root repair above, this admits every frozen Volume
+    /// shape and acquisition origin; the exact CleanupRelease and current
+    /// A20 context remain the only mutation authority.
+    pub fn lifecycle_release(
+        &self,
+        request: &RuntimeVolumeTransitionRequest,
+        volume: &VolumeIntent,
+        expected_head: &RemoteHead,
+        accepted: &NormalAcquireAcceptedContext,
+        deadline: Instant,
+    ) -> Result<NormalReleaseAttempt, NormalAcquireClientError> {
+        let body = encode_runtime_volume_transition_request(request)
+            .map_err(NormalAcquireClientError::InvalidRequest)?;
+        let cleanup = validate_local_lifecycle_release_request(request, volume, expected_head)?;
+        validate_accepted_context(request, accepted)?;
+        let response = match self.transport.post_a19_signed_json(
+            RUNTIME_VOLUME_TRANSITION_PATH,
+            &body,
+            RUNTIME_VOLUME_TRANSITION_SUCCESS_MAX_WIRE_BYTES,
+            deadline,
+        ) {
+            Ok(response) => response,
+            Err(_) => return Ok(NormalReleaseAttempt::Ambiguous),
+        };
+        match response {
+            SignedVolumeTransitionResponse::Success(body) => {
+                let Ok(success) = decode_runtime_volume_transition_success(&body) else {
+                    return Ok(NormalReleaseAttempt::Ambiguous);
+                };
+                let Some(release) = exact_release_success(request, cleanup, expected_head, success)
+                else {
+                    return Ok(NormalReleaseAttempt::Ambiguous);
+                };
+                Ok(NormalReleaseAttempt::Released(release))
+            }
+            SignedVolumeTransitionResponse::ClosedError { status, body } => {
+                let Ok(error) = decode_runtime_volume_transition_error(&body) else {
+                    return Ok(NormalReleaseAttempt::Ambiguous);
+                };
+                Ok(map_closed_release_error(
+                    status, &error, request, volume, accepted,
+                ))
+            }
+            SignedVolumeTransitionResponse::PlainRouteNotFound => {
+                Ok(NormalReleaseAttempt::StopForDeploymentMismatch)
+            }
+            SignedVolumeTransitionResponse::Ambiguous => Ok(NormalReleaseAttempt::Ambiguous),
+        }
+    }
+
+    /// Consume one already-issued disposable-Root authorization.  This only
+    /// moves the signed A22 authority to `Deleting`; it does not authorize the
+    /// caller to remove any local lineage without a separate exact cleanup
+    /// permit and postcondition scanner.
+    pub fn delete_disposable_root(
+        &self,
+        request: &RuntimeVolumeTransitionRequest,
+        volume: &VolumeIntent,
+        expected_epoch: cats_api::runtime_reconciliation::FenceEpoch,
+        expected_head: &RemoteHead,
+        accepted: &NormalAcquireAcceptedContext,
+        deadline: Instant,
+    ) -> Result<DisposableRootDeleteAttempt, NormalAcquireClientError> {
+        let body = encode_runtime_volume_transition_request(request)
+            .map_err(NormalAcquireClientError::InvalidRequest)?;
+        let authorization_id = validate_local_disposable_root_delete_request(
+            request,
+            volume,
+            expected_epoch,
+            expected_head,
+        )?;
+        validate_accepted_context(request, accepted)?;
+        let response = match self.transport.post_a19_signed_json(
+            RUNTIME_VOLUME_TRANSITION_PATH,
+            &body,
+            RUNTIME_VOLUME_TRANSITION_SUCCESS_MAX_WIRE_BYTES,
+            deadline,
+        ) {
+            Ok(response) => response,
+            Err(_) => return Ok(DisposableRootDeleteAttempt::Ambiguous),
+        };
+        match response {
+            SignedVolumeTransitionResponse::Success(body) => {
+                let Ok(success) = decode_runtime_volume_transition_success(&body) else {
+                    return Ok(DisposableRootDeleteAttempt::Ambiguous);
+                };
+                Ok(exact_disposable_root_delete_success(
+                    request,
+                    volume,
+                    authorization_id,
+                    expected_epoch,
+                    expected_head,
+                    success,
+                )
+                .map(Box::new)
+                .map(DisposableRootDeleteAttempt::Deleting)
+                .unwrap_or(DisposableRootDeleteAttempt::Ambiguous))
+            }
+            SignedVolumeTransitionResponse::ClosedError { status, body } => {
+                let Ok(error) = decode_runtime_volume_transition_error(&body) else {
+                    return Ok(DisposableRootDeleteAttempt::Ambiguous);
+                };
+                Ok(map_closed_disposable_root_delete_error(
+                    status,
+                    &error,
+                    request,
+                    volume,
+                    accepted,
+                    authorization_id,
+                ))
+            }
+            SignedVolumeTransitionResponse::PlainRouteNotFound => {
+                Ok(DisposableRootDeleteAttempt::StopForDeploymentMismatch)
+            }
+            SignedVolumeTransitionResponse::Ambiguous => Ok(DisposableRootDeleteAttempt::Ambiguous),
+        }
+    }
+
     pub fn commit_initialized(
         &self,
         request: &RuntimeVolumeTransitionRequest,
@@ -396,6 +551,28 @@ pub fn recover_normal_release_from_authority(
     record: &VolumeRecord,
 ) -> Result<NormalReleaseAuthorityRecovery, NormalAcquireClientError> {
     let cleanup = validate_local_release_request(request, volume, expected_head)?;
+    recover_validated_release_from_authority(volume, expected_head, record, cleanup)
+}
+
+/// Lifecycle counterpart to [`recover_normal_release_from_authority`]. It
+/// accepts the full frozen Volume set while preserving the same exact
+/// immutable release-marker oracle.
+pub fn recover_lifecycle_release_from_authority(
+    request: &RuntimeVolumeTransitionRequest,
+    volume: &VolumeIntent,
+    expected_head: &RemoteHead,
+    record: &VolumeRecord,
+) -> Result<NormalReleaseAuthorityRecovery, NormalAcquireClientError> {
+    let cleanup = validate_local_lifecycle_release_request(request, volume, expected_head)?;
+    recover_validated_release_from_authority(volume, expected_head, record, cleanup)
+}
+
+fn recover_validated_release_from_authority(
+    volume: &VolumeIntent,
+    expected_head: &RemoteHead,
+    record: &VolumeRecord,
+    cleanup: &CleanupRelease,
+) -> Result<NormalReleaseAuthorityRecovery, NormalAcquireClientError> {
     if validate_volume_record(record).is_err()
         || record.volume_id != volume.volume_id
         || record.size_bytes != volume.size_bytes
@@ -532,6 +709,9 @@ pub fn recover_normal_acquire_from_authority(
             node_id: request.placement.node_id.clone(),
             placement_epoch: request.placement.placement_epoch,
         },
+        // Node-side object-write credential registration is not composed
+        // yet; qualified object-write publish paths fail closed on None.
+        object_write_credential: None,
         size_bytes: record.size_bytes,
         durability: record.durability,
         head: record.head.clone(),
@@ -670,6 +850,71 @@ fn validate_local_release_request<'a>(
     Ok(cleanup)
 }
 
+fn validate_local_lifecycle_release_request<'a>(
+    request: &'a RuntimeVolumeTransitionRequest,
+    volume: &VolumeIntent,
+    expected_head: &RemoteHead,
+) -> Result<&'a CleanupRelease, NormalAcquireClientError> {
+    let RuntimeVolumeTransition::Release { cleanup } = &request.transition else {
+        return Err(NormalAcquireClientError::InvalidReleaseBinding);
+    };
+    let (
+        CleanupTarget::Volume {
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+        },
+        Some(replay),
+    ) = (&cleanup.target, &cleanup.volume_release)
+    else {
+        return Err(NormalAcquireClientError::InvalidReleaseBinding);
+    };
+    let shape_is_exact = match volume.disk_kind {
+        DiskKind::Root => volume.mount.is_none(),
+        DiskKind::Persistent => volume.mount.is_some(),
+    };
+    if request.placement.node_id != request.session.node_id
+        || cleanup.inventory_session != request.session
+        || cleanup.desired_read_position < cleanup.inventory_read_position
+        || volume_id != &volume.volume_id
+        || attachment_id != &volume.attachment_id
+        || replay.generation != expected_head.generation
+        || replay.disposition != volume.disposition
+        || volume.size_bytes == 0
+        || volume.access != VolumeAccess::ReadWriteOnce
+        || !shape_is_exact
+        || attachment_epoch.get() == u64::MAX
+    {
+        return Err(NormalAcquireClientError::InvalidReleaseBinding);
+    }
+    Ok(cleanup)
+}
+
+fn validate_local_disposable_root_delete_request<'a>(
+    request: &'a RuntimeVolumeTransitionRequest,
+    volume: &VolumeIntent,
+    expected_epoch: cats_api::runtime_reconciliation::FenceEpoch,
+    _expected_head: &RemoteHead,
+) -> Result<&'a cats_api::runtime_reconciliation::Id, NormalAcquireClientError> {
+    let RuntimeVolumeTransition::DeleteDisposableRoot { authorization_id } = &request.transition
+    else {
+        return Err(NormalAcquireClientError::InvalidReleaseBinding);
+    };
+    let VolumeDisposition::DeleteDisposableRoot { .. } = &volume.disposition else {
+        return Err(NormalAcquireClientError::InvalidReleaseBinding);
+    };
+    if request.placement.node_id != request.session.node_id
+        || volume.disk_kind != DiskKind::Root
+        || volume.access != VolumeAccess::ReadWriteOnce
+        || volume.mount.is_some()
+        || volume.size_bytes == 0
+        || expected_epoch.get() == u64::MAX
+    {
+        return Err(NormalAcquireClientError::InvalidReleaseBinding);
+    }
+    Ok(authorization_id)
+}
+
 fn validate_local_commit_initialized<'a>(
     request: &'a RuntimeVolumeTransitionRequest,
     volume: &VolumeIntent,
@@ -805,6 +1050,9 @@ fn exact_success_attachment(
             node_id: request.placement.node_id.clone(),
             placement_epoch: request.placement.placement_epoch,
         },
+        // Node-side object-write credential registration is not composed
+        // yet; qualified object-write publish paths fail closed on None.
+        object_write_credential: None,
         size_bytes: grant.size_bytes,
         durability: grant.durability,
         head: grant.head,
@@ -899,6 +1147,41 @@ fn exact_release_success(
         && release.resulting_epoch.get() == resulting_epoch
         && release.resulting_head == *expected_head)
         .then_some(release)
+}
+
+fn exact_disposable_root_delete_success(
+    request: &RuntimeVolumeTransitionRequest,
+    volume: &VolumeIntent,
+    authorization_id: &cats_api::runtime_reconciliation::Id,
+    expected_epoch: cats_api::runtime_reconciliation::FenceEpoch,
+    expected_head: &RemoteHead,
+    success: cats_api::runtime_reconciliation::RuntimeVolumeTransitionSuccess,
+) -> Option<BeginDisposableDeleteConsumedReceipt> {
+    if success.version != request.version
+        || success.session != request.session
+        || success.cat_id != request.cat_id
+        || success.desired_revision != request.desired_revision
+        || success.spec_digest != request.spec_digest
+        || success.placement != request.placement
+    {
+        return None;
+    }
+    let RuntimeVolumeTransitionOutcome::DisposableRootDeleting { receipt } = success.outcome else {
+        return None;
+    };
+    let VolumeDisposition::DeleteDisposableRoot { delete_id } = &volume.disposition else {
+        return None;
+    };
+    let resulting_epoch = expected_epoch.get().checked_add(1)?;
+    (receipt.authorization_id == *authorization_id
+        && receipt.volume_id == volume.volume_id
+        && receipt.disk_id == volume.disk_id
+        && receipt.cat_id == request.cat_id
+        && receipt.delete_id == *delete_id
+        && receipt.prior_attachment_id == volume.attachment_id
+        && receipt.resulting_epoch.get() == resulting_epoch
+        && receipt.resulting_head == *expected_head)
+        .then_some(receipt)
 }
 
 fn exact_commit_initialized_success(
@@ -1050,6 +1333,50 @@ fn map_closed_takeover_error(
             TakeoverAcquireAttempt::StopForDeploymentMismatch
         }
         NormalAcquireAttempt::Ambiguous => TakeoverAcquireAttempt::Ambiguous,
+    }
+}
+
+fn map_closed_disposable_root_delete_error(
+    status: u16,
+    error: &RuntimeVolumeTransitionError,
+    request: &RuntimeVolumeTransitionRequest,
+    volume: &VolumeIntent,
+    accepted: &NormalAcquireAcceptedContext,
+    authorization_id: &cats_api::runtime_reconciliation::Id,
+) -> DisposableRootDeleteAttempt {
+    if let (
+        409,
+        RuntimeVolumeTransitionErrorDetail::VolumeAuthorizationRejected {
+            authorization_id: rejected,
+            reason,
+        },
+    ) = (status, error.error.as_ref())
+    {
+        return if rejected == authorization_id {
+            DisposableRootDeleteAttempt::AuthorizationRejected(*reason)
+        } else {
+            DisposableRootDeleteAttempt::Ambiguous
+        };
+    }
+    match map_closed_error(status, error, request, volume, accepted) {
+        NormalAcquireAttempt::RetryExact => DisposableRootDeleteAttempt::RetryExact,
+        NormalAcquireAttempt::RefreshInventory => DisposableRootDeleteAttempt::RefreshInventory,
+        NormalAcquireAttempt::ReplanDesired => DisposableRootDeleteAttempt::ReplanDesired,
+        NormalAcquireAttempt::SessionReplacementRequired => {
+            DisposableRootDeleteAttempt::SessionReplacementRequired
+        }
+        NormalAcquireAttempt::IdentityRepairRequired => {
+            DisposableRootDeleteAttempt::IdentityRepairRequired
+        }
+        NormalAcquireAttempt::StopForLocalContract => {
+            DisposableRootDeleteAttempt::StopForLocalContract
+        }
+        NormalAcquireAttempt::StopForDeploymentMismatch => {
+            DisposableRootDeleteAttempt::StopForDeploymentMismatch
+        }
+        NormalAcquireAttempt::Granted(_)
+        | NormalAcquireAttempt::AuthorityRejected(_)
+        | NormalAcquireAttempt::Ambiguous => DisposableRootDeleteAttempt::Ambiguous,
     }
 }
 
@@ -1410,6 +1737,107 @@ impl RuntimeVolumeTransitionHttpClient {
     }
 }
 
+/// Projects the exact feature-on scanner evidence into the only authority
+/// request the Node may forward. Hint disagreement or a non-data/unreadable
+/// residue has no request representation and remains retained locally.
+#[cfg(feature = "proposed-node-residue-reclamation")]
+pub fn residue_authority_request_from_observed(
+    session: &SessionBinding,
+    residue: &NodeResidue,
+) -> Option<RuntimeResidueAuthorityRequest> {
+    let NodeResidue::DataDirectory {
+        cat_id_hint,
+        disk_id_hint,
+        volume_id_hint,
+        lineage: ResidueLineageEvidence::Readable { lineage },
+        ..
+    } = residue
+    else {
+        return None;
+    };
+    if lineage.node_id != session.node_id
+        || cat_id_hint.as_ref().is_some_and(|id| id != &lineage.cat_id)
+        || disk_id_hint
+            .as_ref()
+            .is_some_and(|id| id != &lineage.disk_id)
+        || volume_id_hint
+            .as_ref()
+            .is_some_and(|id| id != &lineage.volume_id)
+    {
+        return None;
+    }
+    let request = RuntimeResidueAuthorityRequest {
+        version: ContractVersion::V1,
+        session: session.clone(),
+        lineage: lineage.as_ref().clone(),
+    };
+    encode_runtime_residue_authority_request(&request)
+        .is_ok()
+        .then_some(request)
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+impl RuntimeVolumeTransitionHttpClient {
+    /// Sends one exact, feature-gated residue qualification request through
+    /// the same A19 credential, signature, fixed-path and bounded-response
+    /// envelope as the accepted volume authority calls.
+    ///
+    /// Exact typed authentication/identity failures are returned as repair
+    /// direction. Any transport ambiguity, route absence, other closed error
+    /// or response mismatch remains [`RuntimeResidueAuthorityAttempt::Retain`];
+    /// callers must retain the physical directory and retry later.
+    pub fn request_residue_authority(
+        &self,
+        request: &RuntimeResidueAuthorityRequest,
+        deadline: Instant,
+    ) -> Result<RuntimeResidueAuthorityAttempt, cats_api::runtime_reconciliation::ContractError>
+    {
+        let body = encode_runtime_residue_authority_request(request)?;
+        let Ok(response) = self.post_exact_signed_json(
+            RUNTIME_RESIDUE_AUTHORITY_PATH,
+            &body,
+            RUNTIME_RESIDUE_AUTHORITY_SUCCESS_MAX_WIRE_BYTES,
+            deadline,
+        ) else {
+            return Ok(RuntimeResidueAuthorityAttempt::Retain);
+        };
+        match response {
+            StrictSignedJsonResponse::Success(body) => {
+                let Ok(success) = decode_runtime_residue_authority_success(&body) else {
+                    return Ok(RuntimeResidueAuthorityAttempt::Retain);
+                };
+                Ok(
+                    if success.version == request.version
+                        && success.session == request.session
+                        && success.lineage == request.lineage
+                    {
+                        RuntimeResidueAuthorityAttempt::Qualified(Box::new(success))
+                    } else {
+                        RuntimeResidueAuthorityAttempt::Retain
+                    },
+                )
+            }
+            StrictSignedJsonResponse::ClosedError { status, body } => {
+                let Ok(error) = decode_runtime_volume_transition_error(&body) else {
+                    return Ok(RuntimeResidueAuthorityAttempt::Retain);
+                };
+                Ok(match (status, error.error.as_ref()) {
+                    (401, RuntimeVolumeTransitionErrorDetail::AuthenticationFailed) => {
+                        RuntimeResidueAuthorityAttempt::ReauthenticationRequired
+                    }
+                    (403, RuntimeVolumeTransitionErrorDetail::IdentityNotEligible) => {
+                        RuntimeResidueAuthorityAttempt::IdentityReplacementRequired
+                    }
+                    _ => RuntimeResidueAuthorityAttempt::Retain,
+                })
+            }
+            StrictSignedJsonResponse::PlainRouteNotFound | StrictSignedJsonResponse::Ambiguous => {
+                Ok(RuntimeResidueAuthorityAttempt::Retain)
+            }
+        }
+    }
+}
+
 impl A19SignedVolumeTransitionTransport for RuntimeVolumeTransitionHttpClient {
     fn post_a19_signed_json(
         &self,
@@ -1719,6 +2147,10 @@ mod tests {
         ContractError, ContractVersion, Durability, Generation, GuestDeviceIdentity, Id,
         RemoteHead, Revision, RuntimeVolumeTransitionPreconditionProblem, Sha256Digest, UnixMillis,
     };
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    use cats_api::runtime_reconciliation::{
+        Epoch, FenceEpoch, HostPath, NodeBootId, RandomId128, WireU64,
+    };
 
     use super::*;
 
@@ -1873,6 +2305,140 @@ mod tests {
         };
         cats_api::runtime_reconciliation::encode_runtime_volume_transition_success(&success)
             .unwrap()
+    }
+
+    fn lifecycle_release_request(volume: &VolumeIntent) -> RuntimeVolumeTransitionRequest {
+        let mut request = request();
+        request.transition = RuntimeVolumeTransition::Release {
+            cleanup: CleanupRelease {
+                target: CleanupTarget::Volume {
+                    volume_id: volume.volume_id.clone(),
+                    attachment_id: volume.attachment_id.clone(),
+                    attachment_epoch: cats_api::runtime_reconciliation::FenceEpoch::new(1).unwrap(),
+                },
+                inventory_session: request.session.clone(),
+                inventory_epoch: cats_api::runtime_reconciliation::Epoch::new(4).unwrap(),
+                inventory_read_position: cats_api::runtime_reconciliation::Sequence::new(12)
+                    .unwrap(),
+                desired_read_position: cats_api::runtime_reconciliation::Sequence::new(12).unwrap(),
+                volume_release: Some(cats_api::runtime_reconciliation::VolumeReleaseReplay {
+                    release_transition_id: cats_api::runtime_reconciliation::RandomId128::new(
+                        "66666666666666666666666666666666",
+                    )
+                    .unwrap(),
+                    generation: Generation::new(0).unwrap(),
+                    disposition: volume.disposition.clone(),
+                }),
+            },
+        };
+        request
+    }
+
+    #[test]
+    fn lifecycle_release_is_a_separate_full_volume_contract() {
+        let mut persistent = volume();
+        persistent.disk_kind = DiskKind::Persistent;
+        persistent.acquire = VolumeAcquire::Takeover {
+            authorization_id: Id::new("takeover-release-auth").unwrap(),
+        };
+        persistent.disposition = VolumeDisposition::DetachRetained;
+        persistent.mount = Some(cats_api::runtime_reconciliation::Ext4MountIntent {
+            filesystem_uuid: cats_api::runtime_reconciliation::RandomId128::new(
+                "77777777777777777777777777777777",
+            )
+            .unwrap(),
+            mount_path: cats_api::runtime_reconciliation::HostPath::new("/data".to_owned())
+                .unwrap(),
+            initialization: FilesystemInitialization::Existing,
+        });
+        let request = lifecycle_release_request(&persistent);
+        let head = RemoteHead {
+            generation: Generation::new(0).unwrap(),
+            root_hash: None,
+            root_object_id: None,
+        };
+
+        assert!(validate_local_lifecycle_release_request(&request, &persistent, &head).is_ok());
+        assert!(matches!(
+            validate_local_release_request(&request, &persistent, &head),
+            Err(NormalAcquireClientError::InvalidReleaseBinding)
+        ));
+    }
+
+    #[test]
+    fn disposable_root_delete_accepts_only_the_exact_signed_receipt() {
+        let mut volume = volume();
+        volume.disposition = VolumeDisposition::DeleteDisposableRoot {
+            delete_id: Id::new("delete_root_01").unwrap(),
+        };
+        let authorization_id = Id::new("delete_auth_01").unwrap();
+        let mut request = request();
+        request.transition = RuntimeVolumeTransition::DeleteDisposableRoot {
+            authorization_id: authorization_id.clone(),
+        };
+        let expected_epoch = cats_api::runtime_reconciliation::FenceEpoch::new(1).unwrap();
+        let expected_head = RemoteHead {
+            generation: Generation::new(0).unwrap(),
+            root_hash: None,
+            root_object_id: None,
+        };
+        let mut success = decode_runtime_volume_transition_success(SUCCESS).unwrap();
+        success.outcome = RuntimeVolumeTransitionOutcome::DisposableRootDeleting {
+            receipt: BeginDisposableDeleteConsumedReceipt {
+                authorization_id: authorization_id.clone(),
+                volume_id: volume.volume_id.clone(),
+                disk_id: volume.disk_id.clone(),
+                cat_id: request.cat_id.clone(),
+                delete_id: Id::new("delete_root_01").unwrap(),
+                prior_attachment_id: volume.attachment_id.clone(),
+                resulting_epoch: cats_api::runtime_reconciliation::FenceEpoch::new(2).unwrap(),
+                resulting_head: expected_head.clone(),
+                consumed_at: UnixMillis::new(1_720_000_000_100).unwrap(),
+            },
+        };
+        let exact =
+            cats_api::runtime_reconciliation::encode_runtime_volume_transition_success(&success)
+                .unwrap();
+        assert!(matches!(
+            ControlSignedNormalAcquireClient::new(FakeTransport::new(
+                SignedVolumeTransitionResponse::Success(exact),
+            ))
+            .delete_disposable_root(
+                &request,
+                &volume,
+                expected_epoch,
+                &expected_head,
+                &accepted_context(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap(),
+            DisposableRootDeleteAttempt::Deleting(_)
+        ));
+
+        let mut wrong = success;
+        let RuntimeVolumeTransitionOutcome::DisposableRootDeleting { receipt } = &mut wrong.outcome
+        else {
+            unreachable!()
+        };
+        receipt.authorization_id = Id::new("delete_auth_other").unwrap();
+        let wrong =
+            cats_api::runtime_reconciliation::encode_runtime_volume_transition_success(&wrong)
+                .unwrap();
+        assert_eq!(
+            ControlSignedNormalAcquireClient::new(FakeTransport::new(
+                SignedVolumeTransitionResponse::Success(wrong),
+            ))
+            .delete_disposable_root(
+                &request,
+                &volume,
+                expected_epoch,
+                &expected_head,
+                &accepted_context(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap(),
+            DisposableRootDeleteAttempt::Ambiguous
+        );
     }
 
     #[test]
@@ -2578,6 +3144,275 @@ mod tests {
         );
         server.join().unwrap();
         result
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    fn raw_residue_authority_attempt(raw_response: Vec<u8>) -> RuntimeResidueAuthorityAttempt {
+        let request = RuntimeResidueAuthorityRequest {
+            version: ContractVersion::V1,
+            session: SessionBinding {
+                node_id: Id::new("node_a").unwrap(),
+                node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
+                agent_instance_id: RandomId128::new("44444444444444444444444444444444").unwrap(),
+                agent_session_epoch: Epoch::new(2).unwrap(),
+            },
+            lineage: proposal_lineage(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                let (name, value) = line.trim_end().split_once(':').unwrap();
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            reader.into_inner().write_all(&raw_response).unwrap();
+        });
+        let client = RuntimeVolumeTransitionHttpClient::for_loopback_test(
+            &format!("http://{address}/"),
+            signer(),
+        )
+        .unwrap();
+        let attempt = client
+            .request_residue_authority(&request, Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        server.join().unwrap();
+        attempt
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    #[test]
+    fn residue_client_surfaces_typed_reauthentication_and_replacement_but_retains_ambiguity() {
+        fn response(
+            status_line: &str,
+            detail: RuntimeVolumeTransitionErrorDetail,
+            extra_headers: &str,
+        ) -> Vec<u8> {
+            let body = encode_runtime_volume_transition_error(&RuntimeVolumeTransitionError {
+                version: ContractVersion::V1,
+                error: Box::new(detail),
+                message: "typed residue authority error".to_owned(),
+            })
+            .unwrap();
+            let mut response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(&body);
+            response
+        }
+
+        assert_eq!(
+            raw_residue_authority_attempt(response(
+                "401 Unauthorized",
+                RuntimeVolumeTransitionErrorDetail::AuthenticationFailed,
+                &format!("WWW-Authenticate: {NODE_AUTHENTICATE_CHALLENGE}\r\n"),
+            )),
+            RuntimeResidueAuthorityAttempt::ReauthenticationRequired
+        );
+        assert_eq!(
+            raw_residue_authority_attempt(response(
+                "403 Forbidden",
+                RuntimeVolumeTransitionErrorDetail::IdentityNotEligible,
+                "",
+            )),
+            RuntimeResidueAuthorityAttempt::IdentityReplacementRequired
+        );
+
+        // A typed-looking 401 without the exact challenge is not trusted as
+        // authentication direction. It remains a retained ambiguous result.
+        assert_eq!(
+            raw_residue_authority_attempt(response(
+                "401 Unauthorized",
+                RuntimeVolumeTransitionErrorDetail::AuthenticationFailed,
+                "",
+            )),
+            RuntimeResidueAuthorityAttempt::Retain
+        );
+        assert_eq!(
+            raw_residue_authority_attempt(Vec::new()),
+            RuntimeResidueAuthorityAttempt::Retain,
+            "a transport EOF must retain the physical directory"
+        );
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    fn proposal_lineage() -> cats_api::runtime_reconciliation::ResidueDataDirectoryLineage {
+        use cats_api::runtime_reconciliation::{
+            residue_acquisition_digest, AssignedKind, AssignedPlacement,
+            ResidueDataDirectoryLineage,
+        };
+        let request = decode_runtime_volume_transition_request(REQUEST).unwrap();
+        let volume = volume();
+        let acquisition = cats_api::runtime_reconciliation::AuthorizedServingAcquire::Normal {
+            request: NormalAcquireRequest {
+                volume_id: volume.volume_id.clone(),
+                transition_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
+                attachment_id: volume.attachment_id.clone(),
+                expected_unowned_epoch: FenceEpoch::new(0).unwrap(),
+                desired_revision: request.desired_revision,
+                placement_epoch: request.placement.placement_epoch,
+                lease_duration_ms: 60_000,
+            },
+            result: NormalAcquireResult {
+                volume_id: volume.volume_id.clone(),
+                transition_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
+                attachment_id: volume.attachment_id.clone(),
+                resulting_epoch: FenceEpoch::new(1).unwrap(),
+                resulting_head: RemoteHead {
+                    generation: Generation::new(0).unwrap(),
+                    root_hash: None,
+                    root_object_id: None,
+                },
+                lease_expires_at: UnixMillis::new(1_720_000_060_000).unwrap(),
+            },
+        };
+        ResidueDataDirectoryLineage {
+            workspace_id: Id::new("ws_01").unwrap(),
+            cat_id: Id::new("cat_01").unwrap(),
+            disk_id: volume.disk_id,
+            disk_kind: DiskKind::Root,
+            volume_id: volume.volume_id,
+            attachment_id: volume.attachment_id,
+            attachment_epoch: FenceEpoch::new(1).unwrap(),
+            acquire_origin: AcquireOrigin::Normal {
+                transition_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
+            },
+            node_id: request.session.node_id.clone(),
+            desired_revision: request.desired_revision,
+            spec_digest: request.spec_digest,
+            placement: AssignedPlacement {
+                kind: AssignedKind::Assigned,
+                node_id: request.session.node_id,
+                placement_epoch: request.placement.placement_epoch,
+            },
+            placement_epoch: request.placement.placement_epoch,
+            acquisition_digest: residue_acquisition_digest(&acquisition).unwrap(),
+            acquisition,
+            local_durable_generation: Generation::new(0).unwrap(),
+            remote_durable_generation: Generation::new(0).unwrap(),
+            remote_head: RemoteHead {
+                generation: Generation::new(0).unwrap(),
+                root_hash: None,
+                root_object_id: None,
+            },
+            pending_pack_count: WireU64::new(0).unwrap(),
+            fenced: true,
+        }
+    }
+
+    #[cfg(feature = "proposed-node-residue-reclamation")]
+    #[test]
+    fn proposal_residue_client_forwards_only_the_exact_signed_envelope() {
+        use cats_api::runtime_reconciliation::{
+            encode_runtime_residue_authority_success, RuntimeResidueAuthorityOutcome,
+        };
+        let session = SessionBinding {
+            node_id: Id::new("node_a").unwrap(),
+            node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
+            agent_instance_id: RandomId128::new("44444444444444444444444444444444").unwrap(),
+            agent_session_epoch: Epoch::new(2).unwrap(),
+        };
+        let lineage = proposal_lineage();
+        let scanned = NodeResidue::DataDirectory {
+            cat_id_hint: Some(lineage.cat_id.clone()),
+            disk_id_hint: Some(lineage.disk_id.clone()),
+            volume_id_hint: Some(lineage.volume_id.clone()),
+            data_directory: HostPath::new("/var/lib/cats/data/orphan").unwrap(),
+            allocated_bytes: WireU64::new(4096).unwrap(),
+            retention_reason:
+                cats_api::runtime_reconciliation::DataDirectoryRetentionReason::AuthorityProofPending,
+            ownership_token:
+                cats_api::runtime_reconciliation::OwnershipTokenEvidence::Missing,
+            lineage: ResidueLineageEvidence::Readable {
+                lineage: Box::new(lineage),
+            },
+        };
+        let request = residue_authority_request_from_observed(&session, &scanned)
+            .expect("feature scanner residue must become one exact request");
+        let success = RuntimeResidueAuthoritySuccess {
+            version: request.version,
+            session: request.session.clone(),
+            lineage: request.lineage.clone(),
+            outcome: RuntimeResidueAuthorityOutcome::Retained {
+                reason: cats_api::runtime_reconciliation::ResidueAuthorityRetentionReason::UniqueLocalTail,
+            },
+        };
+        let body = encode_runtime_residue_authority_success(&success).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected_body = encode_runtime_residue_authority_request(&request).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            assert_eq!(
+                request_line,
+                "POST /v1/internal/runtime/residue-authority HTTP/1.1\r\n"
+            );
+            let mut content_length = None;
+            let mut proof_headers = std::collections::BTreeMap::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                let (name, value) = line.trim_end().split_once(':').unwrap();
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = Some(value.trim().parse::<usize>().unwrap());
+                }
+                proof_headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
+            }
+            let mut observed_body = vec![0; content_length.unwrap()];
+            reader.read_exact(&mut observed_body).unwrap();
+            assert_eq!(observed_body, expected_body);
+            verify_request_proof(
+                RUNTIME_SPINE_METHOD,
+                RUNTIME_RESIDUE_AUTHORITY_PATH,
+                &observed_body,
+                &proof_headers[NODE_CREDENTIAL_ID_HEADER],
+                &proof_headers[NODE_PUBLIC_KEY_SPKI_HEADER],
+                &proof_headers[NODE_SIGNATURE_HEADER],
+            )
+            .unwrap();
+            let mut stream = reader.into_inner();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        });
+        let client = RuntimeVolumeTransitionHttpClient::for_loopback_test(
+            &format!("http://{address}/"),
+            signer(),
+        )
+        .unwrap();
+        let received = client
+            .request_residue_authority(&request, Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            received,
+            RuntimeResidueAuthorityAttempt::Qualified(Box::new(success))
+        );
     }
 
     #[test]

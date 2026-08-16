@@ -5,6 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+default = ["proposed-node-residue-reclamation"]
+# Kept as a compatibility feature name while the exact N2 wire is the default
+# production shape. A no-default-features build exercises only the retired
+# pre-N2 decoder and is not a deployable Runtime protocol.
+proposed-node-residue-reclamation = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }

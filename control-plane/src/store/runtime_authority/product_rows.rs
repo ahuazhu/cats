@@ -1,9 +1,12 @@
 //! Closed row codecs for covered product mutations.
 
+use std::collections::BTreeMap;
+
+use cats_api::production_mutation_admission::ProductionQualificationProductInventoryCounts;
 use cats_api::runtime_reconciliation::{
     decode_desired_runtime_spec, decode_operation, encode_desired_runtime_spec, encode_operation,
     DesiredRuntimeSpec, Epoch, Generation, Hostname, Id, Operation, OperationPhase,
-    OperationTerminal, Revision, RuntimeTarget, Sha256Digest, UnixMillis,
+    OperationTerminal, Revision, RuntimeTarget, Sha256Digest, UnixMillis, WireU64,
 };
 use cats_storage::authority::{remote_head_is_valid, AuthorityError, VolumeDurability};
 use postgres::{Row, Transaction};
@@ -11,18 +14,19 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use super::pg_codec::{PgBigInt, SizeBytes};
 use super::product::{
-    ApiIdempotencyRequest, ApiIdempotencyResult, CatRecord, DiskAdminState, DiskRecord, DiskRole,
-    DiskSnapshotRecord, EndpointRecord, ExactContentType, HostnameDesiredLookup,
-    PersistentDiskInitialization, RuntimeOperationRead,
+    ApiIdempotencyRequest, ApiIdempotencyResult, CatRecord, DesiredMutationRowCapability,
+    DiskAdminState, DiskRecord, DiskRole, DiskSnapshotRecord, EndpointRecord, ExactContentType,
+    HostnameDesiredLookup, PersistentDiskInitialization, RuntimeOperationRead,
 };
 use crate::store::transaction::{AuthorityTransactionError, AuthorityTxResult};
 use crate::store::{internal, Result, Store};
 
-const CAT_COLUMNS: &str = "cat_id, record::text AS record_json, workspace_id, name, created_at";
-const ENDPOINT_COLUMNS: &str = "
+pub(super) const CAT_COLUMNS: &str =
+    "cat_id, record::text AS record_json, workspace_id, name, created_at";
+pub(super) const ENDPOINT_COLUMNS: &str = "
     endpoint_id, record::text AS record_json, workspace_id, cat_id, name,
     created_at";
-const DISK_COLUMNS: &str = "
+pub(super) const DISK_COLUMNS: &str = "
     disk_id, record::text AS record_json, workspace_id, name, volume_id,
     size_bytes, durability, created_at, admin_state, delete_id, role_kind,
     root_cat_id, initialization_kind, initialization_token, filesystem_uuid,
@@ -32,7 +36,7 @@ const DISK_COLUMNS: &str = "
 const DISK_SNAPSHOT_COLUMNS: &str = "
     snapshot_id, record::text AS record_json, disk_id, volume_id, size_bytes,
     head_generation, head_root_hash, head_root_object_id, created_at";
-const DESIRED_COLUMNS: &str = "
+pub(super) const DESIRED_COLUMNS: &str = "
     cat_id, record::text AS record_json, workspace_id, desired_revision,
     spec_digest, target, node_id, placement_epoch";
 const HOSTNAME_LOOKUP_COLUMNS: &str = "
@@ -465,6 +469,17 @@ pub(super) fn load_cat_by_id_for_update(
         .transpose()
 }
 
+pub(super) fn load_cat_by_id_unlocked(
+    transaction: &mut Transaction<'_>,
+    cat_id: &Id,
+) -> AuthorityTxResult<Option<CatRecord>> {
+    let sql = format!("SELECT {CAT_COLUMNS} FROM cat_records WHERE cat_id=$1");
+    transaction
+        .query_opt(&sql, &[&cat_id.as_str()])?
+        .map(|row| decode_cat(&row))
+        .transpose()
+}
+
 pub(super) fn load_cat_by_name_unlocked(
     transaction: &mut Transaction<'_>,
     workspace_id: &Id,
@@ -491,7 +506,7 @@ pub(super) fn load_root_disk_by_cat_unlocked(
         .transpose()
 }
 
-fn decode_cat(row: &Row) -> AuthorityTxResult<CatRecord> {
+pub(super) fn decode_cat(row: &Row) -> AuthorityTxResult<CatRecord> {
     let stored = CatProjection::from_row(row)?;
     let record: CatRecord = decode_json(row.try_get("record_json")?)?;
     if stored != CatProjection::from_record(&record) {
@@ -558,7 +573,7 @@ pub(super) fn load_endpoint_by_cat_name_unlocked(
         .transpose()
 }
 
-fn decode_endpoint(row: &Row) -> AuthorityTxResult<EndpointRecord> {
+pub(super) fn decode_endpoint(row: &Row) -> AuthorityTxResult<EndpointRecord> {
     let stored = EndpointProjection::from_row(row)?;
     let record: EndpointRecord = decode_json(row.try_get("record_json")?)?;
     if stored != EndpointProjection::from_record(&record) {
@@ -627,6 +642,47 @@ pub(super) fn load_disk_by_id_for_update(
         .query_opt(&sql, &[&disk_id.as_str()])?
         .map(|row| decode_disk(&row))
         .transpose()
+}
+
+pub(super) fn load_disk_by_id_unlocked(
+    transaction: &mut Transaction<'_>,
+    disk_id: &Id,
+) -> AuthorityTxResult<Option<DiskRecord>> {
+    let sql = format!("SELECT {DISK_COLUMNS} FROM disk_records WHERE disk_id=$1");
+    transaction
+        .query_opt(&sql, &[&disk_id.as_str()])?
+        .map(|row| decode_disk(&row))
+        .transpose()
+}
+
+pub(super) fn load_disk_by_volume_unlocked(
+    transaction: &mut Transaction<'_>,
+    volume_id: &cats_api::runtime_reconciliation::Id,
+) -> AuthorityTxResult<Option<DiskRecord>> {
+    let sql = format!(
+        "SELECT {DISK_COLUMNS} FROM disk_records
+          WHERE volume_id=$1 OR record->>'volume_id'=$1
+          ORDER BY disk_id COLLATE \"C\" LIMIT 2"
+    );
+    decode_at_most_one_disk(transaction.query(&sql, &[&volume_id.as_str()])?)
+}
+
+pub(super) fn delete_disk(
+    transaction: &mut Transaction<'_>,
+    record: &DiskRecord,
+) -> AuthorityTxResult<()> {
+    let projection = DiskProjection::from_record(record)?;
+    let changed = transaction.execute(
+        "DELETE FROM disk_records
+          WHERE disk_id=$1 AND volume_id=$2 AND admin_state='deleting'
+            AND delete_id=$3",
+        &[
+            &projection.disk_id,
+            &projection.volume_id,
+            &projection.delete_id,
+        ],
+    )?;
+    exactly_one(changed)
 }
 
 pub(super) fn update_disk(
@@ -780,7 +836,7 @@ fn decode_at_most_one_disk(rows: Vec<Row>) -> AuthorityTxResult<Option<DiskRecor
     Ok(decoded.pop())
 }
 
-fn decode_disk(row: &Row) -> AuthorityTxResult<DiskRecord> {
+pub(super) fn decode_disk(row: &Row) -> AuthorityTxResult<DiskRecord> {
     let stored = DiskProjection::from_row(row)?;
     let record: DiskRecord = decode_json(row.try_get("record_json")?)?;
     if stored != DiskProjection::from_record(&record)? {
@@ -806,6 +862,38 @@ pub(super) fn load_any_disk_snapshot_for_update(
           ORDER BY snapshot_id
           LIMIT 2
           FOR UPDATE"
+    );
+    let rows = transaction.query(&sql, &[&disk_id.as_str(), &volume_id.as_str()])?;
+    let mut first = None;
+    for row in rows {
+        let record = decode_disk_snapshot(&row)?;
+        if record.disk_id != *disk_id
+            || record.volume_id != *volume_id
+            || record.size_bytes != size_bytes
+        {
+            return Err(corrupt(()));
+        }
+        first.get_or_insert(record);
+    }
+    Ok(first)
+}
+
+/// Repeatable-read candidate qualification before any external delete. The
+/// completion transaction takes the `FOR UPDATE` version again to close a
+/// snapshot-create race before metadata removal.
+pub(super) fn load_any_disk_snapshot_unlocked(
+    transaction: &mut Transaction<'_>,
+    disk_id: &Id,
+    volume_id: &Id,
+    size_bytes: u64,
+) -> AuthorityTxResult<Option<DiskSnapshotRecord>> {
+    let sql = format!(
+        "SELECT {DISK_SNAPSHOT_COLUMNS}
+           FROM disk_snapshot_records
+          WHERE disk_id=$1 OR volume_id=$2
+             OR record->>'disk_id'=$1 OR record->>'volume_id'=$2
+          ORDER BY snapshot_id
+          LIMIT 2"
     );
     let rows = transaction.query(&sql, &[&disk_id.as_str(), &volume_id.as_str()])?;
     let mut first = None;
@@ -887,6 +975,64 @@ pub(super) fn insert_desired(
     )?)
 }
 
+#[allow(
+    dead_code,
+    reason = "A1 row CAS is consumed when A2/G4 production Desired routes are composed"
+)]
+pub(super) fn replace_desired(
+    transaction: &mut Transaction<'_>,
+    _capability: &DesiredMutationRowCapability,
+    expected: &DesiredRuntimeSpec,
+    record: &DesiredRuntimeSpec,
+) -> AuthorityTxResult<bool> {
+    let expected_projection = DesiredProjection::from_record(expected)?;
+    let projection = DesiredProjection::from_record(record)?;
+    let json = String::from_utf8(encode_desired_runtime_spec(record).map_err(corrupt)?)
+        .map_err(corrupt)?;
+    let desired_revision = projection.desired_revision.to_pg().map_err(corrupt)?;
+    let placement_epoch = projection.placement_epoch.to_pg().map_err(corrupt)?;
+    let expected_revision = expected_projection
+        .desired_revision
+        .to_pg()
+        .map_err(corrupt)?;
+    let expected_placement_epoch = expected_projection
+        .placement_epoch
+        .to_pg()
+        .map_err(corrupt)?;
+    let changed = transaction.execute(
+        "UPDATE desired_runtime_specs SET
+            record=$2::TEXT::jsonb, workspace_id=$3, desired_revision=$4,
+            spec_digest=$5, target=$6, node_id=$7, placement_epoch=$8
+          WHERE cat_id=$1
+            AND workspace_id=$9
+            AND desired_revision=$10
+            AND spec_digest=$11
+            AND node_id=$12
+            AND placement_epoch=$13",
+        &[
+            &projection.cat_id,
+            &json,
+            &projection.workspace_id,
+            &desired_revision,
+            &projection.spec_digest,
+            &projection.target,
+            &projection.node_id,
+            &placement_epoch,
+            &expected_projection.workspace_id,
+            &expected_revision,
+            &expected_projection.spec_digest,
+            &expected_projection.node_id,
+            &expected_placement_epoch,
+        ],
+    )?;
+    if changed > 1 {
+        return Err(corrupt(
+            "Desired CAS update affected more than one current row",
+        ));
+    }
+    Ok(changed == 1)
+}
+
 pub(super) fn load_desired_for_update(
     transaction: &mut Transaction<'_>,
     cat_id: &Id,
@@ -908,6 +1054,65 @@ pub(super) fn load_desired_unlocked(
         .query_opt(&sql, &[&cat_id.as_str()])?
         .map(|row| decode_desired(&row))
         .transpose()
+}
+
+/// Resolves the sole current Desired that names a Disk. The Disk/Volume row
+/// lock is the serialization barrier for attach/detach callers; this lookup
+/// deliberately does not manufacture a second binding table.
+pub(super) fn load_desired_by_disk_unlocked(
+    transaction: &mut Transaction<'_>,
+    disk_id: &Id,
+) -> AuthorityTxResult<Option<DesiredRuntimeSpec>> {
+    let sql = format!(
+        "SELECT {DESIRED_COLUMNS} FROM desired_runtime_specs
+          WHERE record->'volumes' @>
+                jsonb_build_array(jsonb_build_object('disk_id', $1::text))
+          ORDER BY cat_id COLLATE \"C\" LIMIT 2"
+    );
+    let rows = transaction.query(&sql, &[&disk_id.as_str()])?;
+    if rows.len() > 1 {
+        return Err(corrupt(()));
+    }
+    let desired = rows.first().map(decode_desired).transpose()?;
+    if desired.as_ref().is_some_and(|desired| {
+        desired
+            .volumes
+            .iter()
+            .filter(|intent| intent.disk_id == *disk_id)
+            .count()
+            != 1
+    }) {
+        return Err(corrupt(()));
+    }
+    Ok(desired)
+}
+
+/// Candidate collision probe for the two identities that are globally unique
+/// in one Node's complete Desired set. Callers hold both namespaced advisory
+/// candidate locks before invoking this read.
+pub(super) fn persistent_intent_identity_exists_unlocked(
+    transaction: &mut Transaction<'_>,
+    volume_intent_id: &Id,
+    attachment_id: &Id,
+) -> AuthorityTxResult<bool> {
+    transaction
+        .query_one(
+            "SELECT
+                EXISTS (
+                    SELECT 1 FROM desired_runtime_specs
+                     WHERE record->'volumes' @> jsonb_build_array(
+                         jsonb_build_object('volume_intent_id', $1::text)
+                     )
+                ) OR EXISTS (
+                    SELECT 1 FROM desired_runtime_specs
+                     WHERE record->'volumes' @> jsonb_build_array(
+                         jsonb_build_object('attachment_id', $2::text)
+                     )
+                ) AS present",
+            &[&volume_intent_id.as_str(), &attachment_id.as_str()],
+        )
+        .map(|row| row.get("present"))
+        .map_err(Into::into)
 }
 
 /// Looks up the globally unique Guest network identity without introducing a
@@ -957,6 +1162,25 @@ pub(super) fn load_assigned_desired_for_update(
     );
     transaction
         .query(&sql, &[&node_id.as_str()])?
+        .iter()
+        .map(decode_desired)
+        .collect()
+}
+
+#[allow(dead_code, reason = "used by the gated C3 batch authority")]
+pub(super) fn load_assigned_desired_for_update_bounded(
+    transaction: &mut Transaction<'_>,
+    node_id: &Id,
+    limit: usize,
+) -> AuthorityTxResult<Vec<DesiredRuntimeSpec>> {
+    let limit = i64::try_from(limit).map_err(corrupt)?;
+    let sql = format!(
+        "SELECT {DESIRED_COLUMNS} FROM desired_runtime_specs
+          WHERE node_id=$1 OR record->'placement'->>'node_id'=$1
+          ORDER BY cat_id COLLATE \"C\" LIMIT $2 FOR UPDATE"
+    );
+    transaction
+        .query(&sql, &[&node_id.as_str(), &limit])?
         .iter()
         .map(decode_desired)
         .collect()
@@ -1044,6 +1268,23 @@ pub(super) fn load_hostname_lookups_by_cat_unlocked(
         .collect()
 }
 
+#[allow(
+    dead_code,
+    reason = "A1 row CAS is consumed when A2/G4 production Desired routes are composed"
+)]
+pub(super) fn delete_hostname_lookups_by_cat(
+    transaction: &mut Transaction<'_>,
+    _capability: &DesiredMutationRowCapability,
+    cat_id: &Id,
+) -> AuthorityTxResult<u64> {
+    transaction
+        .execute(
+            "DELETE FROM hostname_desired_lookups WHERE cat_id=$1",
+            &[&cat_id.as_str()],
+        )
+        .map_err(AuthorityTransactionError::from)
+}
+
 fn decode_hostname_lookup(row: &Row) -> AuthorityTxResult<HostnameDesiredLookup> {
     let stored = HostnameLookupProjection::from_row(row)?;
     let record: HostnameDesiredLookup = decode_json(row.try_get("record_json")?)?;
@@ -1097,6 +1338,17 @@ pub(super) fn load_operation_for_update(
     let sql = format!(
         "SELECT {OPERATION_COLUMNS} FROM runtime_operations WHERE operation_id=$1 FOR UPDATE"
     );
+    transaction
+        .query_opt(&sql, &[&operation_id.as_str()])?
+        .map(|row| decode_operation_row(&row))
+        .transpose()
+}
+
+pub(super) fn load_operation_unlocked(
+    transaction: &mut Transaction<'_>,
+    operation_id: &Id,
+) -> AuthorityTxResult<Option<Operation>> {
+    let sql = format!("SELECT {OPERATION_COLUMNS} FROM runtime_operations WHERE operation_id=$1");
     transaction
         .query_opt(&sql, &[&operation_id.as_str()])?
         .map(|row| decode_operation_row(&row))
@@ -1182,6 +1434,27 @@ pub(super) fn load_operation_by_cat_revision_unlocked(
         .transpose()
 }
 
+#[allow(
+    dead_code,
+    reason = "A1 row CAS is consumed when A2/G4 production Desired routes are composed"
+)]
+pub(super) fn load_operation_by_cat_revision_for_update(
+    transaction: &mut Transaction<'_>,
+    _capability: &DesiredMutationRowCapability,
+    cat_id: &Id,
+    revision: Revision,
+) -> AuthorityTxResult<Option<Operation>> {
+    let sql = format!(
+        "SELECT {OPERATION_COLUMNS} FROM runtime_operations
+          WHERE cat_id=$1 AND desired_revision=$2 FOR UPDATE"
+    );
+    let revision = revision.to_pg().map_err(corrupt)?;
+    transaction
+        .query_opt(&sql, &[&cat_id.as_str(), &revision])?
+        .map(|row| decode_operation_row(&row))
+        .transpose()
+}
+
 pub(super) fn load_pending_operation_by_cat_for_update(
     transaction: &mut Transaction<'_>,
     cat_id: &Id,
@@ -1231,6 +1504,219 @@ fn decode_operation_row(row: &Row) -> AuthorityTxResult<Operation> {
         return Err(corrupt(()));
     }
     Ok(record)
+}
+
+/// Decode the complete clean-slate product graph and return the exact current
+/// projection for one qualification Workspace.  This deliberately has no
+/// pagination or client-side list composition: one repeatable-read caller
+/// observes every product row through the same PostgreSQL snapshot.
+pub(super) fn qualification_product_inventory_counts(
+    transaction: &mut Transaction<'_>,
+    workspace_id: &Id,
+) -> AuthorityTxResult<ProductionQualificationProductInventoryCounts> {
+    let cat_sql = format!("SELECT {CAT_COLUMNS} FROM cat_records ORDER BY cat_id COLLATE \"C\"");
+    let cats = transaction
+        .query(&cat_sql, &[])?
+        .iter()
+        .map(decode_cat)
+        .collect::<AuthorityTxResult<Vec<_>>>()?;
+    let cats = cats
+        .into_iter()
+        .filter(|record| record.workspace_id == *workspace_id)
+        .map(|record| (record.cat_id.to_string(), record))
+        .collect::<BTreeMap<_, _>>();
+
+    let desired_sql = format!(
+        "SELECT {DESIRED_COLUMNS} FROM desired_runtime_specs ORDER BY cat_id COLLATE \"C\""
+    );
+    let desired = transaction
+        .query(&desired_sql, &[])?
+        .iter()
+        .map(decode_desired)
+        .collect::<AuthorityTxResult<Vec<_>>>()?;
+    let desired = desired
+        .into_iter()
+        .filter(|record| record.workspace_id == *workspace_id)
+        .map(|record| (record.cat_id.to_string(), record))
+        .collect::<BTreeMap<_, _>>();
+    if cats.keys().ne(desired.keys()) {
+        return Err(corrupt(
+            "qualification product inventory found a Cat/Desired projection gap",
+        ));
+    }
+    let current_cat_count = desired
+        .values()
+        .filter(|record| record.target != RuntimeTarget::Deleted)
+        .count();
+    let deleted_cat_tombstone_count = desired.len().saturating_sub(current_cat_count);
+
+    let disk_sql =
+        format!("SELECT {DISK_COLUMNS} FROM disk_records ORDER BY disk_id COLLATE \"C\"");
+    let disks = transaction
+        .query(&disk_sql, &[])?
+        .iter()
+        .map(decode_disk)
+        .collect::<AuthorityTxResult<Vec<_>>>()?;
+    let disks = disks
+        .into_iter()
+        .filter(|record| record.workspace_id == *workspace_id)
+        .map(|record| (record.disk_id.to_string(), record))
+        .collect::<BTreeMap<_, _>>();
+    let mut root_disk_count = 0_usize;
+    let mut persistent_disk_count = 0_usize;
+    for disk in disks.values() {
+        match &disk.role {
+            DiskRole::Root { cat_id } => {
+                if !cats.contains_key(cat_id.as_str()) {
+                    return Err(corrupt(
+                        "qualification product inventory found an orphan RootDisk",
+                    ));
+                }
+                root_disk_count += 1;
+            }
+            DiskRole::Persistent { .. } => persistent_disk_count += 1,
+        }
+    }
+
+    let snapshot_sql = format!(
+        "SELECT {DISK_SNAPSHOT_COLUMNS} FROM disk_snapshot_records
+          ORDER BY snapshot_id COLLATE \"C\""
+    );
+    let snapshots = transaction
+        .query(&snapshot_sql, &[])?
+        .iter()
+        .map(decode_disk_snapshot)
+        .collect::<AuthorityTxResult<Vec<_>>>()?;
+    let mut disk_snapshot_count = 0_usize;
+    for snapshot in snapshots {
+        let Some(disk) = disks.get(snapshot.disk_id.as_str()) else {
+            continue;
+        };
+        if snapshot.volume_id != disk.volume_id || snapshot.size_bytes != disk.size_bytes {
+            return Err(corrupt(
+                "qualification product inventory found a rebound DiskSnapshot",
+            ));
+        }
+        disk_snapshot_count += 1;
+    }
+
+    let endpoint_sql = format!(
+        "SELECT {ENDPOINT_COLUMNS} FROM endpoint_records ORDER BY endpoint_id COLLATE \"C\""
+    );
+    let endpoints = transaction
+        .query(&endpoint_sql, &[])?
+        .iter()
+        .map(decode_endpoint)
+        .collect::<AuthorityTxResult<Vec<_>>>()?;
+    let endpoints = endpoints
+        .into_iter()
+        .filter(|record| record.workspace_id == *workspace_id)
+        .map(|record| (record.endpoint_id.to_string(), record))
+        .collect::<BTreeMap<_, _>>();
+    if endpoints
+        .values()
+        .any(|endpoint| !cats.contains_key(endpoint.cat_id.as_str()))
+    {
+        return Err(corrupt(
+            "qualification product inventory found an orphan Endpoint",
+        ));
+    }
+
+    let hostname_sql = format!(
+        "SELECT {HOSTNAME_LOOKUP_COLUMNS} FROM hostname_desired_lookups
+          ORDER BY hostname COLLATE \"C\""
+    );
+    let hostname_lookups = transaction
+        .query(&hostname_sql, &[])?
+        .iter()
+        .map(decode_hostname_lookup)
+        .collect::<AuthorityTxResult<Vec<_>>>()?;
+    let hostname_lookups = hostname_lookups
+        .into_iter()
+        .filter(|record| record.workspace_id == *workspace_id)
+        .collect::<Vec<_>>();
+    for lookup in &hostname_lookups {
+        let Some(endpoint) = endpoints.get(lookup.endpoint_id.as_str()) else {
+            return Err(corrupt(
+                "qualification product inventory found an orphan hostname lookup",
+            ));
+        };
+        let Some(current) = desired.get(lookup.cat_id.as_str()) else {
+            return Err(corrupt(
+                "qualification product inventory found a hostname without Desired",
+            ));
+        };
+        if endpoint.cat_id != lookup.cat_id || current.desired_revision != lookup.desired_revision {
+            return Err(corrupt(
+                "qualification product inventory found a rebound hostname lookup",
+            ));
+        }
+    }
+
+    let operation_sql = format!(
+        "SELECT {OPERATION_COLUMNS} FROM runtime_operations
+          ORDER BY operation_id COLLATE \"C\""
+    );
+    let operations = transaction
+        .query(&operation_sql, &[])?
+        .iter()
+        .map(decode_operation_row)
+        .collect::<AuthorityTxResult<Vec<_>>>()?;
+    let operations = operations
+        .into_iter()
+        .filter(|record| record.workspace_id == *workspace_id)
+        .collect::<Vec<_>>();
+    let mut pending_runtime_operation_count = 0_usize;
+    let mut terminal_runtime_operation_history_count = 0_usize;
+    for operation in &operations {
+        let Some(current) = desired.get(operation.cat_id.as_str()) else {
+            return Err(corrupt(
+                "qualification product inventory found an orphan Runtime Operation",
+            ));
+        };
+        if operation.phase == OperationPhase::Pending {
+            if operation.desired_revision != current.desired_revision
+                || operation.desired_spec_digest != current.spec_digest
+            {
+                return Err(corrupt(
+                    "qualification product inventory found a stale pending Runtime Operation",
+                ));
+            }
+            pending_runtime_operation_count += 1;
+        } else {
+            terminal_runtime_operation_history_count += 1;
+        }
+    }
+
+    let api_idempotency_receipt_count = transaction
+        .query_one(
+            "SELECT count(*) FROM api_idempotency_results
+              WHERE authenticated_workspace_id=$1",
+            &[&workspace_id.as_str()],
+        )?
+        .try_get::<_, i64>(0)?;
+    let api_idempotency_receipt_count =
+        usize::try_from(api_idempotency_receipt_count).map_err(corrupt)?;
+
+    Ok(ProductionQualificationProductInventoryCounts {
+        current_cat_count: wire_count(current_cat_count)?,
+        root_disk_count: wire_count(root_disk_count)?,
+        persistent_disk_count: wire_count(persistent_disk_count)?,
+        disk_snapshot_count: wire_count(disk_snapshot_count)?,
+        endpoint_count: wire_count(endpoints.len())?,
+        hostname_desired_lookup_count: wire_count(hostname_lookups.len())?,
+        pending_runtime_operation_count: wire_count(pending_runtime_operation_count)?,
+        deleted_cat_tombstone_count: wire_count(deleted_cat_tombstone_count)?,
+        terminal_runtime_operation_history_count: wire_count(
+            terminal_runtime_operation_history_count,
+        )?,
+        api_idempotency_receipt_count: wire_count(api_idempotency_receipt_count)?,
+    })
+}
+
+fn wire_count(value: usize) -> AuthorityTxResult<WireU64> {
+    let value = u64::try_from(value).map_err(corrupt)?;
+    WireU64::new(value).ok_or_else(|| corrupt("product inventory count exceeds the wire range"))
 }
 
 pub(super) fn insert_api_result(

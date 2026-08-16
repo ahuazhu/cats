@@ -20,9 +20,11 @@ use cats_blockd::format;
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_object_store_aws_s3::AwsS3BlobStoreFactory;
 use cats_object_store_file::FileBlobStore;
+use cats_storage::authority::VolumeDurability;
 use cats_storage::blob::BlobStore;
 use cats_storage::{open_blob_store, AdapterConfig, BlobStoreFactory, MetadataStore};
 use cats_test_support::blob_doubles::SizingBlob;
+use cats_test_support::{prepare_sqlite_authorized_serving, SqliteTestVolumeGrant};
 
 const CHUNK: u64 = cats_api::chunk::CHUNK_SIZE as u64;
 const PAGE: u64 = cats_api::chunk::DIRTY_PAGE_SIZE as u64;
@@ -100,9 +102,24 @@ impl Env {
 
     /// Attach again after the local cache has been deleted: a fresh host.
     fn reattach(&self, attachment: &str) -> Arc<ChunkEngine> {
-        let mut cfg = EngineConfig::new("vol_commit", self.data_dir(), attachment);
+        let epoch = self.meta.load_head("vol_commit").unwrap().lease_epoch + 1;
+        let data_dir = self.data_dir();
+        let mut cfg = EngineConfig::new("vol_commit", &data_dir, attachment);
         cfg.lease_ttl_ms = bench_lease_ttl_ms();
-        ChunkEngine::attach(cfg, self.blob.clone(), self.meta.clone()).expect("reattach")
+        let (authorized, authority) = prepare_sqlite_authorized_serving(
+            &self.root.join("meta.db"),
+            &data_dir,
+            SqliteTestVolumeGrant::new(
+                "vol_commit",
+                attachment,
+                epoch,
+                u64::try_from(cfg.lease_ttl_ms).unwrap(),
+                VolumeDurability::Strict,
+            ),
+        )
+        .unwrap();
+        ChunkEngine::attach_authorized_serving(cfg, authorized, self.blob.clone(), authority)
+            .expect("reattach")
     }
 }
 
@@ -113,9 +130,24 @@ fn env(chunks: u64, run: &str) -> Env {
     meta.create_volume("vol_commit", chunks * CHUNK)
         .expect("volume");
     let meta_for_reattach = meta.clone();
-    let mut cfg = EngineConfig::new("vol_commit", dir.path().join("data"), "att-commit");
+    let data_dir = dir.path().join("data");
+    let mut cfg = EngineConfig::new("vol_commit", &data_dir, "att-commit");
     cfg.lease_ttl_ms = bench_lease_ttl_ms();
-    let engine = ChunkEngine::attach(cfg, published.clone(), meta).expect("attach");
+    let (authorized, authority) = prepare_sqlite_authorized_serving(
+        &dir.path().join("meta.db"),
+        &data_dir,
+        SqliteTestVolumeGrant::new(
+            "vol_commit",
+            "att-commit",
+            1,
+            u64::try_from(cfg.lease_ttl_ms).unwrap(),
+            VolumeDurability::Strict,
+        ),
+    )
+    .unwrap();
+    let engine =
+        ChunkEngine::attach_authorized_serving(cfg, authorized, published.clone(), authority)
+            .expect("attach");
     Env {
         root: dir.path().to_path_buf(),
         _dir: dir,
@@ -133,14 +165,29 @@ fn relaxed_env(chunks: u64, run: &str) -> Env {
     meta.create_volume("vol_commit", chunks * CHUNK)
         .expect("volume");
     let meta_for_reattach = meta.clone();
-    let mut cfg = EngineConfig::new("vol_commit", dir.path().join("data"), "att-commit");
+    let data_dir = dir.path().join("data");
+    let mut cfg = EngineConfig::new("vol_commit", &data_dir, "att-commit");
     cfg.lease_ttl_ms = bench_lease_ttl_ms();
     // No timer makes the two measured boundaries explicit: Guest FLUSH can
     // only stage locally; the benchmark invokes the remote drain separately.
     cfg.durability = DurabilityMode::Relaxed {
         drain_interval_ms: 0,
     };
-    let engine = ChunkEngine::attach(cfg, published.clone(), meta).expect("attach");
+    let (authorized, authority) = prepare_sqlite_authorized_serving(
+        &dir.path().join("meta.db"),
+        &data_dir,
+        SqliteTestVolumeGrant::new(
+            "vol_commit",
+            "att-commit",
+            1,
+            u64::try_from(cfg.lease_ttl_ms).unwrap(),
+            VolumeDurability::Relaxed,
+        ),
+    )
+    .unwrap();
+    let engine =
+        ChunkEngine::attach_authorized_serving(cfg, authorized, published.clone(), authority)
+            .expect("attach");
     Env {
         root: dir.path().to_path_buf(),
         _dir: dir,
@@ -228,7 +275,7 @@ fn relaxed_local_ack_and_remote_publish_cost_are_separate() {
                 )
                 .expect("write benchmark CSV sample");
             }
-            env.engine.detach().unwrap();
+            env.engine.stop_authorized_serving().unwrap();
         }
         local_samples.sort_by(f64::total_cmp);
         remote_samples.sort_by(f64::total_cmp);
@@ -284,7 +331,7 @@ fn flush_cost_scales_with_the_dirty_set() {
             env.engine.flush().expect("flush");
             samples.push(started.elapsed().as_secs_f64() * 1000.0);
             published = env.published.data_bytes();
-            env.engine.detach().unwrap();
+            env.engine.stop_authorized_serving().unwrap();
         }
         samples.sort_by(f64::total_cmp);
         let flush_ms = samples[samples.len() / 2];
@@ -340,7 +387,7 @@ fn flush_cost_for_dense_writes() {
             env.engine.flush().expect("flush");
             samples.push(started.elapsed().as_secs_f64() * 1000.0);
             published = env.published.data_bytes();
-            env.engine.detach().unwrap();
+            env.engine.stop_authorized_serving().unwrap();
         }
         samples.sort_by(f64::total_cmp);
         let flush_ms = samples[samples.len() / 2];
@@ -385,7 +432,7 @@ fn cold_read_cost_by_delta_chain_length() {
             }
             env.engine.flush().expect("delta flush");
         }
-        env.engine.detach().unwrap();
+        env.engine.stop_authorized_serving().unwrap();
 
         // A host with nothing cached.
         std::fs::remove_dir_all(env.data_dir()).ok();
@@ -399,7 +446,7 @@ fn cold_read_cost_by_delta_chain_length() {
             engine.read(chunk * CHUNK, &mut buf).expect("cold read");
         }
         let per_chunk = started.elapsed().as_secs_f64();
-        engine.detach().unwrap();
+        engine.stop_authorized_serving().unwrap();
 
         // Whole volume in one call: what a migration or a large sequential read
         // produces, where chunks overlap too.
@@ -409,7 +456,7 @@ fn cold_read_cost_by_delta_chain_length() {
         let started = Instant::now();
         engine.read(0, &mut whole).expect("bulk cold read");
         let bulk = started.elapsed().as_secs_f64();
-        engine.detach().unwrap();
+        engine.stop_authorized_serving().unwrap();
 
         let mib = (chunks * CHUNK) as f64 / MIB;
         println!(

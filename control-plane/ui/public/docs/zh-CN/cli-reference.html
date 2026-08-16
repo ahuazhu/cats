@@ -1,84 +1,42 @@
 <h2 id="global-options">全局选项</h2>
-<table><thead><tr><th>选项 / 环境变量</th><th>默认值</th><th>用途</th></tr></thead><tbody>
-  <tr><td><code>--api-url</code> / <code>CATS_API_URL</code></td><td>已保存登录目标，否则为 <code>https://cats.run</code></td><td>控制面基础 URL</td></tr>
-  <tr><td><code>--workspace</code> / <code>CATS_WORKSPACE</code></td><td>已保存 Workspace</td><td>仅覆盖一条命令且不改变默认选择；接受 <code>workspace</code>、<code>account/workspace</code> 或 Workspace ID</td></tr>
-  <tr><td><code>--token</code> / <code>CATS_TOKEN</code></td><td>无</td><td>仅供 Machine/Administrator Bearer Credential；普通用户执行 <code>cats login</code></td></tr>
-  <tr><td><code>--no-wait</code></td><td>关闭</td><td>Operation 被接受后立即返回</td></tr>
-  <tr><td><code>--json</code></td><td>关闭</td><td>在支持的位置输出机器可读 JSON</td></tr>
+<table><thead><tr><th>选项 / 环境变量</th><th>用途</th></tr></thead><tbody>
+<tr><td><code>--api-url</code> / <code>CATS_API_URL</code></td><td>Control Plane Base URL</td></tr>
+<tr><td><code>--workspace</code> / <code>CATS_WORKSPACE</code></td><td>为本次命令选择一个不可变 Workspace</td></tr>
+<tr><td><code>--token</code> / <code>CATS_TOKEN</code></td><td>Machine 或 Administrator Credential</td></tr>
+<tr><td><code>--json</code></td><td>在支持时输出机器可读数据</td></tr>
 </tbody></table>
-<p>全局选项可以放在子命令前或后。<code>cats --help</code> 与 <code>cats &lt;command&gt; --help</code> 是当前版本最权威的参考。</p>
+<p><code>cats --help</code> 与 <code>cats &lt;command&gt; --help</code> 是版本权威。</p>
 
-<h2 id="identity-commands">身份与 Workspace 命令</h2>
+<h2 id="identity">身份与 Workspace</h2>
 <pre><code>cats login
+cats logout
 cats whoami
 cats workspace list
 cats workspace create SLUG [--display-name NAME]
 cats workspace use ACCOUNT/WORKSPACE
-cats --workspace ACCOUNT/WORKSPACE ls
-cats logout</code></pre>
-<p><code>login</code> 使用 WorkOS Device Authorization，并且只把 Access/Refresh 信息保存到操作系统凭据存储。Active WorkOS Organization Membership 会暴露 Personal/Organization Account 及其 Workspace。<code>workspace create</code> 会在当前 Account 下增加一个隔离 Workspace，并要求 Account 管理权限。<code>workspace use</code> 修改已保存默认值，<code>--workspace</code> 只影响一条命令；同 Account 切换为本地操作，跨 Account 则在跨进程凭据锁内轮换 WorkOS Refresh Token。<code>logout</code> 会尝试远端撤销，并始终删除本地凭据。</p>
-
-<h2 id="automation-tokens">自动化 Token</h2>
-<pre><code>cats token create LABEL
+cats token create LABEL
 cats token list
 cats token revoke ID</code></pre>
-<p>Workspace Token 是供 CI 使用、可撤销的机器凭据。它只能管理签发 Workspace 内的资源，不能枚举其他 Workspace，也不能创建或撤销 Token。Secret 只展示一次；请保存到 CI 的 Secret Manager，并将它作为 <code>CATS_TOKEN</code>、将不可变 Workspace ID 作为 <code>CATS_WORKSPACE</code> 传入。</p>
 
-<h2 id="cat-commands">Cat 命令</h2>
-<pre><code>cats create NAME [--image IMAGE] [--cpus N] [--memory SIZE]
-                 [--root-size SIZE] [--disk NAME]
-                 [--disk-size SIZE] [--mount-at PATH] [--no-auto-suspend]
-                 [--expires-in SECONDS]
+<h2 id="cats">当前 Cat 命令</h2>
+<pre><code>cats create NAME --boot-image-digest sha256:DIGEST
+                 [--cpus N] [--memory SIZE]
+                 [--root-size SIZE]
+                 [--durability strict|relaxed]
 cats ls
-cats get NAME
-cats start NAME
-cats stop NAME
-cats suspend NAME
-cats resume NAME
-cats warm NAME
-cats destroy NAME
-cats expiry NAME [--in SECONDS | --at UNIX | --never]
-cats exec NAME [--timeout SECONDS] [--env-file PATH]
-               [--stdin-file PATH] -- COMMAND [ARG...]
-cats deploy CAT APP --image REGISTRY/REPOSITORY@sha256:DIGEST
-                [--env-file PATH]
-                [--registry-username USER --registry-password-stdin]
-                [-- COMMAND [ARG...]]</code></pre>
-<p><code>create</code> 默认使用 <code>ubuntu-24.04</code> 镜像、2 CPU、2 GiB 内存、1 GiB RootDisk，并开启自动休眠。容量支持 <code>KiB</code>、<code>MiB</code>、<code>GiB</code> 或原始字节。</p>
-<p><code>exec --env-file</code> 接受逐行 <code>NAME=VALUE</code>，并且只把它们加入 Guest 子进程环境；<code>--stdin-file</code> 将任意文件字节送入标准输入。自动化可以用它们传递 Bootstrap Script 和运行时凭据，而无需把内容放到命令行。不要打印含 Secret 的文件或进程环境。</p>
-<p><code>deploy</code> 在 Cat 内拉取 OCI/Docker manifest 与 layer，校验每个 <code>sha256</code> descriptor，将 layer 扁平化写入 RootDisk，再由 systemd 运行应用；不需要 Docker 或 OverlayFS。镜像必须固定到 digest，tag 会被拒绝。Registry 密码从 stdin 读取且不持久化。<code>deploy --env-file</code> 与 <code>exec --env-file</code> 不同：它会成为 RootDisk 上的持久 systemd 配置，以便 Cold boot 后继续启动服务，所以不能包含 Secret。</p>
+cats get CAT_ID</code></pre>
+<p><code>create</code> 要求 digest-pinned Boot Image，默认 2 CPU、2 GiB Memory、1 GiB RootDisk 与 Strict Durability。List 会跟随有界 Cursor；Item Lookup 只接受不可变 <code>cat_…</code> ID。</p>
 
-<h2 id="sleep-commands">自动休眠命令</h2>
-<pre><code>cats sleep on NAME
-cats sleep off NAME
-cats sleep status NAME</code></pre>
-<p>状态会报告平台/Guest 工作租约、信号新鲜度、是否具备休眠资格及当前原因。</p>
-
-<h2 id="disk-commands">磁盘命令</h2>
-<pre><code>cats disk create NAME --size SIZE
+<h2 id="disks">当前 PersistentDisk 命令</h2>
+<pre><code>cats disk create NAME --size SIZE [--durability strict|relaxed]
 cats disk ls
-cats disk get NAME
-cats disk resize NAME --size SIZE
-cats disk snapshot NAME
-cats disk delete NAME
-cats mount DISK --cat CAT [--at /data]
-cats unmount DISK</code></pre>
+cats disk get DISK_ID</code></pre>
+<p>Create Request 会在发送前持久化；同一命令遇到不明确响应时重用完全相同的 Path、Body 与 Idempotency-Key。这个 release 中容量不可变。Disk Item Lookup 只接受不可变 <code>disk_…</code> ID。</p>
 
-<h2 id="endpoint-commands">Endpoint 命令</h2>
-<pre><code>cats expose CAT PORT [--name web] [--protocol http] [--no-wake]
-cats endpoint ls CAT</code></pre>
-<p>每个 Cat 已经拥有转发 8080 的 <code>web</code> Endpoint。<code>cats expose CAT PORT</code> 会重新配置它；使用其他 <code>--name</code> 可增加 URL。</p>
+<h2 id="operations">Operation 命令</h2>
+<pre><code>cats operation get OPERATION_ID
+cats operation wait OPERATION_ID</code></pre>
+<p>Cat Create 返回 Operation ID。这两个命令都使用精确的 Workspace-scoped Operation Lookup；没有 Operation List。</p>
 
-<h2 id="operation-commands">Operation 命令</h2>
-<pre><code>cats operation get ID
-cats operation wait ID</code></pre>
-<p>Cat Create 返回已接受的 Operation ID。<code>operation get</code> 在当前 Workspace 精确读取该 Operation；<code>operation wait</code> 最多轮询 120 秒，并在 <code>failed</code> 或 <code>superseded</code> 时以失败退出。两个命令都使用严格的 Runtime Reconciliation Decoder。</p>
-<p><code>operation ls</code> 仍不可用，且不会发出 HTTP：Runtime Authority 有意不提供无界 Operation List。旧的全局 Operation URL 已退役。</p>
-
-<h2 id="automation">自动化建议</h2>
-<ul>
-  <li>使用 <code>--json</code>，不要解析对齐后的人类可读输出。</li>
-  <li>把非零退出码视为失败。Guest 命令非零时，<code>exec</code> 也会失败。</li>
-  <li>不要从 Resource ID、Work Lease ID 或 Operation ID 中解析含义。</li>
-  <li>普通用户使用 WorkOS 登录，CI 使用 Workspace Token；不要记录 Token，也不要用 Service/Administrator 凭据替代这两种 Scope。</li>
-</ul>
+<h2 id="cutover">Cutover 边界</h2>
+<p>Lifecycle、Guest Command、Deployment、Endpoint、Cat Delete 与 PersistentDisk Mutation 命令不会出现在发布版 Help 中。若保留兼容 Parser，它会在创建 HTTP Client 之前失败，绝不探测 Legacy Route。</p>

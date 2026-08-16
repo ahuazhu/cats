@@ -17,9 +17,10 @@ use cats_api::agent_registration::{
     NODE_PUBLIC_KEY_SPKI_HEADER, NODE_SIGNATURE_HEADER, REGISTRATION_PATH,
 };
 use cats_api::billing::BillingBalance;
+use cats_api::fleet_verification::{decode_fleet_verification_snapshot, FLEET_VERIFICATION_PATH};
 use cats_api::metering::{
     CatUsageCheckpoint, IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse, UsageMetric,
-    UsageReport, MAX_USAGE_INGEST_BODY_BYTES,
+    UsageReport, MAX_USAGE_INGEST_BODY_BYTES, USAGE_CHECKPOINTS_METHOD, USAGE_CHECKPOINTS_PATH,
 };
 use cats_api::nodejob::{NodeJob, NodeJobAction, NodeJobResult, StopCatDisposition};
 use cats_api::requests::*;
@@ -29,7 +30,7 @@ use cats_api::runtime_reconciliation::{
     encode_agent_registration_attempt, encode_desired_read_request, encode_node_observation,
     guest_config_digest, inventory_digest, AgentRegistrationAttempt, ContractVersion,
     CredentialBinding, DesiredReadRequest, Epoch, Id, NodeBootId, NodeIdentity, NodeIdentityState,
-    NodeObservation, RandomId128, Sequence, SessionBinding, UnixMillis,
+    NodeObservation, RandomId128, Revision, Sequence, SessionBinding, UnixMillis,
 };
 use cats_control_plane::controller::AutoTierPolicy;
 use cats_control_plane::server::{
@@ -38,17 +39,115 @@ use cats_control_plane::server::{
 use cats_control_plane::store::{DsnSource, OciDeploymentClaim, Store};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_metering::{
-    deterministic_event_id, AttributedCheckpoint, IngestOutcome, SqliteUsageStore, UsageAttribution,
+    deterministic_event_id, AttributedCheckpoint, IngestOutcome, RuntimeUsageSourceBinding,
+    SqliteUsageStore, UsageAttribution,
 };
 use cats_storage::MetadataStore;
 
 const SERVICE_TOKEN: &str = "dev-service-token";
+
+struct SignedUsageNode {
+    signer: Ed25519RequestSigner,
+    session: SessionBinding,
+}
 
 async fn reject_unexpected_production_node_call(
     State(calls): State<Arc<AtomicUsize>>,
 ) -> StatusCode {
     calls.fetch_add(1, Ordering::SeqCst);
     StatusCode::INTERNAL_SERVER_ERROR
+}
+
+#[tokio::test]
+async fn fleet_verification_route_is_production_admin_only_and_observation_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let usage: Arc<SqliteUsageStore> =
+        Arc::new(SqliteUsageStore::open(&dir.path().join("fleet-control.db")).unwrap());
+    let production = spawn_production(Config {
+        listen: "127.0.0.1:0".into(),
+        control_store_dsn: DsnSource::Literal(
+            cats_control_plane::testsupport::isolated_control_store_url(),
+        ),
+        control_store_ca_file: None,
+        usage_store: usage.clone(),
+        credit_store: usage,
+        retired_storage_meta_for_tests: None,
+        image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
+        auth_token: SERVICE_TOKEN.into(),
+        guest_runtime_profile_receipt:
+            cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
+        runtime_provisioner_trust_bundle:
+            cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
+        production_cutover_operator_trust_bundle:
+            cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
+        route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
+        admin_token: "dev-admin-token".into(),
+        workos: None,
+        stripe: None,
+        billing_enforcement_enabled: false,
+        node_lease_timeout_ms: 30_000,
+        reconcile_interval_ms: 30_000,
+        oci_deploy_sync_wait_ms: 5_000,
+        auto_tier_policy: AutoTierPolicy::default(),
+    })
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+    let url = format!("{}{}", production.base_url(), FLEET_VERIFICATION_PATH);
+
+    assert_eq!(client.get(&url).send().await.unwrap().status(), 401);
+    assert_eq!(
+        client
+            .get(&url)
+            .bearer_auth(SERVICE_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    let response = client
+        .get(&url)
+        .bearer_auth("dev-admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get_all(reqwest::header::CONTENT_TYPE)
+            .iter()
+            .map(reqwest::header::HeaderValue::as_bytes)
+            .collect::<Vec<_>>(),
+        vec![b"application/json".as_slice()]
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get_all(reqwest::header::CACHE_CONTROL)
+            .iter()
+            .map(reqwest::header::HeaderValue::as_bytes)
+            .collect::<Vec<_>>(),
+        vec![b"no-store".as_slice()]
+    );
+    let snapshot = decode_fleet_verification_snapshot(&response.bytes().await.unwrap()).unwrap();
+    assert!(snapshot.nodes.is_empty());
+    assert_eq!(snapshot.desired_runtime_count.get(), 0);
+    assert_eq!(snapshot.current_runtime_observation_count.get(), 0);
+    assert!(snapshot.route_signing_authority.is_none());
+
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth("dev-admin-token")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        405
+    );
+    production.shutdown().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -71,6 +170,7 @@ struct StubNode {
     /// models the ambiguous boundary where the Host is already serving the
     /// Guest but the control plane never receives the successful job result.
     lose_start_responses_remaining: Arc<AtomicUsize>,
+    started_volumes: Arc<Mutex<Vec<(String, String)>>>,
     /// Hold selected lifecycle HTTP responses after their result has been
     /// computed. Successful results are journaled by job id first, matching
     /// NodeRuntime's ambiguous-success boundary during a reconciler handoff;
@@ -79,8 +179,6 @@ struct StubNode {
     job_response_ready: Arc<tokio::sync::Notify>,
     job_response_release: Arc<tokio::sync::Notify>,
     applied_lifecycle_jobs: Arc<Mutex<HashMap<String, NodeJobResult>>>,
-    started_volume_epochs: Arc<Mutex<Vec<(String, String, i64)>>>,
-    storage_meta: Arc<dyn MetadataStore>,
     stop_dispositions: Arc<Mutex<Vec<StopCatDisposition>>>,
     /// Every OCI deploy that reached this node, as `(cat, app, image)`. The
     /// count is the assertion that matters: a retried or duplicated request
@@ -263,18 +361,11 @@ async fn stub_job(State(node): State<StubNode>, Json(job): Json<NodeJob>) -> Res
         let NodeJobAction::StartCat { volumes, .. } = &job.action else {
             unreachable!("checked StartCat above")
         };
-        let mut epochs = node.started_volume_epochs.lock().unwrap();
-        for volume in volumes {
-            let epoch = node
-                .storage_meta
-                .acquire_lease(&volume.volume_id, &volume.attachment_id, 60_000)
-                .unwrap();
-            epochs.push((
-                volume.volume_id.clone(),
-                volume.attachment_id.clone(),
-                epoch,
-            ));
-        }
+        node.started_volumes.lock().unwrap().extend(
+            volumes
+                .iter()
+                .map(|volume| (volume.volume_id.clone(), volume.attachment_id.clone())),
+        );
     }
     let (cat_id, observed) = match &job.action {
         NodeJobAction::StartCat { cat_id, .. } => (cat_id.clone(), ObservedState::Running),
@@ -394,12 +485,11 @@ async fn start_stub_node(cp: &Handle, id: &str) -> StubNode {
         exec_conflicts_remaining: Arc::new(AtomicUsize::new(0)),
         fail_jobs_remaining: Arc::new(Mutex::new(HashMap::new())),
         lose_start_responses_remaining: Arc::new(AtomicUsize::new(0)),
+        started_volumes: Arc::new(Mutex::new(Vec::new())),
         hold_job_responses_remaining: Arc::new(Mutex::new(HashMap::new())),
         job_response_ready: Arc::new(tokio::sync::Notify::new()),
         job_response_release: Arc::new(tokio::sync::Notify::new()),
         applied_lifecycle_jobs: Arc::new(Mutex::new(HashMap::new())),
-        started_volume_epochs: Arc::new(Mutex::new(Vec::new())),
-        storage_meta: cp.state.storage_meta.clone(),
         stop_dispositions: Arc::new(Mutex::new(Vec::new())),
         oci_deploys: Arc::new(Mutex::new(Vec::new())),
         oci_deploy_delay: Arc::new(Mutex::new(Duration::ZERO)),
@@ -605,13 +695,15 @@ impl Ctx {
             control_store_ca_file: None,
             usage_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
             credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
-            storage_meta,
+            retired_storage_meta_for_tests: Some(storage_meta),
             image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
             auth_token: SERVICE_TOKEN.into(),
             guest_runtime_profile_receipt:
                 cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
             runtime_provisioner_trust_bundle:
                 cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
+            production_cutover_operator_trust_bundle:
+                cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
             route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
             admin_token: "dev-admin-token".into(),
             workos: None,
@@ -713,19 +805,110 @@ impl Ctx {
         }
     }
 
-    /// [`Self::post_service`] for the endpoints whose response body is asserted.
-    async fn post_service_json<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+    async fn register_usage_node(&self, node_id: &str) -> SignedUsageNode {
+        static NEXT_REGISTRATION: AtomicUsize = AtomicUsize::new(1);
+        let unique = NEXT_REGISTRATION.fetch_add(1, Ordering::Relaxed) as u128;
+        let signer = Ed25519RequestSigner::from_pkcs8_pem(
+            Id::new(format!("credential_{node_id}")).unwrap(),
+            include_bytes!("../../tests/fixtures/route_grant_private_ed25519.pem"),
+        )
+        .unwrap();
+        let identity = NodeIdentity {
+            version: ContractVersion::V1,
+            node_id: Id::new(node_id).unwrap(),
+            provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+                provider: Id::new("test_provider").unwrap(),
+                partition: Id::new("test_partition").unwrap(),
+                account_id: Id::new("test_account").unwrap(),
+                region: Id::new("test_region").unwrap(),
+            },
+            immutable_host_id: Id::new(format!("host_{node_id}")).unwrap(),
+            credential_id: signer.credential_id().clone(),
+            credential_binding: CredentialBinding::PublicKey {
+                public_key_spki_sha256: signer.public_key_spki_sha256(),
+            },
+            state_path_id: Id::new(format!("state_{node_id}")).unwrap(),
+            state: NodeIdentityState::Provisioned,
+        };
+        cats_control_plane::testsupport::provision_node_identity(
+            &self.cp.state.store,
+            identity.clone(),
+        )
+        .await;
+        let attempt = AgentRegistrationAttempt {
+            version: ContractVersion::V1,
+            node_id: identity.node_id,
+            immutable_host_id: identity.immutable_host_id,
+            node_boot_id: NodeBootId::new(format!("{unique:032x}")).unwrap(),
+            agent_instance_id: RandomId128::new(format!("{:032x}", unique + 1)).unwrap(),
+            registration_attempt_id: RandomId128::new(format!("{:032x}", unique + 2)).unwrap(),
+            guest_config_digest: guest_config_digest(
+                &cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
+            )
+            .unwrap(),
+            expected_agent_session_epoch: None,
+        };
+        let body = encode_agent_registration_attempt(&attempt).unwrap();
+        let proof = signer.sign("POST", REGISTRATION_PATH, &body);
+        let response = self
+            .http
+            .post(self.url(REGISTRATION_PATH))
+            .header(reqwest::header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+            .header(NODE_CREDENTIAL_ID_HEADER, proof.credential_id)
+            .header(NODE_PUBLIC_KEY_SPKI_HEADER, proof.public_key_spki)
+            .header(NODE_SIGNATURE_HEADER, proof.signature)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.bytes().await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "AgentSession registration failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let session = decode_agent_session(&body).unwrap();
+        SignedUsageNode {
+            signer,
+            session: SessionBinding {
+                node_id: session.node_id,
+                node_boot_id: session.node_boot_id,
+                agent_instance_id: session.agent_instance_id,
+                agent_session_epoch: session.agent_session_epoch,
+            },
+        }
+    }
+
+    async fn post_signed_usage(
         &self,
-        url: String,
-        body: &B,
-    ) -> T {
+        node: &SignedUsageNode,
+        request: &IngestUsageCheckpointsRequest,
+    ) -> reqwest::Response {
+        let body = serde_json::to_vec(request).unwrap();
+        let proof = node
+            .signer
+            .sign(USAGE_CHECKPOINTS_METHOD, USAGE_CHECKPOINTS_PATH, &body);
         self.http
-            .post(url)
-            .bearer_auth(SERVICE_TOKEN)
-            .json(body)
+            .post(self.url(USAGE_CHECKPOINTS_PATH))
+            .header(reqwest::header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+            .header(NODE_CREDENTIAL_ID_HEADER, proof.credential_id)
+            .header(NODE_PUBLIC_KEY_SPKI_HEADER, proof.public_key_spki)
+            .header(NODE_SIGNATURE_HEADER, proof.signature)
+            .body(body)
             .send()
             .await
             .unwrap()
+    }
+
+    async fn post_signed_usage_json(
+        &self,
+        node: &SignedUsageNode,
+        request: &IngestUsageCheckpointsRequest,
+    ) -> IngestUsageCheckpointsResponse {
+        self.post_signed_usage(node, request)
+            .await
             .error_for_status()
             .unwrap()
             .json()
@@ -1079,13 +1262,15 @@ async fn two_api_replicas_linearize_create_start_and_delete() {
         control_store_ca_file: None,
         usage_store: usage.clone(),
         credit_store: usage,
-        storage_meta,
+        retired_storage_meta_for_tests: Some(storage_meta),
         image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
         auth_token: SERVICE_TOKEN.into(),
         guest_runtime_profile_receipt:
             cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
         runtime_provisioner_trust_bundle:
             cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
+        production_cutover_operator_trust_bundle:
+            cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
         route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
         admin_token: "dev-admin-token".into(),
         workos: None,
@@ -1216,13 +1401,15 @@ async fn reconciler_handoff_replays_persisted_suspending_with_the_same_job() {
         control_store_ca_file: None,
         usage_store: usage.clone(),
         credit_store: usage,
-        storage_meta,
+        retired_storage_meta_for_tests: Some(storage_meta),
         image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
         auth_token: SERVICE_TOKEN.into(),
         guest_runtime_profile_receipt:
             cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
         runtime_provisioner_trust_bundle:
             cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
+        production_cutover_operator_trust_bundle:
+            cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
         route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
         admin_token: "dev-admin-token".into(),
         workos: None,
@@ -1839,10 +2026,11 @@ async fn failed_warm_drain_keeps_the_host_bound_source_for_retry() {
 }
 
 #[tokio::test]
-async fn default_auto_suspend_fires_on_the_last_guest_work_release() {
+async fn default_auto_suspend_is_inert_on_the_last_guest_work_release() {
     let ctx = Ctx::new().await;
-    let _node = start_stub_node(&ctx.cp, "node_a").await;
-    ctx.create_cat("worker", None).await;
+    let node = start_stub_node(&ctx.cp, "node_a").await;
+    let created = ctx.create_cat("worker", None).await;
+    ctx.wait_operation(&created.operation.id).await;
     let cat = ctx.wait_observed("worker", ObservedState::Running).await;
     assert!(cat.auto_suspend);
 
@@ -1879,58 +2067,98 @@ async fn default_auto_suspend_fires_on_the_last_guest_work_release() {
         ObservedState::Running
     );
 
+    let operations_before = serde_json::to_value(
+        ctx.get_json::<ListResponse<Operation>>(ctx.ws_url("/operations"))
+            .await,
+    )
+    .unwrap();
+    let jobs_before = node.jobs.lock().unwrap().clone();
     ctx.record_retired_work(report(2, vec![])).await;
-    let suspended = ctx.wait_observed("worker", ObservedState::Suspended).await;
-    assert_eq!(suspended.desired_state, DesiredState::Suspended);
-
-    let operations: ListResponse<Operation> = ctx.get_json(ctx.ws_url("/operations")).await;
-    assert!(operations.items.iter().any(|operation| {
-        operation.kind == "cat.auto_suspend" && operation.phase == OperationPhase::Succeeded
-    }));
+    // The first terminal release has no ResumeRuntime token, so even an
+    // explicitly idle Guest must not manufacture lifecycle intent. Wait for
+    // several reconcile ticks before comparing the authority-bearing fields.
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    let unchanged: Cat = ctx.get_json(ctx.ws_url("/cats/worker")).await;
+    assert_eq!(unchanged.desired_state, DesiredState::Running);
+    assert_eq!(unchanged.observed_state, ObservedState::Running);
+    assert_eq!(unchanged.generation, cat.generation);
+    assert_eq!(unchanged.node_id, cat.node_id);
+    assert_eq!(node.jobs.lock().unwrap().as_slice(), jobs_before.as_slice());
+    assert_eq!(
+        serde_json::to_value(
+            ctx.get_json::<ListResponse<Operation>>(ctx.ws_url("/operations"))
+                .await,
+        )
+        .unwrap(),
+        operations_before,
+    );
 }
 
 #[tokio::test]
 async fn automatic_tiers_progress_from_suspended_through_warm_to_cold() {
     let ctx = Ctx::new_with_auto_tier(
         AutoTierPolicy {
-            warm_after_ms: Some(100),
-            cold_after_ms: Some(100),
+            warm_after_ms: Some(500),
+            cold_after_ms: Some(500),
         },
         20,
     )
     .await;
     let node = start_stub_node(&ctx.cp, "node_a").await;
-    ctx.create_cat("tiered", None).await;
+    let created = ctx.create_cat("tiered", None).await;
+    ctx.wait_operation(&created.operation.id).await;
     let cat = ctx.wait_observed("tiered", ObservedState::Running).await;
+    let cat_id = cat.id.clone();
+    let setup_suspend = ctx
+        .cp
+        .state
+        .store
+        .execute(move |store| {
+            store.set_desired(&cat_id, DesiredState::Suspended, None, "cat.suspend")
+        })
+        .await
+        .unwrap();
+    ctx.cp.state.notify.notify_one();
+    let setup_suspend = ctx.wait_operation(&setup_suspend.id).await;
+    assert_eq!(setup_suspend.phase, OperationPhase::Succeeded);
+    let suspended = ctx.wait_observed("tiered", ObservedState::Suspended).await;
+    assert_eq!(suspended.desired_state, DesiredState::Suspended);
+    assert_eq!(suspended.generation, cat.generation + 1);
+    assert!(suspended.observed_state_since_unix_ms > 0);
 
-    ctx.record_retired_work(NodeWorkStatusRequest {
-        node_id: "node_a".into(),
-        cat_id: cat.id.clone(),
-        generation: cat.generation,
-        guest_source_epoch: "guest-boot-1".into(),
-        guest_lease_sequence: 0,
-        leases: vec![],
-    })
-    .await;
-
+    // Suspend is deliberately not a production API in the first terminal
+    // release. The retired Store fixture above establishes the legal
+    // host-bound state without reviving that route; the automatic deeper-tier
+    // policy still owns persisted-age Suspended -> Warm -> Cold convergence.
     let cold = ctx.wait_observed("tiered", ObservedState::Cold).await;
     assert_eq!(cold.desired_state, DesiredState::Cold);
+    assert_eq!(cold.generation, cat.generation + 3);
     assert!(cold.node_id.is_none());
-    assert!(cold.observed_state_since_unix_ms > 0);
+    assert!(
+        cold.observed_state_since_unix_ms > suspended.observed_state_since_unix_ms,
+        "each observed tier must persist a new state-age origin"
+    );
 
     let operations: ListResponse<Operation> = ctx.get_json(ctx.ws_url("/operations")).await;
-    for kind in ["cat.auto_suspend", "cat.auto_warm", "cat.auto_cold"] {
+    for (kind, generation) in [
+        ("cat.auto_warm", cat.generation + 2),
+        ("cat.auto_cold", cat.generation + 3),
+    ] {
         assert!(
+            operations.items.iter().any(|operation| {
+                operation.kind == kind
+                    && operation.resource_generation == generation
+                    && operation.phase == OperationPhase::Succeeded
+            }),
+            "missing successful {kind} for generation {generation}: {:?}",
             operations
                 .items
                 .iter()
-                .any(|operation| operation.kind == kind
-                    && operation.phase == OperationPhase::Succeeded),
-            "missing successful {kind}: {:?}",
-            operations
-                .items
-                .iter()
-                .map(|operation| (&operation.kind, operation.phase))
+                .map(|operation| (
+                    &operation.kind,
+                    operation.resource_generation,
+                    operation.phase
+                ))
                 .collect::<Vec<_>>()
         );
     }
@@ -1943,8 +2171,8 @@ async fn automatic_tiers_progress_from_suspended_through_warm_to_cold() {
 async fn rwo_second_bind_is_rejected() {
     let ctx = Ctx::new().await;
     let _node = start_stub_node(&ctx.cp, "node_a").await;
-    ctx.create_cat("cat-a", None).await;
-    ctx.create_cat("cat-b", None).await;
+    let cat_a = ctx.create_cat("cat-a", None).await.cat;
+    let cat_b = ctx.create_cat("cat-b", None).await.cat;
     ctx.wait_observed("cat-a", ObservedState::Running).await;
     ctx.wait_observed("cat-b", ObservedState::Running).await;
 
@@ -1965,57 +2193,56 @@ async fn rwo_second_bind_is_rejected() {
         .unwrap();
     assert_eq!(disk.state, DiskState::Available);
 
-    let mount = |cat: &str| serde_json::json!({ "cat_id": cat, "mount_at": "/data" });
-    let r1 = ctx
-        .http
-        .post(ctx.ws_url("/disks/shared/actions/mount"))
-        .bearer_auth("dev-admin-token")
-        .json(&mount("cat-a"))
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        r1.status().is_success(),
-        "first mount failed: {}",
-        r1.status()
-    );
+    // The V1 HTTP writer is intentionally absent even from the retired product
+    // fixture. Keep that cutover boundary closed while the fixture's existing
+    // Store seam characterizes the old product model below.
+    for verb in ["mount", "unmount"] {
+        let response = ctx
+            .http
+            .post(ctx.ws_url(&format!("/disks/shared/actions/{verb}")))
+            .bearer_auth("dev-admin-token")
+            .json(&serde_json::json!({"cat_id": "cat-a", "mount_at": "/data"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "retired {verb} route resurfaced");
+    }
 
-    let r2 = ctx
-        .http
-        .post(ctx.ws_url("/disks/shared/actions/mount"))
-        .bearer_auth("dev-admin-token")
-        .json(&mount("cat-b"))
-        .send()
-        .await
+    let first = ctx
+        .cp
+        .state
+        .store
+        .bind_disk(&disk.id, &cat_a.id, "/data")
         .unwrap();
-    assert_eq!(r2.status(), 409, "RWO second mount must conflict");
+    assert_eq!(first.disk_id, disk.id);
+    assert_eq!(first.cat_id, cat_a.id);
 
-    // Deleting a bound disk is refused; unmount frees it.
-    let del = ctx
+    let conflict = ctx
+        .cp
+        .state
+        .store
+        .bind_disk(&disk.id, &cat_b.id, "/data")
+        .unwrap_err();
+    assert_eq!(conflict.code, cats_api::error::ErrorCode::Conflict);
+
+    let delete_bound = ctx
         .http
         .delete(ctx.ws_url("/disks/shared"))
         .bearer_auth("dev-admin-token")
         .send()
         .await
         .unwrap();
-    assert_eq!(del.status(), 412);
-    let um = ctx
-        .http
-        .post(ctx.ws_url("/disks/shared/actions/unmount"))
-        .bearer_auth("dev-admin-token")
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .unwrap();
-    assert!(um.status().is_success());
-    let del = ctx
+    assert_eq!(delete_bound.status(), 412);
+
+    ctx.cp.state.store.unbind_disk(&disk.id).unwrap();
+    let delete_available = ctx
         .http
         .delete(ctx.ws_url("/disks/shared"))
         .bearer_auth("dev-admin-token")
         .send()
         .await
         .unwrap();
-    assert_eq!(del.status(), 204);
+    assert_eq!(delete_available.status(), 204);
 }
 
 #[tokio::test]
@@ -2085,7 +2312,7 @@ async fn snapshot_requires_the_running_disks_remote_watermark() {
 }
 
 #[tokio::test]
-async fn ambiguous_start_response_retries_the_same_claim_without_revoking_its_epoch() {
+async fn ambiguous_start_response_retries_the_same_node_job() {
     let ctx = Ctx::new_with_auto_tier(Default::default(), 1_500).await;
     let source = start_stub_node(&ctx.cp, "node_z").await;
     source
@@ -2095,22 +2322,16 @@ async fn ambiguous_start_response_retries_the_same_claim_without_revoking_its_ep
 
     ctx.create_cat("ambiguous-start", None).await;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let (volume_id, attachment_id, epoch) = loop {
-        if let Some(epoch) = source
-            .started_volume_epochs
-            .lock()
-            .unwrap()
-            .first()
-            .cloned()
-        {
-            break epoch;
+    loop {
+        if !source.started_volumes.lock().unwrap().is_empty() {
+            break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "the injected StartCat never acquired its disk epoch"
+            "the injected StartCat never presented its disk binding"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    }
 
     // If the control plane treats the missing response as a failed launch, this
     // lexicographically earlier node wins the next placement. A safe retry must
@@ -2140,15 +2361,10 @@ async fn ambiguous_start_response_retries_the_same_claim_without_revoking_its_ep
             .all(|job| !job.contains("_start_cat")),
         "an ambiguous launch must not move to another Host"
     );
-    ctx.cp
-        .state
-        .storage_meta
-        .renew_lease(&volume_id, &attachment_id, epoch, 60_000)
-        .expect("replaying an ambiguous StartCat must preserve its live disk epoch");
 }
 
 #[tokio::test]
-async fn node_loss_preserves_claim_until_fencing_is_explicitly_confirmed() {
+async fn node_loss_preserves_placement_until_fencing_is_explicitly_confirmed() {
     let ctx = Ctx::new().await;
     let node_a = start_stub_node(&ctx.cp, "node_a").await;
     ctx.create_cat("dev", None).await;
@@ -2157,20 +2373,6 @@ async fn node_loss_preserves_claim_until_fencing_is_explicitly_confirmed() {
     ctx.create_cat("doomed", None).await;
     let doomed = ctx.wait_observed("doomed", ObservedState::Running).await;
     assert_eq!(doomed.node_id.as_deref(), Some("node_a"));
-    let root = ctx
-        .cp
-        .state
-        .store
-        .get_disk(&cat.workspace_id, &cat.root_disk_id)
-        .unwrap();
-    let old_attachment = "old-node-a-attachment";
-    let old_epoch = ctx
-        .cp
-        .state
-        .storage_meta
-        .acquire_lease(&root.volume_id, old_attachment, 60_000)
-        .unwrap();
-
     // A second node joins and the first heartbeat stream is interrupted. This
     // is suspicion, not proof that the old runtime has stopped.
     let node_b = start_stub_node(&ctx.cp, "node_b").await;
@@ -2194,11 +2396,6 @@ async fn node_loss_preserves_claim_until_fencing_is_explicitly_confirmed() {
     assert_eq!(cat.observed_state, ObservedState::Unknown);
     assert_eq!(cat.node_id.as_deref(), Some("node_a"));
     assert!(node_b.cats.lock().unwrap().is_empty());
-    ctx.cp
-        .state
-        .storage_meta
-        .renew_lease(&root.volume_id, old_attachment, old_epoch, 60_000)
-        .expect("heartbeat loss alone must not revoke the old epoch");
 
     // A restarted agent cannot prove that its preserved claims are still
     // running by merely re-registering and sending an empty inventory. Keep
@@ -2312,11 +2509,6 @@ async fn node_loss_preserves_claim_until_fencing_is_explicitly_confirmed() {
         .await
         .unwrap();
     assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
-    ctx.cp
-        .state
-        .storage_meta
-        .renew_lease(&root.volume_id, old_attachment, old_epoch, 60_000)
-        .expect("a rejected fence confirmation must leave the claim intact");
 
     let fenced = ctx
         .http
@@ -2348,13 +2540,6 @@ async fn node_loss_preserves_claim_until_fencing_is_explicitly_confirmed() {
             .status(),
         StatusCode::NOT_FOUND
     );
-    assert!(matches!(
-        ctx.cp
-            .state
-            .storage_meta
-            .renew_lease(&root.volume_id, old_attachment, old_epoch, 60_000),
-        Err(cats_storage::MetaError::Fenced)
-    ));
 }
 
 #[tokio::test]
@@ -2426,13 +2611,15 @@ async fn control_plane_startup_grace_preserves_a_reconnecting_host_bound_cat() {
         credit_store: Arc::new(SqliteUsageStore::open(&db_path).unwrap()),
         control_store_dsn: cats_control_plane::store::DsnSource::Literal(control_store_url),
         control_store_ca_file: None,
-        storage_meta,
+        retired_storage_meta_for_tests: Some(storage_meta),
         image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
         auth_token: SERVICE_TOKEN.into(),
         guest_runtime_profile_receipt:
             cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
         runtime_provisioner_trust_bundle:
             cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
+        production_cutover_operator_trust_bundle:
+            cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
         route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
         admin_token: "dev-admin-token".into(),
         workos: None,
@@ -2673,10 +2860,11 @@ async fn exec_retries_a_transient_suspend_conflict() {
 async fn destroy_deletes_root_disk_and_keeps_persistent() {
     let ctx = Ctx::new().await;
     let node = start_stub_node(&ctx.cp, "node_a").await;
-    ctx.create_cat("dev", None).await;
+    let created = ctx.create_cat("dev", None).await;
     ctx.wait_observed("dev", ObservedState::Running).await;
-    // Attach a persistent disk.
-    ctx.http
+
+    let disk: Disk = ctx
+        .http
         .post(ctx.ws_url("/disks"))
         .bearer_auth("dev-admin-token")
         .json(&CreateDiskRequest {
@@ -2686,14 +2874,18 @@ async fn destroy_deletes_root_disk_and_keeps_persistent() {
         })
         .send()
         .await
-        .unwrap();
-    ctx.http
-        .post(ctx.ws_url("/disks/keep/actions/mount"))
-        .bearer_auth("dev-admin-token")
-        .json(&serde_json::json!({"cat_id": "dev", "mount_at": "/data"}))
-        .send()
+        .unwrap()
+        .json()
         .await
         .unwrap();
+    let binding = ctx
+        .cp
+        .state
+        .store
+        .bind_disk(&disk.id, &created.cat.id, "/data")
+        .unwrap();
+    assert_eq!(binding.disk_id, disk.id);
+    assert_eq!(binding.cat_id, created.cat.id);
 
     let resp = ctx
         .http
@@ -2758,13 +2950,15 @@ async fn static_user_tokens_are_not_accepted() {
         control_store_ca_file: None,
         usage_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
         credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
-        storage_meta,
+        retired_storage_meta_for_tests: Some(storage_meta),
         image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
         auth_token: SERVICE_TOKEN.into(),
         guest_runtime_profile_receipt:
             cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
         runtime_provisioner_trust_bundle:
             cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
+        production_cutover_operator_trust_bundle:
+            cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
         route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
         admin_token: "token-admin".into(),
         workos: None,
@@ -2811,7 +3005,6 @@ async fn usage_ingestion_rejects_bodies_above_the_explicit_limit() {
     let response = ctx
         .http
         .post(ctx.url("/v1/internal/usage/checkpoints"))
-        .bearer_auth(SERVICE_TOKEN)
         .header("content-type", "application/json")
         .body(vec![b' '; MAX_USAGE_INGEST_BODY_BYTES + 1])
         .send()
@@ -2824,20 +3017,28 @@ async fn usage_ingestion_rejects_bodies_above_the_explicit_limit() {
 async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metric() {
     let ctx = Ctx::new().await;
     let _node = start_stub_node(&ctx.cp, "node_a").await;
+    let usage_node = ctx.register_usage_node("node_a").await;
     ctx.create_cat("metered", None).await;
     let cat = ctx.wait_observed("metered", ObservedState::Running).await;
+    let source_epoch = format!(
+        "session:{}:{}:desired:{}:runtime:33333333333333333333333333333333:processes:test-scope:1:1:runtime",
+        usage_node.session.agent_instance_id,
+        usage_node.session.agent_session_epoch.get(),
+        cat.generation,
+    );
 
     let make_checkpoint =
         |metric: UsageMetric, sequence: u64, observed_at_unix_ms: i64, quantity: u128| {
             let mut checkpoint = CatUsageCheckpoint {
                 event_id: String::new(),
                 source_id: format!("node/node_a/cat/{}", cat.id),
-                source_epoch: "runtime-1".to_string(),
+                source_epoch: source_epoch.clone(),
                 sequence,
                 observed_at_unix_ms,
                 cat_id: cat.id.clone(),
                 cat_generation: cat.generation,
                 metric,
+                epoch_marker: cats_api::metering::UsageEpochMarker::Open,
                 cumulative_quantity: quantity,
             };
             checkpoint.event_id = deterministic_event_id(&checkpoint);
@@ -2856,6 +3057,7 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
         ),
     ];
     let request = IngestUsageCheckpointsRequest {
+        session: usage_node.session.clone(),
         node_id: "node_a".to_string(),
         checkpoints,
     };
@@ -2864,6 +3066,15 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
             .state
             .usage
             .ingest(&AttributedCheckpoint {
+                source_binding: RuntimeUsageSourceBinding {
+                    session: usage_node.session.clone(),
+                    desired_revision: Revision::new(
+                        u64::try_from(request.checkpoints[0].cat_generation).unwrap(),
+                    )
+                    .unwrap(),
+                    runtime_incarnation: RandomId128::new("33333333333333333333333333333333",)
+                        .unwrap(),
+                },
                 attribution: UsageAttribution {
                     billing_account_id: ctx
                         .cp
@@ -2882,15 +3093,11 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
             .unwrap(),
         IngestOutcome::Accepted
     );
-    let first: IngestUsageCheckpointsResponse = ctx
-        .post_service_json(ctx.url("/v1/internal/usage/checkpoints"), &request)
-        .await;
+    let first = ctx.post_signed_usage_json(&usage_node, &request).await;
     assert_eq!(first.accepted, 3);
     assert_eq!(first.duplicates, 1);
 
-    let replay: IngestUsageCheckpointsResponse = ctx
-        .post_service_json(ctx.url("/v1/internal/usage/checkpoints"), &request)
-        .await;
+    let replay = ctx.post_signed_usage_json(&usage_node, &request).await;
     assert_eq!(replay.accepted, 0);
     assert_eq!(replay.duplicates, 4);
 
@@ -2978,6 +3185,7 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
     let transitioned = ctx.wait_observed("metered", ObservedState::Suspended).await;
     assert!(transitioned.generation > cat.generation);
     let historical = IngestUsageCheckpointsRequest {
+        session: usage_node.session.clone(),
         node_id: "node_a".to_string(),
         checkpoints: vec![make_checkpoint(
             UsageMetric::CpuUsec,
@@ -2986,26 +3194,22 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
             3_600_000_001,
         )],
     };
-    let accepted_historical: IngestUsageCheckpointsResponse = ctx
-        .post_service_json(ctx.url("/v1/internal/usage/checkpoints"), &historical)
-        .await;
+    let accepted_historical = ctx.post_signed_usage_json(&usage_node, &historical).await;
     assert_eq!(accepted_historical.accepted, 1);
 
     let mut future_checkpoint = historical.checkpoints[0].clone();
     future_checkpoint.cat_generation = transitioned.generation + 1;
     future_checkpoint.event_id = deterministic_event_id(&future_checkpoint);
-    let future = ctx
-        .http
-        .post(ctx.url("/v1/internal/usage/checkpoints"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&IngestUsageCheckpointsRequest {
-            node_id: "node_a".to_string(),
-            checkpoints: vec![future_checkpoint],
-        })
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(future.status(), StatusCode::CONFLICT);
+    let future_request = IngestUsageCheckpointsRequest {
+        session: usage_node.session.clone(),
+        node_id: "node_a".to_string(),
+        checkpoints: vec![future_checkpoint],
+    };
+    // The bumped generation no longer matches the checkpoint's signed source
+    // binding, so the signed pipeline classifies the pair as invalid input
+    // rather than a settling conflict.
+    let future = ctx.post_signed_usage(&usage_node, &future_request).await;
+    assert_eq!(future.status(), StatusCode::BAD_REQUEST);
 
     let deleted = ctx
         .http
@@ -3033,22 +3237,19 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    let deleted_tail_request = IngestUsageCheckpointsRequest {
+        session: usage_node.session.clone(),
+        node_id: "node_a".to_string(),
+        checkpoints: vec![make_checkpoint(
+            UsageMetric::CpuUsec,
+            3,
+            hour_end + 2_000,
+            3_600_000_002,
+        )],
+    };
     let deleted_tail: IngestUsageCheckpointsResponse = ctx
-        .http
-        .post(ctx.url("/v1/internal/usage/checkpoints"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&IngestUsageCheckpointsRequest {
-            node_id: "node_a".to_string(),
-            checkpoints: vec![make_checkpoint(
-                UsageMetric::CpuUsec,
-                3,
-                hour_end + 2_000,
-                3_600_000_002,
-            )],
-        })
-        .send()
+        .post_signed_usage(&usage_node, &deleted_tail_request)
         .await
-        .unwrap()
         .error_for_status()
         .unwrap()
         .json()
@@ -3101,74 +3302,6 @@ async fn cumulative_usage_is_idempotent_and_queryable_by_workspace_cat_and_metri
 }
 
 #[tokio::test]
-async fn exhausted_prepaid_balance_blocks_new_or_waking_compute() {
-    let ctx = Ctx::new().await;
-    let _node = start_stub_node(&ctx.cp, "node_a").await;
-    ctx.create_cat("spender", None).await;
-    let cat = ctx.wait_observed("spender", ObservedState::Running).await;
-    let checkpoint = |sequence, observed_at_unix_ms, cumulative_quantity| {
-        let mut checkpoint = CatUsageCheckpoint {
-            event_id: String::new(),
-            source_id: format!("node/node_a/cat/{}", cat.id),
-            source_epoch: "expensive-runtime".to_string(),
-            sequence,
-            observed_at_unix_ms,
-            cat_id: cat.id.clone(),
-            cat_generation: cat.generation,
-            metric: UsageMetric::CpuUsec,
-            cumulative_quantity,
-        };
-        checkpoint.event_id = deterministic_event_id(&checkpoint);
-        checkpoint
-    };
-    let response = ctx
-        .http
-        .post(ctx.url("/v1/internal/usage/checkpoints"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&IngestUsageCheckpointsRequest {
-            node_id: "node_a".to_string(),
-            checkpoints: vec![
-                checkpoint(0, 1_000, 0),
-                checkpoint(1, 720_001_000, 720_000_000_000),
-            ],
-        })
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-
-    ctx.action("spender", "suspend").await;
-    ctx.wait_observed("spender", ObservedState::Suspended).await;
-    let resume = ctx
-        .http
-        .post(ctx.ws_url("/cats/spender/actions/resume"))
-        .bearer_auth("dev-admin-token")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resume.status(), StatusCode::PAYMENT_REQUIRED);
-    let body: cats_api::error::ErrorBody = resume.json().await.unwrap();
-    assert_eq!(body.code, cats_api::error::ErrorCode::PaymentRequired);
-
-    let create = ctx
-        .http
-        .post(ctx.ws_url("/cats"))
-        .bearer_auth("dev-admin-token")
-        .json(&serde_json::json!({
-            "name": "blocked",
-            "image": "ubuntu-24.04",
-            "cpus": 1,
-            "memory_mib": 512,
-            "root_size_bytes": 8 << 20,
-            "disk": null
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(create.status(), StatusCode::PAYMENT_REQUIRED);
-}
-
-#[tokio::test]
 async fn every_composition_closes_old_node_ingress_and_accepts_the_signed_spine() {
     let ctx = Ctx::new().await;
     for path in [
@@ -3196,6 +3329,12 @@ async fn every_composition_closes_old_node_ingress_and_accepts_the_signed_spine(
     let identity = NodeIdentity {
         version: ContractVersion::V1,
         node_id: Id::new("fixture-node").unwrap(),
+        provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+            provider: Id::new("test_provider").unwrap(),
+            partition: Id::new("test_partition").unwrap(),
+            account_id: Id::new("test_account").unwrap(),
+            region: Id::new("test_region").unwrap(),
+        },
         immutable_host_id: Id::new("fixture-host").unwrap(),
         credential_id: signer.credential_id().clone(),
         credential_binding: CredentialBinding::PublicKey {
@@ -3316,8 +3455,6 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
     let dir = tempfile::tempdir().unwrap();
     let usage: Arc<SqliteUsageStore> =
         Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap());
-    let storage_meta: Arc<dyn MetadataStore> =
-        Arc::new(SqliteMetadataStore::open(&dir.path().join("storage-meta.db")).unwrap());
     let config = Config {
         listen: "127.0.0.1:0".into(),
         control_store_dsn: DsnSource::Literal(
@@ -3326,13 +3463,15 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
         control_store_ca_file: None,
         usage_store: usage.clone(),
         credit_store: usage,
-        storage_meta,
+        retired_storage_meta_for_tests: None,
         image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
         auth_token: SERVICE_TOKEN.into(),
         guest_runtime_profile_receipt:
             cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
         runtime_provisioner_trust_bundle:
             cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
+        production_cutover_operator_trust_bundle:
+            cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
         route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
         admin_token: "dev-admin-token".into(),
         workos: None,
@@ -3345,19 +3484,8 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
     };
     let mut legacy_billing = config.clone();
     legacy_billing.billing_enforcement_enabled = true;
-    let billing_error = match spawn_production(legacy_billing).await {
-        Ok(handle) => {
-            handle.shutdown().await.unwrap();
-            panic!("production started the legacy Cat billing enforcer")
-        }
-        Err(error) => error,
-    };
-    assert!(
-        billing_error
-            .to_string()
-            .contains("legacy Cat billing enforcement is unavailable"),
-        "unexpected startup error: {billing_error:#}",
-    );
+    let billing = spawn_production(legacy_billing).await.unwrap();
+    billing.shutdown().await.unwrap();
     let production = spawn_production(config.clone()).await.unwrap();
     let workspace_id = default_workspace_id(&production);
 
@@ -3446,31 +3574,70 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
     let nodes_before = serde_json::to_value(production.state.store.list_nodes().unwrap()).unwrap();
 
     let workspace_base = format!("{}/v1/workspaces/{workspace_id}", production.base_url());
+    let usage_url = format!("{}{}", production.base_url(), USAGE_CHECKPOINTS_PATH);
+
+    // Signed A19 usage ingestion is the one production route that owns this
+    // path now. The retired shared bearer must not be accepted as a fallback,
+    // and omitting the three A19 proof headers must reach the signed
+    // authentication envelope rather than any legacy handler.
+    let legacy_bearer = client
+        .post(&usage_url)
+        .bearer_auth(SERVICE_TOKEN)
+        .json(&serde_json::json!({"checkpoints": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(legacy_bearer.status(), StatusCode::BAD_REQUEST);
+    let legacy_bearer_error: cats_api::error::ErrorBody = legacy_bearer.json().await.unwrap();
+    assert_eq!(
+        legacy_bearer_error.code,
+        cats_api::error::ErrorCode::InvalidArgument
+    );
+
+    let unsigned = client
+        .post(&usage_url)
+        .json(&serde_json::json!({"checkpoints": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        unsigned
+            .headers()
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .and_then(|value| value.to_str().ok()),
+        Some("CatsNodeSignature realm=\"runtime-internal\"")
+    );
+    let unsigned_error: cats_api::error::ErrorBody = unsigned.json().await.unwrap();
+    assert_eq!(
+        unsigned_error.code,
+        cats_api::error::ErrorCode::Unauthenticated
+    );
+    assert_eq!(outbound_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        serde_json::to_value(
+            production
+                .state
+                .store
+                .must_get_cat_by_id(&legacy_cat.id)
+                .unwrap()
+        )
+        .unwrap(),
+        cat_before_json
+    );
+    assert_eq!(
+        serde_json::to_value(
+            production
+                .state
+                .store
+                .list_operations(&workspace_id)
+                .unwrap()
+        )
+        .unwrap(),
+        operations_before
+    );
+
     let closed = vec![
-        (
-            reqwest::Method::GET,
-            format!("{workspace_base}/cats"),
-            None,
-            "invalid-before-cutover-gate",
-        ),
-        (
-            reqwest::Method::GET,
-            format!("{workspace_base}/cats/signed-cutover"),
-            None,
-            "invalid-before-cutover-gate",
-        ),
-        (
-            reqwest::Method::DELETE,
-            format!("{workspace_base}/cats/signed-cutover"),
-            None,
-            "invalid-before-cutover-gate",
-        ),
-        (
-            reqwest::Method::POST,
-            format!("{workspace_base}/cats/signed-cutover/actions/stop"),
-            Some(serde_json::json!({})),
-            "invalid-before-cutover-gate",
-        ),
         (
             reqwest::Method::POST,
             format!("{workspace_base}/cats/signed-cutover/exec"),
@@ -3491,12 +3658,6 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
             format!("{workspace_base}/cats/signed-cutover/oci-deployments"),
             None,
             "invalid-before-cutover-gate",
-        ),
-        (
-            reqwest::Method::POST,
-            format!("{workspace_base}/cats/signed-cutover/actions/sync"),
-            None,
-            "dev-admin-token",
         ),
         (
             reqwest::Method::GET,
@@ -3530,57 +3691,6 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
         ),
         (
             reqwest::Method::POST,
-            format!("{workspace_base}/cats/signed-cutover/endpoints"),
-            Some(serde_json::json!({"name": "web"})),
-            "invalid-before-cutover-gate",
-        ),
-        (
-            reqwest::Method::GET,
-            format!("{workspace_base}/cats/signed-cutover/endpoints"),
-            None,
-            "invalid-before-cutover-gate",
-        ),
-        (
-            reqwest::Method::GET,
-            format!("{workspace_base}/disks"),
-            None,
-            "invalid-before-cutover-gate",
-        ),
-        (
-            reqwest::Method::GET,
-            format!("{workspace_base}/disks/{legacy_disk_id}"),
-            None,
-            "invalid-before-cutover-gate",
-        ),
-        (
-            reqwest::Method::DELETE,
-            format!("{workspace_base}/disks/{legacy_disk_id}"),
-            None,
-            "invalid-before-cutover-gate",
-        ),
-        (
-            reqwest::Method::POST,
-            format!("{workspace_base}/disks/{legacy_disk_id}/actions/resize"),
-            Some(serde_json::json!({"size_bytes": 16 << 20})),
-            "invalid-before-cutover-gate",
-        ),
-        (
-            reqwest::Method::POST,
-            format!("{workspace_base}/disks/old/actions/mount"),
-            Some(serde_json::json!({
-                "cat_id": "signed-cutover",
-                "mount_at": "/data"
-            })),
-            "dev-admin-token",
-        ),
-        (
-            reqwest::Method::POST,
-            format!("{workspace_base}/disks/old/actions/unmount"),
-            Some(serde_json::json!({})),
-            "dev-admin-token",
-        ),
-        (
-            reqwest::Method::POST,
             format!("{workspace_base}/disks/old/snapshots"),
             None,
             "dev-admin-token",
@@ -3604,18 +3714,6 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
         (
             reqwest::Method::GET,
             format!("{workspace_base}/operations"),
-            None,
-            "invalid-before-cutover-gate",
-        ),
-        (
-            reqwest::Method::POST,
-            format!("{}/v1/internal/usage/checkpoints", production.base_url()),
-            Some(serde_json::json!({"checkpoints": []})),
-            "invalid-before-cutover-gate",
-        ),
-        (
-            reqwest::Method::GET,
-            format!("{workspace_base}/billing/usage"),
             None,
             "invalid-before-cutover-gate",
         ),
@@ -3707,6 +3805,72 @@ async fn production_signed_cutover_never_runs_or_enters_the_legacy_node_runtime(
             "legacy runtime entry point stayed reachable: {url}",
         );
     }
+
+    // Product reads are part of the cutover authority. They authenticate as
+    // production routes instead of falling through the retired-authority
+    // closure, even when a seeded legacy row shares the requested identity.
+    for url in [
+        format!("{workspace_base}/cats"),
+        format!("{workspace_base}/cats/signed-cutover"),
+        format!("{workspace_base}/disks"),
+        format!("{workspace_base}/disks/{legacy_disk_id}"),
+        format!("{workspace_base}/billing/usage?from_ms=0&to_ms=1"),
+    ] {
+        assert_eq!(
+            client
+                .get(&url)
+                .bearer_auth("invalid-before-cutover-gate")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED,
+            "production product read did not reach its authentication envelope: {url}",
+        );
+    }
+
+    // Endpoint list is a real v2 production read (A6); for an unknown Cat it
+    // answers through the runtime read authority, never a legacy handler.
+    assert_eq!(
+        client
+            .get(format!("{workspace_base}/cats/signed-cutover/endpoints"))
+            .bearer_auth("dev-admin-token")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND,
+    );
+    for url in [
+        format!("{workspace_base}/disks/{legacy_disk_id}/actions/resize"),
+        format!("{workspace_base}/disks/old/actions/mount"),
+        format!("{workspace_base}/disks/old/actions/unmount"),
+    ] {
+        assert_eq!(
+            client
+                .post(&url)
+                .bearer_auth("dev-admin-token")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND,
+            "retired disk action stayed in the production route set: {url}",
+        );
+    }
+
+    // Production enumerates the four frozen lifecycle methods. A retired or
+    // invented action must not be captured by a wildcard V2 handler.
+    assert_eq!(
+        client
+            .post(format!("{workspace_base}/cats/signed-cutover/actions/sync"))
+            .bearer_auth("dev-admin-token")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND,
+    );
 
     let strict_disk_create = client
         .post(format!("{workspace_base}/disks"))
@@ -4737,19 +4901,26 @@ async fn one_backing_off_cat_does_not_delay_another() {
 async fn an_unattributable_checkpoint_is_rejected_without_failing_its_batch() {
     let ctx = Ctx::new().await;
     let _node = start_stub_node(&ctx.cp, "node_a").await;
+    let usage_node = ctx.register_usage_node("node_a").await;
     ctx.create_cat("billable", None).await;
     let cat = ctx.wait_observed("billable", ObservedState::Running).await;
+    let source_epoch = format!(
+        "session:{}:{}:desired:1:runtime:33333333333333333333333333333333:processes:test-scope:1:1:runtime",
+        usage_node.session.agent_instance_id,
+        usage_node.session.agent_session_epoch.get(),
+    );
 
     let checkpoint = |cat_id: &str, sequence, observed_at_unix_ms, quantity| {
         let mut checkpoint = CatUsageCheckpoint {
             event_id: String::new(),
             source_id: format!("node/node_a/cat/{cat_id}"),
-            source_epoch: "epoch-a".to_string(),
+            source_epoch: source_epoch.clone(),
             sequence,
             observed_at_unix_ms,
             cat_id: cat_id.to_string(),
             cat_generation: 1,
             metric: UsageMetric::CpuUsec,
+            epoch_marker: cats_api::metering::UsageEpochMarker::Open,
             cumulative_quantity: quantity,
         };
         checkpoint.event_id = deterministic_event_id(&checkpoint);
@@ -4760,21 +4931,46 @@ async fn an_unattributable_checkpoint_is_rejected_without_failing_its_batch() {
     // checkpoint of its epoch was attributed: nothing will ever make it
     // ingestible. It sits at the head, where it used to block the rest.
     let poison = checkpoint("cat_vanished", 0, 1_000, 0);
-    let response = ctx
-        .http
-        .post(ctx.url("/v1/internal/usage/checkpoints"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&IngestUsageCheckpointsRequest {
-            node_id: "node_a".to_string(),
-            checkpoints: vec![
-                poison.clone(),
-                checkpoint(&cat.id, 0, 1_000, 0),
-                checkpoint(&cat.id, 1, 61_000, 60_000_000),
-            ],
-        })
-        .send()
-        .await
-        .unwrap();
+    let billable_first = checkpoint(&cat.id, 0, 1_000, 0);
+    assert_eq!(
+        ctx.cp
+            .state
+            .usage
+            .ingest(&AttributedCheckpoint {
+                source_binding: RuntimeUsageSourceBinding {
+                    session: usage_node.session.clone(),
+                    desired_revision: Revision::new(1).unwrap(),
+                    runtime_incarnation: RandomId128::new("33333333333333333333333333333333",)
+                        .unwrap(),
+                },
+                attribution: UsageAttribution {
+                    billing_account_id: ctx
+                        .cp
+                        .state
+                        .store
+                        .billing_account_id_for_workspace(&ctx.workspace_id)
+                        .unwrap(),
+                    workspace_id: ctx.workspace_id.clone(),
+                    resource_type: "cat".to_string(),
+                    resource_id: cat.id.clone(),
+                    attributed_cat_id: Some(cat.id.clone()),
+                },
+                checkpoint: billable_first.clone(),
+            })
+            .await
+            .unwrap(),
+        IngestOutcome::Accepted
+    );
+    let request = IngestUsageCheckpointsRequest {
+        session: usage_node.session.clone(),
+        node_id: "node_a".to_string(),
+        checkpoints: vec![
+            poison.clone(),
+            billable_first,
+            checkpoint(&cat.id, 1, 61_000, 60_000_000),
+        ],
+    };
+    let response = ctx.post_signed_usage(&usage_node, &request).await;
     assert_eq!(
         response.status(),
         StatusCode::OK,

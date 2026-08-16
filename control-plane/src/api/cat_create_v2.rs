@@ -60,20 +60,49 @@ async fn create_cat_v2_from_headers_at(
     // in a handler timeout: before COMMIT_SENT it cancels safely, while after
     // COMMIT_SENT its registered non-cancellable owner must resolve the exact
     // durable result even if the deadline or client connection is gone.
+    match state.cat_create.replay(&ingress).await {
+        Ok(Some(result)) => return cat_create_http_response(result),
+        Ok(None) => {}
+        Err(error) => return cat_create_service_error_response(&state, error),
+    }
+    match tokio::time::timeout_at(
+        tokio::time::Instant::from_std(ingress.absolute_deadline()),
+        require_funded(&state, ingress.authenticated_workspace_id().as_str()),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            return Ok(closed_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                TEMPORARILY_UNAVAILABLE_BODY,
+                true,
+            ));
+        }
+    }
     match state.cat_create.create(ingress).await {
         Ok(result) => cat_create_http_response(result),
-        Err(CatCreateServiceError::Request(error)) => Err(Failure(error)),
-        Err(CatCreateServiceError::PlacementUnavailable) => Ok(closed_response(
+        Err(error) => cat_create_service_error_response(&state, error),
+    }
+}
+
+fn cat_create_service_error_response(
+    state: &AppState,
+    error: CatCreateServiceError,
+) -> ApiResult<Response> {
+    match error {
+        CatCreateServiceError::Request(error) => Err(Failure(error)),
+        CatCreateServiceError::PlacementUnavailable => Ok(closed_response(
             StatusCode::SERVICE_UNAVAILABLE,
             PLACEMENT_UNAVAILABLE_BODY,
             true,
         )),
-        Err(CatCreateServiceError::TemporarilyUnavailable) => Ok(closed_response(
+        CatCreateServiceError::TemporarilyUnavailable => Ok(closed_response(
             StatusCode::SERVICE_UNAVAILABLE,
             TEMPORARILY_UNAVAILABLE_BODY,
             true,
         )),
-        Err(CatCreateServiceError::Fatal(error)) => {
+        CatCreateServiceError::Fatal(error) => {
             tracing::error!(error = %error, "Cat create encountered fatal stored/runtime corruption");
             state.readiness.poison();
             Ok(closed_response(
@@ -85,8 +114,8 @@ async fn create_cat_v2_from_headers_at(
     }
 }
 
-/// Authenticate and fund the public request before parsing any byte of its
-/// Cat-create payload, while retaining every byte the A17 fingerprint binds.
+/// Authenticate the public request before parsing any byte of its Cat-create
+/// payload, while retaining every byte the A17 fingerprint binds.
 async fn authorized_cat_create_ingress(
     state: &AppState,
     workspace: &str,
@@ -94,7 +123,6 @@ async fn authorized_cat_create_ingress(
     request: Request<Body>,
 ) -> ApiResult<AuthorizedCatCreateIngress> {
     let scope = check_workspace_auth(state, request.headers(), workspace).await?;
-    require_funded(state, &scope.workspace.id).await?;
 
     let authenticated_workspace_id =
         cats_api::runtime_reconciliation::Id::new(scope.workspace.id.clone())
@@ -188,7 +216,7 @@ mod tests {
     use axum::http::HeaderValue;
     use cats_api::error::ErrorCode;
     use cats_metering::SqliteUsageStore;
-    use cats_storage::{BlobError, BlobStore, MetadataStore};
+    use cats_storage::{BlobError, BlobStore};
     use futures_util::StreamExt;
 
     use crate::store::runtime_authority::cat_create_service::CAT_CREATE_TOTAL_DEADLINE;
@@ -361,10 +389,6 @@ mod tests {
         let usage = Arc::new(
             SqliteUsageStore::open(&dir.path().join("usage.db")).expect("open usage store"),
         );
-        let storage_meta: Arc<dyn MetadataStore> = Arc::new(
-            cats_metadata_store_sqlite::SqliteMetadataStore::open(&dir.path().join("storage.db"))
-                .unwrap(),
-        );
         let image_blob = Arc::new(FixedImageBlob {
             reads: AtomicUsize::new(0),
         });
@@ -377,11 +401,14 @@ mod tests {
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: usage,
-            storage_meta,
+            #[cfg(debug_assertions)]
+            retired_storage_meta_for_tests: None,
             image_blob: image_blob.clone(),
             guest_runtime_profile_receipt: release.clone(),
             runtime_provisioner_trust_bundle:
                 crate::testsupport::test_runtime_provisioner_trust_bundle(),
+            production_cutover_operator_trust_bundle:
+                crate::testsupport::test_production_cutover_operator_trust_bundle(),
             auth_token: "service-token".into(),
             route_grant_signer: crate::testsupport::route_grant_signer(),
             admin_token: "admin-token".into(),
@@ -405,6 +432,12 @@ mod tests {
                 .find(|workspace| workspace.is_default)
                 .unwrap()
                 .id
+        });
+        tokio::task::block_in_place(|| {
+            crate::testsupport::begin_production_qualification_for_product_test(
+                handle.state.store.as_ref(),
+                &cats_api::runtime_reconciliation::Id::new(workspace_id.clone()).unwrap(),
+            );
         });
         let body = br#"{"boot_image_digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","durability":"strict","memory_bytes":2147483648,"name":"app","root_size_bytes":4194304,"vcpus":2}"#;
         let url = format!("{}/v1/workspaces/{workspace_id}/cats", handle.base_url());

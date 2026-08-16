@@ -1,3 +1,4 @@
+use cats_api::object_write_gateway::ObjectWriteCredentialReference;
 use cats_storage::authority::*;
 
 const MAX_INTEGER: u64 = i64::MAX as u64;
@@ -47,6 +48,13 @@ fn head(value: u64) -> RemoteHead {
         generation: generation(value),
         root_hash: Some(Sha256Digest::new(format!("sha256:{:064x}", value.max(1))).unwrap()),
         root_object_id: Some(AsciiText::new(format!("roots/{value}")).unwrap()),
+    }
+}
+
+fn object_write_credential(value: u8) -> ObjectWriteCredentialReference {
+    ObjectWriteCredentialReference {
+        credential_id: id(&format!("object-write-credential-{value}")),
+        public_key_spki_sha256: Sha256Digest::from_bytes([value; 32]),
     }
 }
 
@@ -101,6 +109,7 @@ fn authorized_serving_attachment() -> (AuthorizedServingAttachment, VolumeRecord
                 node_id: id("node-1"),
                 placement_epoch: request.placement_epoch,
             },
+            object_write_credential: Some(object_write_credential(1)),
             size_bytes: record.size_bytes,
             durability: record.durability,
             head: record.head.clone(),
@@ -109,6 +118,44 @@ fn authorized_serving_attachment() -> (AuthorizedServingAttachment, VolumeRecord
         },
         record,
     )
+}
+
+#[cfg(feature = "proposed-node-residue-reclamation")]
+fn residue_lineage(local: u64, remote: u64) -> ResidueDataDirectoryLineage {
+    let acquired = acquired_volume();
+    let Some(LastVolumeTransition::NormalAcquire { request, result }) = acquired.last_transition
+    else {
+        unreachable!("fixture is a normal acquire")
+    };
+    let acquisition = AuthorizedServingAcquire::Normal { request, result };
+    ResidueDataDirectoryLineage {
+        workspace_id: id("workspace-1"),
+        cat_id: id("cat-1"),
+        disk_id: id("disk-1"),
+        disk_kind: DiskKind::Root,
+        volume_id: id("volume-1"),
+        attachment_id: id("attachment-old"),
+        attachment_epoch: fence_epoch(8),
+        acquire_origin: AcquireOrigin::Normal {
+            transition_id: random_id(1),
+        },
+        node_id: id("node-old"),
+        desired_revision: revision(11),
+        spec_digest: Sha256Digest::from_bytes([11; 32]),
+        placement: cats_api::runtime_reconciliation::AssignedPlacement {
+            kind: cats_api::runtime_reconciliation::AssignedKind::Assigned,
+            node_id: id("node-old"),
+            placement_epoch: epoch(3),
+        },
+        placement_epoch: epoch(3),
+        acquisition_digest: residue_acquisition_digest(&acquisition).unwrap(),
+        acquisition,
+        local_durable_generation: generation(local),
+        remote_durable_generation: generation(remote),
+        remote_head: head(remote),
+        pending_pack_count: WireU64::new(local.saturating_sub(remote)).unwrap(),
+        fenced: true,
+    }
 }
 
 #[test]
@@ -134,8 +181,22 @@ fn authorized_serving_input_binds_identity_receipt_and_exact_authority_record() 
         Err(AuthorityError::BackendUnknown)
     );
 
+    // The exact owner may publish past the frozen attachment head, so a
+    // strictly newer generation is the accepted successor; only an
+    // equal-generation divergence stays unknown state.
+    let mut published_head = record.clone();
+    published_head.head = head(9);
+    assert_eq!(
+        validate_authorized_serving_record(
+            &published_head,
+            &attachment,
+            Some(attachment.lease_expires_at)
+        ),
+        Ok(())
+    );
     let mut wrong_head = record.clone();
-    wrong_head.head = head(9);
+    wrong_head.head.root_hash =
+        Some(Sha256Digest::new(format!("sha256:{:064x}", 0xdead_beef_u64)).unwrap());
     assert_eq!(
         validate_authorized_serving_record(
             &wrong_head,
@@ -170,6 +231,7 @@ fn takeover_authorization(volume: &VolumeRecord) -> AuthorizationRecord {
             volume_id: volume.volume_id.clone(),
             expected_attachment_id: volume.lease_owner.clone().unwrap(),
             expected_epoch: volume.lease_epoch,
+            expected_head: volume.head.clone(),
             new_attachment_id: id("attachment-new"),
             desired_revision: revision(12),
             new_placement_epoch: epoch(4),
@@ -213,6 +275,7 @@ fn authorized_takeover_attachment() -> (AuthorizedServingAttachment, VolumeRecor
                 node_id: authorization.authorized_node_id.clone(),
                 placement_epoch: authorization.new_placement_epoch,
             },
+            object_write_credential: Some(object_write_credential(2)),
             size_bytes: record.size_bytes,
             durability: record.durability,
             head: record.head.clone(),
@@ -1091,6 +1154,168 @@ fn disposable_completion_reconnects_to_the_unique_consumed_receipt() {
             completed_at: time(40_000),
         }
     );
+}
+
+#[test]
+#[cfg(feature = "proposed-node-residue-reclamation")]
+fn residue_reclaim_accepts_only_exact_direct_ordinary_release() {
+    let owned = acquired_volume();
+    let (released, _) = release(
+        &owned,
+        &ReleaseRequest {
+            volume_id: owned.volume_id.clone(),
+            transition_id: random_id(90),
+            attachment_id: id("attachment-old"),
+            expected_epoch: fence_epoch(8),
+        },
+    )
+    .unwrap();
+    let lineage = residue_lineage(4, 4);
+    let expected = RuntimeResidueAuthorityOutcome::Reclaimable {
+        proof: Box::new(ResidueReclaimProof::OrdinaryRelease {
+            current_volume: released.clone(),
+        }),
+    };
+    assert_eq!(
+        classify_residue_reclaim_authority(&lineage, Some(&released), None, None).unwrap(),
+        expected
+    );
+    // Response loss and Agent restart repeat the same pure decision.
+    assert_eq!(
+        classify_residue_reclaim_authority(&lineage, Some(&released), None, None).unwrap(),
+        expected
+    );
+
+    let mut stale = lineage.clone();
+    stale.attachment_epoch = fence_epoch(7);
+    assert!(matches!(
+        classify_residue_reclaim_authority(&stale, Some(&released), None, None).unwrap(),
+        RuntimeResidueAuthorityOutcome::Retained { .. }
+    ));
+
+    let mut successor_request = acquire_request(2);
+    successor_request.expected_unowned_epoch = released.lease_epoch;
+    successor_request.attachment_id = id("attachment-new");
+    let (successor, _) = normal_acquire(&released, &successor_request, time(20_000)).unwrap();
+    assert_eq!(
+        classify_residue_reclaim_authority(&lineage, Some(&successor), None, None).unwrap(),
+        RuntimeResidueAuthorityOutcome::Retained {
+            reason: ResidueAuthorityRetentionReason::CurrentOrNewerOwner,
+        }
+    );
+}
+
+#[test]
+#[cfg(feature = "proposed-node-residue-reclamation")]
+fn residue_reclaim_accepts_exact_normal_delete_completion_only_at_r_equals_l() {
+    let owned = acquired_volume();
+    let (released, _) = release(
+        &owned,
+        &ReleaseRequest {
+            volume_id: owned.volume_id.clone(),
+            transition_id: random_id(90),
+            attachment_id: id("attachment-old"),
+            expected_epoch: fence_epoch(8),
+        },
+    )
+    .unwrap();
+    let request = BeginDeleteRequest {
+        delete_id: id("delete-1"),
+        disk_id: id("disk-1"),
+        volume_id: released.volume_id.clone(),
+        expected_unowned_epoch: released.lease_epoch,
+        expected_head: released.head.clone(),
+    };
+    let deleting = begin_delete(&released, &request).unwrap().0;
+    let completion = complete_normal_delete(&deleting, time(40_000)).unwrap();
+    let lineage = residue_lineage(4, 4);
+    assert!(matches!(
+        classify_residue_reclaim_authority(&lineage, None, Some(&completion), None).unwrap(),
+        RuntimeResidueAuthorityOutcome::Reclaimable { proof }
+            if matches!(proof.as_ref(), ResidueReclaimProof::NormalDeleteCompletion { .. })
+    ));
+
+    let local_tail = residue_lineage(5, 4);
+    assert_eq!(
+        classify_residue_reclaim_authority(&local_tail, None, Some(&completion), None).unwrap(),
+        RuntimeResidueAuthorityOutcome::Retained {
+            reason: ResidueAuthorityRetentionReason::UniqueLocalTail,
+        }
+    );
+}
+
+#[test]
+#[cfg(feature = "proposed-node-residue-reclamation")]
+fn residue_reclaim_accepts_exact_disposable_root_consumed_completion() {
+    let owned = acquired_volume();
+    let event = host_fence_event(HostFenceEventState::Active);
+    let authorization = disposable_authorization(
+        &owned,
+        DisposableDeleteIsolationBasis::HostFenceEvent {
+            event_id: event.event_id.clone(),
+        },
+    );
+    let (deleting, consumed, _) = consume_disposable_root_delete(
+        &owned,
+        Some(&event),
+        &authorization,
+        &id("delete-auth-1"),
+        time(20_000),
+    )
+    .unwrap();
+    let completion = complete_disposable_root_delete(&deleting, &consumed, time(40_000)).unwrap();
+    let mut lineage = residue_lineage(6, 4);
+    lineage.desired_revision = revision(13);
+    assert!(matches!(
+        classify_residue_reclaim_authority(&lineage, None, Some(&completion), Some(&consumed),)
+            .unwrap(),
+        RuntimeResidueAuthorityOutcome::Reclaimable { proof }
+            if matches!(proof.as_ref(), ResidueReclaimProof::DisposableRootDeleteCompletion { .. })
+    ));
+    assert_eq!(
+        classify_residue_reclaim_authority(&lineage, None, Some(&completion), None).unwrap(),
+        RuntimeResidueAuthorityOutcome::Retained {
+            reason: ResidueAuthorityRetentionReason::DeleteIncomplete,
+        }
+    );
+
+    let mut persistent = lineage.clone();
+    persistent.disk_kind = DiskKind::Persistent;
+    assert_eq!(
+        classify_residue_reclaim_authority(&persistent, None, Some(&completion), Some(&consumed),)
+            .unwrap(),
+        RuntimeResidueAuthorityOutcome::Retained {
+            reason: ResidueAuthorityRetentionReason::UnsupportedDiskKind,
+        }
+    );
+
+    let mut wrong_delete = completion.clone();
+    let DeleteCompletionReceipt::DisposableRoot { delete_id, .. } = &mut wrong_delete else {
+        unreachable!("fixture is a disposable-root completion")
+    };
+    *delete_id = id("delete-other");
+    assert!(matches!(
+        classify_residue_reclaim_authority(&lineage, None, Some(&wrong_delete), Some(&consumed),)
+            .unwrap(),
+        RuntimeResidueAuthorityOutcome::Retained { .. }
+    ));
+
+    let mut before_consumption = completion;
+    let DeleteCompletionReceipt::DisposableRoot { completed_at, .. } = &mut before_consumption
+    else {
+        unreachable!("fixture is a disposable-root completion")
+    };
+    *completed_at = time(19_999);
+    assert!(matches!(
+        classify_residue_reclaim_authority(
+            &lineage,
+            None,
+            Some(&before_consumption),
+            Some(&consumed),
+        )
+        .unwrap(),
+        RuntimeResidueAuthorityOutcome::Retained { .. }
+    ));
 }
 
 #[test]

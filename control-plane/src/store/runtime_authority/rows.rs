@@ -30,7 +30,8 @@ pub(super) const EVENT_COLUMNS: &str = "
 pub(super) const AUTHORIZATION_COLUMNS: &str = "
     authorization_id, record::text AS record_json, kind, authorized_node_id,
     host_fence_event_id, volume_id, state, desired_revision,
-    placement_epoch, lease_duration_ms, not_after, consumed_at";
+    placement_epoch, lease_duration_ms, expected_head_generation,
+    expected_head_root_hash, expected_head_root_object_id, not_after, consumed_at";
 
 pub(super) const DELETE_COMPLETION_COLUMNS: &str = "
     delete_id, record::text AS record_json, kind, disk_id, volume_id,
@@ -578,6 +579,9 @@ struct AuthorizationProjection {
     desired_revision: Revision,
     placement_epoch: Epoch,
     lease_duration_ms: Option<LeaseDurationMs>,
+    expected_head_generation: Generation,
+    expected_head_root_hash: Option<String>,
+    expected_head_root_object_id: Option<String>,
     not_after: UnixMillis,
     consumed_at: Option<UnixMillis>,
 }
@@ -606,6 +610,7 @@ impl AuthorizationProjection {
             desired_revision,
             placement_epoch,
             lease_duration_ms,
+            expected_head,
             not_after,
         ) = match &record.authorization {
             VolumeAuthorization::Takeover(authorization) => (
@@ -617,6 +622,7 @@ impl AuthorizationProjection {
                 authorization.desired_revision,
                 authorization.new_placement_epoch,
                 Some(LeaseDurationMs::new(authorization.lease_duration_ms).map_err(corrupt)?),
+                &authorization.expected_head,
                 authorization.not_after,
             ),
             VolumeAuthorization::DisposableRootDelete(authorization) => (
@@ -633,9 +639,11 @@ impl AuthorizationProjection {
                 authorization.desired_revision,
                 authorization.placement_epoch,
                 None,
+                &authorization.expected_head,
                 authorization.not_after,
             ),
         };
+        let expected_head = HeadProjection::from_head(expected_head);
         Ok(Self {
             authorization_id,
             kind,
@@ -646,6 +654,9 @@ impl AuthorizationProjection {
             desired_revision,
             placement_epoch,
             lease_duration_ms,
+            expected_head_generation: expected_head.generation,
+            expected_head_root_hash: expected_head.root_hash,
+            expected_head_root_object_id: expected_head.root_object_id,
             not_after,
             consumed_at,
         })
@@ -665,6 +676,9 @@ impl AuthorizationProjection {
             desired_revision: from_pg(row.try_get("desired_revision")?)?,
             placement_epoch: from_pg(row.try_get("placement_epoch")?)?,
             lease_duration_ms: optional_from_pg(row.try_get("lease_duration_ms")?)?,
+            expected_head_generation: from_pg(row.try_get("expected_head_generation")?)?,
+            expected_head_root_hash: row.try_get("expected_head_root_hash")?,
+            expected_head_root_object_id: row.try_get("expected_head_root_object_id")?,
             not_after: from_pg(row.try_get("not_after")?)?,
             consumed_at: optional_from_pg(row.try_get("consumed_at")?)?,
         })
@@ -928,6 +942,29 @@ pub(super) fn load_authorization_for_update(
         .transpose()
 }
 
+pub(super) fn delete_volume(
+    transaction: &mut Transaction<'_>,
+    record: &VolumeRecord,
+) -> AuthorityTxResult<()> {
+    let projection = project_volume_record(record)?;
+    let changed = transaction.execute(
+        "DELETE FROM volume_records
+          WHERE volume_id=$1 AND admin_state='deleting' AND delete_id=$2
+            AND lease_epoch=$3 AND head_generation=$4
+            AND head_root_hash IS NOT DISTINCT FROM $5
+            AND head_root_object_id IS NOT DISTINCT FROM $6",
+        &[
+            &projection.volume_id,
+            &projection.delete_id,
+            &projection.lease_epoch.to_pg().map_err(corrupt)?,
+            &projection.head_generation.to_pg().map_err(corrupt)?,
+            &projection.head_root_hash,
+            &projection.head_root_object_id,
+        ],
+    )?;
+    exactly_one(changed)
+}
+
 /// Loads the primary evidence row through the one non-enumerating access
 /// predicate. A missing id and an id owned by another Node are intentionally
 /// indistinguishable, and neither path decodes the protected JSON payload.
@@ -956,12 +993,90 @@ pub(super) fn load_authorization_unlocked(
     authorization_id: &Id,
 ) -> AuthorityTxResult<Option<AuthorizationRecord>> {
     let sql = format!(
-        "SELECT {AUTHORIZATION_COLUMNS} FROM volume_authorizations WHERE authorization_id=$1"
+        "WITH candidate_ids AS MATERIALIZED (
+            (SELECT authorization_id FROM volume_authorizations
+              WHERE authorization_id=$1 LIMIT 2)
+            UNION
+            (SELECT authorization_id FROM volume_authorizations
+              WHERE record->'authorization' @> jsonb_build_object(
+                        'authorization_id', $1::text
+                    )
+              LIMIT 2)
+         )
+         SELECT {AUTHORIZATION_COLUMNS} FROM volume_authorizations
+          WHERE authorization_id IN (SELECT authorization_id FROM candidate_ids)
+          ORDER BY authorization_id COLLATE \"C\" LIMIT 2"
+    );
+    let rows = transaction.query(&sql, &[&authorization_id.as_str()])?;
+    if rows.len() > 1 {
+        return Err(corrupt("duplicate canonical authorization id"));
+    }
+    rows.first().map(decode_authorization).transpose()
+}
+
+pub(super) fn load_disposable_root_graph_authorizations(
+    transaction: &mut Transaction<'_>,
+    authorization_id: &Id,
+    volume_id: &Id,
+    delete_id: &Id,
+    desired_revision: Revision,
+    placement_epoch: Epoch,
+) -> AuthorityTxResult<Vec<AuthorizationRecord>> {
+    let desired_revision = desired_revision.to_pg().map_err(corrupt)?;
+    let placement_epoch = placement_epoch.to_pg().map_err(corrupt)?;
+    let sql = format!(
+        "WITH candidate_ids AS MATERIALIZED (
+            (SELECT authorization_id FROM volume_authorizations
+              WHERE authorization_id=$1 LIMIT 2)
+            UNION
+            (SELECT authorization_id FROM volume_authorizations
+              WHERE kind='disposable_root_delete'
+                AND volume_id=$2
+                AND desired_revision=$4
+                AND placement_epoch=$5
+              ORDER BY authorization_id COLLATE \"C\" LIMIT 2)
+            UNION
+            (SELECT authorization_id FROM volume_authorizations
+              WHERE record->'authorization' @> jsonb_build_object(
+                        'kind', 'disposable_root_delete'::text,
+                        'authorization_id', $1::text
+                    )
+              LIMIT 2)
+            UNION
+            (SELECT authorization_id FROM volume_authorizations
+              WHERE record->'authorization' @> jsonb_build_object(
+                        'kind', 'disposable_root_delete'::text,
+                        'volume_id', $2::text,
+                        'desired_revision', $4::bigint,
+                        'placement_epoch', $5::bigint
+                    )
+              LIMIT 2)
+            UNION
+            (SELECT authorization_id FROM volume_authorizations
+              WHERE record->'authorization' @> jsonb_build_object(
+                        'kind', 'disposable_root_delete'::text,
+                        'delete_id', $3::text
+                    )
+              LIMIT 2)
+         )
+         SELECT {AUTHORIZATION_COLUMNS} FROM volume_authorizations
+          WHERE authorization_id IN (SELECT authorization_id FROM candidate_ids)
+          ORDER BY authorization_id COLLATE \"C\" LIMIT 2"
     );
     transaction
-        .query_opt(&sql, &[&authorization_id.as_str()])?
-        .map(|row| decode_authorization(&row))
-        .transpose()
+        .query(
+            &sql,
+            &[
+                &authorization_id.as_str(),
+                &volume_id.as_str(),
+                &delete_id.as_str(),
+                &desired_revision,
+                &placement_epoch,
+            ],
+        )?
+        .iter()
+        .map(decode_authorization)
+        .collect()
 }
 
 // Authorization creation is intentionally transaction-local so the event row
@@ -1005,6 +1120,10 @@ pub(super) fn insert_authorization(
     let desired_revision = projection.desired_revision.to_pg().map_err(corrupt)?;
     let placement_epoch = projection.placement_epoch.to_pg().map_err(corrupt)?;
     let lease_duration_ms = optional_to_pg(projection.lease_duration_ms)?;
+    let expected_head_generation = projection
+        .expected_head_generation
+        .to_pg()
+        .map_err(corrupt)?;
     let not_after = projection.not_after.to_pg().map_err(corrupt)?;
     let consumed_at = optional_to_pg(projection.consumed_at)?;
     let inserted = transaction.execute(
@@ -1012,8 +1131,10 @@ pub(super) fn insert_authorization(
             authorization_id, record, kind, authorized_node_id,
             host_fence_event_id, volume_id,
             state, desired_revision, placement_epoch, lease_duration_ms,
-            not_after, consumed_at
-         ) VALUES ($1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            expected_head_generation, expected_head_root_hash,
+            expected_head_root_object_id, not_after, consumed_at
+         ) VALUES ($1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9, $10,
+                   $11, $12, $13, $14, $15)
          ON CONFLICT (authorization_id) DO NOTHING",
         &[
             &projection.authorization_id,
@@ -1026,6 +1147,9 @@ pub(super) fn insert_authorization(
             &desired_revision,
             &placement_epoch,
             &lease_duration_ms,
+            &expected_head_generation,
+            &projection.expected_head_root_hash,
+            &projection.expected_head_root_object_id,
             &not_after,
             &consumed_at,
         ],
@@ -1062,6 +1186,10 @@ pub(super) fn update_authorization(
     let desired_revision = projection.desired_revision.to_pg().map_err(corrupt)?;
     let placement_epoch = projection.placement_epoch.to_pg().map_err(corrupt)?;
     let lease_duration_ms = optional_to_pg(projection.lease_duration_ms)?;
+    let expected_head_generation = projection
+        .expected_head_generation
+        .to_pg()
+        .map_err(corrupt)?;
     let not_after = projection.not_after.to_pg().map_err(corrupt)?;
     let consumed_at = optional_to_pg(projection.consumed_at)?;
     let changed = transaction.execute(
@@ -1069,8 +1197,10 @@ pub(super) fn update_authorization(
             record=$2::TEXT::jsonb, kind=$3, authorized_node_id=$4,
             host_fence_event_id=$5, volume_id=$6, state=$7,
             desired_revision=$8, placement_epoch=$9,
-            lease_duration_ms=$10, not_after=$11, consumed_at=$12
-          WHERE authorization_id=$1 AND record=$13::TEXT::jsonb",
+            lease_duration_ms=$10, expected_head_generation=$11,
+            expected_head_root_hash=$12, expected_head_root_object_id=$13,
+            not_after=$14, consumed_at=$15
+          WHERE authorization_id=$1 AND record=$16::TEXT::jsonb",
         &[
             &projection.authorization_id,
             &record_json,
@@ -1082,6 +1212,9 @@ pub(super) fn update_authorization(
             &desired_revision,
             &placement_epoch,
             &lease_duration_ms,
+            &expected_head_generation,
+            &projection.expected_head_root_hash,
+            &projection.expected_head_root_object_id,
             &not_after,
             &consumed_at,
             &original_json,
@@ -1205,9 +1338,55 @@ pub(super) fn load_delete_completions_by_volume(
         .collect()
 }
 
-// The A12 sweeper is out of scope; F1 owns only this exact row codec and
-// transaction-local idempotent persistence primitive.
-#[allow(dead_code)]
+pub(super) fn load_root_delete_completion_candidates(
+    transaction: &mut Transaction<'_>,
+    delete_id: &Id,
+    disk_id: &Id,
+    volume_id: &Id,
+) -> AuthorityTxResult<Vec<DeleteCompletionReceipt>> {
+    let sql = format!(
+        "WITH candidate_ids AS MATERIALIZED (
+            (SELECT delete_id FROM delete_completion_receipts
+              WHERE delete_id=$1 LIMIT 2)
+            UNION
+            (SELECT delete_id FROM delete_completion_receipts
+              WHERE volume_id=$3 LIMIT 2)
+            UNION
+            (SELECT delete_id FROM delete_completion_receipts
+              WHERE disk_id=$2 ORDER BY delete_id COLLATE \"C\" LIMIT 2)
+            UNION
+            (SELECT delete_id FROM delete_completion_receipts
+              WHERE record->>'delete_id'=$1 LIMIT 2)
+            UNION
+            (SELECT delete_id FROM delete_completion_receipts
+              WHERE record->>'disk_id'=$2 LIMIT 2)
+            UNION
+            (SELECT delete_id FROM delete_completion_receipts
+              WHERE record->>'volume_id'=$3 LIMIT 2)
+            UNION
+            (SELECT delete_id FROM delete_completion_receipts
+              WHERE record->'request'->>'delete_id'=$1 LIMIT 2)
+            UNION
+            (SELECT delete_id FROM delete_completion_receipts
+              WHERE record->'request'->>'disk_id'=$2 LIMIT 2)
+            UNION
+            (SELECT delete_id FROM delete_completion_receipts
+              WHERE record->'request'->>'volume_id'=$3 LIMIT 2)
+         )
+         SELECT {DELETE_COMPLETION_COLUMNS} FROM delete_completion_receipts
+          WHERE delete_id IN (SELECT delete_id FROM candidate_ids)
+          ORDER BY delete_id COLLATE \"C\" LIMIT 2"
+    );
+    transaction
+        .query(
+            &sql,
+            &[&delete_id.as_str(), &disk_id.as_str(), &volume_id.as_str()],
+        )?
+        .iter()
+        .map(decode_delete_completion)
+        .collect()
+}
+
 pub(super) fn insert_delete_completion(
     transaction: &mut Transaction<'_>,
     receipt: &DeleteCompletionReceipt,

@@ -12,6 +12,7 @@ import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LOCK_PATH = ROOT / "bootstrap" / "toolchain-lock-v1.json"
+MANUAL_RELEASE_LOCK_PATH = ROOT / "tools" / "manual-release-toolchain-lock-v1.json"
 SNAPSHOT_ROOT = "https://snapshot.ubuntu.com/ubuntu"
 SUITES = ("noble", "noble-updates", "noble-security")
 COMPONENTS = ("main", "universe")
@@ -40,14 +41,29 @@ def package_versions(packages: bytes) -> set[tuple[str, str]]:
 
 def main() -> int:
     lock = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
+    manual_release_lock = json.loads(
+        MANUAL_RELEASE_LOCK_PATH.read_text(encoding="utf-8")
+    )
     apt = lock["apt_snapshot"]
     snapshot_id = apt["snapshot_id"]
+    if manual_release_lock["apt_snapshot_id"] != snapshot_id:
+        raise RuntimeError("manual release and base qualification snapshots differ")
+    base_lock_sha256 = hashlib.sha256(LOCK_PATH.read_bytes()).hexdigest()
+    if manual_release_lock["base_toolchain_lock_sha256"] != base_lock_sha256:
+        raise RuntimeError("manual release lock names the wrong base toolchain lock")
     expected_indexes = apt["index_sha256"]
-    expected = {(name, version) for name, version in apt["packages"].items()}
+    expected = {
+        (name, version)
+        for packages in (apt["packages"], manual_release_lock["apt_packages"])
+        for name, version in packages.items()
+    }
     observed: set[tuple[str, str]] = set()
     proof: dict[str, object] = {
         "schema_version": 1,
         "snapshot_id": snapshot_id,
+        "manual_release_lock_sha256": hashlib.sha256(
+            MANUAL_RELEASE_LOCK_PATH.read_bytes()
+        ).hexdigest(),
         "indexes": [],
     }
 

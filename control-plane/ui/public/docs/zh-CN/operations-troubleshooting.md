@@ -20,22 +20,20 @@ Operation 从 `pending` 进入且只进入 `succeeded`、`failed` 或 `supersede
 | `stale_epoch` | 旧磁盘或 Route Owner 尝试工作 | 视为已 fenced；从当前 Assignment 重建。 |
 | `unavailable` | 临时依赖故障 | 有界退避重试并查看 Operation。 |
 
-## Cat 无法 Ready
+## Cat 在 Create 后无法 Ready
 
-1.  执行 `cats get NAME --json`，记录 desired/observed state 与 Node。
+1.  执行 `cats get CAT_ID --json`，记录 desired/observed state 与 Node。
 2.  按已接受的 ID 查看 Operation 及其终态结果或错误。
 3.  管理员检查 Node Heartbeat、blockd/Guest readiness、Console Output 与 Attachment Epoch。
 4.  如果 Suspended/Warm 恢复失败，确认 Controller 已收敛到 Cold fallback，而不是停在中间态。
 
-## 磁盘无法 Mount、Resize 或 Delete
+## Disk Mutation 不可用
 
-执行 `cats disk get NAME`。PersistentDisk 只能有一个活跃读写 Attachment。移动或删除前先安全 Unmount，并遵守当前运行路径的 Resize 前置条件。绝不能绕过 Fencing 冲突。
+执行 `cats disk get DISK_ID` 查看当前 Projection。Attachment、Snapshot、容量变更与删除不属于 release product surface。不要探测 Legacy Route，也不要绕过 Authority/Fencing Conflict。
 
-## 自动休眠未触发
+## Lifecycle 命令不可用
 
-    cats sleep status dev
-
-检查活跃平台/Guest Lease、Guest 信号新鲜度和打印的原因。过期信号会有意 fail awake。确认长期运行应用会释放工作租约，且没有 Shell、Exec、Deploy 或 Gateway Activation Lease。
+Signed Runtime Cutover 期间有意不提供 Lifecycle 与 Guest-command Client。请保留已接受的 Create Operation ID 与当前 Cat Projection；不要替换为旧命令或旧 Route。
 
 ## 控制面无法访问
 

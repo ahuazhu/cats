@@ -20,7 +20,7 @@ use anyhow::{Context as _, Result};
 use cats_api::runtime_reconciliation::{
     encode_runtime_checkpoint, CheckpointEvidence, DesiredRuntimeSpec, DiskKind, Epoch,
     GuestTransportEvidence, Id, LifecycleAdmission, LocalLineageState, NodeBootId, NodeObservation,
-    ObservedDevice, ObservedDiskKind, ObservedNetwork, OwnershipTokenEvidence,
+    NodeResidue, ObservedDevice, ObservedDiskKind, ObservedNetwork, OwnershipTokenEvidence,
     PrepareDeviceFrontend, PreparedDeviceInput, RandomId128, ReconcileStep, RequireIdleCheckpoint,
     RuntimeCheckpoint, RuntimeLaunch, RuntimeNetworkIdentity, RuntimeTarget, RuntimeTransition,
     Sequence, Sha256Digest, UnixMillis, VolumeAccess, VolumeAuthorityEvidence, VolumeDisposition,
@@ -118,6 +118,12 @@ impl NodeGlobalNetworkScanAdmission {
             );
         }
         Ok(Self { entries, physical })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self::new(std::iter::empty(), HostNetworkSnapshot::empty_for_test())
+            .expect("empty network inventory is canonical")
     }
 
     pub(crate) fn network_projections(&self) -> BTreeMap<Id, Vec<ObservedNetwork>> {
@@ -899,13 +905,29 @@ impl NetworkInventoryBridge for NetworkAllocationPort {
                 return Ok(NetworkInventoryBridgeOutcome::Unavailable);
             }
             permit.assert_current_absent_namespace()?;
-            let physical = inspect_host_network_snapshot(&self.ip_binary, context)?;
-            physical.ensure_managed_networks_are_reserved(std::iter::empty())?;
+            let physical = match inspect_host_network_snapshot(&self.ip_binary, context) {
+                Ok(physical) => physical,
+                Err(_) => {
+                    permit.release()?;
+                    return Ok(NetworkInventoryBridgeOutcome::Unavailable);
+                }
+            };
+            let residue = match physical.unreserved_managed_networks(std::iter::empty()) {
+                Ok(residue) => network_residue(residue),
+                Err(_) => {
+                    permit.release()?;
+                    return Ok(NetworkInventoryBridgeOutcome::Unavailable);
+                }
+            };
             physical.ensure_reserved_network_ranges(std::iter::empty())?;
             permit.assert_current_absent_namespace()?;
             let admission = NodeGlobalNetworkScanAdmission::new([], physical)?;
             permit.release()?;
-            return Ok(NetworkInventoryBridgeOutcome::Complete(admission));
+            return Ok(if residue.is_empty() {
+                NetworkInventoryBridgeOutcome::Complete(admission)
+            } else {
+                NetworkInventoryBridgeOutcome::CompleteWithResidue { admission, residue }
+            });
         };
 
         permit.assert_current_snapshot(&snapshot)?;
@@ -917,26 +939,61 @@ impl NetworkInventoryBridge for NetworkAllocationPort {
             "network bridge checkpoint snapshot differs from checkpoint inventory"
         );
         let reservations = NetworkReservations::from_snapshot(&snapshot)?;
-        let physical = inspect_host_network_snapshot(&self.ip_binary, context)?;
-        physical.ensure_managed_networks_are_reserved(
+        let physical = match inspect_host_network_snapshot(&self.ip_binary, context) {
+            Ok(physical) => physical,
+            Err(_) => {
+                permit.release()?;
+                return Ok(NetworkInventoryBridgeOutcome::Unavailable);
+            }
+        };
+        let residue = match physical.unreserved_managed_networks(
             reservations
                 .by_tap
                 .values()
                 .map(|reservation| &reservation.identity),
-        )?;
-        physical.ensure_reserved_network_ranges(
-            reservations
-                .by_tap
-                .values()
-                .map(|reservation| &reservation.identity),
-        )?;
+        ) {
+            Ok(residue) => network_residue(residue),
+            Err(_) => {
+                permit.release()?;
+                return Ok(NetworkInventoryBridgeOutcome::Unavailable);
+            }
+        };
+        if physical
+            .ensure_reserved_network_ranges(
+                reservations
+                    .by_tap
+                    .values()
+                    .map(|reservation| &reservation.identity),
+            )
+            .is_err()
+        {
+            permit.release()?;
+            return Ok(NetworkInventoryBridgeOutcome::Unavailable);
+        }
         let admission =
             NodeGlobalNetworkScanAdmission::new(reservations.by_tap.into_values(), physical)?;
         permit.assert_current_snapshot(&snapshot)?;
         context.check_active()?;
         permit.release()?;
-        Ok(NetworkInventoryBridgeOutcome::Complete(admission))
+        Ok(if residue.is_empty() {
+            NetworkInventoryBridgeOutcome::Complete(admission)
+        } else {
+            NetworkInventoryBridgeOutcome::CompleteWithResidue { admission, residue }
+        })
     }
+}
+
+fn network_residue(physical: Vec<crate::ch::HostNetworkResidue>) -> Vec<NodeResidue> {
+    physical
+        .into_iter()
+        .map(|network| NodeResidue::NetworkTap {
+            network_id_hint: Some(network.network_id),
+            tap_name: network.tap_name,
+            ownership_token: OwnershipTokenEvidence::Valid {
+                ownership_token: network.ownership_token,
+            },
+        })
+        .collect()
 }
 
 pub(crate) struct PrepareNetworkReservationEffect {
@@ -1301,9 +1358,11 @@ impl PrepareNetworkReservationEffect {
         let ServingBlockdProcessInspection::Exact(current_process) = inspection else {
             anyhow::bail!("PrepareNetwork serving authority is no longer exact")
         };
+        // Identity stays exact; the live engine's durability counters
+        // legitimately advance between the admission mint and this read.
         anyhow::ensure!(
             current_process.exactly_matches(expected)
-                && current_process.as_ref() == admitted.evidence(),
+                && current_process.stable_identity_eq(admitted.evidence()),
             "PrepareNetwork serving process/status authority drifted"
         );
         let current_authority = self
@@ -1404,10 +1463,13 @@ pub(super) fn prepare_network_volume_admission_is_exact(
         && lineage.acquire_origin == device.acquire_origin
         && lineage.node_id == desired.placement.node_id
         && lineage.placement_epoch == desired.placement.placement_epoch
-        && lineage.local_durable_generation == head.generation
-        && lineage.remote_durable_generation == head.generation
+        // Monotonic durability pins: a live Relaxed writer legitimately
+        // advances the local generation past the provisioned head while
+        // pending packs hold the unpublished window (see the NodeObservation
+        // lineage contract).
+        && lineage.remote_durable_generation >= head.generation
+        && lineage.local_durable_generation >= lineage.remote_durable_generation
         && lineage.data_directory == device.serving_process.data_directory
-        && lineage.pending_pack_count.get() == 0
         && !lineage.fenced
         && lineage.state == LocalLineageState::Active
 }
@@ -1642,7 +1704,7 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    use crate::runtime_spine::RuntimeDesiredEffectAdmission;
+    use crate::runtime_spine::{RuntimeDesiredEffectAdmission, RuntimeSpineFullScan};
 
     use super::*;
 
@@ -1751,6 +1813,34 @@ mod tests {
             StateDirectory::unanchored(state.to_path_buf()),
             Instant::now() + Duration::from_secs(10),
             admission,
+        )
+    }
+
+    fn inventory_scan_context(
+        desired_specs: Vec<DesiredRuntimeSpec>,
+    ) -> RuntimeInventoryScanContext {
+        let session = SessionBinding {
+            node_id: Id::new("node_a").unwrap(),
+            node_boot_id: NodeBootId::new("a".repeat(32)).unwrap(),
+            agent_instance_id: random('b'),
+            agent_session_epoch: Epoch::new(1).unwrap(),
+        };
+        RuntimeInventoryScanContext::for_test(
+            RuntimeSpineFullScan {
+                session: session.clone(),
+                heartbeat_sequence: Sequence::new(1).unwrap(),
+                inventory_epoch: Epoch::new(1).unwrap(),
+                desired: DesiredReadSnapshot {
+                    version: ContractVersion::V1,
+                    session,
+                    request_sequence: Sequence::new(1).unwrap(),
+                    read_position: Sequence::new(1).unwrap(),
+                    issued_at_unix_ms: UnixMillis::new(1_000).unwrap(),
+                    expires_at_unix_ms: UnixMillis::new(2_000).unwrap(),
+                    desired_specs,
+                },
+            },
+            Instant::now() + Duration::from_secs(5),
         )
     }
 
@@ -2117,6 +2207,39 @@ exit 97\n",
         assert_eq!(
             store.load().unwrap().unwrap().checkpoint(),
             predecessor.checkpoint()
+        );
+    }
+
+    #[test]
+    fn complete_inventory_reports_unreserved_stable_cats_tap_as_residue() {
+        let desired = desired_for(&Id::new("cat_a").unwrap());
+        let ownership_token = random('e');
+        let alias = format!(
+            "cats-network:{}:{}",
+            desired.runtime.network_config.network_id, ownership_token
+        );
+        let fixture = Fixture::with_after_link(Some((&alias, "10.240.0.5")));
+        fs::write(&fixture.marker, b"present").unwrap();
+
+        let NetworkInventoryBridgeOutcome::CompleteWithResidue { admission, residue } = fixture
+            .port()
+            .inspect_all(&BTreeMap::new(), &inventory_scan_context(Vec::new()))
+            .unwrap()
+        else {
+            panic!("stable unreserved Cats TAP must remain complete residue")
+        };
+        assert!(admission.network_projections().is_empty());
+        assert_eq!(
+            residue,
+            [NodeResidue::NetworkTap {
+                network_id_hint: Some(desired.runtime.network_config.network_id),
+                tap_name: Id::new("catold000001").unwrap(),
+                ownership_token: OwnershipTokenEvidence::Valid { ownership_token },
+            }]
+        );
+        assert!(
+            fixture.marker.exists(),
+            "inventory must not remove the TAP fixture"
         );
     }
 

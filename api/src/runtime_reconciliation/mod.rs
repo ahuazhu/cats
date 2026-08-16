@@ -29,6 +29,8 @@ pub const OBSERVATION_PATH: &str = "/v1/internal/runtime/observations";
 pub const RUNTIME_VOLUME_TRANSITION_PATH: &str = "/v1/internal/runtime/volume-transitions";
 pub const RUNTIME_VOLUME_TRANSITION_EVIDENCE_PATH: &str =
     "/v1/internal/runtime/volume-transition-evidence";
+#[cfg(feature = "proposed-node-residue-reclamation")]
+pub const RUNTIME_RESIDUE_AUTHORITY_PATH: &str = "/v1/internal/runtime/residue-authority";
 /// Exact product-router fallback body for an unmatched `/v1/...` route.
 /// Runtime clients use the whole shape (status, headers and these bytes) to
 /// distinguish a deployment mismatch from an HTML/plain proxy response.
@@ -38,9 +40,12 @@ pub const RUNTIME_INTERNAL_ROUTE_NOT_FOUND_ROBOTS: &str = "noindex, nofollow, no
 
 pub(crate) use canonical::value_bytes as canonical_json_value_bytes;
 
+#[cfg(feature = "proposed-node-residue-reclamation")]
+pub use canonical::residue_acquisition_digest;
 pub use canonical::{
     canonical_ed25519_spki_sha256, checkpoint_content_digest, guest_config_digest,
-    inventory_digest, key_ring_digest, runtime_provisioner_active_set_digest, spec_digest,
+    inventory_digest, key_ring_digest, node_observation_canonical_wire_size,
+    runtime_provisioner_active_set_digest, spec_digest,
 };
 pub use types::*;
 pub use wire::{
@@ -68,12 +73,13 @@ pub use wire::{
     encode_runtime_spine_error, encode_runtime_volume_transition_error,
     encode_runtime_volume_transition_evidence_request,
     encode_runtime_volume_transition_evidence_success, encode_runtime_volume_transition_request,
-    encode_runtime_volume_transition_success, volume_transition_evidence_bundle_is_closed,
-    ADMISSION_INVENTORY_ATTESTATION_MAX_WIRE_BYTES, AGENT_REGISTRATION_ATTEMPT_MAX_WIRE_BYTES,
-    AGENT_SESSION_MAX_WIRE_BYTES, CONTRACT_ERROR_MAX_WIRE_BYTES,
-    DESIRED_READ_REQUEST_MAX_WIRE_BYTES, DESIRED_READ_SNAPSHOT_MAX_WIRE_BYTES,
-    DESIRED_RUNTIME_SPEC_MAX_WIRE_BYTES, GUEST_RUNTIME_PROFILE_RECEIPT_MAX_WIRE_BYTES,
-    NODE_CLEANUP_CHECKPOINT_MAX_WIRE_BYTES, NODE_IDENTITY_MAX_WIRE_BYTES,
+    encode_runtime_volume_transition_success, sort_node_residue_canonically,
+    volume_transition_evidence_bundle_is_closed, ADMISSION_INVENTORY_ATTESTATION_MAX_WIRE_BYTES,
+    AGENT_REGISTRATION_ATTEMPT_MAX_WIRE_BYTES, AGENT_SESSION_MAX_WIRE_BYTES,
+    CONTRACT_ERROR_MAX_WIRE_BYTES, DESIRED_READ_REQUEST_MAX_WIRE_BYTES,
+    DESIRED_READ_SNAPSHOT_MAX_WIRE_BYTES, DESIRED_RUNTIME_SPEC_MAX_WIRE_BYTES,
+    GUEST_RUNTIME_PROFILE_RECEIPT_MAX_WIRE_BYTES, NODE_CLEANUP_CHECKPOINT_MAX_WIRE_BYTES,
+    NODE_IDENTITY_MAX_WIRE_BYTES, NODE_OBSERVATION_MAX_RESIDUE_ITEMS,
     NODE_OBSERVATION_MAX_WIRE_BYTES, NODE_PLACEMENT_POLICY_MAX_WIRE_BYTES,
     OBSERVATION_ACCEPTANCE_MAX_WIRE_BYTES, OPERATION_MAX_WIRE_BYTES,
     PROVISION_ROOT_IMAGE_ERROR_MAX_WIRE_BYTES, PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES,
@@ -86,4 +92,11 @@ pub use wire::{
     RUNTIME_VOLUME_TRANSITION_EVIDENCE_SUCCESS_MAX_WIRE_BYTES,
     RUNTIME_VOLUME_TRANSITION_REQUEST_MAX_WIRE_BYTES,
     RUNTIME_VOLUME_TRANSITION_SUCCESS_MAX_WIRE_BYTES,
+};
+#[cfg(feature = "proposed-node-residue-reclamation")]
+pub use wire::{
+    decode_runtime_residue_authority_request, decode_runtime_residue_authority_success,
+    encode_runtime_residue_authority_request, encode_runtime_residue_authority_success,
+    residue_reclaim_proof_is_closed, RUNTIME_RESIDUE_AUTHORITY_REQUEST_MAX_WIRE_BYTES,
+    RUNTIME_RESIDUE_AUTHORITY_SUCCESS_MAX_WIRE_BYTES,
 };

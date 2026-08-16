@@ -11,6 +11,15 @@ Environment=CATS_GUEST_NETWORK_CIDR=10.240.0.0/16
 Environment=CATS_NODE_LISTEN=127.0.0.1:7301
 Environment=CATS_NODE_SERVICE_NAME=cats-noded
 EnvironmentFile=/etc/cats/cats.env
+# The direct-development installer has no validated four-artifact transaction.
+# Clear even a stale EnvironmentFile/manager value because the CLI otherwise
+# accepts this setting from its process environment.
+UnsetEnvironment=CATS_ROUTE_V2_MACHINE_LISTEN
+# Per-Cat VMM/blockd processes are PID-1-owned sibling transient services in
+# system.slice, not children of this service cgroup. Reap every process that
+# does belong to the Agent while leaving those independently owned services
+# available for checkpoint + full-inventory adoption after restart.
+KillMode=control-group
 # Root is required for /dev/kvm, kernel NBD attach and tap devices (Phase A;
 # privilege separation is a hardening milestone). The nbd module is loaded
 # unconditionally so switching CATS_BLOCK_PATH_ARGS back to kernel-nbd needs no
@@ -21,7 +30,6 @@ ExecStartPre=/opt/cats/bin/setup-guest-network
 ExecStart=/opt/cats/bin/cats-noded \
   --listen ${CATS_NODE_LISTEN} \
   --control-plane-url ${CATS_CONTROL_PLANE_URL} \
-  --route-grant-public-key-file /etc/cats/route-grant-public.pem \
   --guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json \
   --blockd-bin /opt/cats/bin/cats-blockd \
   --guest-agent-bin /opt/cats/bin/cats-guest-agent \

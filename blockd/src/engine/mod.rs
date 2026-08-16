@@ -32,7 +32,9 @@ use cats_storage::authority::{
     Id, RemoteHead, RenewLeaseRequest, Sha256Digest, VolumeDataAuthority, VolumeDurability,
     VolumeHeadCasRequest,
 };
-use cats_storage::{BlobError, BlobStore, MetaError, MetadataStore, VolumeHead};
+#[cfg(test)]
+use cats_storage::MetadataStore;
+use cats_storage::{BlobError, BlobStore, MetaError, VolumeHead};
 
 mod gc;
 mod hydrate;
@@ -293,13 +295,24 @@ pub struct ChunkEngine {
 
 #[derive(Clone, Copy)]
 enum AttachmentMode {
-    Acquire,
-    AdoptControlOnly { expected_epoch: i64 },
-    AdoptAuthorizedControlOnly { expected_epoch: i64 },
-    AdoptAuthorizedServing { expected_epoch: i64 },
+    #[cfg(test)]
+    Granted {
+        expected_epoch: i64,
+    },
+    #[cfg(test)]
+    ControlOnly {
+        expected_epoch: i64,
+    },
+    AuthorizedControlOnly {
+        expected_epoch: i64,
+    },
+    AuthorizedServing {
+        expected_epoch: i64,
+    },
 }
 
 enum AuthorityBackend {
+    #[cfg(test)]
     Legacy(Arc<dyn MetadataStore>),
     Target(Arc<dyn VolumeDataAuthority>),
 }
@@ -307,6 +320,7 @@ enum AuthorityBackend {
 impl AuthorityBackend {
     fn load_head(&self, volume_id: &str) -> cats_storage::metadata::Result<VolumeHead> {
         match self {
+            #[cfg(test)]
             Self::Legacy(metadata) => metadata.load_head(volume_id),
             Self::Target(authority) => {
                 let volume_id = Id::new(volume_id.to_string()).ok_or_else(|| {
@@ -349,6 +363,7 @@ impl AuthorityBackend {
         ttl_ms: i64,
     ) -> cats_storage::metadata::Result<()> {
         match self {
+            #[cfg(test)]
             Self::Legacy(metadata) => metadata.renew_lease(volume_id, attachment_id, epoch, ttl_ms),
             Self::Target(authority) => {
                 let volume_id = target_id(volume_id, "volume_id")?;
@@ -391,6 +406,7 @@ impl AuthorityBackend {
         epoch: i64,
     ) -> cats_storage::metadata::Result<i64> {
         match self {
+            #[cfg(test)]
             Self::Legacy(metadata) => {
                 let root_hash = new_head
                     .root_hash
@@ -709,30 +725,36 @@ impl ChunkEngine {
         }
     }
 
-    /// Attach to a volume: acquire the lease (bumping the fencing epoch),
-    /// start lease renewal, then load the committed map and recover pending
-    /// packs under the live lease.
-    pub fn attach(
+    /// Adopt the caller's exact externally granted owner/epoch tuple through
+    /// the compatibility metadata data plane. Unlike the retired attach path,
+    /// this performs no acquire, expiry takeover, or epoch mutation.
+    #[cfg(test)]
+    pub(crate) fn attach_granted_epoch(
         cfg: EngineConfig,
+        expected_epoch: i64,
         blob: Arc<dyn BlobStore>,
         meta: Arc<dyn MetadataStore>,
     ) -> Result<Arc<Self>> {
+        if expected_epoch <= 0 {
+            return Err(EngineError::Meta(MetaError::Fenced));
+        }
         Self::open(
             cfg,
             blob,
             AuthorityBackend::Legacy(meta),
-            AttachmentMode::Acquire,
+            AttachmentMode::Granted { expected_epoch },
             None,
         )
     }
 
     /// Adopt an already-authorized attachment for the root-provision effect.
     ///
-    /// Unlike [`Self::attach`], this does not acquire or bump the lease epoch,
+    /// This does not acquire or bump the lease epoch,
     /// replay pending packs, start a publisher, or enable any Guest I/O entry
     /// point. The caller obtained the exact owner/epoch grant before spawning
     /// blockd; every publication remains guarded by that same tuple.
-    pub fn attach_control_only(
+    #[cfg(test)]
+    pub(crate) fn attach_control_only(
         cfg: EngineConfig,
         expected_epoch: i64,
         blob: Arc<dyn BlobStore>,
@@ -747,17 +769,16 @@ impl ChunkEngine {
             cfg,
             blob,
             AuthorityBackend::Target(authority),
-            AttachmentMode::AdoptControlOnly { expected_epoch },
+            AttachmentMode::ControlOnly { expected_epoch },
             None,
         )
     }
 
     /// Adopt the complete Node-authorized grant for the root-provision effect.
     ///
-    /// This is the signed Runtime form of [`Self::attach_control_only`]. It
-    /// performs the same strict read/renew/reread grant proof as authorized
-    /// serving, retains the complete lineage for status handshakes, and still
-    /// exposes no Guest data frontend or publisher.
+    /// This signed Runtime entry performs the strict read/renew/reread grant
+    /// proof used by authorized serving, retains the complete lineage for
+    /// status handshakes, and still exposes no Guest data frontend or publisher.
     pub fn attach_authorized_control_only(
         cfg: EngineConfig,
         attachment: AuthorizedServingAttachment,
@@ -773,7 +794,7 @@ impl ChunkEngine {
             cfg,
             blob,
             AuthorityBackend::Target(authority),
-            AttachmentMode::AdoptAuthorizedControlOnly { expected_epoch },
+            AttachmentMode::AuthorizedControlOnly { expected_epoch },
             Some(attachment),
         )
     }
@@ -800,7 +821,7 @@ impl ChunkEngine {
             cfg,
             blob,
             AuthorityBackend::Target(authority),
-            AttachmentMode::AdoptAuthorizedServing { expected_epoch },
+            AttachmentMode::AuthorizedServing { expected_epoch },
             Some(attachment),
         )
     }
@@ -832,28 +853,38 @@ impl ChunkEngine {
                 "max_local_bytes must be at least one chunk ({CHUNK_SIZE} bytes)"
             )));
         }
-        match (&mode, &authority, &authorized_attachment) {
+        match (&mode, &authorized_attachment) {
             (
-                AttachmentMode::AdoptAuthorizedServing { .. }
-                | AttachmentMode::AdoptAuthorizedControlOnly { .. },
-                AuthorityBackend::Target(target),
+                AttachmentMode::AuthorizedServing { .. }
+                | AttachmentMode::AuthorizedControlOnly { .. },
                 Some(attachment),
-            ) => preflight_authorized_serving(&cfg, attachment, target.as_ref())?,
+            ) => match &authority {
+                AuthorityBackend::Target(target) => {
+                    preflight_authorized_serving(&cfg, attachment, target.as_ref())?
+                }
+                #[cfg(test)]
+                AuthorityBackend::Legacy(_) => {
+                    return Err(EngineError::InvalidConfig(
+                        "authorized target attach requires target authority".into(),
+                    ));
+                }
+            },
             (
-                AttachmentMode::AdoptAuthorizedServing { .. }
-                | AttachmentMode::AdoptAuthorizedControlOnly { .. },
-                _,
-                _,
+                AttachmentMode::AuthorizedServing { .. }
+                | AttachmentMode::AuthorizedControlOnly { .. },
+                None,
             ) => {
                 return Err(EngineError::InvalidConfig(
                     "authorized target attach requires one complete authority grant".into(),
                 ));
             }
-            (_, _, Some(_)) => {
+            #[cfg(test)]
+            (_, Some(_)) => {
                 return Err(EngineError::InvalidConfig(
                     "an authorized attachment was supplied to another mode".into(),
                 ));
             }
+            #[cfg(test)]
             _ => {}
         }
         let head = authority.load_head(&cfg.volume_id)?;
@@ -871,10 +902,17 @@ impl ChunkEngine {
         let chunk_count = chunk::chunk_count(size);
 
         let epoch = match (mode, &authority) {
-            (AttachmentMode::Acquire, AuthorityBackend::Legacy(metadata)) => {
-                metadata.acquire_lease(&cfg.volume_id, &cfg.attachment_id, cfg.lease_ttl_ms)?
+            #[cfg(test)]
+            (AttachmentMode::Granted { expected_epoch }, AuthorityBackend::Legacy(_)) => {
+                if head.lease_owner.as_deref() != Some(cfg.attachment_id.as_str())
+                    || head.lease_epoch != expected_epoch
+                {
+                    return Err(EngineError::Meta(MetaError::Fenced));
+                }
+                expected_epoch
             }
-            (AttachmentMode::AdoptControlOnly { expected_epoch }, AuthorityBackend::Target(_)) => {
+            #[cfg(test)]
+            (AttachmentMode::ControlOnly { expected_epoch }, AuthorityBackend::Target(_)) => {
                 if head.lease_owner.is_some() && head.lease_epoch <= 0 {
                     return Err(EngineError::Corrupt(
                         "an owned volume cannot have lease epoch zero".into(),
@@ -888,8 +926,8 @@ impl ChunkEngine {
                 expected_epoch
             }
             (
-                AttachmentMode::AdoptAuthorizedServing { expected_epoch }
-                | AttachmentMode::AdoptAuthorizedControlOnly { expected_epoch },
+                AttachmentMode::AuthorizedServing { expected_epoch }
+                | AttachmentMode::AuthorizedControlOnly { expected_epoch },
                 AuthorityBackend::Target(_),
             ) => {
                 let attachment = authorized_attachment.as_ref().ok_or_else(|| {
@@ -906,20 +944,30 @@ impl ChunkEngine {
                 }
                 expected_epoch
             }
-            (AttachmentMode::Acquire, AuthorityBackend::Target(_))
-            | (AttachmentMode::AdoptControlOnly { .. }, AuthorityBackend::Legacy(_))
-            | (AttachmentMode::AdoptAuthorizedControlOnly { .. }, AuthorityBackend::Legacy(_))
-            | (AttachmentMode::AdoptAuthorizedServing { .. }, AuthorityBackend::Legacy(_)) => {
+            #[cfg(test)]
+            (AttachmentMode::Granted { .. }, AuthorityBackend::Target(_)) => {
+                return Err(EngineError::InvalidConfig(
+                    "attachment mode and authority backend do not match".into(),
+                ));
+            }
+            #[cfg(test)]
+            (
+                AttachmentMode::ControlOnly { .. }
+                | AttachmentMode::AuthorizedControlOnly { .. }
+                | AttachmentMode::AuthorizedServing { .. },
+                AuthorityBackend::Legacy(_),
+            ) => {
                 return Err(EngineError::InvalidConfig(
                     "attachment mode and authority backend do not match".into(),
                 ));
             }
         };
-        let control_only = matches!(
-            mode,
-            AttachmentMode::AdoptControlOnly { .. }
-                | AttachmentMode::AdoptAuthorizedControlOnly { .. }
-        );
+        let control_only = match mode {
+            #[cfg(test)]
+            AttachmentMode::ControlOnly { .. } => true,
+            AttachmentMode::AuthorizedControlOnly { .. } => true,
+            _ => false,
+        };
 
         fs::create_dir_all(cfg.data_dir.join(PENDING_PACK_DIR))?;
         let cache_path = cfg.data_dir.join("cache.data");

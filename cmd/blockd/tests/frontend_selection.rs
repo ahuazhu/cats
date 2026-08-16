@@ -1,494 +1,137 @@
-//! Integration tests for the frontend CLI of the real `cats-blockd` binary:
-//! which listeners it accepts, that one process can serve NBD and vhost-user-blk
-//! over the same engine, and that a VMM disconnect releases the attachment.
+//! Release-binary composition tests. Data-plane image, GC, fencing and cold
+//! restore invariants remain exercised in `cats-blockd` engine tests; this
+//! suite proves the shipped CLI cannot recompose their retired authority.
 
-use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::Command;
 
-const VOL_SIZE: u64 = 4 * cats_api::chunk::CHUNK_SIZE as u64;
-
-struct Env {
-    dir: tempfile::TempDir,
+#[test]
+fn legacy_authority_flags_are_rejected_by_clap_before_any_io() {
+    let directory = tempfile::tempdir().unwrap();
+    for legacy in [
+        vec!["--attachment-epoch", "7"],
+        vec!["--create-volume-size", "4194304"],
+        vec!["--collect-garbage"],
+        vec!["--seed-image-id", "legacy-image"],
+        vec!["--seed-image", "/legacy/image.raw"],
+        vec!["--listen-tcp", "127.0.0.1:10809"],
+    ] {
+        let data_dir = directory.path().join(legacy[0].trim_start_matches('-'));
+        let output = Command::new(env!("CARGO_BIN_EXE_cats-blockd"))
+            .args(&legacy)
+            .arg("--object-store-adapter")
+            .arg("definitely-not-an-adapter")
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .output()
+            .expect("run cats-blockd");
+        assert!(!output.status.success(), "legacy flag parsed: {legacy:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unexpected argument"),
+            "legacy flag reached process composition: {legacy:?}: {stderr}"
+        );
+        assert!(!data_dir.exists(), "legacy flag performed local I/O");
+    }
 }
 
-impl Env {
-    fn new() -> Self {
-        Self {
-            dir: tempfile::tempdir().unwrap(),
-        }
-    }
-
-    fn command(&self, attachment: &str) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cats-blockd"));
-        cmd.args([
+#[test]
+fn serving_without_a_complete_artifact_fails_before_adapter_open() {
+    let directory = tempfile::tempdir().unwrap();
+    let data_dir = directory.path().join("data");
+    let output = Command::new(env!("CARGO_BIN_EXE_cats-blockd"))
+        .args([
             "--volume-id",
-            "vol_frontends",
+            "vol_ungranted",
             "--attachment-id",
-            attachment,
+            "att_ungranted",
+            "--metadata-store-adapter",
+            "postgres",
+            "--object-store-adapter",
+            "definitely-not-an-adapter",
         ])
         .arg("--data-dir")
-        .arg(self.dir.path().join(format!("data-{attachment}")))
-        .arg("--metadata-store-adapter")
-        .arg("sqlite")
-        .arg("--metadata-store-option")
-        .arg(format!(
-            "path={}",
-            self.dir.path().join("meta.db").display()
-        ))
-        .arg("--object-store-adapter")
-        .arg("file")
-        .arg("--object-store-option")
-        .arg(format!("root={}", self.dir.path().join("blob").display()))
-        .arg("--create-volume-size")
-        .arg(VOL_SIZE.to_string())
-        .arg("--lease-ttl-ms")
-        .arg("1500");
-        cmd
-    }
-
-    fn path(&self, name: &str) -> PathBuf {
-        self.dir.path().join(name)
-    }
-
-    /// Objects the store holds below a prefix, so a test can assert on what a
-    /// launch actually uploaded.
-    fn objects(&self, prefix: &str) -> Vec<String> {
-        let root = self.dir.path().join("blob").join(prefix);
-        let mut found = Vec::new();
-        let mut stack = vec![root];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                if entry.file_type().is_ok_and(|t| t.is_dir()) {
-                    stack.push(entry.path());
-                } else {
-                    found.push(entry.file_name().to_string_lossy().to_string());
-                }
-            }
-        }
-        found.sort();
-        found
-    }
-}
-
-/// Wait for the `READY <listener>` line the daemon prints once every requested
-/// socket is bound.
-fn wait_ready(child: &mut Child) -> String {
-    let stdout = child.stdout.take().expect("piped stdout");
-    let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("read READY line");
-    assert!(
-        line.starts_with("READY "),
-        "unexpected first line: {line:?}"
-    );
-    line.trim().to_string()
-}
-
-#[test]
-fn requires_at_least_one_listener() {
-    let env = Env::new();
-    let output = env.command("att-none").output().expect("run cats-blockd");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("at least one of --listen-unix"),
-        "unhelpful error: {stderr}"
-    );
-}
-
-#[test]
-fn rejects_two_nbd_listeners() {
-    let env = Env::new();
-    let output = env
-        .command("att-both-nbd")
+        .arg(&data_dir)
         .arg("--listen-unix")
-        .arg(env.path("nbd.sock"))
-        .arg("--listen-tcp")
-        .arg("127.0.0.1:0")
+        .arg(directory.path().join("nbd.sock"))
         .output()
         .expect("run cats-blockd");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("mutually exclusive"),
-        "unhelpful error: {stderr}"
+        stderr.contains("complete authorized serving artifact"),
+        "unexpected rejection: {stderr}"
     );
+    assert!(!stderr.contains("unknown object-store adapter"));
+    assert!(!data_dir.exists(), "ungranted serving performed local I/O");
 }
 
-#[cfg(not(target_os = "linux"))]
 #[test]
-fn vhost_user_is_rejected_off_linux() {
-    let env = Env::new();
-    let output = env
-        .command("att-vhu-unsupported")
-        .arg("--listen-vhost-user")
-        .arg(env.path("vhu.sock"))
-        .arg("--guest-device-serial")
-        .arg("cats-root")
+fn release_help_exposes_only_artifact_authorized_volume_modes() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cats-blockd"))
+        .arg("--help")
         .output()
-        .expect("run cats-blockd");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("requires Linux"),
-        "unhelpful error: {stderr}"
-    );
-}
-
-/// Golden root (ADR-0017): the whole point is that a launch does not upload a
-/// private copy of the rootfs, so this asserts on what landed in the object store.
-#[test]
-fn a_root_disk_is_provisioned_from_a_shared_image_without_copying_it() {
-    use cats_block_client::NbdClient;
-    use std::io::Write;
-    use std::process::Stdio;
-
-    const CHUNK: usize = cats_api::chunk::CHUNK_SIZE as usize;
-    let env = Env::new();
-    let image = env.path("golden.raw");
-    let mut body = vec![0u8; 2 * CHUNK];
-    for (i, byte) in body.iter_mut().enumerate() {
-        // Chunk 1 stays zero so the image is sparse; chunk 0 is distinct content.
-        *byte = if i < CHUNK { (i % 251) as u8 + 1 } else { 0 };
+        .expect("run cats-blockd --help");
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    let protocol = include_str!("../../../docs/specs/blockd-protocol.md");
+    assert!(help.contains("--authorized-serving-spec"));
+    assert!(help.contains("--authorized-control-spec"));
+    for legacy in [
+        "--attachment-epoch",
+        "--create-volume-size",
+        "--collect-garbage",
+        "--seed-image-id",
+        "--seed-image",
+        "--listen-tcp",
+    ] {
+        assert!(!help.contains(legacy), "release help exposes {legacy}");
     }
-    let mut f = std::fs::File::create(&image).unwrap();
-    f.write_all(&body).unwrap();
-    f.sync_all().unwrap();
-
-    let nbd = env.path("seed-nbd.sock");
-    let mut child = env
-        .command("att-seed")
-        .arg("--listen-unix")
-        .arg(&nbd)
-        .arg("--seed-image")
-        .arg(&image)
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn cats-blockd");
-    wait_ready(&mut child);
-
-    let mut client = NbdClient::connect_unix(&nbd).expect("nbd connect");
-    assert_eq!(client.size(), VOL_SIZE);
-    let got = client
-        .read(0, body.len() as u32)
-        .expect("read the provisioned root");
-    assert_eq!(got, body, "the Guest must see the image content");
-
-    // The image was uploaded once, under the image namespace; the volume itself
-    // published no data objects at all, only map nodes.
-    let image_objects = env.objects("images");
-    assert_eq!(
-        image_objects.len(),
-        2,
-        "expected one chunk object plus the manifest, got {image_objects:?}"
-    );
-    assert!(
-        env.objects("volumes/vol_frontends/data").is_empty(),
-        "provisioning must not publish volume data objects: {:?}",
-        env.objects("volumes/vol_frontends/data")
-    );
-
-    client.disconnect().ok();
-    child.kill().ok();
-    child.wait().ok();
-
-    // A second launch of the same volume must not re-provision over its data.
-    let mut again = env
-        .command("att-seed-2")
-        .arg("--listen-unix")
-        .arg(env.path("seed-nbd2.sock"))
-        .arg("--seed-image")
-        .arg(&image)
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn cats-blockd again");
-    wait_ready(&mut again);
-    let mut client = NbdClient::connect_unix(&env.path("seed-nbd2.sock")).unwrap();
-    let patch = vec![0xABu8; 4096];
-    client.write(0, &patch).expect("write");
-    client.flush().expect("flush");
-    assert_eq!(client.read(0, 4096).unwrap(), patch);
-    client.disconnect().ok();
-    again.kill().ok();
-    again.wait().ok();
-
-    let mut third = env
-        .command("att-seed-3")
-        .arg("--listen-unix")
-        .arg(env.path("seed-nbd3.sock"))
-        .arg("--seed-image")
-        .arg(&image)
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn cats-blockd a third time");
-    wait_ready(&mut third);
-    let mut client = NbdClient::connect_unix(&env.path("seed-nbd3.sock")).unwrap();
-    let back = client.read(0, CHUNK as u32).unwrap();
-    assert_eq!(&back[..4096], &patch[..], "re-seeding clobbered Guest data");
-    assert_eq!(
-        &back[4096..],
-        &body[4096..CHUNK],
-        "lost the shared image tail"
-    );
-    client.disconnect().ok();
-    third.kill().ok();
-    third.wait().ok();
-    // Still exactly one copy of the image, plus the one 64 KiB page the Guest wrote.
-    assert_eq!(env.objects("images").len(), 2);
-    assert_eq!(env.objects("volumes/vol_frontends/data").len(), 1);
+    for retired_gc_flag in [
+        "--attachment-epoch",
+        "--collect-garbage",
+        "--gc-interval-ms",
+    ] {
+        assert!(
+            !protocol.contains(retired_gc_flag),
+            "frozen protocol advertises removed release flag {retired_gc_flag}"
+        );
+    }
+    assert!(protocol.contains("typed lifecycle/sweeper effect"));
 }
 
-/// The node agent's path: publish once, then provision by id. Publishing must not
-/// need a volume, a lease or a metadata store — on real hardware, publishing while
-/// holding a 1.5 s attachment lease lost the lease and failed the launch.
 #[test]
-fn an_image_is_published_once_and_then_referenced_by_id() {
-    use cats_block_client::NbdClient;
-    use std::io::Write;
-    use std::process::Stdio;
+fn publishing_an_image_remains_a_volume_free_object_store_operation() {
+    use std::io::Write as _;
 
-    const CHUNK: usize = cats_api::chunk::CHUNK_SIZE as usize;
-    let env = Env::new();
-    let image = env.path("publish-once.raw");
-    let body: Vec<u8> = (0..CHUNK).map(|i| (i % 251) as u8 + 3).collect();
+    let directory = tempfile::tempdir().unwrap();
+    let image = directory.path().join("image.raw");
     let mut file = std::fs::File::create(&image).unwrap();
-    file.write_all(&body).unwrap();
+    file.write_all(b"immutable golden image").unwrap();
     file.sync_all().unwrap();
+    let object_root = directory.path().join("objects");
 
-    // No --volume-id, --data-dir, --attachment-id, --metadata-store-adapter or
-    // listener: publishing serves no volume.
-    let published = Command::new(env!("CARGO_BIN_EXE_cats-blockd"))
-        .arg("--publish-image")
-        .arg(&image)
-        .arg("--object-store-adapter")
-        .arg("file")
-        .arg("--object-store-option")
-        .arg(format!("root={}", env.dir.path().join("blob").display()))
-        .output()
-        .expect("run cats-blockd --publish-image");
+    let publish = || {
+        Command::new(env!("CARGO_BIN_EXE_cats-blockd"))
+            .arg("--publish-image")
+            .arg(&image)
+            .arg("--object-store-adapter")
+            .arg("file")
+            .arg("--object-store-option")
+            .arg(format!("root={}", object_root.display()))
+            .output()
+            .expect("run cats-blockd --publish-image")
+    };
+    let first = publish();
     assert!(
-        published.status.success(),
+        first.status.success(),
         "publish failed: {}",
-        String::from_utf8_lossy(&published.stderr)
+        String::from_utf8_lossy(&first.stderr)
     );
-    let image_id = String::from_utf8_lossy(&published.stdout)
-        .lines()
-        .find_map(|line| line.strip_prefix("IMAGE ").map(str::to_string))
-        .expect("publish printed an image id");
-    assert_eq!(image_id.len(), 64, "image id is a sha256: {image_id:?}");
-    assert_eq!(env.objects("images").len(), 2);
-
-    // Publishing again is a no-op that reports the same id.
-    let again = Command::new(env!("CARGO_BIN_EXE_cats-blockd"))
-        .arg("--publish-image")
-        .arg(&image)
-        .arg("--object-store-adapter")
-        .arg("file")
-        .arg("--object-store-option")
-        .arg(format!("root={}", env.dir.path().join("blob").display()))
-        .output()
-        .expect("run cats-blockd --publish-image again");
-    assert!(String::from_utf8_lossy(&again.stdout).contains(&image_id));
-
-    let nbd = env.path("byid-nbd.sock");
-    let mut child = env
-        .command("att-byid")
-        .arg("--listen-unix")
-        .arg(&nbd)
-        .arg("--seed-image-id")
-        .arg(&image_id)
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn cats-blockd");
-    wait_ready(&mut child);
-    let mut client = NbdClient::connect_unix(&nbd).expect("nbd connect");
-    assert_eq!(client.read(0, CHUNK as u32).unwrap(), body);
-    assert!(
-        env.objects("volumes/vol_frontends/data").is_empty(),
-        "provisioning by id must publish no volume data"
+    let second = publish();
+    assert!(second.status.success());
+    assert_eq!(
+        first.stdout, second.stdout,
+        "image publication is idempotent"
     );
-    client.disconnect().ok();
-    child.kill().ok();
-    child.wait().ok();
-
-    // An unknown image id fails loudly instead of serving an empty disk.
-    let bogus = env
-        .command("att-bogus")
-        .arg("--listen-unix")
-        .arg(env.path("bogus.sock"))
-        .arg("--seed-image-id")
-        .arg("f".repeat(64))
-        .output()
-        .expect("run cats-blockd");
-    assert!(!bogus.status.success());
-    assert!(
-        String::from_utf8_lossy(&bogus.stderr).contains("load base image"),
-        "unhelpful error: {}",
-        String::from_utf8_lossy(&bogus.stderr)
-    );
-}
-
-/// GC through the real binary: it attaches, sweeps, and exits without a listener.
-#[test]
-fn collecting_garbage_needs_no_listener_and_leaves_live_objects_alone() {
-    use cats_block_client::NbdClient;
-    use std::process::Stdio;
-
-    let env = Env::new();
-    let nbd = env.path("gc-nbd.sock");
-    let mut child = env
-        .command("att-gc")
-        .arg("--listen-unix")
-        .arg(&nbd)
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn cats-blockd");
-    wait_ready(&mut child);
-    let mut client = NbdClient::connect_unix(&nbd).expect("nbd connect");
-    // Two full-chunk generations: the first chunk object becomes garbage. (Two
-    // small writes to the same page would not: the second delta replaces the
-    // first in the chain, so the first is never referenced in the first place.)
-    const CHUNK: usize = cats_api::chunk::CHUNK_SIZE as usize;
-    let first = vec![0x11u8; CHUNK];
-    let second = vec![0x22u8; CHUNK];
-    client.write(0, &first).unwrap();
-    client.flush().unwrap();
-    client.write(0, &second).unwrap();
-    client.flush().unwrap();
-    client.disconnect().ok();
-    child.kill().ok();
-    child.wait().ok();
-    assert_eq!(env.objects("volumes/vol_frontends/data").len(), 2);
-
-    // No listener argument at all.
-    let gc = env
-        .command("att-gc-run")
-        .arg("--collect-garbage")
-        .output()
-        .expect("run cats-blockd --collect-garbage");
-    assert!(
-        gc.status.success(),
-        "gc failed: {}",
-        String::from_utf8_lossy(&gc.stderr)
-    );
-    let report = String::from_utf8_lossy(&gc.stdout);
-    assert!(
-        report.contains("data_deleted=1"),
-        "unexpected report: {report}"
-    );
-    assert_eq!(env.objects("volumes/vol_frontends/data").len(), 1);
-
-    // And the volume still serves the live generation.
-    let mut child = env
-        .command("att-gc-after")
-        .arg("--listen-unix")
-        .arg(env.path("gc-nbd2.sock"))
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn cats-blockd again");
-    wait_ready(&mut child);
-    let mut client = NbdClient::connect_unix(&env.path("gc-nbd2.sock")).unwrap();
-    assert_eq!(client.read(0, CHUNK as u32).unwrap(), second);
-    client.disconnect().ok();
-    child.kill().ok();
-    child.wait().ok();
-}
-
-/// The Linux-only half: vhost-user needs eventfd, memfd and SCM_RIGHTS.
-#[cfg(target_os = "linux")]
-mod vhost_user {
-    use std::process::{Child, Stdio};
-    use std::time::{Duration, Instant};
-
-    use cats_block_client::NbdClient;
-
-    use super::{wait_ready, Env, VOL_SIZE};
-
-    fn wait_exit(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                return status;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "cats-blockd did not exit in time"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    /// The node agent runs `cats-blockd` with both frontends: the VMM consumes
-    /// vhost-user while seeding, readiness probing and recovery keep using NBD on the
-    /// same engine and the same attachment lease.
-    #[test]
-    fn serves_nbd_and_vhost_user_together_then_exits_with_the_vmm() {
-        let env = Env::new();
-        let nbd_socket = env.path("nbd.sock");
-        let vhost_user_socket = env.path("vhu.sock");
-        let mut child = env
-            .command("att-dual")
-            .arg("--listen-unix")
-            .arg(&nbd_socket)
-            .arg("--listen-vhost-user")
-            .arg(&vhost_user_socket)
-            .arg("--guest-device-serial")
-            .arg("cats-root")
-            .arg("--vhost-user-queues")
-            .arg("2")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn cats-blockd");
-
-        // READY is printed only after every listener is bound, so a VMM started on
-        // that line cannot race the socket.
-        let ready = wait_ready(&mut child);
-        assert!(
-            ready.contains("vhu.sock"),
-            "READY should name the VMM-facing socket: {ready}"
-        );
-        assert!(vhost_user_socket.exists(), "vhost-user socket is missing");
-
-        // The oracle frontend works while the VMM socket is still unconnected.
-        let mut client = NbdClient::connect_unix(&nbd_socket).expect("nbd connect");
-        assert_eq!(client.size(), VOL_SIZE);
-        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
-        client.write(8192, &payload).expect("nbd write");
-        client.flush().expect("nbd flush");
-        assert_eq!(client.read(8192, 4096).expect("nbd read"), payload);
-        client.disconnect().expect("nbd disconnect");
-
-        // A VMM connecting and then vanishing is the normal end of service: the
-        // process exits so the attachment lease is released for the next host.
-        let vmm = std::os::unix::net::UnixStream::connect(&vhost_user_socket)
-            .expect("connect as a VMM would");
-        drop(vmm);
-        let status = wait_exit(&mut child, Duration::from_secs(15));
-        assert!(
-            status.success(),
-            "a VMM disconnect must not be an error: {status}"
-        );
-
-        // The volume is attachable again right away, and the committed write is
-        // still there.
-        let mut next = env
-            .command("att-after")
-            .arg("--listen-unix")
-            .arg(env.path("nbd2.sock"))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn cats-blockd again");
-        wait_ready(&mut next);
-        let mut client = NbdClient::connect_unix(&env.path("nbd2.sock")).expect("nbd connect");
-        assert_eq!(client.read(8192, 4096).expect("nbd read"), payload);
-        client.disconnect().expect("nbd disconnect");
-        let _ = next.kill();
-        let _ = next.wait();
-    }
+    assert!(String::from_utf8_lossy(&first.stdout).starts_with("IMAGE "));
 }

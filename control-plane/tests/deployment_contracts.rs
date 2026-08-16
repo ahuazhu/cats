@@ -30,6 +30,185 @@ fn read_workspace_file(path: &str) -> String {
 }
 
 #[test]
+fn production_metal_fleet_keeps_stable_addresses_and_one_explicit_root_cutover() {
+    let main = read_workspace_file("deploy/aws/terraform/stacks/platform/main.tf");
+    let variables = read_workspace_file("deploy/aws/terraform/stacks/platform/variables.tf");
+    let outputs = read_workspace_file("deploy/aws/terraform/stacks/platform/outputs.tf");
+    let platform_example =
+        read_workspace_file("deploy/aws/terraform/stacks/platform/platform.tfvars.example");
+    let infrastructure_example = read_workspace_file(
+        "deploy/aws/terraform/stacks/production-infrastructure/production.tfvars.example",
+    );
+    let runbook = read_workspace_file("deploy/aws/terraform/README.md");
+
+    for contract in [
+        "for_each = var.metal_workers",
+        "from = aws_instance.metal_worker[0]",
+        "to   = aws_instance.metal_worker[\"metal-2\"]",
+        "from = aws_instance.metal_worker[1]",
+        "to   = aws_instance.metal_worker[\"metal-1\"]",
+        "encrypted             = each.value.root_volume_encrypted",
+    ] {
+        assert!(
+            main.contains(contract),
+            "missing metal fleet contract: {contract}"
+        );
+    }
+    assert!(
+        !main.contains("root_block_device]"),
+        "root encryption drift must be visible to the reviewed maintenance plan",
+    );
+    assert!(
+        variables.contains("variable \"metal_workers\"")
+            && variables.contains("root_volume_encrypted = bool")
+            && variables.contains("worker.root_volume_encrypted || name == \"metal-2\""),
+        "workers need stable keys and an explicit per-worker root encryption target",
+    );
+    let worker_resource = main
+        .split_once("resource \"aws_instance\" \"metal_worker\"")
+        .and_then(|(_, source)| source.split_once("# Preserve the exact imported"))
+        .map(|(source, _)| source)
+        .expect("metal worker resource and address migration boundary");
+    assert!(
+        !worker_resource.contains("prevent_destroy = true"),
+        "an unconditional prevent_destroy would hide the reviewed root replacement plan",
+    );
+    assert!(
+        outputs.contains("for name, worker in aws_instance.metal_worker : name => worker.id"),
+        "platform must emit the exact stable-name to instance-ID deployment input",
+    );
+
+    for source in [&platform_example, &infrastructure_example] {
+        assert!(
+            source.contains("\"metal-2\"") && source.contains("\"metal-1\""),
+            "both production workers must be present in every fleet handoff example",
+        );
+    }
+    assert!(
+        platform_example.contains("root_volume_encrypted = false")
+            && platform_example.contains("root_volume_encrypted = true"),
+        "the ordinary plan must match legacy metal-2 while keeping metal-1 encrypted",
+    );
+    for contract in [
+        "metal-2-root-encryption.tfplan",
+        "aws_instance.metal_worker[\"metal-2\"]",
+        "aws_instance.metal_worker[\"metal-1\"]",
+    ] {
+        assert!(
+            runbook.contains(contract),
+            "the reviewed saved-plan runbook is missing: {contract}",
+        );
+    }
+}
+
+#[test]
+fn production_cutover_runbook_orders_gates_and_fences_destructive_commands() {
+    let runbook = read_workspace_file("docs/production-cutover-runbook.md");
+    let ordered_stages = [
+        "<!-- cutover-stage: 00-current-blocker -->",
+        "<!-- cutover-stage: 10-maintenance-ingress-closed -->",
+        "<!-- cutover-stage: 20-fresh-targets -->",
+        "<!-- cutover-stage: 30-exact-release-credentials -->",
+        "<!-- cutover-stage: 40-cordoned-nodes -->",
+        "<!-- cutover-stage: 50-e12-empty-fleet -->",
+        "<!-- cutover-stage: 60-e3-runtime-path -->",
+        "<!-- cutover-stage: 70-final-gates -->",
+        "<!-- cutover-stage: 80-reset-read-only -->",
+        "<!-- cutover-stage: 90-reset-execute-forward-only -->",
+        "<!-- cutover-stage: 100-uncordon-open -->",
+    ];
+    let mut prior = 0;
+    for stage in ordered_stages {
+        assert_eq!(
+            runbook.matches(stage).count(),
+            1,
+            "cutover stage marker must be unique: {stage}"
+        );
+        let position = runbook.find(stage).expect("cutover stage marker");
+        assert!(position >= prior, "cutover stage is out of order: {stage}");
+        prior = position + stage.len();
+    }
+
+    for forbidden in [
+        "rm -rf",
+        "aws s3 rm",
+        "kubectl delete namespace",
+        "DROP DATABASE",
+        "DROP SCHEMA",
+        "terraform destroy",
+    ] {
+        assert!(
+            !runbook.contains(forbidden),
+            "runbook regained a broad destructive command: {forbidden}"
+        );
+    }
+
+    let blocker = runbook
+        .find("Current verdict: HOLD before destructive reset and public opening")
+        .expect("top-level reset blocker");
+    let boundary = runbook
+        .find("<!-- forward-only-boundary: immutable-reset-started -->")
+        .expect("forward-only boundary");
+    let opening = runbook
+        .find("<!-- cutover-stage: 100-uncordon-open -->")
+        .expect("opening stage");
+    assert!(blocker < boundary && boundary < opening);
+    assert!(runbook[..boundary].contains("dry-run only"));
+    assert!(runbook[boundary..opening].contains("there is no rollback/cancel path"));
+    assert!(runbook[opening..].contains("DEFERRED(CROSS_COMPONENT_MUTATION_ADMISSION_OPEN)"));
+}
+
+#[test]
+fn production_cutover_native_full_log_is_frozen_before_exact_job_publication() {
+    let runbook = read_workspace_file("docs/production-cutover-runbook.md");
+    assert!(
+        !runbook.contains("/srv/cats-build/jobs/"),
+        "the qualification runner stores immutable job outputs below /srv/cats-build/target"
+    );
+
+    let phase_zero = runbook
+        .split_once("## 0. Freeze and qualify the exact release before the window")
+        .and_then(|(_, remainder)| {
+            remainder.split_once("<!-- cutover-stage: 10-maintenance-ingress-closed -->")
+        })
+        .map(|(section, _)| section)
+        .expect("Stage A phase 0 release qualification section");
+    let final_gates = runbook
+        .split_once("## 8. Recheck final full, Linux and metal gates")
+        .and_then(|(_, remainder)| remainder.split_once("## Stage B"))
+        .map(|(section, _)| section)
+        .expect("Stage A final gates section");
+
+    for (section, job_id) in [
+        (phase_zero, "<QUALIFICATION_JOB_ID>"),
+        (final_gates, "<FINAL_QUALIFICATION_JOB_ID>"),
+    ] {
+        let run = section.find("cats-run-build").expect("native full runner");
+        let pipefail = section[run..]
+            .find("set -o pipefail")
+            .map(|position| run + position)
+            .expect("native full pipefail gate");
+        let log = section[pipefail..]
+            .find("tee \"$CATS_BUILD_OUTPUT_DIR/quality-full.log\"")
+            .map(|position| pipefail + position)
+            .expect("native full frozen log writer");
+        let publish = section[log..]
+            .find("cats-publish-content-addressed evidence")
+            .map(|position| log + position)
+            .expect("native full evidence publisher");
+        let expected_path = format!(
+            "/srv/cats-build/target/<FINAL_RELEASE_SHA>-<SOURCE_MANIFEST_SHA256>-<SOURCE_BUNDLE_SHA256>/{job_id}/output/quality-full.log"
+        );
+        let exact_output = section[publish..]
+            .find(&expected_path)
+            .map(|position| publish + position)
+            .expect("exact immutable job output path");
+
+        assert!(run < pipefail && pipefail < log && log < publish && publish < exact_output);
+    }
+}
+
+#[test]
 fn production_platform_defaults_to_independent_az_dependencies() {
     let variables = read_workspace_file("deploy/aws/terraform/stacks/platform/variables.tf");
     let example =
@@ -79,17 +258,357 @@ fn production_platform_defaults_to_independent_az_dependencies() {
 }
 
 #[test]
-fn route_grant_private_key_reaches_only_control_plane_and_nodes_get_public_key() {
+fn production_platform_preflight_requires_one_nat_gateway_per_az() {
+    let checker = workspace_root().join("deploy/aws/terraform/check-platform-tfvars.sh");
+    let guide = read_workspace_file("deploy/aws/terraform/README.md");
+    let preflight = guide
+        .find("../../check-platform-tfvars.sh platform.auto.tfvars")
+        .expect("platform tfvars preflight in operator guide");
+    let plan = guide
+        .find("terraform plan -refresh-only -out=platform-refresh.tfplan")
+        .expect("platform refresh-only plan in operator guide");
+    assert!(
+        preflight < plan,
+        "the private production tfvars must be checked before Terraform reads them",
+    );
+    let fixture_dir = tempfile::tempdir().expect("temporary tfvars directory");
+    let run = |name: &str, contents: &str| {
+        let path = fixture_dir.path().join(name);
+        std::fs::write(&path, contents).expect("write tfvars fixture");
+        Command::new(&checker)
+            .arg(&path)
+            .output()
+            .unwrap_or_else(|error| panic!("run {}: {error}", checker.display()))
+    };
+
+    let accepted = run(
+        "accepted.tfvars",
+        "availability_zone_count = 2\none_nat_gateway_per_az = true # deployed topology\n",
+    );
+    assert!(
+        accepted.status.success(),
+        "preflight rejected the safe production NAT setting: {}",
+        String::from_utf8_lossy(&accepted.stderr),
+    );
+
+    for (name, contents) in [
+        ("false.tfvars", "one_nat_gateway_per_az = false\n"),
+        ("missing.tfvars", "availability_zone_count = 2\n"),
+        (
+            "duplicate.tfvars",
+            "one_nat_gateway_per_az = true\none_nat_gateway_per_az = true\n",
+        ),
+        (
+            "expression.tfvars",
+            "one_nat_gateway_per_az = local.expected_nat_topology\n",
+        ),
+    ] {
+        let rejected = run(name, contents);
+        assert!(
+            !rejected.status.success(),
+            "preflight accepted unsafe or ambiguous fixture {name}",
+        );
+    }
+}
+
+#[test]
+fn production_maintenance_is_one_reviewed_terraform_transition() {
+    let stack_main =
+        read_workspace_file("deploy/aws/terraform/stacks/production-application/main.tf");
+    let stack_variables =
+        read_workspace_file("deploy/aws/terraform/stacks/production-application/variables.tf");
+    let module_main = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    let module_variables =
+        read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/variables.tf");
+    let example = read_workspace_file(
+        "deploy/aws/terraform/stacks/production-application/production.tfvars.example",
+    );
+
+    let maintenance = stack_variables
+        .split_once("variable \"maintenance_mode\"")
+        .and_then(|(_, rest)| rest.split_once("\n}"))
+        .map(|(section, _)| section)
+        .expect("production maintenance_mode variable");
+    assert!(maintenance.contains("default     = false"));
+    let public_ingress = stack_variables
+        .split_once("variable \"enable_public_ingress\"")
+        .and_then(|(_, rest)| rest.split_once("\n}"))
+        .map(|(section, _)| section)
+        .expect("production enable_public_ingress variable");
+    assert!(public_ingress.contains("default     = false"));
+    let module_public_ingress = module_variables
+        .split_once("variable \"enable_public_ingress\"")
+        .and_then(|(_, rest)| rest.split_once("\n}"))
+        .map(|(section, _)| section)
+        .expect("Kubernetes module enable_public_ingress variable");
+    assert!(module_public_ingress.contains("default     = false"));
+    for expected in [
+        "maintenance_mode                           = var.maintenance_mode",
+        "enable_public_ingress                      = var.enable_public_ingress",
+        "var.route53_zone_id != null && var.enable_public_ingress && !var.maintenance_mode",
+    ] {
+        assert!(
+            stack_main.contains(expected),
+            "production application maintenance wiring lost {expected:?}"
+        );
+    }
+    for expected in [
+        "var.maintenance_mode ? 0 : var.control_plane_replicas",
+        "var.enable_public_ingress && !var.maintenance_mode",
+        "replicas = local.effective_control_plane_replicas",
+        "min_available = var.maintenance_mode ? \"0\" : \"1\"",
+        "suspend                       = var.maintenance_mode",
+        "for_each = local.effective_public_ingress",
+        "count = local.effective_public_ingress",
+    ] {
+        assert!(
+            module_main.contains(expected),
+            "Kubernetes maintenance boundary lost {expected:?}"
+        );
+    }
+    assert!(example.contains("maintenance_mode = false"));
+    assert!(example.contains("enable_public_ingress = false"));
+}
+
+#[test]
+fn production_clean_slate_reset_contract_passes_offline_fixture() {
+    let output = Command::new("python3")
+        .arg(workspace_root().join("deploy/aws/production-clean-slate-reset-fixture.py"))
+        .output()
+        .expect("run production clean-slate reset fixture");
+    assert!(
+        output.status.success(),
+        "clean-slate reset fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("fixture output is UTF-8");
+    assert!(stdout.contains("paginated versions+markers"));
+    assert!(stdout.contains("fresh namespace preserved"));
+    assert!(stdout.contains("post-green blocker passed"));
+    assert!(stdout.contains("closed forward-resume"));
+    assert!(stdout.contains("crash replay"));
+    assert!(stdout.contains("mechanical prerequisite blocks"));
+    assert!(stdout.contains("recoverable receipt publication"));
+    assert!(stdout.contains("S3 expected-owner gates passed"));
+    assert!(stdout.contains("fresh DB read-only"));
+    assert!(stdout.contains("ingress Closed"));
+    assert!(stdout.contains("post-open forward/credential-independent cleanup verification"));
+}
+
+/// The cutover tools refuse group- or world-writable ancestors. The Linux
+/// gate's default /tmp is sticky, so scratch space moves under the
+/// workspace target directory there; macOS's per-user /var/folders default
+/// already satisfies the contract (and the workspace itself sits under the
+/// group-writable /Users, so it cannot serve as the base).
+fn contract_fixture_tmpdir() -> std::path::PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        // Prefer the gate's target volume: the repository bind mount on a
+        // macOS Docker host is virtiofs, which cannot re-resolve a replaced
+        // inode through /proc/self/fd the way the held-descriptor races
+        // require. The native build host relocates the cargo target outside
+        // its read-only checkout via CARGO_TARGET_DIR; the workspace target
+        // stays the last resort for writable checkouts.
+        let base = std::env::var_os("CATS_LINUX_TARGET_DIRECTORY")
+            .or_else(|| std::env::var_os("CARGO_TARGET_DIR"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| workspace_root().join("target"))
+            .join("contract-fixture-tmp");
+        std::fs::create_dir_all(&base).expect("create contract fixture tmpdir");
+        base.canonicalize()
+            .expect("canonicalize contract fixture tmpdir")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::temp_dir()
+    }
+}
+
+#[test]
+fn production_cutover_proof_set_contract_passes_offline_fixture() {
+    let output = Command::new("python3")
+        .arg(workspace_root().join("deploy/aws/production-cutover-proof-set-fixture.py"))
+        .env("TMPDIR", contract_fixture_tmpdir())
+        .output()
+        .expect("run production cutover proof-set fixture");
+    assert!(
+        output.status.success(),
+        "cutover proof-set fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn e3_operator_window_persistence_contract_passes_offline_fixture() {
+    let output = Command::new("bash")
+        .arg(
+            workspace_root()
+                .join("deploy/metal/tests/runtime-cutover-e3-window-persistence-fixture.sh"),
+        )
+        .arg(workspace_root().join("deploy/metal/runtime-cutover-e3-window.sh"))
+        .env("TMPDIR", contract_fixture_tmpdir())
+        .output()
+        .expect("run E3 operator window persistence fixture");
+    assert!(
+        output.status.success(),
+        "E3 window persistence fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("fixture output is UTF-8");
+    assert!(stdout.contains("all cases passed"));
+}
+
+/// The operator-trust and installer fixtures sign with a real Ed25519-capable
+/// openssl; macOS's LibreSSL lacks the algorithm, so probe the well-known
+/// locations and fail (never skip) when none qualifies.
+fn ed25519_openssl() -> String {
+    for candidate in [
+        "/usr/bin/openssl",
+        "/opt/homebrew/bin/openssl",
+        "/usr/local/bin/openssl",
+    ] {
+        let Ok(output) = Command::new(candidate)
+            .args(["list", "-public-key-algorithms"])
+            .output()
+        else {
+            continue;
+        };
+        if output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .to_ascii_lowercase()
+                .contains("ed25519")
+        {
+            return candidate.to_owned();
+        }
+    }
+    panic!("no Ed25519-capable openssl found at the well-known locations");
+}
+
+#[test]
+fn production_cutover_operator_trust_contract_passes_offline_fixture() {
+    let output = Command::new("python3")
+        .arg(workspace_root().join("deploy/aws/production-cutover-operator-trust-fixture.py"))
+        .arg("--tool")
+        .arg(workspace_root().join("deploy/aws/production-cutover-operator-trust.py"))
+        .arg("--openssl")
+        .arg(ed25519_openssl())
+        .env("TMPDIR", contract_fixture_tmpdir())
+        .output()
+        .expect("run production cutover operator trust fixture");
+    assert!(
+        output.status.success(),
+        "operator trust fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn install_operator_tools_contract_passes_offline_fixture() {
+    let output = Command::new("bash")
+        .arg(workspace_root().join("deploy/aws/install-operator-tools-fixture.sh"))
+        .arg("--openssl")
+        .arg(ed25519_openssl())
+        .env("TMPDIR", contract_fixture_tmpdir())
+        .output()
+        .expect("run install-operator-tools fixture");
+    assert!(
+        output.status.success(),
+        "install-operator-tools fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn production_final_open_contract_passes_offline_fixture() {
+    let output = Command::new("python3")
+        .arg(workspace_root().join("deploy/aws/production-final-open-fixture.py"))
+        .output()
+        .expect("run production final-open fixture");
+    assert!(
+        output.status.success(),
+        "production final-open fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("fixture output is UTF-8"),
+        "production final-open fixture: PASS\n"
+    );
+}
+
+#[test]
+fn old_host_positive_stop_contract_passes_calibrated_offline_fixture() {
+    let root = workspace_root();
+    let output = Command::new("python3")
+        .arg(root.join("deploy/aws/old-host-positive-stop-fixture.py"))
+        .arg("--tool")
+        .arg(root.join("deploy/aws/old-host-positive-stop.py"))
+        .output()
+        .expect("run old-Host positive-stop fixture");
+    assert!(
+        output.status.success(),
+        "old-Host positive-stop fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("fixture output is UTF-8");
+    for calibrated_boundary in [
+        "calibrated runtime refusal",
+        "descendant/PID-reuse",
+        "absent/failed units",
+        "ambiguous EC2 discovery/replay",
+        "exact AWS identity/rules/ENIs/stable-deadline",
+        "no-replace",
+        "exact coverage",
+    ] {
+        assert!(
+            stdout.contains(calibrated_boundary),
+            "fixture omitted {calibrated_boundary:?}"
+        );
+    }
+
+    let producer = read_workspace_file("deploy/aws/old-host-positive-stop.py");
+    for required in [
+        "cats.old-host-positive-stop-inventory.v1",
+        "\"--no-ask-password\", \"stop\"",
+        "modify-network-interface-attribute",
+        "host_fence_event\": \"not_established",
+        "object_write_fence\": \"not_established",
+        "production_reset_prerequisite\": \"proposed_unaccepted",
+    ] {
+        assert!(producer.contains(required), "producer lost {required:?}");
+    }
+    assert!(!producer.contains("shell=True"));
+
+    let specification = read_workspace_file("docs/specs/old-host-positive-stop-v1.md");
+    assert!(specification.contains("Status: **Proposed**"));
+    assert!(specification.contains("不是 ADR-0040 的 `HostFenceEvent`"));
+    assert!(specification.contains("不能解除"));
+
+    // The mechanical block is the fail-closed proof-set default: without the
+    // explicit D7 operator attestation input, the positive-stop proof branch
+    // raises before any destructive step.
+    let reset = read_workspace_file("deploy/aws/production-clean-slate-reset.py");
+    assert!(reset.contains("--accept-manual-fence-evidence"));
+    assert!(reset.contains("local_positive_stop_verifier"));
+    let proof_set = read_workspace_file("deploy/aws/production_cutover_proof_set.py");
+    assert!(proof_set.contains("class _UnavailableLocalPositiveStopVerifier"));
+    assert!(proof_set.contains("local positive-stop evidence remains Proposed with no accepted"));
+}
+
+#[test]
+fn legacy_route_grant_private_key_is_control_only_until_c1_removes_v1() {
     let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
     let control = kubernetes
         .split_once("resource \"kubernetes_deployment_v1\" \"control_plane\"")
         .and_then(|(_, rest)| rest.split_once("resource \"kubernetes_pod_disruption_budget_v1\""))
         .map(|(section, _)| section)
         .expect("control-plane Deployment section");
-    assert!(
-        !kubernetes.contains("resource \"kubernetes_deployment_v1\" \"gateway\""),
-        "the V1 Gateway must remain undeployed during the v2 cutover"
-    );
     for fragment in [
         "kubernetes_secret_v1.route_grant_signing",
         "CATS_ROUTE_GRANT_PRIVATE_KEY_FILE",
@@ -113,19 +632,13 @@ fn route_grant_private_key_reaches_only_control_plane_and_nodes_get_public_key()
 
     let worker =
         read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
-    assert!(worker.contains("base64encode(var.route_grant_public_key_pem)"));
-    assert!(worker.contains("/etc/cats/route-grant-public.pem"));
-    assert!(worker.contains("installed_route_grant_key_fingerprint"));
-    assert!(worker.contains("-outform DER"));
+    assert!(!worker.contains("route_grant_public_key_pem"));
+    assert!(!worker.contains("/etc/cats/route-grant-public.pem"));
     for unit in [
         "deploy/aws/metal/cats-worker.service",
         "deploy/metal/systemd/cats-noded.service",
     ] {
-        assert!(
-            read_workspace_file(unit)
-                .contains("--route-grant-public-key-file /etc/cats/route-grant-public.pem"),
-            "{unit} does not give cats-noded its verification key"
-        );
+        assert!(!read_workspace_file(unit).contains("--route-grant-public-key-file"));
     }
 
     let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
@@ -150,6 +663,143 @@ fn route_grant_private_key_reaches_only_control_plane_and_nodes_get_public_key()
     assert!(dev.contains("provisioner-owned /etc/cats/identity"));
     assert!(!dev.contains("--node-id"));
     assert!(!dev.contains("--state-dir"));
+}
+
+#[test]
+fn route_v2_deployment_wires_closed_artifact_sets_without_private_bytes_in_terraform() {
+    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    let kubernetes_variables =
+        read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/variables.tf");
+    for expected in [
+        "route_v2_control_artifact_secret_name",
+        "route_v2_gateway_artifact_secret_name",
+        "--route-v2-machine-listen",
+        "0.0.0.0:7443",
+        "--route-v2-rotation-listen",
+        "0.0.0.0:7444",
+        "resource \"kubernetes_service_v1\" \"control_plane_route_v2_rotation\"",
+        "cats-controld-route-rotation",
+        "publish_not_ready_addresses = true",
+        "resource \"kubernetes_deployment_v1\" \"gateway\"",
+        "resource \"kubernetes_service_v1\" \"gateway\"",
+        "cats-gatewayd",
+        "endpoint_wildcard_host",
+        "node-server-ca-bundle.pem",
+        "gateway-machine-client-certificate.pem",
+        "gateway-machine-client-private-key.pem",
+        "/healthz",
+    ] {
+        assert!(
+            kubernetes.contains(expected) || kubernetes_variables.contains(expected),
+            "Route v2 Kubernetes deployment lost {expected:?}"
+        );
+    }
+    for forbidden in [
+        "gateway_machine_client_private_key_pem",
+        "control_machine_server_private_key_pem",
+        "signer_private_key_pem",
+    ] {
+        assert!(
+            !kubernetes_variables.contains(forbidden),
+            "Terraform variable {forbidden:?} would persist Route v2 bytes in state"
+        );
+    }
+    assert!(kubernetes.contains("default_mode = \"0400\""));
+    assert!(kubernetes.contains("run_as_user                = 0"));
+    assert!(kubernetes_variables
+        .contains("endswith(var.route_v2_control_artifact_secret_name, \"-r${var.route_v2_control_artifact_signer_revision}\")"));
+    assert!(kubernetes_variables
+        .contains("endswith(var.route_v2_gateway_artifact_secret_name, \"-r1\")"));
+
+    let worker =
+        read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
+    let worker_variables =
+        read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/variables.tf");
+    for expected in [
+        "route_v2_node_artifact_secret_arn",
+        "route_v2_node_artifact_secret_version_id",
+        "secretsmanager:GetSecretValue",
+        "public-key-ring.v1.json",
+        "rotation-operator-trust.v1.json",
+        "gateway-client-ca-bundle.pem",
+        "node-machine-server-certificate.pem",
+        "node-machine-server-private-key.pem",
+        "node-server-ca-bundle.pem",
+        "CATS_ROUTE_V2_ROTATION_ORIGIN",
+        "route_v2_rotation_origin",
+    ] {
+        assert!(
+            worker.contains(expected) || worker_variables.contains(expected),
+            "Route v2 worker deployment lost {expected:?}"
+        );
+    }
+    assert!(!worker.contains("base64encode(var.route_grant_public_key_pem)"));
+    assert!(!worker_variables.contains("route_grant_public_key_pem"));
+    assert!(
+        worker_variables.contains(
+            "arn:${var.expected_aws_partition}:secretsmanager:${var.aws_region}:${var.expected_account_id}:secret:${var.name_prefix}-${var.environment}-route-v2-node-r1-"
+        ),
+        "worker Route v2 secret ARN validation must stay bound to the exact partition/account/region/name"
+    );
+    assert!(
+        worker_variables.contains(
+            "route_v2_node_artifact_secret_arn must identify the exact <name-prefix>-<environment>-route-v2-node-r1 secret in the expected partition, account, and region"
+        ),
+        "worker Route v2 secret ARN validation must remain exact rather than suffix-only"
+    );
+    assert!(worker.contains("--version-id \"${var.route_v2_node_artifact_secret_version_id}\""));
+    for expected in [
+        "cats_classify_route_v2_node_r1",
+        "route_v2_install_state",
+        "cats_publish_route_v2_node_r1",
+        "case \"$route_v2_install_state\" in absent|exact) ;; *) exit 1 ;; esac",
+    ] {
+        assert!(
+            worker.contains(expected),
+            "worker initial r1 install lost {expected:?}"
+        );
+    }
+    assert!(!worker.contains("find /etc/cats/route-v2 -mindepth 1 -maxdepth 1 -delete"));
+    let worker_unit = read_workspace_file("deploy/aws/metal/cats-worker.service");
+    assert!(worker_unit.contains("UnsetEnvironment=CATS_ROUTE_V2_MACHINE_LISTEN"));
+    assert!(worker_unit.contains("--route-v2-machine-listen 0.0.0.0:7444"));
+    assert!(worker_unit.contains("--route-v2-rotation-origin $CATS_ROUTE_V2_ROTATION_ORIGIN"));
+    assert!(!worker_unit.contains("Environment=CATS_ROUTE_V2_MACHINE_LISTEN="));
+    assert!(!worker_unit.contains("--route-grant-public-key-file"));
+
+    let direct_unit = read_workspace_file("deploy/metal/systemd/cats-noded.service");
+    assert!(direct_unit.contains("UnsetEnvironment=CATS_ROUTE_V2_MACHINE_LISTEN"));
+    assert!(!direct_unit.contains("Environment=CATS_ROUTE_V2_MACHINE_LISTEN="));
+    assert!(!direct_unit.contains("--route-v2-machine-listen"));
+    assert!(!direct_unit.contains("--route-grant-public-key-file"));
+}
+
+#[test]
+fn route_v2_release_contains_a_separate_digest_pinned_gateway_artifact() {
+    let dockerfile = read_workspace_file("deploy/aws/Dockerfile.gateway");
+    assert!(dockerfile.contains("cargo build --locked --release -p cats-network"));
+    assert!(dockerfile.contains("ENTRYPOINT [\"/usr/local/bin/cats-gatewayd\"]"));
+    assert!(!dockerfile.contains("COPY /etc/cats/route-v2"));
+
+    let release = read_workspace_file(".github/workflows/release.yml");
+    assert!(release.contains("file: deploy/aws/Dockerfile.gateway"));
+    assert!(release.contains("gateway-${GITHUB_SHA}"));
+
+    let manual = read_workspace_file("deploy/aws/tools/build-manual-release.sh");
+    let verifier = read_workspace_file("deploy/aws/tools/verify-manual-release.py");
+    for expected in [
+        "--gateway-image",
+        "deploy/aws/Dockerfile.gateway",
+        "--gateway-image-root",
+        "--gateway-image-reference",
+        "--gateway-image-digest",
+        "--gateway-image-registry-verified",
+    ] {
+        assert!(
+            manual.contains(expected) || verifier.contains(expected),
+            "manual Route v2 release lost {expected:?}"
+        );
+    }
 }
 
 #[test]
@@ -185,9 +835,6 @@ fn production_artifacts_remove_the_v1_gateway_and_shared_route_mirror() {
             "shared_route_cache_table",
             "ROUTE_CACHE_TABLE_NAME",
             "route_cache_infrastructure",
-            "cats-gatewayd",
-            "kubernetes_deployment_v1.gateway",
-            "kubernetes_service_v1.gateway",
         ] {
             assert!(
                 !source.contains(forbidden),
@@ -202,8 +849,17 @@ fn production_artifacts_remove_the_v1_gateway_and_shared_route_mirror() {
     assert!(!manifest.contains("aws-config"));
 
     let binary = read_workspace_file("network/src/main.rs");
-    assert!(binary.contains("Route Grant v2 is not composed"));
-    assert!(binary.contains("ExitCode::FAILURE"));
+    for expected in [
+        "ControlRouteResolver::from_installed_artifacts",
+        "GatewayNodeRouteV2Client::from_installed_artifacts",
+        "GatewayIngress::new",
+        "load_installed_gateway_node_route_v2_machine_artifacts",
+    ] {
+        assert!(
+            binary.contains(expected),
+            "Route v2 Gateway lost {expected:?}"
+        );
+    }
     for forbidden in [
         "cats_network::spawn",
         "/v1/routes/resolve",
@@ -409,6 +1065,137 @@ fn control_plane_image_manifest_access_is_exact_and_read_only() {
 }
 
 #[test]
+fn production_fresh_schema_and_chunkstore_prefix_are_single_reviewed_inputs() {
+    let reset_runbook = read_workspace_file("deploy/aws/production-clean-slate-reset.md");
+    assert!(
+        reset_runbook.contains("--fresh-chunkstore-prefix cats-fresh"),
+        "the contract needs a non-default prefix to calibrate the former hardcoded-worker mismatch"
+    );
+
+    let infrastructure =
+        read_workspace_file("deploy/aws/terraform/stacks/production-infrastructure/main.tf");
+    assert_eq!(
+        infrastructure.matches("= var.chunkstore_prefix").count(),
+        3,
+        "one reviewed infrastructure input must feed usage IAM, the fresh usage instance and the worker deployment"
+    );
+    assert!(infrastructure
+        .lines()
+        .any(|line| line.split_whitespace().collect::<Vec<_>>()
+            == [
+                "control_postgres_schema",
+                "=",
+                "var.control_postgres_schema"
+            ]));
+
+    let worker_variables =
+        read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/variables.tf");
+    assert!(worker_variables.contains("variable \"chunkstore_prefix\""));
+    assert!(worker_variables.contains("variable \"control_postgres_schema\""));
+    assert_eq!(
+        worker_variables
+            .matches("\"CATS_CHUNKSTORE_PREFIX\"")
+            .count(),
+        2,
+        "neither caller-owned environment map may replace the exact module input"
+    );
+
+    let worker_module =
+        read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
+    assert_eq!(
+        worker_module
+            .matches("CATS_CHUNKSTORE_PREFIX=${var.chunkstore_prefix}")
+            .count(),
+        2,
+        "both a fresh seed and an existing worker environment must receive the exact prefix"
+    );
+    assert_eq!(
+        worker_module
+            .matches("CATS_POSTGRES_SCHEMA=${var.control_postgres_schema}")
+            .count(),
+        2,
+        "both a fresh seed and an existing worker environment must receive the exact schema"
+    );
+
+    let worker_unit = read_workspace_file("deploy/aws/metal/cats-worker.service");
+    assert!(worker_unit.contains("--object-store-option prefix=${CATS_CHUNKSTORE_PREFIX}"));
+    assert!(!worker_unit.contains("--object-store-option prefix=cats"));
+
+    let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
+    assert!(workflow.contains("CHUNKSTORE_PREFIX: ${{ vars.CHUNKSTORE_PREFIX }}"));
+    assert!(workflow.contains("-var=\"chunkstore_prefix=$CHUNKSTORE_PREFIX\""));
+    assert!(workflow.contains("CONTROL_POSTGRES_SCHEMA: ${{ vars.CONTROL_POSTGRES_SCHEMA }}"));
+    assert!(workflow.contains("--schema \"CATS_POSTGRES_URL=$CONTROL_POSTGRES_SCHEMA\""));
+    assert!(workflow.contains("-var=\"control_postgres_schema=$CONTROL_POSTGRES_SCHEMA\""));
+    assert!(workflow.contains("${CONTROL_POSTGRES_SCHEMA}.control_schema_version"));
+
+    for variables_path in [
+        "deploy/aws/terraform/stacks/production-infrastructure/variables.tf",
+        "deploy/aws/terraform/stacks/production-application/variables.tf",
+    ] {
+        let variables = read_workspace_file(variables_path);
+        let prefix = variables
+            .split_once("variable \"chunkstore_prefix\"")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(section, _)| section)
+            .expect("production chunkstore_prefix variable");
+        assert!(
+            !prefix.contains("default"),
+            "{variables_path} must require the reviewed prefix"
+        );
+        for canonical_guard in [
+            "!startswith(var.chunkstore_prefix, \"/\")",
+            "!endswith(var.chunkstore_prefix, \"/\")",
+            "!strcontains(var.chunkstore_prefix, \"..\")",
+            "!strcontains(var.chunkstore_prefix, \"//\")",
+        ] {
+            assert!(prefix.contains(canonical_guard));
+        }
+
+        let schema = variables
+            .split_once("variable \"control_postgres_schema\"")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map(|(section, _)| section)
+            .expect("production control_postgres_schema variable");
+        assert!(
+            !schema.contains("default"),
+            "{variables_path} must require the reviewed fresh schema"
+        );
+        assert!(schema.contains("^cats_[a-z0-9_]+$"));
+    }
+
+    let application =
+        read_workspace_file("deploy/aws/terraform/stacks/production-application/main.tf");
+    assert!(
+        application.contains("chunkstore_prefix                          = var.chunkstore_prefix")
+    );
+    assert!(application
+        .lines()
+        .any(|line| line.split_whitespace().collect::<Vec<_>>()
+            == [
+                "control_postgres_schema",
+                "=",
+                "var.control_postgres_schema"
+            ]));
+    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    assert!(kubernetes.contains("prefix=${var.chunkstore_prefix}"));
+    assert!(kubernetes.contains("options=-csearch_path%3D${var.control_postgres_schema}"));
+
+    let manual_environment = read_workspace_file("deploy/aws/metal/worker.env.example");
+    assert!(manual_environment.contains("CATS_CHUNKSTORE_PREFIX=cats"));
+    assert!(manual_environment.contains("CATS_POSTGRES_SCHEMA=cats_fresh"));
+    let renderer = read_workspace_file("deploy/aws/metal/render-postgres-url.sh");
+    assert!(renderer.contains("options=-csearch_path%3D${CATS_POSTGRES_SCHEMA}"));
+    let worker_unit = read_workspace_file("deploy/aws/metal/cats-worker.service");
+    assert!(worker_unit.contains("url-file=/run/cats/postgres-url"));
+    let root_provision =
+        read_workspace_file("node-agent/src/runtime/reconciliation/systemd_root_provision.rs");
+    assert!(root_provision.contains("url-file=/run/cats/postgres-url"));
+    let verifier = read_workspace_file("deploy/aws/tools/verify-manual-release.py");
+    assert!(verifier.contains("\"cats-worker.service\""));
+}
+
+#[test]
 fn production_deploy_has_no_legacy_route_grant_admin_preflight() {
     let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
     for forbidden in [
@@ -462,10 +1249,21 @@ fn release_build_publishes_the_control_plane_runtime_target() {
         .map(|(stage, _)| stage)
         .expect("dedicated control-plane runtime stage");
     assert!(runtime.contains("ENTRYPOINT [\"/usr/local/bin/cats-controld\"]"));
+
+    // The object-write gateway Deployment reuses this image and starts
+    // /usr/local/bin/cats-object-write-gatewayd by explicit command; the
+    // runtime stage must ship that binary or the pod crash-loops on start.
+    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    assert!(
+        kubernetes.contains("command           = [\"/usr/local/bin/cats-object-write-gatewayd\"]")
+    );
+    assert!(runtime.contains(
+        "COPY --from=builder /out/cats-object-write-gatewayd /usr/local/bin/cats-object-write-gatewayd"
+    ));
 }
 
 #[test]
-fn route_grant_application_keeps_gateway_undeployed_until_v2() {
+fn route_grant_application_deploys_only_the_route_v2_gateway() {
     let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
     let control = kubernetes
         .split_once("resource \"kubernetes_deployment_v1\" \"control_plane\"")
@@ -476,14 +1274,10 @@ fn route_grant_application_keeps_gateway_undeployed_until_v2() {
         control.contains("wait_for_rollout = true"),
         "Terraform must wait for the complete control-plane rollout"
     );
-    assert!(
-        !kubernetes.contains("resource \"kubernetes_deployment_v1\" \"gateway\""),
-        "production must not deploy the legacy Gateway while v2 is incomplete"
-    );
-    assert!(
-        !kubernetes.contains("endpoint_wildcard_host"),
-        "production must not publish an Endpoint ingress route without the v2 Gateway"
-    );
+    assert!(kubernetes.contains("resource \"kubernetes_deployment_v1\" \"gateway\""));
+    assert!(kubernetes.contains("endpoint_wildcard_host"));
+    assert!(kubernetes.contains("--control-plane-url"));
+    assert!(!kubernetes.contains("CATS_SHARED_ROUTE_CACHE_TABLE"));
 }
 
 #[cfg(unix)]
@@ -542,8 +1336,12 @@ fn production_schema_probe_fails_closed() {
 
     assert!(probe.contains("query_status=$?"));
     assert!(probe.contains("deploy/aws/run-postgres-probe.sh"));
-    assert!(probe.contains("SELECT version FROM control_schema_version"));
+    assert!(probe.contains("SELECT current_schema()"));
+    assert!(probe.contains("SELECT version FROM ${CONTROL_POSTGRES_SCHEMA}.control_schema_version"));
+    assert!(probe.contains("$RUNNER_TEMP/proposed-control-postgres-url"));
     assert!(runner.contains("-v ON_ERROR_STOP=1"));
+    assert!(runner.contains("create secret generic \"$runtime_secret\""));
+    assert!(runner.contains("--from-file=\"CATS_POSTGRES_URL=$postgres_url_file\""));
     assert!(runner.contains("logs \"$probe\" --container=psql"));
     assert!(runner.contains("state.terminated.exitCode"));
     assert!(
@@ -553,7 +1351,8 @@ fn production_schema_probe_fails_closed() {
             .any(|line| line.contains("--attach")),
         "the schema probe must not attach to the short-lived container"
     );
-    assert!(probe.contains(r#"relation "control_schema_version" does not exist"#));
+    assert!(probe.contains("*'does not exist'*"));
+    assert!(probe.contains("${CONTROL_POSTGRES_SCHEMA}.control_schema_version"));
     assert!(
         !probe.contains("2>/dev/null || true"),
         "database, cluster and scheduling failures must not look like a fresh schema"
@@ -765,13 +1564,25 @@ fn linux_quality_gate_pins_one_private_systemd_e2e_to_an_immutable_image() {
         .join(" ");
     assert!(
         focused_command.contains(
-            "docker_cli capture 12600 exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-node-agent --lib --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart -- --ignored --exact --list"
+            "docker_cli capture 12600 exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-blockd-daemon --test root_provision_control --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" -- --ignored --list"
+        ),
+        "the privileged blockd inventory must be bounded and known-positive"
+    );
+    assert!(
+        focused_command.contains(
+            "exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-blockd-daemon --test root_provision_control --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" -- --ignored --test-threads=1 --nocapture"
+        ),
+        "the installed-namespace blockd tests must run only in the privileged gate"
+    );
+    assert!(
+        focused_command.contains(
+            "docker_cli capture 12600 exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-node-agent --lib --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart -- --ignored --exact --list"
         ),
         "the focused test inventory must bound both Docker and its in-container Cargo process"
     );
     assert!(
         focused_command.contains(
-            "exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-node-agent --lib --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart -- --ignored --exact --nocapture"
+            "exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-node-agent --lib --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart -- --ignored --exact --nocapture"
         ),
         "the privileged gate must run only the exact ignored Node E2E"
     );
@@ -1085,6 +1896,20 @@ case "${1:-} ${2:-}" in
       *" cat /proc/1/cgroup") printf '0::/init.scope\n' ;;
       *" systemctl is-system-running --quiet") ;;
       *" sh -ceu "*) : >"$state/blockd-installed" ;;
+      *" cargo test -p cats-blockd-daemon --test root_provision_control "*" -- --ignored --list")
+        : >"$state/root-control-test-list-ran"
+        if [[ "$mode" != zero-root-control-tests ]]; then
+          printf '%s\n' \
+            'control_only_rejects_frontends_and_serves_only_the_typed_effect: test' \
+            'every_provision_publication_crash_window_recovers_by_authority_or_exact_replay: test' \
+            'first_lf_framing_enforces_prefix_crlf_and_payload_cap_before_effect: test' \
+            'receiver_responds_at_first_lf_without_waiting_for_half_close_or_running_tail: test' \
+            'stalled_connection_times_out_without_starving_the_next_request: test'
+        fi
+        ;;
+      *" cargo test -p cats-blockd-daemon --test root_provision_control "*" -- --ignored --test-threads=1 --nocapture")
+        : >"$state/root-control-tests-ran"
+        ;;
       *" timeout --signal=TERM --kill-after=30s 20m cargo test "*" -- --ignored --exact --list")
         : >"$state/focused-systemd-test-list-ran"
         if [[ "$mode" == timeout-systemd-test-list ]]; then
@@ -1092,7 +1917,7 @@ case "${1:-} ${2:-}" in
         fi
         if [[ "$mode" != zero-systemd-test ]]; then
           printf '%s\n' \
-            'runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_reconcile_one_created_cat_across_restart: test'
+            'runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart: test'
         fi
         ;;
       *" timeout --signal=TERM --kill-after=30s 20m cargo test "*)
@@ -1367,6 +2192,8 @@ fn linux_quality_gate_retries_response_loss_until_exact_owned_create_is_observab
         "response-loss-late-marker",
         "late-workspace-removed",
         "blockd-installed",
+        "root-control-test-list-ran",
+        "root-control-tests-ran",
         "focused-systemd-test-ran",
         "systemd-removed",
     ] {
@@ -1432,6 +2259,54 @@ fn linux_quality_gate_retries_response_loss_until_exact_owned_create_is_observab
             && trace.contains(&format!("rm --force --volumes {systemd_id}")),
         "focused systemd container was not gracefully and exactly cleaned:\n{trace}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_quality_gate_rejects_an_empty_privileged_root_control_inventory() {
+    let fixture = tempfile::tempdir().expect("Linux gate empty root-control fixture");
+    let fake_bin = fixture.path().join("bin");
+    let state = fixture.path().join("state");
+    std::fs::create_dir_all(&state).expect("create fake Docker state");
+    install_linux_gate_fake_cli(&fake_bin);
+
+    let output = linux_gate_command(&fake_bin, &state, "zero-root-control-tests")
+        .output()
+        .expect("run Linux gate empty root-control regression");
+    assert!(
+        !output.status.success(),
+        "an empty privileged root-control test inventory incorrectly passed the Linux gate"
+    );
+    assert!(
+        state.join("root-control-test-list-ran").exists(),
+        "the zero-test regression did not exercise the root-control inventory probe"
+    );
+    assert!(
+        !state.join("root-control-tests-ran").exists(),
+        "the privileged root-control tests ran after their inventory probe returned zero"
+    );
+    assert!(
+        !state.join("focused-systemd-test-ran").exists(),
+        "the Runtime E2E ran after the earlier root-control inventory failed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "privileged blockd root-control test inventory was not the exact known positive"
+        ),
+        "the empty root-control inventory was not diagnosed:\n{stderr}"
+    );
+    for resource in [
+        format!("network.cats-linux-net-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"),
+        format!("container.cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}"),
+    ] {
+        assert!(
+            !state.join(&resource).exists(),
+            "intended resource remained after empty root-control inventory: {resource}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -2284,12 +3159,19 @@ touch "$CATS_TEST_DELETE_LOG"
 #[test]
 fn production_database_clients_read_the_rotating_secret_files() {
     let terraform = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    let trimmed_lines = terraform.lines().map(str::trim).collect::<Vec<_>>();
+    assert!(
+        trimmed_lines.windows(2).any(|pair| {
+            pair == [
+                "\"--control-store-url-file\",",
+                "\"/etc/cats/runtime/CATS_POSTGRES_URL\",",
+            ]
+        }),
+        "the production control Store must read its rotating DSN from the mounted file"
+    );
     for expected in [
-        "--control-store-url-file",
-        "url-file=/etc/cats/runtime/CATS_POSTGRES_URL",
         "CATS_USAGE_POSTGRES_URL_FILE",
         "mount_path = \"/etc/cats/runtime\"",
-        "session-setup=${var.storage_postgres_session_setup}",
     ] {
         assert!(
             terraform.contains(expected),
@@ -2310,7 +3192,7 @@ fn staged_proxy_cutover_rewrites_only_the_storage_database_host() {
     std::fs::write(
         &live,
         r#"{
-          "CATS_POSTGRES_URL": "postgresql://cats:old@direct.example:5432/cats?sslmode=verify-full",
+          "CATS_POSTGRES_URL": "postgresql://cats:old@direct.example:5432/cats?sslmode=verify-full&options=-csearch_path%3Dcats_old",
           "CATS_USAGE_POSTGRES_URL": "postgresql://cats:old@direct.example:5432/cats?sslmode=verify-full"
         }"#,
     )
@@ -2323,6 +3205,8 @@ fn staged_proxy_cutover_rewrites_only_the_storage_database_host() {
         .args([
             "--host",
             "CATS_POSTGRES_URL=cats-production-proxy.proxy.example",
+            "--schema",
+            "CATS_POSTGRES_URL=cats_fresh_cutover",
             "CATS_POSTGRES_URL",
             "CATS_USAGE_POSTGRES_URL",
         ])
@@ -2336,7 +3220,7 @@ fn staged_proxy_cutover_rewrites_only_the_storage_database_host() {
     let rewritten: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
         rewritten["CATS_POSTGRES_URL"],
-        "postgresql://cats:n%40w%3Ap%2Fss@cats-production-proxy.proxy.example:5432/cats?sslmode=verify-full"
+        "postgresql://cats:n%40w%3Ap%2Fss@cats-production-proxy.proxy.example:5432/cats?sslmode=verify-full&options=-csearch_path%3Dcats_fresh_cutover"
     );
     assert_eq!(
         rewritten["CATS_USAGE_POSTGRES_URL"],
@@ -2349,6 +3233,8 @@ fn staged_proxy_cutover_rewrites_only_the_storage_database_host() {
         .args([
             "--host",
             "CATS_POSTGRES_URL=https://attacker.example",
+            "--schema",
+            "CATS_POSTGRES_URL=cats_fresh_cutover",
             "CATS_POSTGRES_URL",
         ])
         .output()
@@ -2430,7 +3316,7 @@ fn production_control_plane_survives_one_pod_or_node_disruption() {
         .expect("control-plane Deployment block");
 
     for expected in [
-        "replicas = var.control_plane_replicas",
+        "replicas = local.effective_control_plane_replicas",
         "type = \"RollingUpdate\"",
         "max_unavailable = \"0\"",
         "termination_grace_period_seconds = local.public_target_termination_grace_period_seconds",
@@ -2474,7 +3360,7 @@ fn production_control_plane_survives_one_pod_or_node_disruption() {
     assert!(
         terraform.contains("resource \"kubernetes_pod_disruption_budget_v1\" \"control_plane\"")
     );
-    assert!(terraform.contains("min_available = \"1\""));
+    assert!(terraform.contains("min_available = var.maintenance_mode ? \"0\" : \"1\""));
     assert!(
         !deployment.contains("type = \"Recreate\""),
         "Recreate deliberately creates a total control-plane outage"
@@ -2482,23 +3368,23 @@ fn production_control_plane_survives_one_pod_or_node_disruption() {
 }
 
 #[test]
-fn production_endpoint_ingress_stays_absent_until_route_grant_v2() {
+fn production_endpoint_ingress_routes_only_to_route_v2_gateway() {
     let terraform = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
     let variables =
         read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/variables.tf");
-    assert!(terraform.contains("Public Endpoint ingress stays absent"));
     assert!(terraform.contains("for host in var.control_plane_hosts"));
-    assert!(!terraform.contains("endpoint_wildcard_host"));
-    assert!(!variables.contains("endpoint_wildcard_host"));
+    assert!(terraform.contains("host         = var.endpoint_wildcard_host"));
+    assert!(terraform.contains("service_name = \"cats-gatewayd\""));
+    assert!(variables.contains("endpoint_wildcard_host"));
 
     let application =
         read_workspace_file("deploy/aws/terraform/stacks/production-application/main.tf");
-    assert!(application.contains("dns_hosts = toset(var.control_plane_hosts)"));
-    assert!(!application.contains("endpoint_wildcard_host"));
+    assert!(application.contains("setunion(toset(var.control_plane_hosts)"));
+    assert!(application.contains("endpoint_wildcard_host"));
 
     let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
-    assert!(workflow.contains("for deployment in cats-controld"));
-    assert!(!workflow.contains("for deployment in cats-controld cats-gatewayd"));
+    assert!(workflow.contains("verify_deployment cats-controld"));
+    assert!(workflow.contains("verify_deployment cats-gatewayd"));
 }
 
 #[test]
@@ -2929,49 +3815,61 @@ fn worker_installation_owns_all_runtime_socket_roots() {
 
 #[cfg(unix)]
 #[test]
-fn worker_bootstrap_validates_and_installs_its_route_grant_key_before_mutation() {
+fn manual_worker_bootstrap_installs_route_v2_revision_one_without_rotation() {
     let script = read_workspace_file("deploy/aws/metal/install-worker.sh");
     let required = script
-        .find("CATS_ROUTE_GRANT_PUBLIC_KEY_FILE is required")
-        .expect("required Route Grant key input");
-    let validator = script
-        .find("validate-route-grant-public-key.sh")
-        .expect("cryptographic Route Grant key validator");
+        .find("CATS_ROUTE_V2_NODE_ARTIFACT_DIR is required")
+        .expect("required Node Route v2 artifact input");
+    let real_directory = script
+        .find("CATS_ROUTE_V2_NODE_ARTIFACT_DIR must be an absolute real directory")
+        .expect("absolute real Node Route v2 artifact directory check");
+    let closed_set = script
+        .find("Node Route v2 artifact source must contain exactly six")
+        .expect("closed Node Route v2 artifact set check");
     let first_package_mutation = script.find("apt-get update -q").expect("package mutation");
-    let key_install = script
-        .find("install -o root -g root -m 0644 \"$ROUTE_GRANT_PUBLIC_KEY_STAGE\"")
-        .expect("root-owned Route Grant key install");
-    let key_destination = script
-        .find("/etc/cats/route-grant-public.pem")
-        .expect("service Route Grant key path");
-    let environment_branch = script
-        .find("if [[ -f /etc/cats/worker.env ]]")
-        .expect("existing worker.env branch");
     assert!(
-        required < validator
-            && validator < first_package_mutation
-            && key_install <= key_destination
-            && key_destination < environment_branch,
-        "missing/malformed key input must fail before package/file/service mutation, and a valid key must be installed before either worker.env branch"
+        required < real_directory
+            && real_directory < closed_set
+            && closed_set < first_package_mutation,
+        "missing or malformed revision-1 artifacts must fail before package mutation"
     );
-    assert!(script.contains("trap cleanup_route_grant_key EXIT"));
-
-    let validator = workspace_root().join("deploy/aws/metal/validate-route-grant-public-key.sh");
-    let valid = Command::new(&validator)
-        .arg(workspace_root().join("tests/fixtures/route_grant_public_ed25519.pem"))
-        .output()
-        .expect("validate Ed25519 public fixture");
-    assert!(valid.status.success());
-    for invalid in [
-        "tests/fixtures/route_grant_private_ed25519.pem",
-        "Cargo.toml",
+    let host_lock = script
+        .find("cats_acquire_worker_deployment_lock")
+        .expect("Host-global worker deployment lock");
+    let exact_classification = script
+        .find("ROUTE_V2_INSTALL_STATE=$(cats_classify_route_v2_node_r1")
+        .expect("exact existing revision-1 classification");
+    let first_systemd_mutation = script
+        .find("cats_gate_node_service cats-worker")
+        .expect("first serialized systemd mutation");
+    let publish_call = script
+        .find("cats_publish_route_v2_node_r1")
+        .expect("exact revision-1 publish");
+    let first_installed_mutation = script
+        .find("install -D -m 0755 \"$CATS_REPO/deploy/aws/metal/install-guest-runtime-release.sh\"")
+        .expect("first installed-file mutation");
+    assert!(
+        host_lock < exact_classification
+            && exact_classification < first_systemd_mutation
+            && exact_classification < first_installed_mutation
+            && publish_call < first_installed_mutation,
+        "exact replay/conflict classification must happen under the Host lock before any systemd or installed-file mutation, and first publish must precede later installed-file mutation"
+    );
+    for expected in [
+        "ROUTE_V2_INSTALL_STATE=$(cats_classify_route_v2_node_r1",
+        "cats_publish_route_v2_node_r1",
+        "[[ $ROUTE_V2_INSTALL_STATE == absent || $ROUTE_V2_INSTALL_STATE == exact ]]",
+        "after-install-route-v2-artifacts",
+        "node-machine-server-private-key.pem",
+        "node-server-ca-bundle.pem",
     ] {
-        let output = Command::new(&validator)
-            .arg(workspace_root().join(invalid))
-            .output()
-            .unwrap_or_else(|error| panic!("validate {invalid}: {error}"));
-        assert!(!output.status.success(), "accepted invalid key {invalid}");
+        assert!(
+            script.contains(expected),
+            "manual revision-1 install lost {expected:?}"
+        );
     }
+    assert!(!script.contains("find /etc/cats/route-v2 -mindepth 1 -maxdepth 1 -delete"));
+    assert!(!script.contains("CATS_ROUTE_GRANT_PUBLIC_KEY_FILE"));
 }
 
 #[test]
@@ -3009,8 +3907,44 @@ fn agent_registration_deployments_share_one_canonical_release_receipt() {
     ] {
         assert!(control_image.contains(copy), "Control image lost {copy:?}");
     }
+    for release_binding in [
+        "ARG CATS_RELEASE_COMMIT_SHA",
+        "ENV CATS_RELEASE_COMMIT_SHA=${CATS_RELEASE_COMMIT_SHA}",
+        "grep -Eq '^[0-9a-f]{40}$'",
+    ] {
+        assert!(
+            control_image.contains(release_binding),
+            "Control image lost qualified source binding {release_binding:?}"
+        );
+    }
     let worker_image = read_workspace_file("deploy/aws/Dockerfile.worker-artifact");
     assert!(worker_image.contains("COPY guest-runtime-release.v1 /guest-runtime-release.v1"));
+    assert!(worker_image.contains(
+        "COPY --from=builder --chmod=0755 /out/old-host-positive-stop.py /old-host-positive-stop.py"
+    ));
+
+    // cats-worker.service requires /opt/cats/bin/setup-guest-network before
+    // start; the bundle must carry it and the bundle-driven installer must
+    // install it, or a bundle-deployed worker can never start its unit.
+    let worker_unit = read_workspace_file("deploy/aws/metal/cats-worker.service");
+    assert!(worker_unit.contains("ExecStartPre=/opt/cats/bin/setup-guest-network"));
+    assert!(worker_image
+        .contains("COPY --from=builder /out/setup-guest-network.sh /setup-guest-network.sh"));
+    let worker_module =
+        read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
+    assert!(worker_module.contains(
+        "install -D -m 0755 \"$stage_path/setup-guest-network.sh\" \"${var.install_root}/bin/setup-guest-network\""
+    ));
+    for release_binding in [
+        "ARG CATS_RELEASE_COMMIT_SHA",
+        "ENV CATS_RELEASE_COMMIT_SHA=${CATS_RELEASE_COMMIT_SHA}",
+        "grep -Eq '^[0-9a-f]{40}$'",
+    ] {
+        assert!(
+            worker_image.contains(release_binding),
+            "worker image lost qualified source binding {release_binding:?}"
+        );
+    }
     let noded = read_workspace_file("cmd/noded/src/main.rs");
     assert!(noded.contains("load_installed_guest_runtime_profile_receipt"));
     assert!(noded.contains("validate_installed_node_guest_runtime"));
@@ -3023,15 +3957,41 @@ fn agent_registration_deployments_share_one_canonical_release_receipt() {
         "the workflow must have one Guest release producer"
     );
     assert!(workflow.contains("RELEASE_OUT=\"$PWD/guest-runtime-release.v1\""));
-    assert_eq!(
-        workflow.matches("needs: guest-runtime-release").count(),
-        2,
-        "Control and Node artifacts must consume the same build job"
+    let control = workflow
+        .split_once("  control-plane-image:\n")
+        .and_then(|(_, rest)| rest.split_once("  gateway-image:\n"))
+        .map(|(section, _)| section)
+        .expect("control-plane image job");
+    let gateway = workflow
+        .split_once("  gateway-image:\n")
+        .and_then(|(_, rest)| rest.split_once("  worker-bundle:\n"))
+        .map(|(section, _)| section)
+        .expect("gateway image job");
+    let worker = workflow
+        .split_once("  worker-bundle:\n")
+        .map(|(_, section)| section)
+        .expect("worker bundle job");
+    for consumer in [control, worker] {
+        assert!(
+            consumer.contains("needs: [aws-target, guest-runtime-release]"),
+            "Control and Node artifacts must consume the canonical Guest release after the AWS target fence"
+        );
+        assert!(consumer.contains("uses: actions/download-artifact@v4"));
+        assert!(consumer.contains("name: guest-runtime-release-v1"));
+    }
+    assert!(
+        !gateway.contains("guest-runtime-release-v1"),
+        "the Gateway image must not pretend to consume the shared Guest release artifact"
     );
+    assert!(workflow.contains("build-args: CATS_RELEASE_COMMIT_SHA=${{ github.sha }}"));
     assert_eq!(
         workflow.matches("name: guest-runtime-release-v1").count(),
         3,
         "one upload and exactly two consumers must name the same artifact"
+    );
+    let production_workflow = read_workspace_file(".github/workflows/deploy-production.yml");
+    assert!(
+        production_workflow.contains("build-args: CATS_RELEASE_COMMIT_SHA=${{ env.RELEASE_SHA }}")
     );
     assert!(
         workflow.contains("tar --owner=0 --group=0 --numeric-owner -C worker-out"),
@@ -3054,6 +4014,138 @@ fn agent_registration_deployments_share_one_canonical_release_receipt() {
             );
         }
     }
+}
+
+#[test]
+fn manual_release_builder_verifies_all_final_artifacts_and_writes_one_receipt() {
+    let root = workspace_root();
+    let builder = read_workspace_file("deploy/aws/tools/build-manual-release.sh");
+    for required in [
+        "manual release builds require a clean checkout",
+        "git archive --format=tar \"$source_sha\"",
+        "rustup target add x86_64-unknown-linux-musl",
+        "RELEASE_OUT=\"$guest_release\"",
+        "--file deploy/aws/Dockerfile.control-plane",
+        "--file deploy/aws/Dockerfile.gateway",
+        "--build-arg \"CATS_RELEASE_COMMIT_SHA=$source_sha\"",
+        "--file deploy/aws/Dockerfile.worker-artifact",
+        "docker create --platform linux/amd64 \"$control_image_id\"",
+        "docker create --platform linux/amd64 \"$gateway_image_id\"",
+        "verify-manual-release.py",
+        "--control-image-registry-verified false",
+        "--control-image-registry-verified true",
+        "--gateway-image-registry-verified false",
+        "--gateway-image-registry-verified true",
+        "--input-file \"guest_host_kernel=$guest_kernel\"",
+        "--input-file \"old_host_positive_stop=$source_root/deploy/aws/old-host-positive-stop.py\"",
+        "--input-file \"production_mutation_admission_operator=$source_root/deploy/aws/production-mutation-admission.py\"",
+        "--input-file \"production_cutover_proof_set=$source_root/deploy/aws/production_cutover_proof_set.py\"",
+        "--input-file \"qualification_catalog=$source_root/deploy/metal/runtime-cutover-e2e-catalog.v1.json\"",
+        "--input-file \"route_v2_control_rollout_operator=$source_root/deploy/aws/terraform/qualification/tools/apply_route_v2_control_rollout_plan.py\"",
+        "--input-file \"route_v2_control_rollout_plan_validator=$source_root/deploy/aws/terraform/qualification/tools/validate_route_v2_control_rollout_plan.py\"",
+        "--input-file \"route_v2_control_rollout_receipt_signer=$worker_root/cats\"",
+        "--export-images",
+        "type=oci,dest=$control_archive",
+        "type=oci,dest=$gateway_archive",
+        "cats-control-plane-image.tar",
+        "cats-gateway-image.tar",
+        "> SHA256SUMS",
+    ] {
+        assert!(
+            builder.contains(required),
+            "manual release builder lost {required:?}"
+        );
+    }
+    assert_eq!(
+        builder.matches("RELEASE_OUT=\"$guest_release\"").count(),
+        1,
+        "the manual builder must run the Guest release generator exactly once"
+    );
+    assert!(
+        !builder.contains("kubectl") && !builder.contains("terraform apply"),
+        "artifact construction must not contain a deployment path"
+    );
+    assert!(
+        builder.find("--control-image-registry-verified false")
+            < builder.find("docker push \"$image_reference\""),
+        "all local artifacts must pass the verifier before an optional registry push"
+    );
+
+    let output = Command::new("python3")
+        .arg(root.join("deploy/aws/tools/manual-release-fixture.py"))
+        .arg("--verifier")
+        .arg(root.join("deploy/aws/tools/verify-manual-release.py"))
+        .output()
+        .expect("run manual release verifier fixture");
+    assert!(
+        output.status.success(),
+        "manual release verifier fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("fixture passed"));
+
+    let publisher = read_workspace_file("deploy/aws/tools/publish-manual-release.sh");
+    for required in [
+        "--manifest-sha256",
+        "verify-image-transport.py",
+        "verify-manual-release.py",
+        "registry-candidate",
+        "docker image load --input",
+        "docker buildx imagetools inspect --raw",
+    ] {
+        assert!(
+            publisher.contains(required),
+            "manual release publisher lost {required:?}"
+        );
+    }
+    for forbidden in [
+        "docker build ",
+        "docker buildx build",
+        "terraform",
+        "kubectl",
+    ] {
+        assert!(
+            !publisher.contains(forbidden),
+            "manual release publisher gained rebuild/deployment effect {forbidden:?}"
+        );
+    }
+}
+
+#[test]
+fn production_deployment_builds_the_same_guest_payload_as_release() {
+    let release = read_workspace_file(".github/workflows/release.yml");
+    let production = read_workspace_file(".github/workflows/deploy-production.yml");
+    assert_eq!(
+        production
+            .matches("      - name: Build the one Guest payload\n")
+            .count(),
+        1,
+        "the production deployment must build the Guest payload exactly once"
+    );
+    let payload_build = production
+        .find("      - name: Build the one Guest payload\n")
+        .expect("production Guest payload build");
+    let image_build = production
+        .find("      - name: Build and push control-plane image\n")
+        .expect("production control-plane image build");
+    assert!(
+        payload_build < image_build,
+        "the Guest payload must exist before Docker consumes it",
+    );
+    let step = |workflow: &str| {
+        workflow
+            .split_once("      - name: Build the one Guest payload\n")
+            .and_then(|(_, rest)| rest.split_once("\n      - "))
+            .map(|(body, _)| body.trim_end().to_owned())
+            .expect("Guest runtime payload build step")
+    };
+
+    assert_eq!(
+        step(&production),
+        step(&release),
+        "production and release workflows must build the exact same Guest runtime payload before the control-plane Docker build",
+    );
 }
 
 #[test]
@@ -3213,15 +4305,19 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
     let identity_validate = terraform
         .find("validate-node-identity-installation.sh\"")
         .expect("staged identity validation");
-    let early_idle_guard = terraform
-        .find("require-idle-worker.sh\"")
-        .expect("drained worker guard");
+    let route_v2_validate = terraform
+        .find("cats-route-v2-node-r1-validator\" --directory \"$route_v2_stage\"")
+        .expect("staged Route v2 candidate validation");
     let deployment_lock = terraform
         .find("cats_acquire_worker_deployment_lock")
         .expect("Host deployment lock");
-    let locked_metering = terraform[deployment_lock..]
-        .find("metering_root=\"$(cats_worker_metering_root cats-worker)\"")
+    let exact_classification = terraform[deployment_lock..]
+        .find("route_v2_install_state=\"$(cats_classify_route_v2_node_r1")
         .map(|offset| deployment_lock + offset)
+        .expect("exact Route v2 classification under the Host lock");
+    let locked_metering = terraform[exact_classification..]
+        .find("metering_root=\"$(cats_worker_metering_root cats-worker)\"")
+        .map(|offset| exact_classification + offset)
         .expect("metering cgroup recomputation under the Host lock");
     let locked_idle_guard = terraform[locked_metering..]
         .find("require-idle-worker.sh\"")
@@ -3241,7 +4337,8 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
     assert!(
         archive_listing < archive_extract
             && archive_extract < release_verify
-            && release_verify < identity_validate,
+            && release_verify < identity_validate
+            && identity_validate < route_v2_validate,
         "nothing from the empty stage may execute before verified extraction"
     );
     let authorize = terraform
@@ -3260,13 +4357,23 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
         first_install < authorize && authorize < start && start < readiness && readiness < commit
     );
     assert!(
-        identity_validate < early_idle_guard
-            && early_idle_guard < deployment_lock
+        route_v2_validate < deployment_lock
             && deployment_lock < locked_metering
+            && deployment_lock < exact_classification
+            && exact_classification < locked_metering
             && locked_metering < locked_idle_guard
             && locked_idle_guard < stop
             && stop < prepare
             && prepare < first_install
+    );
+    let pre_lock = &terraform[..deployment_lock];
+    assert!(
+        !pre_lock.contains("systemctl show"),
+        "exact Route v2 classification must happen under the Host lock before any systemctl query"
+    );
+    assert!(
+        !pre_lock.contains("require-idle-worker.sh"),
+        "the worker deployment must not reintroduce an unlocked idle guard before the Host lock"
     );
     for forbidden in ["169.254.169.254", "CATS_NODE_ID=", "--node-id"] {
         assert!(

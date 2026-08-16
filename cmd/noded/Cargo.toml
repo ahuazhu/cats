@@ -13,17 +13,43 @@ path = "src/main.rs"
 name = "cats-vmm-launcher"
 path = "src/vmm_launcher.rs"
 
+[[bin]]
+name = "cats-route-v2-node-r1-validator"
+path = "src/route_v2_node_r1_validator.rs"
+
+[[bin]]
+name = "cats-runtime-e3-probe"
+path = "src/runtime_e3_probe.rs"
+
+[[bin]]
+name = "cats-usage-schema-v16-verifier"
+path = "src/usage_schema_v16_verifier.rs"
+
+[[bin]]
+name = "cats-usage-terminal-receipt-verifier"
+path = "src/usage_terminal_receipt_verifier.rs"
+
 [dependencies]
 cats-api = { workspace = true }
+cats-metering = { workspace = true }
 cats-node-agent = { workspace = true }
 cats-storage = { workspace = true }
 cats-metadata-store-postgres = { workspace = true }
+cats-usage-store-postgres = { workspace = true }
 cats-object-store-file = { workspace = true }
 cats-object-store-aws-s3 = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+libc = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

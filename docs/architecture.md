@@ -77,7 +77,7 @@ lifecycle cutover或release qualification。下表把已实现边界与仍开放
 | 控制面 | PostgreSQL A19 session、A20 Desired/observation、A22 volume transition、A23 policy/planner与Cat-create v2均已组成；legacy Controller仅test harness | 真实RDS failover与外部Host-fence qualification仍独立 |
 | Node | production `noded`只启动signed cutover；完整scanner、bounded checkpoint、per-Cat effects和observation-only回报已组成 | exact release仍须过Linux/metal物理资格门；无legacy runtime fallback |
 | heartbeat | A20 new-sequence observation是唯一AgentSession续期点；旧register/heartbeat/work-status/work routes在production为404 | timeout只产生suspicion，不得替代HostFenceEvent |
-| route | v2 Grant、Node AdmissionCell/guard、退役/重启恢复及mTLS machine tunnel已实现 | ring/mTLS artifacts未安装时listener保持Closed；跨Node overlay仍deferred |
+| route | v2 Grant、Node AdmissionCell/guard、退役/重启恢复、mTLS machine tunnel及gatewayd public proxy composition已实现 | ring/mTLS artifacts与gatewayd deployment尚未接线，production ingress保持Closed；跨Node overlay仍deferred |
 | Node restart | Host lock、per-Cat scopes、union inventory、current-authority checkpoint/receipt恢复与stale-boot清理已实现 | superseded pre-acquire publication与其他lifecycle恢复不在已完成声明内；systemd 255 + KVM/Cloud Hypervisor exact-SHA证据仍是release gate |
 | HA | bounded PostgreSQL执行、多副本锁序与Operation读取已实现；PG跨组件测试到达signed runner的recording effect dispatch seam | [当前跨组件证据边界](architecture-cross-review.md#当前跨组件证据边界)之后的真实installed effect、control-plane takeover、RDS failover和自动Host fence仍需证据 |
 | PersistentDisk | current-Desired Running路径的多卷Normal/Takeover、NBD/vhost、ext4 UUID、一次性Format、Drain/Commit及private mounted-set gate已实现 | superseded publication、完整lifecycle、Snapshot/GC、跨Host rejoin和delete crash矩阵仍按独立合同验收 |

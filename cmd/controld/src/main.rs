@@ -3,14 +3,10 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use cats_control_plane::store::DsnSource as ControlStoreDsnSource;
-use cats_metadata_store_postgres::PostgresMetadataStoreFactory;
-use cats_metadata_store_sqlite::SqliteMetadataStoreFactory;
 use cats_metering::{CreditStore, SqliteUsageStore, UsageStore};
 use cats_object_store_aws_s3::AwsS3BlobStoreFactory;
 use cats_object_store_file::FileBlobStoreFactory;
-use cats_storage::{
-    open_blob_store, open_metadata_store, AdapterConfig, BlobStoreFactory, MetadataStoreFactory,
-};
+use cats_storage::{open_blob_store, AdapterConfig, BlobStoreFactory};
 use cats_usage_store_aws_stream::{AwsUsageStreamConfig, AwsUsageStreamStore};
 use cats_usage_store_postgres::{DsnSource, PostgresUsageStore, DEFAULT_SCHEMA, DEFAULT_WORKERS};
 use clap::Parser;
@@ -24,8 +20,7 @@ struct Args {
     /// control resource store itself is PostgreSQL (`--control-store-url`).
     #[arg(long, default_value = "cats-control.db")]
     db_path: std::path::PathBuf,
-    /// Control resource database. Falls back to CATS_POSTGRES_URL, the same
-    /// DSN the storage metadata adapter uses: one database, disjoint tables.
+    /// Control resource database. Falls back to CATS_POSTGRES_URL.
     #[arg(long, env = "CATS_CONTROL_POSTGRES_URL")]
     control_store_url: Option<String>,
     /// File holding the control resource PostgreSQL URL. It is re-read after
@@ -95,14 +90,6 @@ struct Args {
         default_value_t = DEFAULT_WORKERS
     )]
     usage_postgres_workers: usize,
-    #[arg(long, default_value = "sqlite")]
-    metadata_store_adapter: String,
-    #[arg(
-        long = "metadata-store-option",
-        value_name = "KEY=VALUE",
-        default_value = "path=cats-storage-meta.db"
-    )]
-    metadata_store_options: Vec<String>,
     /// Provider-neutral immutable-object adapter used only to read exact
     /// golden-image manifest keys.
     #[arg(long, env = "CATS_OBJECT_STORE_ADAPTER", default_value = "file")]
@@ -131,6 +118,15 @@ struct Args {
     /// alternate.
     #[arg(long, value_name = "PATH")]
     runtime_provisioner_trust_file: std::path::PathBuf,
+    /// Independent release-bound E13 offline operator public trust. The
+    /// loader accepts only the canonical installed path.
+    #[arg(
+        long,
+        env = "CATS_PRODUCTION_CUTOVER_OPERATOR_TRUST_FILE",
+        default_value = "/etc/cats/production-cutover-operator-trust.v1.json",
+        value_name = "PATH"
+    )]
+    production_cutover_operator_trust_file: std::path::PathBuf,
     /// PKCS#8 Ed25519 private key used only by the control plane to issue
     /// short-lived V1 Endpoint Route Grants.
     #[arg(long, env = "CATS_ROUTE_GRANT_PRIVATE_KEY_FILE")]
@@ -150,6 +146,12 @@ struct Args {
     /// its frozen installed path; there are no path or inline-byte options.
     #[arg(long, env = "CATS_ROUTE_V2_MACHINE_LISTEN")]
     route_v2_machine_listen: Option<String>,
+    /// Independent server-auth TLS listener for signed Route v2 rotation and
+    /// public successor/current discovery. Production composes it whenever
+    /// the Gateway machine listener is configured, and it stays bound while
+    /// the loaded signer is disabled.
+    #[arg(long, env = "CATS_ROUTE_V2_ROTATION_LISTEN")]
+    route_v2_rotation_listen: Option<String>,
     #[arg(
         long,
         env = "CATS_ROUTE_GRANT_V2_TTL_SECONDS",
@@ -245,7 +247,7 @@ struct Args {
     reconcile_interval_ms: u64,
     /// Seconds a stable Suspended Cat remains before automatic Warm.
     /// Zero disables this automatic boundary.
-    #[arg(long, env = "CATS_AUTO_WARM_AFTER_SECONDS", default_value_t = 600)]
+    #[arg(long, env = "CATS_AUTO_WARM_AFTER_SECONDS", default_value_t = 0)]
     auto_warm_after_seconds: u64,
     /// Seconds a stable Warm Cat remains before automatic Cold.
     /// Zero disables this automatic boundary.
@@ -298,14 +300,6 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
-    let metadata_config = AdapterConfig::from_cli(args.metadata_store_options)?;
-    let metadata_factories: [&dyn MetadataStoreFactory; 2] =
-        [&SqliteMetadataStoreFactory, &PostgresMetadataStoreFactory];
-    let storage_meta = open_metadata_store(
-        &args.metadata_store_adapter,
-        &metadata_config,
-        &metadata_factories,
-    )?;
     let object_config = AdapterConfig::from_cli(args.object_store_options)?;
     let object_factories: [&dyn BlobStoreFactory; 2] =
         [&FileBlobStoreFactory, &AwsS3BlobStoreFactory];
@@ -555,7 +549,14 @@ async fn main() -> anyhow::Result<()> {
         cats_api::runtime_artifacts::load_installed_runtime_provisioner_trust_bundle(
             &args.runtime_provisioner_trust_file,
         )?;
-    let gateway_machine = if let Some(listen) = args.route_v2_machine_listen {
+    let production_cutover_operator_trust =
+        cats_api::runtime_artifacts::load_installed_production_cutover_operator_trust_bundle(
+            &args.production_cutover_operator_trust_file,
+        )?;
+    let gateway_machine = if let (Some(listen), Some(rotation_listen)) = (
+        args.route_v2_machine_listen.clone(),
+        args.route_v2_rotation_listen.clone(),
+    ) {
         use cats_api::gateway_workload_identity::{
             CONTROL_MACHINE_SERVER_CERTIFICATE_PATH, CONTROL_MACHINE_SERVER_PRIVATE_KEY_PATH,
             GATEWAY_CLIENT_CA_BUNDLE_PATH, GATEWAY_WORKLOAD_IDENTITY_AUTHORITY_PATH,
@@ -577,13 +578,25 @@ async fn main() -> anyhow::Result<()> {
             std::path::Path::new(ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH),
             std::path::Path::new(ROUTE_GRANT_V2_SIGNER_PRIVATE_KEY_PATH),
         )?;
+        let rotation_operator_trust =
+            cats_api::runtime_artifacts::load_installed_route_v2_rotation_operator_trust(
+                std::path::Path::new(
+                    cats_api::route_signing_operator::ROUTE_V2_ROTATION_OPERATOR_TRUST_PATH,
+                ),
+            )?;
         Some(cats_control_plane::server::GatewayMachineConfig::new(
             listen,
+            rotation_listen,
             gateway_artifacts,
             signer_artifacts,
+            rotation_operator_trust,
             args.route_grant_v2_ttl_seconds,
         )?)
     } else {
+        anyhow::ensure!(
+            args.route_v2_machine_listen.is_none() && args.route_v2_rotation_listen.is_none(),
+            "--route-v2-machine-listen and --route-v2-rotation-listen must be configured together"
+        );
         None
     };
     let server_config = cats_control_plane::server::Config {
@@ -592,11 +605,15 @@ async fn main() -> anyhow::Result<()> {
         control_store_ca_file: args.control_store_ca_file,
         usage_store,
         credit_store,
-        storage_meta,
+        #[cfg(debug_assertions)]
+        retired_storage_meta_for_tests: None,
         image_blob,
         auth_token: args.auth_token,
         guest_runtime_profile_receipt: guest_runtime_profile_receipt.receipt().clone(),
         runtime_provisioner_trust_bundle: runtime_provisioner_trust.bundle().clone(),
+        production_cutover_operator_trust_bundle: production_cutover_operator_trust
+            .bundle()
+            .clone(),
         route_grant_signer,
         admin_token: args.admin_token,
         workos,
@@ -617,7 +634,7 @@ async fn main() -> anyhow::Result<()> {
         None => cats_control_plane::server::spawn(server_config).await?,
     };
     let usage_projector_task = usage_projector.map(|projector| {
-        cats_control_plane::server::spawn_singleton_task(
+        cats_control_plane::server::spawn_managed_singleton_task(
             handle.state.store.clone(),
             cats_control_plane::store::SingletonRole::UsageProjector,
             move || projector.clone().run_projector(),
@@ -628,10 +645,19 @@ async fn main() -> anyhow::Result<()> {
     // cats-controld is PID 1 in the production image. Explicitly handling
     // SIGTERM stops the reconciler as soon as Kubernetes removes the Pod from
     // Service endpoints, so the deployment gap cannot look like Node loss.
-    if let Some(task) = usage_projector_task {
-        task.abort();
+    if let Some(task) = &usage_projector_task {
+        task.begin_shutdown();
     }
-    handle.shutdown().await?;
+    let usage_projector_shutdown = async {
+        match &usage_projector_task {
+            Some(task) => task.shutdown().await,
+            None => Ok(()),
+        }
+    };
+    let (projector_result, control_result) =
+        tokio::join!(usage_projector_shutdown, handle.shutdown());
+    projector_result?;
+    control_result?;
     println!("SHUTDOWN");
     Ok(())
 }
