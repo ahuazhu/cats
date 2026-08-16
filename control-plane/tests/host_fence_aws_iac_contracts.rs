@@ -84,7 +84,15 @@ fn workers_are_read_only_and_only_the_gateway_can_publish_chunkstore_objects() {
     let application =
         read_workspace_file("deploy/aws/terraform/stacks/production-application/main.tf");
     let kubernetes_module = between(&application, "module \"cats_kubernetes\"", "# Public DNS.");
-    assert!(kubernetes_module.contains("namespace                                  = \"cats\""));
+    // Token comparison, not column: `terraform fmt` aligns `=` to the longest
+    // key in the block, so a new module argument would otherwise break this.
+    assert!(
+        kubernetes_module
+            .lines()
+            .any(|line| line.split_whitespace().collect::<Vec<_>>()
+                == ["namespace", "=", "\"cats\""]),
+        "the Kubernetes module call must pin the reviewed namespace"
+    );
     let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
     let gateway_service_account = between(
         &kubernetes,

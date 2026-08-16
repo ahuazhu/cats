@@ -342,16 +342,26 @@ fn production_maintenance_is_one_reviewed_terraform_transition() {
         .map(|(section, _)| section)
         .expect("Kubernetes module enable_public_ingress variable");
     assert!(module_public_ingress.contains("default     = false"));
+    // Compare the token sequence, not the column: `terraform fmt` aligns `=`
+    // to the longest key in the block, so any new module argument would
+    // otherwise break these assertions without changing the wiring.
     for expected in [
-        "maintenance_mode                           = var.maintenance_mode",
-        "enable_public_ingress                      = var.enable_public_ingress",
-        "var.route53_zone_id != null && var.enable_public_ingress && !var.maintenance_mode",
+        ["maintenance_mode", "=", "var.maintenance_mode"],
+        ["enable_public_ingress", "=", "var.enable_public_ingress"],
     ] {
         assert!(
-            stack_main.contains(expected),
+            stack_main
+                .lines()
+                .any(|line| line.split_whitespace().collect::<Vec<_>>() == expected),
             "production application maintenance wiring lost {expected:?}"
         );
     }
+    let dns_gate =
+        "var.route53_zone_id != null && var.enable_public_ingress && !var.maintenance_mode";
+    assert!(
+        stack_main.contains(dns_gate),
+        "production application maintenance wiring lost {dns_gate:?}"
+    );
     for expected in [
         "var.maintenance_mode ? 0 : var.control_plane_replicas",
         "var.enable_public_ingress && !var.maintenance_mode",
@@ -1167,7 +1177,11 @@ fn production_fresh_schema_and_chunkstore_prefix_are_single_reviewed_inputs() {
     let application =
         read_workspace_file("deploy/aws/terraform/stacks/production-application/main.tf");
     assert!(
-        application.contains("chunkstore_prefix                          = var.chunkstore_prefix")
+        application
+            .lines()
+            .any(|line| line.split_whitespace().collect::<Vec<_>>()
+                == ["chunkstore_prefix", "=", "var.chunkstore_prefix"]),
+        "the production application stack must pass through the reviewed chunkstore prefix"
     );
     assert!(application
         .lines()
