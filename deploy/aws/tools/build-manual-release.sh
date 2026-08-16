@@ -111,6 +111,17 @@ for required in docker git python3 sha256sum stat tar zstd; do
   }
 done
 docker buildx version >/dev/null
+# The qualification host builds through its version-locked buildkitd because
+# the default docker driver cannot export OCI archives without the containerd
+# image store. Hosts without the socket keep their default builder.
+buildx_builder=()
+buildkit_socket=${CATS_BUILDKIT_SOCKET:-/run/buildkit/buildkitd.sock}
+if [[ -S $buildkit_socket ]]; then
+  manual_builder="cats-manual-release-$$"
+  docker buildx create --driver remote --name "$manual_builder" \
+    "unix://$buildkit_socket" >/dev/null
+  buildx_builder=(--builder "$manual_builder")
+fi
 [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || {
   echo "manual release builds require a native x86_64 Linux host" >&2
   exit 1
@@ -244,7 +255,7 @@ if [[ $export_images == true ]]; then
 else
   build_arguments+=(--load)
 fi
-docker buildx build "${build_arguments[@]}" "$source_root"
+docker buildx build "${buildx_builder[@]}" "${build_arguments[@]}" "$source_root"
 
 control_image_digest=$(
   python3 - "$control_metadata" <<'PY'
@@ -312,7 +323,7 @@ if [[ $export_images == true ]]; then
 else
   gateway_build_arguments+=(--load)
 fi
-docker buildx build "${gateway_build_arguments[@]}" "$source_root"
+docker buildx build "${buildx_builder[@]}" "${gateway_build_arguments[@]}" "$source_root"
 
 gateway_image_digest=$(
   python3 - "$gateway_metadata" <<'PY'
@@ -364,6 +375,7 @@ gateway_container=
 chmod 0755 "$gateway_root/usr/local/bin/cats-gatewayd"
 
 docker buildx build \
+  "${buildx_builder[@]}" \
   --file deploy/aws/Dockerfile.worker-artifact \
   --target artifact \
   --platform linux/amd64 \
