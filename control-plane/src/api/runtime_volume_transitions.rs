@@ -1062,15 +1062,18 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        service.clear_deadline_override_for_test();
         wait_for_no_active_requests(&service).await;
         assert_eq!(admission.available_global_permits_for_test(), global_before);
 
+        // The replay only proves the committed outcome is retrievable; do not
+        // let it race the production route deadline on a saturated host.
+        service.set_deadline_override_for_test(cats_test_support::poll_bound());
         let replay = context
             .signed(&node, RUNTIME_VOLUME_TRANSITION_PATH, body)
             .send()
             .await
             .unwrap();
+        service.clear_deadline_override_for_test();
         assert_eq!(replay.status(), StatusCode::OK);
         decode_runtime_volume_transition_success(&replay.bytes().await.unwrap()).unwrap();
     }
