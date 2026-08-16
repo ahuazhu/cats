@@ -177,6 +177,10 @@ class BuildHostBoundaryTests(unittest.TestCase):
         # name", so the helper must download and execute the hyphenated name.
         self.assertIn('"${work_dir}/rustup-init" -y', helper)
         self.assertNotIn("${work_dir}/rustup_init", helper)
+        # rustup >= 1.28 installs its proxies as symlinks whose mode is
+        # immutably 0777, so the frozen-tool-root writable-data probe must
+        # exclude symlinks or every fresh prepare fails.
+        self.assertIn("! -type l -perm /0222", helper)
 
         snapshot_verifier = self.text("tools/verify_apt_snapshot.py")
         self.assertIn("manual-release-toolchain-lock-v1.json", snapshot_verifier)

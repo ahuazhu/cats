@@ -221,7 +221,10 @@ verify_manual_tools() {
     echo "versioned manual release tool root is not frozen" >&2
     return 1
   }
-  if find -P "${tool_root}" -xdev -perm /0222 -print -quit | grep -q .; then
+  # Symlink modes are immutably 0777 on Linux (rustup >= 1.28 installs its
+  # proxies as symlinks); containment comes from the 0555 parent directories,
+  # so only real files and directories count as writable data.
+  if find -P "${tool_root}" -xdev ! -type l -perm /0222 -print -quit | grep -q .; then
     echo "versioned manual release tool root contains writable data" >&2
     return 1
   fi
