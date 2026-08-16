@@ -53,6 +53,8 @@ WORKER_STATIC_FILES = {
     "validate-node-identity-installation.sh",
     "install-route-v2-node-r1.sh",
     "worker-deployment-transaction.sh",
+    "provision-vmm-socket-namespaces.sh",
+    "cats-vmm.conf",
     "guest-systemd/cats-grow-root.service",
     "guest-systemd/cats-guest-agent.service",
     "guest-systemd/cats-mount-propagation.service",
@@ -90,6 +92,7 @@ WORKER_EXECUTABLE_FILES = {
     "validate-node-identity-installation.sh",
     "install-route-v2-node-r1.sh",
     "worker-deployment-transaction.sh",
+    "provision-vmm-socket-namespaces.sh",
 }
 WORKER_BINARY_MEMBER_FILES = {
     relative for relative in WORKER_EXECUTABLE_FILES if relative.startswith("cats")
