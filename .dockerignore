@@ -18,6 +18,10 @@ deploy/metal/*
 !deploy/metal/guest-systemd/
 !deploy/metal/guest-systemd/**
 !deploy/metal/setup-guest-network.sh
+# The worker artifact carries the runtime socket root declarations the
+# deployment installs; without them no Host can start the release.
+!deploy/metal/tmpfiles/
+!deploy/metal/tmpfiles/cats-vmm.conf
 deploy/aws/terraform
 tools
 AGENTS.md
