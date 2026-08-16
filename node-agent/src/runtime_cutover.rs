@@ -326,25 +326,50 @@ async fn shutdown_signal() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Two independent local facts, deliberately not one.
+///
+/// `serving` answers "may this Node admit Route traffic": it additionally
+/// requires the Node to actually hold runtimes, so a cordoned empty Node is
+/// never serving. `attested` answers "did this process establish a
+/// session-bound complete-inventory admission attestation": that is true of a
+/// cordoned empty Node, and it is what a worker deployment must prove before
+/// it commits a release. Collapsing them made the deployment gate ask the
+/// serving question about a Node the cutover requires to be empty, which no
+/// first Node could ever satisfy.
 #[derive(Clone)]
-struct Readiness(Arc<AtomicBool>);
+struct Readiness {
+    serving: Arc<AtomicBool>,
+    attested: Arc<AtomicBool>,
+}
 
 impl Readiness {
     fn closed() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
+        Self {
+            serving: Arc::new(AtomicBool::new(false)),
+            attested: Arc::new(AtomicBool::new(false)),
+        }
     }
 
-    fn set(&self, ready: bool) {
-        self.0.store(ready, Ordering::Release);
+    fn set(&self, serving: bool, attested: bool) {
+        self.serving.store(serving, Ordering::Release);
+        self.attested.store(attested, Ordering::Release);
     }
 
-    fn is_ready(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+    fn close(&self) {
+        self.set(false, false);
+    }
+
+    fn is_serving(&self) -> bool {
+        self.serving.load(Ordering::Acquire)
+    }
+
+    fn is_attested(&self) -> bool {
+        self.attested.load(Ordering::Acquire)
     }
 }
 
 async fn health(State(readiness): State<Readiness>) -> (StatusCode, &'static str) {
-    if readiness.is_ready() {
+    if readiness.is_serving() {
         (StatusCode::OK, "signed Runtime inventory attested")
     } else {
         (
@@ -354,9 +379,24 @@ async fn health(State(readiness): State<Readiness>) -> (StatusCode, &'static str
     }
 }
 
+/// A worker deployment proves the candidate Agent established its
+/// complete-inventory attestation, not that the Node serves runtimes: it
+/// installs a cordoned, empty Node, whose `/healthz` is 503 by design.
+async fn attested(State(readiness): State<Readiness>) -> (StatusCode, &'static str) {
+    if readiness.is_attested() {
+        (StatusCode::OK, "signed Runtime complete inventory attested")
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "signed Runtime complete inventory is not attested",
+        )
+    }
+}
+
 fn health_router(readiness: Readiness) -> Router {
     Router::new()
         .route("/healthz", get(health))
+        .route("/attestedz", get(attested))
         .with_state(readiness)
 }
 
@@ -776,7 +816,7 @@ async fn spawn_signed_runtime_cutover_with_overrides(
             _ = &mut runner_shutdown => (Ok(()), false),
             result = wait_usage_task(&mut usage_task) => (result, true),
         };
-        runner_readiness.set(false);
+        runner_readiness.close();
         let _ = usage_shutdown.send(true);
         if !usage_already_joined {
             if let Some(task) = usage_task.take() {
@@ -917,11 +957,14 @@ fn apply_readiness_policy(
         RuntimeSpineRunStep::DesiredAccepted => {
             // A fresh Desired must be reconciled and attested before the
             // process can advertise local readiness again.
-            readiness.set(false);
+            readiness.close();
             Ok(RuntimeLoopAction::Continue)
         }
-        RuntimeSpineRunStep::ObservationAccepted { service_ready } => {
-            readiness.set(service_ready);
+        RuntimeSpineRunStep::ObservationAccepted {
+            service_ready,
+            inventory_attested,
+        } => {
+            readiness.set(service_ready, inventory_attested);
             Ok(RuntimeLoopAction::Continue)
         }
         RuntimeSpineRunStep::PartialObservationAccepted { .. } => {
@@ -941,7 +984,7 @@ fn apply_readiness_policy(
         | RuntimeSpineRunStep::EffectRefreshInventory { .. }
         | RuntimeSpineRunStep::EffectReplanDesired { .. }
         | RuntimeSpineRunStep::DesiredInvalidated { .. } => {
-            readiness.set(false);
+            readiness.close();
             Ok(RuntimeLoopAction::Continue)
         }
         RuntimeSpineRunStep::RetryExact(_)
@@ -955,32 +998,32 @@ fn apply_readiness_policy(
         | RuntimeSpineRunStep::EffectRetryExact { .. }
         | RuntimeSpineRunStep::EffectUnavailable { .. }
         | RuntimeSpineRunStep::EffectDeadlineExceeded { .. } => {
-            readiness.set(false);
+            readiness.close();
             Ok(RuntimeLoopAction::RetryAfterDelay)
         }
         RuntimeSpineRunStep::SessionInvalid { status, error } => {
-            readiness.set(false);
+            readiness.close();
             anyhow::bail!("signed Runtime session was rejected with {status}: {error:?}");
         }
         RuntimeSpineRunStep::Rejected { status, error } => {
-            readiness.set(false);
+            readiness.close();
             anyhow::bail!("signed Runtime request was rejected with {status}: {error:?}");
         }
         RuntimeSpineRunStep::RouteUnavailable => {
-            readiness.set(false);
+            readiness.close();
             anyhow::bail!("signed Runtime routes are not deployed");
         }
         RuntimeSpineRunStep::EffectIdentityRepairRequired { cat_id } => {
-            readiness.set(false);
+            readiness.close();
             tracing::error!(%cat_id, "signed Runtime identity repair is required; Agent is cordoned");
             Ok(RuntimeLoopAction::WaitForIdentityRepair)
         }
         RuntimeSpineRunStep::EffectSessionReplacementRequired { cat_id } => {
-            readiness.set(false);
+            readiness.close();
             anyhow::bail!("signed Runtime session replacement is required for {cat_id}");
         }
         RuntimeSpineRunStep::EffectStopped { cat_id, reason } => {
-            readiness.set(false);
+            readiness.close();
             // Stop is an exact Cat reconciliation decision, not a Node-loop
             // terminal condition. Keep the durable Desired item available to
             // a later fresh scan while independent Cat workers continue.
@@ -2277,7 +2320,7 @@ mod tests {
         assert_eq!(response.0, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.1, "signed Runtime inventory is not attested");
 
-        readiness.set(true);
+        readiness.set(true, true);
         assert_eq!(health(State(readiness)).await.0, StatusCode::OK);
     }
 
@@ -2648,9 +2691,9 @@ mod tests {
             .unwrap(),
             RuntimeLoopAction::RetryAfterDelay
         );
-        assert!(!readiness.is_ready());
+        assert!(!readiness.is_serving());
 
-        readiness.set(true);
+        readiness.set(true, true);
         assert_eq!(
             apply_readiness_policy(
                 RuntimeSpineRunStep::ScanUnavailable(anyhow::anyhow!("physical residue")),
@@ -2659,7 +2702,7 @@ mod tests {
             .unwrap(),
             RuntimeLoopAction::RetryAfterDelay
         );
-        assert!(!readiness.is_ready());
+        assert!(!readiness.is_serving());
     }
 
     #[test]
@@ -2669,25 +2712,77 @@ mod tests {
             apply_readiness_policy(
                 RuntimeSpineRunStep::ObservationAccepted {
                     service_ready: false,
+                    inventory_attested: false,
                 },
                 &readiness,
             )
             .unwrap(),
             RuntimeLoopAction::Continue
         );
-        assert!(!readiness.is_ready());
+        assert!(!readiness.is_serving());
 
         assert_eq!(
             apply_readiness_policy(
                 RuntimeSpineRunStep::ObservationAccepted {
                     service_ready: true,
+                    inventory_attested: true,
                 },
                 &readiness,
             )
             .unwrap(),
             RuntimeLoopAction::Continue
         );
-        assert!(readiness.is_ready());
+        assert!(readiness.is_serving());
+    }
+
+    /// The cutover installs every Node cordoned and empty, and a worker
+    /// deployment must prove the candidate Agent came up before it commits the
+    /// release. An empty Node never serves, so gating that proof on `/healthz`
+    /// could never succeed on a first Node; the attestation is the fact the
+    /// deployment actually needs.
+    #[test]
+    fn an_empty_attested_node_is_not_serving_but_is_attested() {
+        let readiness = Readiness::closed();
+        assert_eq!(
+            apply_readiness_policy(
+                RuntimeSpineRunStep::ObservationAccepted {
+                    service_ready: false,
+                    inventory_attested: true,
+                },
+                &readiness,
+            )
+            .unwrap(),
+            RuntimeLoopAction::Continue
+        );
+        assert!(
+            !readiness.is_serving(),
+            "an empty Node must not admit Route traffic"
+        );
+        assert!(
+            readiness.is_attested(),
+            "an empty Node still established its complete-inventory attestation"
+        );
+    }
+
+    /// An unsettled physical effect withdraws both facts: a release must not
+    /// commit on top of work whose postcondition is unknown.
+    #[test]
+    fn an_unsettled_effect_withdraws_the_attestation_too() {
+        let readiness = Readiness::closed();
+        readiness.set(true, true);
+        assert_eq!(
+            apply_readiness_policy(
+                RuntimeSpineRunStep::ObservationAccepted {
+                    service_ready: false,
+                    inventory_attested: false,
+                },
+                &readiness,
+            )
+            .unwrap(),
+            RuntimeLoopAction::Continue
+        );
+        assert!(!readiness.is_serving());
+        assert!(!readiness.is_attested());
     }
 
     #[test]
@@ -2703,9 +2798,9 @@ mod tests {
             .unwrap(),
             RuntimeLoopAction::Continue
         );
-        assert!(!readiness.is_ready());
+        assert!(!readiness.is_serving());
 
-        readiness.set(true);
+        readiness.set(true, true);
         assert_eq!(
             apply_readiness_policy(
                 RuntimeSpineRunStep::PartialObservationAccepted {
@@ -2716,7 +2811,7 @@ mod tests {
             .unwrap(),
             RuntimeLoopAction::Continue
         );
-        assert!(readiness.is_ready());
+        assert!(readiness.is_serving());
     }
 
     #[test]
@@ -2732,7 +2827,7 @@ mod tests {
             .unwrap(),
             RuntimeLoopAction::WaitForIdentityRepair
         );
-        assert!(!readiness.is_ready());
+        assert!(!readiness.is_serving());
     }
 
     #[test]
@@ -2749,6 +2844,6 @@ mod tests {
             .unwrap(),
             RuntimeLoopAction::RetryAfterDelay
         );
-        assert!(!readiness.is_ready());
+        assert!(!readiness.is_serving());
     }
 }

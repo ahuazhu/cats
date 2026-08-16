@@ -5237,7 +5237,8 @@ async fn postgres_control_and_restarted_node_runner_reach_one_recorded_cat_effec
     assert!(matches!(
         next_step(&mut runner).await,
         RuntimeSpineRunStep::ObservationAccepted {
-            service_ready: false
+            service_ready: false,
+            ..
         }
     ));
     {
@@ -5333,7 +5334,8 @@ async fn postgres_control_and_restarted_node_runner_reach_one_recorded_cat_effec
     assert!(matches!(
         next_step(&mut restarted).await,
         RuntimeSpineRunStep::ObservationAccepted {
-            service_ready: true
+            service_ready: true,
+            ..
         }
     ));
     assert!(effect.records.lock().unwrap().is_empty());

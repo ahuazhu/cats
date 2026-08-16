@@ -67,6 +67,11 @@ COPY --chmod=0755 deploy/aws/metal/install-guest-runtime-release.sh /out/install
 COPY --chmod=0755 deploy/aws/metal/validate-node-identity-installation.sh /out/validate-node-identity-installation.sh
 COPY --chmod=0755 deploy/aws/metal/install-route-v2-node-r1.sh /out/install-route-v2-node-r1.sh
 COPY --chmod=0755 deploy/aws/metal/worker-deployment-transaction.sh /out/worker-deployment-transaction.sh
+# The Agent opens the runtime socket roots and the Host lock; it never creates
+# them. Without these two files the deployment cannot provision them and no
+# Host can start the release.
+COPY --chmod=0755 deploy/aws/metal/provision-vmm-socket-namespaces.sh /out/provision-vmm-socket-namespaces.sh
+COPY --chmod=0644 deploy/metal/tmpfiles/cats-vmm.conf /out/cats-vmm.conf
 COPY deploy/metal/guest-systemd /out/guest-systemd
 RUN chmod 0755 /out/guest-systemd && chmod 0644 /out/guest-systemd/*
 
@@ -91,6 +96,8 @@ COPY --from=builder --chmod=0755 /out/install-guest-runtime-release.sh /install-
 COPY --from=builder --chmod=0755 /out/validate-node-identity-installation.sh /validate-node-identity-installation.sh
 COPY --from=builder --chmod=0755 /out/install-route-v2-node-r1.sh /install-route-v2-node-r1.sh
 COPY --from=builder --chmod=0755 /out/worker-deployment-transaction.sh /worker-deployment-transaction.sh
+COPY --from=builder --chmod=0755 /out/provision-vmm-socket-namespaces.sh /provision-vmm-socket-namespaces.sh
+COPY --from=builder --chmod=0644 /out/cats-vmm.conf /cats-vmm.conf
 COPY --from=builder /out/guest-systemd /guest-systemd
 COPY --chmod=0644 deploy/aws/metal/cats-worker.service /cats-worker.service
 COPY --chmod=0644 deploy/aws/metal/cats-postgres-url.service /cats-postgres-url.service

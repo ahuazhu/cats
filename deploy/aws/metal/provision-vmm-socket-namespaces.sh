@@ -6,6 +6,10 @@ set -euo pipefail
 
 cats_vmm_namespace_crash_probe() { :; }
 
+# Must match node-agent's HOST_LOCK_BASENAME: the Agent opens exactly this name
+# inside the fixed state root and never creates it.
+CATS_HOST_LOCK_BASENAME=host.lock
+
 validate_installed_runtime_socket_root() {
   local directory=$1
   local label=$2
@@ -29,7 +33,7 @@ validate_or_absent_installed_runtime_socket_root() {
 provision_identity_state_namespaces() {
   local identity=$1
   local node_parent=$2
-  local state_path_id state_directory metadata owner mode namespace
+  local state_path_id state_directory metadata owner mode namespace host_lock
 
   [[ -f $identity && ! -L $identity ]] || {
     echo "Node identity is missing or not a regular file" >&2
@@ -59,6 +63,29 @@ provision_identity_state_namespaces() {
     echo "Node state parent is not root-owned and protected" >&2
     return 1
   }
+
+  # The Node Agent opens the Host lock with O_RDWR and no O_CREAT, so it can
+  # never mint a second lock for the same Host. Nothing else creates it, so
+  # without this step every Agent start fails on `open host.lock`. It is a
+  # sibling of the selected state directory in this same validated parent, so
+  # it belongs to this provisioning step. noclobber leaves an existing lock's
+  # inode untouched: a live Agent holds its descriptor, and truncating or
+  # replacing that inode would hand a second Agent an uncontended lock.
+  host_lock=$node_parent/$CATS_HOST_LOCK_BASENAME
+  if [[ ! -e $host_lock && ! -L $host_lock ]]; then
+    (umask 077; set -o noclobber; : > "$host_lock") 2>/dev/null || true
+  fi
+  [[ -f $host_lock && ! -L $host_lock ]] || {
+    echo "Host lock is not a regular file" >&2
+    return 1
+  }
+  [[ $(stat -Lc '%u:%g:%a:%h' "$host_lock") == 0:0:600:1 ]] || {
+    echo "Host lock violates root:root/0600/single-link" >&2
+    return 1
+  }
+  cats_vmm_namespace_crash_probe after-host-lock-create
+  sync -f "$host_lock"
+  sync -f "$node_parent"
 
   state_directory=$node_parent/$state_path_id
   if [[ -e $state_directory || -L $state_directory ]]; then

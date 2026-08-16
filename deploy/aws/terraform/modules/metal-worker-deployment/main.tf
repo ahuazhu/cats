@@ -287,6 +287,20 @@ locals {
     install -m 0644 "$stage_path/cats-postgres-url.timer" /etc/systemd/system/cats-postgres-url.timer
     cats_worker_deployment_crash_probe after-install-postgres-timer
 
+    # The Agent opens the runtime socket roots, the identity-selected state
+    # namespaces and the Host lock; it creates none of them, so a Host that
+    # never ran this provisioner cannot start the release at all. The
+    # provisioner reads the installed identity, which step 5 published before
+    # this deployment ran.
+    install -D -o root -g root -m 0644 "$stage_path/cats-vmm.conf" \
+      /usr/lib/tmpfiles.d/cats-vmm.conf
+    cats_worker_deployment_crash_probe after-install-runtime-tmpfiles
+    install -D -o root -g root -m 0755 \
+      "$stage_path/provision-vmm-socket-namespaces.sh" \
+      "${var.install_root}/bin/provision-vmm-socket-namespaces"
+    "${var.install_root}/bin/provision-vmm-socket-namespaces"
+    cats_worker_deployment_crash_probe after-provision-vmm-socket-namespaces
+
     curl_path="$(readlink -f "$(command -v curl)")"
     systemctl_path="$(readlink -f "$(command -v systemctl)")"
     journalctl_path="$(readlink -f "$(command -v journalctl)")"
