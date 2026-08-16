@@ -1081,7 +1081,9 @@ impl Drop for DeploymentChild {
 
 #[cfg(target_os = "linux")]
 fn wait_for_file(path: &Path, purpose: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // Pure poll upper bound: a saturated gate host schedules the spawned
+    // deployment shells far more slowly than an idle one.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !path.exists() {
         assert!(
             std::time::Instant::now() < deadline,
@@ -1094,7 +1096,7 @@ fn wait_for_file(path: &Path, purpose: &str) {
 
 #[cfg(target_os = "linux")]
 fn wait_for_success(child: &mut std::process::Child, purpose: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         if let Some(status) = child.try_wait().expect("poll deployment child") {
             assert!(status.success(), "{purpose} failed with {status}");
