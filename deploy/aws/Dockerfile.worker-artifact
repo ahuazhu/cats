@@ -2,7 +2,12 @@
 # Keep this builder identical to the control-plane builder: cargo-chef requires
 # the same Rust version for the dependency and application stages to share
 # artifacts reliably.
-FROM lukemathwalker/cargo-chef:0.1.77-rust-1.97-bookworm@sha256:1689f62cfaa6603480356923cb5966544b2dd6ea523e30486bee4f149965d5bc AS chef
+# The qualification build host reaches AWS registries only: its VPC S3
+# endpoint policy denies the Docker Hub blob bucket, so Docker Hub base images
+# are unreachable there. Pull the same upstream Rust image from Amazon ECR Public and add
+# the pinned cargo-chef, keeping the recipe-layer caching behaviour.
+FROM public.ecr.aws/docker/library/rust:1.97.1-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS chef
+RUN cargo install cargo-chef --locked --version 0.1.77
 
 WORKDIR /src
 
