@@ -27,7 +27,9 @@ OUT=${OUT:-/opt/cats/guest}
 RELEASE_OUT=${RELEASE_OUT:-/opt/cats/guest-runtime-release.v1}
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 KVER=${KVER:-$(uname -r)}
-ROOTFS_MB=${ROOTFS_MB:-512}
+# fio (ceph/gluster engines), git and python3 in the include set outgrew the
+# old 512 MiB floor; mkfs.ext4 -d fails closed when the tree no longer fits.
+ROOTFS_MB=${ROOTFS_MB:-1024}
 BUSYBOX=${BUSYBOX:-/usr/bin/busybox}   # busybox-static
 UBUNTU_SUITE=${UBUNTU_SUITE:-noble}
 # The qualification build host allows outbound 443 only, so the default

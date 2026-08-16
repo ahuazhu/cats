@@ -30,7 +30,12 @@ RUN test "${CATS_RELEASE_COMMIT_SHA}" != "" \
 
 FROM debian:bookworm-slim AS runtime
 
-RUN apt-get update \
+# The qualification build host allows outbound 443 only, so apt must use
+# HTTPS; the trust anchors come from the digest-pinned builder image because
+# bookworm-slim ships without ca-certificates.
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+RUN sed -i 's|http://|https://|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 cats \
