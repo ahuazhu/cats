@@ -17,6 +17,7 @@ experiments
 deploy/metal/*
 !deploy/metal/guest-systemd/
 !deploy/metal/guest-systemd/**
+!deploy/metal/setup-guest-network.sh
 deploy/aws/terraform
 tools
 AGENTS.md
