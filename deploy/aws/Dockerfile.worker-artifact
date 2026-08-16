@@ -1,4 +1,7 @@
-# syntax=docker/dockerfile:1.7
+# No syntax directive: the qualification build host cannot reach Docker Hub,
+# where the external frontend image lives. BuildKit's built-in frontend covers
+# every construct used here, and the manual-release lock pins the BuildKit
+# version, so the parser stays deterministic.
 # Keep this builder identical to the control-plane builder: cargo-chef requires
 # the same Rust version for the dependency and application stages to share
 # artifacts reliably.

@@ -1,4 +1,7 @@
-# syntax=docker/dockerfile:1.7
+# No syntax directive: the qualification build host cannot reach Docker Hub,
+# where the external frontend image lives. BuildKit's built-in frontend covers
+# every construct used here, and the manual-release lock pins the BuildKit
+# version, so the parser stays deterministic.
 # Pin both cargo-chef and its multi-platform image. The recipe layer changes
 # only when Cargo manifests or Cargo.lock change, so ordinary source edits
 # reuse the optimized third-party dependency build.
