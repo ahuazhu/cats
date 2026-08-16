@@ -260,6 +260,16 @@ variable "route_grant_public_key_pem" {
   }
 }
 
+variable "production_cutover_operator_trust_bundle_json" {
+  description = "Release-bound public E13 operator trust bundle. cats-controld loads it at startup and refuses to start without it; it carries no private material."
+  type        = string
+
+  validation {
+    condition     = can(jsondecode(var.production_cutover_operator_trust_bundle_json))
+    error_message = "production_cutover_operator_trust_bundle_json must be JSON."
+  }
+}
+
 variable "runtime_provisioner_trust_bundle_json" {
   description = "Canonical A23 deployment-provisioner trust bundle mounted read-only into cats-controld. Contains public keys only."
   type        = string
