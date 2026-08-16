@@ -291,6 +291,21 @@ resource "kubernetes_config_map_v1" "runtime_provisioner_trust" {
   }
 }
 
+# Release-bound public E13 operator trust. cats-controld loads this at startup
+# through the same reader as the provisioner trust and refuses to start without
+# it, so it is a deployment input rather than an optional extra.
+resource "kubernetes_config_map_v1" "production_cutover_operator_trust" {
+  metadata {
+    name      = "cats-production-cutover-operator-trust"
+    namespace = kubernetes_namespace_v1.cats.metadata[0].name
+    labels    = local.labels
+  }
+
+  data = {
+    "production-cutover-operator-trust.v1.json" = var.production_cutover_operator_trust_bundle_json
+  }
+}
+
 resource "kubernetes_config_map_v1" "rds_ca" {
   metadata {
     name      = "cats-rds-ca"
@@ -606,6 +621,13 @@ resource "kubernetes_deployment_v1" "control_plane" {
             sub_path   = "runtime-provisioner-trust.v1.json"
             read_only  = true
           }
+
+          volume_mount {
+            name       = "production-cutover-operator-trust"
+            mount_path = "/etc/cats/production-cutover-operator-trust.v1.json"
+            sub_path   = "production-cutover-operator-trust.v1.json"
+            read_only  = true
+          }
         }
 
         volume {
@@ -655,6 +677,15 @@ resource "kubernetes_deployment_v1" "control_plane" {
 
           config_map {
             name         = kubernetes_config_map_v1.runtime_provisioner_trust.metadata[0].name
+            default_mode = "0644"
+          }
+        }
+
+        volume {
+          name = "production-cutover-operator-trust"
+
+          config_map {
+            name         = kubernetes_config_map_v1.production_cutover_operator_trust.metadata[0].name
             default_mode = "0644"
           }
         }

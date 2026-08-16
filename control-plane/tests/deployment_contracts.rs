@@ -1249,6 +1249,21 @@ fn release_build_publishes_the_control_plane_runtime_target() {
     // /opt/cats and /opt/cats/release unsearchable at 0644 and made the
     // startup filesystem contract unsatisfiable. The directories are created
     // with their exact mode first and the build asserts it.
+    // cats-controld loads three installed artifacts at startup and refuses to
+    // run without any of them. A deployment that mounts only some of them
+    // crash-loops, which is how the production rollout failed, so the module
+    // must mount every one.
+    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
+    for mount in [
+        "/etc/cats/identity/runtime-provisioner-trust.v1.json",
+        "/etc/cats/production-cutover-operator-trust.v1.json",
+    ] {
+        assert!(
+            kubernetes.contains(&format!("mount_path = \"{mount}\"")),
+            "control plane deployment must mount {mount}"
+        );
+    }
+
     assert!(dockerfile.contains("install -d -o 0 -g 0 -m 0755 /opt/cats /opt/cats/release"));
     assert!(dockerfile.contains(r#"test "$(stat -c %a /opt/cats)" = 755"#));
 
