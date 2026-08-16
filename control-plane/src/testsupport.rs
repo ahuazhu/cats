@@ -36,7 +36,7 @@ fn poll_bound() -> Duration {
 /// waiting behind it. This is shared by unit and cross-router cancellation
 /// tests so both prove that the blocking Store closure has been claimed.
 pub struct RuntimeOperationsTableLockForTest {
-    blocked: tokio::sync::oneshot::Receiver<bool>,
+    blocked: tokio::sync::oneshot::Receiver<Result<(), String>>,
     release: Option<std::sync::mpsc::Sender<()>>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -98,8 +98,42 @@ impl RuntimeOperationsTableLockForTest {
                     )
                     .unwrap()
                     .get(0);
-                if blocked || Instant::now() >= deadline {
-                    let _ = blocked_tx.send(blocked);
+                if blocked {
+                    let _ = blocked_tx.send(Ok(()));
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    // Do not guess between "nothing ever queued" and "another
+                    // session (for example a background sweeper on the shared
+                    // Store lane) starved the by-id read": report the exact
+                    // waiter set and session activity for this schema.
+                    let diagnostic = client
+                        .query(
+                            "SELECT activity.pid::text, activity.state,
+                                    coalesce(activity.wait_event_type, ''),
+                                    activity.query
+                               FROM pg_stat_activity activity
+                              WHERE activity.datname=current_database()
+                                AND activity.pid<>$1
+                                AND activity.query LIKE '%runtime_operations%'",
+                            &[&own_pid],
+                        )
+                        .map(|rows| {
+                            rows.into_iter()
+                                .map(|row| {
+                                    format!(
+                                        "pid={} state={} wait={} query={}",
+                                        row.get::<_, String>(0),
+                                        row.get::<_, String>(1),
+                                        row.get::<_, String>(2),
+                                        row.get::<_, String>(3)
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" | ")
+                        })
+                        .unwrap_or_else(|error| format!("diagnostic query failed: {error}"));
+                    let _ = blocked_tx.send(Err(diagnostic));
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(5));
@@ -120,14 +154,15 @@ impl RuntimeOperationsTableLockForTest {
 
     pub async fn wait_until_query_blocked(&mut self) {
         // Strictly wider than the worker's own poll bound so the worker's
-        // diagnostic `blocked=false` report arrives instead of this timeout.
-        assert!(
+        // diagnostic report arrives instead of this timeout.
+        if let Err(diagnostic) =
             tokio::time::timeout(poll_bound() + Duration::from_secs(10), &mut self.blocked)
                 .await
                 .expect("runtime Operation query did not reach the PostgreSQL lock barrier")
-                .expect("runtime_operations table-lock worker stopped"),
-            "runtime Operation query never blocked on runtime_operations"
-        );
+                .expect("runtime_operations table-lock worker stopped")
+        {
+            panic!("runtime Operation query never blocked on runtime_operations: {diagnostic}");
+        }
     }
 
     pub fn release(mut self) {
