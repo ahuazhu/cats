@@ -541,10 +541,18 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
         2,
         "manual verifier must classify cats as exactly one required executable member"
     );
-    assert_eq!(
-        manual_fixture.matches("    \"cats\",").count(),
-        2,
-        "manual verifier fixture must mirror cats in its file and executable sets"
+    // The fixture used to keep its own copy of these sets, so a new bundle
+    // member had to be added twice and a miss only surfaced during a real
+    // release build. It loads them from the verifier under test instead.
+    assert!(
+        manual_fixture.contains("def load_worker_contract(")
+            && manual_fixture.contains("module.WORKER_STATIC_FILES")
+            && manual_fixture.contains("module.WORKER_EXECUTABLE_FILES"),
+        "manual verifier fixture must take its worker sets from the verifier"
+    );
+    assert!(
+        !manual_fixture.contains("    \"cats-noded\","),
+        "manual verifier fixture must not restate the worker member sets"
     );
     for binary in [
         "cats-runtime-e3-probe",
@@ -579,13 +587,6 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
                 .count(),
             2,
             "manual verifier must classify {binary} in its closed file and executable sets"
-        );
-        assert_eq!(
-            manual_fixture
-                .matches(&format!("    \"{binary}\","))
-                .count(),
-            2,
-            "manual release fixture must mirror qualification binary {binary}"
         );
     }
     for receipt_fragment in [

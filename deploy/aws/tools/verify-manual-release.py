@@ -29,6 +29,7 @@ MAX_MANIFEST_BYTES = 4096
 MAX_PROFILE_BYTES = 4096
 MAX_BOOT_MEMBER_BYTES = 512 * 1024 * 1024
 MAX_WORKER_BUNDLE_BYTES = 2 * 1024 * 1024 * 1024
+MAX_WORKER_ENTRIES = 48
 MAX_WORKER_MEMBER_BYTES = 512 * 1024 * 1024
 MAX_GATEWAY_BINARY_BYTES = 256 * 1024 * 1024
 MAX_RELEASE_MANIFEST_BYTES = 1024 * 1024
@@ -342,8 +343,10 @@ def preflight_worker_archive(archive: tarfile.TarFile) -> list[tuple[tarfile.Tar
     seen: set[str] = set()
     total_size = 0
     for member in archive:
-        if len(entries) >= 34:
-            raise VerificationError("worker bundle has more than 34 archive entries")
+        if len(entries) > MAX_WORKER_ENTRIES:
+            raise VerificationError(
+                f"worker bundle has more than {MAX_WORKER_ENTRIES} archive entries"
+            )
         relative = normalized_tar_path(member.name)
         if relative in seen:
             raise VerificationError(f"worker bundle repeats path {relative!r}")
