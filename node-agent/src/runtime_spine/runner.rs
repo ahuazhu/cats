@@ -1323,7 +1323,13 @@ pub enum RuntimeSpineRunStep {
     /// accepted inventory may be the Missing/Inspect baseline that admits the
     /// first effect for a newly assigned Cat.
     ObservationAccepted {
+        /// This Node may admit Route traffic: it attested a complete
+        /// inventory, holds runtimes, and has no unsettled physical effect.
         service_ready: bool,
+        /// This process established a session-bound complete-inventory
+        /// admission attestation. True of a cordoned empty Node, which
+        /// `service_ready` deliberately is not.
+        inventory_attested: bool,
     },
     /// A durable observation prepared by a predecessor process was resolved.
     /// It repairs an ambiguous result but cannot establish restart admission
@@ -3535,12 +3541,13 @@ impl RuntimeSpineRunner {
                     && self.current_process_partial_observation_id.as_ref()
                         == Some(&request.value().observation_id);
                 let degraded_runtimes = request.value().runtimes.len();
-                let service_ready = establishes_effect_admission
-                    && observation_opens_service_readiness(request.value())
-                    && self
-                        .effect_resource_owner
-                        .as_ref()
-                        .is_none_or(|owner| !owner.has_pending());
+                let settled = self
+                    .effect_resource_owner
+                    .as_ref()
+                    .is_none_or(|owner| !owner.has_pending());
+                let inventory_attested = establishes_effect_admission && settled;
+                let service_ready =
+                    inventory_attested && observation_opens_service_readiness(request.value());
                 let admission = if establishes_effect_admission {
                     let node_global_process = self.current_process_node_global_process.take();
                     let node_global_network = self.current_process_node_global_network.take();
@@ -3587,7 +3594,10 @@ impl RuntimeSpineRunner {
                     self.node_global_effect_open = None;
                     self.effect_batch_closing = false;
                     self.deferred_effect_decision = None;
-                    Ok(RuntimeSpineRunStep::ObservationAccepted { service_ready })
+                    Ok(RuntimeSpineRunStep::ObservationAccepted {
+                        service_ready,
+                        inventory_attested,
+                    })
                 } else if establishes_partial_heartbeat {
                     Ok(RuntimeSpineRunStep::PartialObservationAccepted { degraded_runtimes })
                 } else {
@@ -7044,7 +7054,8 @@ mod tests {
                 .await
                 .unwrap(),
             RuntimeSpineRunStep::ObservationAccepted {
-                service_ready: true
+                service_ready: true,
+                inventory_attested: true
             }
         ));
         assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
@@ -7270,7 +7281,8 @@ mod tests {
                 .await
                 .unwrap(),
             RuntimeSpineRunStep::ObservationAccepted {
-                service_ready: true
+                service_ready: true,
+                inventory_attested: true
             }
         ));
         assert_eq!(scanner.calls.load(Ordering::SeqCst), 2);
@@ -7488,7 +7500,8 @@ mod tests {
                 .await
                 .unwrap(),
             RuntimeSpineRunStep::ObservationAccepted {
-                service_ready: false
+                service_ready: false,
+                inventory_attested: false
             }
         ));
         assert_eq!(effect.calls.load(Ordering::SeqCst), 0);
@@ -8837,7 +8850,8 @@ mod tests {
                 .await
                 .unwrap(),
             RuntimeSpineRunStep::ObservationAccepted {
-                service_ready: false
+                service_ready: false,
+                ..
             }
         ));
 

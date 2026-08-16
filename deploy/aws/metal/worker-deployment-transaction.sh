@@ -4,6 +4,10 @@
 CATS_WORKER_DEPLOYMENT_LOCK_PATH=/run/lock/cats/worker-deployment.lock
 CATS_WORKER_DEPLOYMENT_LOCK_FD=9
 CATS_WORKER_DEPLOYMENT_HELPER=/opt/cats/bin/worker-deployment-transaction
+# systemd resolves unit files from /etc above /run, so cats_gate_node_service
+# parks an already published unit here to let its runtime mask take effect.
+CATS_WORKER_DEPLOYMENT_UNIT_DIR=/etc/systemd/system
+CATS_WORKER_DEPLOYMENT_RETIRED_UNIT_DIR=/run/cats/retired-units
 CATS_WORKER_DEPLOYMENT_WATCHDOG=cats-worker-deployment-watchdog.service
 
 # Production has no environment-controlled fault injection. Linux contract
@@ -178,8 +182,27 @@ cats_worker_metering_root() {
 }
 
 cats_gate_node_service() {
-  local service unit_file_state
+  local service unit_file_state installed_unit
   service=$1
+  # systemd resolves /etc/systemd/system above /run/systemd/system, so a runtime
+  # mask cannot shadow a unit this installer already published to /etc. Without
+  # retiring that unit first the gate is inert on every Host that has been
+  # installed once: the mask symlink appears, UnitFileState stays `enabled`, and
+  # the check below fails a redeploy that a fresh Host passes.
+  #
+  # Retire it under the Host deployment lock, after the caller proved the
+  # service idle. The transaction republishes the unit before it ungates. An
+  # abort therefore leaves the service unstartable, which is the same
+  # fail-closed outcome the mask exists to produce.
+  installed_unit=$CATS_WORKER_DEPLOYMENT_UNIT_DIR/$service.service
+  if [ -f "$installed_unit" ] && [ ! -L "$installed_unit" ]; then
+    install -d -o root -g root -m 0700 "$CATS_WORKER_DEPLOYMENT_RETIRED_UNIT_DIR"
+    mv "$installed_unit" "$CATS_WORKER_DEPLOYMENT_RETIRED_UNIT_DIR/$service.service" \
+      || return 1
+    sync -f "$CATS_WORKER_DEPLOYMENT_RETIRED_UNIT_DIR" 2>/dev/null || true
+    sync -f "$CATS_WORKER_DEPLOYMENT_UNIT_DIR" 2>/dev/null || true
+    systemctl daemon-reload || return 1
+  fi
   systemctl mask --runtime "$service" || return 1
   unit_file_state=$(cats_systemd_property "$service" UnitFileState) || return 1
   case "$unit_file_state" in
@@ -254,7 +277,12 @@ cats_bind_candidate_main() {
 }
 
 cats_wait_for_registered_node() {
-  local service=$1 url=${2:-http://127.0.0.1:7301/healthz} deadline identity
+  # `/attestedz`, not `/healthz`: the deployment proves the candidate Agent
+  # established its session-bound complete-inventory attestation. `/healthz`
+  # additionally requires the Node to hold runtimes, which the cutover's
+  # cordoned empty Node never does, so gating on it could never succeed on a
+  # first Node.
+  local service=$1 url=${2:-http://127.0.0.1:7301/attestedz} deadline identity
   [ -n "${CATS_WORKER_CANDIDATE_MAIN_PID:-}" \
       ] && [ -n "${CATS_WORKER_CANDIDATE_MAIN_START:-}" ] || return 1
   deadline=$(($(date +%s) + 60))

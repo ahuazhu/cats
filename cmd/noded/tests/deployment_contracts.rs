@@ -2602,3 +2602,39 @@ fn worker_release_atomically_updates_the_cloud_hypervisor_guest_seed() {
         "updater did not preserve the previous seed"
     );
 }
+
+/// The Agent opens the Host lock with `O_RDWR` and no `O_CREAT`, so it can
+/// never mint a second lock for the same Host. That makes creating it somebody
+/// else's job, and the only owner of the fixed state root is the deployment's
+/// namespace provisioner. Without it every Agent start fails on
+/// `open host.lock`, which is a Host that cannot run the release at all.
+#[test]
+fn state_provisioning_creates_the_host_lock_the_agent_only_ever_opens() {
+    let provisioner = read_workspace_file("deploy/aws/metal/provision-vmm-socket-namespaces.sh");
+
+    let basename = cats_node_agent::agent_registration::HOST_LOCK_BASENAME;
+    assert!(
+        provisioner.contains(&format!("CATS_HOST_LOCK_BASENAME={basename}")),
+        "the provisioner must create the exact basename the Agent opens ({basename})"
+    );
+
+    let create = provisioner
+        .find(r#"(umask 077; set -o noclobber; : > "$host_lock")"#)
+        .expect("the provisioner must create the Host lock without clobbering a live one");
+    let contract = provisioner
+        .find(r#"[[ $(stat -Lc '%u:%g:%a:%h' "$host_lock") == 0:0:600:1 ]]"#)
+        .expect("the provisioner must prove the Host lock's root:root/0600/single-link contract");
+    assert!(
+        create < contract,
+        "the Host lock contract must be proven after it is created"
+    );
+
+    let state_directory = provisioner
+        .find(r#"state_directory=$node_parent/$state_path_id"#)
+        .expect("identity-selected state directory");
+    assert!(
+        contract < state_directory,
+        "the Host lock must exist before the selected state directory: the Agent takes the \
+         Host-global lock before it opens any state path"
+    );
+}

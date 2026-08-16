@@ -3818,9 +3818,14 @@ fn worker_installation_owns_all_runtime_socket_roots() {
         );
     }
 
+    // The production deployment is the terraform association, not either
+    // bootstrap script. Checking only the bootstraps let the association ship
+    // without the provisioner at all: the Agent then failed every start on the
+    // runtime socket root it opens and never creates.
     for bootstrap in [
         "deploy/aws/metal/install-worker.sh",
         "deploy/metal/install.sh",
+        "deploy/aws/terraform/modules/metal-worker-deployment/main.tf",
     ] {
         let source = read_workspace_file(bootstrap);
         let install = source
@@ -3829,10 +3834,26 @@ fn worker_installation_owns_all_runtime_socket_roots() {
         let provision = source
             .find("\"$PREFIX/bin/provision-vmm-socket-namespaces\"")
             .or_else(|| source.find("\"$CATS_PREFIX/bin/provision-vmm-socket-namespaces\""))
+            .or_else(|| {
+                source.find("\"${var.install_root}/bin/provision-vmm-socket-namespaces\"\n")
+            })
             .unwrap_or_else(|| panic!("{bootstrap} does not run the runtime provisioner"));
         assert!(
             install < provision,
             "{bootstrap} must install tmpfiles before provisioning runtime roots"
+        );
+    }
+
+    // The association can only install what the worker artifact carries.
+    let worker_artifact = read_workspace_file("deploy/aws/Dockerfile.worker-artifact");
+    for member in [
+        "deploy/aws/metal/provision-vmm-socket-namespaces.sh",
+        "deploy/metal/tmpfiles/cats-vmm.conf",
+    ] {
+        assert!(
+            worker_artifact.contains(member),
+            "the worker artifact must carry {member}, or the deployment cannot provision \
+             the runtime roots the Agent opens"
         );
     }
 }
