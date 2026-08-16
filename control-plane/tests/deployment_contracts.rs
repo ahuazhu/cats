@@ -1245,6 +1245,13 @@ fn release_build_publishes_the_control_plane_runtime_target() {
     let dockerfile = read_workspace_file("deploy/aws/Dockerfile.control-plane");
     // Split on the stage name, not the base image: the base moved to Amazon
     // ECR Public because the build host cannot reach Docker Hub.
+    // COPY --chmod also stamps the parent directories it creates, which left
+    // /opt/cats and /opt/cats/release unsearchable at 0644 and made the
+    // startup filesystem contract unsatisfiable. The directories are created
+    // with their exact mode first and the build asserts it.
+    assert!(dockerfile.contains("install -d -o 0 -g 0 -m 0755 /opt/cats /opt/cats/release"));
+    assert!(dockerfile.contains(r#"test "$(stat -c %a /opt/cats)" = 755"#));
+
     let runtime = dockerfile
         .split_once(" AS runtime\n")
         .and_then(|(_, rest)| rest.split_once("FROM runtime AS credential-refresher"))
