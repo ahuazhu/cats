@@ -41,9 +41,11 @@ impl RuntimeOperationsTableLockForTest {
                 .get(0);
             ready_tx.send(()).unwrap();
 
-            // Pure poll upper bound; a saturated gate host can take far
-            // longer than an idle one to schedule the handler onto the lock.
-            let deadline = Instant::now() + Duration::from_secs(30);
+            // Pure poll upper bound; a saturated gate host (late in the
+            // full suite, with a bloated shared PostgreSQL catalog) can take
+            // far longer than an idle one to schedule the handler onto the
+            // lock. The poll exits as soon as the handler blocks.
+            let deadline = Instant::now() + Duration::from_secs(90);
             loop {
                 if release_rx.try_recv().is_ok() {
                     client.batch_execute("ROLLBACK").unwrap();
@@ -97,7 +99,7 @@ impl RuntimeOperationsTableLockForTest {
 
     pub async fn wait_until_query_blocked(&mut self) {
         assert!(
-            tokio::time::timeout(Duration::from_secs(35), &mut self.blocked)
+            tokio::time::timeout(Duration::from_secs(100), &mut self.blocked)
                 .await
                 .expect("runtime Operation query did not reach the PostgreSQL lock barrier")
                 .expect("runtime_operations table-lock worker stopped"),
