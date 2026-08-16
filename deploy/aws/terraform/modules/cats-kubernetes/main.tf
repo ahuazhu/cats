@@ -1079,7 +1079,16 @@ resource "kubernetes_deployment_v1" "object_write_gateway" {
     }
   }
 
-  wait_for_rollout = true
+  # This release's daemon cannot become ready: its PostgreSQL startup check ends
+  # in an unconditional FailedPrecondition because the E13 qualification lock and
+  # its twelfth routine are not composed yet
+  # (deploy/postgres/object-write-gateway-role-v1.sql documents the same gap).
+  # Waiting for a rollout that the code forbids would fail every apply of this
+  # stack -- including the Route v2 services, the public ingress and the DNS
+  # records that depend on this module -- on a gap this stack cannot close.
+  # The Deployment stays so the wiring is exact when E13 lands; its Pods stay
+  # visibly not-ready rather than being hidden behind a disabled component.
+  wait_for_rollout = false
 }
 
 resource "kubernetes_pod_disruption_budget_v1" "object_write_gateway" {
