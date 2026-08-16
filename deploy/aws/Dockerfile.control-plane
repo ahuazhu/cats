@@ -30,7 +30,7 @@ RUN test "${CATS_RELEASE_COMMIT_SHA}" != "" \
     && printf '%s' "${CATS_RELEASE_COMMIT_SHA}" | grep -Eq '^[0-9a-f]{40}$' \
     && cargo build --locked --release \
       -p cats-control-plane-daemon \
-      -p cats-object-write-gatewayd \
+      -p cats-object-write-gateway-daemon \
     && strip target/release/cats-controld \
     && strip target/release/cats-object-write-gatewayd \
     && install -D -m 0755 target/release/cats-controld /out/cats-controld \

@@ -179,6 +179,11 @@ run_skills() {
   done
 }
 
+run_release_images() {
+  echo "==> release Dockerfile targets"
+  python3 scripts/check-release-dockerfiles.py
+}
+
 require_tool_version() {
   local executable="$1"
   local expected="$2"
@@ -290,6 +295,7 @@ run_doc() {
 run_fast() {
   run_fmt
   run_skills
+  run_release_images
   run_check
   run_clippy
 }
@@ -297,6 +303,7 @@ run_fast() {
 run_full() {
   run_fmt
   run_skills
+  run_release_images
   run_deps
   run_check
   run_build
