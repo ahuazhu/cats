@@ -679,9 +679,13 @@ fn embedded_route_v2_rotation_release_commit_sha(trust_release: &str) -> anyhow:
     #[cfg(not(debug_assertions))]
     let embedded = embedded
         .context("release build omitted CATS_RELEASE_COMMIT_SHA for Route v2 rotation authority")?;
+    // Name both sides: a mismatch here stops startup, and without the values
+    // an operator cannot tell a stale trust bundle from a build that embedded
+    // the wrong commit.
     anyhow::ensure!(
         embedded == trust_release,
-        "Route v2 rotation operator trust does not bind this exact release"
+        "Route v2 rotation operator trust does not bind this exact release: \
+         binary embeds {embedded:?}, trust bundle binds {trust_release:?}"
     );
     Ok(embedded.to_owned())
 }
