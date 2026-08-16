@@ -235,6 +235,12 @@ gateway_metadata="$output_incomplete/gateway-image-metadata.json"
 worker_metadata="$output_incomplete/worker-image-metadata.json"
 control_archive="$output_incomplete/cats-control-plane-image.tar"
 gateway_archive="$output_incomplete/cats-gateway-image.tar"
+# The OCI archives are the release transport and the verification subject.
+# Docker only loads its own archive format unless the daemon runs the
+# containerd image store, so exporting both lets the local identity checks and
+# binary extraction keep working. These copies never reach the handoff.
+control_load_archive="$output_incomplete/control-load.tar"
+gateway_load_archive="$output_incomplete/gateway-load.tar"
 control_root="$output_incomplete/control-root"
 gateway_root="$output_incomplete/gateway-root"
 worker_root="$output_incomplete/worker-root"
@@ -251,7 +257,10 @@ build_arguments=(
   --tag "$image_reference"
 )
 if [[ $export_images == true ]]; then
-  build_arguments+=(--output "type=oci,dest=$control_archive")
+  build_arguments+=(
+    --output "type=oci,dest=$control_archive"
+    --output "type=docker,dest=$control_load_archive"
+  )
 else
   build_arguments+=(--load)
 fi
@@ -285,7 +294,7 @@ if [[ $export_images == true ]]; then
     --reference "$image_reference" \
     --image-digest "$control_image_digest" \
     --config-digest "$control_config_digest"
-  docker image load --input "$control_archive" >/dev/null
+  docker image load --input "$control_load_archive" >/dev/null
 fi
 control_image_id=$(docker image inspect --format '{{.Id}}' "$image_reference")
 [[ $control_image_id == "$control_config_digest" || $control_image_id == "$control_image_digest" ]] || {
@@ -319,7 +328,10 @@ gateway_build_arguments=(
   --tag "$gateway_image_reference"
 )
 if [[ $export_images == true ]]; then
-  gateway_build_arguments+=(--output "type=oci,dest=$gateway_archive")
+  gateway_build_arguments+=(
+    --output "type=oci,dest=$gateway_archive"
+    --output "type=docker,dest=$gateway_load_archive"
+  )
 else
   gateway_build_arguments+=(--load)
 fi
@@ -353,7 +365,7 @@ if [[ $export_images == true ]]; then
     --reference "$gateway_image_reference" \
     --image-digest "$gateway_image_digest" \
     --config-digest "$gateway_config_digest"
-  docker image load --input "$gateway_archive" >/dev/null
+  docker image load --input "$gateway_load_archive" >/dev/null
 fi
 gateway_image_id=$(docker image inspect --format '{{.Id}}' "$gateway_image_reference")
 [[ $gateway_image_id == "$gateway_config_digest" || $gateway_image_id == "$gateway_image_digest" ]] || {
@@ -474,6 +486,7 @@ fi
 # their canonical manifest, not mutable build caches or extraction scratch.
 rm -rf -- "$control_root" "$gateway_root" "$worker_root" "$guest_output"
 rm -f -- "$control_metadata" "$gateway_metadata" "$worker_metadata"
+rm -f -- "$control_load_archive" "$gateway_load_archive"
 cp -R "$guest_release" "$output_incomplete/guest-runtime-release.v1"
 chmod -R a-w "$output_incomplete/guest-runtime-release.v1"
 chmod a-w "$output_incomplete/cats-worker.tar.zst" "$output_incomplete/release-manifest.v1.json"

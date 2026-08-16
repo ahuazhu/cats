@@ -4047,6 +4047,15 @@ fn manual_release_builder_verifies_all_final_artifacts_and_writes_one_receipt() 
         "--export-images",
         "type=oci,dest=$control_archive",
         "type=oci,dest=$gateway_archive",
+        // Docker loads only its own archive format unless the daemon runs the
+        // containerd image store, so the export must also produce the archives
+        // the local identity checks and binary extraction load.
+        "type=docker,dest=$control_load_archive",
+        "type=docker,dest=$gateway_load_archive",
+        "docker image load --input \"$control_load_archive\"",
+        "docker image load --input \"$gateway_load_archive\"",
+        // Those copies are build scratch and must never reach the handoff.
+        "rm -f -- \"$control_load_archive\" \"$gateway_load_archive\"",
         "cats-control-plane-image.tar",
         "cats-gateway-image.tar",
         "> SHA256SUMS",
