@@ -30,7 +30,9 @@ KVER=${KVER:-$(uname -r)}
 ROOTFS_MB=${ROOTFS_MB:-512}
 BUSYBOX=${BUSYBOX:-/usr/bin/busybox}   # busybox-static
 UBUNTU_SUITE=${UBUNTU_SUITE:-noble}
-UBUNTU_MIRROR=${UBUNTU_MIRROR:-http://archive.ubuntu.com/ubuntu}
+# The qualification build host allows outbound 443 only, so the default
+# mirror must be HTTPS; plain-HTTP debootstrap hangs there in SYN-SENT.
+UBUNTU_MIRROR=${UBUNTU_MIRROR:-https://archive.ubuntu.com/ubuntu}
 INITRAMFS_BASE=${INITRAMFS_BASE:-}
 GUEST_INIT_MODE=${GUEST_INIT_MODE:-systemd}
 WORK=$(mktemp -d)
