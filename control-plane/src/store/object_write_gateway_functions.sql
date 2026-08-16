@@ -37,19 +37,19 @@ BEGIN
             USING ERRCODE = '42501';
     END IF;
     SELECT pg_catalog.string_agg(
-               function.proname || pg_catalog.chr(0) ||
+               function.proname || pg_catalog.chr(1) ||
                pg_catalog.pg_get_function_identity_arguments(function.oid) ||
-               pg_catalog.chr(0) ||
+               pg_catalog.chr(1) ||
                pg_catalog.pg_get_function_result(function.oid) ||
-               pg_catalog.chr(0) || function.prosecdef::TEXT ||
-               pg_catalog.chr(0) || function.proisstrict::TEXT ||
-               pg_catalog.chr(0) || function.provolatile::TEXT ||
-               pg_catalog.chr(0) || language.lanname ||
-               pg_catalog.chr(0) || COALESCE(
+               pg_catalog.chr(1) || function.prosecdef::TEXT ||
+               pg_catalog.chr(1) || function.proisstrict::TEXT ||
+               pg_catalog.chr(1) || function.provolatile::TEXT ||
+               pg_catalog.chr(1) || language.lanname ||
+               pg_catalog.chr(1) || COALESCE(
                    pg_catalog.array_to_string(function.proconfig, ','), '') ||
-               pg_catalog.chr(0) ||
+               pg_catalog.chr(1) ||
                    (function.proowner=namespace.nspowner)::TEXT ||
-               pg_catalog.chr(0) || (NOT EXISTS (
+               pg_catalog.chr(1) || (NOT EXISTS (
                    SELECT 1
                      FROM pg_catalog.aclexplode(COALESCE(
                           function.proacl,
@@ -58,9 +58,9 @@ BEGIN
                     WHERE privilege.grantee=0
                       AND privilege.privilege_type='EXECUTE'
                ))::TEXT ||
-               pg_catalog.chr(0) || pg_catalog.has_function_privilege(
+               pg_catalog.chr(1) || pg_catalog.has_function_privilege(
                    session_user, function.oid, 'EXECUTE')::TEXT ||
-               pg_catalog.chr(0) || pg_catalog.encode(pg_catalog.sha256(
+               pg_catalog.chr(1) || pg_catalog.encode(pg_catalog.sha256(
                    pg_catalog.convert_to(
                        pg_catalog.replace(pg_catalog.replace(pg_catalog.replace(
                                function.prosrc,
@@ -1051,7 +1051,7 @@ BEGIN
         (('x' || pg_catalog.substr(pg_catalog.encode(pg_catalog.sha256(
             pg_catalog.convert_to(
                 'cats.object-write-qualification-request-lock.v1' ||
-                pg_catalog.chr(0) || (request_json #>> '{request_id}'),
+                pg_catalog.chr(1) || (request_json #>> '{request_id}'),
                 'UTF8'
             )
         ), 'hex'), 1, 16))::bit(64)::bigint)
@@ -1712,7 +1712,7 @@ BEGIN
             (('x' || pg_catalog.substr(pg_catalog.encode(pg_catalog.sha256(
                 pg_catalog.convert_to(
                     'cats.object-write-qualification-request-lock.v1' ||
-                    pg_catalog.chr(0) || requested_request_id,
+                    pg_catalog.chr(1) || requested_request_id,
                     'UTF8'
                 )
             ), 'hex'), 1, 16))::bit(64)::bigint)

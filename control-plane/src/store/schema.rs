@@ -561,7 +561,7 @@ pub(super) fn object_write_gateway_catalog_sha256() -> Result<String> {
             .ok_or_else(|| internal("object-write function digest lost its prefix"))?
             .to_string();
         lines.push(format!(
-            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0search_path=pg_catalog, pg_temp\0true\0true\0{}\0{}",
+            "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}search_path=pg_catalog, pg_temp\u{1}true\u{1}true\u{1}{}\u{1}{}",
             function.name,
             function.identity_arguments,
             function.result,

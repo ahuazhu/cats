@@ -1767,19 +1767,19 @@ fn verify_direct_routine_catalog(
             "SELECT COUNT(*),
                     'sha256:' || pg_catalog.encode(pg_catalog.sha256(
                         pg_catalog.convert_to(COALESCE(pg_catalog.string_agg(
-                            function.proname || pg_catalog.chr(0) ||
+                            function.proname || pg_catalog.chr(1) ||
                             pg_catalog.pg_get_function_identity_arguments(function.oid) ||
-                            pg_catalog.chr(0) ||
+                            pg_catalog.chr(1) ||
                             pg_catalog.pg_get_function_result(function.oid) ||
-                            pg_catalog.chr(0) || function.prosecdef::TEXT ||
-                            pg_catalog.chr(0) || function.proisstrict::TEXT ||
-                            pg_catalog.chr(0) || function.provolatile::TEXT ||
-                            pg_catalog.chr(0) || language.lanname ||
-                            pg_catalog.chr(0) || COALESCE(
+                            pg_catalog.chr(1) || function.prosecdef::TEXT ||
+                            pg_catalog.chr(1) || function.proisstrict::TEXT ||
+                            pg_catalog.chr(1) || function.provolatile::TEXT ||
+                            pg_catalog.chr(1) || language.lanname ||
+                            pg_catalog.chr(1) || COALESCE(
                                 pg_catalog.array_to_string(function.proconfig, ','), '') ||
-                            pg_catalog.chr(0) ||
+                            pg_catalog.chr(1) ||
                                 (function.proowner=namespace.nspowner)::TEXT ||
-                            pg_catalog.chr(0) || (NOT EXISTS (
+                            pg_catalog.chr(1) || (NOT EXISTS (
                                 SELECT 1
                                   FROM pg_catalog.aclexplode(COALESCE(
                                        function.proacl,
@@ -1788,9 +1788,9 @@ fn verify_direct_routine_catalog(
                                  WHERE privilege.grantee=0
                                    AND privilege.privilege_type='EXECUTE'
                             ))::TEXT ||
-                            pg_catalog.chr(0) || pg_catalog.has_function_privilege(
+                            pg_catalog.chr(1) || pg_catalog.has_function_privilege(
                                 session_user, function.oid, 'EXECUTE')::TEXT ||
-                            pg_catalog.chr(0) || pg_catalog.encode(pg_catalog.sha256(
+                            pg_catalog.chr(1) || pg_catalog.encode(pg_catalog.sha256(
                                 pg_catalog.convert_to(pg_catalog.replace(
                                     pg_catalog.replace(pg_catalog.replace(
                                         function.prosrc,
