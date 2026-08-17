@@ -103,7 +103,11 @@ provision_identity_state_namespaces() {
   sync -f "$state_directory"
   sync -f "$node_parent"
 
-  for namespace in vmm-socket-receipts vmm-launch-v1 blockd-socket-intents-v1; do
+  # `checkpoints` is not optional: the kernel-NBD pool proof snapshots this
+  # namespace, and an absent directory is unprovable rather than empty. Without
+  # it a Node with no Cats reports BlockFrontend unavailable forever and can
+  # never attest, which is the state this release installs every Node in.
+  for namespace in checkpoints vmm-socket-receipts vmm-launch-v1 blockd-socket-intents-v1; do
     local directory=$state_directory/$namespace
     if [[ -e $directory || -L $directory ]]; then
       [[ -d $directory && ! -L $directory ]] \

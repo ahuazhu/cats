@@ -3787,7 +3787,11 @@ fn worker_installation_owns_all_runtime_socket_roots() {
         );
     }
 
-    let provisioned_state_namespaces = "vmm-socket-receipts vmm-launch-v1 blockd-socket-intents-v1";
+    // `checkpoints` leads the list because the kernel-NBD pool proof snapshots
+    // it: an absent namespace is unprovable, not empty, so a Node without it can
+    // never attest.
+    let provisioned_state_namespaces =
+        "checkpoints vmm-socket-receipts vmm-launch-v1 blockd-socket-intents-v1";
 
     let provisioner = read_workspace_file("deploy/aws/metal/provision-vmm-socket-namespaces.sh");
     assert!(

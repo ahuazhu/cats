@@ -217,6 +217,13 @@ pub(crate) fn initialize_metering_cgroup(cfg: &NodeConfig) -> Result<()> {
     let Some(root) = &cfg.metering_cgroup_root else {
         return Ok(());
     };
+    initialize_metering_cgroup_root(root)
+}
+
+/// Establishes the Agent's delegated metering root. The signed Runtime's own
+/// inventory proof requires this root to exist: an absent root is unprovable,
+/// not empty, so an Agent that never created it can never attest.
+pub(crate) fn initialize_metering_cgroup_root(root: &Path) -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = root;
