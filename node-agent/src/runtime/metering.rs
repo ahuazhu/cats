@@ -1,5 +1,11 @@
 use super::*;
 
+/// The leaf of its own delegated unit cgroup that the Agent moves itself into
+/// before enabling controllers for per-Cat descendants. The inventory proof
+/// reads the Agent's control group to identify its own service unit, so both
+/// sides must name this leaf from one definition.
+pub(crate) const AGENT_DELEGATED_CGROUP_LEAF: &str = "agent";
+
 #[derive(Debug, Clone)]
 pub(super) struct RuntimeMetering {
     pub(super) cgroup_path: PathBuf,
@@ -252,7 +258,7 @@ pub(crate) fn initialize_metering_cgroup_root(root: &Path) -> Result<()> {
             delegated_root.display()
         );
 
-        let agent_leaf = delegated_root.join("agent");
+        let agent_leaf = delegated_root.join(AGENT_DELEGATED_CGROUP_LEAF);
         std::fs::create_dir_all(&agent_leaf)
             .with_context(|| format!("create node-agent cgroup {}", agent_leaf.display()))?;
         std::fs::write(agent_leaf.join("cgroup.procs"), &process_id)

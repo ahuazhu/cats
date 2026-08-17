@@ -195,9 +195,26 @@ impl StaticServiceIdentity {
         if unified.next().is_some() {
             return None;
         }
-        let agent_unit = control_group.strip_prefix("/system.slice/")?;
-        if agent_unit.contains('/') {
-            return None;
+        // cgroup v2 forbids enabling controllers for children while the parent
+        // holds a process, so before any Cat runtime starts the Agent moves
+        // itself out of its own delegated unit cgroup and into that unit's
+        // `agent` leaf. Its control group is therefore one level below the unit
+        // on every installed Node. Requiring the unit itself made this identity
+        // absent in production, which silently withdrew the whole static
+        // allowance below -- including the deployment watchdog -- while leaving
+        // the Agent's own unit tolerated only by accident, because a delegated
+        // unit cgroup holds no process of its own.
+        let mut components = control_group.strip_prefix("/system.slice/")?.split('/');
+        let agent_unit = components.next()?;
+        // Accept that one exact leaf and nothing deeper: this identity decides
+        // which units the inventory proof may explain, so an unrecognized path
+        // must stay unidentified rather than widen the allowance.
+        match components.next() {
+            None => {}
+            Some(leaf)
+                if leaf == crate::runtime::metering::AGENT_DELEGATED_CGROUP_LEAF
+                    && components.next().is_none() => {}
+            Some(_) => return None,
         }
         // The worker deployment starts its own supervised watchdog while it holds
         // the Host lock, and it demands this Node's attestation inside that same
@@ -21960,5 +21977,112 @@ mod tests {
                     )
             ));
         }
+    }
+
+    #[test]
+    fn the_static_identity_survives_the_agents_delegated_cgroup_leaf() {
+        let executable = PathBuf::from("/opt/cats/bin/cats-noded");
+        let unit = Id::new("cats-worker.service").unwrap();
+        let watchdog = Id::new("cats-worker-deployment-watchdog.service").unwrap();
+
+        let at_unit = StaticServiceIdentity::from_process_facts(
+            81,
+            executable.clone(),
+            b"0::/system.slice/cats-worker.service\n",
+        )
+        .expect("a unit-level control group identifies the service");
+        let delegated = StaticServiceIdentity::from_process_facts(
+            81,
+            executable.clone(),
+            b"0::/system.slice/cats-worker.service/agent\n",
+        )
+        .expect("the Agent's own delegated leaf identifies the same service");
+
+        assert_eq!(at_unit.expected_units, delegated.expected_units);
+        assert!(delegated.expected_units.contains(&unit));
+        assert!(delegated.expected_units.contains(&watchdog));
+        // Re-inspecting the live process re-derives this identity and compares
+        // it for equality, so the control group must stay verbatim.
+        assert_eq!(
+            delegated.control_group,
+            "/system.slice/cats-worker.service/agent"
+        );
+
+        for rejected in [
+            &b"0::/system.slice/cats-worker.service/agent/deeper\n"[..],
+            &b"0::/system.slice/cats-worker.service/metering\n"[..],
+            &b"0::/system.slice/cats-worker.service/metering/cat\n"[..],
+            &b"0::/system.slice/other.slice/cats-worker.service\n"[..],
+        ] {
+            assert!(
+                StaticServiceIdentity::from_process_facts(81, executable.clone(), rejected)
+                    .is_none(),
+                "an unrecognized control group must stay unidentified: {}",
+                String::from_utf8_lossy(rejected)
+            );
+        }
+    }
+
+    #[test]
+    fn a_delegated_agent_proves_the_unit_its_own_deployment_starts() {
+        let environment = TestEnvironment::new();
+        let identity = StaticServiceIdentity::from_process_facts(
+            81,
+            PathBuf::from("/opt/cats/bin/cats-noded"),
+            b"0::/system.slice/cats-worker.service/agent\n",
+        )
+        .unwrap();
+
+        // A delegated unit cgroup holds no process of its own: the Agent moved
+        // itself into the `agent` leaf so controllers could be enabled for
+        // per-Cat descendants.
+        let unit = environment.systemd_root.join("cats-worker.service");
+        std::fs::create_dir(&unit).unwrap();
+        std::fs::write(unit.join("cgroup.procs"), b"").unwrap();
+        let leaf = unit.join("agent");
+        std::fs::create_dir(&leaf).unwrap();
+        std::fs::write(leaf.join("cgroup.procs"), b"81\n").unwrap();
+        // Explaining the unit means walking into it, so the delegated metering
+        // root and its per-Cat descendants are now on that walk.
+        let metering = unit.join("metering");
+        std::fs::create_dir(&metering).unwrap();
+        std::fs::write(metering.join("cgroup.procs"), b"").unwrap();
+        let per_cat = metering.join("cat-1-3");
+        std::fs::create_dir(&per_cat).unwrap();
+        std::fs::write(per_cat.join("cgroup.procs"), b"4241\n").unwrap();
+
+        // The worker deployment supervises its watchdog as an ordinary unit, so
+        // that unit's own cgroup holds the live process directly.
+        let watchdog = environment
+            .systemd_root
+            .join("cats-worker-deployment-watchdog.service");
+        std::fs::create_dir(&watchdog).unwrap();
+        std::fs::write(watchdog.join("cgroup.procs"), b"4242\n").unwrap();
+
+        let limits = ProbeLimits::default();
+        let scan = || {
+            let mut budget = limits.os_entries;
+            scan_systemd_residue_allowing(
+                &environment.systemd_root,
+                &mut budget,
+                limits.recursion_depth,
+                &identity.expected_units,
+                &context(),
+            )
+            .unwrap()
+        };
+
+        assert!(
+            matches!(scan(), Some(residue) if residue.is_empty()),
+            "a delegated Agent must explain both its own unit and the watchdog its deployment starts"
+        );
+
+        let unexplained = environment.systemd_root.join("cats-serving-1.service");
+        std::fs::create_dir(&unexplained).unwrap();
+        std::fs::write(unexplained.join("cgroup.procs"), b"4243\n").unwrap();
+        assert!(
+            scan().is_none(),
+            "a live cats unit this identity does not explain must still refuse the proof"
+        );
     }
 }
