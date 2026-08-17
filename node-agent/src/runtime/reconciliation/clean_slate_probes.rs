@@ -199,13 +199,23 @@ impl StaticServiceIdentity {
         if agent_unit.contains('/') {
             return None;
         }
-        let expected_names = match agent_unit {
-            "cats-noded.service" => ["cats-noded.service", "cats-controld.service"],
-            "cats-worker.service" => ["cats-worker.service", "cats-postgres-url.service"],
+        // The worker deployment starts its own supervised watchdog while it holds
+        // the Host lock, and it demands this Node's attestation inside that same
+        // window. An unexplained cats-named unit makes the systemd proof
+        // unavailable, so omitting the watchdog made every deployment defeat the
+        // readiness it was waiting for.
+        let expected_names: &[&str] = match agent_unit {
+            "cats-noded.service" => &["cats-noded.service", "cats-controld.service"],
+            "cats-worker.service" => &[
+                "cats-worker.service",
+                "cats-postgres-url.service",
+                "cats-worker-deployment-watchdog.service",
+            ],
             _ => return None,
         };
         let expected_units = expected_names
-            .into_iter()
+            .iter()
+            .copied()
             .map(Id::new)
             .collect::<Option<BTreeSet<_>>>()?;
         Some(Self {
@@ -13090,6 +13100,40 @@ mod tests {
         second.process_identity_token =
             RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
         second
+    }
+
+    /// The worker deployment starts its own watchdog and then waits for this
+    /// Node to attest. Every unit it can start while holding the Host lock must
+    /// therefore be explicable to the systemd proof, or the deployment defeats
+    /// the readiness it is waiting for.
+    #[test]
+    fn the_agent_explains_every_unit_its_own_deployment_starts() {
+        let transaction = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("deploy/aws/metal/worker-deployment-transaction.sh"),
+        )
+        .expect("read the worker deployment transaction");
+        let watchdog = transaction
+            .lines()
+            .find_map(|line| line.strip_prefix("CATS_WORKER_DEPLOYMENT_WATCHDOG="))
+            .expect("the transaction names its watchdog unit")
+            .trim()
+            .to_owned();
+
+        let identity = StaticServiceIdentity::from_process_facts(
+            std::process::id(),
+            std::path::PathBuf::from("/opt/cats/bin/cats-noded"),
+            b"0::/system.slice/cats-worker.service\n",
+        )
+        .expect("a worker-unit Agent has a static service identity");
+        let expected = Id::new(watchdog.clone()).expect("watchdog unit is one safe Id");
+        assert!(
+            identity.expected_units.contains(&expected),
+            "the Agent cannot explain {watchdog}, which its own deployment starts \
+             while waiting for this Node to attest"
+        );
     }
 
     /// A Node with no Cats runs exactly one cats-named systemd unit: the Agent's
