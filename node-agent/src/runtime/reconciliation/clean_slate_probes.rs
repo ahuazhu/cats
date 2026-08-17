@@ -5689,11 +5689,21 @@ impl PlatformRootProcessInventoryBridge {
         context: &RuntimeInventoryScanContext,
     ) -> anyhow::Result<Option<NodeGlobalInventoryResidue>> {
         let mut budget = self.limits.os_entries;
+        // The Agent's own service unit is systemd residue it can always explain,
+        // and on a Node with no Cats it is the only cats-named unit present.
+        // Without the static identity in the allowance the walk cannot classify
+        // it, so the scan reports an unprovable inventory forever: a fresh
+        // cordoned Node -- the state this release installs -- could never attest.
+        // The sibling managed-process scan already unions the same identity.
+        let mut allowed_units_with_static = allowed_units.clone();
+        if let Some(identity) = self.static_service_identity.as_ref() {
+            allowed_units_with_static.extend(identity.expected_units.iter().cloned());
+        }
         let Some(systemd) = scan_systemd_residue_allowing(
             &self.systemd_root,
             &mut budget,
             self.limits.recursion_depth,
-            allowed_units,
+            &allowed_units_with_static,
             context,
         )?
         else {
@@ -6570,7 +6580,21 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
                 context,
             ) {
             Ok(Some(residue)) => residue,
-            Ok(None) | Err(_) => {
+            // A discarded error here becomes an eternal silent retry: the Node
+            // reports an incomplete inventory forever with no stated cause.
+            Ok(None) => {
+                tracing::warn!(
+                    systemd_root = %self.systemd_root.display(),
+                    "node-global inventory residue could not be proven"
+                );
+                return Ok(unavailable(exact_running_negative_cats));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    systemd_root = %self.systemd_root.display(),
+                    "node-global inventory residue scan failed"
+                );
                 return Ok(unavailable(exact_running_negative_cats));
             }
         };
@@ -13066,6 +13090,70 @@ mod tests {
         second.process_identity_token =
             RandomId128::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
         second
+    }
+
+    /// A Node with no Cats runs exactly one cats-named systemd unit: the Agent's
+    /// own service. The bridge's node-global residue walk must be able to
+    /// classify it, or the scan is unprovable and the Node can never attest --
+    /// which is the state this release installs every Node in.
+    #[test]
+    fn node_global_residue_classifies_the_agents_own_service_unit() {
+        let environment = TestEnvironment::new();
+        let agent_unit = Id::new("cats-worker.service").unwrap();
+        let unit_cgroup = environment.systemd_root.join(agent_unit.as_str());
+        std::fs::create_dir(&unit_cgroup).unwrap();
+        // A live member is what makes the unit unexplainable: production's own
+        // Agent process sits in this cgroup.
+        std::fs::write(
+            unit_cgroup.join("cgroup.procs"),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+
+        let mut bridge = root_process_bridge(&environment, []);
+        let context = context();
+        let no_units = BTreeSet::new();
+        let no_pids = BTreeSet::new();
+        let no_sockets = BTreeSet::new();
+        let no_vmms = BTreeMap::new();
+
+        // Calibration: with no static identity the Agent's own unit is
+        // unclassifiable and the walk gives up.
+        assert!(
+            bridge
+                .scan_node_global_inventory_residue(
+                    &no_units,
+                    &no_pids,
+                    &no_sockets,
+                    &no_vmms,
+                    &context,
+                )
+                .unwrap()
+                .is_none(),
+            "an unexplained cats-named unit must remain unprovable"
+        );
+
+        bridge.static_service_identity = Some(StaticServiceIdentity {
+            process_id: std::process::id(),
+            executable: environment.blockd_binary.clone(),
+            control_group: format!("/system.slice/{agent_unit}"),
+            expected_units: BTreeSet::from([agent_unit]),
+        });
+        let residue = bridge
+            .scan_node_global_inventory_residue(
+                &no_units,
+                &no_pids,
+                &no_sockets,
+                &no_vmms,
+                &context,
+            )
+            .unwrap()
+            .expect("the Agent's own service unit is explained by its static identity");
+        assert!(
+            residue.0.is_empty(),
+            "the Agent's own service unit is not residue: {:?}",
+            residue.0
+        );
     }
 
     fn root_process_bridge(

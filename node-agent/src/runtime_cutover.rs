@@ -892,6 +892,10 @@ async fn run_signed_spine(
         // a later blocking boundary.
         let deadlines = deadline_policy.deadlines_from(Instant::now())?;
         let step = runner.run_once_with_deadlines(deadlines).await?;
+        // A Node that cannot attest is otherwise completely silent: readiness
+        // stays closed, the loop retries, and no operator can tell which step
+        // refuses. Name the step every iteration.
+        log_spine_step(&step);
         if matches!(&step, RuntimeSpineRunStep::ObservationAccepted { .. }) {
             let observation = runner
                 .accepted_full_observation()
@@ -947,6 +951,57 @@ enum RuntimeLoopAction {
     Continue,
     RetryAfterDelay,
     WaitForIdentityRepair,
+}
+
+/// Names the step the spine just completed. Steps that keep readiness closed are
+/// the ones an operator needs to see, so they are not debug-only.
+fn log_spine_step(step: &RuntimeSpineRunStep) {
+    match step {
+        RuntimeSpineRunStep::ObservationAccepted {
+            service_ready,
+            inventory_attested,
+        } => tracing::info!(
+            service_ready,
+            inventory_attested,
+            "signed Runtime observation accepted"
+        ),
+        RuntimeSpineRunStep::DesiredAccepted => {
+            tracing::info!("signed Runtime Desired accepted");
+        }
+        RuntimeSpineRunStep::PartialObservationAccepted { degraded_runtimes } => {
+            tracing::info!(degraded_runtimes, "partial Runtime observation accepted");
+        }
+        RuntimeSpineRunStep::ScanUnavailable(error) => {
+            tracing::warn!(%error, "physical inventory scan is unavailable");
+        }
+        RuntimeSpineRunStep::ScanIncomplete {
+            unavailable_sources,
+        } => {
+            tracing::warn!(
+                ?unavailable_sources,
+                "physical inventory scan is incomplete"
+            );
+        }
+        RuntimeSpineRunStep::ScanDeadlineExceeded => {
+            tracing::warn!("physical inventory scan exceeded its deadline");
+        }
+        RuntimeSpineRunStep::PreScanAdmissionUnavailable(error) => {
+            tracing::warn!(%error, "pre-scan admission is unavailable");
+        }
+        RuntimeSpineRunStep::PreScanAdmissionDeadlineExceeded => {
+            tracing::warn!("pre-scan admission exceeded its deadline");
+        }
+        RuntimeSpineRunStep::PreScanRecoveryUnavailable(error) => {
+            tracing::warn!(%error, "pre-scan recovery is unavailable");
+        }
+        RuntimeSpineRunStep::PreScanRecoveryDeadlineExceeded => {
+            tracing::warn!("pre-scan recovery exceeded its deadline");
+        }
+        RuntimeSpineRunStep::RetryExact(retry) => {
+            tracing::warn!(?retry, "signed Runtime step must retry the exact request");
+        }
+        other => tracing::info!(step = ?other, "signed Runtime step"),
+    }
 }
 
 fn apply_readiness_policy(
