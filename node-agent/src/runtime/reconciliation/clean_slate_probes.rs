@@ -5717,6 +5717,10 @@ impl PlatformRootProcessInventoryBridge {
             context,
         )?
         else {
+            tracing::warn!(
+                proof = "systemd units",
+                "node-global inventory proof is unavailable"
+            );
             return Ok(None);
         };
         if let Some(root) = &self.metering_root {
@@ -5734,15 +5738,27 @@ impl PlatformRootProcessInventoryBridge {
                 context,
             )? != ProbeFact::Empty
             {
+                tracing::warn!(
+                    proof = "dedicated metering root",
+                    "node-global inventory proof is unavailable"
+                );
                 return Ok(None);
             }
         }
         let Some(processes) =
             scan_process_residue_allowing(&self.process_paths, allowed_pids, context)?
         else {
+            tracing::warn!(
+                proof = "managed processes",
+                "node-global inventory proof is unavailable"
+            );
             return Ok(None);
         };
         let Some(root) = clone_state_root(&self.state_directory)? else {
+            tracing::warn!(
+                proof = "state root",
+                "node-global inventory proof is unavailable"
+            );
             return Ok(None);
         };
         let Some(mut control_sockets) = scan_socket_state_namespace_residue_allowing(
@@ -5755,6 +5771,10 @@ impl PlatformRootProcessInventoryBridge {
             allowed_sockets,
         )?
         else {
+            tracing::warn!(
+                proof = "control-socket namespace",
+                "node-global inventory proof is unavailable"
+            );
             return Ok(None);
         };
         let Some(mut legacy_sockets) = scan_socket_path_residue_allowing(
@@ -5765,6 +5785,10 @@ impl PlatformRootProcessInventoryBridge {
             allowed_sockets,
         )?
         else {
+            tracing::warn!(
+                proof = "legacy socket root",
+                "node-global inventory proof is unavailable"
+            );
             return Ok(None);
         };
         let Some(mut data_sockets) = scan_recursive_control_socket_residue_allowing(
@@ -5774,6 +5798,10 @@ impl PlatformRootProcessInventoryBridge {
             context,
         )?
         else {
+            tracing::warn!(
+                proof = "recursive control sockets",
+                "node-global inventory proof is unavailable"
+            );
             return Ok(None);
         };
         control_sockets.append(&mut legacy_sockets);
@@ -5791,12 +5819,28 @@ impl PlatformRootProcessInventoryBridge {
                 if scan_managed_vmm_socket_root(root, receipts, &checkpoints, context)?
                     != ManagedVmmSocketRootScan::Accounted
                 {
+                    tracing::warn!(
+                        proof = "managed VMM socket root",
+                        "node-global inventory proof is unavailable"
+                    );
                     return Ok(None);
                 }
             }
-            (None, None) if !self.process_paths.supported => return Ok(None),
+            (None, None) if !self.process_paths.supported => {
+                tracing::warn!(
+                    proof = "unsupported process paths",
+                    "node-global inventory proof is unavailable"
+                );
+                return Ok(None);
+            }
             (None, None) => {}
-            _ => return Ok(None),
+            _ => {
+                tracing::warn!(
+                    proof = "managed blockd composition",
+                    "node-global inventory proof is unavailable"
+                );
+                return Ok(None);
+            }
         }
         #[cfg(target_os = "linux")]
         match (
@@ -5813,12 +5857,22 @@ impl PlatformRootProcessInventoryBridge {
                     context,
                 )? != ManagedVmmLaunchRootScan::Accounted
                 {
+                    tracing::warn!(
+                        proof = "managed VMM launch root",
+                        "node-global inventory proof is unavailable"
+                    );
                     return Ok(None);
                 }
             }
             (None, None, None) if !self.process_paths.supported => return Ok(None),
             (None, None, None) => {}
-            _ => return Ok(None),
+            _ => {
+                tracing::warn!(
+                    proof = "managed VMM launch composition",
+                    "node-global inventory proof is unavailable"
+                );
+                return Ok(None);
+            }
         }
         context.check_active()?;
         Ok(Some((systemd, processes, control_sockets)))
@@ -6401,7 +6455,11 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
                 Some((Arc::clone(root), Arc::clone(intents), expected, before))
             }
             (None, None) if !self.process_paths.supported => {
-                return Ok(unavailable(BTreeSet::new()))
+                tracing::warn!(
+                    proof = "linux process sources unsupported",
+                    "root-process bridge proof is unavailable"
+                );
+                return Ok(unavailable(BTreeSet::new()));
             }
             #[cfg(test)]
             (None, None) => None,
@@ -6417,16 +6475,28 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
         let Some(root_first) =
             inspect_root_process_set(self.port.as_ref(), &root_expected, context)?
         else {
+            tracing::warn!(
+                proof = "root-provision process set",
+                "root-process bridge proof is unavailable"
+            );
             return Ok(unavailable(BTreeSet::new()));
         };
         let Some(serving_first) =
             inspect_serving_process_set(self.serving_port.as_ref(), &serving_expected, context)?
         else {
+            tracing::warn!(
+                proof = "serving blockd process set",
+                "root-process bridge proof is unavailable"
+            );
             return Ok(unavailable(BTreeSet::new()));
         };
         let Some(vmm_first) =
             inspect_vmm_process_set(self.vmm_port.as_ref(), &vmm_expected, context)?
         else {
+            tracing::warn!(
+                proof = "vmm process set",
+                "root-process bridge proof is unavailable"
+            );
             return Ok(unavailable(BTreeSet::new()));
         };
         let exact_running_negative_cats = vmm_first
@@ -6570,6 +6640,10 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
             if !platform_managed_blockd_listeners_absent(stale_paths.iter(), context)? {
+                tracing::warn!(
+                    proof = "admitted process inspection",
+                    "root-process bridge proof is unavailable"
+                );
                 return Ok(unavailable(exact_running_negative_cats));
             }
             managed_socket_residue.extend(stale_paths.into_iter().map(|socket_path| {
@@ -6597,6 +6671,10 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
                     systemd_root = %self.systemd_root.display(),
                     "node-global inventory residue could not be proven"
                 );
+                tracing::warn!(
+                    proof = "managed blockd listener absence",
+                    "root-process bridge proof is unavailable"
+                );
                 return Ok(unavailable(exact_running_negative_cats));
             }
             Err(error) => {
@@ -6604,6 +6682,10 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
                     %error,
                     systemd_root = %self.systemd_root.display(),
                     "node-global inventory residue scan failed"
+                );
+                tracing::warn!(
+                    proof = "node-global residue",
+                    "root-process bridge proof is unavailable"
                 );
                 return Ok(unavailable(exact_running_negative_cats));
             }
@@ -6613,6 +6695,10 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
         if let Some((root, intents, expected, before)) = managed_blockd.as_ref() {
             let after = root.capture_closed_whole_root(intents, expected)?;
             if !before.same_coordinates(&after) {
+                tracing::warn!(
+                    proof = "managed blockd root coordinates",
+                    "root-process bridge proof is unavailable"
+                );
                 return Ok(unavailable(exact_running_negative_cats));
             }
         }
@@ -6621,9 +6707,17 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
             match inspect_root_process_set(self.port.as_ref(), &root_expected, context) {
                 Ok(Some(inspected)) => inspected,
                 Ok(None) => {
+                    tracing::warn!(
+                        proof = "managed vmm socket root",
+                        "root-process bridge proof is unavailable"
+                    );
                     return Ok(unavailable(exact_running_negative_cats));
                 }
                 Err(_problem) if context.check_active().is_err() => {
+                    tracing::warn!(
+                        proof = "managed vmm launch root",
+                        "root-process bridge proof is unavailable"
+                    );
                     return Ok(unavailable(exact_running_negative_cats));
                 }
                 Err(problem) => return Err(problem),
@@ -6635,9 +6729,17 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
         ) {
             Ok(Some(inspected)) => inspected,
             Ok(None) => {
+                tracing::warn!(
+                    proof = "late blockd coordinates",
+                    "root-process bridge proof is unavailable"
+                );
                 return Ok(unavailable(exact_running_negative_cats));
             }
             Err(_problem) if context.check_active().is_err() => {
+                tracing::warn!(
+                    proof = "final composition",
+                    "root-process bridge proof is unavailable"
+                );
                 return Ok(unavailable(exact_running_negative_cats));
             }
             Err(problem) => return Err(problem),
@@ -6646,9 +6748,17 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
             match inspect_vmm_process_set(self.vmm_port.as_ref(), &vmm_expected, context) {
                 Ok(Some(inspected)) => inspected,
                 Ok(None) => {
+                    tracing::warn!(
+                        proof = "bridge branch 12",
+                        "root-process bridge proof is unavailable"
+                    );
                     return Ok(unavailable(exact_running_negative_cats));
                 }
                 Err(_problem) if context.check_active().is_err() => {
+                    tracing::warn!(
+                        proof = "bridge branch 13",
+                        "root-process bridge proof is unavailable"
+                    );
                     return Ok(unavailable(exact_running_negative_cats));
                 }
                 Err(problem) => return Err(problem),
@@ -6663,6 +6773,10 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
                     .is_some_and(|second| first.stable_identity_eq(second))
             });
         if root_first != root_second || !serving_stable || vmm_first != vmm_second {
+            tracing::warn!(
+                proof = "bridge branch 14",
+                "root-process bridge proof is unavailable"
+            );
             return Ok(unavailable(exact_running_negative_cats));
         }
         let mut absent_serving_owners = BTreeSet::new();
@@ -8087,6 +8201,10 @@ impl InventoryAbsenceProbe for BlockFrontendProbe {
         context: &RuntimeInventoryScanContext,
     ) -> anyhow::Result<InventoryAbsence> {
         let Some(root) = clone_state_root(&self.state_directory)? else {
+            tracing::warn!(
+                proof = "block-frontend state root",
+                "physical proof is unavailable"
+            );
             return Ok(InventoryAbsence::Unavailable);
         };
         let nbd = if self.supported {
@@ -10182,6 +10300,10 @@ fn scan_nbd_residue(
     context: &RuntimeInventoryScanContext,
 ) -> anyhow::Result<Option<Vec<NodeResidue>>> {
     let Some(entries) = required_directory_entries(root)? else {
+        tracing::warn!(
+            proof = "nbd residue 1",
+            "block-frontend proof is unavailable"
+        );
         return Ok(None);
     };
     let mut count = 0_usize;
@@ -10195,7 +10317,13 @@ fn scan_nbd_residue(
         };
         count = match count.checked_add(1) {
             Some(count) if count <= cap => count,
-            _ => return Ok(None),
+            _ => {
+                tracing::warn!(
+                    proof = "nbd residue 2",
+                    "block-frontend proof is unavailable"
+                );
+                return Ok(None);
+            }
         };
         let name = entry.file_name();
         if !is_nbd_name(&name) {
@@ -10206,7 +10334,13 @@ fn scan_nbd_residue(
             .and_then(|value| value.parse::<u32>().ok())
         {
             Some(index) => index,
-            None => return Ok(None),
+            None => {
+                tracing::warn!(
+                    proof = "nbd residue 3",
+                    "block-frontend proof is unavailable"
+                );
+                return Ok(None);
+            }
         };
         if managed_device_count.is_some_and(|count| index < count) {
             continue;
@@ -10216,7 +10350,13 @@ fn scan_nbd_residue(
             read_kernel_u64(&entry.path().join("size"), context),
         ) {
             (Ok(pid), Ok(size)) => (pid, size),
-            _ => return Ok(None),
+            _ => {
+                tracing::warn!(
+                    proof = "nbd residue 4",
+                    "block-frontend proof is unavailable"
+                );
+                return Ok(None);
+            }
         };
         context.check_active()?;
         let second = match (
@@ -10224,19 +10364,39 @@ fn scan_nbd_residue(
             read_kernel_u64(&entry.path().join("size"), context),
         ) {
             (Ok(pid), Ok(size)) => (pid, size),
-            _ => return Ok(None),
+            _ => {
+                tracing::warn!(
+                    proof = "nbd residue 5",
+                    "block-frontend proof is unavailable"
+                );
+                return Ok(None);
+            }
         };
         if first != second {
+            tracing::warn!(
+                proof = "nbd residue 6",
+                "block-frontend proof is unavailable"
+            );
             return Ok(None);
         }
         let active = match first {
             (_, KernelInteger::Value(size)) if size > 0 => true,
             (KernelInteger::Value(pid), KernelInteger::Value(0)) if pid > 0 => true,
             (KernelInteger::Missing | KernelInteger::Value(0), KernelInteger::Value(0)) => false,
-            _ => return Ok(None),
+            _ => {
+                tracing::warn!(
+                    proof = "nbd residue 7",
+                    "block-frontend proof is unavailable"
+                );
+                return Ok(None);
+            }
         };
         if active {
             let Some(name) = name.to_str() else {
+                tracing::warn!(
+                    proof = "nbd residue 8",
+                    "block-frontend proof is unavailable"
+                );
                 return Ok(None);
             };
             residue.push(NodeResidue::KernelNbd {

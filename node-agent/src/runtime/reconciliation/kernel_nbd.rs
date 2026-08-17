@@ -1486,6 +1486,10 @@ impl KernelNbdInventoryPort {
                 RUNTIME_CHECKPOINT_NAMESPACE_ENTRY_LIMIT,
             )?
             else {
+                tracing::warn!(
+                    proof = "kernel-NBD pool 1",
+                    "kernel-NBD pool proof is unavailable"
+                );
                 return Ok(KernelNbdPoolScanOutcome::Unavailable);
             };
             permit.assert_current_scan_paths(&namespace)?;
@@ -1517,6 +1521,10 @@ impl KernelNbdInventoryPort {
                     match slot {
                         KernelNbdSlotState::Free => {}
                         KernelNbdSlotState::Unavailable => {
+                            tracing::warn!(
+                                proof = "kernel-NBD pool 2",
+                                "kernel-NBD pool proof is unavailable"
+                            );
                             return Ok(KernelNbdPoolScanOutcome::Unavailable);
                         }
                         KernelNbdSlotState::Serving(_) | KernelNbdSlotState::Leaked { .. } => {
