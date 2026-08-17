@@ -1350,6 +1350,11 @@ pub enum RuntimeSpineRunStep {
         cat_id: Id,
     },
     EffectsApplied,
+    /// The accepted Desired required no per-Cat effect at all. Nothing physical
+    /// happened, so this cannot invalidate a current inventory attestation --
+    /// reporting it as an applied batch made an empty Node withdraw its own
+    /// attestation on every loop and never hold one.
+    NoEffectsRequired,
     EffectRetryExact {
         cat_id: Id,
     },
@@ -3498,7 +3503,7 @@ impl RuntimeSpineRunner {
                     self.pending_effects = desired_specs.into();
                     if self.pending_effects.is_empty() {
                         self.finish_effect_batch();
-                        Ok(RuntimeSpineRunStep::EffectsApplied)
+                        Ok(RuntimeSpineRunStep::NoEffectsRequired)
                     } else {
                         self.node_global_effect_gate =
                             Some(Arc::new(NodeGlobalEffectGate::default()));
