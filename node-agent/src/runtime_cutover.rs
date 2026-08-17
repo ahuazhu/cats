@@ -976,6 +976,9 @@ fn log_spine_step(step: &RuntimeSpineRunStep) {
         RuntimeSpineRunStep::DesiredAccepted => {
             tracing::info!("signed Runtime Desired accepted");
         }
+        RuntimeSpineRunStep::NoEffectsRequired => {
+            tracing::debug!("signed Runtime Desired required no effect");
+        }
         RuntimeSpineRunStep::PartialObservationAccepted { degraded_runtimes } => {
             tracing::info!(degraded_runtimes, "partial Runtime observation accepted");
         }
@@ -1040,6 +1043,10 @@ fn apply_readiness_policy(
             // ObservationReplayed and likewise cannot restore readiness.
             Ok(RuntimeLoopAction::Continue)
         }
+        // An empty batch applied nothing, so it preserves the attestation the
+        // last complete observation established, exactly as a retained partial
+        // observation does.
+        RuntimeSpineRunStep::NoEffectsRequired => Ok(RuntimeLoopAction::Continue),
         RuntimeSpineRunStep::ObservationReplayed
         | RuntimeSpineRunStep::PreScanRecovered { .. }
         | RuntimeSpineRunStep::EffectApplied { .. }
@@ -2824,6 +2831,35 @@ mod tests {
         assert!(
             readiness.is_attested(),
             "an empty Node still established its complete-inventory attestation"
+        );
+    }
+
+    /// A Node with no Cats accepts a Desired that requires no effect on every
+    /// loop. Reporting that as an applied batch made it withdraw the attestation
+    /// its own observation had just established, so it oscillated at loop speed
+    /// and never held one long enough for a deployment to read it.
+    #[test]
+    fn an_empty_effect_batch_preserves_the_established_attestation() {
+        let readiness = Readiness::closed();
+        readiness.set(false, true);
+        assert_eq!(
+            apply_readiness_policy(RuntimeSpineRunStep::NoEffectsRequired, &readiness).unwrap(),
+            RuntimeLoopAction::Continue
+        );
+        assert!(
+            readiness.is_attested(),
+            "an empty batch applied nothing and cannot withdraw the attestation"
+        );
+
+        // A batch that did apply effects still withdraws it.
+        readiness.set(false, true);
+        assert_eq!(
+            apply_readiness_policy(RuntimeSpineRunStep::EffectsApplied, &readiness).unwrap(),
+            RuntimeLoopAction::Continue
+        );
+        assert!(
+            !readiness.is_attested(),
+            "an applied batch must withdraw the attestation until the next complete observation"
         );
     }
 
