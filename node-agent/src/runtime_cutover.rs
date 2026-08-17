@@ -543,6 +543,14 @@ async fn spawn_signed_runtime_cutover_with_overrides(
         .register_until_session(&config.control_plane_url)
         .await
         .context("establish durable Agent session")?;
+    // The signed Runtime's own inventory proof requires the delegated metering
+    // root to exist: an absent root is unprovable, not empty. The V1 server
+    // established it at startup; this path never did, so every Node reported an
+    // incomplete inventory forever and could not attest.
+    if let Some(root) = config.metering_cgroup_root.as_deref() {
+        crate::runtime::initialize_metering_cgroup_root(root)
+            .context("establish the delegated metering cgroup root")?;
+    }
     let usage_pipeline = config
         .metering_cgroup_root
         .as_deref()

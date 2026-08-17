@@ -70,7 +70,7 @@ use blockd_control::BLOCKD_STATUS_TIMEOUT;
 #[cfg(test)]
 use proxy::{build_guest_http_request, parse_guest_http_response};
 
-pub(crate) use metering::initialize_metering_cgroup;
+pub(crate) use metering::{initialize_metering_cgroup, initialize_metering_cgroup_root};
 pub(crate) use proxy::{is_activity_changed, ProxyTarget, RuntimeActivityGuard};
 
 /// Which VMM this node runs.
