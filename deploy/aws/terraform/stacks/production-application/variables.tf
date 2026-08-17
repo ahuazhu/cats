@@ -440,3 +440,15 @@ variable "database_master_user_secret_arn" {
   type        = string
   default     = null
 }
+
+variable "route_rotation_nlb_security_group_id" {
+  description = "Security group for the internal NLB that makes the Route v2 rotation Service reachable from the VPC's bare-metal Node Agents. Null keeps it ClusterIP-only."
+  type        = string
+  default     = null
+}
+
+variable "route_rotation_private_zone_id" {
+  description = "Private hosted zone that resolves the rotation Service's cluster-local name for VPC clients. Null leaves the name cluster-internal."
+  type        = string
+  default     = null
+}

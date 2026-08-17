@@ -769,6 +769,21 @@ resource "kubernetes_service_v1" "control_plane_route_v2_rotation" {
     labels = merge(local.labels, {
       "app.kubernetes.io/name" = "cats-controld"
     })
+    # The Node Agents that must read the ring are bare-metal hosts in the VPC,
+    # not cluster members: a ClusterIP is unreachable to them, and the reviewed
+    # rotation origin is frozen to this Service's cluster-local DNS name. Front
+    # it with an internal NLB so a private-zone record for that exact name
+    # resolves for VPC clients; the Control machine certificate already carries
+    # it as a SAN, so TLS validates unchanged. Cluster clients keep resolving it
+    # through CoreDNS and never leave the cluster.
+    annotations = var.route_rotation_nlb_security_group_id == null ? {} : {
+      "service.beta.kubernetes.io/aws-load-balancer-scheme"                              = "internal"
+      "service.beta.kubernetes.io/aws-load-balancer-nlb-target-type"                     = "ip"
+      "service.beta.kubernetes.io/aws-load-balancer-security-groups"                     = var.route_rotation_nlb_security_group_id
+      "service.beta.kubernetes.io/aws-load-balancer-manage-backend-security-group-rules" = "true"
+      "service.beta.kubernetes.io/aws-load-balancer-subnets"                             = join(",", var.object_write_gateway_private_subnet_ids)
+      "service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol"                = "TCP"
+    }
   }
 
   spec {
@@ -777,6 +792,9 @@ resource "kubernetes_service_v1" "control_plane_route_v2_rotation" {
     selector = {
       "app.kubernetes.io/name" = "cats-controld"
     }
+
+    type                = var.route_rotation_nlb_security_group_id == null ? "ClusterIP" : "LoadBalancer"
+    load_balancer_class = var.route_rotation_nlb_security_group_id == null ? null : "eks.amazonaws.com/nlb"
 
     port {
       name        = "route-rotation"

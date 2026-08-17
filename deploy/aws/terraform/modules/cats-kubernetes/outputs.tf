@@ -40,3 +40,11 @@ output "ingress_load_balancer_hostname" {
     null,
   )
 }
+
+output "route_rotation_load_balancer_hostname" {
+  description = "Internal NLB hostname serving the Route v2 rotation port, or null while the Service stays ClusterIP-only."
+  value = try(
+    kubernetes_service_v1.control_plane_route_v2_rotation.status[0].load_balancer[0].ingress[0].hostname,
+    null,
+  )
+}
