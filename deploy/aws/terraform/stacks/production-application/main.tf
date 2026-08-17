@@ -61,6 +61,7 @@ module "cats_kubernetes" {
   chunkstore_bucket_name                        = var.chunkstore_bucket_name
   chunkstore_region                             = var.aws_region
   chunkstore_prefix                             = var.chunkstore_prefix
+  route_rotation_nlb_security_group_id          = var.route_rotation_nlb_security_group_id
   usage_postgres_url                            = var.usage_postgres_url
   usage_postgres_schema                         = var.usage_postgres_schema
   usage_postgres_workers                        = var.usage_postgres_workers
@@ -137,6 +138,22 @@ resource "aws_route53_record" "public" {
 # Stable private certificate authority name for the TLS pass-through NLB. The
 # Service status supplies only the generated ELB hostname; a private CNAME
 # keeps the serverAuth leaf SAN release-bound and deterministic.
+# The reviewed Route v2 rotation origin is frozen to the rotation Service's
+# cluster-local DNS name, but the Node Agents that read the ring are bare-metal
+# hosts in the VPC, not cluster members. A private zone for that name resolves
+# it to the internal NLB for VPC clients only; cluster clients keep using
+# CoreDNS and never leave the cluster. The Control machine certificate already
+# carries this exact name as a SAN, so TLS validates unchanged.
+resource "aws_route53_record" "route_rotation" {
+  count = var.route_rotation_private_zone_id == null ? 0 : 1
+
+  zone_id = var.route_rotation_private_zone_id
+  name    = "cats-controld-route-rotation.cats.svc.cluster.local"
+  type    = "CNAME"
+  ttl     = 60
+  records = [module.cats_kubernetes.route_rotation_load_balancer_hostname]
+}
+
 resource "aws_route53_record" "object_write_gateway" {
   zone_id = var.object_write_gateway_private_zone_id
   name    = var.object_write_gateway_private_dns_name

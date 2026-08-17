@@ -666,3 +666,17 @@ variable "database_master_user_secret_arn" {
     error_message = "database_master_user_secret_arn must be a Secrets Manager ARN."
   }
 }
+
+variable "route_rotation_nlb_security_group_id" {
+  description = "Security group for the internal NLB that makes the Route v2 rotation Service reachable from the VPC's bare-metal Node Agents. Null keeps the Service ClusterIP-only."
+  type        = string
+  default     = null
+
+  validation {
+    condition = (
+      var.route_rotation_nlb_security_group_id == null ||
+      can(regex("^sg-[0-9a-f]{8,}$", var.route_rotation_nlb_security_group_id))
+    )
+    error_message = "route_rotation_nlb_security_group_id must be null or one sg-<hex> identifier."
+  }
+}
