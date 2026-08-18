@@ -42,12 +42,16 @@ hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
+# The Node mints its own attachment-scoped object-write Ed25519 keypairs. `ring`
+# is already the workspace's only Ed25519 implementation (it backs
+# `cats_api::agent_registration::Ed25519RequestSigner`), so generating the key
+# with anything else would introduce a second signature stack for one keypair.
+ring = { workspace = true }
 
 [dev-dependencies]
 cats-test-support = { workspace = true }
 cats-control-plane = { workspace = true, features = ["test-support"] }
 cats-network = { workspace = true, features = ["test-support"] }
-ring = { workspace = true }
 # The stub control planes in `tests/control_plane_connection.rs` and
 # `tests/heartbeat_independence.rs` need a real `MetadataStore` for
 # `ServerConfig`; this is the workspace's SQLite adapter.

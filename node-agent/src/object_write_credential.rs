@@ -1,0 +1,2537 @@
+//! Node-owned lifecycle of one attachment-scoped object-write credential.
+//!
+//! The Node mints one Ed25519 keypair per `(volume, attachment, attachment
+//! epoch)`, persists it durably before anything can register it, registers only
+//! the public half against Control with its A19 key, and finally publishes the
+//! returned public artifact. Loading that credential later returns a signer and
+//! the public [`ObjectWriteCredentialReference`]; retiring it destroys the
+//! private half.
+//!
+//! Three properties are load bearing:
+//!
+//! * The private key never leaves this module. It is written to one root-only
+//!   `0600` file, read back into an [`Ed25519RequestSigner`] whose `Debug` is
+//!   redacted, and never placed in an error, log or wire field.
+//! * Every identifier that selects a file is *derived* from the exact scope by
+//!   the frozen contract helpers. A tampered sidecar can therefore never steer
+//!   a read or an unlink at another path.
+//! * Each step is idempotent and its predecessor is durable before it starts,
+//!   so a crash between any two steps converges on the next attempt. The
+//!   credential ID is scope derived and a private key is never regenerated
+//!   while one already exists, so a retry re-registers the *same* public key
+//!   rather than minting a second live credential for the same epoch.
+//!
+//! Deliberately not wired into the attachment lifecycle yet: this module owns
+//! the credential, not the decision to create or retire one.
+
+// Scoped to this module for exactly as long as the attachment lifecycle has not
+// called into it. Every item below is exercised by this module's tests; drop
+// this attribute in the change that makes the reconciler establish, load and
+// retire these credentials, so an item that is genuinely unreachable then still
+// gets reported.
+#![allow(dead_code)]
+
+use std::ffi::{CStr, CString};
+use std::fs::{DirBuilder, File, OpenOptions};
+use std::io::{self, Read as _, Write as _};
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::os::unix::fs::{
+    DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt,
+};
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::Engine as _;
+use cats_api::agent_registration::{
+    Ed25519RequestSigner, NODE_CREDENTIAL_ID_HEADER, NODE_PUBLIC_KEY_SPKI_HEADER,
+    NODE_SIGNATURE_HEADER,
+};
+use cats_api::object_write_gateway::{
+    decode_object_write_credential_registered_artifact,
+    decode_object_write_credential_registration,
+    decode_object_write_credential_registration_receipt,
+    encode_object_write_credential_registered_artifact, object_write_credential_id,
+    object_write_prepared_registration_file_name, object_write_private_artifact_id,
+    object_write_private_directory_fsync_receipt_id, object_write_private_file_fsync_receipt_id,
+    object_write_private_key_file_name, object_write_registered_artifact_file_name,
+    sign_object_write_credential_registration, ObjectWriteCredentialReference,
+    ObjectWriteCredentialRegisteredArtifact, ObjectWriteCredentialRegistration,
+    ObjectWriteCredentialRegistrationProof, ObjectWriteCredentialRegistrationReceipt,
+    OBJECT_WRITE_CREDENTIAL_DIRECTORY_BASENAME, OBJECT_WRITE_CREDENTIAL_ID_HEADER,
+    OBJECT_WRITE_CREDENTIAL_REGISTRATION_CONTENT_TYPE, OBJECT_WRITE_CREDENTIAL_REGISTRATION_PATH,
+    OBJECT_WRITE_GATEWAY_METHOD, OBJECT_WRITE_PUBLIC_KEY_SPKI_HEADER,
+    OBJECT_WRITE_REGISTERED_ARTIFACT_MAX_BYTES, OBJECT_WRITE_SIGNATURE_HEADER,
+};
+use cats_api::runtime_reconciliation::{
+    Base64UrlNoPad, ContractVersion, FenceEpoch, Id, SessionBinding,
+};
+use ring::rand::SystemRandom;
+use ring::signature::Ed25519KeyPair;
+use thiserror::Error;
+
+/// Control caps one registration request at 16 KiB; the canonical body is far
+/// smaller, so a larger prepared sidecar is corruption rather than growth.
+const PREPARED_REGISTRATION_MAX_BYTES: usize = 16 * 1024;
+/// A PKCS#8 v2 Ed25519 PEM is ~120 bytes. Anything near this bound is not a
+/// key this module wrote.
+const PRIVATE_KEY_MAX_BYTES: usize = 4 * 1024;
+/// Only the process that owns the Node state directory may hold this material.
+const PRIVATE_FILE_MODE: u32 = 0o600;
+const CREDENTIAL_DIRECTORY_MODE: u32 = 0o700;
+/// The gateway contract fixes one method for both of its routes; the registrar
+/// below hard-codes `post`, so a contract change must break the build here.
+const _: () = assert!(matches!(OBJECT_WRITE_GATEWAY_METHOD.as_bytes(), b"POST"));
+
+/// The exact attachment epoch one credential belongs to.
+///
+/// `session` is part of the credential identity: Control accepts a registration
+/// only while that Agent session is current, and a new session therefore mints
+/// a different credential rather than reusing an inherited key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObjectWriteCredentialScope {
+    pub(crate) session: SessionBinding,
+    pub(crate) writer_authority_id: Id,
+    pub(crate) volume_id: Id,
+    pub(crate) attachment_id: Id,
+    pub(crate) attachment_epoch: FenceEpoch,
+}
+
+/// A credential whose private half is present locally and whose public half
+/// Control has registered.
+///
+/// This is the value the object-write data path consumes: it can sign, and it
+/// carries the only credential material a descriptor may quote.
+#[derive(Debug, Clone)]
+pub(crate) struct LoadedObjectWriteCredential {
+    signer: Ed25519RequestSigner,
+    artifact: ObjectWriteCredentialRegisteredArtifact,
+}
+
+impl LoadedObjectWriteCredential {
+    /// Signs object-write requests with the attachment-scoped private key.
+    pub(crate) fn signer(&self) -> &Ed25519RequestSigner {
+        &self.signer
+    }
+
+    /// The only credential material allowed in a descriptor or checkpoint.
+    pub(crate) fn credential(&self) -> &ObjectWriteCredentialReference {
+        &self.artifact.registration.credential
+    }
+
+    /// The registered public artifact, including Control's receipt.
+    pub(crate) fn registered_artifact(&self) -> &ObjectWriteCredentialRegisteredArtifact {
+        &self.artifact
+    }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ObjectWriteCredentialError {
+    #[error("{operation} {path}: {source}")]
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("unsafe object-write credential entry at {path}: {reason}")]
+    UnsafeEntry { path: PathBuf, reason: &'static str },
+    #[error("another object-write credential writer already owns {path}")]
+    WriterAlreadyActive { path: PathBuf },
+    #[error("object-write credential state at {path} is corrupt: {reason}")]
+    Corrupt { path: PathBuf, reason: &'static str },
+    #[error("no registered object-write credential for this attachment epoch")]
+    NotRegistered,
+    #[error("object-write credential registration was rejected: {0}")]
+    Rejected(String),
+    #[error("object-write credential registration outcome is unknown: {0}")]
+    RegistrationAmbiguous(String),
+    #[error("generate object-write attachment key")]
+    KeyGeneration,
+    #[cfg(test)]
+    #[error("injected object-write credential crash")]
+    InjectedCrash,
+}
+
+/// Why one registration attempt did not return a receipt.
+///
+/// `Timeout` and `Connection` are ambiguous: Control may already hold the
+/// credential. Callers must retry the byte-identical body rather than mint a
+/// second key, which is why this module never discards local state for them.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub(crate) enum ObjectWriteCredentialRegistrationFailure {
+    #[error("object-write credential registration timed out")]
+    Timeout,
+    #[error("object-write credential registration transport failed")]
+    Connection,
+    #[error("Control closed object-write credential registration with status {status}")]
+    Closed { status: u16 },
+    #[error("Control returned a malformed object-write credential receipt")]
+    MalformedResponse,
+}
+
+impl ObjectWriteCredentialRegistrationFailure {
+    /// A closed status is a decision; anything else leaves the postcondition
+    /// undiscovered and must be retried rather than rolled back.
+    fn is_ambiguous(&self) -> bool {
+        match self {
+            Self::Timeout | Self::Connection | Self::MalformedResponse => true,
+            Self::Closed { .. } => false,
+        }
+    }
+}
+
+/// The single Control call this module performs.
+///
+/// A trait keeps the credential state machine testable at its crash points
+/// without a Control Plane, while production uses the A19-signed HTTP client
+/// below. Both implementations are real; neither is a stub for the other.
+pub(crate) trait ObjectWriteCredentialRegistrar {
+    fn register(
+        &self,
+        proof: &ObjectWriteCredentialRegistrationProof,
+        deadline: Instant,
+    ) -> Result<ObjectWriteCredentialRegistrationReceipt, ObjectWriteCredentialRegistrationFailure>;
+}
+
+/// Loads the already-registered credential for one attachment epoch.
+///
+/// This is the seam the object-write data path consumes. It takes a shared
+/// directory lock, so it does not contend with another reader and cannot
+/// observe a half-published sidecar; a concurrent mutating operation on the same
+/// Node yields [`ObjectWriteCredentialError::WriterAlreadyActive`], which the
+/// caller retries. It returns [`ObjectWriteCredentialError::NotRegistered`] when
+/// the attachment has no credential, when the credential has been retired, and
+/// when only a pre-registration sidecar survived a crash.
+pub(crate) fn load(
+    state_directory: &Path,
+    volume_id: &Id,
+    attachment_id: &Id,
+    attachment_epoch: FenceEpoch,
+) -> Result<LoadedObjectWriteCredential, ObjectWriteCredentialError> {
+    ObjectWriteCredentialStore::open_shared(state_directory)?.load(
+        volume_id,
+        attachment_id,
+        attachment_epoch,
+    )
+}
+
+/// The `object-write-credentials` namespace under one Node state directory,
+/// held with a whole-directory `flock` for the operation's duration.
+///
+/// The lock is taken on the directory descriptor itself rather than a sidecar
+/// lock file so the namespace contains only the three basenames the frozen
+/// contract declares. Credential operations happen once per attachment epoch,
+/// so serializing the namespace costs nothing and makes "one live credential
+/// per attachment epoch" independent of how many workers race.
+pub(crate) struct ObjectWriteCredentialStore {
+    directory: File,
+    directory_path: PathBuf,
+    #[cfg(test)]
+    faults: std::sync::Mutex<TestFaults>,
+}
+
+impl std::fmt::Debug for ObjectWriteCredentialStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ObjectWriteCredentialStore")
+            .field("directory_path", &self.directory_path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ObjectWriteCredentialStore {
+    fn drop(&mut self) {
+        loop {
+            // SAFETY: `self.directory` owns a live descriptor for the whole
+            // call and `flock` retains neither it nor any Rust memory.
+            let result = unsafe { libc::flock(self.directory.as_raw_fd(), libc::LOCK_UN) };
+            if result == 0 {
+                return;
+            }
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return;
+            }
+        }
+    }
+}
+
+impl ObjectWriteCredentialStore {
+    /// Opens the namespace for a mutating operation, creating it `0700` when
+    /// absent, and excludes every other writer on this Host.
+    pub(crate) fn open(state_directory: &Path) -> Result<Self, ObjectWriteCredentialError> {
+        Self::open_locked(state_directory, libc::LOCK_EX)
+    }
+
+    /// Opens the namespace for reading only.
+    fn open_shared(state_directory: &Path) -> Result<Self, ObjectWriteCredentialError> {
+        Self::open_locked(state_directory, libc::LOCK_SH)
+    }
+
+    fn open_locked(
+        state_directory: &Path,
+        lock_mode: i32,
+    ) -> Result<Self, ObjectWriteCredentialError> {
+        let directory_path = state_directory.join(OBJECT_WRITE_CREDENTIAL_DIRECTORY_BASENAME);
+        let mut builder = DirBuilder::new();
+        builder.recursive(true).mode(CREDENTIAL_DIRECTORY_MODE);
+        builder.create(&directory_path).map_err(|source| {
+            io_error(
+                "create object-write credential directory",
+                &directory_path,
+                source,
+            )
+        })?;
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        );
+        let directory = options.open(&directory_path).map_err(|source| {
+            map_open_error(
+                "open object-write credential directory",
+                &directory_path,
+                source,
+            )
+        })?;
+        let metadata = directory.metadata().map_err(|source| {
+            io_error(
+                "inspect object-write credential directory",
+                &directory_path,
+                source,
+            )
+        })?;
+        if !metadata.is_dir() {
+            return Err(ObjectWriteCredentialError::UnsafeEntry {
+                path: directory_path,
+                reason: "not a directory",
+            });
+        }
+        if metadata.uid() != effective_uid() {
+            return Err(ObjectWriteCredentialError::UnsafeEntry {
+                path: directory_path,
+                reason: "directory is owned by another user",
+            });
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(ObjectWriteCredentialError::UnsafeEntry {
+                path: directory_path,
+                reason: "directory is group or world accessible",
+            });
+        }
+        lock_directory(&directory, lock_mode, &directory_path)?;
+        Ok(Self {
+            directory,
+            directory_path,
+            #[cfg(test)]
+            faults: std::sync::Mutex::new(TestFaults::default()),
+        })
+    }
+
+    /// Converges one attachment epoch on exactly one registered credential.
+    ///
+    /// Ordered so each step's predecessor is already durable:
+    ///
+    /// 1. return the credential when its registered artifact already exists;
+    /// 2. destroy a superseded credential left by an earlier scope at this
+    ///    same attachment locator;
+    /// 3. reuse the durable private key when one exists, otherwise generate
+    ///    and durably publish one;
+    /// 4. durably publish the exact canonical registration body;
+    /// 5. register that body with Control, replaying it byte for byte after an
+    ///    ambiguous attempt so Control's idempotent replay returns the original
+    ///    receipt instead of a second credential;
+    /// 6. durably publish the registered artifact.
+    pub(crate) fn establish(
+        &self,
+        scope: &ObjectWriteCredentialScope,
+        node_signer: &Ed25519RequestSigner,
+        registrar: &dyn ObjectWriteCredentialRegistrar,
+        deadline: Instant,
+    ) -> Result<LoadedObjectWriteCredential, ObjectWriteCredentialError> {
+        let names = CredentialNames::derive(
+            &scope.session,
+            &scope.volume_id,
+            &scope.attachment_id,
+            scope.attachment_epoch,
+        )?;
+
+        if let Some(artifact) = self.read_registered_artifact(&names)? {
+            let signer = self.require_private_key(&names, &artifact.registration)?;
+            // `load` needs the session-independent sidecar to find this
+            // credential at all, so a registered artifact whose sidecar was
+            // lost or superseded is republished rather than left unloadable.
+            if self.read_prepared_registration(&names)?.as_ref() != Some(&artifact.registration) {
+                self.publish_prepared_registration(&names, &artifact.registration)?;
+            }
+            return Ok(LoadedObjectWriteCredential { signer, artifact });
+        }
+
+        let prepared = match self.read_prepared_registration(&names)? {
+            Some(prepared) if prepared.credential.credential_id == names.credential_id => {
+                Some(prepared)
+            }
+            // A different scope owned this attachment locator. Its private key
+            // is unusable for this epoch and must not survive as residue.
+            Some(superseded) => {
+                self.destroy_superseded(scope, &names, &superseded)?;
+                None
+            }
+            None => None,
+        };
+
+        let (signer, registration) = match prepared {
+            Some(registration) => {
+                let signer = self.require_private_key(&names, &registration)?;
+                (signer, registration)
+            }
+            None => {
+                let signer = self.establish_private_key(&names)?;
+                self.maybe_crash(EstablishStage::PrivateKeyDurable)?;
+                let registration = build_registration(scope, &names, &signer)?;
+                self.publish_prepared_registration(&names, &registration)?;
+                self.maybe_crash(EstablishStage::PreparedRegistrationDurable)?;
+                (signer, registration)
+            }
+        };
+
+        let proof = sign_object_write_credential_registration(node_signer, &signer, &registration)
+            .map_err(|_| ObjectWriteCredentialError::Corrupt {
+                path: names.prepared_path(&self.directory_path),
+                reason: "prepared registration does not match its private key",
+            })?;
+        let receipt = registrar
+            .register(&proof, deadline)
+            .map_err(|failure| self.classify_registration_failure(failure))?;
+        self.maybe_crash(EstablishStage::ControlRegistered)?;
+
+        // The frozen artifact validation below cross-checks volume, attachment,
+        // epoch and credential but not the writer authority, and that authority
+        // is what admits the writes this credential will sign.
+        if receipt.writer_authority_id != registration.writer_authority_id {
+            return Err(ObjectWriteCredentialError::Rejected(
+                "Control receipt names another writer authority".to_owned(),
+            ));
+        }
+        let artifact = ObjectWriteCredentialRegisteredArtifact {
+            version: ContractVersion::V1,
+            registration,
+            receipt,
+        };
+        // `encode` re-runs the frozen cross-field validation, so a receipt that
+        // rebinds the volume, attachment, epoch or credential cannot become a
+        // durable artifact.
+        let bytes =
+            encode_object_write_credential_registered_artifact(&artifact).map_err(|_| {
+                ObjectWriteCredentialError::Rejected(
+                    "Control receipt does not bind the registered credential".to_owned(),
+                )
+            })?;
+        self.publish(
+            &names.registered_temporary_name,
+            &names.registered_name,
+            &names.registered_path(&self.directory_path),
+            &bytes,
+        )?;
+        Ok(LoadedObjectWriteCredential { signer, artifact })
+    }
+
+    /// Loads the registered credential for one attachment epoch.
+    ///
+    /// The Agent session is recovered from the prepared sidecar, then every
+    /// identifier it claims is re-derived and compared, so only a self
+    /// consistent triple of files can produce a signer.
+    pub(crate) fn load(
+        &self,
+        volume_id: &Id,
+        attachment_id: &Id,
+        attachment_epoch: FenceEpoch,
+    ) -> Result<LoadedObjectWriteCredential, ObjectWriteCredentialError> {
+        let locator = PreparedLocator::derive(volume_id, attachment_id, attachment_epoch)?;
+        let Some(prepared) = self.read_prepared_at(&locator)? else {
+            return Err(ObjectWriteCredentialError::NotRegistered);
+        };
+        if prepared.volume_id != *volume_id
+            || prepared.attachment_id != *attachment_id
+            || prepared.attachment_epoch != attachment_epoch
+        {
+            return Err(ObjectWriteCredentialError::Corrupt {
+                path: locator.path(&self.directory_path),
+                reason: "prepared registration names another attachment",
+            });
+        }
+        let names = CredentialNames::derive(
+            &prepared.session,
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+        )?;
+        if names.credential_id != prepared.credential.credential_id
+            || names.private_artifact_id != prepared.private_artifact_id
+        {
+            return Err(ObjectWriteCredentialError::Corrupt {
+                path: locator.path(&self.directory_path),
+                reason: "prepared registration claims underived identifiers",
+            });
+        }
+        let Some(artifact) = self.read_registered_artifact(&names)? else {
+            return Err(ObjectWriteCredentialError::NotRegistered);
+        };
+        if artifact.registration != prepared {
+            return Err(ObjectWriteCredentialError::Corrupt {
+                path: names.registered_path(&self.directory_path),
+                reason: "registered artifact disagrees with its prepared registration",
+            });
+        }
+        let signer = self.load_private_key(&names, &artifact.registration)?;
+        Ok(LoadedObjectWriteCredential { signer, artifact })
+    }
+
+    /// Retires the credential for one attachment epoch on release or takeover.
+    ///
+    /// The private key is destroyed first, so any interrupted retirement still
+    /// leaves a state in which [`Self::load`] cannot produce a signer. The
+    /// public sidecars follow. Retiring an attachment with no credential, or
+    /// one already retired, succeeds.
+    ///
+    /// A corrupt sidecar makes the credential unidentifiable, so retirement
+    /// reports that rather than unlinking a file it cannot attribute. That
+    /// still denies a signer, because [`Self::load`] rejects the same sidecar.
+    pub(crate) fn retire(
+        &self,
+        volume_id: &Id,
+        attachment_id: &Id,
+        attachment_epoch: FenceEpoch,
+    ) -> Result<(), ObjectWriteCredentialError> {
+        let locator = PreparedLocator::derive(volume_id, attachment_id, attachment_epoch)?;
+        let Some(prepared) = self.read_prepared_at(&locator)? else {
+            return Ok(());
+        };
+        let names = CredentialNames::derive(
+            &prepared.session,
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+        )?;
+        if names.credential_id != prepared.credential.credential_id
+            || names.private_artifact_id != prepared.private_artifact_id
+        {
+            return Err(ObjectWriteCredentialError::Corrupt {
+                path: locator.path(&self.directory_path),
+                reason: "prepared registration claims underived identifiers",
+            });
+        }
+        self.destroy_private_key(&names)?;
+        self.maybe_crash(RetireStage::PrivateKeyDestroyed)?;
+        self.remove(&locator.name, &locator.path(&self.directory_path))?;
+        self.remove(
+            &names.registered_name,
+            &names.registered_path(&self.directory_path),
+        )?;
+        Ok(())
+    }
+
+    /// Removes an earlier Agent session's credential that still owns this
+    /// attachment locator. Same ordering as retirement: private key first.
+    ///
+    /// Only the Agent session may differ. A sidecar that claims another volume,
+    /// attachment or epoch fails closed instead of authorizing this unlink,
+    /// because those identifiers select which credential gets destroyed.
+    fn destroy_superseded(
+        &self,
+        scope: &ObjectWriteCredentialScope,
+        names: &CredentialNames,
+        superseded: &ObjectWriteCredentialRegistration,
+    ) -> Result<(), ObjectWriteCredentialError> {
+        if superseded.volume_id != scope.volume_id
+            || superseded.attachment_id != scope.attachment_id
+            || superseded.attachment_epoch != scope.attachment_epoch
+        {
+            return Err(ObjectWriteCredentialError::Corrupt {
+                path: names.prepared_path(&self.directory_path),
+                reason: "superseded registration names another attachment",
+            });
+        }
+        let superseded_names = CredentialNames::derive(
+            &superseded.session,
+            &superseded.volume_id,
+            &superseded.attachment_id,
+            superseded.attachment_epoch,
+        )?;
+        if superseded_names.credential_id != superseded.credential.credential_id
+            || superseded_names.private_artifact_id != superseded.private_artifact_id
+        {
+            return Err(ObjectWriteCredentialError::Corrupt {
+                path: names.prepared_path(&self.directory_path),
+                reason: "superseded registration claims underived identifiers",
+            });
+        }
+        self.destroy_private_key(&superseded_names)?;
+        self.remove(
+            &names.prepared_name,
+            &names.prepared_path(&self.directory_path),
+        )?;
+        self.remove(
+            &superseded_names.registered_name,
+            &superseded_names.registered_path(&self.directory_path),
+        )?;
+        Ok(())
+    }
+
+    /// Returns the durable private key when one exists, otherwise generates and
+    /// publishes one.
+    ///
+    /// Reusing an existing key is what keeps a crash between the key barrier
+    /// and the prepared-registration barrier from minting a second key for a
+    /// credential ID Control may already know.
+    fn establish_private_key(
+        &self,
+        names: &CredentialNames,
+    ) -> Result<Ed25519RequestSigner, ObjectWriteCredentialError> {
+        let private_key_path = names.private_key_path(&self.directory_path);
+        if let Some(mut pem) = self.read_private_file(
+            &names.private_key_name,
+            &private_key_path,
+            PRIVATE_KEY_MAX_BYTES,
+        )? {
+            let signer = Ed25519RequestSigner::from_pkcs8_v2_pem(names.credential_id.clone(), &pem);
+            pem.fill(0);
+            return signer.map_err(|_| ObjectWriteCredentialError::Corrupt {
+                path: private_key_path,
+                reason: "private key is not a canonical PKCS#8 v2 Ed25519 key",
+            });
+        }
+        let mut pem = generate_pkcs8_v2_pem()?;
+        let result = (|| {
+            let signer = Ed25519RequestSigner::from_pkcs8_v2_pem(names.credential_id.clone(), &pem)
+                .map_err(|_| ObjectWriteCredentialError::KeyGeneration)?;
+            self.publish(
+                &names.private_key_temporary_name,
+                &names.private_key_name,
+                &private_key_path,
+                &pem,
+            )?;
+            Ok(signer)
+        })();
+        pem.fill(0);
+        result
+    }
+
+    /// Same as [`Self::load_private_key`] but for a credential that is already
+    /// durable: an absent key is then unrecoverable corruption for this epoch,
+    /// not simply an unregistered attachment.
+    fn require_private_key(
+        &self,
+        names: &CredentialNames,
+        registration: &ObjectWriteCredentialRegistration,
+    ) -> Result<Ed25519RequestSigner, ObjectWriteCredentialError> {
+        self.load_private_key(names, registration)
+            .map_err(|error| match error {
+                ObjectWriteCredentialError::NotRegistered => ObjectWriteCredentialError::Corrupt {
+                    path: names.private_key_path(&self.directory_path),
+                    reason: "durable registration has no private key",
+                },
+                other => other,
+            })
+    }
+
+    fn load_private_key(
+        &self,
+        names: &CredentialNames,
+        registration: &ObjectWriteCredentialRegistration,
+    ) -> Result<Ed25519RequestSigner, ObjectWriteCredentialError> {
+        let private_key_path = names.private_key_path(&self.directory_path);
+        let Some(mut pem) = self.read_private_file(
+            &names.private_key_name,
+            &private_key_path,
+            PRIVATE_KEY_MAX_BYTES,
+        )?
+        else {
+            return Err(ObjectWriteCredentialError::NotRegistered);
+        };
+        let signer = Ed25519RequestSigner::from_pkcs8_v2_pem(names.credential_id.clone(), &pem);
+        pem.fill(0);
+        let signer = signer.map_err(|_| ObjectWriteCredentialError::Corrupt {
+            path: private_key_path.clone(),
+            reason: "private key is not a canonical PKCS#8 v2 Ed25519 key",
+        })?;
+        if signer.public_key_spki_sha256() != registration.credential.public_key_spki_sha256
+            || URL_SAFE_NO_PAD.encode(signer.public_key_spki_der())
+                != registration.public_key_spki.as_str()
+        {
+            return Err(ObjectWriteCredentialError::Corrupt {
+                path: private_key_path,
+                reason: "private key does not match the registered public key",
+            });
+        }
+        Ok(signer)
+    }
+
+    /// Overwrites and unlinks the private key.
+    ///
+    /// The overwrite is a best-effort scrub: a journaling or copy-on-write
+    /// filesystem may retain the old blocks. The unlink plus directory barrier
+    /// is the property this module actually relies on, because every path to a
+    /// signer goes through [`Self::load_private_key`].
+    fn destroy_private_key(
+        &self,
+        names: &CredentialNames,
+    ) -> Result<(), ObjectWriteCredentialError> {
+        let path = names.private_key_path(&self.directory_path);
+        let mut file = match open_at(
+            &self.directory,
+            &names.private_key_name,
+            libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0,
+        ) {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(map_open_error("open retired private key", &path, source)),
+        };
+        verify_private_file(&file, &path)?;
+        let length = file
+            .metadata()
+            .map_err(|source| io_error("inspect retired private key", &path, source))?
+            .len();
+        let zeroes = vec![0_u8; usize::try_from(length).unwrap_or(PRIVATE_KEY_MAX_BYTES)];
+        file.write_all(&zeroes)
+            .map_err(|source| io_error("scrub retired private key", &path, source))?;
+        file.sync_all()
+            .map_err(|source| io_error("sync retired private key", &path, source))?;
+        drop(file);
+        self.remove(&names.private_key_name, &path)
+    }
+
+    fn read_registered_artifact(
+        &self,
+        names: &CredentialNames,
+    ) -> Result<Option<ObjectWriteCredentialRegisteredArtifact>, ObjectWriteCredentialError> {
+        let path = names.registered_path(&self.directory_path);
+        let Some(bytes) = self.read_private_file(
+            &names.registered_name,
+            &path,
+            OBJECT_WRITE_REGISTERED_ARTIFACT_MAX_BYTES,
+        )?
+        else {
+            return Ok(None);
+        };
+        let artifact =
+            decode_object_write_credential_registered_artifact(&bytes).map_err(|_| {
+                ObjectWriteCredentialError::Corrupt {
+                    path: path.clone(),
+                    reason: "registered artifact is malformed or noncanonical",
+                }
+            })?;
+        if artifact.registration.credential.credential_id != names.credential_id {
+            return Err(ObjectWriteCredentialError::Corrupt {
+                path,
+                reason: "registered artifact names another credential",
+            });
+        }
+        Ok(Some(artifact))
+    }
+
+    fn read_prepared_registration(
+        &self,
+        names: &CredentialNames,
+    ) -> Result<Option<ObjectWriteCredentialRegistration>, ObjectWriteCredentialError> {
+        self.read_prepared(
+            &names.prepared_name,
+            &names.prepared_path(&self.directory_path),
+        )
+    }
+
+    fn read_prepared_at(
+        &self,
+        locator: &PreparedLocator,
+    ) -> Result<Option<ObjectWriteCredentialRegistration>, ObjectWriteCredentialError> {
+        self.read_prepared(&locator.name, &locator.path(&self.directory_path))
+    }
+
+    fn read_prepared(
+        &self,
+        name: &CStr,
+        path: &Path,
+    ) -> Result<Option<ObjectWriteCredentialRegistration>, ObjectWriteCredentialError> {
+        let Some(bytes) = self.read_private_file(name, path, PREPARED_REGISTRATION_MAX_BYTES)?
+        else {
+            return Ok(None);
+        };
+        decode_object_write_credential_registration(&bytes)
+            .map(Some)
+            .map_err(|_| ObjectWriteCredentialError::Corrupt {
+                path: path.to_path_buf(),
+                reason: "prepared registration is malformed or noncanonical",
+            })
+    }
+
+    fn publish_prepared_registration(
+        &self,
+        names: &CredentialNames,
+        registration: &ObjectWriteCredentialRegistration,
+    ) -> Result<(), ObjectWriteCredentialError> {
+        let path = names.prepared_path(&self.directory_path);
+        let bytes = cats_api::object_write_gateway::encode_object_write_credential_registration(
+            registration,
+        )
+        .map_err(|_| ObjectWriteCredentialError::Corrupt {
+            path: path.clone(),
+            reason: "registration does not satisfy the frozen contract",
+        })?;
+        if bytes.len() > PREPARED_REGISTRATION_MAX_BYTES {
+            return Err(ObjectWriteCredentialError::Corrupt {
+                path,
+                reason: "registration exceeds the Control request bound",
+            });
+        }
+        self.publish(
+            &names.prepared_temporary_name,
+            &names.prepared_name,
+            &path,
+            &bytes,
+        )
+    }
+
+    /// Writes `bytes` to a deterministic temp basename, makes the content
+    /// durable, renames it onto the target and makes the target link durable.
+    ///
+    /// A crash before the rename leaves only the temp, which the next attempt
+    /// removes; a crash after it leaves a complete target.
+    fn publish(
+        &self,
+        temporary_name: &CStr,
+        target_name: &CStr,
+        target_path: &Path,
+        bytes: &[u8],
+    ) -> Result<(), ObjectWriteCredentialError> {
+        let temporary_path = temporary_path(target_path);
+        unlink_at_if_exists(&self.directory, temporary_name).map_err(|source| {
+            io_error(
+                "remove stale object-write credential temp",
+                &temporary_path,
+                source,
+            )
+        })?;
+        let mut file = open_at(
+            &self.directory,
+            temporary_name,
+            libc::O_WRONLY
+                | libc::O_CREAT
+                | libc::O_EXCL
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK,
+            PRIVATE_FILE_MODE,
+        )
+        .map_err(|source| {
+            map_open_error(
+                "create object-write credential temp",
+                &temporary_path,
+                source,
+            )
+        })?;
+        verify_private_file(&file, &temporary_path)?;
+        file.write_all(bytes).map_err(|source| {
+            io_error(
+                "write object-write credential temp",
+                &temporary_path,
+                source,
+            )
+        })?;
+        file.sync_all().map_err(|source| {
+            io_error("sync object-write credential temp", &temporary_path, source)
+        })?;
+        drop(file);
+        rename_at(
+            &self.directory,
+            temporary_name,
+            &self.directory,
+            target_name,
+        )
+        .map_err(|source| io_error("publish object-write credential", target_path, source))?;
+        self.directory.sync_all().map_err(|source| {
+            io_error(
+                "sync object-write credential directory",
+                &self.directory_path,
+                source,
+            )
+        })
+    }
+
+    fn remove(&self, name: &CStr, path: &Path) -> Result<(), ObjectWriteCredentialError> {
+        unlink_at_if_exists(&self.directory, name)
+            .map_err(|source| io_error("remove object-write credential file", path, source))?;
+        self.directory.sync_all().map_err(|source| {
+            io_error(
+                "sync object-write credential directory",
+                &self.directory_path,
+                source,
+            )
+        })
+    }
+
+    /// Reads one root-only `0600` regular file, rejecting a symlink, a hard
+    /// link, foreign ownership, loosened permissions and an over-long body.
+    fn read_private_file(
+        &self,
+        name: &CStr,
+        path: &Path,
+        maximum: usize,
+    ) -> Result<Option<Vec<u8>>, ObjectWriteCredentialError> {
+        let file = match open_at(
+            &self.directory,
+            name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0,
+        ) {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(map_open_error(
+                    "open object-write credential file",
+                    path,
+                    source,
+                ))
+            }
+        };
+        verify_private_file(&file, path)?;
+        let mut bytes = Vec::new();
+        file.take(maximum as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|source| io_error("read object-write credential file", path, source))?;
+        if bytes.len() > maximum {
+            return Err(ObjectWriteCredentialError::UnsafeEntry {
+                path: path.to_path_buf(),
+                reason: "file exceeds its bound",
+            });
+        }
+        Ok(Some(bytes))
+    }
+
+    /// An ambiguous attempt keeps every local artifact so the byte-identical
+    /// body can be replayed; a closed status is a decision.
+    fn classify_registration_failure(
+        &self,
+        failure: ObjectWriteCredentialRegistrationFailure,
+    ) -> ObjectWriteCredentialError {
+        if failure.is_ambiguous() {
+            ObjectWriteCredentialError::RegistrationAmbiguous(failure.to_string())
+        } else {
+            ObjectWriteCredentialError::Rejected(failure.to_string())
+        }
+    }
+
+    #[cfg(not(test))]
+    fn maybe_crash(&self, _stage: impl Into<CrashStage>) -> Result<(), ObjectWriteCredentialError> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn maybe_crash(&self, stage: impl Into<CrashStage>) -> Result<(), ObjectWriteCredentialError> {
+        let stage = stage.into();
+        let mut faults = self.faults.lock().expect("test fault lock");
+        if faults.crash_once == Some(stage) {
+            faults.crash_once = None;
+            return Err(ObjectWriteCredentialError::InjectedCrash);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn inject_crash_once(&self, stage: impl Into<CrashStage>) {
+        self.faults.lock().expect("test fault lock").crash_once = Some(stage.into());
+    }
+}
+
+/// Every basename one credential owns, derived only from its exact scope.
+#[derive(Debug)]
+struct CredentialNames {
+    credential_id: Id,
+    private_artifact_id: Id,
+    private_key_name: CString,
+    private_key_temporary_name: CString,
+    prepared_name: CString,
+    prepared_temporary_name: CString,
+    registered_name: CString,
+    registered_temporary_name: CString,
+    private_key_file: String,
+    prepared_file: String,
+    registered_file: String,
+}
+
+impl CredentialNames {
+    fn derive(
+        session: &SessionBinding,
+        volume_id: &Id,
+        attachment_id: &Id,
+        attachment_epoch: FenceEpoch,
+    ) -> Result<Self, ObjectWriteCredentialError> {
+        let credential_id =
+            object_write_credential_id(session, volume_id, attachment_id, attachment_epoch);
+        let private_artifact_id =
+            object_write_private_artifact_id(session, volume_id, attachment_id, attachment_epoch);
+        let private_key_file = object_write_private_key_file_name(&private_artifact_id);
+        let prepared_file = object_write_prepared_registration_file_name(
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+        );
+        let registered_file = object_write_registered_artifact_file_name(&credential_id);
+        Ok(Self {
+            credential_id,
+            private_artifact_id,
+            private_key_name: basename(&private_key_file)?,
+            private_key_temporary_name: temporary_basename(&private_key_file)?,
+            prepared_name: basename(&prepared_file)?,
+            prepared_temporary_name: temporary_basename(&prepared_file)?,
+            registered_name: basename(&registered_file)?,
+            registered_temporary_name: temporary_basename(&registered_file)?,
+            private_key_file,
+            prepared_file,
+            registered_file,
+        })
+    }
+
+    fn private_key_path(&self, directory: &Path) -> PathBuf {
+        directory.join(&self.private_key_file)
+    }
+
+    fn prepared_path(&self, directory: &Path) -> PathBuf {
+        directory.join(&self.prepared_file)
+    }
+
+    fn registered_path(&self, directory: &Path) -> PathBuf {
+        directory.join(&self.registered_file)
+    }
+}
+
+/// The session-independent sidecar locator, which is all a later reader or a
+/// replacement Agent knows about an attachment epoch.
+#[derive(Debug)]
+struct PreparedLocator {
+    name: CString,
+    file: String,
+}
+
+impl PreparedLocator {
+    fn derive(
+        volume_id: &Id,
+        attachment_id: &Id,
+        attachment_epoch: FenceEpoch,
+    ) -> Result<Self, ObjectWriteCredentialError> {
+        let file = object_write_prepared_registration_file_name(
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+        );
+        Ok(Self {
+            name: basename(&file)?,
+            file,
+        })
+    }
+
+    fn path(&self, directory: &Path) -> PathBuf {
+        directory.join(&self.file)
+    }
+}
+
+fn build_registration(
+    scope: &ObjectWriteCredentialScope,
+    names: &CredentialNames,
+    signer: &Ed25519RequestSigner,
+) -> Result<ObjectWriteCredentialRegistration, ObjectWriteCredentialError> {
+    let credential = ObjectWriteCredentialReference {
+        credential_id: names.credential_id.clone(),
+        public_key_spki_sha256: signer.public_key_spki_sha256(),
+    };
+    let public_key_spki = Base64UrlNoPad::new(URL_SAFE_NO_PAD.encode(signer.public_key_spki_der()))
+        .ok_or(ObjectWriteCredentialError::KeyGeneration)?;
+    // Both receipt identities are derived, not measured: they name the exact
+    // barriers this module has already performed for this artifact and key.
+    let private_file_fsync_receipt_id =
+        object_write_private_file_fsync_receipt_id(&names.private_artifact_id, &credential);
+    let private_directory_fsync_receipt_id = object_write_private_directory_fsync_receipt_id(
+        &names.private_artifact_id,
+        &private_file_fsync_receipt_id,
+    );
+    Ok(ObjectWriteCredentialRegistration {
+        version: ContractVersion::V1,
+        session: scope.session.clone(),
+        writer_authority_id: scope.writer_authority_id.clone(),
+        volume_id: scope.volume_id.clone(),
+        attachment_id: scope.attachment_id.clone(),
+        attachment_epoch: scope.attachment_epoch,
+        credential,
+        public_key_spki,
+        private_artifact_id: names.private_artifact_id.clone(),
+        private_file_fsync_receipt_id,
+        private_directory_fsync_receipt_id,
+    })
+}
+
+/// The A19-authenticated production registration transport.
+#[derive(Clone)]
+pub(crate) struct ObjectWriteCredentialHttpRegistrar {
+    origin: reqwest::Url,
+    client: reqwest::blocking::Client,
+}
+
+impl std::fmt::Debug for ObjectWriteCredentialHttpRegistrar {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ObjectWriteCredentialHttpRegistrar")
+            .field("origin", &self.origin)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ObjectWriteCredentialHttpRegistrar {
+    pub(crate) fn for_production(gateway_origin: &str) -> anyhow::Result<Self> {
+        Self::new(gateway_origin, TransportMode::ProductionHttps)
+    }
+
+    #[cfg(test)]
+    fn for_loopback_test(gateway_origin: &str) -> anyhow::Result<Self> {
+        Self::new(gateway_origin, TransportMode::LoopbackTest)
+    }
+
+    fn new(gateway_origin: &str, mode: TransportMode) -> anyhow::Result<Self> {
+        let origin = validate_origin(gateway_origin, mode)?;
+        let client = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
+            .build()?;
+        Ok(Self { origin, client })
+    }
+}
+
+impl ObjectWriteCredentialRegistrar for ObjectWriteCredentialHttpRegistrar {
+    fn register(
+        &self,
+        proof: &ObjectWriteCredentialRegistrationProof,
+        deadline: Instant,
+    ) -> Result<ObjectWriteCredentialRegistrationReceipt, ObjectWriteCredentialRegistrationFailure>
+    {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(ObjectWriteCredentialRegistrationFailure::Timeout)?;
+        let url = self
+            .origin
+            .join(OBJECT_WRITE_CREDENTIAL_REGISTRATION_PATH)
+            .expect("a validated origin accepts the fixed registration path");
+        let response = self
+            .client
+            .post(url)
+            .timeout(remaining)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                OBJECT_WRITE_CREDENTIAL_REGISTRATION_CONTENT_TYPE,
+            )
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .header(NODE_CREDENTIAL_ID_HEADER, proof.node.credential_id.clone())
+            .header(
+                NODE_PUBLIC_KEY_SPKI_HEADER,
+                proof.node.public_key_spki.clone(),
+            )
+            .header(NODE_SIGNATURE_HEADER, proof.node.signature.clone())
+            .header(
+                OBJECT_WRITE_CREDENTIAL_ID_HEADER,
+                proof.attachment_key.credential_id.clone(),
+            )
+            .header(
+                OBJECT_WRITE_PUBLIC_KEY_SPKI_HEADER,
+                proof.attachment_key.public_key_spki.clone(),
+            )
+            .header(
+                OBJECT_WRITE_SIGNATURE_HEADER,
+                proof.attachment_key.signature.clone(),
+            )
+            .body(proof.body.clone())
+            .send();
+        let response = match response {
+            Ok(response) => response,
+            Err(error) if error.is_timeout() => {
+                return Err(ObjectWriteCredentialRegistrationFailure::Timeout)
+            }
+            Err(_) => return Err(ObjectWriteCredentialRegistrationFailure::Connection),
+        };
+        let status = response.status().as_u16();
+        if status != 200 {
+            return Err(ObjectWriteCredentialRegistrationFailure::Closed { status });
+        }
+        let body = response
+            .bytes()
+            .map_err(|_| ObjectWriteCredentialRegistrationFailure::Connection)?;
+        if body.len() > OBJECT_WRITE_REGISTERED_ARTIFACT_MAX_BYTES {
+            return Err(ObjectWriteCredentialRegistrationFailure::MalformedResponse);
+        }
+        decode_object_write_credential_registration_receipt(&body)
+            .map_err(|_| ObjectWriteCredentialRegistrationFailure::MalformedResponse)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportMode {
+    ProductionHttps,
+    LoopbackTest,
+}
+
+fn validate_origin(input: &str, mode: TransportMode) -> anyhow::Result<reqwest::Url> {
+    let url = reqwest::Url::parse(input)?;
+    anyhow::ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "object-write gateway origin has userinfo"
+    );
+    anyhow::ensure!(
+        url.query().is_none(),
+        "object-write gateway origin has a query"
+    );
+    anyhow::ensure!(
+        url.fragment().is_none(),
+        "object-write gateway origin has a fragment"
+    );
+    anyhow::ensure!(url.path() == "/", "object-write gateway origin has a path");
+    match mode {
+        TransportMode::ProductionHttps => anyhow::ensure!(
+            url.scheme() == "https",
+            "production object-write gateway origin must use HTTPS"
+        ),
+        TransportMode::LoopbackTest => anyhow::ensure!(
+            url.scheme() == "http"
+                && url
+                    .host_str()
+                    .is_some_and(|host| matches!(host, "127.0.0.1" | "::1" | "localhost")),
+            "test object-write gateway origin must be loopback HTTP"
+        ),
+    }
+    Ok(url)
+}
+
+fn generate_pkcs8_v2_pem() -> Result<Vec<u8>, ObjectWriteCredentialError> {
+    let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+        .map_err(|_| ObjectWriteCredentialError::KeyGeneration)?;
+    let mut encoded = STANDARD.encode(document.as_ref());
+    let mut pem = Vec::with_capacity(encoded.len() + 80);
+    pem.extend_from_slice(b"-----BEGIN PRIVATE KEY-----\n");
+    for chunk in encoded.as_bytes().chunks(64) {
+        pem.extend_from_slice(chunk);
+        pem.push(b'\n');
+    }
+    pem.extend_from_slice(b"-----END PRIVATE KEY-----\n");
+    // Drop the intermediate base64 copy of the private key.
+    // SAFETY: NUL is valid UTF-8, so overwriting the ASCII base64 body with
+    // zeroes keeps the `String` well formed for its remaining lifetime.
+    unsafe { encoded.as_bytes_mut() }.fill(0);
+    Ok(pem)
+}
+
+fn temporary_path(target: &Path) -> PathBuf {
+    let (directory, file) = (target.parent(), target.file_name());
+    match (directory, file.and_then(|name| name.to_str())) {
+        (Some(directory), Some(file)) => directory.join(format!(".{file}.incomplete")),
+        _ => target.to_path_buf(),
+    }
+}
+
+fn basename(value: &str) -> Result<CString, ObjectWriteCredentialError> {
+    ensure_plain_basename(value)?;
+    CString::new(value).map_err(|_| ObjectWriteCredentialError::UnsafeEntry {
+        path: PathBuf::from(value),
+        reason: "NUL byte in credential basename",
+    })
+}
+
+fn temporary_basename(value: &str) -> Result<CString, ObjectWriteCredentialError> {
+    ensure_plain_basename(value)?;
+    CString::new(format!(".{value}.incomplete")).map_err(|_| {
+        ObjectWriteCredentialError::UnsafeEntry {
+            path: PathBuf::from(value),
+            reason: "NUL byte in credential basename",
+        }
+    })
+}
+
+/// Every basename this module uses comes from a frozen contract helper, so this
+/// is a defence in depth assertion rather than a parser.
+fn ensure_plain_basename(value: &str) -> Result<(), ObjectWriteCredentialError> {
+    let plain = !value.is_empty()
+        && value != "."
+        && value != ".."
+        && !value.starts_with('.')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte));
+    if plain {
+        Ok(())
+    } else {
+        Err(ObjectWriteCredentialError::UnsafeEntry {
+            path: PathBuf::from(value),
+            reason: "credential basename is not a plain component",
+        })
+    }
+}
+
+fn verify_private_file(file: &File, path: &Path) -> Result<(), ObjectWriteCredentialError> {
+    let metadata = file
+        .metadata()
+        .map_err(|source| io_error("inspect object-write credential file", path, source))?;
+    if !metadata.file_type().is_file() {
+        return Err(ObjectWriteCredentialError::UnsafeEntry {
+            path: path.to_path_buf(),
+            reason: "not a regular file",
+        });
+    }
+    if metadata.nlink() != 1 {
+        return Err(ObjectWriteCredentialError::UnsafeEntry {
+            path: path.to_path_buf(),
+            reason: "hard-linked file",
+        });
+    }
+    if metadata.uid() != effective_uid() {
+        return Err(ObjectWriteCredentialError::UnsafeEntry {
+            path: path.to_path_buf(),
+            reason: "file is owned by another user",
+        });
+    }
+    if metadata.permissions().mode() & 0o7777 != PRIVATE_FILE_MODE {
+        return Err(ObjectWriteCredentialError::UnsafeEntry {
+            path: path.to_path_buf(),
+            reason: "file is not root-only 0600",
+        });
+    }
+    Ok(())
+}
+
+fn effective_uid() -> u32 {
+    // SAFETY: `geteuid` takes no arguments, cannot fail and retains no memory.
+    unsafe { libc::geteuid() }
+}
+
+fn lock_directory(
+    directory: &File,
+    mode: i32,
+    path: &Path,
+) -> Result<(), ObjectWriteCredentialError> {
+    loop {
+        // SAFETY: `directory` owns a live descriptor for the whole call and
+        // `flock` neither takes ownership of it nor retains a pointer.
+        let result = unsafe { libc::flock(directory.as_raw_fd(), mode | libc::LOCK_NB) };
+        if result == 0 {
+            return Ok(());
+        }
+        let source = io::Error::last_os_error();
+        if source.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if source.kind() == io::ErrorKind::WouldBlock {
+            return Err(ObjectWriteCredentialError::WriterAlreadyActive {
+                path: path.to_path_buf(),
+            });
+        }
+        return Err(io_error(
+            "lock object-write credential directory",
+            path,
+            source,
+        ));
+    }
+}
+
+fn open_at(directory: &File, name: &CStr, flags: i32, mode: u32) -> io::Result<File> {
+    loop {
+        // SAFETY: `directory` remains open for the call, `name` is
+        // NUL-terminated, and a successful descriptor is transferred exactly
+        // once into `File`. `openat` retains neither pointer.
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                flags,
+                mode as libc::mode_t as libc::c_uint,
+            )
+        };
+        if descriptor >= 0 {
+            // SAFETY: `openat` returned one fresh owned descriptor.
+            return Ok(unsafe { File::from_raw_fd(descriptor) });
+        }
+        let source = io::Error::last_os_error();
+        if source.kind() != io::ErrorKind::Interrupted {
+            return Err(source);
+        }
+    }
+}
+
+fn rename_at(
+    old_directory: &File,
+    old_name: &CStr,
+    new_directory: &File,
+    new_name: &CStr,
+) -> io::Result<()> {
+    loop {
+        // SAFETY: both descriptors remain live for the call and both names are
+        // NUL-terminated. `renameat` retains neither pointer.
+        let result = unsafe {
+            libc::renameat(
+                old_directory.as_raw_fd(),
+                old_name.as_ptr(),
+                new_directory.as_raw_fd(),
+                new_name.as_ptr(),
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let source = io::Error::last_os_error();
+        if source.kind() != io::ErrorKind::Interrupted {
+            return Err(source);
+        }
+    }
+}
+
+fn unlink_at_if_exists(directory: &File, name: &CStr) -> io::Result<()> {
+    loop {
+        // SAFETY: `directory` and `name` remain live for the call. The name is
+        // directory-relative and NUL-terminated; `unlinkat` retains no pointer.
+        let result = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+        if result == 0 {
+            return Ok(());
+        }
+        let source = io::Error::last_os_error();
+        if source.kind() == io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        if source.kind() != io::ErrorKind::Interrupted {
+            return Err(source);
+        }
+    }
+}
+
+fn map_open_error(
+    operation: &'static str,
+    path: &Path,
+    source: io::Error,
+) -> ObjectWriteCredentialError {
+    if source.raw_os_error() == Some(libc::ELOOP) {
+        ObjectWriteCredentialError::UnsafeEntry {
+            path: path.to_path_buf(),
+            reason: "symbolic link",
+        }
+    } else {
+        io_error(operation, path, source)
+    }
+}
+
+fn io_error(operation: &'static str, path: &Path, source: io::Error) -> ObjectWriteCredentialError {
+    ObjectWriteCredentialError::Io {
+        operation,
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+/// The durable barriers `establish` crosses, in order. Tests inject a crash at
+/// one of them; production builds only name them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EstablishStage {
+    PrivateKeyDurable,
+    PreparedRegistrationDurable,
+    ControlRegistered,
+}
+
+/// The one durable barrier `retire` crosses before it removes public sidecars.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetireStage {
+    PrivateKeyDestroyed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrashStage {
+    Establish(EstablishStage),
+    Retire(RetireStage),
+}
+
+impl From<EstablishStage> for CrashStage {
+    fn from(stage: EstablishStage) -> Self {
+        Self::Establish(stage)
+    }
+}
+
+impl From<RetireStage> for CrashStage {
+    fn from(stage: RetireStage) -> Self {
+        Self::Retire(stage)
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestFaults {
+    crash_once: Option<CrashStage>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use cats_api::agent_registration::verify_request_proof;
+    use cats_api::object_write_gateway::{
+        verify_object_write_credential_registration, ObjectWriteCredentialRegistrationReceipt,
+    };
+    use cats_api::runtime_reconciliation::{Epoch, NodeBootId, RandomId128, UnixMillis};
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn id(value: &str) -> Id {
+        Id::new(value).unwrap()
+    }
+
+    fn session(epoch: u64) -> SessionBinding {
+        SessionBinding {
+            node_id: id("node_a"),
+            node_boot_id: NodeBootId::new("1".repeat(32)).unwrap(),
+            agent_instance_id: RandomId128::new("2".repeat(32)).unwrap(),
+            agent_session_epoch: Epoch::new(epoch).unwrap(),
+        }
+    }
+
+    fn scope() -> ObjectWriteCredentialScope {
+        scope_for_session(session(7))
+    }
+
+    fn scope_for_session(session: SessionBinding) -> ObjectWriteCredentialScope {
+        ObjectWriteCredentialScope {
+            session,
+            writer_authority_id: id("writer_a"),
+            volume_id: id("volume_a"),
+            attachment_id: id("attachment_a"),
+            attachment_epoch: FenceEpoch::new(9).unwrap(),
+        }
+    }
+
+    fn node_signer() -> Ed25519RequestSigner {
+        let mut private_key = vec![
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ];
+        private_key.extend(std::iter::repeat_n(0x11_u8, 32));
+        Ed25519RequestSigner::from_pkcs8_der(id("node_credential_a"), &private_key).unwrap()
+    }
+
+    /// Control's real replay rule: the exact same registration returns the
+    /// original receipt, and a different key under the same credential ID is a
+    /// conflict rather than a second credential.
+    #[derive(Default)]
+    struct ReplayingControl {
+        registered: Mutex<HashMap<String, ObjectWriteCredentialRegistration>>,
+        bodies: Mutex<Vec<Vec<u8>>>,
+        fail_next: Mutex<Option<ObjectWriteCredentialRegistrationFailure>>,
+    }
+
+    impl ReplayingControl {
+        fn fail_next(&self, failure: ObjectWriteCredentialRegistrationFailure) {
+            *self.fail_next.lock().unwrap() = Some(failure);
+        }
+
+        fn accepted_bodies(&self) -> Vec<Vec<u8>> {
+            self.bodies.lock().unwrap().clone()
+        }
+
+        fn registered_public_keys(&self) -> Vec<String> {
+            self.registered
+                .lock()
+                .unwrap()
+                .values()
+                .map(|registration| registration.public_key_spki.as_str().to_owned())
+                .collect()
+        }
+    }
+
+    impl ObjectWriteCredentialRegistrar for ReplayingControl {
+        fn register(
+            &self,
+            proof: &ObjectWriteCredentialRegistrationProof,
+            _deadline: Instant,
+        ) -> Result<
+            ObjectWriteCredentialRegistrationReceipt,
+            ObjectWriteCredentialRegistrationFailure,
+        > {
+            if let Some(failure) = self.fail_next.lock().unwrap().take() {
+                return Err(failure);
+            }
+            let (_node, _attachment, registration) = verify_object_write_credential_registration(
+                &proof.body,
+                &proof.node,
+                &proof.attachment_key,
+            )
+            .expect("Control verifies both proofs");
+            self.bodies.lock().unwrap().push(proof.body.clone());
+            let mut registered = self.registered.lock().unwrap();
+            let key = registration.credential.credential_id.as_str().to_owned();
+            match registered.get(&key) {
+                Some(existing) if *existing == registration => {}
+                Some(_) => {
+                    return Err(ObjectWriteCredentialRegistrationFailure::Closed { status: 409 })
+                }
+                None => {
+                    registered.insert(key, registration.clone());
+                }
+            }
+            Ok(ObjectWriteCredentialRegistrationReceipt {
+                version: ContractVersion::V1,
+                writer_authority_id: registration.writer_authority_id.clone(),
+                volume_id: registration.volume_id.clone(),
+                attachment_id: registration.attachment_id.clone(),
+                attachment_epoch: registration.attachment_epoch,
+                credential: registration.credential.clone(),
+                registered_at_unix_ms: UnixMillis::new(1_720_000_000_000).unwrap(),
+            })
+        }
+    }
+
+    fn deadline() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
+
+    fn establish(
+        root: &Path,
+        control: &ReplayingControl,
+    ) -> Result<LoadedObjectWriteCredential, ObjectWriteCredentialError> {
+        let store = ObjectWriteCredentialStore::open(root).unwrap();
+        store.establish(&scope(), &node_signer(), control, deadline())
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    /// A 16-byte slice of the encoded private key, calibrated against a known
+    /// positive so an absent match cannot be an artefact of a broken search.
+    fn key_material_probe(private_key: &[u8]) -> &[u8] {
+        let middle = private_key.len() / 2;
+        let probe = &private_key[middle..middle + 16];
+        assert!(
+            contains(private_key, probe),
+            "the key-material probe must find itself in the key file it came from"
+        );
+        assert!(
+            !contains(b"-----BEGIN PRIVATE KEY-----\n", probe),
+            "the probe must be key bytes, not the shared PEM envelope"
+        );
+        probe
+    }
+
+    fn credential_directory(root: &Path) -> PathBuf {
+        root.join(OBJECT_WRITE_CREDENTIAL_DIRECTORY_BASENAME)
+    }
+
+    fn directory_entries(root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(credential_directory(root))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn establish_publishes_root_only_artifacts_and_loads_a_matching_signer() {
+        let root = TempDir::new().unwrap();
+        let control = ReplayingControl::default();
+        let established = establish(root.path(), &control).unwrap();
+
+        let names = CredentialNames::derive(
+            &scope().session,
+            &scope().volume_id,
+            &scope().attachment_id,
+            scope().attachment_epoch,
+        )
+        .unwrap();
+        let directory = credential_directory(root.path());
+        assert_eq!(
+            directory_entries(root.path()),
+            {
+                let mut expected = vec![
+                    names.private_key_file.clone(),
+                    names.prepared_file.clone(),
+                    names.registered_file.clone(),
+                ];
+                expected.sort();
+                expected
+            },
+            "only the three contract-declared basenames survive a successful establish"
+        );
+        for file in [
+            &names.private_key_file,
+            &names.prepared_file,
+            &names.registered_file,
+        ] {
+            let metadata = std::fs::metadata(directory.join(file)).unwrap();
+            assert_eq!(
+                metadata.permissions().mode() & 0o7777,
+                0o600,
+                "{file} must be root-only 0600"
+            );
+            assert_eq!(metadata.uid(), effective_uid(), "{file} must be root owned");
+        }
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o7777,
+            0o700,
+            "the credential namespace must not be group or world accessible"
+        );
+
+        let loaded = load(
+            root.path(),
+            &scope().volume_id,
+            &scope().attachment_id,
+            scope().attachment_epoch,
+        )
+        .unwrap();
+        assert_eq!(loaded.credential(), established.credential());
+        assert_eq!(
+            loaded.credential().credential_id,
+            names.credential_id,
+            "the credential ID is derived from the exact scope"
+        );
+        assert_eq!(
+            loaded.signer().public_key_spki_sha256(),
+            loaded.credential().public_key_spki_sha256,
+            "the loaded signer holds the registered public key"
+        );
+        assert_eq!(
+            loaded.registered_artifact().receipt.attachment_epoch,
+            scope().attachment_epoch
+        );
+    }
+
+    #[test]
+    fn registration_body_carries_the_derived_durability_receipts_and_no_private_key() {
+        let root = TempDir::new().unwrap();
+        let control = ReplayingControl::default();
+        let loaded = establish(root.path(), &control).unwrap();
+        let registration = &loaded.registered_artifact().registration;
+        let names = CredentialNames::derive(
+            &scope().session,
+            &scope().volume_id,
+            &scope().attachment_id,
+            scope().attachment_epoch,
+        )
+        .unwrap();
+
+        assert_eq!(registration.private_artifact_id, names.private_artifact_id);
+        let file_receipt = object_write_private_file_fsync_receipt_id(
+            &names.private_artifact_id,
+            &registration.credential,
+        );
+        assert_eq!(registration.private_file_fsync_receipt_id, file_receipt);
+        assert_eq!(
+            registration.private_directory_fsync_receipt_id,
+            object_write_private_directory_fsync_receipt_id(
+                &names.private_artifact_id,
+                &file_receipt
+            )
+        );
+
+        let private_key =
+            std::fs::read(credential_directory(root.path()).join(&names.private_key_file)).unwrap();
+        let seed = key_material_probe(&private_key);
+        let bodies = control.accepted_bodies();
+        assert_eq!(bodies.len(), 1);
+        for body in bodies {
+            assert!(
+                !contains(&body, seed),
+                "no private key material may reach the registration wire"
+            );
+        }
+    }
+
+    #[test]
+    fn crash_after_the_private_key_barrier_reuses_that_key_instead_of_minting_a_second() {
+        let root = TempDir::new().unwrap();
+        let control = ReplayingControl::default();
+
+        let store = ObjectWriteCredentialStore::open(root.path()).unwrap();
+        store.inject_crash_once(EstablishStage::PrivateKeyDurable);
+        let crashed = store.establish(&scope(), &node_signer(), &control, deadline());
+        assert!(matches!(
+            crashed,
+            Err(ObjectWriteCredentialError::InjectedCrash)
+        ));
+        let names = CredentialNames::derive(
+            &scope().session,
+            &scope().volume_id,
+            &scope().attachment_id,
+            scope().attachment_epoch,
+        )
+        .unwrap();
+        let directory = credential_directory(root.path());
+        let key_after_crash = std::fs::read(directory.join(&names.private_key_file)).unwrap();
+        assert!(
+            !directory.join(&names.prepared_file).exists(),
+            "the prepared registration must not exist before its private key barrier"
+        );
+        drop(store);
+
+        let recovered = establish(root.path(), &control).unwrap();
+        assert_eq!(
+            std::fs::read(directory.join(&names.private_key_file)).unwrap(),
+            key_after_crash,
+            "recovery must reuse the durable key, never generate a second one"
+        );
+        assert_eq!(
+            control.registered_public_keys().len(),
+            1,
+            "exactly one public key is ever registered for this attachment epoch"
+        );
+        assert_eq!(
+            recovered.signer().public_key_spki_sha256(),
+            recovered.credential().public_key_spki_sha256
+        );
+    }
+
+    #[test]
+    fn crash_after_the_prepared_barrier_replays_the_identical_body() {
+        let root = TempDir::new().unwrap();
+        let control = ReplayingControl::default();
+
+        let store = ObjectWriteCredentialStore::open(root.path()).unwrap();
+        store.inject_crash_once(EstablishStage::PreparedRegistrationDurable);
+        assert!(matches!(
+            store.establish(&scope(), &node_signer(), &control, deadline()),
+            Err(ObjectWriteCredentialError::InjectedCrash)
+        ));
+        assert!(
+            control.accepted_bodies().is_empty(),
+            "no registration is sent before the prepared barrier"
+        );
+        drop(store);
+
+        assert!(establish(root.path(), &control).is_ok());
+        assert_eq!(control.accepted_bodies().len(), 1);
+        assert_eq!(control.registered_public_keys().len(), 1);
+    }
+
+    #[test]
+    fn crash_after_control_registration_replays_and_converges_on_the_same_credential() {
+        let root = TempDir::new().unwrap();
+        let control = ReplayingControl::default();
+
+        let store = ObjectWriteCredentialStore::open(root.path()).unwrap();
+        store.inject_crash_once(EstablishStage::ControlRegistered);
+        assert!(matches!(
+            store.establish(&scope(), &node_signer(), &control, deadline()),
+            Err(ObjectWriteCredentialError::InjectedCrash)
+        ));
+        assert_eq!(
+            control.accepted_bodies().len(),
+            1,
+            "Control committed the registration the Node never observed"
+        );
+        drop(store);
+        assert!(
+            matches!(
+                load(
+                    root.path(),
+                    &scope().volume_id,
+                    &scope().attachment_id,
+                    scope().attachment_epoch
+                ),
+                Err(ObjectWriteCredentialError::NotRegistered)
+            ),
+            "a credential Control holds but the Node never published is not loadable"
+        );
+
+        let recovered = establish(root.path(), &control).unwrap();
+        let bodies = control.accepted_bodies();
+        assert_eq!(bodies.len(), 2, "recovery replays the registration");
+        assert_eq!(
+            bodies[0], bodies[1],
+            "the replayed body is byte identical, so Control returns the original receipt"
+        );
+        assert_eq!(control.registered_public_keys().len(), 1);
+        let loaded = load(
+            root.path(),
+            &scope().volume_id,
+            &scope().attachment_id,
+            scope().attachment_epoch,
+        )
+        .unwrap();
+        assert_eq!(loaded.credential(), recovered.credential());
+    }
+
+    #[test]
+    fn an_ambiguous_registration_keeps_local_state_for_the_replay() {
+        let root = TempDir::new().unwrap();
+        let control = ReplayingControl::default();
+        control.fail_next(ObjectWriteCredentialRegistrationFailure::Timeout);
+
+        let store = ObjectWriteCredentialStore::open(root.path()).unwrap();
+        let error = store
+            .establish(&scope(), &node_signer(), &control, deadline())
+            .unwrap_err();
+        assert!(
+            matches!(error, ObjectWriteCredentialError::RegistrationAmbiguous(_)),
+            "a timeout is undiscovered, not a decision: {error}"
+        );
+        let names = CredentialNames::derive(
+            &scope().session,
+            &scope().volume_id,
+            &scope().attachment_id,
+            scope().attachment_epoch,
+        )
+        .unwrap();
+        let directory = credential_directory(root.path());
+        assert!(directory.join(&names.private_key_file).exists());
+        assert!(
+            directory.join(&names.prepared_file).exists(),
+            "an ambiguous attempt must not discard the body it has to replay"
+        );
+        drop(store);
+
+        let recovered = establish(root.path(), &control).unwrap();
+        assert_eq!(control.registered_public_keys().len(), 1);
+        assert_eq!(
+            recovered.credential().credential_id,
+            names.credential_id,
+            "the same credential converges after the ambiguity"
+        );
+    }
+
+    #[test]
+    fn retirement_makes_the_private_key_unusable_and_is_idempotent() {
+        let root = TempDir::new().unwrap();
+        let control = ReplayingControl::default();
+        establish(root.path(), &control).unwrap();
+
+        let store = ObjectWriteCredentialStore::open(root.path()).unwrap();
+        store
+            .retire(
+                &scope().volume_id,
+                &scope().attachment_id,
+                scope().attachment_epoch,
+            )
+            .unwrap();
+        drop(store);
+
+        assert!(
+            directory_entries(root.path()).is_empty(),
+            "retirement leaves no credential residue"
+        );
+        assert!(matches!(
+            load(
+                root.path(),
+                &scope().volume_id,
+                &scope().attachment_id,
+                scope().attachment_epoch
+            ),
+            Err(ObjectWriteCredentialError::NotRegistered)
+        ));
+
+        let store = ObjectWriteCredentialStore::open(root.path()).unwrap();
+        store
+            .retire(
+                &scope().volume_id,
+                &scope().attachment_id,
+                scope().attachment_epoch,
+            )
+            .expect("retiring an already retired attachment succeeds");
+    }
+
+    #[test]
+    fn a_crash_during_retirement_still_leaves_the_private_key_gone() {
+        let root = TempDir::new().unwrap();
+        let control = ReplayingControl::default();
+        establish(root.path(), &control).unwrap();
+        let names = CredentialNames::derive(
+            &scope().session,
+            &scope().volume_id,
+            &scope().attachment_id,
+            scope().attachment_epoch,
+        )
+        .unwrap();
+        let directory = credential_directory(root.path());
+
+        let store = ObjectWriteCredentialStore::open(root.path()).unwrap();
+        store.inject_crash_once(RetireStage::PrivateKeyDestroyed);
+        assert!(matches!(
+            store.retire(
+                &scope().volume_id,
+                &scope().attachment_id,
+                scope().attachment_epoch
+            ),
+            Err(ObjectWriteCredentialError::InjectedCrash)
+        ));
+        drop(store);
+
+        assert!(!directory.join(&names.private_key_file).exists());
+        assert!(
+            directory.join(&names.prepared_file).exists(),
+            "the interrupted retirement is mid-flight, not undone"
+        );
+        assert!(matches!(
+            load(
+                root.path(),
+                &scope().volume_id,
+                &scope().attachment_id,
+                scope().attachment_epoch
+            ),
+            Err(ObjectWriteCredentialError::NotRegistered)
+        ));
+
+        let store = ObjectWriteCredentialStore::open(root.path()).unwrap();
+        store
+            .retire(
+                &scope().volume_id,
+                &scope().attachment_id,
+                scope().attachment_epoch,
+            )
+            .unwrap();
+        drop(store);
+        assert!(directory_entries(root.path()).is_empty());
+    }
+
+    #[test]
+    fn a_replacement_agent_session_destroys_the_superseded_credential() {
+        let root = TempDir::new().unwrap();
+        let control = ReplayingControl::default();
+        let first = establish(root.path(), &control).unwrap();
+        let first_names = CredentialNames::derive(
+            &scope().session,
+            &scope().volume_id,
+            &scope().attachment_id,
+            scope().attachment_epoch,
+        )
+        .unwrap();
+
+        let replacement = scope_for_session(session(8));
+        let store = ObjectWriteCredentialStore::open(root.path()).unwrap();
+        let second = store
+            .establish(&replacement, &node_signer(), &control, deadline())
+            .unwrap();
+        drop(store);
+
+        assert_ne!(
+            second.credential().credential_id,
+            first.credential().credential_id,
+            "a new Agent session mints a new credential identity"
+        );
+        let directory = credential_directory(root.path());
+        assert!(
+            !directory.join(&first_names.private_key_file).exists(),
+            "the superseded private key must not survive as residue"
+        );
+        assert!(
+            !directory.join(&first_names.registered_file).exists(),
+            "the superseded registered artifact must not survive"
+        );
+        let loaded = load(
+            root.path(),
+            &scope().volume_id,
+            &scope().attachment_id,
+            scope().attachment_epoch,
+        )
+        .unwrap();
+        assert_eq!(loaded.credential(), second.credential());
+    }
+
+    #[test]
+    fn a_sidecar_claiming_another_attachment_cannot_destroy_that_credential() {
+        let root = TempDir::new().unwrap();
+        let control = ReplayingControl::default();
+
+        // Establish a credential for a neighbouring attachment, then forge this
+        // attachment's sidecar so it names the neighbour.
+        let victim = ObjectWriteCredentialScope {
+            attachment_id: id("attachment_b"),
+            ..scope()
+        };
+        let store = ObjectWriteCredentialStore::open(root.path()).unwrap();
+        store
+            .establish(&victim, &node_signer(), &control, deadline())
+            .unwrap();
+        drop(store);
+        let victim_names = CredentialNames::derive(
+            &victim.session,
+            &victim.volume_id,
+            &victim.attachment_id,
+            victim.attachment_epoch,
+        )
+        .unwrap();
+        let directory = credential_directory(root.path());
+        let forged = std::fs::read(directory.join(&victim_names.prepared_file)).unwrap();
+        let names = CredentialNames::derive(
+            &scope().session,
+            &scope().volume_id,
+            &scope().attachment_id,
+            scope().attachment_epoch,
+        )
+        .unwrap();
+        let forged_path = directory.join(&names.prepared_file);
+        std::fs::write(&forged_path, forged).unwrap();
+        // The forgery has to clear the ownership and mode gate to reach the
+        // attachment check this test is about.
+        std::fs::set_permissions(&forged_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let store = ObjectWriteCredentialStore::open(root.path()).unwrap();
+        let error = store
+            .establish(&scope(), &node_signer(), &control, deadline())
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ObjectWriteCredentialError::Corrupt {
+                    reason: "superseded registration names another attachment",
+                    ..
+                }
+            ),
+            "a forged sidecar may not authorize destroying another attachment: {error}"
+        );
+        drop(store);
+        assert!(
+            directory.join(&victim_names.private_key_file).exists(),
+            "the neighbouring attachment keeps its private key"
+        );
+        assert!(directory.join(&victim_names.registered_file).exists());
+        load(
+            root.path(),
+            &victim.volume_id,
+            &victim.attachment_id,
+            victim.attachment_epoch,
+        )
+        .expect("the neighbouring credential is still usable");
+    }
+
+    #[test]
+    fn load_fails_closed_on_a_tampered_prepared_registration() {
+        let root = TempDir::new().unwrap();
+        let control = ReplayingControl::default();
+        establish(root.path(), &control).unwrap();
+        let names = CredentialNames::derive(
+            &scope().session,
+            &scope().volume_id,
+            &scope().attachment_id,
+            scope().attachment_epoch,
+        )
+        .unwrap();
+        let prepared_path = credential_directory(root.path()).join(&names.prepared_file);
+
+        let mut registration =
+            decode_object_write_credential_registration(&std::fs::read(&prepared_path).unwrap())
+                .unwrap();
+        registration.private_artifact_id = id("owpriv1_forged");
+        std::fs::write(
+            &prepared_path,
+            cats_api::object_write_gateway::encode_object_write_credential_registration(
+                &registration,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = load(
+            root.path(),
+            &scope().volume_id,
+            &scope().attachment_id,
+            scope().attachment_epoch,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ObjectWriteCredentialError::Corrupt {
+                    reason: "prepared registration claims underived identifiers",
+                    ..
+                }
+            ),
+            "a sidecar may never steer a read at an underived path: {error}"
+        );
+    }
+
+    #[test]
+    fn load_fails_closed_when_the_registered_artifact_is_absent() {
+        let root = TempDir::new().unwrap();
+        let control = ReplayingControl::default();
+        establish(root.path(), &control).unwrap();
+        let names = CredentialNames::derive(
+            &scope().session,
+            &scope().volume_id,
+            &scope().attachment_id,
+            scope().attachment_epoch,
+        )
+        .unwrap();
+        std::fs::remove_file(credential_directory(root.path()).join(&names.registered_file))
+            .unwrap();
+
+        assert!(matches!(
+            load(
+                root.path(),
+                &scope().volume_id,
+                &scope().attachment_id,
+                scope().attachment_epoch
+            ),
+            Err(ObjectWriteCredentialError::NotRegistered)
+        ));
+    }
+
+    #[test]
+    fn establish_republishes_a_lost_sidecar_so_the_seam_can_still_load() {
+        let root = TempDir::new().unwrap();
+        let control = ReplayingControl::default();
+        establish(root.path(), &control).unwrap();
+        let names = CredentialNames::derive(
+            &scope().session,
+            &scope().volume_id,
+            &scope().attachment_id,
+            scope().attachment_epoch,
+        )
+        .unwrap();
+        std::fs::remove_file(credential_directory(root.path()).join(&names.prepared_file)).unwrap();
+        assert!(
+            matches!(
+                load(
+                    root.path(),
+                    &scope().volume_id,
+                    &scope().attachment_id,
+                    scope().attachment_epoch
+                ),
+                Err(ObjectWriteCredentialError::NotRegistered)
+            ),
+            "without its sidecar the credential is not reachable by attachment locator"
+        );
+
+        let recovered = establish(root.path(), &control).unwrap();
+        assert_eq!(
+            control.accepted_bodies().len(),
+            1,
+            "an already registered credential needs no second Control call"
+        );
+        let loaded = load(
+            root.path(),
+            &scope().volume_id,
+            &scope().attachment_id,
+            scope().attachment_epoch,
+        )
+        .expect("establish must leave the seam able to load");
+        assert_eq!(loaded.credential(), recovered.credential());
+    }
+
+    #[test]
+    fn a_group_readable_private_key_is_rejected() {
+        let root = TempDir::new().unwrap();
+        let control = ReplayingControl::default();
+        establish(root.path(), &control).unwrap();
+        let names = CredentialNames::derive(
+            &scope().session,
+            &scope().volume_id,
+            &scope().attachment_id,
+            scope().attachment_epoch,
+        )
+        .unwrap();
+        let key_path = credential_directory(root.path()).join(&names.private_key_file);
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let error = load(
+            root.path(),
+            &scope().volume_id,
+            &scope().attachment_id,
+            scope().attachment_epoch,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ObjectWriteCredentialError::UnsafeEntry {
+                    reason: "file is not root-only 0600",
+                    ..
+                }
+            ),
+            "a widened private key must not produce a signer: {error}"
+        );
+    }
+
+    #[test]
+    fn a_receipt_that_rebinds_the_writer_authority_is_rejected() {
+        struct RebindingControl;
+
+        impl ObjectWriteCredentialRegistrar for RebindingControl {
+            fn register(
+                &self,
+                proof: &ObjectWriteCredentialRegistrationProof,
+                _deadline: Instant,
+            ) -> Result<
+                ObjectWriteCredentialRegistrationReceipt,
+                ObjectWriteCredentialRegistrationFailure,
+            > {
+                let registration =
+                    decode_object_write_credential_registration(&proof.body).unwrap();
+                Ok(ObjectWriteCredentialRegistrationReceipt {
+                    version: ContractVersion::V1,
+                    writer_authority_id: id("writer_b"),
+                    volume_id: registration.volume_id,
+                    attachment_id: registration.attachment_id,
+                    attachment_epoch: registration.attachment_epoch,
+                    credential: registration.credential,
+                    registered_at_unix_ms: UnixMillis::new(1_720_000_000_000).unwrap(),
+                })
+            }
+        }
+
+        let root = TempDir::new().unwrap();
+        let store = ObjectWriteCredentialStore::open(root.path()).unwrap();
+        let error = store
+            .establish(&scope(), &node_signer(), &RebindingControl, deadline())
+            .unwrap_err();
+        assert!(
+            matches!(error, ObjectWriteCredentialError::Rejected(ref message)
+                if message.contains("writer authority")),
+            "a receipt may not move the credential to another writer authority: {error}"
+        );
+        drop(store);
+        assert!(matches!(
+            load(
+                root.path(),
+                &scope().volume_id,
+                &scope().attachment_id,
+                scope().attachment_epoch
+            ),
+            Err(ObjectWriteCredentialError::NotRegistered)
+        ));
+    }
+
+    #[test]
+    fn a_durable_registration_without_its_private_key_fails_closed() {
+        let root = TempDir::new().unwrap();
+        let control = ReplayingControl::default();
+        establish(root.path(), &control).unwrap();
+        let names = CredentialNames::derive(
+            &scope().session,
+            &scope().volume_id,
+            &scope().attachment_id,
+            scope().attachment_epoch,
+        )
+        .unwrap();
+        std::fs::remove_file(credential_directory(root.path()).join(&names.private_key_file))
+            .unwrap();
+
+        let store = ObjectWriteCredentialStore::open(root.path()).unwrap();
+        let error = store
+            .establish(&scope(), &node_signer(), &control, deadline())
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ObjectWriteCredentialError::Corrupt {
+                    reason: "durable registration has no private key",
+                    ..
+                }
+            ),
+            "a registered credential with no key must not be re-minted: {error}"
+        );
+        assert_eq!(
+            control.accepted_bodies().len(),
+            1,
+            "the failure must not register a replacement key for this epoch"
+        );
+    }
+
+    #[test]
+    fn a_second_writer_cannot_open_the_namespace() {
+        let root = TempDir::new().unwrap();
+        let held = ObjectWriteCredentialStore::open(root.path()).unwrap();
+        let error = ObjectWriteCredentialStore::open(root.path()).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ObjectWriteCredentialError::WriterAlreadyActive { .. }
+            ),
+            "two credential writers may never run at once: {error}"
+        );
+        drop(held);
+        ObjectWriteCredentialStore::open(root.path()).expect("the lock is released with the store");
+    }
+
+    #[test]
+    fn the_http_registrar_sends_both_proofs_and_never_the_private_key() {
+        let root = TempDir::new().unwrap();
+        let control = ReplayingControl::default();
+        let loaded = establish(root.path(), &control).unwrap();
+        let names = CredentialNames::derive(
+            &scope().session,
+            &scope().volume_id,
+            &scope().attachment_id,
+            scope().attachment_epoch,
+        )
+        .unwrap();
+        let private_key =
+            std::fs::read(credential_directory(root.path()).join(&names.private_key_file)).unwrap();
+
+        let node = node_signer();
+        let proof = sign_object_write_credential_registration(
+            &node,
+            loaded.signer(),
+            &loaded.registered_artifact().registration,
+        )
+        .unwrap();
+        let receipt_body =
+            cats_api::object_write_gateway::encode_object_write_credential_registration_receipt(
+                &ObjectWriteCredentialRegistrationReceipt {
+                    version: ContractVersion::V1,
+                    writer_authority_id: scope().writer_authority_id,
+                    volume_id: scope().volume_id,
+                    attachment_id: scope().attachment_id,
+                    attachment_epoch: scope().attachment_epoch,
+                    credential: loaded.credential().clone(),
+                    registered_at_unix_ms: UnixMillis::new(1_720_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut headers = HashMap::new();
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                let (name, value) = line.trim_end().split_once(':').unwrap();
+                let name = name.to_ascii_lowercase();
+                if name == "content-length" {
+                    content_length = value.trim().parse().unwrap();
+                }
+                headers.insert(name, value.trim().to_owned());
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let mut stream = reader.into_inner();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n",
+                        receipt_body.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            stream.write_all(&receipt_body).unwrap();
+            (request_line, headers, body)
+        });
+
+        let registrar =
+            ObjectWriteCredentialHttpRegistrar::for_loopback_test(&format!("http://{address}/"))
+                .unwrap();
+        let receipt = registrar.register(&proof, deadline()).unwrap();
+        let (request_line, headers, body) = server.join().unwrap();
+
+        assert_eq!(receipt.credential, *loaded.credential());
+        assert!(request_line.starts_with(&format!(
+            "POST {OBJECT_WRITE_CREDENTIAL_REGISTRATION_PATH} "
+        )));
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some(OBJECT_WRITE_CREDENTIAL_REGISTRATION_CONTENT_TYPE)
+        );
+        assert_eq!(body, proof.body);
+        verify_request_proof(
+            OBJECT_WRITE_GATEWAY_METHOD,
+            OBJECT_WRITE_CREDENTIAL_REGISTRATION_PATH,
+            &body,
+            headers.get(NODE_CREDENTIAL_ID_HEADER).unwrap(),
+            headers.get(NODE_PUBLIC_KEY_SPKI_HEADER).unwrap(),
+            headers.get(NODE_SIGNATURE_HEADER).unwrap(),
+        )
+        .expect("the A19 node proof travels in the frozen headers");
+        verify_object_write_credential_registration(
+            &body,
+            &cats_api::agent_registration::NodeRequestProof {
+                credential_id: headers.get(NODE_CREDENTIAL_ID_HEADER).unwrap().clone(),
+                public_key_spki: headers.get(NODE_PUBLIC_KEY_SPKI_HEADER).unwrap().clone(),
+                signature: headers.get(NODE_SIGNATURE_HEADER).unwrap().clone(),
+            },
+            &cats_api::agent_registration::NodeRequestProof {
+                credential_id: headers
+                    .get(OBJECT_WRITE_CREDENTIAL_ID_HEADER)
+                    .unwrap()
+                    .clone(),
+                public_key_spki: headers
+                    .get(OBJECT_WRITE_PUBLIC_KEY_SPKI_HEADER)
+                    .unwrap()
+                    .clone(),
+                signature: headers.get(OBJECT_WRITE_SIGNATURE_HEADER).unwrap().clone(),
+            },
+        )
+        .expect("Control's own verifier accepts what the Node sent");
+
+        let seed = key_material_probe(&private_key);
+        assert!(!contains(&body, seed));
+        for value in headers.values() {
+            assert!(!contains(value.as_bytes(), seed));
+        }
+    }
+
+    #[test]
+    fn a_production_registrar_refuses_a_plaintext_origin() {
+        assert!(ObjectWriteCredentialHttpRegistrar::for_production("http://127.0.0.1:9/").is_err());
+        assert!(ObjectWriteCredentialHttpRegistrar::for_production(
+            "https://control.example/v1/internal/"
+        )
+        .is_err());
+        assert!(
+            ObjectWriteCredentialHttpRegistrar::for_production("https://control.example/").is_ok()
+        );
+    }
+
+    #[test]
+    fn errors_never_render_private_key_material() {
+        let root = TempDir::new().unwrap();
+        let control = ReplayingControl::default();
+        establish(root.path(), &control).unwrap();
+        let names = CredentialNames::derive(
+            &scope().session,
+            &scope().volume_id,
+            &scope().attachment_id,
+            scope().attachment_epoch,
+        )
+        .unwrap();
+        let key_path = credential_directory(root.path()).join(&names.private_key_file);
+        let private_key = std::fs::read(&key_path).unwrap();
+        std::fs::write(&key_path, b"-----BEGIN PRIVATE KEY-----\nbroken\n").unwrap();
+
+        let error = load(
+            root.path(),
+            &scope().volume_id,
+            &scope().attachment_id,
+            scope().attachment_epoch,
+        )
+        .unwrap_err();
+        let rendered = format!("{error} {error:?}");
+        assert!(!contains(
+            rendered.as_bytes(),
+            key_material_probe(&private_key)
+        ));
+        assert!(matches!(
+            error,
+            ObjectWriteCredentialError::Corrupt {
+                reason: "private key is not a canonical PKCS#8 v2 Ed25519 key",
+                ..
+            }
+        ));
+
+        let store = ObjectWriteCredentialStore::open(root.path()).unwrap();
+        assert!(format!("{store:?}").find("PRIVATE KEY").is_none());
+    }
+}
