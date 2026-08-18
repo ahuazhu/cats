@@ -1711,7 +1711,7 @@ impl ObjectWriteCredentialUnavailable {
 /// The Node's authority to mint and destroy the attachment-scoped object-write
 /// credential one serving grant needs before it may publish.
 ///
-/// The reconciler holds this instead of an [`ObjectWriteCredentialStore`] so a
+/// The reconciler holds this instead of a crate-private `ObjectWriteCredentialStore` so a
 /// grant path never learns the state-directory layout, the A19 Node signer or
 /// the registration transport, and so the private half of a credential cannot
 /// escape this module: `establish` returns only the public reference a
