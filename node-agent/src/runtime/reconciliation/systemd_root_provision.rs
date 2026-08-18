@@ -692,14 +692,12 @@ fn build_launch_with_authorization(
     // mutation by IAM, so blockd refuses to start without the one path it may
     // publish through — the serving launch carried these three arguments while
     // this one did not, which stopped every Cat at its root disk.
-    if let Some(gateway) = config.blockd.object_write_gateway.as_ref() {
-        arguments.push(OsString::from("--object-write-gateway-url"));
-        arguments.push(OsString::from(&gateway.gateway_url));
-        arguments.push(OsString::from("--object-write-credential-directory"));
-        arguments.push(gateway.credential_directory.clone().into_os_string());
-        arguments.push(OsString::from("--object-write-gateway-ca-file"));
-        arguments.push(gateway.server_ca_bundle_file.clone().into_os_string());
-    }
+    arguments.extend(
+        super::authorized_blockd::object_write_publish_path_arguments(
+            config.blockd.object_write_gateway.as_ref(),
+            config.blockd.object_write_gateway.is_some(),
+        )?,
+    );
     Ok(TransientServiceLaunch {
         unit_id: expected.scope_id.clone(),
         cgroup_path: expected.cgroup_path.clone(),

@@ -347,6 +347,16 @@ impl PrepareDeviceHandoffReady {
         for option in config.object_store.config.to_cli() {
             command.arg("--object-store-option").arg(option);
         }
+        // The sealed Root serving handoff is the launch blockd reads its
+        // authorization from, and that record binds the object-write credential.
+        // Decide the publish path from the same attachment so the argv and the
+        // record cannot disagree.
+        command.args(
+            super::authorized_blockd::object_write_publish_path_arguments(
+                config.object_write_gateway.as_ref(),
+                attachment.object_write_credential.is_some(),
+            )?,
+        );
         command.env_remove("CATS_CRASH_POINT");
         self.assert_current(checkpoint, desired, authority)?;
         Ok(command)
@@ -3875,6 +3885,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[cfg(not(target_os = "linux"))]
+    use cats_api::object_write_gateway::ObjectWriteCredentialReference;
     use cats_api::runtime_reconciliation::NodeBootId;
     use cats_api::runtime_reconciliation::{
         decode_runtime_checkpoint, spec_digest, AdmissionInventoryAttestation, AgentSession,
@@ -7062,6 +7073,16 @@ mod tests {
     }
 
     fn fixture_with_guest_config_digest(guest_config_digest: Sha256Digest) -> Fixture {
+        fixture_with_guest_config_digest_and_credential(guest_config_digest, None)
+    }
+
+    /// A Node that composed the ObjectWrite Gateway mints a credential and binds
+    /// it into the acquire-time attachment, so every launch built from that
+    /// attachment must carry the publish path.
+    fn fixture_with_guest_config_digest_and_credential(
+        guest_config_digest: Sha256Digest,
+        object_write_credential: Option<ObjectWriteCredentialReference>,
+    ) -> Fixture {
         let root = tempfile::tempdir().expect("create serving handoff fixture");
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let state_directory = StateDirectory::unanchored(root.path().to_path_buf());
@@ -7147,7 +7168,7 @@ mod tests {
                 node_id: desired.placement.node_id.clone(),
                 placement_epoch,
             },
-            object_write_credential: None,
+            object_write_credential,
             size_bytes: volume.size_bytes,
             durability: volume.durability,
             head: blank_head(),
@@ -7863,6 +7884,139 @@ mod tests {
                 &fixture.authority.volume,
             )
             .is_err());
+    }
+
+    /// IAM denies a production worker direct ChunkStore mutation, so blockd
+    /// refuses to start when its attachment binds an object-write credential and
+    /// the launch omits the gateway path. This sealed Root serving builder never
+    /// emitted those three arguments, so every Cat whose Node had minted a
+    /// credential looped `EffectRefreshInventory` while the serving unit died on
+    /// `--object-write-gateway-url is required`, with the effect reporting only a
+    /// refresh. Assert the launch carries the path, and that a credential without
+    /// a composed gateway fails the launch instead of starting a blockd that
+    /// cannot publish.
+    #[test]
+    fn sealed_root_serving_command_carries_the_object_write_publish_path() {
+        let mut fixture = fixture_with_guest_config_digest_and_credential(
+            Sha256Digest::new(
+                "sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2",
+            )
+            .unwrap(),
+            Some(ObjectWriteCredentialReference {
+                credential_id: id("owcred1_publish"),
+                public_key_spki_sha256: Sha256Digest::from_bytes([9; 32]),
+            }),
+        );
+        advance_fixture_to_prepare_device(&mut fixture);
+        let retained = AuthorizedBlockdStore::new(fixture.state_directory.clone())
+            .retain_prepare_device_handoff(
+                fixture.stored_checkpoint.checkpoint(),
+                &fixture.acquired.desired,
+            )
+            .expect("retain exact PrepareDevice attachment inputs");
+        let ready = fixture
+            .store()
+            .reopen_prepare_device_handoff(
+                fixture.stored_checkpoint.checkpoint(),
+                &fixture.acquired.desired,
+                &fixture.authority.volume,
+                retained,
+            )
+            .expect("reopen sealed PrepareDevice handoff");
+        assert!(
+            ready.attempt().attachment.object_write_credential.is_some(),
+            "this fixture must bind a credential, or the assertion below is vacuous"
+        );
+
+        let mut config = AuthorizedBlockdLaunchConfig {
+            blockd_binary: PathBuf::from(fixture.expected_executable_path.as_str()),
+            metadata_store: AdapterSelection::new(
+                "postgres",
+                AdapterConfig::from_pairs([("url-file", "/run/cats/postgres-url")]).unwrap(),
+            ),
+            object_store: AdapterSelection::new(
+                "aws-s3",
+                AdapterConfig::from_pairs([("bucket", "cats-runtime-test")]).unwrap(),
+            ),
+            max_staged_bytes: 101,
+            max_staged_packs: 102,
+            max_local_bytes: 103,
+            object_write_gateway: None,
+        };
+        config.object_write_gateway =
+            Some(super::super::authorized_blockd::ObjectWriteGatewayLaunch {
+                gateway_url: "https://gateway.object-write.internal".to_owned(),
+                credential_directory: PathBuf::from(
+                    "/var/lib/cats/node/n1/object-write-credentials",
+                ),
+                server_ca_bundle_file: PathBuf::from(
+                    "/etc/cats/route-v2/node-server-ca-bundle.pem",
+                ),
+            });
+        let command = ready
+            .authorized_serving_command(
+                &config,
+                fixture.stored_checkpoint.checkpoint(),
+                &fixture.acquired.desired,
+                &fixture.authority.volume,
+            )
+            .expect("sealed Root serving command builds with a composed gateway");
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for (flag, value) in [
+            (
+                "--object-write-gateway-url",
+                "https://gateway.object-write.internal",
+            ),
+            (
+                "--object-write-credential-directory",
+                "/var/lib/cats/node/n1/object-write-credentials",
+            ),
+            (
+                "--object-write-gateway-ca-file",
+                "/etc/cats/route-v2/node-server-ca-bundle.pem",
+            ),
+        ] {
+            let position = arguments
+                .iter()
+                .position(|argument| argument == flag)
+                .unwrap_or_else(|| panic!("sealed Root serving must pass {flag}"));
+            assert_eq!(
+                arguments[position + 1],
+                value,
+                "{flag} must carry the composed value"
+            );
+        }
+
+        let mut ungated = AuthorizedBlockdLaunchConfig {
+            blockd_binary: PathBuf::from(fixture.expected_executable_path.as_str()),
+            metadata_store: AdapterSelection::new(
+                "postgres",
+                AdapterConfig::from_pairs([("url-file", "/run/cats/postgres-url")]).unwrap(),
+            ),
+            object_store: AdapterSelection::new(
+                "aws-s3",
+                AdapterConfig::from_pairs([("bucket", "cats-runtime-test")]).unwrap(),
+            ),
+            max_staged_bytes: 101,
+            max_staged_packs: 102,
+            max_local_bytes: 103,
+            object_write_gateway: None,
+        };
+        ungated.object_write_gateway = None;
+        assert!(
+            ready
+                .authorized_serving_command(
+                    &ungated,
+                    fixture.stored_checkpoint.checkpoint(),
+                    &fixture.acquired.desired,
+                    &fixture.authority.volume,
+                )
+                .is_err(),
+            "a credentialed attachment without a composed gateway must fail the launch"
+        );
     }
 
     #[test]

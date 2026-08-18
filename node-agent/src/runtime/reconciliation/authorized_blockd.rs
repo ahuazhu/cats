@@ -8,6 +8,7 @@
 //! any observation calls the lineage serving; writing these files alone is
 //! not serving evidence.
 
+use std::ffi::OsString;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
@@ -1523,6 +1524,50 @@ pub struct ObjectWriteGatewayLaunch {
     pub server_ca_bundle_file: PathBuf,
 }
 
+/// The three arguments that name the only path a production worker may publish
+/// through.
+///
+/// IAM denies a worker direct ChunkStore mutation, so whenever an attachment
+/// binds an object-write credential blockd refuses to start without these. Three
+/// separate launch paths build blockd argv — root provision, the sealed Root
+/// serving handoff, and a direct authorized attachment — and each of the first
+/// two shipped once with the arguments missing, stopping every Cat at its root
+/// disk with a message naming only `--object-write-gateway-url`. Keep the flag
+/// names and the absolute-path contract in this one function so a fourth launch
+/// path cannot omit them silently.
+///
+/// `required` differs by launch path and each caller owns that judgement: a
+/// serving launch requires the path exactly when its attachment binds a
+/// credential, while root provision runs before any attachment record exists and
+/// requires it whenever the Node composed a gateway at all.
+pub(crate) fn object_write_publish_path_arguments(
+    gateway: Option<&ObjectWriteGatewayLaunch>,
+    required: bool,
+) -> Result<Vec<OsString>> {
+    if !required {
+        return Ok(Vec::new());
+    }
+    let gateway = gateway.context(
+        "authorized attachment carries an object-write credential but this Node has no ObjectWrite Gateway launch configuration",
+    )?;
+    anyhow::ensure!(
+        gateway.credential_directory.is_absolute(),
+        "object-write credential directory must be absolute"
+    );
+    anyhow::ensure!(
+        gateway.server_ca_bundle_file.is_absolute(),
+        "object-write gateway server CA bundle path must be absolute"
+    );
+    Ok(vec![
+        OsString::from("--object-write-gateway-url"),
+        OsString::from(&gateway.gateway_url),
+        OsString::from("--object-write-credential-directory"),
+        gateway.credential_directory.clone().into_os_string(),
+        OsString::from("--object-write-gateway-ca-file"),
+        gateway.server_ca_bundle_file.clone().into_os_string(),
+    ])
+}
+
 /// Exactly one Guest block frontend for the first Running slice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthorizedBlockFrontend {
@@ -1720,26 +1765,10 @@ fn build_authorized_blockd_command(
     // minted one launches exactly the command it launched before this field
     // existed, and a credential that cannot be reached fails the launch rather
     // than starting a process that cannot publish.
-    if attachment.object_write_credential.is_some() {
-        let gateway = config.object_write_gateway.as_ref().context(
-            "authorized attachment carries an object-write credential but this Node has no ObjectWrite Gateway launch configuration",
-        )?;
-        anyhow::ensure!(
-            gateway.credential_directory.is_absolute(),
-            "object-write credential directory must be absolute"
-        );
-        anyhow::ensure!(
-            gateway.server_ca_bundle_file.is_absolute(),
-            "object-write gateway server CA bundle path must be absolute"
-        );
-        command
-            .arg("--object-write-gateway-url")
-            .arg(&gateway.gateway_url)
-            .arg("--object-write-credential-directory")
-            .arg(&gateway.credential_directory)
-            .arg("--object-write-gateway-ca-file")
-            .arg(&gateway.server_ca_bundle_file);
-    }
+    command.args(object_write_publish_path_arguments(
+        config.object_write_gateway.as_ref(),
+        attachment.object_write_credential.is_some(),
+    )?);
 
     // Crash injection belongs only to explicit blockd tests. A production
     // Node never forwards an ambient value across this signed seam.
