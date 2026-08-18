@@ -426,10 +426,15 @@ pub(crate) enum RuntimeEffectSection {
     ServingHandoff,
     RootProvision,
     NormalAcquire,
+    // Steps inside the kernel-NBD attach. Production wedges there, and the
+    // sub-effect name alone still leaves several blocking-capable calls.
+    CheckpointStore,
+    KernelNbdClientCleanup,
+    KernelNbdClientSubmit,
 }
 
 impl RuntimeEffectSection {
-    const ALL: [Self; 21] = [
+    const ALL: [Self; 24] = [
         Self::Running,
         Self::NodeGlobalEffectGate,
         Self::KernelNbdAllocator,
@@ -451,6 +456,9 @@ impl RuntimeEffectSection {
         Self::ServingHandoff,
         Self::RootProvision,
         Self::NormalAcquire,
+        Self::CheckpointStore,
+        Self::KernelNbdClientCleanup,
+        Self::KernelNbdClientSubmit,
     ];
 
     fn name(self) -> &'static str {
@@ -476,6 +484,9 @@ impl RuntimeEffectSection {
             Self::ServingHandoff => "serving handoff",
             Self::RootProvision => "root provision",
             Self::NormalAcquire => "normal acquire",
+            Self::CheckpointStore => "checkpoint store",
+            Self::KernelNbdClientCleanup => "kernel-NBD client cleanup",
+            Self::KernelNbdClientSubmit => "kernel-NBD client submit",
         }
     }
 }
