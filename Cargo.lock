@@ -1415,6 +1415,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "cats-object-store-gateway"
+version = "0.1.0"
+dependencies = [
+ "cats-api",
+ "cats-storage",
+ "reqwest",
+ "ring",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
 name = "cats-object-write-gateway-daemon"
 version = "0.1.0"
 dependencies = [
