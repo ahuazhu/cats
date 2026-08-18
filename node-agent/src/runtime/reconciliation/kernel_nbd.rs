@@ -2061,7 +2061,10 @@ where
         // guard, matching reservation's lock order. It remains held across
         // the command and post-scan, so two cooperating attaches cannot both
         // observe one slot as Free.
-        let permit = self.inventory.lock_and_inspect(context)?;
+        let permit = context.in_section(
+            crate::runtime_spine::RuntimeEffectSection::KernelNbdAllocator,
+            || self.inventory.lock_and_inspect(context),
+        )?;
         let context_state_root = context
             .state_directory()
             .try_clone_directory()
@@ -2130,10 +2133,17 @@ where
         // ioctl while sysfs remains Free. Settle the runtime-owned registry
         // under the same Node-global flock and conservatively block every new
         // attach until no late client can race this submission.
-        self.cleanup_owner
-            .poll_reap()
+        context
+            .in_section(
+                crate::runtime_spine::RuntimeEffectSection::KernelNbdClientCleanup,
+                || self.cleanup_owner.poll_reap(),
+            )
             .context("poll prior kernel-NBD client cleanup before attach")?;
-        if self.cleanup_owner.pending_count() > 0 {
+        if context.in_section(
+            crate::runtime_spine::RuntimeEffectSection::KernelNbdClientCleanup,
+            || self.cleanup_owner.pending_count(),
+        ) > 0
+        {
             // This accepted call cannot submit while an earlier owned child is
             // unsettled. An unlock failure is still terminally unknown rather
             // than authority to retry this batch.
@@ -2142,6 +2152,7 @@ where
         }
         context.check_active()?;
 
+        context.enter_section(crate::runtime_spine::RuntimeEffectSection::KernelNbdClientSubmit);
         let submission = match self.submitter.submit(
             &self.inventory.config,
             &checkpoint_request,
@@ -2575,11 +2586,17 @@ impl KernelNbdAttachEffect {
             return refresh("checkpoint evidence is not valid");
         };
         let checkpoint_directory = context.state_directory().path().join(CHECKPOINT_NAMESPACE);
-        let store = FileCheckpointStore::open_preserving_checkpoint_temp(
-            &checkpoint_directory,
-            &desired.cat_id,
-        )
-        .context("open kernel-NBD attach checkpoint")?;
+        let store = context
+            .in_section(
+                crate::runtime_spine::RuntimeEffectSection::CheckpointStore,
+                || {
+                    FileCheckpointStore::open_preserving_checkpoint_temp(
+                        &checkpoint_directory,
+                        &desired.cat_id,
+                    )
+                },
+            )
+            .context("open kernel-NBD attach checkpoint")?;
         anyhow::ensure!(
             store.path() == Path::new(checkpoint_path.as_str()),
             "kernel-NBD admission names another checkpoint path"
@@ -2664,7 +2681,10 @@ impl KernelNbdAttachEffect {
                     RuntimeDesiredEffectStopReason::LocalContract,
                 )));
             }
-            let first_authority = match self.authority.load_volume(&device.volume_id) {
+            let first_authority = match context.in_section(
+                crate::runtime_spine::RuntimeEffectSection::VolumeAuthority,
+                || self.authority.load_volume(&device.volume_id),
+            ) {
                 Ok(authority) => authority,
                 Err(error) => {
                     return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory_after(
