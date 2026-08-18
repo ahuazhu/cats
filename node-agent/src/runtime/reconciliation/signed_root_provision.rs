@@ -383,59 +383,73 @@ impl RuntimeDesiredEffect for SignedRunningEffect {
         desired: &DesiredRuntimeSpec,
     ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
         if let Some(running_admission) = &self.running_admission {
+            context
+                .enter_section(crate::runtime_spine::RuntimeEffectSection::RunningAdmissionRetire);
             if let Some(outcome) = running_admission.try_retire(&context, desired)? {
                 return Ok(outcome);
             }
+            context.enter_section(crate::runtime_spine::RuntimeEffectSection::RunningAdmission);
             if let Some(outcome) = running_admission.try_apply(&context, desired)? {
                 return Ok(outcome);
             }
         }
         if let Some(lifecycle) = &self.lifecycle {
+            context.enter_section(crate::runtime_spine::RuntimeEffectSection::Lifecycle);
             if let Some(outcome) = lifecycle.try_apply(&context, desired)? {
                 return Ok(outcome);
             }
         }
         if let Some(prepare_device_retirement) = &self.prepare_device_retirement {
+            context
+                .enter_section(crate::runtime_spine::RuntimeEffectSection::PrepareDeviceRetirement);
             if let Some(outcome) = prepare_device_retirement.try_apply(&context, desired)? {
                 return Ok(outcome);
             }
         }
         if let Some(serving_process) = &self.serving_process {
+            context.enter_section(crate::runtime_spine::RuntimeEffectSection::ServingProcess);
             if let Some(outcome) = serving_process.try_apply(&context, desired)? {
                 return Ok(outcome);
             }
         }
         if let Some(kernel_nbd_attach) = &self.kernel_nbd_attach {
+            context.enter_section(crate::runtime_spine::RuntimeEffectSection::KernelNbdAttach);
             if let Some(outcome) = kernel_nbd_attach.try_apply(&context, desired)? {
                 return Ok(outcome);
             }
         }
         if let Some(prepare_network) = &self.prepare_network {
+            context.enter_section(crate::runtime_spine::RuntimeEffectSection::PrepareNetwork);
             if let Some(outcome) = prepare_network.try_apply(&context, desired)? {
                 return Ok(outcome);
             }
         }
         if let Some(start_runtime) = &self.start_runtime {
+            context.enter_section(crate::runtime_spine::RuntimeEffectSection::StartRuntime);
             if let Some(outcome) = start_runtime.try_apply(&context, desired)? {
                 return Ok(outcome);
             }
         }
         if let Some(persistent_filesystem) = &self.persistent_filesystem {
+            context.enter_section(crate::runtime_spine::RuntimeEffectSection::PersistentFilesystem);
             if let Some(outcome) = persistent_filesystem.try_apply(&context, desired)? {
                 return Ok(outcome);
             }
         }
         if let Some(physical_start_runtime) = &self.physical_start_runtime {
+            context.enter_section(crate::runtime_spine::RuntimeEffectSection::PhysicalStartRuntime);
             if let Some(outcome) = physical_start_runtime.try_apply(&context, desired)? {
                 return Ok(outcome);
             }
         }
+        context.enter_section(crate::runtime_spine::RuntimeEffectSection::PrepareDeviceDirect);
         if let Some(outcome) = self
             .prepare_device
             .try_persist_direct_existing(&context, desired)?
         {
             return Ok(outcome);
         }
+        context.enter_section(crate::runtime_spine::RuntimeEffectSection::ServingHandoff);
         match self.handoff.try_apply(&context, desired)? {
             ServingHandoffEffectProgress::NotApplicable => {}
             ServingHandoffEffectProgress::RefreshInventory => {
@@ -446,6 +460,7 @@ impl RuntimeDesiredEffect for SignedRunningEffect {
                 return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
             }
         }
+        context.enter_section(crate::runtime_spine::RuntimeEffectSection::RootProvision);
         if let Some(outcome) = self.provision.try_apply(&context, desired)? {
             return Ok(outcome);
         }
@@ -456,6 +471,7 @@ impl RuntimeDesiredEffect for SignedRunningEffect {
             // pre-acquire planner, which correctly rejects later phases.
             return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
         }
+        context.enter_section(crate::runtime_spine::RuntimeEffectSection::NormalAcquire);
         self.acquire.apply(context, desired)
     }
 }

@@ -408,10 +408,28 @@ pub(crate) enum RuntimeEffectSection {
     VolumeAuthority,
     SystemdUnit,
     BlockdHandshake,
+    // One variant per dispatched sub-effect. A boundary marker alone cannot
+    // localise a wedge in an unmarked call, so the dispatcher records which
+    // sub-effect it entered and a report of `running` then means "inside this
+    // sub-effect, outside every known boundary".
+    RunningAdmissionRetire,
+    RunningAdmission,
+    Lifecycle,
+    PrepareDeviceRetirement,
+    ServingProcess,
+    KernelNbdAttach,
+    PrepareNetwork,
+    StartRuntime,
+    PersistentFilesystem,
+    PhysicalStartRuntime,
+    PrepareDeviceDirect,
+    ServingHandoff,
+    RootProvision,
+    NormalAcquire,
 }
 
 impl RuntimeEffectSection {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 21] = [
         Self::Running,
         Self::NodeGlobalEffectGate,
         Self::KernelNbdAllocator,
@@ -419,6 +437,20 @@ impl RuntimeEffectSection {
         Self::VolumeAuthority,
         Self::SystemdUnit,
         Self::BlockdHandshake,
+        Self::RunningAdmissionRetire,
+        Self::RunningAdmission,
+        Self::Lifecycle,
+        Self::PrepareDeviceRetirement,
+        Self::ServingProcess,
+        Self::KernelNbdAttach,
+        Self::PrepareNetwork,
+        Self::StartRuntime,
+        Self::PersistentFilesystem,
+        Self::PhysicalStartRuntime,
+        Self::PrepareDeviceDirect,
+        Self::ServingHandoff,
+        Self::RootProvision,
+        Self::NormalAcquire,
     ];
 
     fn name(self) -> &'static str {
@@ -430,6 +462,20 @@ impl RuntimeEffectSection {
             Self::VolumeAuthority => "Volume authority",
             Self::SystemdUnit => "systemd unit",
             Self::BlockdHandshake => "blockd handshake",
+            Self::RunningAdmissionRetire => "running admission retire",
+            Self::RunningAdmission => "running admission",
+            Self::Lifecycle => "lifecycle step",
+            Self::PrepareDeviceRetirement => "PrepareDevice retirement",
+            Self::ServingProcess => "serving process",
+            Self::KernelNbdAttach => "kernel-NBD attach",
+            Self::PrepareNetwork => "PrepareNetwork",
+            Self::StartRuntime => "StartRuntime",
+            Self::PersistentFilesystem => "persistent filesystem",
+            Self::PhysicalStartRuntime => "physical StartRuntime",
+            Self::PrepareDeviceDirect => "PrepareDevice direct persist",
+            Self::ServingHandoff => "serving handoff",
+            Self::RootProvision => "root provision",
+            Self::NormalAcquire => "normal acquire",
         }
     }
 }
@@ -4475,12 +4521,22 @@ mod tests {
         );
 
         // Every variant round-trips, so a new boundary cannot silently render
-        // as `running` and read as "not in a boundary".
+        // as `running` and read as "not in a boundary". A duplicated index would
+        // make one section report as another, which is worse than no marker.
         for section in RuntimeEffectSection::ALL {
             enter_effect_section(worker, section);
             assert_eq!(current_effect_section(worker), section);
             assert!(!section.name().is_empty());
         }
+        let names = RuntimeEffectSection::ALL
+            .iter()
+            .map(|section| section.name())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            names.len(),
+            RuntimeEffectSection::ALL.len(),
+            "every section renders a distinct name"
+        );
     }
 
     /// A refresh is the reconciler's only bridge back to a full scan, so a
