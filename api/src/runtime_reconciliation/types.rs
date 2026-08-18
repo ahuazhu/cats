@@ -133,6 +133,14 @@ pub(crate) fn valid_ascii_text(value: &str) -> bool {
     (1..=512).contains(&value.len()) && printable_ascii(value)
 }
 
+/// The closed shape of an assigned object-write writer-authority ID: the one
+/// version prefix followed by the SHA-256 of its exact binding preimage.
+pub(crate) fn valid_object_write_writer_authority_id(value: &str) -> bool {
+    value
+        .strip_prefix("owa1_")
+        .is_some_and(|digest| digest.len() == 64 && lowercase_hex(digest))
+}
+
 pub(crate) fn valid_json_pointer(value: &str) -> bool {
     if value.len() > 512 || !printable_ascii(value) {
         return false;
@@ -531,6 +539,17 @@ pub enum RuntimeNodeAuthorityMutation {
         expected_credential_id: Id,
         expected_credential_binding: PublicKeyCredentialBinding,
     },
+    /// Opens the one Host-scoped object-write writer authority this Node's
+    /// attachment credentials register against. The operator states only the
+    /// object-store side of the binding; Control derives the Host identity,
+    /// the assigned authority ID and the empty accepted-sequence state from
+    /// the Node's own provisioned identity.
+    ProvisionObjectWriteAuthority {
+        expected_policy_revision: Epoch,
+        object_provider_scope: ProviderScope,
+        workload_principal_id: AsciiText,
+        object_store_scope_id: AsciiText,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -540,6 +559,7 @@ pub enum RuntimeNodeAuthorityOutcome {
     PolicyUpdated,
     CredentialRotated,
     Retired,
+    ObjectWriteAuthorityProvisioned,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -551,6 +571,12 @@ pub struct RuntimeNodeAuthorityApplyResult {
     pub outcome: RuntimeNodeAuthorityOutcome,
     pub identity_state: NodeIdentityState,
     pub policy_revision: Epoch,
+    /// Present exactly for [`RuntimeNodeAuthorityOutcome::ObjectWriteAuthorityProvisioned`].
+    /// Control assigns this ID and no caller may choose it. The Node cannot
+    /// derive it either, so it reads its own assigned authority back from
+    /// Control rather than carrying it as configuration.
+    #[serde(default)]
+    pub writer_authority_id: Option<Id>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

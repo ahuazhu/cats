@@ -24,6 +24,12 @@ use crate::runtime_reconciliation::{
 pub const OBJECT_WRITE_GATEWAY_PATH: &str = "/v1/internal/runtime/object-writes";
 pub const OBJECT_WRITE_CREDENTIAL_REGISTRATION_PATH: &str =
     "/v1/internal/runtime/object-write-credentials";
+/// Exact Control route on which one authenticated Node reads its *own*
+/// object-write writer authority. It is a Control management route, not a
+/// Gateway route: the row lives in Control and the Node authenticates with the
+/// same A19 proof it uses for every other `/v1/internal/runtime/...` call.
+pub const OBJECT_WRITE_WRITER_AUTHORITY_READ_PATH: &str =
+    "/v1/internal/runtime/object-write-authority-reads";
 pub const OBJECT_WRITE_GATEWAY_METHOD: &str = "POST";
 pub const OBJECT_WRITE_GATEWAY_CONTENT_TYPE: &str = "application/octet-stream";
 pub const OBJECT_WRITE_CREDENTIAL_REGISTRATION_CONTENT_TYPE: &str = "application/json";
@@ -34,6 +40,8 @@ pub const OBJECT_WRITE_SIGNATURE_HEADER: &str = "cats-object-write-signature";
 pub const OBJECT_WRITE_DESCRIPTOR_MAX_BYTES: usize = 16 * 1024;
 pub const OBJECT_WRITE_BODY_MAX_BYTES: usize = 32 * 1024 * 1024;
 pub const OBJECT_WRITE_REGISTERED_ARTIFACT_MAX_BYTES: usize = 32 * 1024;
+pub const OBJECT_WRITE_WRITER_AUTHORITY_READ_MAX_WIRE_BYTES: usize = 4 * 1024;
+pub const OBJECT_WRITE_WRITER_AUTHORITY_VIEW_MAX_WIRE_BYTES: usize = 4 * 1024;
 pub const OBJECT_WRITE_QUALIFICATION_AUTHORIZATION_MAX_BYTES: usize = 16 * 1024;
 pub const OBJECT_WRITE_QUALIFICATION_RESPONSE_LOSS_MAX_BYTES: usize = 32 * 1024;
 pub const OBJECT_WRITE_QUALIFICATION_HEAD_EVIDENCE_MAX_BYTES: usize = 16 * 1024;
@@ -397,6 +405,8 @@ pub enum ObjectWriteGatewayContractError {
     InvalidCredentialRegistration,
     #[error("object-write receipt is malformed or noncanonical")]
     InvalidReceipt,
+    #[error("object-write writer authority read or view is malformed or noncanonical")]
+    InvalidWriterAuthorityRead,
 }
 
 impl From<RequestProofError> for ObjectWriteGatewayContractError {
@@ -748,6 +758,163 @@ pub fn decode_object_write_credential_registered_artifact(
         return Err(ObjectWriteGatewayContractError::InvalidCredentialRegistration);
     }
     Ok(artifact)
+}
+
+/// One Node asking Control which object-write writer authority its *own*
+/// attachment credentials register under.
+///
+/// The request names only the asking Node's current Agent session. It carries
+/// no authority ID, no Host identity and no other Node: Control derives the
+/// answer from the authenticated A19 credential and refuses a session that is
+/// not this credential's exact current one. A Node therefore cannot read
+/// another Node's authority, and cannot assert an authority it was configured
+/// with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectWriteWriterAuthorityRead {
+    pub version: ContractVersion,
+    pub session: SessionBinding,
+}
+
+/// The complete closed set of answers to that read.
+///
+/// `Absent` is a typed answer, not an error: an operator has not run
+/// `object-write-authority provision` for this Host yet. Every non-`Open`
+/// answer must fail an object-write credential path closed; only `Open`
+/// accepts a registration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ObjectWriteWriterAuthorityStateV1 {
+    Absent,
+    Open { writer_authority_id: Id },
+    CutoffPending { writer_authority_id: Id },
+    CutoffComplete { writer_authority_id: Id },
+}
+
+impl ObjectWriteWriterAuthorityStateV1 {
+    /// The authority ID a registration may name. `None` for every state in
+    /// which Control would refuse the registration anyway, so a caller cannot
+    /// accidentally publish under a cut-off writer.
+    pub fn open_writer_authority_id(&self) -> Option<&Id> {
+        match self {
+            Self::Open {
+                writer_authority_id,
+            } => Some(writer_authority_id),
+            Self::Absent | Self::CutoffPending { .. } | Self::CutoffComplete { .. } => None,
+        }
+    }
+
+    /// Stable lowercase wire spelling of the state, for an operator-facing
+    /// message. It never carries the authority ID.
+    pub fn state_name(&self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Open { .. } => "open",
+            Self::CutoffPending { .. } => "cutoff_pending",
+            Self::CutoffComplete { .. } => "cutoff_complete",
+        }
+    }
+}
+
+/// Control's answer, echoing the exact session it was resolved for so a caller
+/// can reject a response that belongs to another session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectWriteWriterAuthorityView {
+    pub version: ContractVersion,
+    pub session: SessionBinding,
+    pub authority: ObjectWriteWriterAuthorityStateV1,
+}
+
+fn validate_writer_authority_read(
+    request: &ObjectWriteWriterAuthorityRead,
+) -> Result<(), ObjectWriteGatewayContractError> {
+    if request.version != ContractVersion::V1 {
+        return Err(ObjectWriteGatewayContractError::InvalidWriterAuthorityRead);
+    }
+    Ok(())
+}
+
+fn validate_writer_authority_view(
+    view: &ObjectWriteWriterAuthorityView,
+) -> Result<(), ObjectWriteGatewayContractError> {
+    if view.version != ContractVersion::V1 {
+        return Err(ObjectWriteGatewayContractError::InvalidWriterAuthorityRead);
+    }
+    let assigned = match &view.authority {
+        ObjectWriteWriterAuthorityStateV1::Absent => None,
+        ObjectWriteWriterAuthorityStateV1::Open {
+            writer_authority_id,
+        }
+        | ObjectWriteWriterAuthorityStateV1::CutoffPending {
+            writer_authority_id,
+        }
+        | ObjectWriteWriterAuthorityStateV1::CutoffComplete {
+            writer_authority_id,
+        } => Some(writer_authority_id),
+    };
+    // Only Control assigns this ID and its shape is closed, so a value that is
+    // not `owa1_<64 lowercase hex>` cannot have come from the derivation.
+    if assigned.is_some_and(|id| {
+        !crate::runtime_reconciliation::valid_object_write_writer_authority_id(id.as_str())
+    }) {
+        return Err(ObjectWriteGatewayContractError::InvalidWriterAuthorityRead);
+    }
+    Ok(())
+}
+
+pub fn encode_object_write_writer_authority_read(
+    request: &ObjectWriteWriterAuthorityRead,
+) -> Result<Vec<u8>, ObjectWriteGatewayContractError> {
+    validate_writer_authority_read(request)?;
+    let bytes = serde_json::to_vec(request)
+        .map_err(|_| ObjectWriteGatewayContractError::InvalidWriterAuthorityRead)?;
+    if bytes.len() > OBJECT_WRITE_WRITER_AUTHORITY_READ_MAX_WIRE_BYTES {
+        return Err(ObjectWriteGatewayContractError::InvalidWriterAuthorityRead);
+    }
+    Ok(bytes)
+}
+
+pub fn decode_object_write_writer_authority_read(
+    bytes: &[u8],
+) -> Result<ObjectWriteWriterAuthorityRead, ObjectWriteGatewayContractError> {
+    if bytes.len() > OBJECT_WRITE_WRITER_AUTHORITY_READ_MAX_WIRE_BYTES {
+        return Err(ObjectWriteGatewayContractError::InvalidWriterAuthorityRead);
+    }
+    let request: ObjectWriteWriterAuthorityRead = serde_json::from_slice(bytes)
+        .map_err(|_| ObjectWriteGatewayContractError::InvalidWriterAuthorityRead)?;
+    validate_writer_authority_read(&request)?;
+    if encode_object_write_writer_authority_read(&request)? != bytes {
+        return Err(ObjectWriteGatewayContractError::InvalidWriterAuthorityRead);
+    }
+    Ok(request)
+}
+
+pub fn encode_object_write_writer_authority_view(
+    view: &ObjectWriteWriterAuthorityView,
+) -> Result<Vec<u8>, ObjectWriteGatewayContractError> {
+    validate_writer_authority_view(view)?;
+    let bytes = serde_json::to_vec(view)
+        .map_err(|_| ObjectWriteGatewayContractError::InvalidWriterAuthorityRead)?;
+    if bytes.len() > OBJECT_WRITE_WRITER_AUTHORITY_VIEW_MAX_WIRE_BYTES {
+        return Err(ObjectWriteGatewayContractError::InvalidWriterAuthorityRead);
+    }
+    Ok(bytes)
+}
+
+pub fn decode_object_write_writer_authority_view(
+    bytes: &[u8],
+) -> Result<ObjectWriteWriterAuthorityView, ObjectWriteGatewayContractError> {
+    if bytes.len() > OBJECT_WRITE_WRITER_AUTHORITY_VIEW_MAX_WIRE_BYTES {
+        return Err(ObjectWriteGatewayContractError::InvalidWriterAuthorityRead);
+    }
+    let view: ObjectWriteWriterAuthorityView = serde_json::from_slice(bytes)
+        .map_err(|_| ObjectWriteGatewayContractError::InvalidWriterAuthorityRead)?;
+    validate_writer_authority_view(&view)?;
+    if encode_object_write_writer_authority_view(&view)? != bytes {
+        return Err(ObjectWriteGatewayContractError::InvalidWriterAuthorityRead);
+    }
+    Ok(view)
 }
 
 /// Stable credential identity for one exact session-bound attachment.
@@ -2200,6 +2367,124 @@ mod tests {
         assert_eq!(
             encode_object_write_qualification_ambiguity_receipt(&wrong_catalog),
             Err(ObjectWriteGatewayContractError::InvalidReceipt)
+        );
+    }
+
+    fn session_binding(epoch: u64) -> SessionBinding {
+        SessionBinding {
+            node_id: id("node_a"),
+            node_boot_id: NodeBootId::new("1".repeat(32)).unwrap(),
+            agent_instance_id: RandomId128::new("2".repeat(32)).unwrap(),
+            agent_session_epoch: Epoch::new(epoch).unwrap(),
+        }
+    }
+
+    fn assigned_authority_id() -> Id {
+        id(&format!("owa1_{}", "5b".repeat(32)))
+    }
+
+    /// The read is only a session; there is deliberately no field in which a
+    /// caller could assert an authority ID or another Node.
+    #[test]
+    fn a_writer_authority_read_round_trips_and_rejects_noncanonical_bytes() {
+        let request = ObjectWriteWriterAuthorityRead {
+            version: ContractVersion::V1,
+            session: session_binding(7),
+        };
+        let bytes = encode_object_write_writer_authority_read(&request).unwrap();
+        assert_eq!(
+            decode_object_write_writer_authority_read(&bytes).unwrap(),
+            request
+        );
+
+        let mut padded = bytes.clone();
+        padded.push(b' ');
+        assert_eq!(
+            decode_object_write_writer_authority_read(&padded),
+            Err(ObjectWriteGatewayContractError::InvalidWriterAuthorityRead)
+        );
+        assert_eq!(
+            decode_object_write_writer_authority_read(
+                br#"{"version":"v1","session":null,"writer_authority_id":"owa1_x"}"#
+            ),
+            Err(ObjectWriteGatewayContractError::InvalidWriterAuthorityRead),
+            "the read contract has no authority field to assert"
+        );
+        assert_eq!(
+            decode_object_write_writer_authority_read(&[]),
+            Err(ObjectWriteGatewayContractError::InvalidWriterAuthorityRead)
+        );
+    }
+
+    /// Every closed answer round-trips, and only Control's derived ID shape is
+    /// representable: a caller-chosen value is not decodable at all.
+    #[test]
+    fn every_writer_authority_state_round_trips_and_only_open_yields_an_id() {
+        for authority in [
+            ObjectWriteWriterAuthorityStateV1::Absent,
+            ObjectWriteWriterAuthorityStateV1::Open {
+                writer_authority_id: assigned_authority_id(),
+            },
+            ObjectWriteWriterAuthorityStateV1::CutoffPending {
+                writer_authority_id: assigned_authority_id(),
+            },
+            ObjectWriteWriterAuthorityStateV1::CutoffComplete {
+                writer_authority_id: assigned_authority_id(),
+            },
+        ] {
+            let open = matches!(authority, ObjectWriteWriterAuthorityStateV1::Open { .. });
+            let view = ObjectWriteWriterAuthorityView {
+                version: ContractVersion::V1,
+                session: session_binding(7),
+                authority: authority.clone(),
+            };
+            let bytes = encode_object_write_writer_authority_view(&view).unwrap();
+            assert_eq!(
+                decode_object_write_writer_authority_view(&bytes).unwrap(),
+                view
+            );
+            assert_eq!(
+                authority.open_writer_authority_id().is_some(),
+                open,
+                "only an open authority may hand out an ID to register under"
+            );
+            assert!(bytes
+                .windows(authority.state_name().len())
+                .any(|window| window == authority.state_name().as_bytes()));
+        }
+    }
+
+    #[test]
+    fn a_view_whose_authority_id_is_not_controls_derivation_is_refused() {
+        for rejected in [
+            "writer_a",
+            "owa1_",
+            &format!("owa1_{}", "5B".repeat(32)),
+            &format!("owa1_{}", "5b".repeat(31)),
+        ] {
+            let view = ObjectWriteWriterAuthorityView {
+                version: ContractVersion::V1,
+                session: session_binding(7),
+                authority: ObjectWriteWriterAuthorityStateV1::Open {
+                    writer_authority_id: id(rejected),
+                },
+            };
+            assert_eq!(
+                encode_object_write_writer_authority_view(&view),
+                Err(ObjectWriteGatewayContractError::InvalidWriterAuthorityRead),
+                "{rejected} is not an assigned writer authority ID"
+            );
+        }
+        // Calibration: the derived shape encodes.
+        assert!(
+            encode_object_write_writer_authority_view(&ObjectWriteWriterAuthorityView {
+                version: ContractVersion::V1,
+                session: session_binding(7),
+                authority: ObjectWriteWriterAuthorityStateV1::Open {
+                    writer_authority_id: assigned_authority_id(),
+                },
+            })
+            .is_ok()
         );
     }
 }

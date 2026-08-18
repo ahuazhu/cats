@@ -8,12 +8,12 @@ use cats_api::runtime_reconciliation::{
     canonical_ed25519_spki_sha256, encode_node_placement_policy,
     encode_runtime_node_authority_apply, encode_runtime_node_authority_apply_result,
     encode_runtime_provisioner_active_set, encode_runtime_provisioner_trust_bundle,
-    runtime_provisioner_active_set_digest, Base64UrlNoPad, ContractVersion, CredentialBinding,
-    Epoch, FleetPolicyPrincipal, Id, NodeIdentity, NodeIdentityState, NodePlacementPolicy,
-    NodeTransportTarget, PublicKeyCredentialBinding, RuntimeNodeAuthorityApply,
-    RuntimeNodeAuthorityApplyRecord, RuntimeNodeAuthorityApplyResult, RuntimeNodeAuthorityMutation,
-    RuntimeNodeAuthorityOutcome, RuntimeNodeAuthorityStoredOutcome, RuntimeProvisionerActiveSet,
-    RuntimeProvisionerCredential, RuntimeProvisionerExpectedPrevious,
+    object_write_writer_authority_id, runtime_provisioner_active_set_digest, Base64UrlNoPad,
+    ContractVersion, CredentialBinding, Epoch, FleetPolicyPrincipal, Id, NodeIdentity,
+    NodeIdentityState, NodePlacementPolicy, NodeTransportTarget, PublicKeyCredentialBinding,
+    RuntimeNodeAuthorityApply, RuntimeNodeAuthorityApplyRecord, RuntimeNodeAuthorityApplyResult,
+    RuntimeNodeAuthorityMutation, RuntimeNodeAuthorityOutcome, RuntimeNodeAuthorityStoredOutcome,
+    RuntimeProvisionerActiveSet, RuntimeProvisionerCredential, RuntimeProvisionerExpectedPrevious,
     RuntimeProvisionerTrustBundle, RuntimeSchedulingState, Sha256Digest, UnixMillis,
 };
 use cats_storage::authority::AuthorityError;
@@ -25,6 +25,7 @@ use super::gateway_identity::lock_route_v2_machine_authority_shared;
 use super::host_fence_recovery_batch::{
     require_host_recovery_unblocked_in, require_product_mutation_unblocked_in,
 };
+use super::object_write::open_object_write_authority_in;
 use super::pg_codec::PgBigInt;
 use super::product_rows::load_assigned_desired_for_update;
 use super::route_signing_authority::node_acks_current_published_ring_in;
@@ -701,6 +702,7 @@ fn apply_runtime_node_authority_in(
                 RuntimeNodeAuthorityOutcome::Provisioned,
                 NodeIdentityState::Provisioned,
                 placement_policy.policy_revision,
+                None,
             )
         }
         RuntimeNodeAuthorityMutation::Provision { .. } => {
@@ -721,6 +723,7 @@ fn apply_runtime_node_authority_in(
                     RuntimeNodeAuthorityOutcome::PolicyUpdated,
                     NodeIdentityState::Provisioned,
                     placement_policy.policy_revision,
+                    None,
                 )
             }
             _ => RuntimeNodeAuthorityStoredOutcome::AuthorityPreconditionFailed,
@@ -760,6 +763,7 @@ fn apply_runtime_node_authority_in(
                     RuntimeNodeAuthorityOutcome::CredentialRotated,
                     NodeIdentityState::Provisioned,
                     policy.policy_revision,
+                    None,
                 )
             }
             _ => RuntimeNodeAuthorityStoredOutcome::AuthorityPreconditionFailed,
@@ -790,7 +794,49 @@ fn apply_runtime_node_authority_in(
                     RuntimeNodeAuthorityOutcome::Retired,
                     NodeIdentityState::Retired,
                     policy.policy_revision,
+                    None,
                 )
+            }
+            _ => RuntimeNodeAuthorityStoredOutcome::AuthorityPreconditionFailed,
+        },
+        // Opening the Host's object-write writer authority needs the exact
+        // provisioned identity and policy revision, but deliberately not a
+        // cordoned or quiescent Node: the authority is a prerequisite for any
+        // attachment credential, and opening it publishes no physical effect.
+        RuntimeNodeAuthorityMutation::ProvisionObjectWriteAuthority {
+            expected_policy_revision,
+            object_provider_scope,
+            workload_principal_id,
+            object_store_scope_id,
+        } => match (identity.as_ref(), policy.as_ref()) {
+            (Some(identity), Some(policy))
+                if identity.state == NodeIdentityState::Provisioned
+                    && policy.policy_revision == *expected_policy_revision =>
+            {
+                let writer_authority_id = object_write_writer_authority_id(
+                    &apply.node_id,
+                    object_provider_scope,
+                    workload_principal_id,
+                    object_store_scope_id,
+                );
+                if open_object_write_authority_in(
+                    transaction,
+                    identity,
+                    &writer_authority_id,
+                    object_provider_scope,
+                    workload_principal_id,
+                    object_store_scope_id,
+                )? {
+                    applied_result(
+                        apply,
+                        RuntimeNodeAuthorityOutcome::ObjectWriteAuthorityProvisioned,
+                        NodeIdentityState::Provisioned,
+                        policy.policy_revision,
+                        Some(writer_authority_id),
+                    )
+                } else {
+                    RuntimeNodeAuthorityStoredOutcome::AuthorityPreconditionFailed
+                }
             }
             _ => RuntimeNodeAuthorityStoredOutcome::AuthorityPreconditionFailed,
         },
@@ -1224,41 +1270,66 @@ fn validate_stored_outcome(
         if response.apply_id != request.apply_id || response.node_id != request.node_id {
             return Err(corrupt("apply result is not bound to its request"));
         }
-        let (expected_outcome, expected_state, expected_revision) = match &request.mutation {
-            RuntimeNodeAuthorityMutation::Provision {
-                placement_policy, ..
-            } => (
-                RuntimeNodeAuthorityOutcome::Provisioned,
-                NodeIdentityState::Provisioned,
-                placement_policy.policy_revision,
-            ),
-            RuntimeNodeAuthorityMutation::UpdatePolicy {
-                placement_policy, ..
-            } => (
-                RuntimeNodeAuthorityOutcome::PolicyUpdated,
-                NodeIdentityState::Provisioned,
-                placement_policy.policy_revision,
-            ),
-            RuntimeNodeAuthorityMutation::RotateCredential {
-                expected_policy_revision,
-                ..
-            } => (
-                RuntimeNodeAuthorityOutcome::CredentialRotated,
-                NodeIdentityState::Provisioned,
-                *expected_policy_revision,
-            ),
-            RuntimeNodeAuthorityMutation::Retire {
-                expected_policy_revision,
-                ..
-            } => (
-                RuntimeNodeAuthorityOutcome::Retired,
-                NodeIdentityState::Retired,
-                *expected_policy_revision,
-            ),
-        };
+        let (expected_outcome, expected_state, expected_revision, expected_writer) =
+            match &request.mutation {
+                RuntimeNodeAuthorityMutation::Provision {
+                    placement_policy, ..
+                } => (
+                    RuntimeNodeAuthorityOutcome::Provisioned,
+                    NodeIdentityState::Provisioned,
+                    placement_policy.policy_revision,
+                    None,
+                ),
+                RuntimeNodeAuthorityMutation::UpdatePolicy {
+                    placement_policy, ..
+                } => (
+                    RuntimeNodeAuthorityOutcome::PolicyUpdated,
+                    NodeIdentityState::Provisioned,
+                    placement_policy.policy_revision,
+                    None,
+                ),
+                RuntimeNodeAuthorityMutation::RotateCredential {
+                    expected_policy_revision,
+                    ..
+                } => (
+                    RuntimeNodeAuthorityOutcome::CredentialRotated,
+                    NodeIdentityState::Provisioned,
+                    *expected_policy_revision,
+                    None,
+                ),
+                RuntimeNodeAuthorityMutation::Retire {
+                    expected_policy_revision,
+                    ..
+                } => (
+                    RuntimeNodeAuthorityOutcome::Retired,
+                    NodeIdentityState::Retired,
+                    *expected_policy_revision,
+                    None,
+                ),
+                // A replayed writer-authority apply must return the one ID this
+                // exact binding assigns. A stored result naming any other
+                // authority is corrupt, not a replay.
+                RuntimeNodeAuthorityMutation::ProvisionObjectWriteAuthority {
+                    expected_policy_revision,
+                    object_provider_scope,
+                    workload_principal_id,
+                    object_store_scope_id,
+                } => (
+                    RuntimeNodeAuthorityOutcome::ObjectWriteAuthorityProvisioned,
+                    NodeIdentityState::Provisioned,
+                    *expected_policy_revision,
+                    Some(object_write_writer_authority_id(
+                        &request.node_id,
+                        object_provider_scope,
+                        workload_principal_id,
+                        object_store_scope_id,
+                    )),
+                ),
+            };
         if response.outcome != expected_outcome
             || response.identity_state != expected_state
             || response.policy_revision != expected_revision
+            || response.writer_authority_id != expected_writer
         {
             return Err(corrupt("apply result does not match its mutation"));
         }
@@ -1271,6 +1342,7 @@ fn applied_result(
     outcome: RuntimeNodeAuthorityOutcome,
     identity_state: NodeIdentityState,
     policy_revision: Epoch,
+    writer_authority_id: Option<Id>,
 ) -> RuntimeNodeAuthorityStoredOutcome {
     RuntimeNodeAuthorityStoredOutcome::Applied {
         response: RuntimeNodeAuthorityApplyResult {
@@ -1280,6 +1352,7 @@ fn applied_result(
             outcome,
             identity_state,
             policy_revision,
+            writer_authority_id,
         },
     }
 }

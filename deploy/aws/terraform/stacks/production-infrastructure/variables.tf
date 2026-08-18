@@ -254,6 +254,18 @@ variable "worker_managed_environment" {
   default     = {}
 }
 
+variable "object_write_gateway_url" {
+  description = "Exact HTTPS origin of the ObjectWrite Gateway, as published by the application stack's object_write_gateway_url output."
+  type        = string
+
+  validation {
+    condition = (
+      can(regex("^https://gateway\\.object-write\\.[a-z0-9-]+\\.cats\\.internal$", var.object_write_gateway_url))
+    )
+    error_message = "object_write_gateway_url must be the platform-owned https://gateway.object-write.<environment>.cats.internal origin."
+  }
+}
+
 variable "route_v2_rotation_origin" {
   description = "Independent server-authenticated HTTPS origin for Route v2 ring delivery and disabled-signer recovery."
   type        = string

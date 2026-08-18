@@ -1453,6 +1453,7 @@ fn production_authorized_blockd_launch(
         max_staged_bytes: cats_api::blockd::DEFAULT_MAX_STAGED_BYTES,
         max_staged_packs: cats_api::blockd::DEFAULT_MAX_STAGED_PACKS,
         max_local_bytes: cats_api::blockd::DEFAULT_MAX_LOCAL_BYTES,
+        object_write_gateway: None,
     }
 }
 
@@ -1548,6 +1549,10 @@ fn production_cutover_config(
         authorized_blockd_launch,
         guest_agent_binary: "/opt/cats/bin/cats-guest-agent".into(),
         metering_cgroup_root: None,
+        // This cross-component run predates the ObjectWrite Gateway and keeps
+        // the pre-composition behavior: attachments carry no object-write
+        // credential, so every publish path stays the direct object store.
+        object_write_gateway: None,
         volume_data_authority: data_authority,
         volume_inventory_authority: inventory_authority,
         blob_store,

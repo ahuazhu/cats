@@ -7,6 +7,7 @@
 //! transition ID, or falls back to a legacy ownership route.
 
 use std::io::Read as _;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cats_api::agent_registration::{
@@ -43,6 +44,8 @@ use cats_storage::authority::{
     validate_volume_record, AttachmentLineageIdentity, AuthorizedServingAcquire,
     AuthorizedServingAttachment,
 };
+
+use crate::object_write_credential::{ObjectWriteCredentialPort, ObjectWriteCredentialUnavailable};
 
 use super::volume_transitions::{
     A19BlockingSignedVolumeEvidenceTransport, SignedVolumeEvidenceResponse,
@@ -217,11 +220,57 @@ pub enum NormalAcquireClientError {
 #[derive(Debug, Clone)]
 pub struct ControlSignedNormalAcquireClient<T> {
     transport: T,
+    /// The Node's object-write credential authority. `None` composes a Node
+    /// that is not wired to an ObjectWrite Gateway at all: its grants carry no
+    /// credential and every qualified publish path fails closed on that.
+    /// `Some` makes the credential part of the grant, so an attachment that
+    /// cannot publish is never handed out.
+    credentials: Option<Arc<dyn ObjectWriteCredentialPort>>,
 }
 
 impl<T> ControlSignedNormalAcquireClient<T> {
     pub fn new(transport: T) -> Self {
-        Self { transport }
+        Self {
+            transport,
+            credentials: None,
+        }
+    }
+
+    /// Binds the attachment-scoped object-write credential authority every
+    /// grant this client returns must carry.
+    pub fn with_object_write_credentials(
+        mut self,
+        credentials: Arc<dyn ObjectWriteCredentialPort>,
+    ) -> Self {
+        self.credentials = Some(credentials);
+        self
+    }
+
+    fn credentials(&self) -> Option<&dyn ObjectWriteCredentialPort> {
+        self.credentials.as_deref()
+    }
+
+    /// Destroys the object-write credential of the attachment epoch this
+    /// release just ended.
+    ///
+    /// It runs only after Control has released the epoch, so it can never
+    /// destroy a credential a live attachment still needs. A failure is not
+    /// reported as a completed release: the caller retries the exact
+    /// transition, and both the retirement and Control's idempotent release
+    /// replay converge on the next attempt.
+    fn retire_released_credential(&self, cleanup: &CleanupRelease) -> bool {
+        let Some(credentials) = self.credentials() else {
+            return true;
+        };
+        let CleanupTarget::Volume {
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+        } = &cleanup.target
+        else {
+            return true;
+        };
+        retire_ended_attachment_credential(credentials, volume_id, attachment_id, *attachment_epoch)
     }
 
     pub fn transport(&self) -> &T {
@@ -258,9 +307,20 @@ where
                 let Ok(success) = decode_runtime_volume_transition_success(&body) else {
                     return Ok(NormalAcquireAttempt::Ambiguous);
                 };
-                let Some(attachment) = exact_success_attachment(request, volume, normal, success)
-                else {
-                    return Ok(NormalAcquireAttempt::Ambiguous);
+                let attachment = match exact_success_attachment(
+                    request,
+                    volume,
+                    normal,
+                    success,
+                    self.credentials(),
+                    deadline,
+                ) {
+                    Ok(Some(attachment)) => attachment,
+                    Ok(None) => return Ok(NormalAcquireAttempt::Ambiguous),
+                    // The lease is held but unusable for publishing. Retrying
+                    // the exact transition returns the original grant, and
+                    // credential establishment is idempotent for this epoch.
+                    Err(_) => return Ok(NormalAcquireAttempt::RetryExact),
                 };
                 Ok(NormalAcquireAttempt::Granted(Box::new(attachment)))
             }
@@ -358,6 +418,9 @@ where
                 else {
                     return Ok(NormalReleaseAttempt::Ambiguous);
                 };
+                if !self.retire_released_credential(cleanup) {
+                    return Ok(NormalReleaseAttempt::RetryExact);
+                }
                 Ok(NormalReleaseAttempt::Released(release))
             }
             SignedVolumeTransitionResponse::ClosedError { status, body } => {
@@ -409,6 +472,9 @@ where
                 else {
                     return Ok(NormalReleaseAttempt::Ambiguous);
                 };
+                if !self.retire_released_credential(cleanup) {
+                    return Ok(NormalReleaseAttempt::RetryExact);
+                }
                 Ok(NormalReleaseAttempt::Released(release))
             }
             SignedVolumeTransitionResponse::ClosedError { status, body } => {
@@ -542,6 +608,29 @@ where
     }
 }
 
+/// Destroys the credential of one ended attachment epoch, reporting whether the
+/// epoch is now provably unable to sign an object write from this Node.
+///
+/// The failure is deliberately not swallowed: a credential that outlives its
+/// epoch is residue the next reconcile must still remove.
+fn retire_ended_attachment_credential(
+    credentials: &dyn ObjectWriteCredentialPort,
+    volume_id: &cats_api::runtime_reconciliation::Id,
+    attachment_id: &cats_api::runtime_reconciliation::Id,
+    attachment_epoch: cats_api::runtime_reconciliation::FenceEpoch,
+) -> bool {
+    match credentials.retire(volume_id, attachment_id, attachment_epoch) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "ended attachment epoch keeps its object-write credential until the next reconcile"
+            );
+            false
+        }
+    }
+}
+
 /// Resolve an ambiguous release only from its exact immutable marker. An
 /// Unowned record without the matching transition/result pair is not success.
 pub fn recover_normal_release_from_authority(
@@ -549,9 +638,10 @@ pub fn recover_normal_release_from_authority(
     volume: &VolumeIntent,
     expected_head: &RemoteHead,
     record: &VolumeRecord,
+    credentials: Option<&dyn ObjectWriteCredentialPort>,
 ) -> Result<NormalReleaseAuthorityRecovery, NormalAcquireClientError> {
     let cleanup = validate_local_release_request(request, volume, expected_head)?;
-    recover_validated_release_from_authority(volume, expected_head, record, cleanup)
+    recover_validated_release_from_authority(volume, expected_head, record, cleanup, credentials)
 }
 
 /// Lifecycle counterpart to [`recover_normal_release_from_authority`]. It
@@ -562,9 +652,10 @@ pub fn recover_lifecycle_release_from_authority(
     volume: &VolumeIntent,
     expected_head: &RemoteHead,
     record: &VolumeRecord,
+    credentials: Option<&dyn ObjectWriteCredentialPort>,
 ) -> Result<NormalReleaseAuthorityRecovery, NormalAcquireClientError> {
     let cleanup = validate_local_lifecycle_release_request(request, volume, expected_head)?;
-    recover_validated_release_from_authority(volume, expected_head, record, cleanup)
+    recover_validated_release_from_authority(volume, expected_head, record, cleanup, credentials)
 }
 
 fn recover_validated_release_from_authority(
@@ -572,6 +663,7 @@ fn recover_validated_release_from_authority(
     expected_head: &RemoteHead,
     record: &VolumeRecord,
     cleanup: &CleanupRelease,
+    credentials: Option<&dyn ObjectWriteCredentialPort>,
 ) -> Result<NormalReleaseAuthorityRecovery, NormalAcquireClientError> {
     if validate_volume_record(record).is_err()
         || record.volume_id != volume.volume_id
@@ -632,6 +724,19 @@ fn recover_validated_release_from_authority(
     {
         return Ok(NormalReleaseAuthorityRecovery::Blocked);
     }
+    // The durable marker proves this epoch is over, so its credential is now
+    // residue on this Node. Restart-time recovery is the path that converges a
+    // crash between dropping the attachment and destroying its key.
+    if let Some(credentials) = credentials {
+        if !retire_ended_attachment_credential(
+            credentials,
+            volume_id,
+            attachment_id,
+            *attachment_epoch,
+        ) {
+            return Ok(NormalReleaseAuthorityRecovery::RetryExact);
+        }
+    }
     Ok(NormalReleaseAuthorityRecovery::Released(result.clone()))
 }
 
@@ -643,6 +748,8 @@ pub fn recover_normal_acquire_from_authority(
     request: &RuntimeVolumeTransitionRequest,
     volume: &VolumeIntent,
     record: &VolumeRecord,
+    credentials: Option<&dyn ObjectWriteCredentialPort>,
+    deadline: Instant,
 ) -> Result<NormalAcquireAuthorityRecovery, NormalAcquireClientError> {
     let acquire = validate_local_normal_request(request, volume)?;
     if validate_volume_record(record).is_err()
@@ -698,6 +805,24 @@ pub fn recover_normal_acquire_from_authority(
     {
         return Ok(NormalAcquireAuthorityRecovery::Blocked);
     }
+    // Recovery adopts an already-granted epoch, so it must own the same
+    // credential a fresh grant would have minted. Establishment is idempotent
+    // for this exact epoch: it republishes the credential the interrupted
+    // acquire already registered instead of minting a second one. A failure is
+    // not an adoption; the caller retries the exact transition.
+    let object_write_credential = match credentials {
+        Some(credentials) => match credentials.establish(
+            &request.session,
+            &volume.volume_id,
+            attachment_id,
+            stored_result.resulting_epoch,
+            deadline,
+        ) {
+            Ok(credential) => Some(credential),
+            Err(_) => return Ok(NormalAcquireAuthorityRecovery::RetryExact),
+        },
+        None => None,
+    };
     let attachment = AuthorizedServingAttachment {
         identity: AttachmentLineageIdentity {
             volume_id: volume.volume_id.clone(),
@@ -709,9 +834,7 @@ pub fn recover_normal_acquire_from_authority(
             node_id: request.placement.node_id.clone(),
             placement_epoch: request.placement.placement_epoch,
         },
-        // Node-side object-write credential registration is not composed
-        // yet; qualified object-write publish paths fail closed on None.
-        object_write_credential: None,
+        object_write_credential,
         size_bytes: record.size_bytes,
         durability: record.durability,
         head: record.head.clone(),
@@ -978,12 +1101,17 @@ fn validate_accepted_context(
     Ok(())
 }
 
+/// `Ok(None)` means the success was not the exact grant this request asked
+/// for. `Err` means the grant was exact but this Node could not mint the
+/// object-write credential it must publish through, which is never a grant.
 fn exact_success_attachment(
     request: &RuntimeVolumeTransitionRequest,
     volume: &VolumeIntent,
     acquire: &VolumeAcquireRequest,
     success: cats_api::runtime_reconciliation::RuntimeVolumeTransitionSuccess,
-) -> Option<AuthorizedServingAttachment> {
+    credentials: Option<&dyn ObjectWriteCredentialPort>,
+    deadline: Instant,
+) -> Result<Option<AuthorizedServingAttachment>, ObjectWriteCredentialUnavailable> {
     if success.version != request.version
         || success.session != request.session
         || success.cat_id != request.cat_id
@@ -991,10 +1119,10 @@ fn exact_success_attachment(
         || success.spec_digest != request.spec_digest
         || success.placement != request.placement
     {
-        return None;
+        return Ok(None);
     }
     let RuntimeVolumeTransitionOutcome::LeaseGranted { grant } = success.outcome else {
-        return None;
+        return Ok(None);
     };
     let VolumeAcquireRequest::Normal {
         volume_id,
@@ -1006,9 +1134,11 @@ fn exact_success_attachment(
         lease_duration_ms,
     } = acquire
     else {
-        return None;
+        return Ok(None);
     };
-    let resulting_epoch = expected_unowned_epoch.get().checked_add(1)?;
+    let Some(resulting_epoch) = expected_unowned_epoch.get().checked_add(1) else {
+        return Ok(None);
+    };
     if grant.volume_id != *volume_id
         || grant.attachment_id != *attachment_id
         || grant.attachment_epoch.get() != resulting_epoch
@@ -1019,10 +1149,10 @@ fn exact_success_attachment(
                 transition_id: transition_id.clone(),
             })
     {
-        return None;
+        return Ok(None);
     }
     if !acquire_head_matches_intent(volume, &grant.head) {
-        return None;
+        return Ok(None);
     }
     let acquire_request = NormalAcquireRequest {
         volume_id: volume_id.clone(),
@@ -1041,6 +1171,20 @@ fn exact_success_attachment(
         resulting_head: grant.head.clone(),
         lease_expires_at: grant.lease_expires_at,
     };
+    // The credential is minted for the exact epoch Control just granted, and
+    // only after that grant is proven exact. A failure here leaves this call
+    // without a grant to return: an attachment that cannot publish is never
+    // handed out, and the caller retries the same exact transition.
+    let object_write_credential = match credentials {
+        Some(credentials) => Some(credentials.establish(
+            &request.session,
+            &grant.volume_id,
+            &grant.attachment_id,
+            grant.attachment_epoch,
+            deadline,
+        )?),
+        None => None,
+    };
     let attachment = AuthorizedServingAttachment {
         identity: AttachmentLineageIdentity {
             volume_id: grant.volume_id,
@@ -1050,9 +1194,7 @@ fn exact_success_attachment(
             node_id: request.placement.node_id.clone(),
             placement_epoch: request.placement.placement_epoch,
         },
-        // Node-side object-write credential registration is not composed
-        // yet; qualified object-write publish paths fail closed on None.
-        object_write_credential: None,
+        object_write_credential,
         size_bytes: grant.size_bytes,
         durability: grant.durability,
         head: grant.head,
@@ -1062,9 +1204,9 @@ fn exact_success_attachment(
             result: acquire_result,
         },
     };
-    validate_authorized_serving_attachment(&attachment)
+    Ok(validate_authorized_serving_attachment(&attachment)
         .is_ok()
-        .then_some(attachment)
+        .then_some(attachment))
 }
 
 fn exact_takeover_success(
@@ -2152,6 +2294,8 @@ mod tests {
         Epoch, FenceEpoch, HostPath, NodeBootId, RandomId128, WireU64,
     };
 
+    use crate::object_write_credential::RecordingObjectWriteCredentials;
+
     use super::*;
 
     const REQUEST: &[u8] = br#"{"cat_id":"cat_01","desired_revision":7,"placement":{"kind":"assigned","node_id":"node_a","placement_epoch":3},"session":{"agent_instance_id":"44444444444444444444444444444444","agent_session_epoch":2,"node_boot_id":"33333333333333333333333333333333","node_id":"node_a"},"spec_digest":"sha256:d1dc4a8ff5e5d2fa4239eb14a6ac3e825a5070bd0d646762f723507f11ec54ad","transition":{"kind":"acquire","request":{"attachment_id":"att_01","desired_revision":7,"expected_unowned_epoch":0,"kind":"normal","lease_duration_ms":60000,"placement_epoch":3,"transition_id":"22222222222222222222222222222222","volume_id":"vol_root"}},"version":1}"#;
@@ -3018,7 +3162,9 @@ mod tests {
             lease_expires_at: Some(UnixMillis::new(1_720_000_120_000).unwrap()),
             last_transition: Some(attachment.expected_last_transition()),
         };
-        let recovered = recover_normal_acquire_from_authority(&request, &volume, &record).unwrap();
+        let recovered =
+            recover_normal_acquire_from_authority(&request, &volume, &record, None, Instant::now())
+                .unwrap();
         let NormalAcquireAuthorityRecovery::Granted(recovered) = recovered else {
             panic!("matching authority marker was not adopted")
         };
@@ -3031,7 +3177,9 @@ mod tests {
                 cats_api::runtime_reconciliation::AsciiText::new("roots/provisioned").unwrap(),
             ),
         };
-        let recovered = recover_normal_acquire_from_authority(&request, &volume, &record).unwrap();
+        let recovered =
+            recover_normal_acquire_from_authority(&request, &volume, &record, None, Instant::now())
+                .unwrap();
         let NormalAcquireAuthorityRecovery::Granted(recovered) = recovered else {
             panic!("later exact head was not adopted")
         };
@@ -3050,13 +3198,21 @@ mod tests {
             last_transition: None,
         };
         assert_eq!(
-            recover_normal_acquire_from_authority(&request, &volume, &predecessor).unwrap(),
+            recover_normal_acquire_from_authority(
+                &request,
+                &volume,
+                &predecessor,
+                None,
+                Instant::now()
+            )
+            .unwrap(),
             NormalAcquireAuthorityRecovery::RetryExact
         );
 
         record.lease_owner = Some(Id::new("foreign-writer").unwrap());
         assert_eq!(
-            recover_normal_acquire_from_authority(&request, &volume, &record).unwrap(),
+            recover_normal_acquire_from_authority(&request, &volume, &record, None, Instant::now())
+                .unwrap(),
             NormalAcquireAuthorityRecovery::Blocked
         );
     }
@@ -3555,5 +3711,252 @@ mod tests {
             SignedVolumeTransitionResponse::Success(SUCCESS.to_vec())
         );
         server.join().unwrap();
+    }
+
+    // ---- object-write credential composition ---------------------------
+
+    fn credential_scope() -> (Id, Id, cats_api::runtime_reconciliation::FenceEpoch) {
+        (
+            Id::new("vol_root").unwrap(),
+            Id::new("att_01").unwrap(),
+            cats_api::runtime_reconciliation::FenceEpoch::new(1).unwrap(),
+        )
+    }
+
+    fn released_release_fixture() -> (
+        RuntimeVolumeTransitionRequest,
+        VolumeIntent,
+        RemoteHead,
+        VolumeRecord,
+    ) {
+        let base = request();
+        let (volume_id, attachment_id, attachment_epoch) = credential_scope();
+        let release_transition_id =
+            cats_api::runtime_reconciliation::RandomId128::new("2".repeat(32)).unwrap();
+        let expected_head = RemoteHead {
+            generation: Generation::new(4).unwrap(),
+            root_hash: Some(Sha256Digest::from_bytes([5; 32])),
+            root_object_id: Some(
+                cats_api::runtime_reconciliation::AsciiText::new("roots/5").unwrap(),
+            ),
+        };
+        let cleanup = CleanupRelease {
+            target: CleanupTarget::Volume {
+                volume_id: volume_id.clone(),
+                attachment_id: attachment_id.clone(),
+                attachment_epoch,
+            },
+            inventory_session: base.session.clone(),
+            inventory_epoch: cats_api::runtime_reconciliation::Epoch::new(3).unwrap(),
+            inventory_read_position: cats_api::runtime_reconciliation::Sequence::new(9).unwrap(),
+            desired_read_position: cats_api::runtime_reconciliation::Sequence::new(9).unwrap(),
+            volume_release: Some(cats_api::runtime_reconciliation::VolumeReleaseReplay {
+                release_transition_id: release_transition_id.clone(),
+                generation: expected_head.generation,
+                disposition: VolumeDisposition::Retain,
+            }),
+        };
+        let request = RuntimeVolumeTransitionRequest {
+            transition: RuntimeVolumeTransition::Release { cleanup },
+            ..base
+        };
+        let resulting_epoch =
+            cats_api::runtime_reconciliation::FenceEpoch::new(attachment_epoch.get() + 1).unwrap();
+        let record = VolumeRecord {
+            volume_id: volume_id.clone(),
+            size_bytes: volume().size_bytes,
+            durability: volume().durability,
+            admin_state: VolumeAdminState::Active,
+            head: expected_head.clone(),
+            lease_owner: None,
+            lease_epoch: resulting_epoch,
+            lease_expires_at: None,
+            last_transition: Some(LastVolumeTransition::Release {
+                request: ReleaseRequest {
+                    volume_id: volume_id.clone(),
+                    transition_id: release_transition_id.clone(),
+                    attachment_id: attachment_id.clone(),
+                    expected_epoch: attachment_epoch,
+                },
+                result: ReleaseResult {
+                    volume_id,
+                    transition_id: release_transition_id,
+                    released_attachment_id: attachment_id,
+                    resulting_epoch,
+                    resulting_head: expected_head.clone(),
+                },
+            }),
+        };
+        (request, volume(), expected_head, record)
+    }
+
+    /// An exact grant carries exactly the credential the Node established for
+    /// that (volume, attachment, epoch); nothing is reconstructed by hand.
+    #[test]
+    fn an_exact_grant_binds_the_established_object_write_credential() {
+        let credentials = Arc::new(RecordingObjectWriteCredentials::default());
+        let client = ControlSignedNormalAcquireClient::new(FakeTransport::new(
+            SignedVolumeTransitionResponse::Success(SUCCESS.to_vec()),
+        ))
+        .with_object_write_credentials(Arc::clone(&credentials) as Arc<_>);
+        let request = request();
+        let attempt = client
+            .acquire(
+                &request,
+                &volume(),
+                &accepted_context(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+        let NormalAcquireAttempt::Granted(attachment) = attempt else {
+            panic!("expected an exact grant")
+        };
+        let (volume_id, attachment_id, attachment_epoch) = credential_scope();
+        assert_eq!(
+            credentials.established(),
+            vec![(volume_id.clone(), attachment_id.clone(), attachment_epoch)],
+            "the credential must be minted for the exact granted epoch"
+        );
+        assert_eq!(
+            attachment.object_write_credential,
+            Some(RecordingObjectWriteCredentials::expected_credential(
+                &request.session,
+                &volume_id,
+                &attachment_id,
+                attachment_epoch,
+            ))
+        );
+    }
+
+    /// Fail closed: a grant that cannot publish is not a grant. The identical
+    /// exchange with a working authority is the calibrating positive above.
+    #[test]
+    fn an_uncredentialed_grant_is_refused_instead_of_downgraded() {
+        let client = ControlSignedNormalAcquireClient::new(FakeTransport::new(
+            SignedVolumeTransitionResponse::Success(SUCCESS.to_vec()),
+        ))
+        .with_object_write_credentials(Arc::new(
+            RecordingObjectWriteCredentials::failing_establish(),
+        ) as Arc<_>);
+        let attempt = client
+            .acquire(
+                &request(),
+                &volume(),
+                &accepted_context(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert!(
+            matches!(attempt, NormalAcquireAttempt::RetryExact),
+            "an unpublishable attachment must not be granted: {attempt:?}"
+        );
+    }
+
+    /// Restart-time adoption of an already-granted epoch establishes the same
+    /// credential rather than adopting an attachment that cannot publish.
+    #[test]
+    fn recovered_acquire_binds_and_refuses_the_object_write_credential() {
+        let request = request();
+        let volume = volume();
+        let attachment = {
+            let client = ControlSignedNormalAcquireClient::new(FakeTransport::new(
+                SignedVolumeTransitionResponse::Success(SUCCESS.to_vec()),
+            ));
+            let NormalAcquireAttempt::Granted(attachment) = client
+                .acquire(
+                    &request,
+                    &volume,
+                    &accepted_context(),
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .unwrap()
+            else {
+                panic!("fixture grant")
+            };
+            *attachment
+        };
+        let record = VolumeRecord {
+            volume_id: attachment.identity.volume_id.clone(),
+            size_bytes: attachment.size_bytes,
+            durability: attachment.durability,
+            admin_state: VolumeAdminState::Active,
+            head: attachment.head.clone(),
+            lease_owner: Some(attachment.identity.attachment_id.clone()),
+            lease_epoch: attachment.identity.attachment_epoch,
+            lease_expires_at: Some(UnixMillis::new(1_720_000_120_000).unwrap()),
+            last_transition: Some(attachment.expected_last_transition()),
+        };
+        let credentials = Arc::new(RecordingObjectWriteCredentials::default());
+        let recovered = recover_normal_acquire_from_authority(
+            &request,
+            &volume,
+            &record,
+            Some(credentials.as_ref()),
+            Instant::now(),
+        )
+        .unwrap();
+        let NormalAcquireAuthorityRecovery::Granted(recovered) = recovered else {
+            panic!("the exact authority marker must be adopted")
+        };
+        let (volume_id, attachment_id, attachment_epoch) = credential_scope();
+        assert_eq!(
+            recovered.object_write_credential,
+            Some(RecordingObjectWriteCredentials::expected_credential(
+                &request.session,
+                &volume_id,
+                &attachment_id,
+                attachment_epoch,
+            ))
+        );
+
+        let refusing = RecordingObjectWriteCredentials::failing_establish();
+        assert!(matches!(
+            recover_normal_acquire_from_authority(
+                &request,
+                &volume,
+                &record,
+                Some(&refusing),
+                Instant::now(),
+            )
+            .unwrap(),
+            NormalAcquireAuthorityRecovery::RetryExact
+        ));
+    }
+
+    /// The epoch that just ended loses its private key, and a retirement that
+    /// did not happen is never reported as a completed release.
+    #[test]
+    fn a_recovered_release_retires_that_attachment_epoch_credential() {
+        let (request, volume, expected_head, record) = released_release_fixture();
+        let credentials = Arc::new(RecordingObjectWriteCredentials::default());
+        let recovery = recover_normal_release_from_authority(
+            &request,
+            &volume,
+            &expected_head,
+            &record,
+            Some(credentials.as_ref()),
+        )
+        .unwrap();
+        assert!(
+            matches!(recovery, NormalReleaseAuthorityRecovery::Released(_)),
+            "fixture must model a completed release: {recovery:?}"
+        );
+        assert_eq!(credentials.retired(), vec![credential_scope()]);
+
+        let stuck = RecordingObjectWriteCredentials::failing_retire();
+        assert!(
+            matches!(
+                recover_normal_release_from_authority(
+                    &request,
+                    &volume,
+                    &expected_head,
+                    &record,
+                    Some(&stuck),
+                )
+                .unwrap(),
+                NormalReleaseAuthorityRecovery::RetryExact
+            ),
+            "a live credential for an ended epoch must keep the Node converging"
+        );
     }
 }

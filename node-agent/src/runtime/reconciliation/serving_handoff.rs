@@ -5854,6 +5854,7 @@ mod tests {
             max_staged_bytes: 101,
             max_staged_packs: 102,
             max_local_bytes: 103,
+            object_write_gateway: None,
         })
         .unwrap()
     }
@@ -7759,6 +7760,7 @@ mod tests {
             max_staged_bytes: 101,
             max_staged_packs: 102,
             max_local_bytes: 103,
+            object_write_gateway: None,
         };
 
         let command = ready

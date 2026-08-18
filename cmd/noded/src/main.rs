@@ -35,6 +35,12 @@ struct Args {
     /// public management Control origin.
     #[arg(long, env = "CATS_ROUTE_V2_ROTATION_ORIGIN")]
     route_v2_rotation_origin: Option<String>,
+    /// Bare HTTPS origin of the ObjectWrite Gateway. A production worker is
+    /// denied direct object-store writes by IAM, so this is the only path by
+    /// which a serving process can publish; it is independent from the public
+    /// management Control origin.
+    #[arg(long, env = "CATS_OBJECT_WRITE_GATEWAY_URL")]
+    object_write_gateway_url: Option<String>,
     #[arg(
         long,
         env = "CATS_GATEWAY_CLIENT_CA_BUNDLE_FILE",
@@ -206,6 +212,9 @@ async fn main() -> anyhow::Result<()> {
         max_staged_bytes: args.blockd_max_staged_bytes,
         max_staged_packs: args.blockd_max_staged_packs,
         max_local_bytes: args.blockd_max_local_bytes,
+        // Filled in by the cutover composition, which owns the credential
+        // namespace path and the validated gateway origin.
+        object_write_gateway: None,
     };
     let object_factories: [&dyn BlobStoreFactory; 2] =
         [&FileBlobStoreFactory, &AwsS3BlobStoreFactory];
@@ -251,6 +260,12 @@ async fn main() -> anyhow::Result<()> {
             "--route-v2-machine-listen and --route-v2-rotation-origin must be configured together"
         ),
     };
+    // The Host's writer authority ID is not configuration: it is derived from
+    // the Node ID, so the fleet-shared worker environment cannot carry it. The
+    // credential port reads it from Control once per Agent session.
+    let object_write_gateway = args.object_write_gateway_url.map(|gateway_url| {
+        cats_node_agent::runtime_cutover::ObjectWriteGatewayComposition { gateway_url }
+    });
     let deadline_policy = RuntimeSpineDeadlinePolicy::new(
         Duration::from_millis(args.runtime_inventory_scan_timeout_ms),
         Duration::from_millis(args.runtime_effect_step_timeout_ms),
@@ -273,6 +288,7 @@ async fn main() -> anyhow::Result<()> {
         blob_store,
         volume_lease_duration_ms: args.runtime_volume_lease_duration_ms,
         deadline_policy,
+        object_write_gateway,
     })
     .await?;
     match handle.route_v2_addr {

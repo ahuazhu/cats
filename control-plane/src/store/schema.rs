@@ -431,6 +431,16 @@ const OBJECT_WRITE_GATEWAY_FUNCTION_CATALOG: &[ObjectWriteGatewayFunction] = &[
         gateway_execute: false,
     },
     ObjectWriteGatewayFunction {
+        name: "control_object_write_gateway_qualification_lock_v1",
+        identity_arguments: "p_request_canonical bytea, p_version bigint, p_mutation_class text, p_request_id text, p_writer_authority_id text, p_credential_id text, p_credential_public_key_spki_sha256 text, p_provider_attempt_id text, p_fault_kind text, p_qualification_id text, p_fault_id text, p_fault_catalog_sha256 text, p_provider text, p_partition text, p_account_id text, p_region text, p_object_store_scope_id text, p_canonical_logical_key text, p_content_sha256 text, p_content_length bigint",
+        result: "TABLE(request_canonical bytea, authorization_canonical bytea, authorization_version bigint, authorization_mutation_class text, qualification_id text, workspace_id text, deployment_id text, release_id text, source_commit_sha text, control_schema_version bigint, qualification_catalog_sha256 text, admission_binding_sha256 text, admission_revision bigint, authorized_at_unix_ms bigint, qualification_expires_at_unix_ms bigint)",
+        security_definer: true,
+        strict: false,
+        volatility: "v",
+        language: "plpgsql",
+        gateway_execute: true,
+    },
+    ObjectWriteGatewayFunction {
         name: "control_object_write_gateway_qualification_response_lost_v1",
         identity_arguments:
             "p_request_canonical bytea, p_successful_put_canonical bytea",
@@ -7845,7 +7855,7 @@ mod object_write_gateway_catalog_tests {
     const SERVICE_SOURCE: &str = include_str!("../object_write_gateway/mod.rs");
 
     #[test]
-    fn precomposition_surface_is_exact_and_honestly_unavailable() {
+    fn the_production_surface_is_exact_and_attests_the_qualification_lock() {
         let executable: BTreeSet<_> = OBJECT_WRITE_GATEWAY_FUNCTION_CATALOG
             .iter()
             .filter(|function| function.gateway_execute)
@@ -7861,16 +7871,24 @@ mod object_write_gateway_catalog_tests {
             "control_object_write_gateway_register_v1",
             "control_object_write_gateway_spool_durable_v1",
             "control_object_write_gateway_spool_removed_v1",
+            "control_object_write_gateway_qualification_lock_v1",
             "control_object_write_gateway_startup_v1",
             "control_object_write_gateway_terminal_v1",
         ]);
         assert_eq!(executable, expected);
-        assert!(!OBJECT_WRITE_GATEWAY_FUNCTIONS
+        assert!(OBJECT_WRITE_GATEWAY_FUNCTIONS
             .contains("CREATE OR REPLACE FUNCTION __CATS_SCHEMA_IDENT__.control_object_write_gateway_qualification_lock_v1"));
-        assert!(OBJECT_WRITE_GATEWAY_FUNCTIONS.contains("11::BIGINT"));
+        assert!(OBJECT_WRITE_GATEWAY_FUNCTIONS.contains("12::BIGINT"));
         assert!(OBJECT_WRITE_GATEWAY_FUNCTIONS.contains("qualification_lock_available BOOLEAN"));
         assert!(OBJECT_WRITE_GATEWAY_FUNCTIONS.contains("pg_catalog.convert_to(catalog_input"));
-        assert!(OBJECT_WRITE_GATEWAY_FUNCTIONS.contains("        FALSE;"));
+        // The capability is attested from pg_catalog, never asserted as a literal.
+        assert!(!OBJECT_WRITE_GATEWAY_FUNCTIONS.contains("        FALSE;"));
+        assert!(OBJECT_WRITE_GATEWAY_FUNCTIONS.contains(
+            "has_function_privilege(\n                    session_user, function.oid, 'EXECUTE')"
+        ));
+        // The E13 lock must hold both ADR-0055 locks in the caller's transaction.
+        assert!(OBJECT_WRITE_GATEWAY_FUNCTIONS.contains("pg_advisory_xact_lock"));
+        assert!(OBJECT_WRITE_GATEWAY_FUNCTIONS.contains("FOR SHARE"));
         assert!(object_write_gateway_contract_sha256()
             .unwrap()
             .starts_with("sha256:"));
@@ -7909,9 +7927,9 @@ mod object_write_gateway_catalog_tests {
         }
         assert_eq!(
             ROLE_INSTALLER.matches("GRANT EXECUTE ON FUNCTION").count(),
-            11
+            12
         );
-        assert!(!ROLE_INSTALLER.contains("control_object_write_gateway_qualification_lock_v1"));
+        assert!(ROLE_INSTALLER.contains("control_object_write_gateway_qualification_lock_v1"));
     }
 
     #[test]

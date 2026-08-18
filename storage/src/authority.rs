@@ -56,8 +56,11 @@ pub struct AuthorizedServingAttachment {
     /// in a separate root-only artifact and never enters this receipt.
     /// `None` means no object-write credential is bound to this attachment;
     /// every qualified object-write publish path must fail closed on it.
-    /// Node-side credential generation and A19 registration are not composed
-    /// yet (see DEFERRED), so ordinary serving attachments carry `None`.
+    /// A Node composed with an ObjectWrite Gateway mints one credential per
+    /// granted attachment epoch and binds it here, so `None` on such a Node
+    /// means the grant was refused rather than downgraded. A Node with no
+    /// gateway configured still grants `None`, and its serving process cannot
+    /// publish at all.
     /// The canonical encoding omits an unbound credential entirely, keeping
     /// pre-field frozen artifacts byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]

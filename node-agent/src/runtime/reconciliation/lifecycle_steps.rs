@@ -28,6 +28,7 @@ use cats_api::runtime_reconciliation::{
 use cats_storage::authority::{validate_volume_record, VolumeDataAuthority, VolumeRecord};
 
 use crate::guest_client::GuestClient;
+use crate::object_write_credential::ObjectWriteCredentialPort;
 use crate::runtime_spine::{
     RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome, RuntimeDesiredEffectStopReason,
 };
@@ -1218,6 +1219,10 @@ pub(crate) struct LifecycleStepEffect {
     physical: Arc<dyn LifecyclePhysicalPort>,
     volume_transition: Arc<dyn SignedLifecycleVolumePort>,
     volume_authority: Arc<dyn VolumeDataAuthority>,
+    /// Retires the object-write credential of every attachment epoch this
+    /// lifecycle suffix ends. `None` composes a Node with no ObjectWrite
+    /// Gateway, whose grants never carried one.
+    credentials: Option<Arc<dyn ObjectWriteCredentialPort>>,
     #[cfg(feature = "proposed-node-residue-reclamation")]
     data_directory_reclaim: Option<super::DataDirectoryReclaimEffect>,
 }
@@ -1245,9 +1250,20 @@ impl LifecycleStepEffect {
             }),
             volume_transition,
             volume_authority,
+            credentials: None,
             #[cfg(feature = "proposed-node-residue-reclamation")]
             data_directory_reclaim: Some(super::DataDirectoryReclaimEffect::new(residue_authority)),
         }
+    }
+
+    /// Binds the Node's object-write credential authority so an ended epoch
+    /// loses its private key with the release that ended it.
+    pub(crate) fn with_object_write_credentials(
+        mut self,
+        credentials: Arc<dyn ObjectWriteCredentialPort>,
+    ) -> Self {
+        self.credentials = Some(credentials);
+        self
     }
 
     pub(crate) fn try_apply(
@@ -1642,6 +1658,7 @@ impl LifecycleStepEffect {
                 intent,
                 &expected_head,
                 &record,
+                self.credentials.as_deref(),
             ) {
                 Ok(NormalReleaseAuthorityRecovery::Released(_)) => {
                     if let Some(successor) = cleanup_postcondition_successor(
@@ -1721,6 +1738,7 @@ impl LifecycleStepEffect {
                     intent,
                     &expected_head,
                     &record,
+                    self.credentials.as_deref(),
                 ) {
                     Ok(NormalReleaseAuthorityRecovery::Released(_)) => {
                         RuntimeDesiredEffectOutcome::RefreshInventory
@@ -6008,6 +6026,7 @@ mod tests {
             delete_authorization_ids: Mutex::new(Vec::new()),
         });
         let effect = LifecycleStepEffect {
+            credentials: None,
             physical: Arc::new(NeverLifecyclePhysical),
             volume_transition: Arc::clone(&volume) as Arc<dyn SignedLifecycleVolumePort>,
             volume_authority: Arc::new(UnavailableVolumeAuthority),
@@ -7196,6 +7215,7 @@ mod tests {
                 delete_authorization_ids: Mutex::new(Vec::new()),
             });
             let effect = LifecycleStepEffect {
+                credentials: None,
                 physical: Arc::new(NeverLifecyclePhysical),
                 volume_transition: Arc::clone(&port) as Arc<dyn SignedLifecycleVolumePort>,
                 volume_authority: Arc::new(UnavailableVolumeAuthority),

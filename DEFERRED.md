@@ -12,7 +12,7 @@ V3：Automatic Host fencing remains deferred because EC2 stop plus ENI quarantin
 V5：The live PersistentDisk first-format/crash/remount matrix remains deferred because the production v2 API has no Cat-to-PersistentDisk attach/mount mutation; create/read/delete alone cannot drive the required real matrix without inventing a new product protocol.
 E13：Positive-stop/isolation evidence 仍缺少已接受的 authority 与 canonical terminal semantics；现有 proposed 工具只能留证，不能解除 clean-slate reset 的机械阻断。
 E14：Cross-component Closed mutation-admission proof 尚无已接受的可消费 authority；在该证明落地前 reset execute、最终 uncordon 与 public open 必须保持阻塞。
-V3/E13：Node 侧 object-write credential 生成 + A19 注册未组合；`AuthorizedServingAttachment.object_write_credential` 定为 `Option`，普通 serving 走 `None`，qualified object-write 发布路径对 `None` fail-closed（与手工围栏 D7 一致）。组合落地后回收该 Option。
+V3/E13：Node 侧 object-write credential 生成 + A19 注册已组合到 serving 授权路径；`AuthorizedServingAttachment.object_write_credential` 仍为 `Option`，因为未配置 ObjectWrite Gateway 的 Node（含全部现有测试组合）依然发 `None`，qualified object-write 发布路径对 `None` fail-closed。`writer_authority_id` 由 Node 用自己的 A19 credential 从 Control 读回（`POST /v1/internal/runtime/object-write-authority-reads`），absent/cutoff 一律 fail-closed，不再是 Node 配置。剩余缺口：production 仍未运行过 `cats admin runtime-node object-write-authority provision`，因此还没有 `object_write_authorities` 行。
 E3/D6：operator 私钥 prepare/apply 远程签名分离受 4 分钟 command lifetime 限制未接入 runner；v1 按 CUTOVER-DECISIONS.md D6 妥协执行，改造延后。
 E13：install-operator-tools.sh 的 bundle sha256 校验与 tar 提取按路径分次打开（TOCTOU）；合并后改为单 fd 打开、对 /dev/fd/N 校验并从同一 fd 提取（照 E3 窗口脚本的 fd-pinning 模式）。操作员 Host 无低权限本地用户，窗口内风险有限。
 

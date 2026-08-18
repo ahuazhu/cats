@@ -1627,6 +1627,7 @@ fn test_systemd_config_for_path(blockd_binary: &Path) -> RootProvisionSystemdCon
         max_staged_bytes: 1,
         max_staged_packs: 1,
         max_local_bytes: 4_194_304,
+        object_write_gateway: None,
     })
     .unwrap()
 }
@@ -13492,6 +13493,7 @@ mod tests {
             max_staged_bytes: 1,
             max_staged_packs: 1,
             max_local_bytes: 4_194_304,
+            object_write_gateway: None,
         })
         .unwrap()
     }
@@ -16790,6 +16792,7 @@ mod tests {
                     max_staged_bytes: 1,
                     max_staged_packs: 1,
                     max_local_bytes: 4_194_304,
+                    object_write_gateway: None,
                 },
             )
             .unwrap(),

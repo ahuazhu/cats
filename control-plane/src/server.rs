@@ -723,6 +723,11 @@ pub struct AppState {
     /// resolve lane. Authentication is checked before a permit is acquired.
     pub(crate) route_resolve_admission: Arc<crate::api::route_resolve_v2::RouteResolveV2Admission>,
     pub(crate) runtime_volume_transition_admission: Arc<RuntimeSpineAdmission>,
+    /// Independent work bound for the Node's read of its own object-write
+    /// writer authority. It is deliberately separate from the Desired-read and
+    /// volume-transition lanes so one authority read per Agent session can
+    /// never contend with, or be starved by, the reconcile loop.
+    pub(crate) object_write_authority_read_admission: Arc<RuntimeSpineAdmission>,
     pub(crate) runtime_volume_transition_service: Arc<RuntimeVolumeTransitionService>,
     pub(crate) fleet_verification_service: Arc<FleetVerificationService>,
     pub(crate) runtime_node_authority:
@@ -1623,6 +1628,7 @@ async fn spawn_inner(
             ),
         ),
         runtime_volume_transition_admission: Arc::new(RuntimeSpineAdmission::new()),
+        object_write_authority_read_admission: Arc::new(RuntimeSpineAdmission::new()),
         runtime_volume_transition_service: Arc::new(RuntimeVolumeTransitionService::new()),
         fleet_verification_service: Arc::new(FleetVerificationService::new()),
         #[cfg(debug_assertions)]

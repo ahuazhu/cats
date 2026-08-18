@@ -1,0 +1,21 @@
+[package]
+name = "cats-object-store-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+cats-api = { workspace = true }
+cats-storage = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+ring = { workspace = true }
+
+[lints]
+workspace = true

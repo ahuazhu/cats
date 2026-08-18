@@ -26,10 +26,11 @@ use cats_api::runtime_reconciliation::{
     decode_node_identity, decode_node_placement_policy, decode_runtime_node_authority_apply,
     decode_runtime_node_authority_apply_result, encode_node_identity, encode_node_placement_policy,
     encode_runtime_node_authority_apply, encode_runtime_node_authority_apply_result,
-    ContractVersion, Epoch, Id, NodeIdentity, NodeIdentityState, NodePlacementPolicy, RandomId128,
-    RuntimeNodeAuthorityApply, RuntimeNodeAuthorityApplyResult, RuntimeNodeAuthorityMutation,
-    RuntimeNodeAuthorityOutcome, NODE_IDENTITY_MAX_WIRE_BYTES,
-    NODE_PLACEMENT_POLICY_MAX_WIRE_BYTES, RUNTIME_NODE_AUTHORITY_APPLY_MAX_WIRE_BYTES,
+    object_write_writer_authority_id, AsciiText, ContractVersion, Epoch, Id, NodeIdentity,
+    NodeIdentityState, NodePlacementPolicy, ProviderScope, RandomId128, RuntimeNodeAuthorityApply,
+    RuntimeNodeAuthorityApplyResult, RuntimeNodeAuthorityMutation, RuntimeNodeAuthorityOutcome,
+    NODE_IDENTITY_MAX_WIRE_BYTES, NODE_PLACEMENT_POLICY_MAX_WIRE_BYTES,
+    RUNTIME_NODE_AUTHORITY_APPLY_MAX_WIRE_BYTES,
     RUNTIME_NODE_AUTHORITY_APPLY_RESULT_MAX_WIRE_BYTES,
 };
 use fs2::FileExt;
@@ -45,6 +46,7 @@ use crate::stable_unix_fs::{
 };
 use crate::{
     auth, config, Cli, RuntimeNodeAuthorityAuth, RuntimeNodeCommand, RuntimeNodeCredentialCommand,
+    RuntimeNodeObjectWriteAuthorityBinding, RuntimeNodeObjectWriteAuthorityCommand,
     RuntimeNodePolicyCommand,
 };
 
@@ -123,16 +125,20 @@ impl PendingRecord {
     }
 
     /// Recover the command-level binding without changing the V1 pending
-    /// schema. Official provision/policy commands generate apply IDs, while
-    /// rotate/retire files carry an exact caller-selected apply ID.
+    /// schema. Official provision/policy/object-write-authority commands
+    /// generate apply IDs, while rotate/retire files carry an exact
+    /// caller-selected apply ID.
     fn settled_binding(&self) -> Result<SettledBinding> {
         let apply = self.apply()?;
         match &apply.mutation {
             RuntimeNodeAuthorityMutation::Provision { .. }
-            | RuntimeNodeAuthorityMutation::UpdatePolicy { .. } => Ok(SettledBinding {
-                kind: SettledBindingKind::GeneratedMutation,
-                sha256: mutation_digest(&apply)?,
-            }),
+            | RuntimeNodeAuthorityMutation::UpdatePolicy { .. }
+            | RuntimeNodeAuthorityMutation::ProvisionObjectWriteAuthority { .. } => {
+                Ok(SettledBinding {
+                    kind: SettledBindingKind::GeneratedMutation,
+                    sha256: mutation_digest(&apply)?,
+                })
+            }
             RuntimeNodeAuthorityMutation::RotateCredential { .. }
             | RuntimeNodeAuthorityMutation::Retire { .. } => Ok(SettledBinding {
                 kind: SettledBindingKind::ExactApply,
@@ -725,6 +731,16 @@ pub(crate) fn run(
         cli.workspace.is_none(),
         "Runtime Node authority is fleet-scoped, not Workspace-scoped; remove --workspace/CATS_WORKSPACE"
     );
+    // The assigned writer authority ID is a closed function of its binding, so
+    // recovering it needs no request, no credential and no local state.
+    if let RuntimeNodeCommand::ObjectWriteAuthority {
+        cmd: RuntimeNodeObjectWriteAuthorityCommand::Id { binding },
+    } = command
+    {
+        let binding = writer_authority_binding(binding)?;
+        println!("{}", binding.assigned_writer_authority_id());
+        return Ok(());
+    }
     let origin = validate_https_origin(&auth::configured_api_url(cli.api_url.as_deref())?)?;
     let desired = desired_apply(command)?;
     let state_root = state_root()?;
@@ -845,7 +861,74 @@ fn desired_apply(command: &RuntimeNodeCommand) -> Result<DesiredApply> {
             );
             Ok(DesiredApply::Exact(apply))
         }
+        RuntimeNodeCommand::ObjectWriteAuthority {
+            cmd:
+                RuntimeNodeObjectWriteAuthorityCommand::Provision {
+                    expected_revision,
+                    binding,
+                },
+        } => {
+            let binding = writer_authority_binding(binding)?;
+            let expected_policy_revision =
+                Epoch::new(*expected_revision).context("invalid expected policy revision")?;
+            Ok(DesiredApply::Generated {
+                node_id: binding.node_id.clone(),
+                mutation: RuntimeNodeAuthorityMutation::ProvisionObjectWriteAuthority {
+                    expected_policy_revision,
+                    object_provider_scope: binding.object_provider_scope,
+                    workload_principal_id: binding.workload_principal_id,
+                    object_store_scope_id: binding.object_store_scope_id,
+                },
+            })
+        }
+        // Handled before any origin, credential or local state is touched.
+        RuntimeNodeCommand::ObjectWriteAuthority {
+            cmd: RuntimeNodeObjectWriteAuthorityCommand::Id { .. },
+        } => bail!("the writer authority ID command issues no apply"),
     }
+}
+
+/// One validated object-store writer binding from operator arguments.
+struct WriterAuthorityBinding {
+    node_id: Id,
+    object_provider_scope: ProviderScope,
+    workload_principal_id: AsciiText,
+    object_store_scope_id: AsciiText,
+}
+
+impl WriterAuthorityBinding {
+    /// The exact ID Control assigns to this binding. Recomputing it locally
+    /// keeps the CLI from printing a server-chosen authority it cannot verify.
+    fn assigned_writer_authority_id(&self) -> Id {
+        object_write_writer_authority_id(
+            &self.node_id,
+            &self.object_provider_scope,
+            &self.workload_principal_id,
+            &self.object_store_scope_id,
+        )
+    }
+}
+
+fn writer_authority_binding(
+    binding: &RuntimeNodeObjectWriteAuthorityBinding,
+) -> Result<WriterAuthorityBinding> {
+    Ok(WriterAuthorityBinding {
+        node_id: Id::new(binding.node.clone()).context("invalid Node ID")?,
+        object_provider_scope: ProviderScope {
+            provider: Id::new(binding.object_provider.clone())
+                .context("invalid object-store provider")?,
+            partition: Id::new(binding.object_partition.clone())
+                .context("invalid object-store partition")?,
+            account_id: Id::new(binding.object_account_id.clone())
+                .context("invalid object-store account ID")?,
+            region: Id::new(binding.object_region.clone())
+                .context("invalid object-store region")?,
+        },
+        workload_principal_id: AsciiText::new(binding.workload_principal_id.clone())
+            .context("invalid workload principal ID")?,
+        object_store_scope_id: AsciiText::new(binding.object_store_scope_id.clone())
+            .context("invalid object-store scope ID")?,
+    })
 }
 
 fn read_canonical_identity(path: &Path) -> Result<NodeIdentity> {
@@ -1167,6 +1250,25 @@ fn result_binds_request(
                 && result.identity_state == NodeIdentityState::Retired
                 && result.policy_revision == *expected_policy_revision
         }
+        RuntimeNodeAuthorityMutation::ProvisionObjectWriteAuthority {
+            expected_policy_revision,
+            object_provider_scope,
+            workload_principal_id,
+            object_store_scope_id,
+        } => {
+            result.outcome == RuntimeNodeAuthorityOutcome::ObjectWriteAuthorityProvisioned
+                && result.identity_state == NodeIdentityState::Provisioned
+                && result.policy_revision == *expected_policy_revision
+                // The returned authority must be the one this exact binding
+                // assigns, not merely a well-shaped ID.
+                && result.writer_authority_id.as_ref()
+                    == Some(&object_write_writer_authority_id(
+                        &apply.node_id,
+                        object_provider_scope,
+                        workload_principal_id,
+                        object_store_scope_id,
+                    ))
+        }
     }
 }
 
@@ -1191,6 +1293,12 @@ fn report_terminal(cli: &Cli, terminal: TerminalOutcome) -> Result<()> {
                     result.identity_state,
                     result.policy_revision.get()
                 );
+                if let Some(writer_authority_id) = &result.writer_authority_id {
+                    // Control assigns this. The Node reads it back over the
+                    // authenticated authority-read route; it is never Node
+                    // configuration.
+                    println!("writer-authority-id {writer_authority_id}");
+                }
             }
             Ok(())
         }
@@ -1694,6 +1802,23 @@ mod tests {
         fs::canonicalize(directory.path()).unwrap()
     }
 
+    fn writer_authority_command() -> RuntimeNodeCommand {
+        RuntimeNodeCommand::ObjectWriteAuthority {
+            cmd: RuntimeNodeObjectWriteAuthorityCommand::Provision {
+                expected_revision: 1,
+                binding: RuntimeNodeObjectWriteAuthorityBinding {
+                    node: "node_a".to_owned(),
+                    object_provider: "aws".to_owned(),
+                    object_partition: "aws".to_owned(),
+                    object_account_id: "123456789012".to_owned(),
+                    object_region: "us-east-1".to_owned(),
+                    workload_principal_id: "arn:aws:iam::123456789012:role/cats-gateway".to_owned(),
+                    object_store_scope_id: "arn:aws:s3:::cats-production/chunks".to_owned(),
+                },
+            },
+        }
+    }
+
     fn pending() -> PendingRecord {
         PendingRecord::from_apply("https://control.example:8443", &update()).unwrap()
     }
@@ -1715,6 +1840,7 @@ mod tests {
             outcome: RuntimeNodeAuthorityOutcome::PolicyUpdated,
             identity_state: NodeIdentityState::Provisioned,
             policy_revision: Epoch::new(2).unwrap(),
+            writer_authority_id: None,
         };
         response(
             200,
@@ -1724,13 +1850,15 @@ mod tests {
 
     fn success_for(pending: &PendingRecord) -> StoredHttpResponse {
         let apply = pending.apply().unwrap();
-        let (outcome, identity_state, policy_revision) = match &apply.mutation {
+        let (outcome, identity_state, policy_revision, writer_authority_id) = match &apply.mutation
+        {
             RuntimeNodeAuthorityMutation::Provision {
                 placement_policy, ..
             } => (
                 RuntimeNodeAuthorityOutcome::Provisioned,
                 NodeIdentityState::Provisioned,
                 placement_policy.policy_revision,
+                None,
             ),
             RuntimeNodeAuthorityMutation::UpdatePolicy {
                 placement_policy, ..
@@ -1738,6 +1866,7 @@ mod tests {
                 RuntimeNodeAuthorityOutcome::PolicyUpdated,
                 NodeIdentityState::Provisioned,
                 placement_policy.policy_revision,
+                None,
             ),
             RuntimeNodeAuthorityMutation::RotateCredential {
                 expected_policy_revision,
@@ -1746,6 +1875,7 @@ mod tests {
                 RuntimeNodeAuthorityOutcome::CredentialRotated,
                 NodeIdentityState::Provisioned,
                 *expected_policy_revision,
+                None,
             ),
             RuntimeNodeAuthorityMutation::Retire {
                 expected_policy_revision,
@@ -1754,6 +1884,23 @@ mod tests {
                 RuntimeNodeAuthorityOutcome::Retired,
                 NodeIdentityState::Retired,
                 *expected_policy_revision,
+                None,
+            ),
+            RuntimeNodeAuthorityMutation::ProvisionObjectWriteAuthority {
+                expected_policy_revision,
+                object_provider_scope,
+                workload_principal_id,
+                object_store_scope_id,
+            } => (
+                RuntimeNodeAuthorityOutcome::ObjectWriteAuthorityProvisioned,
+                NodeIdentityState::Provisioned,
+                *expected_policy_revision,
+                Some(object_write_writer_authority_id(
+                    &apply.node_id,
+                    object_provider_scope,
+                    workload_principal_id,
+                    object_store_scope_id,
+                )),
             ),
         };
         response(
@@ -1765,6 +1912,7 @@ mod tests {
                 outcome,
                 identity_state,
                 policy_revision,
+                writer_authority_id,
             })
             .unwrap(),
         )
@@ -2618,6 +2766,94 @@ mod tests {
     }
 
     #[test]
+    fn writer_authority_apply_reports_one_assigned_id_and_replays_it_locally() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = test_base(&directory).join("state");
+        let origin = "https://control.example:8443";
+        let command = writer_authority_command();
+        let desired = desired_apply(&command).unwrap();
+        let RuntimeNodeCommand::ObjectWriteAuthority {
+            cmd: RuntimeNodeObjectWriteAuthorityCommand::Provision { binding, .. },
+        } = &command
+        else {
+            unreachable!()
+        };
+        let expected = writer_authority_binding(binding)
+            .unwrap()
+            .assigned_writer_authority_id();
+        let state = PendingState::acquire(&root, desired.node_id()).unwrap();
+        let transport = RecordingTransport::default();
+
+        let TerminalOutcome::Applied(result) =
+            apply_with_transport(&state, origin, &desired, &transport)
+        else {
+            panic!("writer authority apply must settle as applied")
+        };
+        assert_eq!(
+            result.outcome,
+            RuntimeNodeAuthorityOutcome::ObjectWriteAuthorityProvisioned
+        );
+        assert_eq!(result.writer_authority_id, Some(expected.clone()));
+
+        // Re-running the exact command replays the settled receipt instead of
+        // issuing a second apply that the Host authority would refuse.
+        let TerminalOutcome::Applied(replay) =
+            apply_with_transport(&state, origin, &desired, &transport)
+        else {
+            panic!("writer authority replay must settle as applied")
+        };
+        assert_eq!(replay, result);
+        assert_eq!(transport.request_count(), 1);
+        assert_eq!(replay.writer_authority_id, Some(expected));
+    }
+
+    #[test]
+    fn a_writer_authority_result_naming_another_authority_is_not_terminal() {
+        let command = writer_authority_command();
+        let desired = desired_apply(&command).unwrap();
+        let apply = desired.materialize(None).unwrap();
+        let pending = PendingRecord::from_apply("https://control.example:8443", &apply).unwrap();
+        assert!(matches!(
+            classify_response(&pending, &success_for(&pending)).unwrap(),
+            ResponseClassification::Terminal(TerminalOutcome::Applied(_))
+        ));
+
+        let RuntimeNodeAuthorityMutation::ProvisionObjectWriteAuthority {
+            object_provider_scope,
+            workload_principal_id,
+            ..
+        } = &apply.mutation
+        else {
+            unreachable!()
+        };
+        // A well-shaped ID assigned to a different object-store scope must not
+        // settle: the CLI would otherwise print an authority the operator's own
+        // binding never created.
+        let foreign = RuntimeNodeAuthorityApplyResult {
+            version: ContractVersion::V1,
+            apply_id: apply.apply_id.clone(),
+            node_id: apply.node_id.clone(),
+            outcome: RuntimeNodeAuthorityOutcome::ObjectWriteAuthorityProvisioned,
+            identity_state: NodeIdentityState::Provisioned,
+            policy_revision: Epoch::new(1).unwrap(),
+            writer_authority_id: Some(object_write_writer_authority_id(
+                &apply.node_id,
+                object_provider_scope,
+                workload_principal_id,
+                &AsciiText::new("arn:aws:s3:::cats-other/chunks").unwrap(),
+            )),
+        };
+        let foreign = response(
+            200,
+            encode_runtime_node_authority_apply_result(&foreign).unwrap(),
+        );
+        assert!(matches!(
+            classify_response(&pending, &foreign).unwrap(),
+            ResponseClassification::Nonterminal
+        ));
+    }
+
+    #[test]
     fn only_exact_bound_responses_are_terminal() {
         let pending = pending();
         assert!(matches!(
@@ -2642,6 +2878,7 @@ mod tests {
             outcome: RuntimeNodeAuthorityOutcome::PolicyUpdated,
             identity_state: NodeIdentityState::Provisioned,
             policy_revision: Epoch::new(1).unwrap(),
+            writer_authority_id: None,
         };
         let wrong_revision = response(
             200,

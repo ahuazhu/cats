@@ -4,7 +4,8 @@ use cats_api::runtime_reconciliation::{
     decode_runtime_provisioner_trust_bundle, encode_node_placement_policy,
     encode_runtime_node_authority_apply, encode_runtime_node_authority_apply_result,
     encode_runtime_provisioner_active_set, encode_runtime_provisioner_trust_bundle,
-    runtime_provisioner_active_set_digest,
+    object_write_writer_authority_id, runtime_provisioner_active_set_digest,
+    RuntimeNodeAuthorityMutation,
 };
 use sha2::{Digest, Sha256};
 
@@ -12,7 +13,10 @@ const POLICY: &[u8] = br#"{"allocatable_memory_bytes":17179869184,"allocatable_v
 const ACTIVE_SET: &[u8] = br#"{"credentials":[{"credential_id":"provisioner_a","public_key_spki":"MCowBQYDK2VwAyEA11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}],"deployment_id":"deployment_a","version":1}"#;
 const TRUST_BUNDLE: &[u8] = br#"{"credentials":[{"credential_id":"provisioner_a","public_key_spki":"MCowBQYDK2VwAyEA11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}],"deployment_id":"deployment_a","expected_previous":null,"trust_revision":1,"version":1}"#;
 const APPLY: &[u8] = br#"{"apply_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","mutation":{"expected_policy_revision":1,"kind":"update_policy","placement_policy":{"allocatable_memory_bytes":17179869184,"allocatable_vcpus":8,"capabilities":{"block_frontend":"kernel_nbd","guest_agent_protocol_version":1,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","guest_network":"isolated_ipv4","guest_transport":"vsock","vmm":"cloud_hypervisor"},"guest_ipv4_pool":{"kind":"private_ipv4_16","network_address":"10.240.0.0","prefix_length":16},"node_id":"node_a","node_transport_target":"https://node-a.internal:7301","policy_revision":2,"scheduling_state":"schedulable","version":1}},"node_id":"node_a","version":1}"#;
-const RESULT: &[u8] = br#"{"apply_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","identity_state":"provisioned","node_id":"node_a","outcome":"policy_updated","policy_revision":2,"version":1}"#;
+const RESULT: &[u8] = br#"{"apply_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","identity_state":"provisioned","node_id":"node_a","outcome":"policy_updated","policy_revision":2,"version":1,"writer_authority_id":null}"#;
+
+const OBJECT_WRITE_APPLY: &[u8] = br#"{"apply_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","mutation":{"expected_policy_revision":2,"kind":"provision_object_write_authority","object_provider_scope":{"account_id":"123456789012","partition":"aws","provider":"aws","region":"us-east-1"},"object_store_scope_id":"arn:aws:s3:::cats-production/chunks","workload_principal_id":"arn:aws:iam::123456789012:role/cats-production-object-write-gateway"},"node_id":"node_a","version":1}"#;
+const OBJECT_WRITE_RESULT: &[u8] = br#"{"apply_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","identity_state":"provisioned","node_id":"node_a","outcome":"object_write_authority_provisioned","policy_revision":2,"version":1,"writer_authority_id":"owa1_281bca4b03db70a1efdc5a7a2fb3c5c8c4e15672546f2ccf8459b458cd9abdfa"}"#;
 
 fn assert_vector(bytes: &[u8], expected_len: usize, expected_sha256: &str) {
     assert_eq!(bytes.len(), expected_len);
@@ -72,9 +76,94 @@ fn canonical_fixed_vectors_round_trip_exactly() {
     );
     assert_vector(
         RESULT,
-        156,
-        "94ff5e6829405355d85dfff7c1a7f1e7f02cf420c64cab408c68366438e16468",
+        183,
+        "3f97eb7605f89e57e2196b19c1e76bbddf839032603c050b7cb3d7cd3980bdfc",
     );
+}
+
+#[test]
+fn object_write_authority_apply_freezes_its_wire_and_assigned_id() {
+    let apply = decode_runtime_node_authority_apply(OBJECT_WRITE_APPLY).unwrap();
+    assert_eq!(
+        encode_runtime_node_authority_apply(&apply).unwrap(),
+        OBJECT_WRITE_APPLY
+    );
+    assert_vector(
+        OBJECT_WRITE_APPLY,
+        428,
+        "9512b8ea46a51c0ab48cd5a4e4b22ed1ef6ddb536bc206afe58b9c5dda8f2f5e",
+    );
+
+    let RuntimeNodeAuthorityMutation::ProvisionObjectWriteAuthority {
+        object_provider_scope,
+        workload_principal_id,
+        object_store_scope_id,
+        ..
+    } = &apply.mutation
+    else {
+        panic!("frozen vector is a writer-authority apply");
+    };
+    // The assigned ID is a closed function of the exact binding, so the frozen
+    // result vector below is the only ID this apply can ever produce.
+    assert_eq!(
+        object_write_writer_authority_id(
+            &apply.node_id,
+            object_provider_scope,
+            workload_principal_id,
+            object_store_scope_id,
+        )
+        .as_str(),
+        "owa1_281bca4b03db70a1efdc5a7a2fb3c5c8c4e15672546f2ccf8459b458cd9abdfa"
+    );
+
+    let result = decode_runtime_node_authority_apply_result(OBJECT_WRITE_RESULT).unwrap();
+    assert_eq!(
+        encode_runtime_node_authority_apply_result(&result).unwrap(),
+        OBJECT_WRITE_RESULT
+    );
+    assert_vector(
+        OBJECT_WRITE_RESULT,
+        270,
+        "8ea3bd1f3af6b63ced5325a8a76bb5548f925dfdde8f957c7c0e61bd13827cad",
+    );
+}
+
+#[test]
+fn assigned_writer_authority_id_belongs_to_exactly_one_outcome_and_shape() {
+    let text = String::from_utf8(OBJECT_WRITE_RESULT.to_vec()).unwrap();
+    for wrong in [
+        r#""outcome":"policy_updated""#,
+        r#""outcome":"provisioned""#,
+        r#""outcome":"credential_rotated""#,
+    ] {
+        let candidate = text.replace(r#""outcome":"object_write_authority_provisioned""#, wrong);
+        assert!(
+            decode_runtime_node_authority_apply_result(candidate.as_bytes()).is_err(),
+            "accepted an assigned writer authority ID on {wrong}"
+        );
+    }
+    let missing = text.replace(
+        r#""writer_authority_id":"owa1_281bca4b03db70a1efdc5a7a2fb3c5c8c4e15672546f2ccf8459b458cd9abdfa""#,
+        r#""writer_authority_id":null"#,
+    );
+    assert!(decode_runtime_node_authority_apply_result(missing.as_bytes()).is_err());
+    for wrong_shape in [
+        "owa1_281BCA4B03DB70A1EFDC5A7A2FB3C5C8C4E15672546F2CCF8459B458CD9ABDFA",
+        "owa1_281bca4b03db70a1efdc5a7a2fb3c5c8c4e15672546f2ccf8459b458cd9abdf",
+        "owa2_281bca4b03db70a1efdc5a7a2fb3c5c8c4e15672546f2ccf8459b458cd9abdfa",
+        "281bca4b03db70a1efdc5a7a2fb3c5c8c4e15672546f2ccf8459b458cd9abdfa",
+    ] {
+        let candidate = text.replace(
+            "owa1_281bca4b03db70a1efdc5a7a2fb3c5c8c4e15672546f2ccf8459b458cd9abdfa",
+            wrong_shape,
+        );
+        assert!(
+            decode_runtime_node_authority_apply_result(candidate.as_bytes()).is_err(),
+            "accepted a non-canonical writer authority ID {wrong_shape}"
+        );
+    }
+    // Calibration: the exact frozen result still decodes.
+    assert!(decode_runtime_node_authority_apply_result(OBJECT_WRITE_RESULT).is_ok());
 }
 
 #[test]

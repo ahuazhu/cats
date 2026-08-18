@@ -22,6 +22,7 @@ locals {
       "CATS_CHUNKSTORE_PREFIX=${var.chunkstore_prefix}",
       "CATS_POSTGRES_SCHEMA=${var.control_postgres_schema}",
       "CATS_ROUTE_V2_ROTATION_ORIGIN=${var.route_v2_rotation_origin}",
+      "CATS_OBJECT_WRITE_GATEWAY_URL=${var.object_write_gateway_url}",
     ],
   ))
 
@@ -40,6 +41,7 @@ locals {
       "CATS_CHUNKSTORE_PREFIX=${var.chunkstore_prefix}",
       "CATS_POSTGRES_SCHEMA=${var.control_postgres_schema}",
       "CATS_ROUTE_V2_ROTATION_ORIGIN=${var.route_v2_rotation_origin}",
+      "CATS_OBJECT_WRITE_GATEWAY_URL=${var.object_write_gateway_url}",
     ],
     var.database_master_user_secret_arn == null ? [] : [
       "CATS_POSTGRES_SECRET_ARN=${var.database_master_user_secret_arn}",

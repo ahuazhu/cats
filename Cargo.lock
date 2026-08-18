@@ -1054,6 +1054,7 @@ name = "cats-blockd-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "cats-api",
  "cats-block-client",
  "cats-blockd",
@@ -1062,11 +1063,13 @@ dependencies = [
  "cats-metadata-store-sqlite",
  "cats-object-store-aws-s3",
  "cats-object-store-file",
+ "cats-object-store-gateway",
  "cats-storage",
  "cats-test-support",
  "clap",
  "libc",
  "postgres",
+ "ring",
  "serde_json",
  "tempfile",
  "tracing",
@@ -1322,6 +1325,7 @@ name = "cats-node-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aws-config",
  "axum",
  "base64",
  "bytes",
@@ -1329,12 +1333,14 @@ dependencies = [
  "cats-block-client",
  "cats-blockd",
  "cats-control-plane",
+ "cats-host-fence-aws",
  "cats-metadata-store-postgres",
  "cats-metadata-store-sqlite",
  "cats-metering",
  "cats-network",
  "cats-object-store-aws-s3",
  "cats-object-store-file",
+ "cats-object-store-gateway",
  "cats-storage",
  "cats-test-support",
  "futures-util",
@@ -1344,6 +1350,7 @@ dependencies = [
  "hyper-util",
  "jsonwebtoken",
  "libc",
+ "postgres",
  "reqwest",
  "ring",
  "rusqlite",
@@ -1412,6 +1419,20 @@ dependencies = [
  "cats-storage",
  "cats-test-support",
  "tempfile",
+]
+
+[[package]]
+name = "cats-object-store-gateway"
+version = "0.1.0"
+dependencies = [
+ "cats-api",
+ "cats-storage",
+ "reqwest",
+ "ring",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.19",
+ "tracing",
 ]
 
 [[package]]

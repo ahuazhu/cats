@@ -685,6 +685,41 @@ pub fn route_v2_gateway_machine_config(
     route_v2_gateway_machine_fixture_inner(listen).map(|(config, _)| config)
 }
 
+#[cfg(feature = "test-support")]
+pub use crate::store::runtime_authority::object_write_e2e_fixture::{
+    ObjectWriteNodeFixture, ObjectWriteNodeRequest,
+};
+
+/// Provision one Node identity, current Agent session, Active Volume and Owned
+/// attachment epoch through the production Store transactions.
+///
+/// The object-write writer authority is deliberately left closed; open it with
+/// [`provision_object_write_authority`] so a caller can first measure the
+/// gateway's refusal while every other precondition already holds.
+#[cfg(feature = "test-support")]
+pub async fn provision_object_write_node(
+    store: &Arc<crate::store::Store>,
+    request: ObjectWriteNodeRequest,
+) -> ObjectWriteNodeFixture {
+    store
+        .execute(move |store| Ok(store.provision_object_write_node(&request)))
+        .await
+        .expect("provision object-write Node fixture")
+}
+
+/// Open exactly one object-write writer authority for the fixture Host through
+/// the production `ProvisionObjectWriteAuthority` mutation.
+#[cfg(feature = "test-support")]
+pub async fn provision_object_write_authority(
+    store: &Arc<crate::store::Store>,
+    request: ObjectWriteNodeRequest,
+) -> cats_api::runtime_reconciliation::Id {
+    store
+        .execute(move |store| Ok(store.provision_object_write_authority(&request)))
+        .await
+        .expect("provision object-write writer authority")
+}
+
 /// Base DSN of the disposable test server.
 ///
 /// Panics with instructions when unset: silently skipping the store tests

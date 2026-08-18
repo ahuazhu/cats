@@ -64,6 +64,7 @@ pub(crate) mod route_signing_operator;
 #[cfg(debug_assertions)]
 mod routes;
 pub(crate) mod runtime_node_authority;
+mod runtime_object_write_authority;
 mod runtime_operations;
 mod runtime_product_reads;
 mod runtime_spine;
@@ -887,6 +888,14 @@ pub fn router(state: AppState) -> Router {
             "/v1/internal/runtime/observations",
             post(runtime_spine::observation).fallback(runtime_spine::observation),
         )
+        // The literal keeps this route visible to the router snapshot test;
+        // `runtime_object_write_authority` asserts at compile time that it is
+        // exactly the frozen contract path.
+        .route(
+            "/v1/internal/runtime/object-write-authority-reads",
+            post(runtime_object_write_authority::writer_authority_read)
+                .fallback(runtime_object_write_authority::writer_authority_read),
+        )
         .route(
             cats_api::metering::USAGE_CHECKPOINTS_PATH,
             post(runtime_usage::ingest).fallback(runtime_usage::ingest),
@@ -1064,6 +1073,10 @@ mod tests {
             "independent_internal_authority",
         ),
         ("POST /v1/internal/runtime/desired-reads", "read_only_post"),
+        (
+            "POST /v1/internal/runtime/object-write-authority-reads",
+            "read_only_post",
+        ),
         (
             "POST /v1/internal/runtime/observations",
             "independent_internal_settlement",
@@ -1357,6 +1370,7 @@ POST /v1/billing/stripe/webhook
 POST /v1/internal/routes/resolve
 POST /v1/internal/runtime/agent-sessions
 POST /v1/internal/runtime/desired-reads
+POST /v1/internal/runtime/object-write-authority-reads
 POST /v1/internal/runtime/observations
 POST /v1/internal/runtime/residue-authority
 POST /v1/internal/runtime/volume-transition-evidence
@@ -1468,6 +1482,7 @@ POST /v1/internal/route-v2/signing-authority-commands
 POST /v1/internal/routes/resolve
 POST /v1/internal/runtime/agent-sessions
 POST /v1/internal/runtime/desired-reads
+POST /v1/internal/runtime/object-write-authority-reads
 POST /v1/internal/runtime/observations
 POST /v1/internal/runtime/residue-authority
 POST /v1/internal/runtime/volume-transition-evidence

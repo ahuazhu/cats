@@ -235,6 +235,10 @@ impl ServingBlockdExpectation {
                     node_id: desired.placement.node_id.clone(),
                     placement_epoch: desired.placement.placement_epoch,
                 },
+                // This fixture composes a Node with no ObjectWrite Gateway,
+                // which is the only shape that grants an attachment without a
+                // credential. The credentialed launch argv is covered where it
+                // is built, in `authorized_blockd`.
                 object_write_credential: None,
                 size_bytes: intent.size_bytes,
                 durability: intent.durability,

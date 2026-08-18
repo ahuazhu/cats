@@ -1,6 +1,8 @@
 //! cats-blockd composition root: selects storage adapters and serves one
 //! volume under one attachment lease.
 
+mod object_write;
+
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -140,6 +142,23 @@ struct Args {
     /// Opaque object adapter option (`key=value`); may be repeated.
     #[arg(long = "object-store-option", value_name = "KEY=VALUE")]
     object_store_options: Vec<String>,
+
+    /// ObjectWrite Gateway origin, for example `https://gateway.internal:8443`.
+    ///
+    /// Production workers are denied direct ChunkStore mutation by IAM, so an
+    /// adopted attachment that binds an object-write credential publishes
+    /// every immutable object through the Gateway and reads unchanged from the
+    /// object adapter above. Required together with the credential directory
+    /// whenever such an attachment is adopted; ignored by an attachment that
+    /// binds no credential.
+    #[arg(long, value_name = "URL")]
+    object_write_gateway_url: Option<String>,
+
+    /// Absolute path of the Node's `object-write-credentials` namespace, which
+    /// holds the registered artifact and the root-only private key of the
+    /// attachment-scoped object-write credential.
+    #[arg(long, value_name = "PATH")]
+    object_write_credential_directory: Option<PathBuf>,
 
     /// Serve NBD on this unix socket path.
     #[arg(long)]
@@ -1391,6 +1410,36 @@ fn main() -> Result<()> {
     let expected_target_request = authorized_target_control
         .as_ref()
         .map(|artifact| artifact.request.clone());
+    // Production workers are denied direct ChunkStore mutation by IAM, so an
+    // attachment that binds an object-write credential must publish through
+    // the Gateway. Resolve that here, while this process is still only parsing
+    // authorization input: a credential blockd cannot load is a refusal to
+    // start, never a direct write.
+    let adopted_attachment = authorized_serving
+        .as_ref()
+        .map(AuthorizedServingInput::attachment)
+        .or_else(|| {
+            authorized_target_control
+                .as_ref()
+                .map(|artifact| &artifact.attachment)
+        })
+        .or(authorized_control.as_ref());
+    let blob = match adopted_attachment {
+        Some(attachment) => match object_write::gateway_publish_store(
+            args.object_write_gateway_url.as_deref(),
+            args.object_write_credential_directory.as_deref(),
+            attachment,
+            &blob,
+        )
+        .context("select the object-write publish path")?
+        {
+            Some(gateway) => {
+                std::sync::Arc::new(gateway) as std::sync::Arc<dyn cats_storage::BlobStore>
+            }
+            None => blob,
+        },
+        None => blob,
+    };
     if let Some(directory) = &retained_engine_data_directory {
         // Close the pathname-to-descriptor window only after every canonical
         // authorization input has been parsed, and before the engine can
@@ -1765,6 +1814,24 @@ fn validate_handoff_listener_path(path: &Path, label: &str) -> Result<()> {
 }
 
 fn validate_process_mode(args: &Args) -> Result<()> {
+    // The Gateway origin and the credential namespace are one capability: a
+    // signer with nowhere to publish, or an endpoint with no signer, can never
+    // complete an object write.
+    match (
+        &args.object_write_gateway_url,
+        &args.object_write_credential_directory,
+    ) {
+        (Some(_), None) => {
+            bail!("--object-write-gateway-url requires --object-write-credential-directory")
+        }
+        (None, Some(_)) => {
+            bail!("--object-write-credential-directory requires --object-write-gateway-url")
+        }
+        (Some(_), Some(directory)) if !directory.is_absolute() => {
+            bail!("--object-write-credential-directory must be an absolute path")
+        }
+        _ => {}
+    }
     let direct_serving = args.authorized_serving_spec.is_some();
     let handoff_serving = args.authorized_serving_handoff_record.is_some();
     if direct_serving && handoff_serving {
@@ -2186,6 +2253,88 @@ mod tests {
             PathBuf::from(paths.control_socket().as_str()),
             PathBuf::from(paths.io_socket().as_str()),
         )
+    }
+
+    /// A release CLI that serves no volume, used to exercise flag-level
+    /// process-mode rules without an authorization artifact.
+    fn publish_only_args(extra: &[&str]) -> Args {
+        let mut argv = vec![
+            "cats-blockd",
+            "--publish-image",
+            "/var/lib/cats/image.raw",
+            "--object-store-adapter",
+            "file",
+        ];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv).expect("parse release CLI")
+    }
+
+    /// The Node passes these two flags verbatim. Renaming either one silently
+    /// disables the only ChunkStore write path production permits.
+    #[test]
+    fn the_object_write_gateway_flags_parse_under_their_exact_names() {
+        let args = publish_only_args(&[
+            "--object-write-gateway-url",
+            "https://gateway.internal:8443",
+            "--object-write-credential-directory",
+            "/var/lib/cats/object-write-credentials",
+        ]);
+        assert_eq!(
+            args.object_write_gateway_url.as_deref(),
+            Some("https://gateway.internal:8443")
+        );
+        assert_eq!(
+            args.object_write_credential_directory.as_deref(),
+            Some(Path::new("/var/lib/cats/object-write-credentials"))
+        );
+        validate_process_mode(&args).expect("paired absolute flags are admitted");
+    }
+
+    #[test]
+    fn one_object_write_gateway_flag_without_the_other_is_refused() {
+        let message = validate_process_mode(&publish_only_args(&[
+            "--object-write-gateway-url",
+            "https://gateway.internal:8443",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            message.contains("requires --object-write-credential-directory"),
+            "{message}"
+        );
+
+        let message = validate_process_mode(&publish_only_args(&[
+            "--object-write-credential-directory",
+            "/var/lib/cats/object-write-credentials",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            message.contains("requires --object-write-gateway-url"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_relative_object_write_credential_directory_is_refused() {
+        let message = validate_process_mode(&publish_only_args(&[
+            "--object-write-gateway-url",
+            "https://gateway.internal:8443",
+            "--object-write-credential-directory",
+            "object-write-credentials",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("must be an absolute path"), "{message}");
+    }
+
+    /// A release CLI that names neither flag must stay exactly as it was.
+    #[test]
+    fn omitting_both_object_write_gateway_flags_remains_admitted() {
+        let args = publish_only_args(&[]);
+        assert!(args.object_write_gateway_url.is_none());
+        assert!(args.object_write_credential_directory.is_none());
+        validate_process_mode(&args).expect("the pre-gateway CLI is unchanged");
     }
 
     #[cfg(target_os = "linux")]

@@ -6,6 +6,11 @@ pub mod admission;
 pub mod agent_registration;
 pub mod ch;
 pub mod guest_client;
+pub mod object_write_credential;
+/// End-to-end acceptance for the Node -> ObjectWrite Gateway -> object-store
+/// publish chain. This crate is the only one that can see all of it.
+#[cfg(test)]
+mod object_write_end_to_end;
 pub(crate) mod proc;
 pub mod route_grant;
 pub mod route_grant_v2;

@@ -318,16 +318,24 @@ impl SignedRunningEffect {
         )?;
         Ok(Self {
             running_admission: Some(running_admission),
-            lifecycle: Some(LifecycleStepEffect::platform(
-                network_ip_binary,
-                acquire.lifecycle_volume_port(),
-                Arc::clone(&authority),
-                Arc::clone(&process_ports.serving_global),
-                Arc::clone(&process_ports.vmm_global),
-                kernel_nbd_detach,
-                #[cfg(feature = "proposed-node-residue-reclamation")]
-                residue_authority,
-            )),
+            lifecycle: Some({
+                let lifecycle = LifecycleStepEffect::platform(
+                    network_ip_binary,
+                    acquire.lifecycle_volume_port(),
+                    Arc::clone(&authority),
+                    Arc::clone(&process_ports.serving_global),
+                    Arc::clone(&process_ports.vmm_global),
+                    kernel_nbd_detach,
+                    #[cfg(feature = "proposed-node-residue-reclamation")]
+                    residue_authority,
+                );
+                // The suffix that ends an epoch must retire exactly what the
+                // acquire prefix minted, so both share one authority.
+                match acquire.object_write_credentials() {
+                    Some(credentials) => lifecycle.with_object_write_credentials(credentials),
+                    None => lifecycle,
+                }
+            }),
             acquire,
             provision: SignedRootProvisionEffect::platform(
                 Arc::clone(&authority),
