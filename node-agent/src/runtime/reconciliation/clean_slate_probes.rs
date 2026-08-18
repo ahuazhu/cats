@@ -19139,7 +19139,10 @@ mod tests {
             .recv_timeout(cats_test_support::poll_bound())
             .expect("production launch authority deadlocked on its checkpoint guard")
             .unwrap();
-        assert_eq!(outcome, Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        assert_eq!(
+            outcome,
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
+        );
         assert_eq!(effect_guest_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             registry
@@ -19774,7 +19777,7 @@ mod tests {
             );
             assert_eq!(
                 filesystem_effect.try_apply(&context, &desired).unwrap(),
-                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+                Some(RuntimeDesiredEffectOutcome::refresh_inventory())
             );
         };
 
@@ -20081,7 +20084,7 @@ mod tests {
             success_effect
                 .try_apply(&success_context, &desired)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::RefreshInventory(_))
         ));
         assert_eq!(success_guest_calls.load(Ordering::SeqCst), 1);
         assert!(success_launch_revalidated.load(Ordering::SeqCst));
@@ -20145,7 +20148,7 @@ mod tests {
             success_effect
                 .try_retire(&vmm_absent_context, &desired)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(
             registry
@@ -21335,7 +21338,7 @@ mod tests {
             effect
                 .try_apply(&context, desired, &store, &stored, &current)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert!(!fixture.data_directory.exists());
         assert_eq!(std::fs::read(store.path()).unwrap(), checkpoint_bytes);
@@ -21385,7 +21388,7 @@ mod tests {
             effect
                 .try_apply(&context, desired, &store, &stored, &current)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert!(!fixture.data_directory.exists());
     }

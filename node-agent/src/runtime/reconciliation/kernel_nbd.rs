@@ -2545,12 +2545,9 @@ impl KernelNbdAttachEffect {
         // prepare_device emitting 468 refreshes in three minutes with nothing
         // to read; name each one at the point it fires.
         let refresh = |reason: &'static str| {
-            tracing::warn!(
-                reason,
-                cat = %desired.cat_id,
-                "kernel-NBD attach asked for a fresh inventory",
-            );
-            Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+            Ok(Some(
+                RuntimeDesiredEffectOutcome::refresh_inventory_because(reason),
+            ))
         };
         let admission = context.kernel_nbd_pool()?;
         anyhow::ensure!(
@@ -2653,7 +2650,7 @@ impl KernelNbdAttachEffect {
                 KernelNbdDeviceScanState::Absent { listener: None, .. }
                 | KernelNbdDeviceScanState::Leaked { .. }
                 | KernelNbdDeviceScanState::Unavailable { .. } => {
-                    return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                    return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
                 }
             };
             if runtime
@@ -2669,7 +2666,11 @@ impl KernelNbdAttachEffect {
             }
             let first_authority = match self.authority.load_volume(&device.volume_id) {
                 Ok(authority) => authority,
-                Err(_) => return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory)),
+                Err(error) => {
+                    return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory_after(
+                        &error,
+                    )))
+                }
             };
             let retained = match RetainedServingBlockdAuthority::reopen(
                 context.state_directory(),
@@ -2679,7 +2680,11 @@ impl KernelNbdAttachEffect {
                 &first_authority,
             ) {
                 Ok(retained) => retained,
-                Err(_) => return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory)),
+                Err(error) => {
+                    return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory_after(
+                        &error,
+                    )))
+                }
             };
             retained.assert_current(
                 stored.checkpoint(),
@@ -2688,7 +2693,7 @@ impl KernelNbdAttachEffect {
                 listener.expectation(),
             )?;
             let Some(first_lease_expiry) = first_authority.lease_expires_at else {
-                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
             };
             admitted.push(AdmittedKernelNbdAttach {
                 device,
@@ -2767,7 +2772,7 @@ impl KernelNbdAttachEffect {
             .lock()
             .map_err(|_| anyhow::anyhow!("kernel-NBD submission gate poisoned"))?;
         if submitted.as_ref() == Some(observation_id) {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         }
         *submitted = Some(observation_id.clone());
         drop(submitted);
@@ -2801,7 +2806,7 @@ impl KernelNbdAttachEffect {
                     .retained
                     .assert_current(stored.checkpoint(), desired, &after, expectation);
         }
-        Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+        Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()))
     }
 }
 

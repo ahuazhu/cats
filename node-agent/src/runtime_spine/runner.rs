@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{catch_unwind, AssertUnwindSafe, Location};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -204,17 +204,110 @@ pub(crate) trait RuntimeEffectResourceOwner:
 /// Closed control decision returned by a typed Desired effect. Only
 /// `RetryExact` retains the same in-memory admission and exact Desired unit;
 /// every other non-applied decision leaves that batch.
+/// Why one effect asked the runner for a fresh full inventory.
+///
+/// A refresh is the reconciler's only bridge back to a new full scan, so a
+/// condition that keeps returning it livelocks the Cat while the logs stay
+/// silent. Diagnosing that from production has repeatedly required shipping a
+/// new release to name one branch, because a refresh carried no reason and the
+/// `Err(_) => refresh` arms discarded the error they had already diagnosed.
+/// This type makes both impossible to lose: the construction site is captured
+/// from the caller, and a diagnosed error travels with it.
+#[derive(Debug, Clone)]
+pub struct RuntimeRefreshCause {
+    site: &'static Location<'static>,
+    reason: Option<&'static str>,
+    error: Option<String>,
+}
+
+impl RuntimeRefreshCause {
+    #[track_caller]
+    fn at_caller(reason: Option<&'static str>, error: Option<String>) -> Self {
+        Self {
+            site: Location::caller(),
+            reason,
+            error,
+        }
+    }
+
+    /// Source location of the branch that produced this refresh.
+    pub fn site(&self) -> &'static Location<'static> {
+        self.site
+    }
+
+    /// Operator-facing reason, when the branch named one.
+    pub fn reason(&self) -> Option<&'static str> {
+        self.reason
+    }
+
+    /// The diagnosed error this refresh replaced, when there was one.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+}
+
+impl std::fmt::Display for RuntimeRefreshCause {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}:{}", self.site.file(), self.site.line())?;
+        if let Some(reason) = self.reason {
+            write!(formatter, ": {reason}")?;
+        }
+        if let Some(error) = &self.error {
+            write!(formatter, ": {error}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Two refreshes are the same decision regardless of which branch produced it.
+/// Outcome assertions are about the decision; the cause is diagnostic payload
+/// and must not make an existing expectation depend on a line number.
+impl PartialEq for RuntimeRefreshCause {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for RuntimeRefreshCause {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeDesiredEffectOutcome {
     /// The accepted full inventory already proved this item converged; this
     /// invocation performed no persistent or physical change.
     Applied,
     RetryExact,
-    RefreshInventory,
+    RefreshInventory(RuntimeRefreshCause),
     ReplanDesired,
     IdentityRepairRequired,
     SessionReplacementRequired,
     Stop(RuntimeDesiredEffectStopReason),
+}
+
+impl RuntimeDesiredEffectOutcome {
+    /// Ask for a fresh full inventory, recording this call site.
+    #[track_caller]
+    pub fn refresh_inventory() -> Self {
+        Self::RefreshInventory(RuntimeRefreshCause::at_caller(None, None))
+    }
+
+    /// Ask for a fresh full inventory and name the condition that forced it.
+    #[track_caller]
+    pub fn refresh_inventory_because(reason: &'static str) -> Self {
+        Self::RefreshInventory(RuntimeRefreshCause::at_caller(Some(reason), None))
+    }
+
+    /// Ask for a fresh full inventory, retaining the error this refresh
+    /// replaced. Use this wherever a fallible read is answered with a retry:
+    /// the error is the diagnosis and must not be dropped.
+    #[track_caller]
+    pub fn refresh_inventory_after<E: std::fmt::Display>(error: &E) -> Self {
+        // `{:#}` renders an `anyhow::Error`'s full cause chain and is an
+        // ignored flag for a typed error's own Display.
+        Self::RefreshInventory(RuntimeRefreshCause::at_caller(
+            None,
+            Some(format!("{error:#}")),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3360,7 +3453,12 @@ impl RuntimeSpineRunner {
                             self.pending_effects.push_back(*desired);
                             return Ok(Some(RuntimeSpineRunStep::EffectRetryExact { cat_id }));
                         }
-                        Ok(RuntimeDesiredEffectOutcome::RefreshInventory) => {
+                        Ok(RuntimeDesiredEffectOutcome::RefreshInventory(cause)) => {
+                            tracing::warn!(
+                                cat = %cat_id,
+                                cause = %cause,
+                                "effect asked for a fresh full inventory",
+                            );
                             self.hard_close_effect_batch();
                             return Ok(Some(RuntimeSpineRunStep::EffectRefreshInventory {
                                 cat_id,
@@ -4204,6 +4302,68 @@ fn invalid_session(error: &RuntimeSpineError) -> bool {
 #[cfg(test)]
 mod tests {
     use std::ffi::CString;
+
+    /// A refresh is the reconciler's only bridge back to a full scan, so a
+    /// branch that keeps returning one livelocks the Cat. Production has hit
+    /// that three times with nothing in the logs but the refresh itself. Every
+    /// refresh must therefore name the branch that produced it, and a refresh
+    /// standing in for a diagnosed error must carry that error.
+    #[test]
+    fn every_refresh_names_its_branch_and_keeps_the_error_it_replaced() {
+        let bare = RuntimeDesiredEffectOutcome::refresh_inventory();
+        let named =
+            RuntimeDesiredEffectOutcome::refresh_inventory_because("the admitted pool is empty");
+        let failed = RuntimeDesiredEffectOutcome::refresh_inventory_after(
+            &anyhow::anyhow!("open the allocator").context("attach the kernel device"),
+        );
+
+        let (
+            RuntimeDesiredEffectOutcome::RefreshInventory(bare_cause),
+            RuntimeDesiredEffectOutcome::RefreshInventory(named_cause),
+            RuntimeDesiredEffectOutcome::RefreshInventory(failed_cause),
+        ) = (&bare, &named, &failed)
+        else {
+            panic!("each constructor returns a refresh outcome");
+        };
+
+        // The captured site is this test's call site, not the constructor's.
+        for cause in [bare_cause, named_cause, failed_cause] {
+            assert!(
+                cause.site().file().ends_with("runner.rs"),
+                "captured site is the caller: {}",
+                cause.site().file()
+            );
+            assert!(cause.site().line() > 0);
+        }
+        assert!(bare_cause.site().line() < named_cause.site().line());
+        assert!(named_cause.site().line() < failed_cause.site().line());
+
+        assert_eq!(bare_cause.reason(), None);
+        assert_eq!(bare_cause.error(), None);
+        assert_eq!(named_cause.reason(), Some("the admitted pool is empty"));
+
+        // The whole cause chain survives, so the diagnosis is not lost.
+        let error = failed_cause
+            .error()
+            .expect("the replaced error is retained");
+        assert!(error.contains("attach the kernel device"), "{error}");
+        assert!(error.contains("open the allocator"), "{error}");
+
+        // Rendering is one operator-readable line.
+        let rendered = format!("{named_cause}");
+        assert!(rendered.contains("runner.rs:"), "{rendered}");
+        assert!(
+            rendered.contains("the admitted pool is empty"),
+            "{rendered}"
+        );
+
+        // Equality stays a statement about the decision, so no existing
+        // outcome expectation silently became a line-number assertion.
+        assert_eq!(bare, named);
+        assert_eq!(named, failed);
+        assert_ne!(bare, RuntimeDesiredEffectOutcome::RetryExact);
+    }
+
     use std::fs::OpenOptions;
     use std::io::Read as _;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -5106,7 +5266,7 @@ mod tests {
             // Models a provider call that cannot observe cancellation until it
             // returns. The runner must not scan beside this late phase.
             std::thread::sleep(self.delay);
-            Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
         }
     }
 
@@ -5197,10 +5357,10 @@ mod tests {
                 // worker until the entire apply call returns.
                 let _reentered = context.lock_node_global_effect()?;
                 self.first_reentries.fetch_add(1, Ordering::SeqCst);
-                Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
             } else {
                 self.second_mutations.fetch_add(1, Ordering::SeqCst);
-                Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
             }
         }
     }
@@ -5850,12 +6010,12 @@ mod tests {
     #[tokio::test]
     async fn delivered_typed_effect_result_wins_an_already_ready_deadline() {
         let (send, receive) = tokio::sync::oneshot::channel();
-        send.send(Ok(RuntimeDesiredEffectOutcome::RefreshInventory))
+        send.send(Ok(RuntimeDesiredEffectOutcome::refresh_inventory()))
             .unwrap();
 
         assert!(matches!(
             receive_effect_result_until(receive, Instant::now()).await,
-            EffectReceive::Delivered(Ok(RuntimeDesiredEffectOutcome::RefreshInventory))
+            EffectReceive::Delivered(Ok(RuntimeDesiredEffectOutcome::RefreshInventory(_)))
         ));
     }
 
@@ -7659,7 +7819,7 @@ mod tests {
         let registered = decode_agent_session(SESSION).unwrap();
         let desired = prepare_unconsumed_effect_desired(&state, &registered);
         let effect = Arc::new(DecisionEffect {
-            outcome: RuntimeDesiredEffectOutcome::RefreshInventory,
+            outcome: RuntimeDesiredEffectOutcome::refresh_inventory(),
             calls: AtomicUsize::new(0),
         });
         let mut runner = RuntimeSpineRunner::new_with_desired_effects(

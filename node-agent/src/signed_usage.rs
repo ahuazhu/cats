@@ -634,7 +634,7 @@ impl RuntimeDesiredEffect for MeteredRuntimeDesiredEffect {
                 if !matches!(
                     outcome,
                     RuntimeDesiredEffectOutcome::RetryExact
-                        | RuntimeDesiredEffectOutcome::RefreshInventory
+                        | RuntimeDesiredEffectOutcome::RefreshInventory(_)
                 ) {
                     self.usage.cancel_pending_effect(desired)?;
                 }

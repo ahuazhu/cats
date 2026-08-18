@@ -202,7 +202,7 @@ impl RuntimeDesiredEffect for ProductionRuntimeDesiredEffect {
         // Every successful invocation performed at most one physical step.
         // The runner must discard this admission and establish another full
         // physical inventory before it can choose the successor step.
-        Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+        Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
     }
 }
 
@@ -1061,7 +1061,7 @@ mod tests {
         let outcome = effect
             .apply(effect_context(root.path(), &desired), &desired)
             .unwrap();
-        assert_eq!(outcome, RuntimeDesiredEffectOutcome::RefreshInventory);
+        assert_eq!(outcome, RuntimeDesiredEffectOutcome::refresh_inventory());
         assert_eq!(network_calls.lock().unwrap().plans, 1);
         assert_eq!(
             network_calls.lock().unwrap().prepares,
@@ -1075,7 +1075,7 @@ mod tests {
         let outcome = effect
             .apply(launch_context(root.path(), &desired, &planned), &desired)
             .unwrap();
-        assert_eq!(outcome, RuntimeDesiredEffectOutcome::RefreshInventory);
+        assert_eq!(outcome, RuntimeDesiredEffectOutcome::refresh_inventory());
         assert_eq!(network_calls.lock().unwrap().plans, 1);
         assert_eq!(
             network_calls.lock().unwrap().prepares,
@@ -1457,7 +1457,7 @@ mod tests {
         let outcome = effect
             .apply(effect_context(root.path(), &desired), &desired)
             .unwrap();
-        assert_eq!(outcome, RuntimeDesiredEffectOutcome::RefreshInventory);
+        assert_eq!(outcome, RuntimeDesiredEffectOutcome::refresh_inventory());
 
         assert!(launch_calls.lock().unwrap().is_empty());
         let network = checkpoint(root.path(), &desired)
@@ -1486,7 +1486,7 @@ mod tests {
         let outcome = effect
             .apply(launch_context(root.path(), &desired, &network), &desired)
             .unwrap();
-        assert_eq!(outcome, RuntimeDesiredEffectOutcome::RefreshInventory);
+        assert_eq!(outcome, RuntimeDesiredEffectOutcome::refresh_inventory());
         assert_eq!(
             launch_calls.lock().unwrap().as_slice(),
             &[(desired, network)]

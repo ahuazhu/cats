@@ -1096,14 +1096,14 @@ impl PrepareNetworkReservationEffect {
         let _node_global_effect = context.lock_node_global_effect()?;
         let process_admission = context.node_global_process()?;
         if process_admission.serving_blockd_count(&desired.cat_id) != devices.len() {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         }
         let mut admitted = Vec::with_capacity(devices.len());
         for prepared in devices {
             let Some((expectation, Some(serving))) =
                 process_admission.serving_blockd(&desired.cat_id, &prepared.volume_id)
             else {
-                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
             };
             if !expectation.matches_device_contract(&desired.cat_id, prepared) {
                 return Ok(Some(local_contract_stop()));
@@ -1184,10 +1184,10 @@ impl PrepareNetworkReservationEffect {
             "PrepareNetwork admission names another checkpoint path"
         );
         let Some(stored) = store.load().context("load PrepareNetwork predecessor")? else {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         };
         if stored.content_digest() != content_digest || stored.checkpoint().step != runtime.step {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         }
         let prepared = prepared_device_inputs(stored.checkpoint())?;
         self.allocation.reserve_and_replace(
@@ -1198,7 +1198,7 @@ impl PrepareNetworkReservationEffect {
             || self.revalidate_serving_authorities(context, &admitted),
             |network| prepare_network_successor(&stored, network, prepared),
         )?;
-        Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+        Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()))
     }
 
     fn try_apply_physical(
@@ -1230,14 +1230,14 @@ impl PrepareNetworkReservationEffect {
         }
         let process_admission = context.node_global_process()?;
         if process_admission.serving_blockd_count(&desired.cat_id) != devices.len() {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         }
         let mut serving_devices = Vec::with_capacity(devices.len());
         for device in devices {
             let Some((expectation, Some(serving))) =
                 process_admission.serving_blockd(&desired.cat_id, &device.volume_id)
             else {
-                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
             };
             if !expectation.matches_device_contract(&desired.cat_id, device) {
                 return Ok(Some(local_contract_stop()));
@@ -1319,10 +1319,10 @@ impl PrepareNetworkReservationEffect {
             "TAP effect admission names another checkpoint path"
         );
         let Some(stored) = store.load()? else {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         };
         if stored.content_digest() != content_digest || stored.checkpoint().step != runtime.step {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         }
         let round = self.allocation.create_or_adopt_reserved(
             context,
@@ -1337,7 +1337,7 @@ impl PrepareNetworkReservationEffect {
             // StartRuntime reservation effect own this batch's sole CAS.
             NetworkPhysicalRound::AdoptedExact => None,
             NetworkPhysicalRound::CreateAttempted => {
-                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+                Some(RuntimeDesiredEffectOutcome::refresh_inventory())
             }
         })
     }

@@ -502,7 +502,7 @@ impl RuntimeDesiredEffect for RecordingRefreshEffect {
                 .desired_read_position()
                 .context("recorded effect lacks its fresh Desired cursor")?,
         });
-        Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+        Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
     }
 }
 

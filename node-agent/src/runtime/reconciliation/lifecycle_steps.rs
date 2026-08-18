@@ -1337,7 +1337,7 @@ impl LifecycleStepEffect {
             return Ok(Some(stop_local()));
         }
         let Some(stored) = store.load().context("load lifecycle checkpoint")? else {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         };
         if stored.content_digest() != content_digest
             || stored.checkpoint().step != runtime.step
@@ -1421,7 +1421,7 @@ impl LifecycleStepEffect {
                     &current,
                     "rebind exact lifecycle cleanup to fresh inventory",
                 )?;
-                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
             }
             if matches!(cleanup.target, CleanupTarget::Volume { .. }) {
                 #[cfg(feature = "proposed-node-residue-reclamation")]
@@ -1514,7 +1514,7 @@ impl LifecycleStepEffect {
             | LifecyclePhysicalAttempt::ExactPostcondition
             | LifecyclePhysicalAttempt::VerifiedDrain(_)
             | LifecyclePhysicalAttempt::Unavailable => {
-                RuntimeDesiredEffectOutcome::RefreshInventory
+                RuntimeDesiredEffectOutcome::refresh_inventory()
             }
             LifecyclePhysicalAttempt::Conflict => stop_local(),
         }))
@@ -1604,7 +1604,7 @@ impl LifecycleStepEffect {
                     VolumeDisposition::DeleteDisposableRoot { .. }
                 ) =>
             {
-                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+                return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
             }
             VolumeAuthorityEvidence::Absent
                 if matches!(
@@ -1628,7 +1628,7 @@ impl LifecycleStepEffect {
                     current,
                     "settle completed disposable Root cleanup",
                 )?;
-                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+                return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
             }
             _ => return Ok(stop_local()),
         };
@@ -1651,7 +1651,9 @@ impl LifecycleStepEffect {
             context.check_active()?;
             let record = match self.volume_authority.load_volume(volume_id) {
                 Ok(record) => record,
-                Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+                Err(error) => {
+                    return Ok(RuntimeDesiredEffectOutcome::refresh_inventory_after(&error))
+                }
             };
             return match recover_lifecycle_release_from_authority(
                 &request,
@@ -1677,7 +1679,7 @@ impl LifecycleStepEffect {
                             "settle exact lifecycle Volume release",
                         )?;
                     }
-                    Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                    Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
                 }
                 Ok(NormalReleaseAuthorityRecovery::RetryExact) => {
                     Ok(RuntimeDesiredEffectOutcome::RetryExact)
@@ -1701,9 +1703,11 @@ impl LifecycleStepEffect {
             Err(_) => return Ok(stop_local()),
         };
         Ok(match attempt {
-            NormalReleaseAttempt::Released(_) => RuntimeDesiredEffectOutcome::RefreshInventory,
+            NormalReleaseAttempt::Released(_) => RuntimeDesiredEffectOutcome::refresh_inventory(),
             NormalReleaseAttempt::RetryExact => RuntimeDesiredEffectOutcome::RetryExact,
-            NormalReleaseAttempt::RefreshInventory => RuntimeDesiredEffectOutcome::RefreshInventory,
+            NormalReleaseAttempt::RefreshInventory => {
+                RuntimeDesiredEffectOutcome::refresh_inventory()
+            }
             NormalReleaseAttempt::ReplanDesired => RuntimeDesiredEffectOutcome::ReplanDesired,
             NormalReleaseAttempt::SessionReplacementRequired => {
                 RuntimeDesiredEffectOutcome::SessionReplacementRequired
@@ -1721,7 +1725,7 @@ impl LifecycleStepEffect {
                 {
                     return Ok(stop_local());
                 }
-                RuntimeDesiredEffectOutcome::RefreshInventory
+                RuntimeDesiredEffectOutcome::refresh_inventory()
             }
             NormalReleaseAttempt::StopForLocalContract => stop_local(),
             NormalReleaseAttempt::StopForDeploymentMismatch => RuntimeDesiredEffectOutcome::Stop(
@@ -1741,7 +1745,7 @@ impl LifecycleStepEffect {
                     self.credentials.as_deref(),
                 ) {
                     Ok(NormalReleaseAuthorityRecovery::Released(_)) => {
-                        RuntimeDesiredEffectOutcome::RefreshInventory
+                        RuntimeDesiredEffectOutcome::refresh_inventory()
                     }
                     Ok(NormalReleaseAuthorityRecovery::RetryExact) => {
                         RuntimeDesiredEffectOutcome::RetryExact
@@ -1822,7 +1826,7 @@ impl LifecycleStepEffect {
                     current,
                     "settle exact disposable Root absence",
                 )?;
-                Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
             }
             VolumeAuthorityEvidence::Deleting {
                 delete_id: observed_delete_id,
@@ -1894,13 +1898,13 @@ impl LifecycleStepEffect {
                 };
                 Ok(match attempt {
                     DisposableRootDeleteAttempt::Deleting(_) => {
-                        RuntimeDesiredEffectOutcome::RefreshInventory
+                        RuntimeDesiredEffectOutcome::refresh_inventory()
                     }
                     DisposableRootDeleteAttempt::RetryExact => {
                         RuntimeDesiredEffectOutcome::RetryExact
                     }
                     DisposableRootDeleteAttempt::RefreshInventory => {
-                        RuntimeDesiredEffectOutcome::RefreshInventory
+                        RuntimeDesiredEffectOutcome::refresh_inventory()
                     }
                     DisposableRootDeleteAttempt::Ambiguous => {
                         return self.recover_disposable_root_deleting(
@@ -1982,7 +1986,7 @@ impl LifecycleStepEffect {
                 ) {
                     // The authority mutation is exact. Local lineage deletion is
                     // still unavailable and remains a zero-I/O refresh.
-                    RuntimeDesiredEffectOutcome::RefreshInventory
+                    RuntimeDesiredEffectOutcome::refresh_inventory()
                 } else if evidence_context == DisposableEvidenceContext::AmbiguousOwnedAttempt
                     && exact_disposable_unconsumed_evidence(
                         &request,
@@ -2054,7 +2058,7 @@ impl LifecycleStepEffect {
             return Ok(Some(stop_local()));
         }
         let Some(stored) = store.load().context("load lifecycle planner checkpoint")? else {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         };
         if stored.content_digest() != content_digest
             || stored.checkpoint().step != runtime.step
@@ -2089,7 +2093,7 @@ impl LifecycleStepEffect {
             &current,
             "persist first lifecycle step before physical effect",
         )?;
-        Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+        Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()))
     }
 
     fn plan_cold_membership_rebind(
@@ -2133,7 +2137,7 @@ impl LifecycleStepEffect {
             .load()
             .context("load Cold membership rebind checkpoint")?
         else {
-            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+            return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
         };
         if stored.content_digest() != content_digest
             || stored.checkpoint().step != runtime.step
@@ -2152,10 +2156,12 @@ impl LifecycleStepEffect {
             context.check_active()?;
             let record = match self.volume_authority.load_volume(&observed.volume_id) {
                 Ok(record) => record,
-                Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+                Err(error) => {
+                    return Ok(RuntimeDesiredEffectOutcome::refresh_inventory_after(&error))
+                }
             };
             if !record_matches_exact_unowned_observation(&record, observed) {
-                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+                return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
             }
             records.insert(observed.volume_id.clone(), record);
         }
@@ -2167,7 +2173,7 @@ impl LifecycleStepEffect {
             if let Some(removed) = cold_membership_removed_volume(desired, stored.checkpoint()) {
                 if !removed.local_lineages.is_empty() {
                     let Some(record) = records.get(&removed.volume_id) else {
-                        return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+                        return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
                     };
                     if !released_cache_record_matches_checkpoint(record, removed) {
                         return Ok(stop_local());
@@ -2205,7 +2211,7 @@ impl LifecycleStepEffect {
             &current,
             "atomically rebind exact Cold volume membership",
         )?;
-        Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+        Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
     }
 
     fn apply_cold_membership_detach_cleanup(
@@ -2240,7 +2246,7 @@ impl LifecycleStepEffect {
             .load()
             .context("load Cold detach cache-cleanup checkpoint")?
         else {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         };
         if stored.content_digest() != content_digest
             || stored.checkpoint().step != runtime.step
@@ -2257,10 +2263,14 @@ impl LifecycleStepEffect {
             context.check_active()?;
             let record = match self.volume_authority.load_volume(&observed.volume_id) {
                 Ok(record) => record,
-                Err(_) => return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory)),
+                Err(error) => {
+                    return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory_after(
+                        &error,
+                    )))
+                }
             };
             if !record_matches_exact_unowned_observation(&record, observed) {
-                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
             }
         }
         if accepted.attestation().accepted_at_unix_ms < stored.checkpoint().updated_at_unix_ms {
@@ -2308,7 +2318,7 @@ impl LifecycleStepEffect {
             &current,
             "atomically bind Cold membership after exact cache cleanup",
         )?;
-        Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+        Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()))
     }
 }
 
@@ -7235,7 +7245,7 @@ mod tests {
                 match (fault, retry_unconsumed, already_deleting) {
                     (Some(_), _, _) | (None, true, true) => stop_local(),
                     (None, true, false) => RuntimeDesiredEffectOutcome::RetryExact,
-                    (None, false, _) => RuntimeDesiredEffectOutcome::RefreshInventory,
+                    (None, false, _) => RuntimeDesiredEffectOutcome::refresh_inventory(),
                 },
                 "{already_deleting}/{retry_unconsumed}/{fault:?}"
             );

@@ -1266,7 +1266,7 @@ impl RunningAdmissionEffect {
             return Ok(Some(if converged {
                 RuntimeDesiredEffectOutcome::Applied
             } else {
-                RuntimeDesiredEffectOutcome::RefreshInventory
+                RuntimeDesiredEffectOutcome::refresh_inventory()
             }));
         };
         context.check_active()?;
@@ -1276,7 +1276,7 @@ impl RunningAdmissionEffect {
                 let _node_global_effect = context.lock_node_global_effect()?;
                 let Some(_route_publication) = self.registry.begin_route_admission_publication()?
                 else {
-                    return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                    return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
                 };
                 let times = next_persist_times(&stored)?;
                 Some(
@@ -1331,7 +1331,7 @@ impl RunningAdmissionEffect {
                 let _node_global_effect = context.lock_node_global_effect()?;
                 let Some(_route_publication) = self.registry.begin_route_admission_publication()?
                 else {
-                    return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                    return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
                 };
                 let times = next_persist_times(&stored)?;
                 Some(
@@ -1366,7 +1366,7 @@ impl RunningAdmissionEffect {
         // the bounded sequencer has already resolved the exact postcondition
         // and finalized its checkpoint. The runner still discards the stale
         // accepted batch and obtains a new full inventory.
-        Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+        Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()))
     }
 
     /// Applies one scanner-sealed retirement edge before any component may
@@ -1499,7 +1499,7 @@ impl RunningAdmissionEffect {
             return Ok(Some(if terminal_busy {
                 RuntimeDesiredEffectOutcome::Applied
             } else {
-                RuntimeDesiredEffectOutcome::RefreshInventory
+                RuntimeDesiredEffectOutcome::refresh_inventory()
             }));
         };
         context.check_active()?;
@@ -1512,7 +1512,7 @@ impl RunningAdmissionEffect {
                 self.registry.remove(&desired.cat_id, &session)?,
                 "route-retirement shared-registry compare-remove lost ownership"
             );
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         }
 
         let times = next_persist_times(&stored)?;
@@ -1545,7 +1545,7 @@ impl RunningAdmissionEffect {
                 let _node_global_effect = context.lock_node_global_effect()?;
                 let Some(_route_publication) = self.registry.begin_route_admission_publication()?
                 else {
-                    return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                    return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
                 };
                 sequencer.install_gate_with_barrier(
                     &stored,
@@ -1587,7 +1587,7 @@ impl RunningAdmissionEffect {
             stored.checkpoint().runtime_launch
         );
         seal_stable_running_session(&session, desired, result.checkpoint().checkpoint())?;
-        Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+        Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()))
     }
 }
 
@@ -3096,7 +3096,10 @@ mod tests {
                     effect.try_apply(&context, &first_successor)
                 }
                 .unwrap();
-            assert_eq!(outcome, Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            assert_eq!(
+                outcome,
+                Some(RuntimeDesiredEffectOutcome::refresh_inventory())
+            );
         }
         let stable = session.checkpoint_store().load().unwrap().unwrap();
         assert!(matches!(
@@ -3198,7 +3201,7 @@ mod tests {
         );
         assert_eq!(
             effect.try_retire(&accepted, &successor).unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         let closed_cell = session.cell().snapshot();
         assert_eq!(closed_cell.lifecycle_admission(), LifecycleAdmission::Open);
@@ -3397,7 +3400,7 @@ mod tests {
         );
         assert_eq!(
             effect.try_retire(&negative, &successor).unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         tokio::time::timeout(cats_test_support::poll_bound(), guard.cancelled())
             .await
@@ -3470,7 +3473,7 @@ mod tests {
         );
         assert_eq!(
             effect.try_retire(&negative, &successor).unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         tokio::time::timeout(cats_test_support::poll_bound(), guards[1].cancelled())
             .await
@@ -3514,7 +3517,7 @@ mod tests {
 
         assert_eq!(
             effect.try_retire(&accepted, &fixture.desired).unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(
             session.cell().snapshot().lifecycle_admission(),
@@ -3534,7 +3537,7 @@ mod tests {
         );
         assert_eq!(
             effect.try_retire(&draining, &fixture.desired).unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert!(registry.get(&fixture.desired.cat_id).is_some());
         drop(guard);
@@ -3549,7 +3552,7 @@ mod tests {
         );
         assert_eq!(
             effect.try_retire(&drained, &fixture.desired).unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert!(registry.get(&fixture.desired.cat_id).is_none());
     }
@@ -3825,7 +3828,7 @@ mod tests {
             effect
                 .try_apply(&fixture.context(&registry, true), &fixture.desired)
                 .expect("open zero-Endpoint Running tail"),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         let first_cell = registry
             .get(&fixture.desired.cat_id)
@@ -3863,7 +3866,7 @@ mod tests {
             successor_effect
                 .try_apply(&fixture.context(&successor, true), &fixture.desired)
                 .expect("reopen only from fresh accepted-full authority"),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(
             successor
@@ -3886,7 +3889,7 @@ mod tests {
             effect
                 .try_apply(&fixture.context(&registry, true), &fixture.desired)
                 .expect("disabled zero-Endpoint Running tail stays bounded"),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(
             registry
@@ -3907,7 +3910,7 @@ mod tests {
             effect
                 .try_apply(&fixture.context(&registry, true), &fixture.desired)
                 .expect("install first Endpoint gate"),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         let cell = registry
             .get(&fixture.desired.cat_id)
@@ -4066,7 +4069,7 @@ mod tests {
             RunningAdmissionEffect::new(Arc::clone(&registry))
                 .try_apply(&fixture.context(&registry, true), &fixture.desired)
                 .expect("same-process retained edge resumes the prepared token"),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(
             session.cell().snapshot().endpoints()[0].gate,
@@ -4175,7 +4178,7 @@ mod tests {
             RunningAdmissionEffect::new(Arc::clone(&registry))
                 .try_apply(&fixture.context(&registry, true), &fixture.desired)
                 .expect("same-process retained edge retries the fresh barrier and cell effect"),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(
             session.cell().snapshot().endpoints()[0].gate,
@@ -4243,7 +4246,7 @@ mod tests {
             effect
                 .try_apply(&fixture.context(&registry, true), &fixture.desired)
                 .expect("install first Endpoint"),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         let cell = registry
             .get(&fixture.desired.cat_id)
@@ -4287,7 +4290,7 @@ mod tests {
             effect
                 .try_apply(&fixture.context(&registry, true), &fixture.desired)
                 .expect("install second Endpoint"),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         let stable_cell = cell.snapshot();
         assert_eq!(stable_cell.endpoints().len(), 2);
@@ -4332,7 +4335,7 @@ mod tests {
                 effect
                     .try_apply(&fixture.context(&registry, true), &fixture.desired)
                     .expect("install the next Endpoint"),
-                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+                Some(RuntimeDesiredEffectOutcome::refresh_inventory())
             );
         }
         let checkpoint_path = runtime_checkpoint_path(
@@ -4349,7 +4352,7 @@ mod tests {
             successor_effect
                 .try_apply(&fixture.context(&successor, true), &fixture.desired)
                 .expect("old Endpoint epochs remain fail-closed after restart"),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         let closed = successor
             .get(&fixture.desired.cat_id)
@@ -4370,7 +4373,7 @@ mod tests {
             successor_effect
                 .try_apply(&fixture.context(&successor, true), &fixture.desired)
                 .expect("old Endpoint epoch replay stays closed"),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         let restart_scan = fixture.scan(&successor);
         let sealed = RunningTailScanAdmission::for_test_from_authorities(
@@ -4432,7 +4435,7 @@ mod tests {
             );
             assert_eq!(
                 successor_effect.try_retire(&context, &fresh).unwrap(),
-                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+                Some(RuntimeDesiredEffectOutcome::refresh_inventory())
             );
         }
         let durable = session.checkpoint_store().load().unwrap().unwrap();
@@ -4515,7 +4518,7 @@ mod tests {
         );
         assert_eq!(
             effect.try_retire(&retirement, &successor).unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         let adopted = session.checkpoint_store().load().unwrap().unwrap();
         assert_eq!(
@@ -4538,7 +4541,7 @@ mod tests {
                     &successor,
                 )
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         let stable = session.checkpoint_store().load().unwrap().unwrap();
         assert_eq!(stable.checkpoint().stable_state, Some(StableState::Running));
@@ -4602,7 +4605,7 @@ mod tests {
             effect
                 .try_apply(&fixture.context(&registry, true), &fixture.desired)
                 .expect("resolve B response loss from exact postcondition"),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(cell.snapshot(), after_unknown);
         let stable = session

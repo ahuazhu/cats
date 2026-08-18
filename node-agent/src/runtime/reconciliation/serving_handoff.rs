@@ -5874,7 +5874,7 @@ mod tests {
             effect
                 .try_apply(&absent_effect_context(fixture), &fixture.acquired.desired)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory),
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory()),
             "the first absent round must durably retire the real managed Root owner"
         );
         assert!(!Path::new(fixture.managed_root.intent.control_socket_path().as_str()).exists());
@@ -6646,7 +6646,7 @@ mod tests {
             reservation
                 .try_apply(&context, &fixture.acquired.desired)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         fixture.stored_checkpoint = current_runtime_checkpoint(fixture);
         assert!(matches!(
@@ -6831,7 +6831,7 @@ mod tests {
         assert!(reservation_outcome.is_ok(), "{reservation_outcome:#?}");
         assert_eq!(
             reservation_outcome.unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         fixture.stored_checkpoint = current_runtime_checkpoint(fixture);
         assert!(matches!(
@@ -7031,7 +7031,7 @@ mod tests {
                     &fixture.acquired.desired,
                 )
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         fixture.stored_checkpoint = current_runtime_checkpoint(fixture);
         assert!(matches!(
@@ -7889,14 +7889,14 @@ mod tests {
             effect
                 .try_apply(&absent_effect_context(&fixture), &fixture.acquired.desired)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(port.starts.load(Ordering::SeqCst), 1);
         assert_eq!(
             effect
                 .try_apply(&absent_effect_context(&fixture), &fixture.acquired.desired)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(port.starts.load(Ordering::SeqCst), 1);
         let exact_context = effect_context_with_processes(&fixture, vec![accepted]);
@@ -8048,7 +8048,7 @@ mod tests {
                 ServingBlockdProcessStart::Submitted,
             ));
             let expected_outcome = if matches!(kind, ServingBlockdProcessInspectionKind::Exact) {
-                RuntimeDesiredEffectOutcome::RefreshInventory
+                RuntimeDesiredEffectOutcome::refresh_inventory()
             } else {
                 RuntimeDesiredEffectOutcome::Stop(RuntimeDesiredEffectStopReason::LocalContract)
             };
@@ -8086,7 +8086,7 @@ mod tests {
                     &fixture.acquired.desired,
                 )
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         let current = current_runtime_checkpoint(&fixture);
         assert_ne!(current.content_digest(), &predecessor_digest);
@@ -8424,7 +8424,7 @@ mod tests {
                 effect
                     .try_apply(&context, &fixture.acquired.desired)
                     .unwrap(),
-                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+                Some(RuntimeDesiredEffectOutcome::refresh_inventory())
             );
             assert_eq!(events.creates.load(Ordering::SeqCst), 1);
             assert_eq!(
@@ -8492,7 +8492,7 @@ mod tests {
             start_runtime
                 .try_apply(&context, &fixture.acquired.desired)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         fixture.stored_checkpoint = current_runtime_checkpoint(&fixture);
         assert_ne!(
@@ -8808,7 +8808,7 @@ mod tests {
                 effect
                     .try_apply(&context, &fixture.acquired.desired)
                     .unwrap(),
-                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+                Some(RuntimeDesiredEffectOutcome::refresh_inventory())
             );
             assert_eq!(vmm.starts.load(Ordering::SeqCst), 1, "{start:?}");
             let incarnation = fixture
@@ -8831,7 +8831,7 @@ mod tests {
                 effect
                     .try_apply(&context, &fixture.acquired.desired)
                     .unwrap(),
-                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+                Some(RuntimeDesiredEffectOutcome::refresh_inventory())
             );
             assert_eq!(vmm.starts.load(Ordering::SeqCst), 1, "{start:?}");
         }
@@ -8862,7 +8862,7 @@ mod tests {
             effect
                 .try_apply(&context, &fixture.acquired.desired)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(vmm.starts.load(Ordering::SeqCst), 0);
         assert_no_physical_launch_residue(&fixture, &physical);
@@ -8939,7 +8939,7 @@ mod tests {
             effect
                 .try_apply(&context(random('4')), &fixture.acquired.desired)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(vmm.starts.load(Ordering::SeqCst), 1);
         assert!(Path::new(launch_paths.memory_file_path().as_str()).exists());
@@ -8950,7 +8950,7 @@ mod tests {
             effect
                 .try_apply(&context(random('9')), &fixture.acquired.desired)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(vmm.starts.load(Ordering::SeqCst), 1);
         assert!(!Path::new(launch_paths.directory().as_str()).exists());
@@ -8961,7 +8961,7 @@ mod tests {
             effect
                 .try_apply(&context(random('8')), &fixture.acquired.desired)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(vmm.starts.load(Ordering::SeqCst), 2);
     }
@@ -8996,7 +8996,7 @@ mod tests {
             effect
                 .try_apply(&context, &fixture.acquired.desired)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(blocked.load(Ordering::SeqCst), 1);
         assert_eq!(vmm.starts.load(Ordering::SeqCst), 1);
@@ -9077,7 +9077,7 @@ mod tests {
             reservation
                 .try_apply(&reservation_context, &fixture.acquired.desired)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         fixture.stored_checkpoint = current_runtime_checkpoint(&fixture);
         assert!(matches!(
@@ -9100,7 +9100,7 @@ mod tests {
             serving_effect(&fixture, Arc::clone(&restarted_serving))
                 .try_apply(&serving_absent_context, &fixture.acquired.desired)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(restarted_serving.starts.load(Ordering::SeqCst), 1);
         assert_eq!(
@@ -9152,7 +9152,7 @@ mod tests {
             attach_effect
                 .try_apply(&attach_context, &fixture.acquired.desired)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(attach.calls.load(Ordering::SeqCst), 1);
         assert_eq!(
@@ -9192,7 +9192,7 @@ mod tests {
             effect
                 .try_apply(&physical_context, &fixture.acquired.desired)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(events.creates.load(Ordering::SeqCst), 1);
         assert_eq!(events.publish_attempts.load(Ordering::SeqCst), 1);
@@ -9240,7 +9240,7 @@ mod tests {
             serving_effect(&fixture, Arc::clone(&port))
                 .try_apply(&absent, &fixture.acquired.desired)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(port.starts.load(Ordering::SeqCst), 1);
 
@@ -9475,7 +9475,7 @@ mod tests {
                 effect
                     .try_apply(&context, &fixture.acquired.desired)
                     .unwrap(),
-                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+                Some(RuntimeDesiredEffectOutcome::refresh_inventory())
             );
             assert_eq!(
                 attach.calls.load(Ordering::SeqCst),
@@ -9658,7 +9658,7 @@ mod tests {
                     &fixture.acquired.desired,
                 )
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(global.calls.load(Ordering::SeqCst), 1);
         assert_eq!(process.stopped(), vec![fixture.process.clone()]);
@@ -9703,7 +9703,7 @@ mod tests {
             effect
                 .try_apply(&absent_effect_context(&fixture), &fixture.acquired.desired)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         match effect
             .try_apply(
@@ -9938,7 +9938,7 @@ mod tests {
                     &fixture.acquired.desired,
                 )
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(global.calls.load(Ordering::SeqCst), 1);
         assert_eq!(process.stopped(), vec![fixture.process.clone()]);
@@ -10054,7 +10054,7 @@ mod tests {
                     &fixture.acquired.desired,
                 )
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(process.stopped().len(), 1);
         assert_eq!(
@@ -10064,7 +10064,7 @@ mod tests {
                     &fixture.acquired.desired,
                 )
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(
             effect
@@ -10101,7 +10101,7 @@ mod tests {
                     &fixture.acquired.desired,
                 )
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(global.calls.load(Ordering::SeqCst), 1);
         assert_eq!(process.stopped(), vec![fixture.process.clone()]);

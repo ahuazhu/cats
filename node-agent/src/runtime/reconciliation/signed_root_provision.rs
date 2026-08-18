@@ -439,11 +439,11 @@ impl RuntimeDesiredEffect for SignedRunningEffect {
         match self.handoff.try_apply(&context, desired)? {
             ServingHandoffEffectProgress::NotApplicable => {}
             ServingHandoffEffectProgress::RefreshInventory => {
-                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                return Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
             }
             ServingHandoffEffectProgress::Ready(ready) => {
                 self.prepare_device.persist(&context, desired, &ready)?;
-                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+                return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
             }
         }
         if let Some(outcome) = self.provision.try_apply(&context, desired)? {
@@ -454,7 +454,7 @@ impl RuntimeDesiredEffect for SignedRunningEffect {
             // is checkpoint-first. Preserve any exact current later step and
             // demand a fresh full inventory instead of falling into the
             // pre-acquire planner, which correctly rejects later phases.
-            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+            return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
         }
         self.acquire.apply(context, desired)
     }
@@ -569,10 +569,10 @@ impl SignedRootProvisionEffect {
             return Ok(Some(stop_local()));
         }
         let Some(stored) = store.load().context("load root provision checkpoint")? else {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         };
         if stored.content_digest() != content_digest || stored.checkpoint().step != runtime.step {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         }
         if stored.checkpoint().desired_revision != desired.desired_revision
             || stored.checkpoint().spec_digest != desired.spec_digest
@@ -607,7 +607,7 @@ impl SignedRootProvisionEffect {
             {
                 ProvisionHeadRead::Ready { blank, target } => (blank, target),
                 ProvisionHeadRead::Retry => {
-                    return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+                    return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()))
                 }
                 ProvisionHeadRead::Invalid => return Ok(Some(stop_local())),
             };
@@ -639,7 +639,11 @@ impl SignedRootProvisionEffect {
         let attachment = prepared.checkpoint().attachment.clone();
         let record = match self.authority.load_volume(&volume.volume_id) {
             Ok(record) => record,
-            Err(_) => return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory)),
+            Err(error) => {
+                return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory_after(
+                    &error,
+                )))
+            }
         };
         let expectation = match super::RootProvisionProcessExpectation::from_checkpoint(
             stored.checkpoint(),
@@ -661,7 +665,7 @@ impl SignedRootProvisionEffect {
                 .retirement
                 .retain_start_socket_absence(&expectation, context)?
             else {
-                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
             };
             let outcome =
                 ensure_root_provision_process_from_persisted_checkpoint_with_socket_absence(
@@ -683,7 +687,7 @@ impl SignedRootProvisionEffect {
                 | RootProvisionProcessOutcome::AbsentAfterAmbiguousStart
                 | RootProvisionProcessOutcome::CancelledClean
                 | RootProvisionProcessOutcome::Unavailable => {
-                    RuntimeDesiredEffectOutcome::RefreshInventory
+                    RuntimeDesiredEffectOutcome::refresh_inventory()
                 }
                 RootProvisionProcessOutcome::Conflict(
                     RootProvisionProcessConflict::DuplicateIdentity
@@ -697,7 +701,7 @@ impl SignedRootProvisionEffect {
         // accepted scan is owned by the target-control/handoff slice; never
         // send the provision request again.
         if record.head == target {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         }
         if record.head != blank {
             return Ok(Some(stop_local()));
@@ -729,7 +733,7 @@ impl SignedRootProvisionEffect {
             | RootProvisionProcessInspection::Conflict(_) => return Ok(Some(stop_local())),
             RootProvisionProcessInspection::Absent
             | RootProvisionProcessInspection::Unavailable => {
-                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+                return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()))
             }
         };
         let expected_peer_process = ProcIdentity {
@@ -757,13 +761,17 @@ impl SignedRootProvisionEffect {
         // may already have committed before cancellation was observed.
         let current = match self.authority.load_volume(&volume.volume_id) {
             Ok(record) => record,
-            Err(_) => return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory)),
+            Err(error) => {
+                return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory_after(
+                    &error,
+                )))
+            }
         };
         if !same_owner_and_marker(&record, &current) {
             return Ok(Some(stop_local()));
         }
         if current.head == target {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         }
         if current.head != blank {
             return Ok(Some(stop_local()));
@@ -774,7 +782,7 @@ impl SignedRootProvisionEffect {
         ) {
             return Ok(Some(stop_local()));
         }
-        Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+        Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()))
     }
 
     fn retire_superseded_process(
@@ -800,7 +808,7 @@ impl SignedRootProvisionEffect {
         let existing_receipt = match settlement {
             StopReceiptSettlement::Absent => None,
             StopReceiptSettlement::Recovered(_) => {
-                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                return Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
             }
             StopReceiptSettlement::Stable(receipt) => {
                 if receipt.checkpoint_content_digest() != stored.content_digest()
@@ -825,7 +833,7 @@ impl SignedRootProvisionEffect {
         context.check_active()?;
         let record = match self.authority.load_volume(&old_volume.volume_id) {
             Ok(record) => record,
-            Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+            Err(error) => return Ok(RuntimeDesiredEffectOutcome::refresh_inventory_after(&error)),
         };
         let target_authorization = match self
             .reopen_superseded_target_authorization(context, stored, &prepared, &record)
@@ -887,7 +895,7 @@ impl SignedRootProvisionEffect {
             | RootProvisionManagedStopInspection::Conflict(_) => return Ok(stop_local()),
             RootProvisionManagedStopInspection::Absent
             | RootProvisionManagedStopInspection::Unavailable => {
-                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                return Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
             }
         };
         let receipt = match RootProvisionStopReceipt::new(
@@ -918,7 +926,7 @@ impl SignedRootProvisionEffect {
                     recovered.process() == receipt.process(),
                     "recovered root-provision stop receipt changed process identity"
                 );
-                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+                return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
             }
             StopReceiptPublication::Stable(existing)
             | StopReceiptPublication::Published(existing) => {
@@ -940,7 +948,7 @@ impl SignedRootProvisionEffect {
             RootProvisionProcessStop::Submitted
             | RootProvisionProcessStop::AlreadyAbsent
             | RootProvisionProcessStop::Unavailable => {
-                RuntimeDesiredEffectOutcome::RefreshInventory
+                RuntimeDesiredEffectOutcome::refresh_inventory()
             }
             RootProvisionProcessStop::Conflict(_) => stop_local(),
         })
@@ -973,7 +981,7 @@ impl SignedRootProvisionEffect {
         {
             StopReceiptSettlement::Absent => None,
             StopReceiptSettlement::Recovered(_) => {
-                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+                return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()))
             }
             StopReceiptSettlement::Stable(receipt) => Some(receipt),
         };
@@ -997,7 +1005,11 @@ impl SignedRootProvisionEffect {
         context.check_active()?;
         let current = match self.authority.load_volume(&old_volume.volume_id) {
             Ok(record) => record,
-            Err(_) => return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory)),
+            Err(error) => {
+                return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory_after(
+                    &error,
+                )))
+            }
         };
         if current.head != observed_head {
             return Ok(Some(stop_local()));
@@ -1041,18 +1053,22 @@ impl SignedRootProvisionEffect {
             context,
         ) {
             Ok(absence) => absence,
-            Err(_) => return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory)),
+            Err(error) => {
+                return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory_after(
+                    &error,
+                )))
+            }
         };
         if let Some(receipt) = receipt.as_ref() {
             if !retirement_admission_strictly_succeeds(receipt.admission(), absence.admission()) {
-                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
             }
         }
         let retirement = self
             .retirement
             .retire_absent_socket_owner(absence.expectation(), context)?;
         if retirement == ManagedBlockdSocketOwnerRetirement::Retired {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         }
         let Some(receipt) = receipt.as_ref() else {
             // Only this fresh AlreadyAbsent result may hand the still-current
@@ -1062,7 +1078,7 @@ impl SignedRootProvisionEffect {
         retained
             .remove_stop_receipt(receipt)
             .context("remove exact settled root-provision stop receipt")?;
-        Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+        Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()))
     }
 
     fn reopen_superseded_target_authorization(
@@ -2848,7 +2864,7 @@ mod tests {
                     &fixture.desired,
                 )
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(process.stops.load(Ordering::SeqCst), 1);
         assert!(fixture.stop_receipt_path().exists());
@@ -3117,7 +3133,7 @@ mod tests {
             .is_some());
         assert_eq!(
             effect.try_apply(&first_context, &fixture.desired).unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(
             (
@@ -3137,7 +3153,7 @@ mod tests {
             fixture.context_at_with_managed_stop_receipt_evidence(expectation, &receipt, 6, 14);
         assert_eq!(
             effect.try_apply(&second_context, &fixture.desired).unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(retirement.retirements.load(Ordering::SeqCst), 2);
         assert!(!fixture.stop_receipt_path().exists());
@@ -3395,7 +3411,10 @@ mod tests {
         let context =
             fixture.context_at_with_absent_root(fixture.root_process_expectation(), 4, 12);
         let outcome = effect.try_apply(&context, &fixture.desired).unwrap();
-        assert_eq!(outcome, Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        assert_eq!(
+            outcome,
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
+        );
         assert_eq!(process.inspections.load(Ordering::SeqCst), 1);
         assert_eq!(process.starts.load(Ordering::SeqCst), 1);
         assert_eq!(retirement.start_absences.load(Ordering::SeqCst), 1);
@@ -3572,7 +3591,10 @@ mod tests {
                 &fixture.desired,
             )
             .unwrap();
-        assert_eq!(outcome, Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        assert_eq!(
+            outcome,
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
+        );
         assert_eq!(request.calls.load(Ordering::SeqCst), 1);
         assert_eq!(process.inspections.load(Ordering::SeqCst), 1);
         assert_eq!(process.starts.load(Ordering::SeqCst), 0);
@@ -3585,7 +3607,10 @@ mod tests {
                 &fixture.desired,
             )
             .unwrap();
-        assert_eq!(outcome, Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+        assert_eq!(
+            outcome,
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
+        );
         assert_eq!(request.calls.load(Ordering::SeqCst), 1);
     }
 
@@ -3636,7 +3661,7 @@ mod tests {
                     &fixture.desired,
                 )
                 .unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         assert!(target_path.exists());
         assert!(!record_path.exists());
@@ -3650,7 +3675,7 @@ mod tests {
                     &fixture.desired,
                 )
                 .unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         assert!(record_path.exists());
         let still_provision = FileCheckpointStore::open(
@@ -3674,7 +3699,7 @@ mod tests {
                     &fixture.desired,
                 )
                 .unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         let prepared = FileCheckpointStore::open(
             &fixture.state.path().join(CHECKPOINT_NAMESPACE),
@@ -3724,7 +3749,7 @@ mod tests {
             dispatcher
                 .apply(fixture.context_at(Vec::new(), 7, 15), &fixture.desired)
                 .unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         assert_eq!(request.calls.load(Ordering::SeqCst), 0);
         assert_eq!(process.starts.load(Ordering::SeqCst), 0);
@@ -3784,7 +3809,7 @@ mod tests {
                             &fixture.desired,
                         )
                         .unwrap(),
-                    RuntimeDesiredEffectOutcome::RefreshInventory
+                    RuntimeDesiredEffectOutcome::refresh_inventory()
                 );
             }
 
@@ -3888,7 +3913,7 @@ mod tests {
                     &fixture.desired,
                 )
                 .unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
 
         // The target authorization now binds the target-wrapper CLI. Make the
@@ -3911,7 +3936,7 @@ mod tests {
                     &fixture.desired,
                 )
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(retirement.calls.load(Ordering::SeqCst), 1);
         assert_eq!(process.stops.load(Ordering::SeqCst), 1);
@@ -4014,7 +4039,7 @@ mod tests {
             effect
                 .try_apply(&fixture.context(vec![accepted_process]), &fixture.desired)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
 
         assert_eq!(
@@ -4118,7 +4143,7 @@ mod tests {
                 effect
                     .try_apply(&fixture.context(vec![accepted_process]), &fixture.desired)
                     .unwrap(),
-                Some(RuntimeDesiredEffectOutcome::RefreshInventory),
+                Some(RuntimeDesiredEffectOutcome::refresh_inventory()),
                 "a post-send response mismatch remains authority-reread ambiguity"
             );
             assert_eq!(
@@ -4225,7 +4250,7 @@ mod tests {
         context.cancel_for_test();
         assert_eq!(
             worker.join().unwrap().unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory),
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory()),
             "post-request cancellation must not suppress the mandatory authority reread"
         );
         assert_eq!(fixture.authority.loads.load(Ordering::SeqCst), 2);
@@ -4241,7 +4266,7 @@ mod tests {
             effect
                 .try_apply(&fixture.context(vec![accepted_process]), &fixture.desired,)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(
             request.calls.load(Ordering::SeqCst),
@@ -4403,7 +4428,7 @@ mod tests {
                     &fixture.desired,
                 )
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(process.inspections.load(Ordering::SeqCst), 1);
         assert_eq!(request.calls.load(Ordering::SeqCst), 0);
@@ -4491,7 +4516,7 @@ mod tests {
                         &fixture.desired,
                     )
                     .unwrap(),
-                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+                Some(RuntimeDesiredEffectOutcome::refresh_inventory())
             );
             assert_eq!(retirement.inspections.load(Ordering::SeqCst), 1);
             assert_eq!(retirement.retirements.load(Ordering::SeqCst), 1);
@@ -4548,7 +4573,7 @@ mod tests {
                         &fixture.desired,
                     )
                     .unwrap(),
-                RuntimeDesiredEffectOutcome::RefreshInventory
+                RuntimeDesiredEffectOutcome::refresh_inventory()
             );
             let successor_store = FileCheckpointStore::open(
                 &fixture.state.path().join(CHECKPOINT_NAMESPACE),
@@ -4630,7 +4655,7 @@ mod tests {
             effect
                 .try_apply(&missing_admission, &fixture.desired)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         let mut wrong_expectation = expectation;
         wrong_expectation.process_identity_token = random('a');
@@ -4639,7 +4664,7 @@ mod tests {
             effect
                 .try_apply(&mismatched_admission, &fixture.desired)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
 
         assert_eq!(retirement.inspections.load(Ordering::SeqCst), 0);
@@ -4733,7 +4758,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 first,
-                Some(RuntimeDesiredEffectOutcome::RefreshInventory),
+                Some(RuntimeDesiredEffectOutcome::refresh_inventory()),
                 "stops={}, inspections={}, receipt={}",
                 process.stops.load(Ordering::SeqCst),
                 retirement.inspections.load(Ordering::SeqCst),
@@ -4782,7 +4807,7 @@ mod tests {
                         &fixture.desired,
                     )
                     .unwrap(),
-                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+                Some(RuntimeDesiredEffectOutcome::refresh_inventory())
             );
             assert!(!socket_path.exists());
             assert!(
@@ -4797,7 +4822,7 @@ mod tests {
                         &fixture.desired,
                     )
                     .unwrap(),
-                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+                Some(RuntimeDesiredEffectOutcome::refresh_inventory())
             );
             assert!(!fixture.stop_receipt_path().exists());
             assert_eq!(std::fs::read(&checkpoint_path).unwrap(), checkpoint_before);
@@ -4822,7 +4847,7 @@ mod tests {
                         &fixture.desired,
                     )
                     .unwrap(),
-                RuntimeDesiredEffectOutcome::RefreshInventory
+                RuntimeDesiredEffectOutcome::refresh_inventory()
             );
             let successor_store = FileCheckpointStore::open(
                 &fixture.state.path().join(CHECKPOINT_NAMESPACE),
@@ -4885,7 +4910,7 @@ mod tests {
                     &fixture.desired,
                 )
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert!(!fixture.stop_receipt_path().exists());
         assert_eq!(retirement.calls.load(Ordering::SeqCst), 1);
@@ -4968,7 +4993,7 @@ mod tests {
                     &fixture.desired,
                 )
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert_eq!(retirement.calls.load(Ordering::SeqCst), 1);
         assert_eq!(process.stops.load(Ordering::SeqCst), 1);
@@ -5103,7 +5128,10 @@ mod tests {
             assert_eq!(process.stops.load(Ordering::SeqCst), 0);
             assert_eq!(request.calls.load(Ordering::SeqCst), 0);
             if exact_replay {
-                assert_eq!(first, Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                assert_eq!(
+                    first,
+                    Some(RuntimeDesiredEffectOutcome::refresh_inventory())
+                );
                 assert!(target.exists());
                 assert!(!temporary.exists());
                 let replay = fixture.effect_with_ports(
@@ -5118,7 +5146,7 @@ mod tests {
                             &fixture.desired,
                         )
                         .unwrap(),
-                    Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+                    Some(RuntimeDesiredEffectOutcome::refresh_inventory())
                 );
                 assert_eq!(process.stops.load(Ordering::SeqCst), 1);
             } else {
@@ -5199,7 +5227,7 @@ mod tests {
                     &fixture.desired,
                 )
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         let receipt_bytes = std::fs::read(fixture.stop_receipt_path()).unwrap();
         let receipt =
@@ -5466,7 +5494,7 @@ mod tests {
                         &fixture.desired,
                     )
                     .unwrap(),
-                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+                Some(RuntimeDesiredEffectOutcome::refresh_inventory())
             );
             assert!(!target.exists());
             assert_eq!(retirement.calls.load(Ordering::SeqCst), 1);
@@ -5498,7 +5526,7 @@ mod tests {
                     &fixture.desired,
                 )
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
         assert!(!fixture.stop_receipt_path().exists());
         assert_eq!(process.stops.load(Ordering::SeqCst), 1);
@@ -5536,7 +5564,7 @@ mod tests {
                     &fixture.desired,
                 )
                 .unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         let store = FileCheckpointStore::open(
             &fixture.state.path().join(CHECKPOINT_NAMESPACE),
@@ -5601,7 +5629,7 @@ mod tests {
                     &fixture.desired,
                 )
                 .unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         let store = FileCheckpointStore::open(
             &fixture.state.path().join(CHECKPOINT_NAMESPACE),

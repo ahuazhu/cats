@@ -609,7 +609,7 @@ impl DataDirectoryReclaimEffect {
             .context("revalidate exact cleanup checkpoint before DataDirectory unlink")?;
         retained.revalidate_chain()?;
         retained.reclaim(context)?;
-        Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+        Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()))
     }
 
     /// Reclaim the one cache which an exact Cold membership detach removes.
@@ -712,20 +712,24 @@ impl DataDirectoryReclaimEffect {
         retained.revalidate_chain()?;
         let record = match volume_authority.load_volume(volume_id) {
             Ok(record) => record,
-            Err(_) => return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory)),
+            Err(error) => {
+                return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory_after(
+                    &error,
+                )))
+            }
         };
         if !super::lifecycle_steps::released_cache_record_matches_cleanup_checkpoint(
             &record,
             stored.checkpoint(),
         ) {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         }
         context.check_active()?;
         store
             .revalidate_current(stored, current)
             .context("revalidate typed Cold detach checkpoint at cache unlink")?;
         retained.reclaim(context)?;
-        Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+        Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()))
     }
 }
 

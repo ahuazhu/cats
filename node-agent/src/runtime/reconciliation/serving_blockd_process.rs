@@ -1735,10 +1735,10 @@ impl ServingBlockdStartEffect {
             .load()
             .context("load serving PrepareDevice checkpoint")?
         else {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         };
         if stored.content_digest() != content_digest || stored.checkpoint().step != runtime.step {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         }
         let prepared = prepared_device_inputs(stored.checkpoint())?;
         if prepared.is_empty()
@@ -1752,14 +1752,14 @@ impl ServingBlockdStartEffect {
             "serving process admission is not bound to the accepted full observation"
         );
         if admission.serving_blockd_count(&desired.cat_id) != prepared.len() {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         }
         let mut serving = Vec::with_capacity(prepared.len());
         for device in &prepared {
             let Some((admitted_expected, admitted_exact)) =
                 admission.serving_blockd(&desired.cat_id, &device.volume_id)
             else {
-                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
             };
             if !admitted_expected.matches_device_contract(&desired.cat_id, device)
                 || !accepted_devices_are_compatible(
@@ -1773,7 +1773,11 @@ impl ServingBlockdStartEffect {
             }
             let first_authority = match self.authority.load_volume(&device.volume_id) {
                 Ok(authority) => authority,
-                Err(_) => return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory)),
+                Err(error) => {
+                    return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory_after(
+                        &error,
+                    )))
+                }
             };
             let retained = match RetainedServingBlockdAuthority::reopen(
                 context.state_directory(),
@@ -1845,7 +1849,7 @@ impl ServingBlockdStartEffect {
                 | (None, ServingBlockdProcessInspection::Exact(_))
                 | (Some(_), ServingBlockdProcessInspection::Absent)
                 | (Some(_), ServingBlockdProcessInspection::Exact(_)) => {
-                    return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                    return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
                 }
             }
         }
@@ -1880,7 +1884,7 @@ impl ServingBlockdStartEffect {
                 store
                     .replace(&stored, &successor)
                     .context("publish serving publisher-clean checkpoint successor")?;
-                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
             }
             #[cfg(test)]
             if let Some(observer) = &self.after_exact_adoption {
@@ -1893,7 +1897,7 @@ impl ServingBlockdStartEffect {
             .process
             .retain_start_socket_absence(&selected_entry.expected, context)?
         else {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         };
 
         let observation_id = &accepted.observation().observation_id;
@@ -1902,7 +1906,7 @@ impl ServingBlockdStartEffect {
             .lock()
             .map_err(|_| anyhow::anyhow!("serving process submission gate poisoned"))?;
         if submitted.as_ref() == Some(observation_id) {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         }
         *submitted = Some(observation_id.clone());
         drop(submitted);
@@ -1933,7 +1937,7 @@ impl ServingBlockdStartEffect {
                 .retained
                 .assert_current(stored.checkpoint(), desired, &after, &entry.expected)?;
         }
-        Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+        Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()))
     }
 
     fn reread_current(

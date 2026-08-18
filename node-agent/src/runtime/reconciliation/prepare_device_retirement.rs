@@ -135,10 +135,10 @@ impl PrepareDeviceTargetRetirementEffect {
             .load()
             .context("load PrepareDevice target-retirement checkpoint")?
         else {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         };
         if stored.content_digest() != content_digest || stored.checkpoint().step != runtime.step {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         }
         let checkpoint_guard = store
             .assert_current(&stored)
@@ -153,7 +153,11 @@ impl PrepareDeviceTargetRetirementEffect {
         };
         let authority = match self.authority.load_volume(&desired_volume.volume_id) {
             Ok(authority) => authority,
-            Err(_) => return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory)),
+            Err(error) => {
+                return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory_after(
+                    &error,
+                )))
+            }
         };
         let retained = match AuthorizedBlockdStore::new(context.state_directory().clone())
             .retain_prepare_device_handoff(stored.checkpoint(), desired)
@@ -242,14 +246,14 @@ impl PrepareDeviceTargetRetirementEffect {
                 store.revalidate_current(&stored, &checkpoint_guard)?;
                 return Ok(match retirement {
                     ManagedBlockdSocketOwnerRetirement::Retired => {
-                        Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+                        Some(RuntimeDesiredEffectOutcome::refresh_inventory())
                     }
                     ManagedBlockdSocketOwnerRetirement::AlreadyAbsent => None,
                 });
             }
             (AcceptedProcess::Root(_), RootProvisionProcessInspection::Absent)
             | (_, RootProvisionProcessInspection::Unavailable) => {
-                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+                return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()))
             }
             (AcceptedProcess::Root(accepted), RootProvisionProcessInspection::Exact(evidence))
                 if accepted.process_id == evidence.process_id
@@ -271,7 +275,11 @@ impl PrepareDeviceTargetRetirementEffect {
         context.check_active()?;
         let current_authority = match self.authority.load_volume(&desired_volume.volume_id) {
             Ok(authority) => authority,
-            Err(_) => return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory)),
+            Err(error) => {
+                return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory_after(
+                    &error,
+                )))
+            }
         };
         if ready
             .assert_current(stored.checkpoint(), desired, &current_authority)
@@ -296,7 +304,7 @@ impl PrepareDeviceTargetRetirementEffect {
             RootProvisionProcessStop::Submitted
             | RootProvisionProcessStop::AlreadyAbsent
             | RootProvisionProcessStop::Unavailable => {
-                RuntimeDesiredEffectOutcome::RefreshInventory
+                RuntimeDesiredEffectOutcome::refresh_inventory()
             }
             RootProvisionProcessStop::Conflict(_) => stop_local(),
         }))
