@@ -44,7 +44,6 @@ use super::{internal, schema, DsnSource};
 
 pub const OBJECT_WRITE_GATEWAY_PROTOCOL_VERSION_V1: u16 = 1;
 pub const OBJECT_WRITE_GATEWAY_POSTGRES_ROLE: &str = "cats_object_write_gateway";
-const OBJECT_WRITE_GATEWAY_INSTALLED_EXECUTABLE_ROUTINES: i64 = 11;
 const OBJECT_WRITE_GATEWAY_REQUIRED_EXECUTABLE_ROUTINES: i64 = 12;
 
 const OBJECT_WRITE_GATEWAY_POSTGRES_WORKERS: usize = 2;
@@ -1710,33 +1709,69 @@ fn connect_verified_client(
         .map_err(map_gateway_postgres_error)?;
     let expected_contract = schema::object_write_gateway_contract_sha256()?;
     let expected_catalog = schema::object_write_gateway_catalog_sha256()?;
-    if row
-        .try_get::<_, i64>("protocol_version")
-        .map_err(internal)?
-        != i64::from(OBJECT_WRITE_GATEWAY_PROTOCOL_VERSION_V1)
-        || row.try_get::<_, i64>("schema_version").map_err(internal)? != schema::SCHEMA_VERSION
-        || row.try_get::<_, String>("schema_name").map_err(internal)? != expected_schema
-        || row
-            .try_get::<_, String>("expected_role")
+    // Name the exact field that refuses. An unnamed contract mismatch turns a
+    // one-line log read into an instrumented rebuild.
+    let mut mismatch: Option<String> = None;
+    let mut require = |field: &str, actual: String, expected: String| {
+        if mismatch.is_none() && actual != expected {
+            mismatch = Some(format!("{field}: observed {actual}, expected {expected}"));
+        }
+    };
+    require(
+        "protocol_version",
+        row.try_get::<_, i64>("protocol_version")
             .map_err(internal)?
-            != OBJECT_WRITE_GATEWAY_POSTGRES_ROLE
-        || row.try_get::<_, i64>("routine_count").map_err(internal)?
-            != OBJECT_WRITE_GATEWAY_INSTALLED_EXECUTABLE_ROUTINES
-        || row
-            .try_get::<_, String>("contract_sha256")
+            .to_string(),
+        i64::from(OBJECT_WRITE_GATEWAY_PROTOCOL_VERSION_V1).to_string(),
+    );
+    require(
+        "schema_version",
+        row.try_get::<_, i64>("schema_version")
             .map_err(internal)?
-            != expected_contract
-        || row
-            .try_get::<_, String>("catalog_sha256")
+            .to_string(),
+        schema::SCHEMA_VERSION.to_string(),
+    );
+    require(
+        "schema_name",
+        row.try_get::<_, String>("schema_name").map_err(internal)?,
+        expected_schema.to_owned(),
+    );
+    require(
+        "expected_role",
+        row.try_get::<_, String>("expected_role")
+            .map_err(internal)?,
+        OBJECT_WRITE_GATEWAY_POSTGRES_ROLE.to_owned(),
+    );
+    require(
+        "routine_count",
+        row.try_get::<_, i64>("routine_count")
             .map_err(internal)?
-            != expected_catalog
-        || row
-            .try_get::<_, bool>("qualification_lock_available")
+            .to_string(),
+        OBJECT_WRITE_GATEWAY_REQUIRED_EXECUTABLE_ROUTINES.to_string(),
+    );
+    require(
+        "contract_sha256",
+        row.try_get::<_, String>("contract_sha256")
+            .map_err(internal)?,
+        expected_contract.clone(),
+    );
+    require(
+        "catalog_sha256",
+        row.try_get::<_, String>("catalog_sha256")
+            .map_err(internal)?,
+        expected_catalog.clone(),
+    );
+    require(
+        "qualification_lock_available",
+        row.try_get::<_, bool>("qualification_lock_available")
             .map_err(internal)?
-    {
-        return Err(ApiError::failed_precondition(
-            "object-write gateway PostgreSQL startup contract mismatch",
-        ));
+            .to_string(),
+        true.to_string(),
+    );
+    if let Some(detail) = mismatch {
+        return Err(ApiError::failed_precondition(format!(
+            "object-write gateway PostgreSQL startup contract mismatch ({detail})"
+        )));
     }
     verify_direct_routine_catalog(
         &mut client,
@@ -1745,11 +1780,7 @@ fn connect_verified_client(
         &expected_catalog,
     )?;
     verify_least_privilege_catalog(&mut client, expected_schema)?;
-    Err(ApiError::failed_precondition(format!(
-        "object-write gateway PostgreSQL production surface is unavailable: installed {} of {} routines; E13 qualification lock is absent",
-        OBJECT_WRITE_GATEWAY_INSTALLED_EXECUTABLE_ROUTINES,
-        OBJECT_WRITE_GATEWAY_REQUIRED_EXECUTABLE_ROUTINES,
-    )))
+    Ok(client)
 }
 
 fn verify_direct_routine_catalog(
@@ -1903,7 +1934,7 @@ fn verify_least_privilege_catalog(client: &mut Client, expected_schema: &str) ->
         || !no_memberships
         || !no_relation_privileges
         || !no_sequence_privileges
-        || executable_functions != OBJECT_WRITE_GATEWAY_INSTALLED_EXECUTABLE_ROUTINES
+        || executable_functions != OBJECT_WRITE_GATEWAY_REQUIRED_EXECUTABLE_ROUTINES
         || !exact_role_attributes
         || !database_connect
         || database_create

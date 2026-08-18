@@ -2,10 +2,10 @@
 -- control schema has been created. Invoke with psql variables:
 --   -v control_database=cats -v control_schema=cats_control
 --
--- This pre-composition script grants the eleven routines present in this
--- leaf. The daemon still refuses startup because the E13-owned qualification
--- lock is absent; the final composition must add that exact twelfth grant and
--- flip the attested capability only after installing the reviewed routine.
+-- This grants the twelve routines the daemon requires, including the E13
+-- qualification lock. The startup contract attests that capability by asking
+-- PostgreSQL whether this exact login may execute the installed routine, so a
+-- missing grant still refuses startup rather than reporting a false capability.
 -- Password creation/rotation belongs to the platform secret workflow.
 \set ON_ERROR_STOP on
 
@@ -86,6 +86,11 @@ GRANT EXECUTE ON FUNCTION
     TO cats_object_write_gateway;
 GRANT EXECUTE ON FUNCTION
     :"control_schema".control_object_write_gateway_qualification_response_lost_v1(BYTEA,BYTEA)
+    TO cats_object_write_gateway;
+GRANT EXECUTE ON FUNCTION
+    :"control_schema".control_object_write_gateway_qualification_lock_v1(
+        BYTEA,BIGINT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,
+        TEXT,TEXT,TEXT,BIGINT)
     TO cats_object_write_gateway;
 
 ALTER ROLE cats_object_write_gateway SET search_path TO :"control_schema";

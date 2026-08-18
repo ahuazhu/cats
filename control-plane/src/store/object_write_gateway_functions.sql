@@ -95,7 +95,8 @@ BEGIN
            'control_object_write_gateway_terminal_v1',
            'control_object_write_gateway_spool_removed_v1',
            'control_object_write_gateway_recover_ingress_v1',
-           'control_object_write_gateway_recover_accepted_v1'
+           'control_object_write_gateway_recover_accepted_v1',
+           'control_object_write_gateway_qualification_lock_v1'
        ]::TEXT[]);
     RETURN QUERY SELECT
         1::BIGINT,
@@ -106,11 +107,23 @@ BEGIN
         )::BIGINT,
         __CATS_SCHEMA_LITERAL__::TEXT,
         'cats_object_write_gateway'::TEXT,
-        11::BIGINT,
+        12::BIGINT,
         'sha256:__CATS_OBJECT_WRITE_GATEWAY_CONTRACT_SHA256_VALUE__'::TEXT,
         'sha256:' || pg_catalog.encode(
             pg_catalog.sha256(pg_catalog.convert_to(catalog_input, 'UTF8')), 'hex'),
-        FALSE;
+        -- Attested, never asserted: the capability is true only when the E13
+        -- routine is installed in this schema and this exact login may execute
+        -- it. A missing grant reports false and the daemon refuses to start.
+        (
+            SELECT COALESCE(pg_catalog.bool_or(
+                pg_catalog.has_function_privilege(
+                    session_user, function.oid, 'EXECUTE')), FALSE)
+              FROM pg_catalog.pg_proc function
+              JOIN pg_catalog.pg_namespace namespace
+                ON namespace.oid=function.pronamespace
+             WHERE namespace.nspname=__CATS_SCHEMA_LITERAL__
+               AND function.proname='control_object_write_gateway_qualification_lock_v1'
+        );
 END;
 $function$;
 REVOKE ALL ON FUNCTION
@@ -2573,3 +2586,190 @@ END;
 $function$;
 REVOKE ALL ON FUNCTION
     __CATS_SCHEMA_IDENT__.control_object_write_gateway_recover_accepted_v1(TEXT) FROM PUBLIC;
+
+-- ADR-0055 §4: the E13 fault path opens one exclusive guard serialized by the
+-- exact request, and reads the current Qualification admission while holding a
+-- FOR SHARE lock on its singleton. Both locks stay held by the caller's
+-- transaction across the real provider PUT and the durable response-loss
+-- receipt, so a successful End or EmergencyClose can never return before this
+-- effect is either committed or rolled back. Every authorized fact is derived
+-- here from the current admission; the caller submits none of them.
+CREATE OR REPLACE FUNCTION __CATS_SCHEMA_IDENT__.control_object_write_gateway_qualification_lock_v1(
+    p_request_canonical BYTEA,
+    p_version BIGINT,
+    p_mutation_class TEXT,
+    p_request_id TEXT,
+    p_writer_authority_id TEXT,
+    p_credential_id TEXT,
+    p_credential_public_key_spki_sha256 TEXT,
+    p_provider_attempt_id TEXT,
+    p_fault_kind TEXT,
+    p_qualification_id TEXT,
+    p_fault_id TEXT,
+    p_fault_catalog_sha256 TEXT,
+    p_provider TEXT,
+    p_partition TEXT,
+    p_account_id TEXT,
+    p_region TEXT,
+    p_object_store_scope_id TEXT,
+    p_canonical_logical_key TEXT,
+    p_content_sha256 TEXT,
+    p_content_length BIGINT
+)
+RETURNS TABLE(
+    request_canonical BYTEA,
+    authorization_canonical BYTEA,
+    authorization_version BIGINT,
+    authorization_mutation_class TEXT,
+    qualification_id TEXT,
+    workspace_id TEXT,
+    deployment_id TEXT,
+    release_id TEXT,
+    source_commit_sha TEXT,
+    control_schema_version BIGINT,
+    qualification_catalog_sha256 TEXT,
+    admission_binding_sha256 TEXT,
+    admission_revision BIGINT,
+    authorized_at_unix_ms BIGINT,
+    qualification_expires_at_unix_ms BIGINT
+)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $function$
+DECLARE
+    admission_row RECORD;
+    request_json JSONB;
+    request_text TEXT;
+    fault_text TEXT;
+    authorization_text TEXT;
+    authorization_bytes BYTEA;
+    now_ms BIGINT;
+BEGIN
+    IF session_user::TEXT IS DISTINCT FROM 'cats_object_write_gateway' THEN
+        RAISE EXCEPTION 'object-write gateway PostgreSQL role mismatch'
+            USING ERRCODE = '42501';
+    END IF;
+    IF p_version IS DISTINCT FROM 1
+       OR p_mutation_class IS DISTINCT FROM 'object_write_ambiguity'
+       OR p_fault_kind IS DISTINCT FROM 'successful_put_response_loss' THEN
+        RAISE EXCEPTION 'object-write qualification lock class is not E13'
+            USING ERRCODE = '22023';
+    END IF;
+
+    -- The caller may not assert its own request: rebuild the canonical request
+    -- from the exact arguments and require it to be the bytes it presented.
+    fault_text := '{"kind":"successful_put_response_loss","qualification_id":' ||
+        pg_catalog.to_json(p_qualification_id)::TEXT ||
+        ',"fault_id":' || pg_catalog.to_json(p_fault_id)::TEXT ||
+        ',"qualification_catalog_sha256":' ||
+        pg_catalog.to_json(p_fault_catalog_sha256)::TEXT || '}';
+    request_text := '{"version":1,"mutation_class":"object_write_ambiguity","request_id":' ||
+        pg_catalog.to_json(p_request_id)::TEXT ||
+        ',"writer_authority_id":' || pg_catalog.to_json(p_writer_authority_id)::TEXT ||
+        ',"credential":{"credential_id":' || pg_catalog.to_json(p_credential_id)::TEXT ||
+        ',"public_key_spki_sha256":' ||
+        pg_catalog.to_json(p_credential_public_key_spki_sha256)::TEXT ||
+        '},"provider_attempt_id":' || pg_catalog.to_json(p_provider_attempt_id)::TEXT ||
+        ',"fault":' || fault_text ||
+        ',"object_provider_scope":{"provider":' || pg_catalog.to_json(p_provider)::TEXT ||
+        ',"partition":' || pg_catalog.to_json(p_partition)::TEXT ||
+        ',"account_id":' || pg_catalog.to_json(p_account_id)::TEXT ||
+        ',"region":' || pg_catalog.to_json(p_region)::TEXT ||
+        '},"object_store_scope_id":' || pg_catalog.to_json(p_object_store_scope_id)::TEXT ||
+        ',"canonical_logical_key":' || pg_catalog.to_json(p_canonical_logical_key)::TEXT ||
+        ',"content_sha256":' || pg_catalog.to_json(p_content_sha256)::TEXT ||
+        ',"content_length":' || p_content_length::TEXT || '}';
+    IF pg_catalog.convert_to(request_text, 'UTF8') IS DISTINCT FROM p_request_canonical THEN
+        RAISE EXCEPTION 'object-write qualification lock request is not canonical'
+            USING ERRCODE = '22023';
+    END IF;
+    request_json := pg_catalog.convert_from(p_request_canonical, 'UTF8')::JSONB;
+    IF request_json IS NULL THEN
+        RAISE EXCEPTION 'object-write qualification lock request is not an object'
+            USING ERRCODE = '22023';
+    END IF;
+
+    -- Exclusive guard serialized by the exact request. It is a transaction lock,
+    -- so it is released only by commit or rollback -- never between the provider
+    -- PUT and the resolution write.
+    PERFORM pg_catalog.pg_advisory_xact_lock(
+        pg_catalog.hashtextextended(
+            'cats.object-write.qualification-request.v1' || pg_catalog.encode(
+                pg_catalog.sha256(p_request_canonical), 'hex'),
+            0));
+
+    -- The E13 lock. FOR SHARE blocks End/EmergencyClose (which take FOR UPDATE)
+    -- until this transaction settles, and is itself blocked while one is running.
+    SELECT admission.* INTO admission_row
+      FROM __CATS_SCHEMA_IDENT__.production_mutation_admission admission
+     WHERE admission.singleton
+       FOR SHARE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'production mutation admission is absent'
+            USING ERRCODE = 'P0002';
+    END IF;
+    now_ms := (EXTRACT(EPOCH FROM pg_catalog.clock_timestamp()) * 1000)::BIGINT;
+    IF admission_row.mode IS DISTINCT FROM 'qualification'
+       OR admission_row.binding_kind IS DISTINCT FROM 'qualification'
+       OR admission_row.qualification_id IS NULL
+       OR admission_row.qualification_id IS DISTINCT FROM p_qualification_id
+       OR admission_row.qualification_catalog_sha256 IS DISTINCT FROM p_fault_catalog_sha256
+       OR admission_row.qualification_workspace_id IS NULL
+       OR admission_row.deployment_id IS NULL
+       OR admission_row.release_id IS NULL
+       OR admission_row.source_commit_sha IS NULL
+       OR admission_row.control_schema_version IS DISTINCT FROM 16
+       OR admission_row.binding_sha256 IS NULL
+       OR admission_row.qualification_expires_at_unix_ms IS NULL
+       OR admission_row.qualification_expires_at_unix_ms <= now_ms
+       OR NOT (admission_row.binding #> '{allowed_mutation_classes}'
+               @> '["object_write_ambiguity"]'::JSONB) THEN
+        RAISE EXCEPTION 'current Qualification does not admit this object write'
+            USING ERRCODE = '55000';
+    END IF;
+
+    authorization_text := '{"version":1,"mutation_class":"object_write_ambiguity"' ||
+        ',"qualification_id":' || pg_catalog.to_json(admission_row.qualification_id)::TEXT ||
+        ',"workspace_id":' ||
+        pg_catalog.to_json(admission_row.qualification_workspace_id)::TEXT ||
+        ',"deployment_id":' || pg_catalog.to_json(admission_row.deployment_id)::TEXT ||
+        ',"release_id":' || pg_catalog.to_json(admission_row.release_id)::TEXT ||
+        ',"source_commit_sha":' || pg_catalog.to_json(admission_row.source_commit_sha)::TEXT ||
+        ',"control_schema_version":' || admission_row.control_schema_version::TEXT ||
+        ',"qualification_catalog_sha256":' ||
+        pg_catalog.to_json(admission_row.qualification_catalog_sha256)::TEXT ||
+        ',"admission_binding_sha256":' ||
+        pg_catalog.to_json(admission_row.binding_sha256)::TEXT ||
+        ',"admission_revision":' || admission_row.revision::TEXT ||
+        ',"request":' || request_text ||
+        ',"authorized_at_unix_ms":' || now_ms::TEXT ||
+        ',"qualification_expires_at_unix_ms":' ||
+        admission_row.qualification_expires_at_unix_ms::TEXT || '}';
+    authorization_bytes := pg_catalog.convert_to(authorization_text, 'UTF8');
+    IF pg_catalog.convert_from(authorization_bytes, 'UTF8')::JSONB IS NULL THEN
+        RAISE EXCEPTION 'object-write qualification authorization is not canonical'
+            USING ERRCODE = '55000';
+    END IF;
+
+    RETURN QUERY SELECT
+        p_request_canonical,
+        authorization_bytes,
+        1::BIGINT,
+        'object_write_ambiguity'::TEXT,
+        admission_row.qualification_id::TEXT,
+        admission_row.qualification_workspace_id::TEXT,
+        admission_row.deployment_id::TEXT,
+        admission_row.release_id::TEXT,
+        admission_row.source_commit_sha::TEXT,
+        admission_row.control_schema_version::BIGINT,
+        admission_row.qualification_catalog_sha256::TEXT,
+        admission_row.binding_sha256::TEXT,
+        admission_row.revision::BIGINT,
+        now_ms,
+        admission_row.qualification_expires_at_unix_ms::BIGINT;
+END;
+$function$;
+REVOKE ALL ON FUNCTION
+    __CATS_SCHEMA_IDENT__.control_object_write_gateway_qualification_lock_v1(
+        BYTEA,BIGINT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,
+        TEXT,TEXT,TEXT,BIGINT) FROM PUBLIC;
