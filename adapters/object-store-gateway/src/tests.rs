@@ -509,6 +509,7 @@ fn fixture(script: Vec<Reply>) -> Fixture {
         Id::new(VOLUME).expect("a valid volume id"),
         signer("credential-1"),
         Arc::clone(&reads) as Arc<dyn BlobStore>,
+        ObjectWriteGatewayServerTrust::PlaintextLoopback,
     )
     .expect("open the gateway store");
     Fixture {
@@ -957,6 +958,21 @@ fn deletion_and_destructive_listing_fail_closed() {
 // Construction
 // ---------------------------------------------------------------------------
 
+/// A fixed self-signed root, standing in for the deployment's Route v2 root.
+/// Its only job is to be a parseable trust anchor, so it is a literal rather
+/// than something generated per run.
+const SELF_SIGNED_ROOT_PEM: &str = "\
+-----BEGIN CERTIFICATE-----\n\
+MIIBYzCCARWgAwIBAgIULICwc/RLnF4bSmGzzr94Ux2eOTIwBQYDK2VwMCYxJDAi\n\
+BgNVBAMMG0NhdHMgb2JqZWN0LXdyaXRlIHRlc3Qgcm9vdDAgFw0yNjA4MTgxMTAx\n\
+NTZaGA8yMTI2MDcyNTExMDE1NlowJjEkMCIGA1UEAwwbQ2F0cyBvYmplY3Qtd3Jp\n\
+dGUgdGVzdCByb290MCowBQYDK2VwAyEA1NilIB8rScb67W7/kKsQ7WB/zvZaT1BG\n\
+f2zFVOq+kZOjUzBRMB0GA1UdDgQWBBQkQswCbzxcDl5pz/rGPiUdFSpISDAfBgNV\n\
+HSMEGDAWgBQkQswCbzxcDl5pz/rGPiUdFSpISDAPBgNVHRMBAf8EBTADAQH/MAUG\n\
+AytlcANBAD1/4EhOQ+aymAJVDBlUSZR9rfAwzGDkp3HohSGR+goWZV++BRdaMN/a\n\
+AOyU0kuaUva+bGyoQ8A95rEzSQMTmw4=\n\
+-----END CERTIFICATE-----\n";
+
 /// The gateway serves TLS only. A plaintext origin is accepted for a loopback
 /// literal — the test double and local development — and refused everywhere
 /// else, so volume bytes are never shipped in the clear to a routable host.
@@ -964,11 +980,17 @@ fn deletion_and_destructive_listing_fail_closed() {
 fn a_plaintext_origin_is_accepted_only_for_a_loopback_literal() {
     let reads = Arc::new(RecordingReads::default()) as Arc<dyn BlobStore>;
     let open = |base: &str| {
+        let trust = if base.starts_with("https://") {
+            ObjectWriteGatewayServerTrust::Roots(SELF_SIGNED_ROOT_PEM.as_bytes())
+        } else {
+            ObjectWriteGatewayServerTrust::PlaintextLoopback
+        };
         ObjectWriteGatewayBlobStore::new(
             base,
             Id::new(VOLUME).expect("a valid volume id"),
             signer("credential-1"),
             Arc::clone(&reads),
+            trust,
         )
     };
 
@@ -1001,9 +1023,14 @@ fn the_factory_opens_from_configuration_without_credentials() {
     let factory = ObjectWriteGatewayBlobStoreFactory::new(signer("credential-1"), reads);
     assert_eq!(factory.name(), ADAPTER_NAME);
 
+    let bundle = std::env::temp_dir().join("cats-object-write-test-root.pem");
+    std::fs::write(&bundle, SELF_SIGNED_ROOT_PEM).expect("write the test trust anchor");
+    let bundle = bundle.to_str().expect("a UTF-8 temporary path");
+
     let config = AdapterConfig::from_pairs([
         ("gateway-url", "https://gateway.internal:8443"),
         ("volume-id", VOLUME),
+        ("server-ca-file", bundle),
     ])
     .expect("valid options");
     assert!(factory.open(&config).is_ok());
@@ -1015,9 +1042,22 @@ fn the_factory_opens_from_configuration_without_credentials() {
         Err(AdapterError::MissingOption { .. })
     ));
 
+    // The trust anchor is as mandatory as the volume: a store opened without it
+    // could never publish through the gateway it was pointed at.
+    let no_trust = AdapterConfig::from_pairs([
+        ("gateway-url", "https://gateway.internal:8443"),
+        ("volume-id", VOLUME),
+    ])
+    .expect("valid options");
+    assert!(matches!(
+        factory.open(&no_trust),
+        Err(AdapterError::MissingOption { .. })
+    ));
+
     let unsupported = AdapterConfig::from_pairs([
         ("gateway-url", "https://gateway.internal:8443"),
         ("volume-id", VOLUME),
+        ("server-ca-file", bundle),
         ("secret-key", "leaked"),
     ])
     .expect("valid options");
@@ -1025,4 +1065,64 @@ fn the_factory_opens_from_configuration_without_credentials() {
         factory.open(&unsupported),
         Err(AdapterError::UnsupportedOptions { .. })
     ));
+}
+
+/// The gateway's certificate comes from the deployment's own root, so the
+/// production store cannot be built without it. These are the two ways a caller
+/// could otherwise end up with a client that authenticates nothing: an https
+/// origin declared as loopback plaintext, and roots declared for an origin that
+/// carries no TLS at all.
+#[test]
+fn an_https_origin_cannot_be_opened_without_server_roots() {
+    let reads = Arc::new(RecordingReads::default()) as Arc<dyn BlobStore>;
+    let open = |base: &str, trust| {
+        ObjectWriteGatewayBlobStore::new(
+            base,
+            Id::new(VOLUME).expect("a valid volume id"),
+            signer("credential-1"),
+            Arc::clone(&reads),
+            trust,
+        )
+    };
+
+    let error = open(
+        "https://gateway.internal:8443",
+        ObjectWriteGatewayServerTrust::PlaintextLoopback,
+    )
+    .expect_err("an https origin must not authenticate nothing");
+    assert!(
+        matches!(error, ObjectWriteError::InvalidServerTrust { .. }),
+        "got {error}"
+    );
+
+    let error = open(
+        "http://127.0.0.1:8443",
+        ObjectWriteGatewayServerTrust::Roots(SELF_SIGNED_ROOT_PEM.as_bytes()),
+    )
+    .expect_err("a plaintext origin must not claim to authenticate roots");
+    assert!(
+        matches!(error, ObjectWriteError::InvalidServerTrust { .. }),
+        "got {error}"
+    );
+
+    for unusable in [
+        "",
+        "-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n",
+    ] {
+        let error = open(
+            "https://gateway.internal:8443",
+            ObjectWriteGatewayServerTrust::Roots(unusable.as_bytes()),
+        )
+        .expect_err("an unusable PEM bundle must fail closed");
+        assert!(
+            matches!(error, ObjectWriteError::InvalidServerTrust { .. }),
+            "got {error}"
+        );
+    }
+
+    open(
+        "https://gateway.internal:8443",
+        ObjectWriteGatewayServerTrust::Roots(SELF_SIGNED_ROOT_PEM.as_bytes()),
+    )
+    .expect("the deployment's own root is the usable case");
 }

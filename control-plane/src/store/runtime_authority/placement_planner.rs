@@ -218,7 +218,21 @@ impl CatCreatePlacementPlanner for PostgresCatCreatePlacementPlanner {
                 CatCreatePlacementLoad::Planned(plan) => {
                     Ok(CatCreatePlacementOutcome::Planned(*plan))
                 }
-                CatCreatePlacementLoad::Unavailable { .. } => {
+                CatCreatePlacementLoad::Unavailable { first_rejection } => {
+                    // The planner already knows exactly why the fleet refused.
+                    // Dropping it turns every Cat create refusal into one
+                    // opaque HTTP 503 with no way to tell a cordoned Node from
+                    // an expired session or an exhausted network.
+                    match first_rejection {
+                        Some((node_id, rejection)) => tracing::warn!(
+                            node = %node_id,
+                            rejection = ?rejection,
+                            "Cat create found no placement",
+                        ),
+                        None => tracing::warn!(
+                            "Cat create found no placement: no provisioned Node was a candidate",
+                        ),
+                    }
                     Ok(CatCreatePlacementOutcome::Unavailable)
                 }
                 CatCreatePlacementLoad::CandidateIdentityCollision => {

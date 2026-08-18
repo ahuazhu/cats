@@ -1519,6 +1519,8 @@ pub struct ObjectWriteGatewayLaunch {
     pub gateway_url: String,
     /// Absolute credential namespace directory, not the Node state root.
     pub credential_directory: PathBuf,
+    /// PEM roots that issue this deployment's gateway server certificate.
+    pub server_ca_bundle_file: PathBuf,
 }
 
 /// Exactly one Guest block frontend for the first Running slice.
@@ -1726,11 +1728,17 @@ fn build_authorized_blockd_command(
             gateway.credential_directory.is_absolute(),
             "object-write credential directory must be absolute"
         );
+        anyhow::ensure!(
+            gateway.server_ca_bundle_file.is_absolute(),
+            "object-write gateway server CA bundle path must be absolute"
+        );
         command
             .arg("--object-write-gateway-url")
             .arg(&gateway.gateway_url)
             .arg("--object-write-credential-directory")
-            .arg(&gateway.credential_directory);
+            .arg(&gateway.credential_directory)
+            .arg("--object-write-gateway-ca-file")
+            .arg(&gateway.server_ca_bundle_file);
     }
 
     // Crash injection belongs only to explicit blockd tests. A production
@@ -3519,9 +3527,12 @@ mod tests {
         let credential_directory = PathBuf::from("/var/lib/cats/node/n1")
             .join(cats_api::object_write_gateway::OBJECT_WRITE_CREDENTIAL_DIRECTORY_BASENAME);
         let mut config = launch_config();
+        let server_ca_bundle_file =
+            PathBuf::from(cats_api::route_grant_v2::NODE_ROUTE_V2_SERVER_CA_BUNDLE_PATH);
         config.object_write_gateway = Some(ObjectWriteGatewayLaunch {
             gateway_url: "https://gateway.invalid".to_owned(),
             credential_directory: credential_directory.clone(),
+            server_ca_bundle_file: server_ca_bundle_file.clone(),
         });
 
         // Calibrating negative: the same configured Node, an attachment that
@@ -3589,6 +3600,16 @@ mod tests {
             cats_api::object_write_gateway::OBJECT_WRITE_CREDENTIAL_DIRECTORY_BASENAME,
             "blockd refuses any path whose last component is not the namespace"
         );
+        // The Gateway is certified by this deployment's own root, so the serving
+        // process must be told which root before it can publish anything.
+        let bundle_index = arguments
+            .iter()
+            .position(|argument| argument == OsStr::new("--object-write-gateway-ca-file"))
+            .expect("a credentialed attachment names its Gateway trust anchor");
+        assert_eq!(
+            PathBuf::from(&arguments[bundle_index + 1]),
+            server_ca_bundle_file
+        );
 
         // Fail closed: a credential this Node cannot reach must not launch a
         // process that would silently be unable to publish.
@@ -3599,7 +3620,15 @@ mod tests {
         relative.object_write_gateway = Some(ObjectWriteGatewayLaunch {
             gateway_url: "https://gateway.invalid".to_owned(),
             credential_directory: PathBuf::from("object-write-credentials"),
+            server_ca_bundle_file: server_ca_bundle_file.clone(),
         });
         assert!(build(&relative, &credentialed).is_err());
+        let mut relative_bundle = launch_config();
+        relative_bundle.object_write_gateway = Some(ObjectWriteGatewayLaunch {
+            gateway_url: "https://gateway.invalid".to_owned(),
+            credential_directory: credential_directory.clone(),
+            server_ca_bundle_file: PathBuf::from("node-server-ca-bundle.pem"),
+        });
+        assert!(build(&relative_bundle, &credentialed).is_err());
     }
 }

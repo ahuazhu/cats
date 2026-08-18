@@ -41,6 +41,15 @@ struct Args {
     /// management Control origin.
     #[arg(long, env = "CATS_OBJECT_WRITE_GATEWAY_URL")]
     object_write_gateway_url: Option<String>,
+    /// PEM roots that issue server certificates in this deployment's Route v2
+    /// revision, which is what certifies the ObjectWrite Gateway. It defaults to
+    /// the installed Node artifact rather than being separately deployed.
+    #[arg(
+        long,
+        env = "CATS_OBJECT_WRITE_GATEWAY_CA_FILE",
+        default_value = cats_api::route_grant_v2::NODE_ROUTE_V2_SERVER_CA_BUNDLE_PATH
+    )]
+    object_write_gateway_ca_file: PathBuf,
     #[arg(
         long,
         env = "CATS_GATEWAY_CLIENT_CA_BUNDLE_FILE",
@@ -264,7 +273,10 @@ async fn main() -> anyhow::Result<()> {
     // the Node ID, so the fleet-shared worker environment cannot carry it. The
     // credential port reads it from Control once per Agent session.
     let object_write_gateway = args.object_write_gateway_url.map(|gateway_url| {
-        cats_node_agent::runtime_cutover::ObjectWriteGatewayComposition { gateway_url }
+        cats_node_agent::runtime_cutover::ObjectWriteGatewayComposition {
+            gateway_url,
+            server_ca_bundle_file: args.object_write_gateway_ca_file.clone(),
+        }
     });
     let deadline_policy = RuntimeSpineDeadlinePolicy::new(
         Duration::from_millis(args.runtime_inventory_scan_timeout_ms),

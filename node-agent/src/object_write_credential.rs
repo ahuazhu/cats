@@ -1135,8 +1135,21 @@ impl std::fmt::Debug for ObjectWriteCredentialHttpRegistrar {
 }
 
 impl ObjectWriteCredentialHttpRegistrar {
-    pub(crate) fn for_production(gateway_origin: &str) -> anyhow::Result<Self> {
-        Self::new(gateway_origin, TransportMode::ProductionHttps)
+    /// `server_ca_bundle_pem` are the PEM roots that issue server certificates
+    /// in this deployment's Route v2 revision. The gateway is a fixed internal
+    /// origin whose certificate no public trust store contains, so the roots
+    /// are mandatory and they *replace* the built-in set rather than extending
+    /// it: leaving the public roots installed would let any publicly issued
+    /// certificate for the gateway host stand in for the gateway.
+    pub(crate) fn for_production(
+        gateway_origin: &str,
+        server_ca_bundle_pem: &[u8],
+    ) -> anyhow::Result<Self> {
+        Self::new(
+            gateway_origin,
+            TransportMode::ProductionHttps,
+            Some(server_ca_bundle_pem),
+        )
     }
 
     /// Same real registrar against a loopback HTTP peer. `pub(crate)` so the
@@ -1145,18 +1158,36 @@ impl ObjectWriteCredentialHttpRegistrar {
     /// scheme, and it is compiled out of every non-test build.
     #[cfg(test)]
     pub(crate) fn for_loopback_test(gateway_origin: &str) -> anyhow::Result<Self> {
-        Self::new(gateway_origin, TransportMode::LoopbackTest)
+        Self::new(gateway_origin, TransportMode::LoopbackTest, None)
     }
 
-    fn new(gateway_origin: &str, mode: TransportMode) -> anyhow::Result<Self> {
+    fn new(
+        gateway_origin: &str,
+        mode: TransportMode,
+        server_ca_bundle_pem: Option<&[u8]>,
+    ) -> anyhow::Result<Self> {
         let origin = validate_origin(gateway_origin, "object-write gateway", mode)?;
-        let client = reqwest::blocking::Client::builder()
+        let mut client = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_gzip()
             .no_brotli()
             .no_deflate()
-            .no_zstd()
-            .build()?;
+            .no_zstd();
+        if let Some(pem) = server_ca_bundle_pem {
+            let roots = reqwest::tls::Certificate::from_pem_bundle(pem).map_err(|error| {
+                anyhow::anyhow!(
+                    "object-write gateway server CA bundle is not a readable PEM bundle: {error}"
+                )
+            })?;
+            if roots.is_empty() {
+                anyhow::bail!("object-write gateway server CA bundle contains no certificate");
+            }
+            client = client.https_only(true).tls_built_in_root_certs(false);
+            for root in roots {
+                client = client.add_root_certificate(root);
+            }
+        }
+        let client = client.build()?;
         Ok(Self { origin, client })
     }
 }
@@ -1713,6 +1744,9 @@ pub trait ObjectWriteCredentialPort: std::fmt::Debug + Send + Sync {
 
     /// The origin the serving process publishes objects through.
     fn gateway_origin(&self) -> &str;
+
+    /// PEM roots the serving process must authenticate that origin against.
+    fn server_ca_bundle_file(&self) -> &Path;
 }
 
 /// A recording [`ObjectWriteCredentialPort`] for the reconciler's own tests.
@@ -1837,6 +1871,10 @@ impl ObjectWriteCredentialPort for RecordingObjectWriteCredentials {
     fn gateway_origin(&self) -> &str {
         "https://gateway.invalid"
     }
+
+    fn server_ca_bundle_file(&self) -> &Path {
+        Path::new("/etc/cats/route-v2/node-server-ca-bundle.pem")
+    }
 }
 
 /// Production [`ObjectWriteCredentialPort`]: one Node state directory, the
@@ -1850,6 +1888,7 @@ impl ObjectWriteCredentialPort for RecordingObjectWriteCredentials {
 pub struct NodeObjectWriteCredentials {
     state_directory: PathBuf,
     gateway_origin: String,
+    server_ca_bundle_file: PathBuf,
     node_signer: Ed25519RequestSigner,
     registrar: Arc<dyn ObjectWriteCredentialRegistrar>,
     authority_reader: Arc<dyn ObjectWriteWriterAuthorityResolver>,
@@ -1877,6 +1916,7 @@ impl NodeObjectWriteCredentials {
     pub fn for_production(
         state_directory: PathBuf,
         gateway_origin: &str,
+        server_ca_bundle_file: &Path,
         control_plane_origin: &str,
         node_signer: Ed25519RequestSigner,
     ) -> anyhow::Result<Self> {
@@ -1884,7 +1924,20 @@ impl NodeObjectWriteCredentials {
             state_directory.is_absolute(),
             "object-write credential state directory must be absolute"
         );
-        let registrar = ObjectWriteCredentialHttpRegistrar::for_production(gateway_origin)?;
+        anyhow::ensure!(
+            server_ca_bundle_file.is_absolute(),
+            "object-write gateway server CA bundle path must be absolute"
+        );
+        let server_ca_bundle_pem = std::fs::read(server_ca_bundle_file).map_err(|error| {
+            anyhow::anyhow!(
+                "read object-write gateway server CA bundle {}: {error}",
+                server_ca_bundle_file.display()
+            )
+        })?;
+        let registrar = ObjectWriteCredentialHttpRegistrar::for_production(
+            gateway_origin,
+            &server_ca_bundle_pem,
+        )?;
         let authority_reader = ObjectWriteWriterAuthorityHttpReader::for_production(
             control_plane_origin,
             node_signer.clone(),
@@ -1894,6 +1947,7 @@ impl NodeObjectWriteCredentials {
             // Keep the exact configured origin: the serving process must be
             // told the same one this Node registered against.
             gateway_origin: gateway_origin.to_owned(),
+            server_ca_bundle_file: server_ca_bundle_file.to_path_buf(),
             node_signer,
             registrar: Arc::new(registrar),
             authority_reader: Arc::new(authority_reader),
@@ -1915,6 +1969,9 @@ impl NodeObjectWriteCredentials {
         Self {
             state_directory,
             gateway_origin: gateway_origin.to_owned(),
+            server_ca_bundle_file: PathBuf::from(
+                cats_api::route_grant_v2::NODE_ROUTE_V2_SERVER_CA_BUNDLE_PATH,
+            ),
             node_signer,
             registrar,
             authority_reader,
@@ -1980,8 +2037,20 @@ impl ObjectWriteCredentialPort for NodeObjectWriteCredentials {
         attachment_epoch: FenceEpoch,
         deadline: Instant,
     ) -> Result<ObjectWriteCredentialReference, ObjectWriteCredentialUnavailable> {
+        // Every grant path collapses this failure into a bare retry of the same
+        // exact transition, so this is the only place the reason exists. An
+        // unlogged refusal here reads on the Node as an effect that retries
+        // forever with no stated cause.
         let failed = |error: &ObjectWriteCredentialError| {
-            ObjectWriteCredentialUnavailable::new(volume_id, attachment_id, attachment_epoch, error)
+            let unavailable = ObjectWriteCredentialUnavailable::new(
+                volume_id,
+                attachment_id,
+                attachment_epoch,
+                error,
+            );
+            tracing::warn!(gateway = %self.gateway_origin, refusal = %unavailable,
+                "object-write credential establish failed");
+            unavailable
         };
         let scope = ObjectWriteCredentialScope {
             session: session.clone(),
@@ -2009,7 +2078,15 @@ impl ObjectWriteCredentialPort for NodeObjectWriteCredentials {
         attachment_epoch: FenceEpoch,
     ) -> Result<(), ObjectWriteCredentialUnavailable> {
         let failed = |error: &ObjectWriteCredentialError| {
-            ObjectWriteCredentialUnavailable::new(volume_id, attachment_id, attachment_epoch, error)
+            let unavailable = ObjectWriteCredentialUnavailable::new(
+                volume_id,
+                attachment_id,
+                attachment_epoch,
+                error,
+            );
+            tracing::warn!(gateway = %self.gateway_origin, refusal = %unavailable,
+                "object-write credential retire failed");
+            unavailable
         };
         let store = ObjectWriteCredentialStore::open(&self.state_directory)
             .map_err(|error| failed(&error))?;
@@ -2025,6 +2102,10 @@ impl ObjectWriteCredentialPort for NodeObjectWriteCredentials {
 
     fn gateway_origin(&self) -> &str {
         &self.gateway_origin
+    }
+
+    fn server_ca_bundle_file(&self) -> &Path {
+        &self.server_ca_bundle_file
     }
 }
 
@@ -3097,16 +3178,57 @@ mod tests {
         }
     }
 
+    /// A fixed self-signed root, standing in for the deployment's Route v2 root.
+    const TEST_SERVER_ROOT_PEM: &str = "\
+-----BEGIN CERTIFICATE-----\n\
+MIIBYzCCARWgAwIBAgIULICwc/RLnF4bSmGzzr94Ux2eOTIwBQYDK2VwMCYxJDAi\n\
+BgNVBAMMG0NhdHMgb2JqZWN0LXdyaXRlIHRlc3Qgcm9vdDAgFw0yNjA4MTgxMTAx\n\
+NTZaGA8yMTI2MDcyNTExMDE1NlowJjEkMCIGA1UEAwwbQ2F0cyBvYmplY3Qtd3Jp\n\
+dGUgdGVzdCByb290MCowBQYDK2VwAyEA1NilIB8rScb67W7/kKsQ7WB/zvZaT1BG\n\
+f2zFVOq+kZOjUzBRMB0GA1UdDgQWBBQkQswCbzxcDl5pz/rGPiUdFSpISDAfBgNV\n\
+HSMEGDAWgBQkQswCbzxcDl5pz/rGPiUdFSpISDAPBgNVHRMBAf8EBTADAQH/MAUG\n\
+AytlcANBAD1/4EhOQ+aymAJVDBlUSZR9rfAwzGDkp3HohSGR+goWZV++BRdaMN/a\n\
+AOyU0kuaUva+bGyoQ8A95rEzSQMTmw4=\n\
+-----END CERTIFICATE-----\n";
+
     #[test]
     fn a_production_registrar_refuses_a_plaintext_origin() {
-        assert!(ObjectWriteCredentialHttpRegistrar::for_production("http://127.0.0.1:9/").is_err());
+        let roots = TEST_SERVER_ROOT_PEM.as_bytes();
+        assert!(
+            ObjectWriteCredentialHttpRegistrar::for_production("http://127.0.0.1:9/", roots)
+                .is_err()
+        );
         assert!(ObjectWriteCredentialHttpRegistrar::for_production(
-            "https://control.example/v1/internal/"
+            "https://control.example/v1/internal/",
+            roots
         )
         .is_err());
-        assert!(
-            ObjectWriteCredentialHttpRegistrar::for_production("https://control.example/").is_ok()
-        );
+        assert!(ObjectWriteCredentialHttpRegistrar::for_production(
+            "https://control.example/",
+            roots
+        )
+        .is_ok());
+    }
+
+    /// The gateway is certified by the deployment's own root, so a registrar
+    /// built without a usable one is a startup refusal. Without this the client
+    /// silently keeps the public trust store and can never reach the gateway,
+    /// which the grant path then reports only as an endless exact retry.
+    #[test]
+    fn a_production_registrar_requires_usable_server_roots() {
+        for unusable in [
+            b"".as_slice(),
+            b"-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n".as_slice(),
+        ] {
+            assert!(
+                ObjectWriteCredentialHttpRegistrar::for_production(
+                    "https://gateway.example/",
+                    unusable
+                )
+                .is_err(),
+                "an unusable PEM bundle must fail closed"
+            );
+        }
     }
 
     #[test]

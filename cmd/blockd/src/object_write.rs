@@ -63,6 +63,7 @@ const CREDENTIAL_FILE_MODE: u32 = 0o600;
 pub(crate) fn gateway_publish_store(
     gateway_url: Option<&str>,
     credential_directory: Option<&Path>,
+    server_ca_bundle_file: Option<&Path>,
     attachment: &AuthorizedServingAttachment,
     reads: &Arc<dyn BlobStore>,
 ) -> Result<Option<ObjectWriteGatewayBlobStore>> {
@@ -86,11 +87,28 @@ pub(crate) fn gateway_publish_store(
         )
     })?;
     let signer = load_attachment_signer(directory, attachment, reference)?;
+    // The gateway's certificate is issued by the deployment's own Route v2
+    // root, so publishing requires that root explicitly. A missing bundle is a
+    // refusal to start rather than a client that falls back to the public trust
+    // store and would accept any publicly issued certificate for the host.
+    let bundle_file = server_ca_bundle_file.with_context(|| {
+        format!(
+            "attachment {attachment_id} binds object-write credential {credential_id}, so \
+             --object-write-gateway-ca-file is required to authenticate the Gateway"
+        )
+    })?;
+    let bundle = std::fs::read(bundle_file).with_context(|| {
+        format!(
+            "read the ObjectWrite Gateway server CA bundle {}",
+            bundle_file.display()
+        )
+    })?;
     let store = ObjectWriteGatewayBlobStore::new(
         gateway_url,
         attachment.identity.volume_id.clone(),
         signer,
         Arc::clone(reads),
+        cats_object_store_gateway::ObjectWriteGatewayServerTrust::Roots(&bundle),
     )
     .with_context(|| {
         format!("bind object-write credential {credential_id} to the ObjectWrite Gateway")
@@ -379,6 +397,26 @@ mod tests {
     use super::*;
 
     const GATEWAY_URL: &str = "https://object-write-gateway.invalid:8443";
+
+    /// A fixed self-signed root standing in for the deployment's Route v2 root,
+    /// written where the production flag expects a file.
+    const TEST_ROOT_PEM: &str = "\
+-----BEGIN CERTIFICATE-----\n\
+MIIBYzCCARWgAwIBAgIULICwc/RLnF4bSmGzzr94Ux2eOTIwBQYDK2VwMCYxJDAi\n\
+BgNVBAMMG0NhdHMgb2JqZWN0LXdyaXRlIHRlc3Qgcm9vdDAgFw0yNjA4MTgxMTAx\n\
+NTZaGA8yMTI2MDcyNTExMDE1NlowJjEkMCIGA1UEAwwbQ2F0cyBvYmplY3Qtd3Jp\n\
+dGUgdGVzdCByb290MCowBQYDK2VwAyEA1NilIB8rScb67W7/kKsQ7WB/zvZaT1BG\n\
+f2zFVOq+kZOjUzBRMB0GA1UdDgQWBBQkQswCbzxcDl5pz/rGPiUdFSpISDAfBgNV\n\
+HSMEGDAWgBQkQswCbzxcDl5pz/rGPiUdFSpISDAPBgNVHRMBAf8EBTADAQH/MAUG\n\
+AytlcANBAD1/4EhOQ+aymAJVDBlUSZR9rfAwzGDkp3HohSGR+goWZV++BRdaMN/a\n\
+AOyU0kuaUva+bGyoQ8A95rEzSQMTmw4=\n\
+-----END CERTIFICATE-----\n";
+
+    fn test_ca_file() -> PathBuf {
+        let path = std::env::temp_dir().join("cats-blockd-object-write-test-root.pem");
+        std::fs::write(&path, TEST_ROOT_PEM).expect("write the test trust anchor");
+        path
+    }
     const VOLUME_ID: &str = "vol_owgateway";
     const ATTACHMENT_ID: &str = "att_owgateway";
     const ATTACHMENT_EPOCH: u64 = 9;
@@ -469,6 +507,7 @@ mod tests {
             gateway_publish_store(
                 Some(GATEWAY_URL),
                 Some(self.directory.as_path()),
+                Some(test_ca_file().as_path()),
                 &self.attachment,
                 &self.reads,
             )
@@ -698,13 +737,14 @@ mod tests {
         assert!(gateway_publish_store(
             Some(GATEWAY_URL),
             Some(fixture.directory.as_path()),
+            Some(test_ca_file().as_path()),
             &attachment,
             &fixture.reads,
         )
         .unwrap()
         .is_none());
         assert!(
-            gateway_publish_store(None, None, &attachment, &fixture.reads)
+            gateway_publish_store(None, None, None, &attachment, &fixture.reads)
                 .unwrap()
                 .is_none()
         );
@@ -716,6 +756,7 @@ mod tests {
         let message = refusal(gateway_publish_store(
             None,
             Some(fixture.directory.as_path()),
+            Some(test_ca_file().as_path()),
             &fixture.attachment,
             &fixture.reads,
         ));
@@ -731,6 +772,7 @@ mod tests {
         let message = refusal(gateway_publish_store(
             Some(GATEWAY_URL),
             None,
+            Some(test_ca_file().as_path()),
             &fixture.attachment,
             &fixture.reads,
         ));
@@ -738,6 +780,36 @@ mod tests {
             message.contains("--object-write-credential-directory is required"),
             "{message}"
         );
+    }
+
+    /// A credential with nowhere it can authenticate is not a publish path.
+    /// Without the deployment's own root this process would fall back to the
+    /// public trust store, so the refusal happens before the attachment is
+    /// adopted rather than at its first write.
+    #[test]
+    fn an_attachment_credential_without_the_gateway_trust_anchor_is_refused() {
+        let fixture = fixture();
+        let message = refusal(gateway_publish_store(
+            Some(GATEWAY_URL),
+            Some(fixture.directory.as_path()),
+            None,
+            &fixture.attachment,
+            &fixture.reads,
+        ));
+        assert!(
+            message.contains("--object-write-gateway-ca-file"),
+            "got {message}"
+        );
+
+        let missing = fixture.directory.join("absent-root.pem");
+        let message = refusal(gateway_publish_store(
+            Some(GATEWAY_URL),
+            Some(fixture.directory.as_path()),
+            Some(missing.as_path()),
+            &fixture.attachment,
+            &fixture.reads,
+        ));
+        assert!(message.contains("server CA bundle"), "got {message}");
     }
 
     /// The attachment names a public key the registered artifact does not
@@ -892,6 +964,7 @@ mod tests {
         let message = refusal(gateway_publish_store(
             Some(GATEWAY_URL),
             Some(parent.as_path()),
+            Some(test_ca_file().as_path()),
             &fixture.attachment,
             &fixture.reads,
         ));
@@ -907,6 +980,7 @@ mod tests {
         let message = refusal(gateway_publish_store(
             Some(GATEWAY_URL),
             Some(Path::new("object-write-credentials")),
+            Some(test_ca_file().as_path()),
             &fixture.attachment,
             &fixture.reads,
         ));
@@ -934,6 +1008,7 @@ mod tests {
         let message = refusal(gateway_publish_store(
             Some("http://object-write-gateway.invalid"),
             Some(fixture.directory.as_path()),
+            Some(test_ca_file().as_path()),
             &fixture.attachment,
             &fixture.reads,
         ));
