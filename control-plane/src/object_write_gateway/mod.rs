@@ -1132,10 +1132,24 @@ async fn recover_once(
         }
         for attempt in attempts {
             after = Some(attempt.descriptor.request_id.clone());
+            let key = attempt.descriptor.target.canonical_logical_key.clone();
+            let request_id = attempt.descriptor.request_id.as_str().to_owned();
             let deadline = Instant::now() + OBJECT_WRITE_GATEWAY_REQUEST_DEADLINE;
-            Box::pin(drive_accepted(service, attempt, deadline))
-                .await
-                .map_err(|error| anyhow::anyhow!(error))?;
+            // One recoverable attempt that cannot be driven must not deny the
+            // whole fleet its only write path. Escalating here turned a single
+            // unsatisfiable request into a crash loop that took both replicas
+            // down permanently: startup resumed it, failed, exited, repeated.
+            // The attempt keeps its durable record and its next drive; the
+            // writer retries the identical signed request either way.
+            if let Err(error) = Box::pin(drive_accepted(service, attempt, deadline)).await {
+                tracing::warn!(
+                    code = ?error.code,
+                    detail = %error,
+                    key = %key,
+                    request_id = %request_id,
+                    "recoverable object-write attempt did not settle; leaving it durable",
+                );
+            }
         }
     }
     Ok(())
