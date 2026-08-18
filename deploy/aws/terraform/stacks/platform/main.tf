@@ -603,6 +603,83 @@ resource "aws_iam_role_policy" "metal_worker_chunkstore" {
   policy = data.aws_iam_policy_document.metal_worker_chunkstore.json
 }
 
+# Shared base images are the one ChunkStore surface that is not per-volume
+# writer state: they are immutable, content-addressed, read by every Node, and
+# never carry a Cat's data. Fencing exists to stop a superseded attachment epoch
+# from publishing volume writes, so a principal restricted to `images/` cannot
+# reach that surface at all. Publication is an operator action performed once per
+# reviewed image, not a runtime path, so it gets its own assumable role rather
+# than widening the worker or the Gateway.
+data "aws_iam_policy_document" "base_image_publisher_assume" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole", "sts:TagSession"]
+
+    principals {
+      type        = "AWS"
+      identifiers = var.base_image_publisher_principal_arns
+    }
+  }
+}
+
+resource "aws_iam_role" "base_image_publisher" {
+  name               = "${var.name_prefix}-${var.environment}-base-image-publisher"
+  description        = "Publishes reviewed shared base images into the ChunkStore image namespace only"
+  assume_role_policy = data.aws_iam_policy_document.base_image_publisher_assume.json
+
+  tags = var.tags
+}
+
+data "aws_iam_policy_document" "base_image_publisher_chunkstore" {
+  statement {
+    sid     = "ListImageNamespace"
+    effect  = "Allow"
+    actions = ["s3:ListBucket", "s3:GetBucketLocation"]
+
+    resources = [aws_s3_bucket.chunkstore.arn]
+
+    condition {
+      test     = "StringLike"
+      variable = "s3:prefix"
+      values   = ["${var.chunkstore_prefix}/images/*"]
+    }
+  }
+
+  statement {
+    sid     = "PublishSharedBaseImages"
+    effect  = "Allow"
+    actions = ["s3:GetObject", "s3:PutObject"]
+
+    resources = [
+      "${aws_s3_bucket.chunkstore.arn}/${var.chunkstore_prefix}/images/*",
+    ]
+  }
+
+  # An explicit deny keeps this role off every per-volume surface even if a
+  # later broad attachment is added: volume data, maps and commit records are
+  # the fenced writer state this role must never be able to touch.
+  statement {
+    sid    = "DenyEverythingOutsideTheImageNamespace"
+    effect = "Deny"
+
+    actions = [
+      "s3:AbortMultipartUpload",
+      "s3:DeleteObject",
+      "s3:PutObject",
+    ]
+
+    not_resources = [
+      "${aws_s3_bucket.chunkstore.arn}/${var.chunkstore_prefix}/images/*",
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "base_image_publisher_chunkstore" {
+  name   = "base-image-publish"
+  role   = aws_iam_role.base_image_publisher.id
+  policy = data.aws_iam_policy_document.base_image_publisher_chunkstore.json
+}
+
 # The ObjectWrite Gateway is the sole principal permitted to publish new
 # ChunkStore objects. Its PostgreSQL authority issues and closes Host-scoped
 # accepted request sequences; this AWS role only performs the resulting exact

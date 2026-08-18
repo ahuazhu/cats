@@ -1338,6 +1338,7 @@ dependencies = [
  "cats-network",
  "cats-object-store-aws-s3",
  "cats-object-store-file",
+ "cats-object-store-gateway",
  "cats-storage",
  "cats-test-support",
  "futures-util",

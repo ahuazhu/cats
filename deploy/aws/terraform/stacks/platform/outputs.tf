@@ -202,3 +202,8 @@ output "metal_worker_private_ips" {
 output "instance_connect_endpoint_id" {
   value = one(aws_ec2_instance_connect_endpoint.workers[*].id)
 }
+
+output "base_image_publisher_role_arn" {
+  description = "Role an operator assumes to publish a reviewed shared base image into the ChunkStore image namespace."
+  value       = aws_iam_role.base_image_publisher.arn
+}

@@ -181,6 +181,7 @@ module "metal_worker_deployment" {
   chunkstore_prefix                        = var.chunkstore_prefix
   control_postgres_schema                  = var.control_postgres_schema
   route_v2_rotation_origin                 = var.route_v2_rotation_origin
+  object_write_gateway_url                 = var.object_write_gateway_url
   worker_base_environment                  = var.worker_base_environment
 
   # The worker reads the database password from its authority instead of a copy.

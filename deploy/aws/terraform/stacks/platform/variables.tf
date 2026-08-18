@@ -419,3 +419,9 @@ variable "metal_worker_root_volume_gib" {
   type        = number
   default     = 200
 }
+
+variable "base_image_publisher_principal_arns" {
+  description = "Operator principals allowed to assume the base-image publisher role. Empty leaves the role assumable by nobody."
+  type        = list(string)
+  default     = []
+}

@@ -80,6 +80,19 @@ variable "control_postgres_schema" {
   }
 }
 
+variable "object_write_gateway_url" {
+  description = "Exact HTTPS origin of the ObjectWrite Gateway. Production IAM denies blockd every direct ChunkStore mutation, so this is the only path a Node may publish through."
+  type        = string
+
+  validation {
+    condition = (
+      can(regex("^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[1-9][0-9]{0,4})?$", var.object_write_gateway_url)) &&
+      !strcontains(var.object_write_gateway_url, "..")
+    )
+    error_message = "object_write_gateway_url must be one canonical HTTPS DNS origin."
+  }
+}
+
 variable "route_v2_rotation_origin" {
   description = "Exact independent server-authenticated HTTPS origin for Route v2 ring delivery while Control readiness is closed."
   type        = string

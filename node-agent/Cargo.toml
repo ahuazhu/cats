@@ -49,6 +49,7 @@ tokio-rustls = { workspace = true }
 ring = { workspace = true }
 
 [dev-dependencies]
+cats-object-store-gateway = { workspace = true }
 cats-test-support = { workspace = true }
 cats-control-plane = { workspace = true, features = ["test-support"] }
 cats-network = { workspace = true, features = ["test-support"] }
