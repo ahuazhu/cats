@@ -18,6 +18,10 @@ cats-blockd = { workspace = true }
 cats-storage = { workspace = true }
 cats-object-store-file = { workspace = true }
 cats-object-store-aws-s3 = { workspace = true }
+# Production workers are IAM-denied direct ChunkStore mutation, so blockd needs
+# the Gateway write transport in its composition root; there is no other way to
+# publish an immutable object for a credential-bearing attachment.
+cats-object-store-gateway = { workspace = true }
 cats-metadata-store-postgres = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
@@ -37,6 +41,10 @@ cats-test-support = { workspace = true }
 cats-block-client = { workspace = true }
 postgres = { workspace = true }
 tempfile = { workspace = true }
+# Object-write credential fixtures mint one real Ed25519 key and encode the
+# exact canonical PKCS#8 v2 PEM and SPKI the Node publishes.
+ring = { workspace = true }
+base64 = { workspace = true }
 
 [lints]
 workspace = true
