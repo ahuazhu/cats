@@ -35,6 +35,18 @@ struct Args {
     /// public management Control origin.
     #[arg(long, env = "CATS_ROUTE_V2_ROTATION_ORIGIN")]
     route_v2_rotation_origin: Option<String>,
+    /// Bare HTTPS origin of the ObjectWrite Gateway. A production worker is
+    /// denied direct object-store writes by IAM, so this is the only path by
+    /// which a serving process can publish; it is independent from the public
+    /// management Control origin.
+    #[arg(long, env = "CATS_OBJECT_WRITE_GATEWAY_URL")]
+    object_write_gateway_url: Option<String>,
+    /// The Control-side ObjectWriteAuthority this Host's attachment credentials
+    /// are registered under. Control refuses a registration naming any other
+    /// authority and the Node cannot derive it, so it is configured with the
+    /// gateway origin and the two are required together.
+    #[arg(long, env = "CATS_OBJECT_WRITE_WRITER_AUTHORITY_ID")]
+    object_write_writer_authority_id: Option<String>,
     #[arg(
         long,
         env = "CATS_GATEWAY_CLIENT_CA_BUNDLE_FILE",
@@ -206,6 +218,9 @@ async fn main() -> anyhow::Result<()> {
         max_staged_bytes: args.blockd_max_staged_bytes,
         max_staged_packs: args.blockd_max_staged_packs,
         max_local_bytes: args.blockd_max_local_bytes,
+        // Filled in by the cutover composition, which owns the credential
+        // namespace path and the validated gateway origin.
+        object_write_gateway: None,
     };
     let object_factories: [&dyn BlobStoreFactory; 2] =
         [&FileBlobStoreFactory, &AwsS3BlobStoreFactory];
@@ -251,6 +266,24 @@ async fn main() -> anyhow::Result<()> {
             "--route-v2-machine-listen and --route-v2-rotation-origin must be configured together"
         ),
     };
+    let object_write_gateway = match (
+        args.object_write_gateway_url,
+        args.object_write_writer_authority_id,
+    ) {
+        (Some(gateway_url), Some(writer_authority_id)) => {
+            Some(cats_node_agent::runtime_cutover::ObjectWriteGatewayComposition {
+                gateway_url,
+                writer_authority_id: cats_api::runtime_reconciliation::Id::new(
+                    &writer_authority_id,
+                )
+                .context("--object-write-writer-authority-id is not a canonical Id")?,
+            })
+        }
+        (None, None) => None,
+        _ => anyhow::bail!(
+            "--object-write-gateway-url and --object-write-writer-authority-id must be configured together"
+        ),
+    };
     let deadline_policy = RuntimeSpineDeadlinePolicy::new(
         Duration::from_millis(args.runtime_inventory_scan_timeout_ms),
         Duration::from_millis(args.runtime_effect_step_timeout_ms),
@@ -273,6 +306,7 @@ async fn main() -> anyhow::Result<()> {
         blob_store,
         volume_lease_duration_ms: args.runtime_volume_lease_duration_ms,
         deadline_policy,
+        object_write_gateway,
     })
     .await?;
     match handle.route_v2_addr {

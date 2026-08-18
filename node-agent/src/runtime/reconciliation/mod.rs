@@ -154,7 +154,7 @@ pub(crate) use admission_registry::{
 pub use authorized_blockd::{
     authorized_blockd_command, authorized_blockd_status_is_bound, AuthorizedBlockFrontend,
     AuthorizedBlockdCheckpoint, AuthorizedBlockdLaunchConfig, AuthorizedBlockdStore,
-    PreparedAuthorizedBlockd,
+    ObjectWriteGatewayLaunch, PreparedAuthorizedBlockd,
 };
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use authorized_blockd::{AUTHORIZED_SERVING_FILE, IDENTITY_FILE};

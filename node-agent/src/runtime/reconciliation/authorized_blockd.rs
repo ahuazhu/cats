@@ -1502,6 +1502,23 @@ pub struct AuthorizedBlockdLaunchConfig {
     pub max_staged_bytes: u64,
     pub max_staged_packs: usize,
     pub max_local_bytes: u64,
+    /// How a serving process reaches the ObjectWrite Gateway. `None` composes
+    /// a Node with no gateway at all, whose attachments carry no object-write
+    /// credential; an attachment that does carry one refuses to launch without
+    /// this, because it would start a process that cannot publish.
+    pub object_write_gateway: Option<ObjectWriteGatewayLaunch>,
+}
+
+/// The two launch inputs a serving process needs to publish through the
+/// ObjectWrite Gateway. Neither is key material: the private half stays in the
+/// credential directory, readable only by the process that owns Node state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectWriteGatewayLaunch {
+    /// Bare HTTPS origin of the gateway this Node registered its credentials
+    /// against. It comes from Node configuration, never from a constant.
+    pub gateway_url: String,
+    /// Absolute credential namespace directory, not the Node state root.
+    pub credential_directory: PathBuf,
 }
 
 /// Exactly one Guest block frontend for the first Running slice.
@@ -1697,6 +1714,25 @@ fn build_authorized_blockd_command(
     for option in config.object_store.config.to_cli() {
         command.arg("--object-store-option").arg(option);
     }
+    // The gateway inputs travel with the credential, so a Node that never
+    // minted one launches exactly the command it launched before this field
+    // existed, and a credential that cannot be reached fails the launch rather
+    // than starting a process that cannot publish.
+    if attachment.object_write_credential.is_some() {
+        let gateway = config.object_write_gateway.as_ref().context(
+            "authorized attachment carries an object-write credential but this Node has no ObjectWrite Gateway launch configuration",
+        )?;
+        anyhow::ensure!(
+            gateway.credential_directory.is_absolute(),
+            "object-write credential directory must be absolute"
+        );
+        command
+            .arg("--object-write-gateway-url")
+            .arg(&gateway.gateway_url)
+            .arg("--object-write-credential-directory")
+            .arg(&gateway.credential_directory);
+    }
+
     // Crash injection belongs only to explicit blockd tests. A production
     // Node never forwards an ambient value across this signed seam.
     command.env_remove("CATS_CRASH_POINT");
@@ -2638,7 +2674,9 @@ fn unlink_at(directory: &File, name: &CStr) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
+
+    use cats_api::object_write_gateway::ObjectWriteCredentialReference;
     use std::os::unix::fs::{symlink, MetadataExt as _, PermissionsExt as _};
 
     use cats_api::runtime_reconciliation::{
@@ -2896,6 +2934,7 @@ mod tests {
             max_staged_bytes: 101,
             max_staged_packs: 102,
             max_local_bytes: 103,
+            object_write_gateway: None,
         }
     }
 
@@ -3466,5 +3505,101 @@ mod tests {
             },
         );
         assert!(result.is_err());
+    }
+
+    /// The gateway inputs travel with the credential: a Node that minted none
+    /// launches the command it launched before this field existed, and a
+    /// credentialed attachment always names the namespace blockd validates.
+    #[test]
+    fn object_write_gateway_flags_follow_the_attachment_credential() {
+        let temp = tempfile::tempdir().unwrap();
+        let store =
+            AuthorizedBlockdStore::new(StateDirectory::unanchored(temp.path().to_path_buf()));
+        let (desired, volume, attachment) = fixture();
+        let credential_directory = PathBuf::from("/var/lib/cats/node/n1")
+            .join(cats_api::object_write_gateway::OBJECT_WRITE_CREDENTIAL_DIRECTORY_BASENAME);
+        let mut config = launch_config();
+        config.object_write_gateway = Some(ObjectWriteGatewayLaunch {
+            gateway_url: "https://gateway.invalid".to_owned(),
+            credential_directory: credential_directory.clone(),
+        });
+
+        // Calibrating negative: the same configured Node, an attachment that
+        // carries no credential, and the flags must not appear.
+        let uncredentialed = store.prepare(&desired, &volume, &attachment).unwrap();
+        let device_ownership_token = random(3);
+        let (control, frontend) = managed_serving_sockets(&device_ownership_token);
+        let build = |config: &AuthorizedBlockdLaunchConfig, prepared: &PreparedAuthorizedBlockd| {
+            authorized_blockd_command(
+                config,
+                prepared,
+                &id("cats-cat-1-root.scope"),
+                &random(2),
+                &device_ownership_token,
+                &control,
+                &AuthorizedBlockFrontend::VhostUser {
+                    socket: frontend.clone(),
+                    queues: 2,
+                    queue_size: 256,
+                },
+            )
+        };
+        let arguments = argv(&build(&config, &uncredentialed).unwrap());
+        for absent in [
+            "--object-write-gateway-url",
+            "--object-write-credential-directory",
+        ] {
+            assert!(
+                !arguments.contains(&OsString::from(absent)),
+                "an attachment with no credential must not name a gateway"
+            );
+        }
+        drop(uncredentialed);
+
+        let credentialed_temp = tempfile::tempdir().unwrap();
+        let credentialed_store = AuthorizedBlockdStore::new(StateDirectory::unanchored(
+            credentialed_temp.path().to_path_buf(),
+        ));
+        let mut credentialed_attachment = attachment.clone();
+        credentialed_attachment.object_write_credential = Some(ObjectWriteCredentialReference {
+            credential_id: id("owcred1_aaaa"),
+            public_key_spki_sha256: Sha256Digest::from_bytes([9; 32]),
+        });
+        let credentialed = credentialed_store
+            .prepare(&desired, &volume, &credentialed_attachment)
+            .unwrap();
+        let arguments = argv(&build(&config, &credentialed).unwrap());
+        let gateway_index = arguments
+            .iter()
+            .position(|argument| argument == OsStr::new("--object-write-gateway-url"))
+            .expect("a credentialed attachment names its gateway");
+        assert_eq!(
+            arguments[gateway_index + 1],
+            OsString::from("https://gateway.invalid")
+        );
+        let directory_index = arguments
+            .iter()
+            .position(|argument| argument == OsStr::new("--object-write-credential-directory"))
+            .expect("a credentialed attachment names its credential directory");
+        let passed = PathBuf::from(&arguments[directory_index + 1]);
+        assert_eq!(passed, credential_directory);
+        assert!(passed.is_absolute());
+        assert_eq!(
+            passed.file_name().unwrap(),
+            cats_api::object_write_gateway::OBJECT_WRITE_CREDENTIAL_DIRECTORY_BASENAME,
+            "blockd refuses any path whose last component is not the namespace"
+        );
+
+        // Fail closed: a credential this Node cannot reach must not launch a
+        // process that would silently be unable to publish.
+        let mut ungated = launch_config();
+        ungated.object_write_gateway = None;
+        assert!(build(&ungated, &credentialed).is_err());
+        let mut relative = launch_config();
+        relative.object_write_gateway = Some(ObjectWriteGatewayLaunch {
+            gateway_url: "https://gateway.invalid".to_owned(),
+            credential_directory: PathBuf::from("object-write-credentials"),
+        });
+        assert!(build(&relative, &credentialed).is_err());
     }
 }

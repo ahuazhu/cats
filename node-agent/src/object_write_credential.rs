@@ -39,6 +39,7 @@ use std::os::unix::fs::{
     DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt,
 };
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -186,7 +187,7 @@ impl ObjectWriteCredentialRegistrationFailure {
 /// A trait keeps the credential state machine testable at its crash points
 /// without a Control Plane, while production uses the A19-signed HTTP client
 /// below. Both implementations are real; neither is a stub for the other.
-pub(crate) trait ObjectWriteCredentialRegistrar {
+pub(crate) trait ObjectWriteCredentialRegistrar: Send + Sync {
     fn register(
         &self,
         proof: &ObjectWriteCredentialRegistrationProof,
@@ -1464,6 +1465,323 @@ impl From<RetireStage> for CrashStage {
     }
 }
 
+/// Why one attachment epoch has no usable object-write credential.
+///
+/// The exact attachment is named so an operator can find the grant that failed.
+/// `reason` renders only this module's own error, which describes a path, a
+/// derived identifier or Control's decision; no private key byte, and no value
+/// derived from one, can reach it.
+#[derive(Debug, Error)]
+#[error(
+    "no usable object-write credential for volume {volume_id} attachment {attachment_id} epoch {attachment_epoch}: {reason}"
+)]
+pub struct ObjectWriteCredentialUnavailable {
+    volume_id: Id,
+    attachment_id: Id,
+    attachment_epoch: u64,
+    reason: String,
+}
+
+impl ObjectWriteCredentialUnavailable {
+    fn new(
+        volume_id: &Id,
+        attachment_id: &Id,
+        attachment_epoch: FenceEpoch,
+        source: &ObjectWriteCredentialError,
+    ) -> Self {
+        Self {
+            volume_id: volume_id.clone(),
+            attachment_id: attachment_id.clone(),
+            attachment_epoch: attachment_epoch.get(),
+            reason: source.to_string(),
+        }
+    }
+}
+
+/// The Node's authority to mint and destroy the attachment-scoped object-write
+/// credential one serving grant needs before it may publish.
+///
+/// The reconciler holds this instead of an [`ObjectWriteCredentialStore`] so a
+/// grant path never learns the state-directory layout, the A19 Node signer or
+/// the registration transport, and so the private half of a credential cannot
+/// escape this module: `establish` returns only the public reference a
+/// descriptor may quote.
+pub trait ObjectWriteCredentialPort: std::fmt::Debug + Send + Sync {
+    /// Converges one attachment epoch on exactly one registered credential and
+    /// returns its public binding. Idempotent: a repeat for the same epoch
+    /// re-registers the same key rather than minting a second credential.
+    fn establish(
+        &self,
+        session: &SessionBinding,
+        volume_id: &Id,
+        attachment_id: &Id,
+        attachment_epoch: FenceEpoch,
+        deadline: Instant,
+    ) -> Result<ObjectWriteCredentialReference, ObjectWriteCredentialUnavailable>;
+
+    /// Destroys the credential of one ended attachment epoch, private half
+    /// first. Retiring an epoch that has no credential succeeds.
+    fn retire(
+        &self,
+        volume_id: &Id,
+        attachment_id: &Id,
+        attachment_epoch: FenceEpoch,
+    ) -> Result<(), ObjectWriteCredentialUnavailable>;
+
+    /// Absolute directory the serving process loads the private half from. It
+    /// is the credential namespace itself, not the Node state root.
+    fn credential_directory(&self) -> PathBuf;
+
+    /// The origin the serving process publishes objects through.
+    fn gateway_origin(&self) -> &str;
+}
+
+/// A recording [`ObjectWriteCredentialPort`] for the reconciler's own tests.
+///
+/// It is deliberately not a stub of the production port: it performs no I/O and
+/// exists only so a reconciliation test can observe *which* attachment epoch
+/// was credentialed or retired, and inject the two failures the grant paths
+/// must fail closed on.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct RecordingObjectWriteCredentials {
+    establish_fails: bool,
+    retire_fails: bool,
+    established: std::sync::Mutex<Vec<(Id, Id, FenceEpoch)>>,
+    retired: std::sync::Mutex<Vec<(Id, Id, FenceEpoch)>>,
+}
+
+#[cfg(test)]
+impl RecordingObjectWriteCredentials {
+    pub(crate) fn failing_establish() -> Self {
+        Self {
+            establish_fails: true,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn failing_retire() -> Self {
+        Self {
+            retire_fails: true,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn established(&self) -> Vec<(Id, Id, FenceEpoch)> {
+        self.established.lock().unwrap().clone()
+    }
+
+    pub(crate) fn retired(&self) -> Vec<(Id, Id, FenceEpoch)> {
+        self.retired.lock().unwrap().clone()
+    }
+
+    /// The public reference this port hands back for one scope. It is derived
+    /// exactly the way the production port derives it, so a test asserting the
+    /// bound value is asserting the real binding rule.
+    pub(crate) fn expected_credential(
+        session: &SessionBinding,
+        volume_id: &Id,
+        attachment_id: &Id,
+        attachment_epoch: FenceEpoch,
+    ) -> ObjectWriteCredentialReference {
+        ObjectWriteCredentialReference {
+            credential_id: object_write_credential_id(
+                session,
+                volume_id,
+                attachment_id,
+                attachment_epoch,
+            ),
+            public_key_spki_sha256: cats_api::runtime_reconciliation::Sha256Digest::from_bytes(
+                [7; 32],
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ObjectWriteCredentialPort for RecordingObjectWriteCredentials {
+    fn establish(
+        &self,
+        session: &SessionBinding,
+        volume_id: &Id,
+        attachment_id: &Id,
+        attachment_epoch: FenceEpoch,
+        _deadline: Instant,
+    ) -> Result<ObjectWriteCredentialReference, ObjectWriteCredentialUnavailable> {
+        if self.establish_fails {
+            return Err(ObjectWriteCredentialUnavailable::new(
+                volume_id,
+                attachment_id,
+                attachment_epoch,
+                &ObjectWriteCredentialError::Rejected("injected".to_owned()),
+            ));
+        }
+        self.established.lock().unwrap().push((
+            volume_id.clone(),
+            attachment_id.clone(),
+            attachment_epoch,
+        ));
+        Ok(Self::expected_credential(
+            session,
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+        ))
+    }
+
+    fn retire(
+        &self,
+        volume_id: &Id,
+        attachment_id: &Id,
+        attachment_epoch: FenceEpoch,
+    ) -> Result<(), ObjectWriteCredentialUnavailable> {
+        if self.retire_fails {
+            return Err(ObjectWriteCredentialUnavailable::new(
+                volume_id,
+                attachment_id,
+                attachment_epoch,
+                &ObjectWriteCredentialError::Rejected("injected".to_owned()),
+            ));
+        }
+        self.retired.lock().unwrap().push((
+            volume_id.clone(),
+            attachment_id.clone(),
+            attachment_epoch,
+        ));
+        Ok(())
+    }
+
+    fn credential_directory(&self) -> PathBuf {
+        PathBuf::from("/var/lib/cats/node/test").join(OBJECT_WRITE_CREDENTIAL_DIRECTORY_BASENAME)
+    }
+
+    fn gateway_origin(&self) -> &str {
+        "https://gateway.invalid"
+    }
+}
+
+/// Production [`ObjectWriteCredentialPort`]: one Node state directory, the
+/// installed A19 Node signer, and the ObjectWrite Gateway registration route.
+pub struct NodeObjectWriteCredentials {
+    state_directory: PathBuf,
+    gateway_origin: String,
+    writer_authority_id: Id,
+    node_signer: Ed25519RequestSigner,
+    registrar: Arc<dyn ObjectWriteCredentialRegistrar>,
+}
+
+impl std::fmt::Debug for NodeObjectWriteCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NodeObjectWriteCredentials")
+            .field("state_directory", &self.state_directory)
+            .field("gateway_origin", &self.gateway_origin)
+            .field("writer_authority_id", &self.writer_authority_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NodeObjectWriteCredentials {
+    /// Composes the production path. `gateway_origin` must be a bare HTTPS
+    /// origin; it is validated here so a misconfigured Node fails at startup
+    /// rather than at its first grant.
+    pub fn for_production(
+        state_directory: PathBuf,
+        gateway_origin: &str,
+        writer_authority_id: Id,
+        node_signer: Ed25519RequestSigner,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            state_directory.is_absolute(),
+            "object-write credential state directory must be absolute"
+        );
+        let registrar = ObjectWriteCredentialHttpRegistrar::for_production(gateway_origin)?;
+        Ok(Self {
+            state_directory,
+            // Keep the exact configured origin: the serving process must be
+            // told the same one this Node registered against.
+            gateway_origin: gateway_origin.to_owned(),
+            writer_authority_id,
+            node_signer,
+            registrar: Arc::new(registrar),
+        })
+    }
+
+    /// Same composition against an in-test Control. The registrar is real; only
+    /// the peer it talks to is supplied by the caller.
+    #[cfg(test)]
+    pub(crate) fn with_registrar_for_test(
+        state_directory: PathBuf,
+        gateway_origin: &str,
+        writer_authority_id: Id,
+        node_signer: Ed25519RequestSigner,
+        registrar: Arc<dyn ObjectWriteCredentialRegistrar>,
+    ) -> Self {
+        Self {
+            state_directory,
+            gateway_origin: gateway_origin.to_owned(),
+            writer_authority_id,
+            node_signer,
+            registrar,
+        }
+    }
+}
+
+impl ObjectWriteCredentialPort for NodeObjectWriteCredentials {
+    fn establish(
+        &self,
+        session: &SessionBinding,
+        volume_id: &Id,
+        attachment_id: &Id,
+        attachment_epoch: FenceEpoch,
+        deadline: Instant,
+    ) -> Result<ObjectWriteCredentialReference, ObjectWriteCredentialUnavailable> {
+        let scope = ObjectWriteCredentialScope {
+            session: session.clone(),
+            writer_authority_id: self.writer_authority_id.clone(),
+            volume_id: volume_id.clone(),
+            attachment_id: attachment_id.clone(),
+            attachment_epoch,
+        };
+        let failed = |error: &ObjectWriteCredentialError| {
+            ObjectWriteCredentialUnavailable::new(volume_id, attachment_id, attachment_epoch, error)
+        };
+        let store = ObjectWriteCredentialStore::open(&self.state_directory)
+            .map_err(|error| failed(&error))?;
+        let loaded = store
+            .establish(&scope, &self.node_signer, self.registrar.as_ref(), deadline)
+            .map_err(|error| failed(&error))?;
+        // Only the public half leaves this call. `loaded` owns the signer and
+        // is dropped here.
+        Ok(loaded.credential().clone())
+    }
+
+    fn retire(
+        &self,
+        volume_id: &Id,
+        attachment_id: &Id,
+        attachment_epoch: FenceEpoch,
+    ) -> Result<(), ObjectWriteCredentialUnavailable> {
+        let failed = |error: &ObjectWriteCredentialError| {
+            ObjectWriteCredentialUnavailable::new(volume_id, attachment_id, attachment_epoch, error)
+        };
+        let store = ObjectWriteCredentialStore::open(&self.state_directory)
+            .map_err(|error| failed(&error))?;
+        store
+            .retire(volume_id, attachment_id, attachment_epoch)
+            .map_err(|error| failed(&error))
+    }
+
+    fn credential_directory(&self) -> PathBuf {
+        self.state_directory
+            .join(OBJECT_WRITE_CREDENTIAL_DIRECTORY_BASENAME)
+    }
+
+    fn gateway_origin(&self) -> &str {
+        &self.gateway_origin
+    }
+}
+
 #[cfg(test)]
 #[derive(Default)]
 struct TestFaults {
@@ -2533,5 +2851,206 @@ mod tests {
 
         let store = ObjectWriteCredentialStore::open(root.path()).unwrap();
         assert!(format!("{store:?}").find("PRIVATE KEY").is_none());
+    }
+
+    fn port_for_test(root: &Path, control: Arc<ReplayingControl>) -> NodeObjectWriteCredentials {
+        NodeObjectWriteCredentials::with_registrar_for_test(
+            root.to_path_buf(),
+            "https://gateway.invalid",
+            id("writer_a"),
+            node_signer(),
+            control,
+        )
+    }
+
+    fn private_key_files(root: &Path) -> Vec<String> {
+        directory_entries(root)
+            .into_iter()
+            .filter(|name| {
+                name.ends_with(cats_api::object_write_gateway::OBJECT_WRITE_PRIVATE_KEY_FILE_SUFFIX)
+            })
+            .collect()
+    }
+
+    /// Crash point 1: the Node registered a credential but died before the
+    /// grant that would have bound it. The next attempt for the same epoch
+    /// must adopt that same credential, not mint a second live one.
+    #[test]
+    fn re_establishing_after_a_crash_before_binding_adopts_the_same_credential() {
+        let root = TempDir::new().unwrap();
+        let control = Arc::new(ReplayingControl::default());
+        let port = port_for_test(root.path(), Arc::clone(&control));
+        let scope = scope();
+
+        let first = port
+            .establish(
+                &scope.session,
+                &scope.volume_id,
+                &scope.attachment_id,
+                scope.attachment_epoch,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+        // The crash is between `establish` and the caller binding `first`.
+        let second = port
+            .establish(
+                &scope.session,
+                &scope.volume_id,
+                &scope.attachment_id,
+                scope.attachment_epoch,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            private_key_files(root.path()).len(),
+            1,
+            "one attachment epoch may never hold two live credentials"
+        );
+        assert_eq!(
+            control.registered_public_keys().len(),
+            1,
+            "Control must hold exactly one credential for this epoch"
+        );
+    }
+
+    /// Crash point 2: the attachment was dropped but the credential outlived
+    /// it. Retiring converges, denies a signer and stays idempotent.
+    #[test]
+    fn retiring_a_dropped_attachment_denies_a_signer_and_repeats_cleanly() {
+        let root = TempDir::new().unwrap();
+        let control = Arc::new(ReplayingControl::default());
+        let port = port_for_test(root.path(), Arc::clone(&control));
+        let scope = scope();
+        port.establish(
+            &scope.session,
+            &scope.volume_id,
+            &scope.attachment_id,
+            scope.attachment_epoch,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        // Calibration: before retirement this exact load succeeds, so the
+        // failure asserted below cannot be an artefact of a broken lookup.
+        load(
+            root.path(),
+            &scope.volume_id,
+            &scope.attachment_id,
+            scope.attachment_epoch,
+        )
+        .expect("a live credential must load before it is retired");
+
+        port.retire(
+            &scope.volume_id,
+            &scope.attachment_id,
+            scope.attachment_epoch,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            load(
+                root.path(),
+                &scope.volume_id,
+                &scope.attachment_id,
+                scope.attachment_epoch,
+            ),
+            Err(ObjectWriteCredentialError::NotRegistered)
+        ));
+        assert!(private_key_files(root.path()).is_empty());
+        port.retire(
+            &scope.volume_id,
+            &scope.attachment_id,
+            scope.attachment_epoch,
+        )
+        .expect("retiring an already retired epoch succeeds");
+    }
+
+    /// blockd validates that the final path component is the credential
+    /// namespace basename and refuses to start otherwise.
+    #[test]
+    fn credential_directory_names_the_namespace_not_the_state_root() {
+        let root = TempDir::new().unwrap();
+        let port = port_for_test(root.path(), Arc::new(ReplayingControl::default()));
+        let directory = port.credential_directory();
+        assert_eq!(
+            directory.file_name().unwrap(),
+            OBJECT_WRITE_CREDENTIAL_DIRECTORY_BASENAME
+        );
+        assert_eq!(directory.parent().unwrap(), root.path());
+        assert!(directory.is_absolute());
+    }
+
+    /// The value the reconciler binds into an attachment, and the value it
+    /// would log on failure, must never carry key material.
+    #[test]
+    fn the_port_publishes_no_private_key_material() {
+        let root = TempDir::new().unwrap();
+        let port = port_for_test(root.path(), Arc::new(ReplayingControl::default()));
+        let scope = scope();
+        let credential = port
+            .establish(
+                &scope.session,
+                &scope.volume_id,
+                &scope.attachment_id,
+                scope.attachment_epoch,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+        let key_path = credential_directory(root.path()).join(
+            private_key_files(root.path())
+                .first()
+                .expect("one private key exists"),
+        );
+        let private_key = std::fs::read(&key_path).unwrap();
+        let probe = key_material_probe(&private_key);
+
+        let published = format!(
+            "{credential:?} {:?} {}",
+            port,
+            port.retire(
+                &scope.volume_id,
+                &scope.attachment_id,
+                FenceEpoch::new(1).unwrap()
+            )
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default()
+        );
+        assert!(!contains(published.as_bytes(), probe));
+        assert!(!contains(
+            serde_json::to_vec(&credential).unwrap().as_slice(),
+            probe
+        ));
+    }
+
+    /// An unusable Control decision is never downgraded into "no credential".
+    #[test]
+    fn a_refused_registration_yields_no_credential_at_all() {
+        let root = TempDir::new().unwrap();
+        let control = Arc::new(ReplayingControl::default());
+        control.fail_next(ObjectWriteCredentialRegistrationFailure::Closed { status: 403 });
+        let port = port_for_test(root.path(), Arc::clone(&control));
+        let scope = scope();
+        let error = port
+            .establish(
+                &scope.session,
+                &scope.volume_id,
+                &scope.attachment_id,
+                scope.attachment_epoch,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("volume_a"));
+        // Calibration: the same port with the same scope succeeds once Control
+        // stops refusing, so the error above is the refusal and not the setup.
+        port.establish(
+            &scope.session,
+            &scope.volume_id,
+            &scope.attachment_id,
+            scope.attachment_epoch,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .expect("the identical scope registers once Control accepts");
     }
 }

@@ -31,15 +31,17 @@ use cats_storage::BlobStore;
 
 use crate::agent_registration::AgentRegistrationConfig;
 use crate::ch::{BlockPath, ChConfig};
+use crate::object_write_credential::{NodeObjectWriteCredentials, ObjectWriteCredentialPort};
 use crate::route_v2_machine::{RouteV2MachineConfig, RouteV2MachineListener};
 use crate::runtime::reconciliation::{
     installed_clean_slate_scanner, installed_root_process_effect_ports, AdmissionCellRegistry,
     AuthorizedBlockdLaunchConfig, ControlBlockingSignedVolumeEvidenceClient,
     ControlSignedNormalAcquireClient, InstalledCleanSlateProbeConfig, KernelNbdClientCleanupOwner,
-    KernelNbdInventoryConfig, RootProvisionSystemdConfig, RunningAdmissionPreScan,
-    RuntimeVolumeTransitionHttpClient, ServingPrepareFrontend, SignedRunningAcquireEffect,
-    SignedRunningEffect, SignedRunningHostConfig, SignedRunningProcessPorts,
-    SignedRunningPublicationRecovery, SignedVolumeEvidencePort, VmmLaunchArtifactPaths,
+    KernelNbdInventoryConfig, ObjectWriteGatewayLaunch, RootProvisionSystemdConfig,
+    RunningAdmissionPreScan, RuntimeVolumeTransitionHttpClient, ServingPrepareFrontend,
+    SignedRunningAcquireEffect, SignedRunningEffect, SignedRunningHostConfig,
+    SignedRunningProcessPorts, SignedRunningPublicationRecovery, SignedVolumeEvidencePort,
+    VmmLaunchArtifactPaths,
 };
 use crate::runtime_spine::{
     RuntimeEffectResourceOwner, RuntimeInventoryScanner, RuntimeSpineDeadlinePolicy,
@@ -77,11 +79,28 @@ pub struct SignedRuntimeCutoverConfig {
     pub blob_store: Arc<dyn BlobStore>,
     pub volume_lease_duration_ms: u64,
     pub deadline_policy: RuntimeSpineDeadlinePolicy,
+    /// The ObjectWrite Gateway this Node mints attachment-scoped credentials
+    /// against. Production `noded` always supplies it, because a production
+    /// worker is denied direct object-store writes by IAM. `None` composes a
+    /// Node with no gateway: its grants carry no credential and every
+    /// qualified publish path fails closed on that.
+    pub object_write_gateway: Option<ObjectWriteGatewayComposition>,
     /// Test-only scheduler barrier after one accepted physical observation
     /// and before the next Desired/effect iteration. It does not replace or
     /// wrap the installed scanner/effect composition.
     #[cfg(test)]
     pub(crate) observation_barrier_for_test: Option<RuntimeObservationBarrierForTest>,
+}
+
+/// Node configuration for the ObjectWrite Gateway path.
+#[derive(Debug, Clone)]
+pub struct ObjectWriteGatewayComposition {
+    /// Bare HTTPS origin, from Node configuration rather than a constant.
+    pub gateway_url: String,
+    /// The Control-side ObjectWriteAuthority this Host's credentials belong
+    /// to. Control rejects a registration that names any other authority, so
+    /// the Node cannot derive or guess it.
+    pub writer_authority_id: cats_api::runtime_reconciliation::Id,
 }
 
 #[cfg(test)]
@@ -460,9 +479,37 @@ async fn spawn_signed_runtime_cutover_with_overrides(
         .context("validate signed Runtime startup deadlines")?;
     SignedRunningAcquireEffect::validate_lease_duration(config.volume_lease_duration_ms)
         .context("compose one-step signed Running acquire")?;
-    let root_provision_systemd =
-        RootProvisionSystemdConfig::new(config.authorized_blockd_launch.clone())
-            .context("compose credentialless root-provision systemd process owner")?;
+    // Composed before the effect lane starts so a misconfigured gateway origin
+    // fails at startup rather than at the first grant.
+    let object_write_credentials: Option<Arc<dyn ObjectWriteCredentialPort>> = config
+        .object_write_gateway
+        .as_ref()
+        .map(|gateway| {
+            NodeObjectWriteCredentials::for_production(
+                config
+                    .agent_registration
+                    .runtime_state_directory()
+                    .path()
+                    .to_path_buf(),
+                &gateway.gateway_url,
+                gateway.writer_authority_id.clone(),
+                config.agent_registration.runtime_request_signer(),
+            )
+            .map(|credentials| Arc::new(credentials) as Arc<dyn ObjectWriteCredentialPort>)
+        })
+        .transpose()
+        .context("compose the Node object-write credential authority")?;
+    let mut authorized_blockd_launch = config.authorized_blockd_launch.clone();
+    if let Some(credentials) = object_write_credentials.as_ref() {
+        authorized_blockd_launch.object_write_gateway = Some(ObjectWriteGatewayLaunch {
+            gateway_url: credentials.gateway_origin().to_owned(),
+            credential_directory: credentials.credential_directory(),
+        });
+    }
+    let effect_object_write_credentials = object_write_credentials.clone();
+    let recovery_object_write_credentials = object_write_credentials;
+    let root_provision_systemd = RootProvisionSystemdConfig::new(authorized_blockd_launch)
+        .context("compose credentialless root-provision systemd process owner")?;
     let effect_root_provision_systemd = root_provision_systemd.clone();
     #[cfg(target_os = "linux")]
     let kernel_nbd_inventory = match config.ch_config.block_path {
@@ -641,16 +688,23 @@ async fn spawn_signed_runtime_cutover_with_overrides(
         );
         #[cfg(feature = "proposed-node-residue-reclamation")]
         let residue_authority = volume_transition_transport.clone();
+        let acquire_client = match effect_object_write_credentials.clone() {
+            Some(credentials) => ControlSignedNormalAcquireClient::new(volume_transition_transport)
+                .with_object_write_credentials(credentials),
+            None => ControlSignedNormalAcquireClient::new(volume_transition_transport),
+        };
         let acquire = SignedRunningAcquireEffect::new(
-            Arc::new(ControlSignedNormalAcquireClient::new(
-                volume_transition_transport,
-            )),
+            Arc::new(acquire_client),
             Arc::clone(&effect_volume_authority),
             Arc::clone(&effect_blob_store),
             effect_lease_duration_ms,
         )
         .context("compose one-step signed Running acquire")?
         .with_volume_evidence(Arc::clone(&volume_evidence));
+        let acquire = match effect_object_write_credentials.clone() {
+            Some(credentials) => acquire.with_object_write_credentials(credentials),
+            None => acquire,
+        };
         macro_rules! compose_platform_effect {
             ($process_ports:expr) => {{
                 let process_ports = $process_ports;
@@ -744,6 +798,10 @@ async fn spawn_signed_runtime_cutover_with_overrides(
             }
         }
         .with_volume_evidence(volume_evidence);
+        let recovery = match recovery_object_write_credentials {
+            Some(credentials) => recovery.with_object_write_credentials(credentials),
+            None => recovery,
+        };
         let runner = RuntimeSpineRunner::new_with_recovery_desired_effects_and_resource_owner(
             effect_state_directory,
             session,
@@ -1396,6 +1454,7 @@ mod tests {
             max_staged_bytes: cats_api::blockd::DEFAULT_MAX_STAGED_BYTES,
             max_staged_packs: cats_api::blockd::DEFAULT_MAX_STAGED_PACKS,
             max_local_bytes: cats_api::blockd::DEFAULT_MAX_LOCAL_BYTES,
+            object_write_gateway: None,
         }
     }
 
@@ -2085,6 +2144,7 @@ mod tests {
             Arc::new(TestUnavailableVolumeDataAuthority);
         let blob_store: Arc<dyn BlobStore> = blob;
         SignedRuntimeCutoverConfig {
+            object_write_gateway: None,
             listen: "127.0.0.1:0".into(),
             route_v2_machine: None,
             control_plane_url: origin,
@@ -2489,6 +2549,7 @@ mod tests {
         let scanner = isolated_empty_scanner(state_root.path(), &state_path);
         let mut handle = spawn_signed_runtime_cutover_with_scanner(
             SignedRuntimeCutoverConfig {
+                object_write_gateway: None,
                 listen: "127.0.0.1:0".into(),
                 route_v2_machine: None,
                 control_plane_url: origin.clone(),
@@ -2578,6 +2639,7 @@ mod tests {
         let scanner = isolated_empty_scanner(state_root.path(), &state_path);
         let mut handle = spawn_signed_runtime_cutover_with_overrides(
             SignedRuntimeCutoverConfig {
+                object_write_gateway: None,
                 listen: "127.0.0.1:0".into(),
                 route_v2_machine: None,
                 control_plane_url: origin,
@@ -2664,6 +2726,7 @@ mod tests {
             .unwrap();
         });
         let result = spawn_signed_runtime_cutover(SignedRuntimeCutoverConfig {
+            object_write_gateway: None,
             listen: "not-a-socket-address".into(),
             route_v2_machine: None,
             control_plane_url: format!("http://{control_address}"),
@@ -2715,6 +2778,7 @@ mod tests {
             .unwrap();
         });
         let result = spawn_signed_runtime_cutover(SignedRuntimeCutoverConfig {
+            object_write_gateway: None,
             listen: "not-a-socket-address".into(),
             route_v2_machine: None,
             control_plane_url: format!("http://{control_address}"),

@@ -34,6 +34,7 @@ use cats_storage::authority::{
 };
 use cats_storage::{read_image_manifest_until, BlobStore, ImageManifestReadError};
 
+use crate::object_write_credential::{ObjectWriteCredentialPort, ObjectWriteCredentialUnavailable};
 use crate::runtime_spine::{
     RuntimeDesiredEffect, RuntimeDesiredEffectContext, RuntimeDesiredEffectOutcome,
     RuntimeDesiredEffectStopReason, RuntimePreScanRecovery, RuntimePreScanRecoveryContext,
@@ -310,6 +311,11 @@ pub(crate) struct SignedRunningAcquireEffect {
     volume_evidence: Option<Arc<dyn SignedVolumeEvidencePort>>,
     authority: Arc<dyn VolumeDataAuthority>,
     blob: Arc<dyn BlobStore>,
+    /// Mints the credential every adopted grant must carry and destroys it
+    /// again when the epoch ends. `None` composes a Node with no ObjectWrite
+    /// Gateway; its grants carry no credential and blockd fails closed on the
+    /// qualified publish path.
+    credentials: Option<Arc<dyn ObjectWriteCredentialPort>>,
     lease_duration_ms: u64,
     #[cfg(test)]
     after_prepare: Option<AfterPrepareHook>,
@@ -321,6 +327,11 @@ pub(crate) struct SignedRunningAcquireEffect {
 pub(crate) struct SignedRunningPublicationRecovery {
     authority: Arc<dyn VolumeDataAuthority>,
     volume_evidence: Option<Arc<dyn SignedVolumeEvidencePort>>,
+    /// Restart-time recovery re-establishes the credential of a grant that was
+    /// interrupted, and retires the credential of an epoch whose release was
+    /// interrupted. Both are idempotent, which is what makes a crash between a
+    /// physical effect and its credential barrier converge.
+    credentials: Option<Arc<dyn ObjectWriteCredentialPort>>,
     #[cfg(target_os = "linux")]
     stale_boot_vmm: Option<InstalledStaleBootVmmRecoveryPorts>,
 }
@@ -331,6 +342,7 @@ impl SignedRunningPublicationRecovery {
         Self {
             authority,
             volume_evidence: None,
+            credentials: None,
             #[cfg(target_os = "linux")]
             stale_boot_vmm: None,
         }
@@ -344,6 +356,7 @@ impl SignedRunningPublicationRecovery {
         Self {
             authority,
             volume_evidence: None,
+            credentials: None,
             stale_boot_vmm: Some(stale_boot_vmm),
         }
     }
@@ -353,6 +366,15 @@ impl SignedRunningPublicationRecovery {
         evidence: Arc<dyn SignedVolumeEvidencePort>,
     ) -> Self {
         self.volume_evidence = Some(evidence);
+        self
+    }
+
+    /// Binds the Node's object-write credential authority.
+    pub(crate) fn with_object_write_credentials(
+        mut self,
+        credentials: Arc<dyn ObjectWriteCredentialPort>,
+    ) -> Self {
+        self.credentials = Some(credentials);
         self
     }
 
@@ -366,6 +388,7 @@ impl SignedRunningPublicationRecovery {
         Self {
             authority,
             volume_evidence: None,
+            credentials: None,
             #[cfg(target_os = "linux")]
             stale_boot_vmm: None,
         }
@@ -514,7 +537,13 @@ impl SignedRunningPublicationRecovery {
                     Err(_) => return Ok(RuntimePreScanRecoveryOutcome::NoChange),
                 };
                 context.check_active()?;
-                match recover_normal_acquire_from_authority(&request, volume, &record) {
+                match recover_normal_acquire_from_authority(
+                    &request,
+                    volume,
+                    &record,
+                    self.credentials.as_deref(),
+                    context.deadline(),
+                ) {
                     Ok(NormalAcquireAuthorityRecovery::Granted(attachment))
                         if normal_publication_closes_checkpoint_predecessor(
                             stored.checkpoint(),
@@ -574,9 +603,20 @@ impl SignedRunningPublicationRecovery {
                 else {
                     return Ok(RuntimePreScanRecoveryOutcome::NoChange);
                 };
-                let Some(attachment) = takeover_attachment_from_signed_evidence(
-                    desired, volume, prior, &evidence, &receipt, None,
+                let Ok(Some(attachment)) = takeover_attachment_from_signed_evidence(
+                    desired,
+                    volume,
+                    prior,
+                    &evidence,
+                    &receipt,
+                    None,
+                    self.credentials.as_deref(),
+                    &context.coordinates().session,
+                    context.deadline(),
                 ) else {
+                    // Either the evidence does not close this attachment, or
+                    // its credential could not be minted. Neither adopts a
+                    // publication here; the effect lane retries.
                     return Ok(RuntimePreScanRecoveryOutcome::NoChange);
                 };
                 context.check_active()?;
@@ -698,8 +738,13 @@ impl SignedRunningPublicationRecovery {
             .find(|volume| &volume.volume_id == volume_id)
         {
             let request = release_transition_request(desired, cleanup.clone());
-            let recovery =
-                recover_lifecycle_release_from_authority(&request, volume, &record.head, &record);
+            let recovery = recover_lifecycle_release_from_authority(
+                &request,
+                volume,
+                &record.head,
+                &record,
+                self.credentials.as_deref(),
+            );
             if !matches!(recovery, Ok(NormalReleaseAuthorityRecovery::Released(_))) {
                 return Ok(RuntimePreScanRecoveryOutcome::NoChange);
             }
@@ -978,6 +1023,7 @@ impl SignedRunningAcquireEffect {
             volume_evidence: None,
             authority,
             blob,
+            credentials: None,
             lease_duration_ms,
             #[cfg(test)]
             after_prepare: None,
@@ -990,6 +1036,21 @@ impl SignedRunningAcquireEffect {
     ) -> Self {
         self.volume_evidence = Some(evidence);
         self
+    }
+
+    /// Binds the Node's object-write credential authority.
+    pub(crate) fn with_object_write_credentials(
+        mut self,
+        credentials: Arc<dyn ObjectWriteCredentialPort>,
+    ) -> Self {
+        self.credentials = Some(credentials);
+        self
+    }
+
+    /// The same authority the lifecycle suffix must use to retire what this
+    /// acquire minted.
+    pub(crate) fn object_write_credentials(&self) -> Option<Arc<dyn ObjectWriteCredentialPort>> {
+        self.credentials.clone()
     }
 
     pub(crate) fn volume_transition_port(&self) -> Arc<dyn SignedNormalAcquirePort> {
@@ -1216,16 +1277,26 @@ impl SignedRunningAcquireEffect {
             Ok(record) => record,
             Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
         };
-        let Some(attachment) =
-            attachment_from_checkpoint_acquire(old_checkpoint, old_request, &record)
-        else {
-            return self.stop_unsupported_conflict(
-                desired,
-                accepted,
-                admission.runtime,
-                store,
-                predecessor,
-            );
+        let attachment = match attachment_from_checkpoint_acquire(
+            old_checkpoint,
+            old_request,
+            &record,
+            self.credentials.as_deref(),
+            &session_binding(accepted.session()),
+            context.deadline(),
+        ) {
+            Ok(Some(attachment)) => attachment,
+            // No credential is no adoption. The exact retry re-establishes it.
+            Err(_) => return Ok(RuntimeDesiredEffectOutcome::RetryExact),
+            Ok(None) => {
+                return self.stop_unsupported_conflict(
+                    desired,
+                    accepted,
+                    admission.runtime,
+                    store,
+                    predecessor,
+                )
+            }
         };
         if attachment_is_adoptable(desired, admission.volume, old_observed, &attachment)
             && record.head == blank_head()
@@ -1314,15 +1385,25 @@ impl SignedRunningAcquireEffect {
             Ok(record) => record,
             Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
         };
-        let Some(attachment) = attachment_from_current_desired(desired, admission.volume, &record)
-        else {
-            return self.stop_unsupported_conflict(
-                desired,
-                accepted,
-                admission.runtime,
-                store,
-                predecessor,
-            );
+        let attachment = match attachment_from_current_desired(
+            desired,
+            admission.volume,
+            &record,
+            self.credentials.as_deref(),
+            &session_binding(accepted.session()),
+            context.deadline(),
+        ) {
+            Ok(Some(attachment)) => attachment,
+            Err(_) => return Ok(RuntimeDesiredEffectOutcome::RetryExact),
+            Ok(None) => {
+                return self.stop_unsupported_conflict(
+                    desired,
+                    accepted,
+                    admission.runtime,
+                    store,
+                    predecessor,
+                )
+            }
         };
         if record.head != blank_head()
             || !observed_authority_matches_attachment(observed, &attachment)
@@ -1667,6 +1748,7 @@ impl SignedRunningAcquireEffect {
                 admission.volume,
                 &expected_head,
                 &record,
+                self.credentials.as_deref(),
             ) {
                 Ok(NormalReleaseAuthorityRecovery::Released(_)) => self.stop_unsupported_conflict(
                     desired,
@@ -1769,6 +1851,7 @@ impl SignedRunningAcquireEffect {
                     admission.volume,
                     &expected_head,
                     &record,
+                    self.credentials.as_deref(),
                 ) {
                     Ok(NormalReleaseAuthorityRecovery::Released(_)) => {
                         Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
@@ -1962,7 +2045,13 @@ impl SignedRunningAcquireEffect {
                     ) => return Ok(RuntimeDesiredEffectOutcome::RetryExact),
                 };
                 context.check_active()?;
-                match recover_normal_acquire_from_authority(&request, volume, &record) {
+                match recover_normal_acquire_from_authority(
+                    &request,
+                    volume,
+                    &record,
+                    self.credentials.as_deref(),
+                    context.deadline(),
+                ) {
                     Ok(NormalAcquireAuthorityRecovery::Granted(attachment)) => attachment,
                     Ok(NormalAcquireAuthorityRecovery::RetryExact) => {
                         return Ok(RuntimeDesiredEffectOutcome::RetryExact)
@@ -2166,7 +2255,13 @@ impl SignedRunningAcquireEffect {
                             }
                             Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
                         };
-                        match recover_normal_acquire_from_authority(&request, volume, &record) {
+                        match recover_normal_acquire_from_authority(
+                            &request,
+                            volume,
+                            &record,
+                            self.credentials.as_deref(),
+                            context.deadline(),
+                        ) {
                             Ok(NormalAcquireAuthorityRecovery::Granted(attachment)) => attachment,
                             Ok(NormalAcquireAuthorityRecovery::RetryExact) => {
                                 return Ok(RuntimeDesiredEffectOutcome::RetryExact)
@@ -2311,15 +2406,22 @@ impl SignedRunningAcquireEffect {
                     Err(_) => return Ok(RuntimeDesiredEffectOutcome::RetryExact),
                 }
                 Box::new(
-                    takeover_attachment_from_signed_evidence(
+                    match takeover_attachment_from_signed_evidence(
                         desired,
                         volume,
                         prior,
                         &evidence,
                         &receipt,
                         grant.as_ref(),
-                    )
-                    .context("signed takeover evidence did not close the initial attachment")?,
+                        self.credentials.as_deref(),
+                        &session_binding(accepted.session()),
+                        context.deadline(),
+                    ) {
+                        Ok(attachment) => attachment.context(
+                            "signed takeover evidence did not close the initial attachment",
+                        )?,
+                        Err(_) => return Ok(RuntimeDesiredEffectOutcome::RetryExact),
+                    },
                 )
             }
         };
@@ -3259,11 +3361,18 @@ fn record_matches_unowned_observation(record: &VolumeRecord, observed: &Observed
         && record.head == *head
 }
 
+/// `Ok(None)` means the durable authority does not support this attachment.
+/// `Err` means it does, but this Node could not mint the object-write
+/// credential the grant must publish through: no attachment is adopted, and
+/// the caller retries.
 fn attachment_from_checkpoint_acquire(
     checkpoint: &RuntimeCheckpoint,
     request: &VolumeAcquireRequest,
     record: &VolumeRecord,
-) -> Option<AuthorizedServingAttachment> {
+    credentials: Option<&dyn ObjectWriteCredentialPort>,
+    session: &SessionBinding,
+    deadline: Instant,
+) -> Result<Option<AuthorizedServingAttachment>, ObjectWriteCredentialUnavailable> {
     let VolumeAcquireRequest::Normal {
         volume_id,
         transition_id,
@@ -3274,7 +3383,7 @@ fn attachment_from_checkpoint_acquire(
         lease_duration_ms,
     } = request
     else {
-        return None;
+        return Ok(None);
     };
     if *desired_revision != checkpoint.desired_revision
         || *placement_epoch != checkpoint.placement_epoch
@@ -3282,14 +3391,14 @@ fn attachment_from_checkpoint_acquire(
         || record.volume_id != *volume_id
         || !matches!(record.admin_state, VolumeAdminState::Active)
     {
-        return None;
+        return Ok(None);
     }
     let Some(LastVolumeTransition::NormalAcquire {
         request: stored_request,
         result,
     }) = &record.last_transition
     else {
-        return None;
+        return Ok(None);
     };
     let expected_request = NormalAcquireRequest {
         volume_id: volume_id.clone(),
@@ -3308,17 +3417,35 @@ fn attachment_from_checkpoint_acquire(
         || record.lease_epoch != result.resulting_epoch
         || record.lease_expires_at != Some(result.lease_expires_at)
     {
-        return None;
+        return Ok(None);
     }
-    let observed = checkpoint
+    let Some(observed) = checkpoint
         .volumes
         .iter()
-        .find(|observed| observed.volume_id == *volume_id)?;
+        .find(|observed| observed.volume_id == *volume_id)
+    else {
+        return Ok(None);
+    };
     if observed.size_bytes != Some(record.size_bytes)
         || observed.durability != Some(record.durability)
     {
-        return None;
+        return Ok(None);
     }
+    // Adopting a durable grant makes this Node the writer for that exact
+    // epoch, so it must own the same credential a fresh grant would mint.
+    // Establishment is idempotent for this scope: it republishes the
+    // credential an interrupted acquire already registered rather than
+    // minting a second live one.
+    let object_write_credential = match credentials {
+        Some(credentials) => Some(credentials.establish(
+            session,
+            &(*volume_id).clone(),
+            &(*attachment_id).clone(),
+            result.resulting_epoch,
+            deadline,
+        )?),
+        None => None,
+    };
     let attachment = AuthorizedServingAttachment {
         identity: AttachmentLineageIdentity {
             volume_id: volume_id.clone(),
@@ -3330,9 +3457,7 @@ fn attachment_from_checkpoint_acquire(
             node_id: checkpoint.node_id.clone(),
             placement_epoch: checkpoint.placement_epoch,
         },
-        // Node-side object-write credential registration is not composed
-        // yet; qualified object-write publish paths fail closed on None.
-        object_write_credential: None,
+        object_write_credential,
         size_bytes: record.size_bytes,
         durability: record.durability,
         head: result.resulting_head.clone(),
@@ -3342,26 +3467,33 @@ fn attachment_from_checkpoint_acquire(
             result: result.clone(),
         },
     };
-    (validate_authorized_serving_attachment(&attachment).is_ok()
+    Ok((validate_authorized_serving_attachment(&attachment).is_ok()
         && validate_authorized_serving_record(record, &attachment, None).is_ok())
-    .then_some(attachment)
+    .then_some(attachment))
 }
 
+/// `Ok(None)` means the durable authority does not support this attachment.
+/// `Err` means it does, but this Node could not mint the object-write
+/// credential the grant must publish through: no attachment is adopted, and
+/// the caller retries.
 fn attachment_from_current_desired(
     desired: &DesiredRuntimeSpec,
     volume: &VolumeIntent,
     record: &VolumeRecord,
-) -> Option<AuthorizedServingAttachment> {
+    credentials: Option<&dyn ObjectWriteCredentialPort>,
+    session: &SessionBinding,
+    deadline: Instant,
+) -> Result<Option<AuthorizedServingAttachment>, ObjectWriteCredentialUnavailable> {
     let VolumeAcquire::Normal {
         transition_id,
         expected_unowned_epoch,
     } = &volume.acquire
     else {
-        return None;
+        return Ok(None);
     };
     let Some(LastVolumeTransition::NormalAcquire { request, result }) = &record.last_transition
     else {
-        return None;
+        return Ok(None);
     };
     if validate_volume_record(record).is_err()
         || record.volume_id != volume.volume_id
@@ -3381,8 +3513,23 @@ fn attachment_from_current_desired(
         || record.lease_epoch != result.resulting_epoch
         || record.lease_expires_at != Some(result.lease_expires_at)
     {
-        return None;
+        return Ok(None);
     }
+    // Adopting a durable grant makes this Node the writer for that exact
+    // epoch, so it must own the same credential a fresh grant would mint.
+    // Establishment is idempotent for this scope: it republishes the
+    // credential an interrupted acquire already registered rather than
+    // minting a second live one.
+    let object_write_credential = match credentials {
+        Some(credentials) => Some(credentials.establish(
+            session,
+            &volume.volume_id,
+            &volume.attachment_id,
+            result.resulting_epoch,
+            deadline,
+        )?),
+        None => None,
+    };
     let attachment = AuthorizedServingAttachment {
         identity: AttachmentLineageIdentity {
             volume_id: volume.volume_id.clone(),
@@ -3394,9 +3541,7 @@ fn attachment_from_current_desired(
             node_id: desired.placement.node_id.clone(),
             placement_epoch: desired.placement.placement_epoch,
         },
-        // Node-side object-write credential registration is not composed
-        // yet; qualified object-write publish paths fail closed on None.
-        object_write_credential: None,
+        object_write_credential,
         size_bytes: record.size_bytes,
         durability: record.durability,
         head: result.resulting_head.clone(),
@@ -3406,9 +3551,9 @@ fn attachment_from_current_desired(
             result: result.clone(),
         },
     };
-    (validate_authorized_serving_attachment(&attachment).is_ok()
+    Ok((validate_authorized_serving_attachment(&attachment).is_ok()
         && validate_authorized_serving_record(record, &attachment, None).is_ok())
-    .then_some(attachment)
+    .then_some(attachment))
 }
 
 fn attachment_is_adoptable(
@@ -3480,6 +3625,14 @@ fn record_matches_attachment_lineage(
         )
 }
 
+/// `Ok(None)` means the durable authority does not support this attachment.
+/// `Err` means it does, but this Node could not mint the object-write
+/// credential the grant must publish through: no attachment is adopted, and
+/// the caller retries.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one takeover attachment closes the signed evidence, the consumed receipt, the optional thin grant and its object-write credential scope"
+)]
 fn takeover_attachment_from_signed_evidence(
     desired: &DesiredRuntimeSpec,
     volume: &VolumeIntent,
@@ -3487,24 +3640,30 @@ fn takeover_attachment_from_signed_evidence(
     evidence: &RuntimeVolumeTransitionEvidenceSuccess,
     decision_receipt: &cats_api::runtime_reconciliation::TakeoverConsumedReceipt,
     grant: Option<&VolumeLeaseGrant>,
-) -> Option<AuthorizedServingAttachment> {
+    credentials: Option<&dyn ObjectWriteCredentialPort>,
+    session: &SessionBinding,
+    deadline: Instant,
+) -> Result<Option<AuthorizedServingAttachment>, ObjectWriteCredentialUnavailable> {
     let VolumeAcquire::Takeover { authorization_id } = &volume.acquire else {
-        return None;
+        return Ok(None);
     };
     let VolumeAuthorization::Takeover(authorization) = &evidence.authorization.authorization else {
-        return None;
+        return Ok(None);
     };
     let AuthorizationState::Consumed(stored_receipt) = &evidence.authorization.state else {
-        return None;
+        return Ok(None);
     };
     let AuthorizationConsumedReceipt::Takeover(stored_receipt) = stored_receipt.as_ref() else {
-        return None;
+        return Ok(None);
     };
-    let lease_expires_at = decision_receipt
+    let Some(lease_expires_at) = decision_receipt
         .consumed_at
         .get()
         .checked_add(authorization.lease_duration_ms)
-        .and_then(UnixMillis::new)?;
+        .and_then(UnixMillis::new)
+    else {
+        return Ok(None);
+    };
     if evidence.authorization_id != *authorization_id
         || authorization.authorization_id != *authorization_id
         || stored_receipt != decision_receipt
@@ -3516,7 +3675,7 @@ fn takeover_attachment_from_signed_evidence(
         || !takeover_predecessor_is_exact(prior, volume, authorization, decision_receipt)
         || !multi_acquire_head_matches_intent(volume, &decision_receipt.resulting_head)
     {
-        return None;
+        return Ok(None);
     }
     if grant.is_some_and(|grant| {
         grant.volume_id != volume.volume_id
@@ -3531,8 +3690,23 @@ fn takeover_attachment_from_signed_evidence(
                     authorization_id: authorization_id.clone(),
                 })
     }) {
-        return None;
+        return Ok(None);
     }
+    // Adopting a durable grant makes this Node the writer for that exact
+    // epoch, so it must own the same credential a fresh grant would mint.
+    // Establishment is idempotent for this scope: it republishes the
+    // credential an interrupted acquire already registered rather than
+    // minting a second live one.
+    let object_write_credential = match credentials {
+        Some(credentials) => Some(credentials.establish(
+            session,
+            &volume.volume_id,
+            &volume.attachment_id,
+            decision_receipt.resulting_epoch,
+            deadline,
+        )?),
+        None => None,
+    };
     let attachment = AuthorizedServingAttachment {
         identity: AttachmentLineageIdentity {
             volume_id: volume.volume_id.clone(),
@@ -3544,9 +3718,7 @@ fn takeover_attachment_from_signed_evidence(
             node_id: desired.placement.node_id.clone(),
             placement_epoch: desired.placement.placement_epoch,
         },
-        // Node-side object-write credential registration is not composed
-        // yet; qualified object-write publish paths fail closed on None.
-        object_write_credential: None,
+        object_write_credential,
         size_bytes: volume.size_bytes,
         durability: volume.durability,
         // This publication is the immutable R0 acquire artifact. A signed
@@ -3560,9 +3732,9 @@ fn takeover_attachment_from_signed_evidence(
             receipt: stored_receipt.clone(),
         },
     };
-    validate_authorized_serving_attachment(&attachment)
+    Ok(validate_authorized_serving_attachment(&attachment)
         .is_ok()
-        .then_some(attachment)
+        .then_some(attachment))
 }
 
 fn takeover_predecessor_is_exact(
@@ -4923,6 +5095,17 @@ fn path_matches(path: &HostPath, expected: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// Fixtures below compose no object-write credential authority, so this
+    /// session only has to be a well-formed binding.
+    fn test_session_binding() -> SessionBinding {
+        SessionBinding {
+            node_id: Id::new("cats-node-1").unwrap(),
+            node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
+            agent_instance_id: RandomId128::new("44444444444444444444444444444444").unwrap(),
+            agent_session_epoch: Epoch::new(3).unwrap(),
+        }
+    }
     use std::collections::{BTreeMap, VecDeque};
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     use std::process::Command;
@@ -5874,8 +6057,17 @@ mod tests {
             direct_successor_authorization: None,
         };
         let attachment = takeover_attachment_from_signed_evidence(
-            &desired, volume, &prior, &evidence, &receipt, None,
+            &desired,
+            volume,
+            &prior,
+            &evidence,
+            &receipt,
+            None,
+            None,
+            &test_session_binding(),
+            Instant::now(),
         )
+        .expect("no credential authority is composed in this fixture")
         .expect("exact consumed evidence must form the thick serving authority");
         assert_eq!(attachment.lease_expires_at, unix_ms(70_000));
 
@@ -5893,7 +6085,11 @@ mod tests {
             &wrong_revision,
             &receipt,
             None,
+            None,
+            &test_session_binding(),
+            Instant::now(),
         )
+        .expect("no credential authority is composed in this fixture")
         .is_none());
 
         let store = AuthorizedBlockdStore::new(StateDirectory::unanchored(root.path().into()));
@@ -12186,8 +12382,17 @@ mod tests {
             direct_successor_authorization: None,
         };
         let attachment = takeover_attachment_from_signed_evidence(
-            desired, volume, &prior, &evidence, &receipt, None,
+            desired,
+            volume,
+            &prior,
+            &evidence,
+            &receipt,
+            None,
+            None,
+            &test_session_binding(),
+            Instant::now(),
         )
+        .expect("no credential authority is composed in this fixture")
         .unwrap();
         (
             attachment,

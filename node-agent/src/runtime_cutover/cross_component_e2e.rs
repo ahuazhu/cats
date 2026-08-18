@@ -1453,6 +1453,7 @@ fn production_authorized_blockd_launch(
         max_staged_bytes: cats_api::blockd::DEFAULT_MAX_STAGED_BYTES,
         max_staged_packs: cats_api::blockd::DEFAULT_MAX_STAGED_PACKS,
         max_local_bytes: cats_api::blockd::DEFAULT_MAX_LOCAL_BYTES,
+        object_write_gateway: None,
     }
 }
 

@@ -4621,6 +4621,7 @@ while True:
             max_staged_bytes: 1,
             max_staged_packs: 1,
             max_local_bytes: 4_194_304,
+            object_write_gateway: None,
         }
     }
 

@@ -6,7 +6,7 @@ pub mod admission;
 pub mod agent_registration;
 pub mod ch;
 pub mod guest_client;
-pub(crate) mod object_write_credential;
+pub mod object_write_credential;
 pub(crate) mod proc;
 pub mod route_grant;
 pub mod route_grant_v2;
