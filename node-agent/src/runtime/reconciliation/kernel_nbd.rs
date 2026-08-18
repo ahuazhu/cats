@@ -2540,6 +2540,18 @@ impl KernelNbdAttachEffect {
             }
             _ => unreachable!("phase was classified before global admission"),
         };
+        // Every refresh below is a distinct physical disagreement, and the step
+        // that reports them carries no reason. A production Cat sat at
+        // prepare_device emitting 468 refreshes in three minutes with nothing
+        // to read; name each one at the point it fires.
+        let refresh = |reason: &'static str| {
+            tracing::warn!(
+                reason,
+                cat = %desired.cat_id,
+                "kernel-NBD attach asked for a fresh inventory",
+            );
+            Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+        };
         let admission = context.kernel_nbd_pool()?;
         anyhow::ensure!(
             admission.matches_observation(accepted.observation()),
@@ -2563,7 +2575,7 @@ impl KernelNbdAttachEffect {
             ..
         } = &runtime.checkpoint
         else {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return refresh("checkpoint evidence is not valid");
         };
         let checkpoint_directory = context.state_directory().path().join(CHECKPOINT_NAMESPACE);
         let store = FileCheckpointStore::open_preserving_checkpoint_temp(
@@ -2576,10 +2588,12 @@ impl KernelNbdAttachEffect {
             "kernel-NBD admission names another checkpoint path"
         );
         let Some(stored) = store.load().context("load kernel-NBD attach checkpoint")? else {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return refresh("checkpoint namespace holds no record for this Cat");
         };
         if stored.content_digest() != content_digest || stored.checkpoint().step != runtime.step {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return refresh(
+                "stored checkpoint digest or step differs from the admitted observation",
+            );
         }
         let prepared = prepared_device_inputs(stored.checkpoint())?;
         if prepared.is_empty()
@@ -2594,13 +2608,13 @@ impl KernelNbdAttachEffect {
             .filter(|device| matches!(device.frontend, PrepareDeviceFrontend::KernelNbd { .. }))
             .collect::<Vec<_>>();
         if admission.device_count(&desired.cat_id) != kernel_devices.len() {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return refresh("admitted device count differs from the prepared kernel device count");
         }
 
         let mut admitted = Vec::with_capacity(kernel_devices.len());
         for device in kernel_devices {
             let Some(state) = admission.device(&desired.cat_id, &device.volume_id) else {
-                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                return refresh("the admitted pool has no state for this prepared volume");
             };
             let (expectation, observed_device) = match state {
                 KernelNbdDeviceScanState::Exact(proof) => {
