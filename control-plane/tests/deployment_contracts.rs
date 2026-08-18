@@ -2131,7 +2131,7 @@ fn linux_quality_gate_process_group_term_preserves_create_receipt_before_exact_c
     let workspace_started = Instant::now();
     while !state.join("workspace-network-active").exists() {
         assert!(
-            workspace_started.elapsed() < Duration::from_secs(8),
+            workspace_started.elapsed() < cats_test_support::poll_bound(),
             "fake Docker never entered the foreground workspace run"
         );
         std::thread::sleep(Duration::from_millis(25));
@@ -2146,7 +2146,7 @@ fn linux_quality_gate_process_group_term_preserves_create_receipt_before_exact_c
         "could not TERM Linux quality-gate process group"
     );
 
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + cats_test_support::poll_bound();
     let mut removed_at = None;
     let status = loop {
         if removed_at.is_none() && state.join("late-workspace-removed").exists() {
@@ -2158,7 +2158,7 @@ fn linux_quality_gate_process_group_term_preserves_create_receipt_before_exact_c
         if Instant::now() >= deadline {
             child.kill().expect("kill timed-out Linux quality gate");
             child.wait().expect("reap timed-out Linux quality gate");
-            panic!("TERM cleanup exceeded its 15-second bound");
+            panic!("TERM cleanup exceeded the test poll bound");
         }
         std::thread::sleep(Duration::from_millis(50));
     };
@@ -2548,7 +2548,7 @@ fn linux_quality_gate_term_interrupts_start_after_create_receipt_and_cleans_exac
         .spawn()
         .expect("start top-level Linux quality gate");
 
-    let start_deadline = Instant::now() + Duration::from_secs(8);
+    let start_deadline = Instant::now() + cats_test_support::poll_bound();
     while !state.join("start-entered").exists() {
         if Instant::now() >= start_deadline {
             child.kill().expect("kill Linux gate missing start marker");
@@ -2570,10 +2570,10 @@ fn linux_quality_gate_term_interrupts_start_after_create_receipt_and_cleans_exac
         if let Some(status) = child.try_wait().expect("poll Linux quality gate") {
             break status;
         }
-        if signal_at.elapsed() >= Duration::from_secs(8) {
+        if signal_at.elapsed() >= cats_test_support::poll_bound() {
             child.kill().expect("kill timed-out Linux quality gate");
             child.wait().expect("reap timed-out Linux quality gate");
-            panic!("start cancellation and exact cleanup exceeded eight seconds");
+            panic!("start cancellation and exact cleanup exceeded the test poll bound");
         }
         std::thread::sleep(Duration::from_millis(50));
     };
@@ -2636,7 +2636,7 @@ fn linux_quality_gate_cleanup_has_one_hard_deadline_when_docker_cli_hangs() {
     let workspace_started = Instant::now();
     while !state.join("workspace-network-active").exists() {
         assert!(
-            workspace_started.elapsed() < Duration::from_secs(8),
+            workspace_started.elapsed() < cats_test_support::poll_bound(),
             "fake Docker never entered the foreground workspace run"
         );
         std::thread::sleep(Duration::from_millis(25));
@@ -2648,7 +2648,7 @@ fn linux_quality_gate_cleanup_has_one_hard_deadline_when_docker_cli_hangs() {
         .expect("signal top-level quality gate");
     assert!(signal.success(), "could not TERM top-level quality gate");
 
-    let deadline = signal_at + Duration::from_secs(9);
+    let deadline = signal_at + cats_test_support::poll_bound();
     let status = loop {
         if let Some(status) = child.try_wait().expect("poll Linux quality gate") {
             break status;
@@ -2656,7 +2656,7 @@ fn linux_quality_gate_cleanup_has_one_hard_deadline_when_docker_cli_hangs() {
         if Instant::now() >= deadline {
             child.kill().expect("kill timed-out Linux quality gate");
             child.wait().expect("reap timed-out Linux quality gate");
-            panic!("hung cleanup exceeded its nine-second test deadline");
+            panic!("hung cleanup exceeded the test poll bound");
         }
         std::thread::sleep(Duration::from_millis(50));
     };

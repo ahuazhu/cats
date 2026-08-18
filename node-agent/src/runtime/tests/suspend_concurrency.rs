@@ -163,8 +163,10 @@ fn different_cats_suspend_concurrently_but_one_cat_remains_serialized() {
         }));
     }
 
-    let first = arrived_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    let second = arrived_rx.recv_timeout(Duration::from_secs(2));
+    let first = arrived_rx
+        .recv_timeout(cats_test_support::poll_bound())
+        .unwrap();
+    let second = arrived_rx.recv_timeout(cats_test_support::poll_bound());
     for release in releases {
         release.send(()).unwrap();
     }
@@ -193,7 +195,7 @@ fn different_cats_suspend_concurrently_but_one_cat_remains_serialized() {
         first_runtime.execute(suspend_job(CAT_SAME, 2, "suspend_same_first"))
     });
     same_arrived_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(cats_test_support::poll_bound())
         .unwrap();
     let (completed_tx, completed_rx) = mpsc::channel();
     let second_runtime = Arc::clone(&runtime);
@@ -252,7 +254,9 @@ fn an_abandoned_suspend_result_does_not_leak_the_per_cat_lock_or_gate() {
         let result = worker_runtime.execute(suspend_job(CAT, 2, "suspend_abandoned"));
         let _ = result_tx.send(result);
     });
-    arrived_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    arrived_rx
+        .recv_timeout(cats_test_support::poll_bound())
+        .unwrap();
 
     // Model the dispatch deadline expiring: the blocking job keeps running,
     // but nobody remains to receive its eventual result.

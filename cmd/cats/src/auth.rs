@@ -743,7 +743,7 @@ mod tests {
     }
 
     fn wait_for_child_marker(path: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + cats_test_support::poll_bound();
         while !path.exists() {
             assert!(
                 Instant::now() < deadline,
@@ -755,7 +755,7 @@ mod tests {
     }
 
     fn wait_for_marker(path: &Path, child: &mut Child) {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + cats_test_support::poll_bound();
         loop {
             if path.exists() {
                 return;
@@ -893,7 +893,7 @@ mod tests {
 
     fn wait_for_child_without_network(child: &mut Child, listener: &TcpListener) -> ExitStatus {
         listener.set_nonblocking(true).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + cats_test_support::poll_bound();
         loop {
             match listener.accept() {
                 Ok((_stream, _)) => {

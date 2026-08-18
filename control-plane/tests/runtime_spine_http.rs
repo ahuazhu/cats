@@ -40,10 +40,13 @@ async fn pending_chunked_request(addr: std::net::SocketAddr, path: &str) -> TcpS
 
 async fn raw_status(mut stream: TcpStream) -> StatusCode {
     let mut response = Vec::new();
-    tokio::time::timeout(Duration::from_secs(12), stream.read_to_end(&mut response))
-        .await
-        .expect("signed ingress did not enforce its body deadline")
-        .unwrap();
+    tokio::time::timeout(
+        cats_test_support::poll_bound(),
+        stream.read_to_end(&mut response),
+    )
+    .await
+    .expect("signed ingress did not enforce its body deadline")
+    .unwrap();
     let line = std::str::from_utf8(&response)
         .unwrap()
         .lines()
@@ -578,7 +581,7 @@ async fn observation_renews_while_the_ordinary_store_connection_is_saturated() {
     });
     tokio::task::spawn_blocking(move || {
         entered_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(cats_test_support::poll_bound())
             .expect("ordinary Store closure must own its connection lane")
     })
     .await
@@ -604,8 +607,10 @@ async fn observation_renews_while_the_ordinary_store_connection_is_saturated() {
         residue: Vec::new(),
     };
     observation.inventory_digest = Some(inventory_digest(&observation).unwrap());
+    // A regression here parks the observation behind the held ordinary lane
+    // indefinitely, so the wide shared poll bound still discriminates.
     let response = tokio::time::timeout(
-        Duration::from_secs(3),
+        cats_test_support::poll_bound(),
         context
             .signed(
                 OBSERVATION_PATH,

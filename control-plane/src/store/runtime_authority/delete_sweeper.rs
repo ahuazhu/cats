@@ -1270,13 +1270,13 @@ mod tests {
                     .await
             })
         };
-        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        entered_rx
+            .recv_timeout(cats_test_support::poll_bound())
+            .unwrap();
         running.abort();
         release_tx.send(()).unwrap();
-        for _ in 0..100 {
-            if blob.delete_finished.load(Ordering::Acquire) {
-                break;
-            }
+        let finish_deadline = Instant::now() + cats_test_support::poll_bound();
+        while !blob.delete_finished.load(Ordering::Acquire) && Instant::now() < finish_deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(blob.delete_finished.load(Ordering::Acquire));

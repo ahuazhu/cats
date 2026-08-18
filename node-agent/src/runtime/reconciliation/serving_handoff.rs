@@ -4228,7 +4228,7 @@ mod tests {
         }
 
         fn await_listener_absent_preserving_path(&self, socket_path: &Path) -> anyhow::Result<()> {
-            let deadline = Instant::now() + Duration::from_secs(6);
+            let deadline = Instant::now() + cats_test_support::poll_bound();
             loop {
                 anyhow::ensure!(
                     socket_path.exists(),
@@ -4650,7 +4650,7 @@ mod tests {
             // kernel can briefly keep the dropped listener connectable, so
             // wait for refusal before treating a connect as a live listener.
             for socket in self.socket_paths() {
-                let deadline = Instant::now() + Duration::from_secs(6);
+                let deadline = Instant::now() + cats_test_support::poll_bound();
                 while UnixStream::connect(socket).is_ok() {
                     anyhow::ensure!(
                         Instant::now() < deadline,

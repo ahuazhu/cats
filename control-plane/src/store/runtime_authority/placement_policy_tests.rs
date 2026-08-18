@@ -704,7 +704,7 @@ fn provisioner_retirement_and_apply_share_locks_define_both_race_orders() {
     let committed = writer.join().unwrap();
     assert_applied(committed.clone(), RuntimeNodeAuthorityOutcome::Provisioned);
     result_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(cats_test_support::poll_bound())
         .unwrap()
         .unwrap();
     retirement.join().unwrap();
@@ -806,7 +806,9 @@ fn ambiguous_resolver_waits_for_apply_reservation_then_distinguishes_commit_and_
     release_apply_commit(&mut commit_barrier, COMMIT_BARRIER);
     let committed = writer.join().unwrap();
     assert_eq!(
-        result_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        result_rx
+            .recv_timeout(cats_test_support::poll_bound())
+            .unwrap(),
         Some(committed)
     );
     resolver_thread.join().unwrap();
@@ -854,7 +856,9 @@ fn ambiguous_resolver_waits_for_apply_reservation_then_distinguishes_commit_and_
     release.wait();
     writer.join().unwrap();
     assert_eq!(
-        result_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        result_rx
+            .recv_timeout(cats_test_support::poll_bound())
+            .unwrap(),
         None
     );
     resolver_thread.join().unwrap();

@@ -1126,8 +1126,11 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
     let operation_lock =
         RuntimeOperationsTableLockForTest::acquire(&context.control_store_dsn).await;
     for raw_operation in [operation_alias.as_str(), "%FF"] {
+        // A regression that reaches the locked Store read parks behind the
+        // ACCESS-EXCLUSIVE barrier indefinitely, so the wide shared poll
+        // bound still discriminates.
         let response = tokio::time::timeout(
-            Duration::from_secs(1),
+            cats_test_support::poll_bound(),
             context
                 .operation_request(&context.first, &workspace_id, raw_operation)
                 .send(),
@@ -1510,7 +1513,7 @@ async fn production_replicas_share_registration_observation_and_cat_create_autho
     cancelled_read.abort();
     assert!(cancelled_read.await.unwrap_err().is_cancelled());
     corrupt_lock.release();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(cats_test_support::poll_bound(), async {
         loop {
             let status = context
                 .http

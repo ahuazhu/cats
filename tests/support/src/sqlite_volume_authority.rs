@@ -95,7 +95,7 @@ impl SqliteTestVolumeAuthority {
     pub fn open(path: &Path, grant: SqliteTestVolumeGrant) -> Result<Self, String> {
         let connection = Connection::open(path).map_err(|error| error.to_string())?;
         connection
-            .busy_timeout(std::time::Duration::from_secs(10))
+            .busy_timeout(crate::wait::poll_bound())
             .map_err(|error| error.to_string())?;
         let head = load_head(&connection, &grant.volume_id)?;
         if head.lease_owner.as_ref() != Some(&grant.attachment_id)

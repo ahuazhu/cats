@@ -452,7 +452,7 @@ fn shared_route_authority_lock_orders_initial_signer_install() {
     ));
     snapshot.commit().unwrap();
     receive
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(cats_test_support::poll_bound())
         .unwrap()
         .unwrap();
     writer.join().unwrap();

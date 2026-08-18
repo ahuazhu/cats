@@ -469,7 +469,7 @@ fn writer_first_revocation_commits_before_a_new_route_v2_snapshot_authenticates(
     release_writer.wait();
     writer.join().unwrap().unwrap();
     let authenticated = authenticated_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(cats_test_support::poll_bound())
         .expect("reader finished after writer commit")
         .unwrap();
     reader.join().unwrap();

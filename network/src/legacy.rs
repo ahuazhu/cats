@@ -1718,7 +1718,7 @@ mod tests {
     }
 
     async fn wait_for_calls(state: &RouteServerState, expected: usize) {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(cats_test_support::poll_bound(), async {
             while state.calls() < expected {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
@@ -1728,7 +1728,7 @@ mod tests {
     }
 
     async fn wait_for_idle(gateway: &Gateway, hostname: &str) {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(cats_test_support::poll_bound(), async {
             loop {
                 let refreshing = gateway
                     .cache
@@ -2032,8 +2032,10 @@ mod tests {
             },
         );
 
+        // A regression that waits for the hanging background refresh parks
+        // indefinitely, so the wide shared poll bound still discriminates.
         let resolved = tokio::time::timeout(
-            Duration::from_millis(200),
+            cats_test_support::poll_bound(),
             gateway.resolve("dev.cats.run", true),
         )
         .await
@@ -2525,7 +2527,7 @@ mod tests {
                 .await;
 
         let resolved = tokio::time::timeout(
-            Duration::from_millis(250),
+            cats_test_support::poll_bound(),
             gateway.resolve("dev.cats.run", true),
         )
         .await
@@ -2849,7 +2851,7 @@ mod tests {
         leader.abort();
 
         let follower = tokio::time::timeout(
-            Duration::from_secs(1),
+            cats_test_support::poll_bound(),
             gateway.resolve("dev.cats.run", true),
         )
         .await

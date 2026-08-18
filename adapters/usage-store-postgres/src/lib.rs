@@ -3120,7 +3120,7 @@ mod tests {
 
         release.send(()).unwrap();
         processed_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(cats_test_support::poll_bound())
             .expect("worker did not discard the queued effect after poison");
         assert_eq!(effects.load(Ordering::SeqCst), 0);
         drop(store);
@@ -3175,7 +3175,7 @@ mod tests {
         assert!(store.dispatch(|_| Ok(())).await.is_err());
         release.send(()).unwrap();
         finished_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(cats_test_support::poll_bound())
             .expect("cancelled worker effect did not exit after release");
         drop(store);
         drop_test_schema(url, schema).await;

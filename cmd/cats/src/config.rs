@@ -692,7 +692,7 @@ fn fleet_admin_after_lock_test_barrier() -> Result<()> {
         .context("test fleet-administrator lock marker has no release path")?;
     fs::write(PathBuf::from(marker), b"locked")?;
     let release = PathBuf::from(release);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + cats_test_support::poll_bound();
     while !release.exists() {
         anyhow::ensure!(
             std::time::Instant::now() < deadline,

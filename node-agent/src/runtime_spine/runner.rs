@@ -5986,7 +5986,7 @@ mod tests {
             .is_ok());
         assert_eq!(scanner.calls.load(Ordering::SeqCst), 0);
 
-        tokio::time::timeout(Duration::from_secs(1), runner.shutdown())
+        tokio::time::timeout(cats_test_support::poll_bound(), runner.shutdown())
             .await
             .expect("shutdown must join the late effect")
             .unwrap();
@@ -6060,7 +6060,7 @@ mod tests {
         });
         tokio::task::spawn_blocking(move || {
             slow_started_rx
-                .recv_timeout(Duration::from_secs(1))
+                .recv_timeout(cats_test_support::poll_bound())
                 .expect("slow Cat never entered its worker")
         })
         .await
@@ -6118,10 +6118,10 @@ mod tests {
             RuntimeSpineRunStep::EffectApplied { cat_id } if cat_id == ready.cat_id
         ));
         slow_started_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(cats_test_support::poll_bound())
             .expect("slow Cat never entered its worker");
         ready_started_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(cats_test_support::poll_bound())
             .expect("ready sibling never ran independently");
 
         assert!(matches!(
@@ -6262,7 +6262,7 @@ mod tests {
         assert_eq!(dispatch_count.load(Ordering::SeqCst), 2);
         for _ in 0..2 {
             started_rx
-                .recv_timeout(Duration::from_secs(1))
+                .recv_timeout(cats_test_support::poll_bound())
                 .expect("bounded worker never started");
         }
         assert_eq!(effect.max_active.load(Ordering::SeqCst), 2);
@@ -6324,7 +6324,7 @@ mod tests {
         ));
         for _ in 0..MAX_CONCURRENT_CAT_EFFECT_WORKERS {
             started_rx
-                .recv_timeout(Duration::from_secs(1))
+                .recv_timeout(cats_test_support::poll_bound())
                 .expect("production-bounded worker never started");
         }
         assert_eq!(
@@ -6382,7 +6382,7 @@ mod tests {
             (runner, step)
         });
         first_entered_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(cats_test_support::poll_bound())
             .expect("first global effect never acquired the gate");
         second_allowed_tx.send(()).unwrap();
         first_release_tx.send(()).unwrap();
@@ -7769,7 +7769,7 @@ mod tests {
             RuntimeSpineRunStep::EffectDeadlineExceeded { cat_id } if cat_id == sibling.cat_id
         ));
         sibling_started_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(cats_test_support::poll_bound())
             .expect("identity-repair sibling never entered its worker");
         sibling_release_tx.send(()).unwrap();
 
@@ -7857,7 +7857,7 @@ mod tests {
         tokio::pin!(child_started);
         let mut effect_step =
             Box::pin(runner.run_once_until(Instant::now() + Duration::from_secs(30)));
-        let started = tokio::time::timeout(Duration::from_secs(3), async {
+        let started = tokio::time::timeout(cats_test_support::poll_bound(), async {
             tokio::select! {
                 result = &mut effect_step => {
                     panic!("effect returned before the hanging ip child-start barrier: {result:?}")
@@ -7894,7 +7894,7 @@ mod tests {
             .cat_effect_workers
             .as_ref()
             .is_some_and(CatEffectWorkers::has_active));
-        tokio::time::timeout(Duration::from_secs(3), runner.shutdown())
+        tokio::time::timeout(cats_test_support::poll_bound(), runner.shutdown())
             .await
             .expect("hanging ip prevented runner shutdown from joining")
             .unwrap();
@@ -8112,13 +8112,13 @@ mod tests {
         release_sender.send(()).unwrap();
         tokio::task::spawn_blocking(move || {
             exited_receiver
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(cats_test_support::poll_bound())
                 .expect("cancelled scanner did not exit")
         })
         .await
         .unwrap();
 
-        let successor = tokio::time::timeout(Duration::from_secs(2), async {
+        let successor = tokio::time::timeout(cats_test_support::poll_bound(), async {
             loop {
                 let scanner: Arc<dyn RuntimeInventoryScanner> = Arc::new(EmptyScanner {
                     calls: AtomicUsize::new(0),

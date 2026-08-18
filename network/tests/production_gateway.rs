@@ -893,7 +893,7 @@ async fn rejected_websocket_discards_buffered_bytes_before_the_guest_case() {
         .unwrap();
     let mut response = Vec::new();
     tokio::time::timeout(
-        Duration::from_millis(250),
+        cats_test_support::poll_bound(),
         client.read_to_end(&mut response),
     )
     .await
@@ -902,7 +902,7 @@ async fn rejected_websocket_discards_buffered_bytes_before_the_guest_case() {
 
     assert!(response.is_empty());
     assert!(
-        tokio::time::timeout(Duration::from_millis(250), captured_receiver)
+        tokio::time::timeout(cats_test_support::poll_bound(), captured_receiver)
             .await
             .expect("rejected WebSocket did not close the Node tunnel")
             .unwrap()
@@ -955,7 +955,7 @@ async fn malformed_websocket_101_never_commits_raw_mode_case() {
         .unwrap();
     let mut response = Vec::new();
     tokio::time::timeout(
-        Duration::from_millis(250),
+        cats_test_support::poll_bound(),
         client.read_to_end(&mut response),
     )
     .await
@@ -964,7 +964,7 @@ async fn malformed_websocket_101_never_commits_raw_mode_case() {
 
     assert!(response.is_empty());
     assert!(
-        tokio::time::timeout(Duration::from_millis(250), captured_receiver)
+        tokio::time::timeout(cats_test_support::poll_bound(), captured_receiver)
             .await
             .expect("malformed 101 did not close the Node tunnel")
             .unwrap()
@@ -1104,7 +1104,7 @@ async fn close_delimited_and_connection_close_responses_close_public_connection_
             .unwrap();
         let mut received = Vec::new();
         tokio::time::timeout(
-            Duration::from_millis(250),
+            cats_test_support::poll_bound(),
             client.read_to_end(&mut received),
         )
         .await
@@ -1165,7 +1165,7 @@ async fn public_disconnect_drops_silent_tunnel_and_releases_connection_slot_case
         tokio::task::yield_now().await;
     }
     drop(abandoned);
-    tokio::time::timeout(Duration::from_millis(250), first_dropped_receiver)
+    tokio::time::timeout(cats_test_support::poll_bound(), first_dropped_receiver)
         .await
         .expect("public disconnect did not drop the Node tunnel")
         .unwrap();
@@ -1175,10 +1175,13 @@ async fn public_disconnect_drops_silent_tunnel_and_releases_connection_slot_case
         .await
         .unwrap();
     let mut response = Vec::new();
-    tokio::time::timeout(Duration::from_millis(250), next.read_to_end(&mut response))
-        .await
-        .expect("released connection slot did not admit the next client")
-        .unwrap();
+    tokio::time::timeout(
+        cats_test_support::poll_bound(),
+        next.read_to_end(&mut response),
+    )
+    .await
+    .expect("released connection slot did not admit the next client")
+    .unwrap();
     assert_eq!(
         response,
         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
@@ -1259,7 +1262,7 @@ async fn public_disconnect_cancels_a_blocked_connector_before_tunnel_authority_c
         .unwrap();
     started_receiver.await.unwrap();
     drop(abandoned);
-    tokio::time::timeout(Duration::from_millis(250), dropped_receiver)
+    tokio::time::timeout(cats_test_support::poll_bound(), dropped_receiver)
         .await
         .expect("public disconnect did not cancel the connector future")
         .unwrap();
@@ -1302,7 +1305,7 @@ async fn public_pipeline_overflow_cancels_a_blocked_connector_and_releases_its_s
         .unwrap();
     started_receiver.await.unwrap();
     attacker.write_all(&[b'x'; 129]).await.unwrap();
-    tokio::time::timeout(Duration::from_millis(250), dropped_receiver)
+    tokio::time::timeout(cats_test_support::poll_bound(), dropped_receiver)
         .await
         .expect("bounded public overflow did not cancel the connector future")
         .unwrap();
@@ -1351,12 +1354,12 @@ async fn public_disconnect_cancels_each_blocked_tunnel_write_stage_case() {
         let mut request = REQUEST_HEAD.to_vec();
         request.extend_from_slice(b"data");
         abandoned.write_all(&request).await.unwrap();
-        tokio::time::timeout(Duration::from_millis(250), blocked_receiver)
+        tokio::time::timeout(cats_test_support::poll_bound(), blocked_receiver)
             .await
             .expect("Gateway did not reach the selected blocked tunnel stage")
             .unwrap();
         drop(abandoned);
-        tokio::time::timeout(Duration::from_millis(250), dropped_receiver)
+        tokio::time::timeout(cats_test_support::poll_bound(), dropped_receiver)
             .await
             .expect("public disconnect did not drop the blocked tunnel")
             .unwrap();
@@ -1412,14 +1415,14 @@ async fn run_blocked_public_egress_case(stage: PublicEgressStage, disconnect: bo
         .write_all(request)
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), started_receiver)
+    tokio::time::timeout(cats_test_support::poll_bound(), started_receiver)
         .await
         .unwrap_or_else(|_| panic!("{stage:?}: Gateway never began the selected public egress"))
         .unwrap();
     if disconnect {
         drop(abandoned.take());
     }
-    tokio::time::timeout(Duration::from_secs(1), dropped_receiver)
+    tokio::time::timeout(cats_test_support::poll_bound(), dropped_receiver)
         .await
         .unwrap_or_else(|_| {
             panic!(
@@ -1467,10 +1470,13 @@ async fn assert_health_gets_released_permit(address: std::net::SocketAddr) {
         .await
         .unwrap();
     let mut response = Vec::new();
-    tokio::time::timeout(Duration::from_millis(250), next.read_to_end(&mut response))
-        .await
-        .expect("released connection slot did not admit health probe")
-        .unwrap();
+    tokio::time::timeout(
+        cats_test_support::poll_bound(),
+        next.read_to_end(&mut response),
+    )
+    .await
+    .expect("released connection slot did not admit health probe")
+    .unwrap();
     assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
 }
 
@@ -1540,7 +1546,7 @@ async fn response_socket_matrix_keeps_no_body_and_ambiguous_frames_closed_case()
         let mut client = TcpStream::connect(address).await.unwrap();
         client.write_all(request_bytes).await.unwrap();
         let mut response = Vec::new();
-        tokio::time::timeout(Duration::from_millis(250), client.read_to_end(&mut response))
+        tokio::time::timeout(cats_test_support::poll_bound(), client.read_to_end(&mut response))
             .await
             .expect("response matrix connection did not close")
             .unwrap();
@@ -1644,7 +1650,11 @@ async fn invalid_public_egress_deadlines_are_rejected_at_startup_case() {
     }
 }
 
-const PRODUCTION_GATEWAY_CASE_DEADLINE: Duration = Duration::from_secs(20);
+/// One absolute per-case bound over every stage. Strictly wider than the
+/// shared per-stage poll bound so a hang fails at its precise stage first.
+fn production_gateway_case_deadline() -> Duration {
+    cats_test_support::poll_bound() + Duration::from_secs(10)
+}
 
 #[derive(Clone, Copy)]
 struct ProductionGatewayCaseContext {
@@ -1675,8 +1685,9 @@ async fn run_production_gateway_case(
     case: &'static str,
     future: impl std::future::Future<Output = ()>,
 ) {
+    let bound = production_gateway_case_deadline();
     let deadline = Instant::now()
-        .checked_add(PRODUCTION_GATEWAY_CASE_DEADLINE)
+        .checked_add(bound)
         .expect("fixed production Gateway test deadline fits");
     let context = ProductionGatewayCaseContext { case, deadline };
     tokio::time::timeout_at(deadline, PRODUCTION_GATEWAY_CASE.scope(context, future))
@@ -1684,7 +1695,7 @@ async fn run_production_gateway_case(
         .unwrap_or_else(|_| {
             panic!(
                 "production_gateway case={case} stage=total-e2e exceeded absolute {}s deadline",
-                PRODUCTION_GATEWAY_CASE_DEADLINE.as_secs()
+                bound.as_secs()
             )
         });
 }

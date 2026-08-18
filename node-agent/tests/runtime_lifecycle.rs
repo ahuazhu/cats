@@ -823,8 +823,10 @@ fn different_cats_stop_concurrently_but_one_cat_remains_serialized() {
             ))
         }));
     }
-    let first = arrived_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    let second = arrived_rx.recv_timeout(Duration::from_secs(2));
+    let first = arrived_rx
+        .recv_timeout(cats_test_support::poll_bound())
+        .unwrap();
+    let second = arrived_rx.recv_timeout(cats_test_support::poll_bound());
     for release in releases {
         release.send(()).unwrap();
     }
@@ -861,7 +863,9 @@ fn different_cats_stop_concurrently_but_one_cat_remains_serialized() {
             StopCatDisposition::Cold,
         ))
     });
-    arrived_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    arrived_rx
+        .recv_timeout(cats_test_support::poll_bound())
+        .unwrap();
     let (completed_tx, completed_rx) = mpsc::channel();
     let second_runtime = Arc::clone(&runtime);
     let second = std::thread::spawn(move || {

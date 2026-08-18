@@ -424,7 +424,7 @@ impl Server {
     }
 
     fn wait_exit(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + cats_test_support::poll_bound();
         while Instant::now() < deadline {
             if self.child.try_wait().unwrap().is_some() {
                 return;
@@ -503,7 +503,7 @@ fn wire_request(request: &ProvisionRootImageRequest) -> Vec<u8> {
 fn exchange(path: &std::path::Path, wire: &[u8]) -> Vec<u8> {
     let mut stream = UnixStream::connect(path).unwrap();
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(cats_test_support::poll_bound()))
         .unwrap();
     stream.write_all(wire).unwrap();
     let mut response = Vec::new();
@@ -663,7 +663,7 @@ fn receiver_responds_at_first_lf_without_waiting_for_half_close_or_running_tail(
     let _server = env.spawn(None);
     let mut stream = UnixStream::connect(env.control_socket()).unwrap();
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(cats_test_support::poll_bound()))
         .unwrap();
     stream.write_all(&wire_request(&env.request)).unwrap();
     // Keep the write half open: the receiver must not wait for EOF.

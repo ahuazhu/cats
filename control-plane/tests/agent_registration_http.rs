@@ -36,7 +36,7 @@ async fn pending_chunked_request(addr: std::net::SocketAddr) -> TcpStream {
 async fn raw_status(mut stream: TcpStream) -> StatusCode {
     let mut response = Vec::new();
     tokio::time::timeout(
-        std::time::Duration::from_secs(12),
+        cats_test_support::poll_bound(),
         stream.read_to_end(&mut response),
     )
     .await

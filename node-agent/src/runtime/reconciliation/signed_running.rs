@@ -9014,7 +9014,7 @@ mod tests {
                 .env("CATS_AUTHORIZED_BLOCKD_KILL_MARKER", &marker)
                 .spawn()
                 .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + cats_test_support::poll_bound();
             while !marker.exists() {
                 if let Some(status) = child.try_wait().unwrap() {
                     panic!("authorized publication child exited early at {point}: {status}");

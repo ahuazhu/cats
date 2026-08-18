@@ -1047,12 +1047,12 @@ mod tests {
                 )
             }
         });
-        tokio::time::timeout(Duration::from_secs(2), first_started_rx)
+        tokio::time::timeout(cats_test_support::poll_bound(), first_started_rx)
             .await
             .expect("ordinary delivery never reached its first slow ACK")
             .unwrap();
         shutdown.send(true).unwrap();
-        tokio::time::timeout(Duration::from_secs(2), usage_task)
+        tokio::time::timeout(cats_test_support::poll_bound(), usage_task)
             .await
             .expect("ordinary backlog delivery made shutdown unbounded")
             .unwrap()
@@ -1065,7 +1065,7 @@ mod tests {
         );
         ingestion.release_first.add_permits(1);
         tokio::time::timeout(
-            Duration::from_secs(2),
+            cats_test_support::poll_bound(),
             pipeline.deliver_pending_for_shutdown(),
         )
         .await

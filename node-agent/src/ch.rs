@@ -4377,7 +4377,9 @@ exit 0\n",
                 .unwrap();
             // Reproduce CH v53: keep the connection open after the complete
             // response. The client must still return immediately.
-            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            release_rx
+                .recv_timeout(cats_test_support::poll_bound())
+                .unwrap();
         });
 
         let (status, body) = ch_api(&sock, "GET", "/api/v1/vmm.ping", None).unwrap();
@@ -4452,7 +4454,9 @@ exit 0\n",
                 },
             )
         });
-        accepted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        accepted_rx
+            .recv_timeout(cats_test_support::poll_bound())
+            .unwrap();
         cancelled.store(true, Ordering::Release);
         let result = client.join().unwrap();
         assert!(result.is_err());

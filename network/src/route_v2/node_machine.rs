@@ -617,17 +617,17 @@ mod tests {
         )
         .unwrap();
         let client_task = tokio::spawn(async move { client.open_tunnel(&route).await });
-        tokio::time::timeout(Duration::from_secs(2), entered_receiver)
+        tokio::time::timeout(cats_test_support::poll_bound(), entered_receiver)
             .await
             .unwrap()
             .unwrap();
         client_task.abort();
         let _ = client_task.await;
-        tokio::time::timeout(Duration::from_secs(2), dropped_receiver)
+        tokio::time::timeout(cats_test_support::poll_bound(), dropped_receiver)
             .await
             .expect("server request must be cancelled when the caller drops open_tunnel")
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), server)
+        tokio::time::timeout(cats_test_support::poll_bound(), server)
             .await
             .unwrap()
             .unwrap();

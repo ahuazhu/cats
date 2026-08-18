@@ -648,7 +648,7 @@ fn singleton_roles_elect_independently_and_release_on_session_drop() {
     // Client destruction closes the session, but PostgreSQL may observe the
     // standby query before it processes that close. Poll the lock authority
     // instead of treating Rust Drop completion as synchronous server state.
-    let release_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let release_deadline = std::time::Instant::now() + cats_test_support::poll_bound();
     loop {
         if second_reconciler.try_acquire().unwrap() {
             break;
@@ -691,7 +691,7 @@ async fn singleton_task_cancellation_aborts_old_leader_before_failover() {
                 }
             }
         });
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(cats_test_support::poll_bound(), async {
         while starts.load(Ordering::SeqCst) < 1 {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -725,7 +725,7 @@ async fn singleton_task_cancellation_aborts_old_leader_before_failover() {
 
     first_task.abort();
     let _ = first_task.await;
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(cats_test_support::poll_bound(), async {
         while starts.load(Ordering::SeqCst) < 2 {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -2296,7 +2296,7 @@ fn cordon_linearizes_after_a_placement_that_already_observed_ready() {
                 .unwrap();
         });
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let deadline = std::time::Instant::now() + cats_test_support::poll_bound();
         loop {
             if let Ok(result) = placement_result_rx.try_recv() {
                 early_placement_result = Some(result);
@@ -2339,7 +2339,7 @@ fn cordon_linearizes_after_a_placement_that_already_observed_ready() {
         // This is a positive synchronization oracle, not a scheduling-delay
         // assertion: PostgreSQL must show the exact cordoner session queued on
         // an advisory lock before the older placement is allowed to commit.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let deadline = std::time::Instant::now() + cats_test_support::poll_bound();
         loop {
             if let Ok(result) = cordon_result_rx.try_recv() {
                 early_cordon_result = Some(result);

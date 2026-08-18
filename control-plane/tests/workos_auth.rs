@@ -5,7 +5,6 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -1210,7 +1209,7 @@ async fn cli_jwt_membership_5xx_fails_closed_and_recovers() {
 
     ctx.set_membership_fault(MembershipFault::Status500);
     let unavailable = tokio::time::timeout(
-        Duration::from_secs(5),
+        cats_test_support::poll_bound(),
         ctx.http
             .get(ctx.cats_url("default/default"))
             .bearer_auth(&token)
@@ -1262,7 +1261,7 @@ async fn web_session_membership_disconnect_fails_closed_and_recovers() {
 
     ctx.set_membership_fault(MembershipFault::Disconnect);
     let unavailable = tokio::time::timeout(
-        Duration::from_secs(5),
+        cats_test_support::poll_bound(),
         ctx.http
             .get(ctx.cats_url("default/default"))
             .header("Cookie", &user_cookie)

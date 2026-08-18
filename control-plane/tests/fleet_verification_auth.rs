@@ -126,7 +126,7 @@ impl FleetStoreBarrier {
                 .unwrap();
             ready_tx.send(()).unwrap();
 
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + cats_test_support::poll_bound();
             let blocked = loop {
                 if release_rx.try_recv().is_ok() {
                     break None;
@@ -187,10 +187,10 @@ impl FleetStoreBarrier {
                 std::thread::sleep(Duration::from_millis(5));
             };
             let _ = blocked_tx.send(blocked);
-            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+            let _ = release_rx.recv_timeout(cats_test_support::poll_bound());
             client.batch_execute("ROLLBACK").unwrap();
         });
-        tokio::time::timeout(Duration::from_secs(5), ready_rx)
+        tokio::time::timeout(cats_test_support::poll_bound(), ready_rx)
             .await
             .expect("fleet verification table lock was not acquired")
             .expect("fleet verification table-lock worker stopped");
@@ -202,11 +202,16 @@ impl FleetStoreBarrier {
     }
 
     async fn wait_until_query_blocked(&mut self) -> String {
-        tokio::time::timeout(Duration::from_secs(6), &mut self.blocked)
-            .await
-            .expect("fleet verification query did not reach the PostgreSQL lock barrier")
-            .expect("fleet verification table-lock worker stopped")
-            .expect("no exact fleet verification query reached a locked table")
+        // Strictly wider than the worker's own poll bound so the worker's
+        // diagnostic report arrives instead of this timeout.
+        tokio::time::timeout(
+            cats_test_support::poll_bound() + Duration::from_secs(10),
+            &mut self.blocked,
+        )
+        .await
+        .expect("fleet verification query did not reach the PostgreSQL lock barrier")
+        .expect("fleet verification table-lock worker stopped")
+        .expect("no exact fleet verification query reached a locked table")
     }
 
     async fn release(mut self) {
@@ -471,7 +476,7 @@ async fn fleet_auth_has_no_store_prefix_and_dropped_http_is_joined_on_shutdown()
         "shutdown reported settlement while fleet Store work remained claimed"
     );
     barrier.release().await;
-    tokio::time::timeout(Duration::from_secs(5), shutdown.as_mut())
+    tokio::time::timeout(cats_test_support::poll_bound(), shutdown.as_mut())
         .await
         .expect("fleet shutdown did not join the released Store query")
         .unwrap();

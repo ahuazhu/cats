@@ -900,7 +900,7 @@ mod tests {
     }
 
     async fn wait_for_no_active_requests(service: &crate::server::RuntimeVolumeTransitionService) {
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(cats_test_support::poll_bound(), async {
             while service.active_for_test() != 0 {
                 tokio::task::yield_now().await;
             }
@@ -930,7 +930,7 @@ mod tests {
                 .send(),
         );
         tokio::time::timeout(
-            Duration::from_secs(3),
+            cats_test_support::poll_bound(),
             service.wait_for_paused_node_resolution_for_test(),
         )
         .await
@@ -940,7 +940,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         service.release_paused_node_resolution_for_test();
         assert_connection_closed(
-            tokio::time::timeout(Duration::from_secs(3), request)
+            tokio::time::timeout(cats_test_support::poll_bound(), request)
                 .await
                 .expect("deadline-bound A22 resolver did not join")
                 .unwrap(),
@@ -970,7 +970,7 @@ mod tests {
                 .send(),
         );
         tokio::time::timeout(
-            Duration::from_secs(3),
+            cats_test_support::poll_bound(),
             service.wait_for_paused_node_resolution_for_test(),
         )
         .await
@@ -988,7 +988,7 @@ mod tests {
             "shutdown returned before the owned resolver joined"
         );
         service.release_paused_node_resolution_for_test();
-        tokio::time::timeout(Duration::from_secs(5), &mut shutdown)
+        tokio::time::timeout(cats_test_support::poll_bound(), &mut shutdown)
             .await
             .expect("shutdown did not join the released A22 resolver")
             .unwrap();
@@ -1038,7 +1038,7 @@ mod tests {
                 .send(),
         );
         tokio::time::timeout(
-            Duration::from_secs(3),
+            cats_test_support::poll_bound(),
             service.wait_for_paused_response_encoding_for_test(),
         )
         .await
@@ -1056,21 +1056,24 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1_100)).await;
         service.release_paused_response_encoding_for_test();
         assert_connection_closed(
-            tokio::time::timeout(Duration::from_secs(3), request)
+            tokio::time::timeout(cats_test_support::poll_bound(), request)
                 .await
                 .expect("deadline-bound A22 encoder did not join")
                 .unwrap(),
         )
         .await;
-        service.clear_deadline_override_for_test();
         wait_for_no_active_requests(&service).await;
         assert_eq!(admission.available_global_permits_for_test(), global_before);
 
+        // The replay only proves the committed outcome is retrievable; do not
+        // let it race the production route deadline on a saturated host.
+        service.set_deadline_override_for_test(cats_test_support::poll_bound());
         let replay = context
             .signed(&node, RUNTIME_VOLUME_TRANSITION_PATH, body)
             .send()
             .await
             .unwrap();
+        service.clear_deadline_override_for_test();
         assert_eq!(replay.status(), StatusCode::OK);
         decode_runtime_volume_transition_success(&replay.bytes().await.unwrap()).unwrap();
     }
@@ -1117,7 +1120,7 @@ mod tests {
                 .send(),
         );
         tokio::time::timeout(
-            Duration::from_secs(3),
+            cats_test_support::poll_bound(),
             context
                 .server
                 .state

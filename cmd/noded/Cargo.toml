@@ -52,6 +52,7 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 
 [dev-dependencies]
+cats-test-support = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

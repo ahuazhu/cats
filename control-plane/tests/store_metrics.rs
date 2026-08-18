@@ -136,7 +136,7 @@ async fn saturation_and_connection_lifetimes_report_explicit_deltas() {
     let load_stores = (0..=CONTROL_STORE_BLOCKING_WORKERS)
         .map(|_| Arc::new(Store::connect(&context.dsn, None).unwrap()))
         .collect::<Vec<_>>();
-    let before = tokio::time::timeout(Duration::from_secs(3), async {
+    let before = tokio::time::timeout(cats_test_support::poll_bound(), async {
         loop {
             let sample = sample(&context).await;
             if sample.active == 0 && sample.queue == 0 && sample.admission == 0 {
@@ -167,8 +167,11 @@ async fn saturation_and_connection_lifetimes_report_explicit_deltas() {
         blocked.spawn(async move { store.execute(|store| store.list_all_cats()).await });
     }
 
+    // A regression that routes authentication through the DB lane parks it
+    // behind the held lock indefinitely, so the wide shared poll bound still
+    // discriminates.
     let unauthorized = tokio::time::timeout(
-        Duration::from_secs(1),
+        cats_test_support::poll_bound(),
         context
             .http
             .get(context.metrics_url())
@@ -180,7 +183,7 @@ async fn saturation_and_connection_lifetimes_report_explicit_deltas() {
     .unwrap();
     assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-    let during = tokio::time::timeout(Duration::from_secs(2), async {
+    let during = tokio::time::timeout(cats_test_support::poll_bound(), async {
         loop {
             let current = sample(&context).await;
             if delta(current.active, before.active, "active")
@@ -213,7 +216,7 @@ async fn saturation_and_connection_lifetimes_report_explicit_deltas() {
     }
     database_lock.join().unwrap();
 
-    let after = tokio::time::timeout(Duration::from_secs(3), async {
+    let after = tokio::time::timeout(cats_test_support::poll_bound(), async {
         loop {
             let current = sample(&context).await;
             if current.active < during.active
@@ -249,11 +252,11 @@ async fn saturation_and_connection_lifetimes_report_explicit_deltas() {
             }
         },
     );
-    tokio::time::timeout(Duration::from_secs(5), role_started_rx)
+    tokio::time::timeout(cats_test_support::poll_bound(), role_started_rx)
         .await
         .expect("the extra singleton session must acquire")
         .unwrap();
-    let with_singleton = tokio::time::timeout(Duration::from_secs(3), async {
+    let with_singleton = tokio::time::timeout(cats_test_support::poll_bound(), async {
         loop {
             let current = sample(&context).await;
             if delta(
@@ -317,7 +320,7 @@ async fn saturation_and_connection_lifetimes_report_explicit_deltas() {
         OciDeploymentClaim::Claimed { lease, .. } => lease,
         _ => panic!("the fixture must create one OCI ownership session"),
     };
-    let with_oci = tokio::time::timeout(Duration::from_secs(3), async {
+    let with_oci = tokio::time::timeout(cats_test_support::poll_bound(), async {
         loop {
             let current = sample(&context).await;
             if delta(
@@ -337,7 +340,7 @@ async fn saturation_and_connection_lifetimes_report_explicit_deltas() {
     drop(lease);
     singleton.abort();
     let _ = singleton.await;
-    let released = tokio::time::timeout(Duration::from_secs(5), async {
+    let released = tokio::time::timeout(cats_test_support::poll_bound(), async {
         loop {
             let current = sample(&context).await;
             if delta(

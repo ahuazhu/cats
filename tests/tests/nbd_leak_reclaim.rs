@@ -86,7 +86,7 @@ fn pid_is_alive(pid: i32) -> bool {
 }
 
 fn wait_until<F: Fn() -> bool>(what: &str, condition: F) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + cats_test_support::poll_bound();
     while !condition() {
         if Instant::now() > deadline {
             bail!("timed out waiting for {what}");
@@ -126,7 +126,7 @@ impl Blockd {
             .stderr(Stdio::null())
             .spawn()
             .context("spawn cats-blockd")?;
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + cats_test_support::poll_bound();
         while !socket.exists() {
             if Instant::now() > deadline {
                 bail!("cats-blockd never bound {}", socket.display());

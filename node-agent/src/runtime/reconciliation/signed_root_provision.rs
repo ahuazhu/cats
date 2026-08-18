@@ -3947,10 +3947,10 @@ mod tests {
         let target = expected_provisioned_head.clone();
         let (events_tx, events_rx) = mpsc::channel();
         let server = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + cats_test_support::poll_bound();
             let mut status = accept_before(&listener, deadline);
             status
-                .set_read_timeout(Some(Duration::from_secs(1)))
+                .set_read_timeout(Some(cats_test_support::poll_bound()))
                 .unwrap();
             let mut status_line = Vec::new();
             BufReader::new(&mut status)
@@ -4010,12 +4010,16 @@ mod tests {
         );
 
         assert_eq!(
-            events_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            events_rx
+                .recv_timeout(cats_test_support::poll_bound())
+                .unwrap(),
             b"status\n",
             "positive calibration: the full status reinspection reached the serial listener"
         );
         assert_eq!(
-            events_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            events_rx
+                .recv_timeout(cats_test_support::poll_bound())
+                .unwrap(),
             expected_request_frame,
             "the provision request must reach the same one-at-a-time listener after status closes"
         );
@@ -4110,7 +4114,9 @@ mod tests {
                 "a post-send response mismatch remains authority-reread ambiguity"
             );
             assert_eq!(
-                request_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                request_rx
+                    .recv_timeout(cats_test_support::poll_bound())
+                    .unwrap(),
                 expected_request_frame,
                 "positive calibration: the exact provision request reached the real socket"
             );
@@ -4166,7 +4172,9 @@ mod tests {
                 .unwrap();
             authority.set_head(target);
             request_tx.send(request_frame).unwrap();
-            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            release_rx
+                .recv_timeout(cats_test_support::poll_bound())
+                .unwrap();
         });
 
         let process_id = std::process::id();
@@ -4200,7 +4208,9 @@ mod tests {
             std::thread::spawn(move || worker_effect.try_apply(worker_context.as_ref(), &desired));
 
         assert_eq!(
-            request_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            request_rx
+                .recv_timeout(cats_test_support::poll_bound())
+                .unwrap(),
             expected_request_frame,
             "positive calibration: the complete provision frame reached the real serial socket"
         );

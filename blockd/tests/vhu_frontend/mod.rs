@@ -32,6 +32,26 @@ use vm_memory::{
 };
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
 
+/// Private mirror of the canonical `cats_test_support::wait::poll_bound`.
+///
+/// This file is also compiled into the `cats-blockd` library behind the
+/// opt-in `test-vhost-user-frontend` feature, where dev-dependencies such as
+/// `cats-test-support` are not visible. Keep the contract in sync with
+/// `tests/support/src/wait.rs`: a pure polling upper bound is not a
+/// performance assertion, so it defaults absurdly wide and is overridden
+/// only through `CATS_TEST_POLL_BOUND_SECS` (parse failure panics).
+fn poll_bound() -> Duration {
+    const ENV: &str = "CATS_TEST_POLL_BOUND_SECS";
+    match std::env::var(ENV) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => Duration::from_secs(secs),
+            _ => panic!("{ENV} must be a positive whole number of seconds, got {raw:?}"),
+        },
+        Err(std::env::VarError::NotPresent) => Duration::from_secs(180),
+        Err(err) => panic!("{ENV} is not readable: {err}"),
+    }
+}
+
 pub(crate) const VIRTIO_BLK_T_IN: u32 = 0;
 pub(crate) const VIRTIO_BLK_T_OUT: u32 = 1;
 pub(crate) const VIRTIO_BLK_T_FLUSH: u32 = 4;
@@ -247,7 +267,7 @@ impl BlkFrontend {
                 in_flight: 0,
                 next_slot: 0,
                 event_idx,
-                timeout: Duration::from_secs(20),
+                timeout: poll_bound(),
                 spin_iterations: 0,
             }));
         }

@@ -408,7 +408,7 @@ fn cancelling_a_started_http_authority_request_rolls_back_before_commit() {
         store.runtime_desired_read_for_request(&authenticated, &request, &worker_context)
     });
 
-    let wait_deadline = Instant::now() + Duration::from_secs(3);
+    let wait_deadline = Instant::now() + cats_test_support::poll_bound();
     loop {
         let sleeping = observer
             .with(|client| {
@@ -3921,7 +3921,7 @@ async fn gateway_test_http_request(
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     stream.write_all(request).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(cats_test_support::poll_bound(), async {
         let mut response = Vec::new();
         loop {
             let mut chunk = [0_u8; 4096];
@@ -4457,7 +4457,7 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
             .await
             .unwrap();
         let mut raw = Vec::new();
-        tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut raw))
+        tokio::time::timeout(cats_test_support::poll_bound(), stream.read_to_end(&mut raw))
             .await
             .expect("unauthenticated resolve waited for the body")
             .unwrap();
@@ -4500,7 +4500,7 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
             .await
             .unwrap();
         let mut raw = Vec::new();
-        tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut raw))
+        tokio::time::timeout(cats_test_support::poll_bound(), stream.read_to_end(&mut raw))
             .await
             .expect("signerless resolve waited for the body")
             .unwrap();
@@ -4634,12 +4634,12 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
         let entered_wait = tokio::task::spawn_blocking(move || {
             entered.wait();
         });
-        tokio::time::timeout(Duration::from_secs(1), entered_wait)
+        tokio::time::timeout(cats_test_support::poll_bound(), entered_wait)
             .await
             .expect("Store closure did not start")
             .unwrap();
         assert_eq!(service.active_requests_for_test(), 1);
-        let response = tokio::time::timeout(Duration::from_secs(3), timed)
+        let response = tokio::time::timeout(cats_test_support::poll_bound(), timed)
             .await
             .expect("Route v2 handler did not enforce its deadline")
             .unwrap();
@@ -4653,7 +4653,7 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
         })
         .await
         .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(cats_test_support::poll_bound(), async {
             while service.active_requests_for_test() != 0 {
                 tokio::task::yield_now().await;
             }
@@ -4679,7 +4679,7 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
         let entered_wait = tokio::task::spawn_blocking(move || {
             entered.wait();
         });
-        tokio::time::timeout(Duration::from_secs(1), entered_wait)
+        tokio::time::timeout(cats_test_support::poll_bound(), entered_wait)
             .await
             .expect("cancelled Store closure did not start")
             .unwrap();
@@ -4696,7 +4696,7 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
         })
         .await
         .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), shutdown)
+        tokio::time::timeout(cats_test_support::poll_bound(), shutdown)
             .await
             .expect("shutdown did not join the cancelled Store closure")
             .unwrap()
@@ -4732,7 +4732,7 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
             ),
         );
         let signerless_response = tokio::time::timeout(
-            Duration::from_secs(1),
+            cats_test_support::poll_bound(),
             crate::api::route_resolve_v2::resolve(
                 Extension(Arc::clone(&production_signerless)),
                 signerless_request,
@@ -4933,7 +4933,7 @@ fn route_signer_snapshot_closes_hostname_runtime_and_ring_in_one_authority_read(
         // writer still owns its exclusive advisory lock. Releasing the writer
         // only after this point makes an old snapshot-before-lock
         // implementation deterministically issue from stale authority.
-        let lock_wait_deadline = Instant::now() + Duration::from_secs(1);
+        let lock_wait_deadline = Instant::now() + cats_test_support::poll_bound();
         loop {
             let waiting_on_shared_advisory: bool = lock_observer
                 .with(|client| {

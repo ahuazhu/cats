@@ -1207,13 +1207,15 @@ mod tests {
             close_done_tx.send(apply(&close_store, &close)).unwrap();
         });
         close_started_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(cats_test_support::poll_bound())
             .unwrap();
         assert!(close_done_rx
             .recv_timeout(Duration::from_millis(100))
             .is_err());
         product_transaction.commit().unwrap();
-        let closed = close_done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let closed = close_done_rx
+            .recv_timeout(cats_test_support::poll_bound())
+            .unwrap();
         close_thread.join().unwrap();
         assert!(matches!(
             closed.outcome,
@@ -1341,7 +1343,9 @@ mod tests {
         });
         assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
         product_transaction.commit().unwrap();
-        let ended = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let ended = done_rx
+            .recv_timeout(cats_test_support::poll_bound())
+            .unwrap();
         worker.join().unwrap();
         assert!(matches!(
             ended.outcome,

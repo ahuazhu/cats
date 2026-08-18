@@ -90,7 +90,7 @@ fn isolated_schema_bootstrap_waits_on_the_test_global_ddl_lock_only_for_exact_ma
     for dsn in [absent_dsn, off_dsn] {
         let (worker, result_rx) = connect_in_background(dsn);
         result_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(cats_test_support::poll_bound())
             .expect("an unmarked schema bootstrap waited on the test-only global lock")
             .expect("an unmarked schema bootstrap failed");
         worker.join().unwrap();
@@ -101,7 +101,7 @@ fn isolated_schema_bootstrap_waits_on_the_test_global_ddl_lock_only_for_exact_ma
     let (worker, result_rx) = connect_in_background(marked_dsn);
     let mut observer = postgres::Client::connect(&base_dsn, NoTls).unwrap();
 
-    let observation_deadline = Instant::now() + Duration::from_secs(10);
+    let observation_deadline = Instant::now() + cats_test_support::poll_bound();
     let waiting_pid = loop {
         match result_rx.try_recv() {
             Ok(result) => panic!(
@@ -172,7 +172,7 @@ fn isolated_schema_bootstrap_waits_on_the_test_global_ddl_lock_only_for_exact_ma
         .get(0);
     assert!(unlocked, "test holder did not own the global DDL lock");
     result_rx
-        .recv_timeout(Duration::from_secs(30))
+        .recv_timeout(cats_test_support::poll_bound())
         .expect("marked schema bootstrap did not finish within its test budget after release")
         .expect("marked schema bootstrap failed after the global DDL lock was released");
     worker.join().unwrap();

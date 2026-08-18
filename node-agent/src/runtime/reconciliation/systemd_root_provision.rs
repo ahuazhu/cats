@@ -3596,7 +3596,7 @@ mod tests {
         let identity = ProcIdentity::sample(child.id());
         assert!(identity.start_ticks.is_some() && identity.exe.as_deref() == Some(executable));
         let waiter = std::thread::spawn(move || {
-            let cleanup_deadline = Instant::now() + Duration::from_secs(10);
+            let cleanup_deadline = Instant::now() + cats_test_support::poll_bound();
             loop {
                 if let Some(status) = child.try_wait().unwrap() {
                     return status;
@@ -3640,7 +3640,7 @@ mod tests {
         let identity = ProcIdentity::sample(child.id());
         assert!(identity.start_ticks.is_some() && identity.exe.as_deref() == Some(executable));
         let waiter = std::thread::spawn(move || {
-            let cleanup_deadline = Instant::now() + Duration::from_secs(10);
+            let cleanup_deadline = Instant::now() + cats_test_support::poll_bound();
             loop {
                 if let Some(status) = child.try_wait().unwrap() {
                     return status;
@@ -3830,7 +3830,7 @@ while True:
             SystemdStartSubmission::Submitted
         );
 
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + cats_test_support::poll_bound();
         let proof = loop {
             if let Ok(bytes) = std::fs::read(&ready_path) {
                 let ready_pid = std::str::from_utf8(&bytes)

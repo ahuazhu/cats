@@ -321,7 +321,7 @@ fn run_vhost_user_with(
     for thread in 0..workload.threads {
         let mut queue = frontend.take(thread);
         handles.push(std::thread::spawn(move || {
-            queue.set_timeout(Duration::from_secs(60));
+            queue.set_timeout(cats_test_support::poll_bound());
             queue.set_spin_iterations(spin_iterations);
             let mut offsets = Offsets::new(seed ^ (thread as u64 + 1) << 32, workload.block);
             let payload = vec![0x5au8; workload.block];

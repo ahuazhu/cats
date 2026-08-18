@@ -2706,7 +2706,7 @@ mod tests {
         assert!(projected[0].cancellation_pending);
         assert!(!projected[1].cancellation_pending);
         assert!(projected[2].cancellation_pending);
-        tokio::time::timeout(Duration::from_secs(1), guards[0].cancelled())
+        tokio::time::timeout(cats_test_support::poll_bound(), guards[0].cancelled())
             .await
             .expect("A cancellation");
         assert!(
@@ -2714,7 +2714,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        tokio::time::timeout(Duration::from_secs(1), guards[2].cancelled())
+        tokio::time::timeout(cats_test_support::poll_bound(), guards[2].cancelled())
             .await
             .expect("C cancellation");
         assert!(matches!(
@@ -2815,7 +2815,7 @@ mod tests {
         );
         assert!(r2_latched
             .endpoint_is_revoked(&r2_latched.snapshot().endpoints()[0].binding.endpoint_id));
-        tokio::time::timeout(Duration::from_secs(1), b_guard.cancelled())
+        tokio::time::timeout(cats_test_support::poll_bound(), b_guard.cancelled())
             .await
             .expect("direct R2 cancels its changed B stream");
 
@@ -2881,7 +2881,7 @@ mod tests {
         let unchanged = session.checkpoint_store().load().unwrap().unwrap();
         assert_eq!(unchanged.content_digest(), before.content_digest());
         assert_eq!(unchanged.checkpoint(), before.checkpoint());
-        tokio::time::timeout(Duration::from_secs(1), a_guard.cancelled())
+        tokio::time::timeout(cats_test_support::poll_bound(), a_guard.cancelled())
             .await
             .expect("changed A guard is cancelled by the pre-scan latch");
         assert!(
@@ -2959,10 +2959,10 @@ mod tests {
         assert!(latched.endpoint_is_revoked(&old.endpoints()[0].binding.endpoint_id));
         assert!(!latched.endpoint_is_revoked(&old.endpoints()[1].binding.endpoint_id));
         assert!(latched.endpoint_is_revoked(&old.endpoints()[2].binding.endpoint_id));
-        tokio::time::timeout(Duration::from_secs(1), guards[0].cancelled())
+        tokio::time::timeout(cats_test_support::poll_bound(), guards[0].cancelled())
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), guards[2].cancelled())
+        tokio::time::timeout(cats_test_support::poll_bound(), guards[2].cancelled())
             .await
             .unwrap();
         let mut b_guard = guards.remove(1);
@@ -3259,7 +3259,7 @@ mod tests {
         RunningAdmissionPreScan::new(Arc::clone(&registry))
             .reconcile(pre_scan_context(successor))
             .expect("checkpoint-first global close settles its exact sealed source");
-        tokio::time::timeout(Duration::from_secs(1), guard.cancelled())
+        tokio::time::timeout(cats_test_support::poll_bound(), guard.cancelled())
             .await
             .expect("global recovery cancels the old stream");
         let live = session.cell().snapshot();
@@ -3399,7 +3399,7 @@ mod tests {
             effect.try_retire(&negative, &successor).unwrap(),
             Some(RuntimeDesiredEffectOutcome::RefreshInventory)
         );
-        tokio::time::timeout(Duration::from_secs(1), guard.cancelled())
+        tokio::time::timeout(cats_test_support::poll_bound(), guard.cancelled())
             .await
             .expect("complete physical negative cancels Busy/Open stream");
         assert_eq!(
@@ -3451,7 +3451,7 @@ mod tests {
         RunningAdmissionPreScan::new(Arc::clone(&registry))
             .reconcile(pre_scan_context(successor.clone()))
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), guards[0].cancelled())
+        tokio::time::timeout(cats_test_support::poll_bound(), guards[0].cancelled())
             .await
             .expect("changed A is latched before the physical scan");
         assert!(
@@ -3472,7 +3472,7 @@ mod tests {
             effect.try_retire(&negative, &successor).unwrap(),
             Some(RuntimeDesiredEffectOutcome::RefreshInventory)
         );
-        tokio::time::timeout(Duration::from_secs(1), guards[1].cancelled())
+        tokio::time::timeout(cats_test_support::poll_bound(), guards[1].cancelled())
             .await
             .expect("complete physical negative cancels unchanged B too");
         assert_eq!(
@@ -3520,7 +3520,7 @@ mod tests {
             session.cell().snapshot().lifecycle_admission(),
             LifecycleAdmission::Closed
         );
-        tokio::time::timeout(Duration::from_secs(1), guard.cancelled())
+        tokio::time::timeout(cats_test_support::poll_bound(), guard.cancelled())
             .await
             .expect("global close cancels the racing guard");
 
@@ -3595,7 +3595,7 @@ mod tests {
             .iter()
             .all(|route| route.gate == RouteGateState::Closed));
         for guard in &mut guards {
-            tokio::time::timeout(Duration::from_secs(1), guard.cancelled())
+            tokio::time::timeout(cats_test_support::poll_bound(), guard.cancelled())
                 .await
                 .expect("global cancellation");
         }
@@ -3706,7 +3706,7 @@ mod tests {
         // This is the runner's synchronous fallback racing after the worker
         // durably produced Busy/Open but before its response was received.
         session.cell().force_close();
-        tokio::time::timeout(Duration::from_secs(1), guard.cancelled())
+        tokio::time::timeout(cats_test_support::poll_bound(), guard.cancelled())
             .await
             .expect("timeout fallback cancels the stream");
         pre_scan

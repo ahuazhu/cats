@@ -10,12 +10,33 @@ use std::time::{Duration, Instant};
 
 use postgres::NoTls;
 
+/// Private mirror of the canonical `cats_test_support::wait::poll_bound`.
+///
+/// This module is compiled into the production `cats-control-plane` library
+/// target so downstream crates' tests can reuse it, which means
+/// dev-dependencies such as `cats-test-support` are not visible here. Keep
+/// the contract in sync with `tests/support/src/wait.rs`: a pure polling
+/// upper bound is not a performance assertion — success exits early, so a
+/// healthy run pays nothing and the default must be absurdly wide instead of
+/// being calibrated against an idle development machine.
+fn poll_bound() -> Duration {
+    const ENV: &str = "CATS_TEST_POLL_BOUND_SECS";
+    match std::env::var(ENV) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => Duration::from_secs(secs),
+            _ => panic!("{ENV} must be a positive whole number of seconds, got {raw:?}"),
+        },
+        Err(std::env::VarError::NotPresent) => Duration::from_secs(180),
+        Err(err) => panic!("{ENV} is not readable: {err}"),
+    }
+}
+
 /// Hold an isolated test schema's runtime_operations table at an
 /// ACCESS-EXCLUSIVE barrier and report when one production Store query is
 /// waiting behind it. This is shared by unit and cross-router cancellation
 /// tests so both prove that the blocking Store closure has been claimed.
 pub struct RuntimeOperationsTableLockForTest {
-    blocked: tokio::sync::oneshot::Receiver<bool>,
+    blocked: tokio::sync::oneshot::Receiver<Result<(), String>>,
     release: Option<std::sync::mpsc::Sender<()>>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -45,7 +66,7 @@ impl RuntimeOperationsTableLockForTest {
             // full suite, with a bloated shared PostgreSQL catalog) can take
             // far longer than an idle one to schedule the handler onto the
             // lock. The poll exits as soon as the handler blocks.
-            let deadline = Instant::now() + Duration::from_secs(90);
+            let deadline = Instant::now() + poll_bound();
             loop {
                 if release_rx.try_recv().is_ok() {
                     client.batch_execute("ROLLBACK").unwrap();
@@ -77,16 +98,50 @@ impl RuntimeOperationsTableLockForTest {
                     )
                     .unwrap()
                     .get(0);
-                if blocked || Instant::now() >= deadline {
-                    let _ = blocked_tx.send(blocked);
+                if blocked {
+                    let _ = blocked_tx.send(Ok(()));
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    // Do not guess between "nothing ever queued" and "another
+                    // session (for example a background sweeper on the shared
+                    // Store lane) starved the by-id read": report the exact
+                    // waiter set and session activity for this schema.
+                    let diagnostic = client
+                        .query(
+                            "SELECT activity.pid::text, activity.state,
+                                    coalesce(activity.wait_event_type, ''),
+                                    activity.query
+                               FROM pg_stat_activity activity
+                              WHERE activity.datname=current_database()
+                                AND activity.pid<>$1
+                                AND activity.query LIKE '%runtime_operations%'",
+                            &[&own_pid],
+                        )
+                        .map(|rows| {
+                            rows.into_iter()
+                                .map(|row| {
+                                    format!(
+                                        "pid={} state={} wait={} query={}",
+                                        row.get::<_, String>(0),
+                                        row.get::<_, String>(1),
+                                        row.get::<_, String>(2),
+                                        row.get::<_, String>(3)
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" | ")
+                        })
+                        .unwrap_or_else(|error| format!("diagnostic query failed: {error}"));
+                    let _ = blocked_tx.send(Err(diagnostic));
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
-            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+            let _ = release_rx.recv_timeout(poll_bound());
             client.batch_execute("ROLLBACK").unwrap();
         });
-        tokio::time::timeout(Duration::from_secs(5), ready_rx)
+        tokio::time::timeout(poll_bound(), ready_rx)
             .await
             .expect("runtime_operations table lock was not acquired")
             .expect("runtime_operations table-lock worker stopped");
@@ -98,13 +153,16 @@ impl RuntimeOperationsTableLockForTest {
     }
 
     pub async fn wait_until_query_blocked(&mut self) {
-        assert!(
-            tokio::time::timeout(Duration::from_secs(100), &mut self.blocked)
+        // Strictly wider than the worker's own poll bound so the worker's
+        // diagnostic report arrives instead of this timeout.
+        if let Err(diagnostic) =
+            tokio::time::timeout(poll_bound() + Duration::from_secs(10), &mut self.blocked)
                 .await
                 .expect("runtime Operation query did not reach the PostgreSQL lock barrier")
-                .expect("runtime_operations table-lock worker stopped"),
-            "runtime Operation query never blocked on runtime_operations"
-        );
+                .expect("runtime_operations table-lock worker stopped")
+        {
+            panic!("runtime Operation query never blocked on runtime_operations: {diagnostic}");
+        }
     }
 
     pub fn release(mut self) {
@@ -814,7 +872,7 @@ impl RuntimeSchemaWriteBarrierForTest {
                 }
             }
         });
-        tokio::time::timeout(Duration::from_secs(10), ready_rx)
+        tokio::time::timeout(poll_bound(), ready_rx)
             .await
             .expect("Runtime schema write barrier did not acquire its bounded table locks")
             .expect("Runtime schema write-barrier worker stopped")
@@ -832,7 +890,7 @@ impl RuntimeSchemaWriteBarrierForTest {
     pub async fn calibrate_dml_blocked(&self) {
         let dsn = self.dsn.clone();
         tokio::time::timeout(
-            Duration::from_secs(5),
+            poll_bound(),
             tokio::task::spawn_blocking(move || calibrate_runtime_schema_dml_barrier(&dsn)),
         )
         .await
@@ -851,14 +909,14 @@ impl RuntimeSchemaWriteBarrierForTest {
             .expect("Runtime schema write-barrier command channel")
             .send(RuntimeSchemaWriteBarrierCommand::Finish { result: result_tx })
             .expect("Runtime schema write-barrier worker stopped");
-        let result = tokio::time::timeout(Duration::from_secs(10), result_rx)
+        let result = tokio::time::timeout(poll_bound(), result_rx)
             .await
             .expect("Runtime schema write-barrier settlement exceeded its deadline")
             .expect("Runtime schema write-barrier worker stopped before settlement");
         self.command.take();
         if let Some(worker) = self.worker.take() {
             tokio::time::timeout(
-                Duration::from_secs(2),
+                poll_bound(),
                 tokio::task::spawn_blocking(move || worker.join()),
             )
             .await

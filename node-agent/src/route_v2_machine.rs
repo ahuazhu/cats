@@ -1519,7 +1519,7 @@ mod tests {
         // so emergency close can linearize before any Guest-network await and
         // cancel the already-acquired Endpoint guard.
         registry.latch_emergency_route_disable();
-        tokio::time::timeout(Duration::from_secs(1), admitted.cancelled())
+        tokio::time::timeout(cats_test_support::poll_bound(), admitted.cancelled())
             .await
             .expect("emergency close cancels the admitted guard");
         drop(admitted);
@@ -1782,9 +1782,10 @@ mod tests {
             .unwrap();
 
         let mut tail = [0_u8; 1];
-        let a_closed = tokio::time::timeout(Duration::from_secs(2), tunnel_a.read(&mut tail))
-            .await
-            .expect("A tunnel must be cancelled");
+        let a_closed =
+            tokio::time::timeout(cats_test_support::poll_bound(), tunnel_a.read(&mut tail))
+                .await
+                .expect("A tunnel must be cancelled");
         assert!(matches!(a_closed, Ok(0) | Err(_)));
         assert_eq!(active.active_guards(&claims_a.endpoint_id), Some(0));
         assert_eq!(active.active_guards(&claims_b.endpoint_id), Some(1));
