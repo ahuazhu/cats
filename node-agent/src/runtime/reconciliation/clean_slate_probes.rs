@@ -5762,6 +5762,28 @@ impl PlatformRootProcessInventoryBridge {
         };
         #[cfg(not(target_os = "linux"))]
         let managed_vmm_launch_files = ProbeFact::Empty;
+        // Six independent sources join into one verdict, and the caller can only
+        // report "residue outside the allowed set". Name the members here or a
+        // production refusal says nothing about which physical source spoke.
+        for (name, fact) in [
+            ("systemd cgroup tree", systemd),
+            ("dedicated metering root", metering),
+            ("managed processes", processes),
+            ("root-provision sockets", sockets),
+            ("managed vmm socket root", managed_vmm_sockets),
+            ("managed vmm launch root", managed_vmm_launch_files),
+        ] {
+            if fact != ProbeFact::Empty {
+                tracing::warn!(
+                    source = name,
+                    fact = ?fact,
+                    allowed_units = ?allowed_units,
+                    allowed_pids = ?allowed_pids,
+                    allowed_sockets = ?allowed_sockets,
+                    "node-global sweep member is not empty",
+                );
+            }
+        }
         Ok(
             if [
                 systemd,
