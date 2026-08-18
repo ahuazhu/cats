@@ -22309,6 +22309,40 @@ mod tests {
         }
     }
 
+    /// A static identity recorded before the Agent moved into its delegated leaf
+    /// no longer equals the identity its own live process re-derives, and the
+    /// effect-time process sweep turns that inequality into
+    /// `StaticProcessInspection::Conflict`, which reports the Agent itself as
+    /// node-global residue. The two identities agree on the allowed unit set, so
+    /// only the verbatim control group separates them — which is exactly why this
+    /// survived the fix that taught the parser about the delegated leaf.
+    #[test]
+    fn a_static_identity_recorded_before_the_delegated_move_conflicts_with_the_live_agent() {
+        let executable = PathBuf::from("/opt/cats/bin/cats-noded");
+        let before_move = StaticServiceIdentity::from_process_facts(
+            4242,
+            executable.clone(),
+            b"0::/system.slice/cats-worker.service\n",
+        )
+        .expect("the pre-move control group identifies the service");
+        let live = StaticServiceIdentity::from_process_facts(
+            4242,
+            executable,
+            b"0::/system.slice/cats-worker.service/agent\n",
+        )
+        .expect("the live delegated control group identifies the same service");
+
+        assert_eq!(
+            before_move.expected_units, live.expected_units,
+            "both identities allow the same units, so the unit set cannot detect this"
+        );
+        assert_ne!(
+            before_move, live,
+            "a pre-move identity must not compare equal to the live one, which is \
+             what the sweep reads as a conflict"
+        );
+    }
+
     #[test]
     fn a_delegated_agent_proves_the_unit_its_own_deployment_starts() {
         let environment = TestEnvironment::new();
