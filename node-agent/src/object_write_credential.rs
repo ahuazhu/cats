@@ -3125,7 +3125,11 @@ mod tests {
             )
             .is_ok();
             observer.lock().unwrap().push(credential_id);
-            let status = if accepted { "401 Unauthorized" } else { "400 Bad Request" };
+            let status = if accepted {
+                "401 Unauthorized"
+            } else {
+                "400 Bad Request"
+            };
             let mut stream = reader.into_inner();
             // Either way the publish fails; this test is about which identity
             // arrived and whether the verifier accepted its signature, not

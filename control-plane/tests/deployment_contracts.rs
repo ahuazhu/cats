@@ -746,17 +746,15 @@ fn route_v2_deployment_wires_closed_artifact_sets_without_private_bytes_in_terra
     // Production IAM denies blockd every direct ChunkStore mutation, so a
     // worker that does not learn the Gateway origin has no write path at all
     // and fails closed on the first publish. Losing this key is silent.
-    for expected in [
-        "CATS_OBJECT_WRITE_GATEWAY_URL",
-        "object_write_gateway_url",
-    ] {
+    for expected in ["CATS_OBJECT_WRITE_GATEWAY_URL", "object_write_gateway_url"] {
         assert!(
             worker.contains(expected) || worker_variables.contains(expected),
             "worker deployment lost the ObjectWrite Gateway origin {expected:?}"
         );
     }
     assert!(
-        worker_variables.contains("object_write_gateway_url must be one canonical HTTPS DNS origin."),
+        worker_variables
+            .contains("object_write_gateway_url must be one canonical HTTPS DNS origin."),
         "the Gateway origin must stay an exact validated HTTPS origin"
     );
 
