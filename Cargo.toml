@@ -8,6 +8,7 @@ members = [
     "storage",
     "adapters/object-store-file",
     "adapters/object-store-aws-s3",
+    "adapters/object-store-gateway",
     "adapters/host-fence-aws",
     "adapters/metadata-store-sqlite",
     "adapters/metadata-store-postgres",
@@ -40,6 +41,7 @@ cats-blockd = { path = "blockd" }
 cats-storage = { path = "storage" }
 cats-object-store-file = { path = "adapters/object-store-file" }
 cats-object-store-aws-s3 = { path = "adapters/object-store-aws-s3" }
+cats-object-store-gateway = { path = "adapters/object-store-gateway" }
 cats-host-fence-aws = { path = "adapters/host-fence-aws" }
 cats-metadata-store-sqlite = { path = "adapters/metadata-store-sqlite" }
 cats-metadata-store-postgres = { path = "adapters/metadata-store-postgres" }
