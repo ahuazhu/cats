@@ -1026,10 +1026,12 @@ impl RuntimeDesiredEffectContext {
     /// logical ownership remains attached to this worker through the final
     /// provider postcondition even if the returned marker leaves scope.
     pub(crate) fn lock_node_global_effect(&self) -> anyhow::Result<RuntimeNodeGlobalEffectPermit> {
-        self.enter_section(RuntimeEffectSection::NodeGlobalEffectGate);
-        let permit = self.node_global_effect_gate.acquire(self);
-        self.enter_section(RuntimeEffectSection::Running);
-        permit
+        // Restore whatever section was current, never reset to `Running`: this
+        // runs inside a dispatched sub-effect, and resetting reported every
+        // later block in that sub-effect as "outside any known boundary".
+        self.in_section(RuntimeEffectSection::NodeGlobalEffectGate, || {
+            self.node_global_effect_gate.acquire(self)
+        })
     }
 
     /// Record the blocking boundary this worker is entering, so an abandoned
@@ -1039,6 +1041,10 @@ impl RuntimeDesiredEffectContext {
     }
 
     /// Run `body` inside `section`, restoring the previous section afterwards.
+    ///
+    /// Nesting must restore, not reset: a boundary entered inside a dispatched
+    /// sub-effect would otherwise erase which sub-effect the worker is in, and a
+    /// later block there would report as belonging to no known section at all.
     pub(crate) fn in_section<T>(
         &self,
         section: RuntimeEffectSection,
@@ -4536,6 +4542,35 @@ mod tests {
             names.len(),
             RuntimeEffectSection::ALL.len(),
             "every section renders a distinct name"
+        );
+    }
+
+    /// A boundary entered inside a dispatched sub-effect must restore that
+    /// sub-effect on the way out. Resetting to `Running` instead reported every
+    /// later block in the sub-effect as belonging to no known section, which is
+    /// exactly how the first instrumentation lied about a production wedge.
+    #[test]
+    fn a_nested_boundary_restores_the_sub_effect_it_was_entered_from() {
+        let worker = 9_001_u64;
+        enter_effect_section(worker, RuntimeEffectSection::ServingProcess);
+
+        let previous = current_effect_section(worker);
+        enter_effect_section(worker, RuntimeEffectSection::NodeGlobalEffectGate);
+        assert_eq!(
+            current_effect_section(worker),
+            RuntimeEffectSection::NodeGlobalEffectGate,
+            "the boundary is visible while it is held"
+        );
+        enter_effect_section(worker, previous);
+
+        assert_eq!(
+            current_effect_section(worker),
+            RuntimeEffectSection::ServingProcess,
+            "leaving the boundary must restore the sub-effect, not reset to running"
+        );
+        assert_ne!(
+            current_effect_section(worker),
+            RuntimeEffectSection::Running
         );
     }
 
