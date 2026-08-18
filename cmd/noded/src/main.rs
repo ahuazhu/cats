@@ -41,12 +41,6 @@ struct Args {
     /// management Control origin.
     #[arg(long, env = "CATS_OBJECT_WRITE_GATEWAY_URL")]
     object_write_gateway_url: Option<String>,
-    /// The Control-side ObjectWriteAuthority this Host's attachment credentials
-    /// are registered under. Control refuses a registration naming any other
-    /// authority and the Node cannot derive it, so it is configured with the
-    /// gateway origin and the two are required together.
-    #[arg(long, env = "CATS_OBJECT_WRITE_WRITER_AUTHORITY_ID")]
-    object_write_writer_authority_id: Option<String>,
     #[arg(
         long,
         env = "CATS_GATEWAY_CLIENT_CA_BUNDLE_FILE",
@@ -266,24 +260,12 @@ async fn main() -> anyhow::Result<()> {
             "--route-v2-machine-listen and --route-v2-rotation-origin must be configured together"
         ),
     };
-    let object_write_gateway = match (
-        args.object_write_gateway_url,
-        args.object_write_writer_authority_id,
-    ) {
-        (Some(gateway_url), Some(writer_authority_id)) => {
-            Some(cats_node_agent::runtime_cutover::ObjectWriteGatewayComposition {
-                gateway_url,
-                writer_authority_id: cats_api::runtime_reconciliation::Id::new(
-                    &writer_authority_id,
-                )
-                .context("--object-write-writer-authority-id is not a canonical Id")?,
-            })
-        }
-        (None, None) => None,
-        _ => anyhow::bail!(
-            "--object-write-gateway-url and --object-write-writer-authority-id must be configured together"
-        ),
-    };
+    // The Host's writer authority ID is not configuration: it is derived from
+    // the Node ID, so the fleet-shared worker environment cannot carry it. The
+    // credential port reads it from Control once per Agent session.
+    let object_write_gateway = args.object_write_gateway_url.map(|gateway_url| {
+        cats_node_agent::runtime_cutover::ObjectWriteGatewayComposition { gateway_url }
+    });
     let deadline_policy = RuntimeSpineDeadlinePolicy::new(
         Duration::from_millis(args.runtime_inventory_scan_timeout_ms),
         Duration::from_millis(args.runtime_effect_step_timeout_ms),

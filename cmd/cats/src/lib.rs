@@ -778,8 +778,9 @@ pub enum RuntimeNodeObjectWriteAuthorityCommand {
         binding: RuntimeNodeObjectWriteAuthorityBinding,
     },
     /// Print the bare authority ID that exact binding assigns, without
-    /// contacting Control, so it can be piped into the Node's
-    /// `--object-write-writer-authority-id`.
+    /// contacting Control, so an operator can check what a binding would
+    /// assign or confirm what a Node reads back from Control. It is not Node
+    /// configuration: the Node reads its authority from Control.
     Id {
         #[command(flatten)]
         binding: RuntimeNodeObjectWriteAuthorityBinding,

@@ -10,7 +10,8 @@
 use cats_api::agent_registration::AuthenticatedNodeCredential;
 use cats_api::object_write_gateway::{
     ObjectWriteCredentialReference, ObjectWriteCredentialRegistration,
-    ObjectWriteCredentialRegistrationReceipt,
+    ObjectWriteCredentialRegistrationReceipt, ObjectWriteWriterAuthorityRead,
+    ObjectWriteWriterAuthorityStateV1,
 };
 use cats_api::runtime_reconciliation::{
     canonical_ed25519_spki_sha256, guest_config_digest, object_write_writer_authority_id,
@@ -786,4 +787,255 @@ fn gateway_registration_succeeds_only_once_the_writer_authority_exists() {
         })
         .unwrap();
     assert_eq!(bound, assigned_id(&apply).as_str());
+}
+
+/// One current AgentSession for an already-provisioned identity.
+fn register_session(
+    store: &Store,
+    identity: &NodeIdentity,
+    boot: u128,
+    instance: u128,
+    attempt: u128,
+    expected_epoch: Option<Epoch>,
+) -> cats_api::runtime_reconciliation::AgentSession {
+    let authenticated = AuthenticatedNodeCredential::new(
+        identity.credential_id.clone(),
+        identity.credential_binding.clone(),
+    );
+    match store
+        .register_agent_session(
+            &authenticated,
+            &cats_api::runtime_reconciliation::AgentRegistrationAttempt {
+                version: ContractVersion::V1,
+                node_id: identity.node_id.clone(),
+                immutable_host_id: identity.immutable_host_id.clone(),
+                node_boot_id: NodeBootId::new(format!("{boot:032x}")).unwrap(),
+                agent_instance_id: random(instance),
+                registration_attempt_id: random(attempt),
+                guest_config_digest: guest_config_digest(&guest_release()).unwrap(),
+                expected_agent_session_epoch: expected_epoch,
+            },
+            &AgentSessionRegistrationPolicy::from_release_receipt(&guest_release()).unwrap(),
+        )
+        .unwrap()
+    {
+        AgentRegistrationOutcome::Registered(session) => session,
+        AgentRegistrationOutcome::Rejected(rejection) => {
+            panic!("test AgentSession was rejected: {rejection:?}")
+        }
+    }
+}
+
+fn binding_of(session: &cats_api::runtime_reconciliation::AgentSession) -> SessionBinding {
+    SessionBinding {
+        node_id: session.node_id.clone(),
+        node_boot_id: session.node_boot_id.clone(),
+        agent_instance_id: session.agent_instance_id.clone(),
+        agent_session_epoch: session.agent_session_epoch,
+    }
+}
+
+/// The exact server answer to one Node's read of its own writer authority.
+fn read_own_authority(
+    store: &Store,
+    identity: &NodeIdentity,
+    session: &SessionBinding,
+) -> Option<ObjectWriteWriterAuthorityStateV1> {
+    let authenticated = AuthenticatedNodeCredential::new(
+        identity.credential_id.clone(),
+        identity.credential_binding.clone(),
+    );
+    store
+        .object_write_writer_authority_for_node(
+            &authenticated,
+            &ObjectWriteWriterAuthorityRead {
+                version: ContractVersion::V1,
+                session: session.clone(),
+            },
+            &crate::store::AuthorityRequestContext::new(
+                std::time::Instant::now() + std::time::Duration::from_secs(10),
+            ),
+        )
+        .unwrap()
+}
+
+/// The Node cannot derive `owa1_<64hex>` and the fleet deployment writes one
+/// shared worker environment, so Control has to answer this. Before an operator
+/// provisions the Host the answer is a typed absence, not an error and not a
+/// guess.
+#[test]
+fn a_node_reads_the_exact_writer_authority_control_assigned_it() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let store = provisioned_store(&url);
+    let identity = identity();
+    let session = binding_of(&register_session(&store, &identity, 11, 12, 13, None));
+
+    assert_eq!(
+        read_own_authority(&store, &identity, &session),
+        Some(ObjectWriteWriterAuthorityStateV1::Absent),
+        "an unprovisioned Host reads as absent"
+    );
+
+    let apply = writer_apply(2, object_scope(), OBJECT_STORE_SCOPE);
+    assert_eq!(
+        applied_writer(store.apply_runtime_node_authority(&principal(), &apply)),
+        Some(assigned_id(&apply))
+    );
+
+    assert_eq!(
+        read_own_authority(&store, &identity, &session),
+        Some(ObjectWriteWriterAuthorityStateV1::Open {
+            writer_authority_id: assigned_id(&apply),
+        }),
+        "the read must return exactly the ID the operator apply assigned"
+    );
+}
+
+/// The authenticated credential selects the Node; the request may only restate
+/// it. One Node reading another Node's authority is refused outright, even
+/// though that other authority exists and is open.
+#[test]
+fn a_node_may_not_read_another_nodes_writer_authority() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let store = provisioned_store(&url);
+    let mine = identity();
+    let apply = writer_apply(2, object_scope(), OBJECT_STORE_SCOPE);
+    assert_eq!(
+        applied_writer(store.apply_runtime_node_authority(&principal(), &apply)),
+        Some(assigned_id(&apply))
+    );
+    let my_session = binding_of(&register_session(&store, &mine, 11, 12, 13, None));
+
+    // A second provisioned Node with its own credential, Host and session.
+    let neighbour = NodeIdentity {
+        node_id: id("node_owa_other"),
+        immutable_host_id: id("host_owa_other"),
+        credential_id: id("credential_owa_other"),
+        credential_binding: CredentialBinding::PublicKey {
+            public_key_spki_sha256: digest(8),
+        },
+        state_path_id: id("state_path_owa_other"),
+        ..identity()
+    };
+    assert_eq!(
+        applied(
+            store.apply_runtime_node_authority(
+                &principal(),
+                &RuntimeNodeAuthorityApply {
+                    version: ContractVersion::V1,
+                    apply_id: random(91),
+                    node_id: neighbour.node_id.clone(),
+                    mutation: RuntimeNodeAuthorityMutation::Provision {
+                        node_identity: Box::new(neighbour.clone()),
+                        placement_policy: Box::new(NodePlacementPolicy {
+                            node_id: neighbour.node_id.clone(),
+                            node_transport_target: NodeTransportTarget::new(
+                                "https://node-owa-other.internal:7301",
+                            )
+                            .unwrap(),
+                            ..policy()
+                        }),
+                    },
+                },
+            )
+        ),
+        RuntimeNodeAuthorityOutcome::Provisioned
+    );
+    let neighbour_session = binding_of(&register_session(&store, &neighbour, 21, 22, 23, None));
+
+    // Calibration: the neighbour's own read is answered, so the refusal below
+    // is the identity boundary and not an unusable credential.
+    assert_eq!(
+        read_own_authority(&store, &neighbour, &neighbour_session),
+        Some(ObjectWriteWriterAuthorityStateV1::Absent)
+    );
+
+    assert_eq!(
+        read_own_authority(&store, &neighbour, &my_session),
+        None,
+        "a Node may never read another Node's writer authority"
+    );
+    assert_eq!(
+        read_own_authority(&store, &mine, &neighbour_session),
+        None,
+        "naming another Node's session is refused in both directions"
+    );
+}
+
+/// A cut-off writer is reported as cut off rather than as open or absent, so the
+/// Node fails closed with a state an operator can act on.
+#[test]
+fn a_cut_off_writer_authority_is_reported_as_cut_off() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let store = provisioned_store(&url);
+    let identity = identity();
+    let session = binding_of(&register_session(&store, &identity, 11, 12, 13, None));
+    let apply = writer_apply(2, object_scope(), OBJECT_STORE_SCOPE);
+    let assigned =
+        applied_writer(store.apply_runtime_node_authority(&principal(), &apply)).unwrap();
+    // Calibration: the same read reports this exact authority as open first.
+    assert_eq!(
+        read_own_authority(&store, &identity, &session),
+        Some(ObjectWriteWriterAuthorityStateV1::Open {
+            writer_authority_id: assigned.clone(),
+        })
+    );
+
+    close_authority(&store, &assigned, "cutoff_pending");
+    assert_eq!(
+        read_own_authority(&store, &identity, &session),
+        Some(ObjectWriteWriterAuthorityStateV1::CutoffPending {
+            writer_authority_id: assigned.clone(),
+        })
+    );
+
+    close_authority(&store, &assigned, "cutoff_complete");
+    assert_eq!(
+        read_own_authority(&store, &identity, &session),
+        Some(ObjectWriteWriterAuthorityStateV1::CutoffComplete {
+            writer_authority_id: assigned,
+        })
+    );
+}
+
+/// The answer is bound to the exact current Agent session. A superseded session
+/// gets no answer at all, so a replaced Agent cannot keep resolving an
+/// authority under an epoch Control has already retired.
+#[test]
+fn a_superseded_agent_session_gets_no_writer_authority_answer() {
+    let url = crate::testsupport::isolated_control_store_url();
+    let store = provisioned_store(&url);
+    let identity = identity();
+    let apply = writer_apply(2, object_scope(), OBJECT_STORE_SCOPE);
+    let assigned =
+        applied_writer(store.apply_runtime_node_authority(&principal(), &apply)).unwrap();
+    let first = binding_of(&register_session(&store, &identity, 11, 12, 13, None));
+    assert_eq!(
+        read_own_authority(&store, &identity, &first),
+        Some(ObjectWriteWriterAuthorityStateV1::Open {
+            writer_authority_id: assigned.clone(),
+        })
+    );
+
+    let replacement = binding_of(&register_session(
+        &store,
+        &identity,
+        14,
+        15,
+        16,
+        Some(first.agent_session_epoch),
+    ));
+    assert_ne!(replacement, first);
+    assert_eq!(
+        read_own_authority(&store, &identity, &replacement),
+        Some(ObjectWriteWriterAuthorityStateV1::Open {
+            writer_authority_id: assigned,
+        }),
+        "the replacement session resolves the same authority"
+    );
+    assert_eq!(
+        read_own_authority(&store, &identity, &first),
+        None,
+        "a superseded session must get no answer"
+    );
 }
