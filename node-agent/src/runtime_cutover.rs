@@ -552,6 +552,23 @@ async fn spawn_signed_runtime_cutover_with_overrides(
         blob_store: Arc::clone(&config.blob_store),
         root_provision_systemd,
     };
+    // The signed Runtime's own inventory proof requires the delegated metering
+    // root to exist: an absent root is unprovable, not empty. The V1 server
+    // established it at startup; this path never did, so every Node reported an
+    // incomplete inventory forever and could not attest.
+    //
+    // It must also happen before any probe is composed. Establishing the root
+    // moves this Agent into its own delegated cgroup leaf, and every probe
+    // records the Agent's static-service identity at construction. Composing the
+    // effect ports first captured the pre-move identity while the inventory
+    // scanner, composed later, captured the post-move one: the effect-time
+    // process sweep then read its own Agent as an identity conflict and refused
+    // every physical start as node-global residue, on a Node with no managed
+    // process at all, while attestation kept passing.
+    if let Some(root) = config.metering_cgroup_root.as_deref() {
+        crate::runtime::initialize_metering_cgroup_root(root)
+            .context("establish the delegated metering cgroup root")?;
+    }
     #[cfg(not(test))]
     let effect_root_process_ports =
         installed_root_process_effect_ports(installed_probe_config.clone())
@@ -597,14 +614,6 @@ async fn spawn_signed_runtime_cutover_with_overrides(
         .register_until_session(&config.control_plane_url)
         .await
         .context("establish durable Agent session")?;
-    // The signed Runtime's own inventory proof requires the delegated metering
-    // root to exist: an absent root is unprovable, not empty. The V1 server
-    // established it at startup; this path never did, so every Node reported an
-    // incomplete inventory forever and could not attest.
-    if let Some(root) = config.metering_cgroup_root.as_deref() {
-        crate::runtime::initialize_metering_cgroup_root(root)
-            .context("establish the delegated metering cgroup root")?;
-    }
     let usage_pipeline = config
         .metering_cgroup_root
         .as_deref()
@@ -2188,6 +2197,38 @@ mod tests {
         visit(root, &mut names);
         names.sort();
         names
+    }
+
+    /// Establishing the delegated metering root moves this Agent into its own
+    /// cgroup leaf, and every probe records the Agent's static-service identity
+    /// verbatim at construction. Composing a probe before that move captures the
+    /// unit-level control group while the live process reports the leaf, so the
+    /// effect-time process sweep reads its own Agent as an identity conflict and
+    /// refuses every physical start as node-global residue — deterministically,
+    /// on a Node carrying no managed process, while attestation keeps passing
+    /// because its scanner is composed after the move.
+    #[test]
+    fn the_delegated_cgroup_is_established_before_any_probe_is_composed() {
+        let source = include_str!("runtime_cutover.rs");
+        let establish = source
+            .find("initialize_metering_cgroup_root(root)")
+            .expect("startup establishes the delegated metering root");
+        let effect_ports = source
+            .find("installed_root_process_effect_ports(installed_probe_config")
+            .expect("startup composes the sealed root-process effect ports");
+        let scanner = source
+            .find("installed_clean_slate_scanner(")
+            .expect("startup composes the inventory scanner");
+        assert!(
+            establish < effect_ports,
+            "the delegated cgroup must exist before the effect ports record the \
+             Agent's static identity"
+        );
+        assert!(
+            establish < scanner,
+            "the delegated cgroup must exist before the inventory scanner records \
+             the Agent's static identity"
+        );
     }
 
     #[test]
