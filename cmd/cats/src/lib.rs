@@ -732,6 +732,58 @@ pub enum RuntimeNodeCommand {
         #[arg(long)]
         request: std::path::PathBuf,
     },
+    /// Issue or inspect the Node Host's one object-write writer authority.
+    ObjectWriteAuthority {
+        #[command(subcommand)]
+        cmd: RuntimeNodeObjectWriteAuthorityCommand,
+    },
+}
+
+/// The object-store side of one writer authority binding. Control derives the
+/// immutable Host identity from the Node's provisioned identity, so no Host
+/// fact is accepted here.
+#[derive(Args, Debug)]
+pub struct RuntimeNodeObjectWriteAuthorityBinding {
+    /// Provisioned Node whose Host publishes through this authority.
+    #[arg(long)]
+    pub node: String,
+    /// Object-store provider, for example `aws`.
+    #[arg(long)]
+    pub object_provider: String,
+    /// Object-store partition, for example `aws`.
+    #[arg(long)]
+    pub object_partition: String,
+    /// Object-store account holding the ChunkStore scope.
+    #[arg(long)]
+    pub object_account_id: String,
+    /// Object-store region holding the ChunkStore scope.
+    #[arg(long)]
+    pub object_region: String,
+    /// Workload principal the ObjectWrite Gateway presents to the provider.
+    #[arg(long)]
+    pub workload_principal_id: String,
+    /// Exact ChunkStore write scope this authority may publish into.
+    #[arg(long)]
+    pub object_store_scope_id: String,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RuntimeNodeObjectWriteAuthorityCommand {
+    /// Open the one authority for this Node's Host and print its assigned ID.
+    Provision {
+        /// Exact current placement-policy revision this apply is bound to.
+        #[arg(long)]
+        expected_revision: u64,
+        #[command(flatten)]
+        binding: RuntimeNodeObjectWriteAuthorityBinding,
+    },
+    /// Print the bare authority ID that exact binding assigns, without
+    /// contacting Control, so it can be piped into the Node's
+    /// `--object-write-writer-authority-id`.
+    Id {
+        #[command(flatten)]
+        binding: RuntimeNodeObjectWriteAuthorityBinding,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2983,6 +3035,100 @@ mod tests {
                 cmd: AdminCommand::RuntimeNode {
                     cmd: RuntimeNodeCommand::Policy {
                         cmd: RuntimeNodePolicyCommand::Apply { .. }
+                    },
+                    ..
+                }
+            }
+        ));
+        let writer = Cli::parse_from([
+            "cats",
+            "admin",
+            "runtime-node",
+            "object-write-authority",
+            "provision",
+            "--node",
+            "node_a",
+            "--expected-revision",
+            "1",
+            "--object-provider",
+            "aws",
+            "--object-partition",
+            "aws",
+            "--object-account-id",
+            "123456789012",
+            "--object-region",
+            "us-east-1",
+            "--workload-principal-id",
+            "arn:aws:iam::123456789012:role/cats-gateway",
+            "--object-store-scope-id",
+            "arn:aws:s3:::cats-production/chunks",
+        ]);
+        let Command::Admin {
+            cmd:
+                AdminCommand::RuntimeNode {
+                    cmd:
+                        RuntimeNodeCommand::ObjectWriteAuthority {
+                            cmd:
+                                RuntimeNodeObjectWriteAuthorityCommand::Provision {
+                                    expected_revision,
+                                    binding,
+                                },
+                        },
+                    ..
+                },
+        } = writer.command
+        else {
+            panic!("writer authority provision must parse")
+        };
+        assert_eq!(expected_revision, 1);
+        assert_eq!(binding.node, "node_a");
+        assert_eq!(binding.object_region, "us-east-1");
+        assert_eq!(
+            binding.object_store_scope_id,
+            "arn:aws:s3:::cats-production/chunks"
+        );
+        // The Host side of the binding is never an operator argument.
+        assert!(Cli::try_parse_from([
+            "cats",
+            "admin",
+            "runtime-node",
+            "object-write-authority",
+            "provision",
+            "--node",
+            "node_a",
+            "--expected-revision",
+            "1",
+            "--immutable-host-id",
+            "i-0123456789abcdef0",
+        ])
+        .is_err());
+        assert!(matches!(
+            Cli::parse_from([
+                "cats",
+                "admin",
+                "runtime-node",
+                "object-write-authority",
+                "id",
+                "--node",
+                "node_a",
+                "--object-provider",
+                "aws",
+                "--object-partition",
+                "aws",
+                "--object-account-id",
+                "123456789012",
+                "--object-region",
+                "us-east-1",
+                "--workload-principal-id",
+                "arn:aws:iam::123456789012:role/cats-gateway",
+                "--object-store-scope-id",
+                "arn:aws:s3:::cats-production/chunks",
+            ])
+            .command,
+            Command::Admin {
+                cmd: AdminCommand::RuntimeNode {
+                    cmd: RuntimeNodeCommand::ObjectWriteAuthority {
+                        cmd: RuntimeNodeObjectWriteAuthorityCommand::Id { .. }
                     },
                     ..
                 }

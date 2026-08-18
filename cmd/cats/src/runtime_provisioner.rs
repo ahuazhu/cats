@@ -1521,6 +1521,7 @@ mod tests {
             outcome: RuntimeNodeAuthorityOutcome::Provisioned,
             identity_state: NodeIdentityState::Provisioned,
             policy_revision: Epoch::new(1).unwrap(),
+            writer_authority_id: None,
         };
         let result_path = temp.path().join("apply-result.json");
         std::fs::write(
@@ -1590,6 +1591,7 @@ mod tests {
             outcome: RuntimeNodeAuthorityOutcome::Provisioned,
             identity_state: NodeIdentityState::Provisioned,
             policy_revision: Epoch::new(1).unwrap(),
+            writer_authority_id: None,
         };
         let result_path = temp.path().join("apply-result.json");
         std::fs::write(
@@ -1643,6 +1645,7 @@ mod tests {
             outcome: RuntimeNodeAuthorityOutcome::Provisioned,
             identity_state: NodeIdentityState::Provisioned,
             policy_revision: Epoch::new(1).unwrap(),
+            writer_authority_id: None,
         };
         std::fs::write(
             &result_path,

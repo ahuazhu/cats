@@ -181,6 +181,13 @@ RuntimeNodeAuthorityMutation =
     expected_credential_id: Id,
     expected_credential_binding: PublicKeyCredentialBinding
   }
+| {
+    kind: "provision_object_write_authority",
+    expected_policy_revision: Epoch,
+    object_provider_scope: ProviderScope,
+    workload_principal_id: AsciiText,
+    object_store_scope_id: AsciiText
+  }
 
 PublicKeyCredentialBinding = {
   kind: "public_key",
@@ -191,9 +198,11 @@ RuntimeNodeAuthorityApplyResult {
   version: 1,
   apply_id: RandomId128,
   node_id: Id,
-  outcome: "provisioned" | "policy_updated" | "credential_rotated" | "retired",
+  outcome: "provisioned" | "policy_updated" | "credential_rotated" | "retired"
+         | "object_write_authority_provisioned",
   identity_state: "provisioned" | "retired",
-  policy_revision: Epoch
+  policy_revision: Epoch,
+  writer_authority_id: Id | null
 }
 
 RuntimeNodeAuthorityStoredOutcome =
@@ -212,6 +221,26 @@ identity或policy已存在时只有§3.4 exact apply replay可成功，不能ado
 exact public-key credential、exact policy revision、policy cordoned、assigned set为空和session
 absent/expired，再把identity置为retired；retired identity不能update/rotate/unretire。
 
+`provision_object_write_authority`开启该Node所在Host唯一的ObjectWrite writer authority，它是
+attachment-scoped object-write credential注册时被检查的那一行。请求只声明object-store一侧的binding；
+Host provider scope、`immutable_host_id`、`node_id`以及空的accepted-sequence初始状态全部由已锁定的
+provisioned identity派生，caller不能提交。`writer_authority_id`同样由Control按下式派生并回传，
+caller不能选择，Node也无法自行推导，必须由operator配置给Node：
+
+```text
+writer_authority_id = "owa1_" || lowercase_hex(SHA-256(
+  ASCII("cats.object-write.writer-authority-id.v1") || 0x00 ||
+  canonical_json({ node_id, object_provider_scope, object_store_scope_id,
+                   version: 1, workload_principal_id })))
+```
+
+它要求identity为`provisioned`且policy revision与`expected_policy_revision`逐字相等，但不要求cordoned
+或quiescent：开authority不产生物理效果，且它是任何attachment credential的前置条件。同一immutable Host
+只能有一行writer authority：该Host已存在任何状态（`open`/`cutoff_pending`/`cutoff_complete`）的authority
+时固定返回并持久`authority_precondition_failed`。因此changed binding不会覆盖current authority，
+已cutoff的authority也不会被re-apply重开；派生ID已被别处占用时同样fail closed而不是撞primary key。
+同一`apply_id`的exact replay按§3.4返回原始结果与同一`writer_authority_id`。
+
 route envelope固定为：exact path、method `POST`、query完全缺席（含裸`?`）、恰好一个无parameter
 `Content-Type: application/json`、`Content-Encoding`缺席、body为无BOM的UTF-8 closed JSON且最大65536
 octets。handler从收到完整headers起总deadline为10000 ms，最多对serialization/deadlock做3次完整transaction
@@ -224,7 +253,17 @@ cats admin runtime-node provision --identity <artifact> --policy <policy>
 cats admin runtime-node policy apply --node <id> --expected-revision <n> --file <policy>
 cats admin runtime-node credential rotate --request <file>
 cats admin runtime-node retire --request <file>
+cats admin runtime-node object-write-authority provision --node <id> --expected-revision <n> \
+  --object-provider <id> --object-partition <id> --object-account-id <id> --object-region <id> \
+  --workload-principal-id <principal> --object-store-scope-id <scope>
+cats admin runtime-node object-write-authority id <same binding flags>
 ```
+
+`object-write-authority provision`与`provision`/`policy apply`一样由CLI生成`apply_id`并按mutation
+digest建立settled index，因此重复运行同一命令重放原receipt而不是发第二个必被拒的apply；它打印Control
+回传的`writer_authority_id`，并在settle前用同一派生式验证该ID确实属于本次binding。
+`object-write-authority id`只做同一离线派生并打印裸ID（供`--object-write-writer-authority-id`使用），
+不读取local authority state、不需要credential、也不发送任何请求。
 
 每个上述命令只选择一种认证来源。deployment provisioner同时提供
 `--deployment-id <id> --provisioner-credential-id <id>
