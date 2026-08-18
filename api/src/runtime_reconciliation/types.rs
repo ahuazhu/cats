@@ -572,8 +572,9 @@ pub struct RuntimeNodeAuthorityApplyResult {
     pub identity_state: NodeIdentityState,
     pub policy_revision: Epoch,
     /// Present exactly for [`RuntimeNodeAuthorityOutcome::ObjectWriteAuthorityProvisioned`].
-    /// Control assigns this ID; no caller may choose it, and the Node cannot
-    /// derive it, so an operator must configure the Node with this value.
+    /// Control assigns this ID and no caller may choose it. The Node cannot
+    /// derive it either, so it reads its own assigned authority back from
+    /// Control rather than carrying it as configuration.
     #[serde(default)]
     pub writer_authority_id: Option<Id>,
 }

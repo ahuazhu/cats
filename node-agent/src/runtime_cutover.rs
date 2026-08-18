@@ -93,14 +93,15 @@ pub struct SignedRuntimeCutoverConfig {
 }
 
 /// Node configuration for the ObjectWrite Gateway path.
+///
+/// The Control-side ObjectWriteAuthority this Host's credentials belong to is
+/// deliberately *not* here: it is derived from the Node ID, so it is per Node,
+/// while the fleet deployment writes one shared worker environment. The
+/// credential port reads it from Control once per Agent session instead.
 #[derive(Debug, Clone)]
 pub struct ObjectWriteGatewayComposition {
     /// Bare HTTPS origin, from Node configuration rather than a constant.
     pub gateway_url: String,
-    /// The Control-side ObjectWriteAuthority this Host's credentials belong
-    /// to. Control rejects a registration that names any other authority, so
-    /// the Node cannot derive or guess it.
-    pub writer_authority_id: cats_api::runtime_reconciliation::Id,
 }
 
 #[cfg(test)]
@@ -492,7 +493,7 @@ async fn spawn_signed_runtime_cutover_with_overrides(
                     .path()
                     .to_path_buf(),
                 &gateway.gateway_url,
-                gateway.writer_authority_id.clone(),
+                &config.control_plane_url,
                 config.agent_registration.runtime_request_signer(),
             )
             .map(|credentials| Arc::new(credentials) as Arc<dyn ObjectWriteCredentialPort>)

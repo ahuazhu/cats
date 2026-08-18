@@ -1294,8 +1294,9 @@ fn report_terminal(cli: &Cli, terminal: TerminalOutcome) -> Result<()> {
                     result.policy_revision.get()
                 );
                 if let Some(writer_authority_id) = &result.writer_authority_id {
-                    // The Node cannot derive this; configure it with
-                    // --object-write-writer-authority-id.
+                    // Control assigns this. The Node reads it back over the
+                    // authenticated authority-read route; it is never Node
+                    // configuration.
                     println!("writer-authority-id {writer_authority_id}");
                 }
             }

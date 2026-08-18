@@ -51,18 +51,21 @@ use cats_api::agent_registration::{
 use cats_api::object_write_gateway::{
     decode_object_write_credential_registered_artifact,
     decode_object_write_credential_registration,
-    decode_object_write_credential_registration_receipt,
-    encode_object_write_credential_registered_artifact, object_write_credential_id,
-    object_write_prepared_registration_file_name, object_write_private_artifact_id,
-    object_write_private_directory_fsync_receipt_id, object_write_private_file_fsync_receipt_id,
-    object_write_private_key_file_name, object_write_registered_artifact_file_name,
-    sign_object_write_credential_registration, ObjectWriteCredentialReference,
-    ObjectWriteCredentialRegisteredArtifact, ObjectWriteCredentialRegistration,
-    ObjectWriteCredentialRegistrationProof, ObjectWriteCredentialRegistrationReceipt,
-    OBJECT_WRITE_CREDENTIAL_DIRECTORY_BASENAME, OBJECT_WRITE_CREDENTIAL_ID_HEADER,
-    OBJECT_WRITE_CREDENTIAL_REGISTRATION_CONTENT_TYPE, OBJECT_WRITE_CREDENTIAL_REGISTRATION_PATH,
-    OBJECT_WRITE_GATEWAY_METHOD, OBJECT_WRITE_PUBLIC_KEY_SPKI_HEADER,
-    OBJECT_WRITE_REGISTERED_ARTIFACT_MAX_BYTES, OBJECT_WRITE_SIGNATURE_HEADER,
+    decode_object_write_credential_registration_receipt, decode_object_write_writer_authority_view,
+    encode_object_write_credential_registered_artifact, encode_object_write_writer_authority_read,
+    object_write_credential_id, object_write_prepared_registration_file_name,
+    object_write_private_artifact_id, object_write_private_directory_fsync_receipt_id,
+    object_write_private_file_fsync_receipt_id, object_write_private_key_file_name,
+    object_write_registered_artifact_file_name, sign_object_write_credential_registration,
+    ObjectWriteCredentialReference, ObjectWriteCredentialRegisteredArtifact,
+    ObjectWriteCredentialRegistration, ObjectWriteCredentialRegistrationProof,
+    ObjectWriteCredentialRegistrationReceipt, ObjectWriteWriterAuthorityRead,
+    ObjectWriteWriterAuthorityStateV1, OBJECT_WRITE_CREDENTIAL_DIRECTORY_BASENAME,
+    OBJECT_WRITE_CREDENTIAL_ID_HEADER, OBJECT_WRITE_CREDENTIAL_REGISTRATION_CONTENT_TYPE,
+    OBJECT_WRITE_CREDENTIAL_REGISTRATION_PATH, OBJECT_WRITE_GATEWAY_METHOD,
+    OBJECT_WRITE_PUBLIC_KEY_SPKI_HEADER, OBJECT_WRITE_REGISTERED_ARTIFACT_MAX_BYTES,
+    OBJECT_WRITE_SIGNATURE_HEADER, OBJECT_WRITE_WRITER_AUTHORITY_READ_PATH,
+    OBJECT_WRITE_WRITER_AUTHORITY_VIEW_MAX_WIRE_BYTES,
 };
 use cats_api::runtime_reconciliation::{
     Base64UrlNoPad, ContractVersion, FenceEpoch, Id, SessionBinding,
@@ -149,9 +152,55 @@ pub(crate) enum ObjectWriteCredentialError {
     RegistrationAmbiguous(String),
     #[error("generate object-write attachment key")]
     KeyGeneration,
+    #[error(
+        "Control reports no object-write writer authority for this Node; an operator must run \
+         `cats admin runtime-node object-write-authority provision` for this Host"
+    )]
+    WriterAuthorityAbsent,
+    #[error(
+        "the Node's object-write writer authority is {state}, so no attachment credential may be \
+         registered under it"
+    )]
+    WriterAuthorityClosed { state: &'static str },
+    #[error("the object-write writer authority read did not settle: {0}")]
+    WriterAuthorityUnresolved(ObjectWriteWriterAuthorityReadFailure),
     #[cfg(test)]
     #[error("injected object-write credential crash")]
     InjectedCrash,
+}
+
+/// Why one writer-authority read did not produce an answer.
+///
+/// Every variant fails the credential path closed. None of them may be
+/// substituted with a configured, cached-from-another-session or locally
+/// derived authority ID: the Node has no authority to name one, and Control's
+/// derivation is the only source.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub(crate) enum ObjectWriteWriterAuthorityReadFailure {
+    #[error("object-write writer authority read timed out")]
+    Timeout,
+    #[error("object-write writer authority read transport failed")]
+    Connection,
+    #[error("Control closed the object-write writer authority read with status {status}")]
+    Closed { status: u16 },
+    #[error("Control returned a malformed object-write writer authority view")]
+    MalformedResponse,
+    #[error("Control answered an object-write writer authority read for another session")]
+    SessionMismatch,
+}
+
+/// The one Control read that tells this Node which writer authority its
+/// attachment credentials belong to.
+///
+/// A trait keeps the once-per-session resolution testable without a Control
+/// Plane; production uses the A19-signed HTTP reader below. Both
+/// implementations are real; neither is a stub for the other.
+pub(crate) trait ObjectWriteWriterAuthorityResolver: Send + Sync {
+    fn read(
+        &self,
+        session: &SessionBinding,
+        deadline: Instant,
+    ) -> Result<ObjectWriteWriterAuthorityStateV1, ObjectWriteWriterAuthorityReadFailure>;
 }
 
 /// Why one registration attempt did not return a receipt.
@@ -1096,7 +1145,7 @@ impl ObjectWriteCredentialHttpRegistrar {
     }
 
     fn new(gateway_origin: &str, mode: TransportMode) -> anyhow::Result<Self> {
-        let origin = validate_origin(gateway_origin, mode)?;
+        let origin = validate_origin(gateway_origin, "object-write gateway", mode)?;
         let client = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_gzip()
@@ -1174,38 +1223,164 @@ impl ObjectWriteCredentialRegistrar for ObjectWriteCredentialHttpRegistrar {
     }
 }
 
+/// A19-signed reader for this Node's own writer authority.
+///
+/// It targets the *Control* management origin, not the ObjectWrite Gateway:
+/// the `object_write_authorities` row and the `owa1_` derivation both live in
+/// Control, and the Node authenticates here with the same per-Node credential
+/// it uses for every other `/v1/internal/runtime/...` call.
+pub(crate) struct ObjectWriteWriterAuthorityHttpReader {
+    origin: reqwest::Url,
+    signer: Ed25519RequestSigner,
+    client: reqwest::blocking::Client,
+}
+
+impl std::fmt::Debug for ObjectWriteWriterAuthorityHttpReader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ObjectWriteWriterAuthorityHttpReader")
+            .field("origin", &self.origin)
+            .field("signer", &self.signer)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ObjectWriteWriterAuthorityHttpReader {
+    pub(crate) fn for_production(
+        control_plane_origin: &str,
+        signer: Ed25519RequestSigner,
+    ) -> anyhow::Result<Self> {
+        Self::new(control_plane_origin, signer, TransportMode::ProductionHttps)
+    }
+
+    #[cfg(test)]
+    fn for_loopback_test(
+        control_plane_origin: &str,
+        signer: Ed25519RequestSigner,
+    ) -> anyhow::Result<Self> {
+        Self::new(control_plane_origin, signer, TransportMode::LoopbackTest)
+    }
+
+    fn new(
+        control_plane_origin: &str,
+        signer: Ed25519RequestSigner,
+        mode: TransportMode,
+    ) -> anyhow::Result<Self> {
+        let origin = validate_origin(control_plane_origin, "Control", mode)?;
+        let client = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
+            .build()?;
+        Ok(Self {
+            origin,
+            signer,
+            client,
+        })
+    }
+}
+
+impl ObjectWriteWriterAuthorityResolver for ObjectWriteWriterAuthorityHttpReader {
+    fn read(
+        &self,
+        session: &SessionBinding,
+        deadline: Instant,
+    ) -> Result<ObjectWriteWriterAuthorityStateV1, ObjectWriteWriterAuthorityReadFailure> {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(ObjectWriteWriterAuthorityReadFailure::Timeout)?;
+        let request = ObjectWriteWriterAuthorityRead {
+            version: ContractVersion::V1,
+            session: session.clone(),
+        };
+        let body = encode_object_write_writer_authority_read(&request)
+            .map_err(|_| ObjectWriteWriterAuthorityReadFailure::MalformedResponse)?;
+        let proof = self.signer.sign(
+            OBJECT_WRITE_GATEWAY_METHOD,
+            OBJECT_WRITE_WRITER_AUTHORITY_READ_PATH,
+            &body,
+        );
+        let url = self
+            .origin
+            .join(OBJECT_WRITE_WRITER_AUTHORITY_READ_PATH)
+            .expect("a validated origin accepts the fixed authority read path");
+        let response = self
+            .client
+            .post(url)
+            .timeout(remaining)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                OBJECT_WRITE_CREDENTIAL_REGISTRATION_CONTENT_TYPE,
+            )
+            .header(
+                reqwest::header::ACCEPT,
+                OBJECT_WRITE_CREDENTIAL_REGISTRATION_CONTENT_TYPE,
+            )
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .header(NODE_CREDENTIAL_ID_HEADER, proof.credential_id)
+            .header(NODE_PUBLIC_KEY_SPKI_HEADER, proof.public_key_spki)
+            .header(NODE_SIGNATURE_HEADER, proof.signature)
+            .body(body)
+            .send();
+        let response = match response {
+            Ok(response) => response,
+            Err(error) if error.is_timeout() => {
+                return Err(ObjectWriteWriterAuthorityReadFailure::Timeout)
+            }
+            Err(_) => return Err(ObjectWriteWriterAuthorityReadFailure::Connection),
+        };
+        let status = response.status().as_u16();
+        if status != 200 {
+            return Err(ObjectWriteWriterAuthorityReadFailure::Closed { status });
+        }
+        let body = response
+            .bytes()
+            .map_err(|_| ObjectWriteWriterAuthorityReadFailure::Connection)?;
+        if body.len() > OBJECT_WRITE_WRITER_AUTHORITY_VIEW_MAX_WIRE_BYTES {
+            return Err(ObjectWriteWriterAuthorityReadFailure::MalformedResponse);
+        }
+        let view = decode_object_write_writer_authority_view(&body)
+            .map_err(|_| ObjectWriteWriterAuthorityReadFailure::MalformedResponse)?;
+        if view.session != *session {
+            return Err(ObjectWriteWriterAuthorityReadFailure::SessionMismatch);
+        }
+        Ok(view.authority)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TransportMode {
     ProductionHttps,
     LoopbackTest,
 }
 
-fn validate_origin(input: &str, mode: TransportMode) -> anyhow::Result<reqwest::Url> {
+fn validate_origin(
+    input: &str,
+    subject: &'static str,
+    mode: TransportMode,
+) -> anyhow::Result<reqwest::Url> {
     let url = reqwest::Url::parse(input)?;
     anyhow::ensure!(
         url.username().is_empty() && url.password().is_none(),
-        "object-write gateway origin has userinfo"
+        "{subject} origin has userinfo"
     );
-    anyhow::ensure!(
-        url.query().is_none(),
-        "object-write gateway origin has a query"
-    );
-    anyhow::ensure!(
-        url.fragment().is_none(),
-        "object-write gateway origin has a fragment"
-    );
-    anyhow::ensure!(url.path() == "/", "object-write gateway origin has a path");
+    anyhow::ensure!(url.query().is_none(), "{subject} origin has a query");
+    anyhow::ensure!(url.fragment().is_none(), "{subject} origin has a fragment");
+    anyhow::ensure!(url.path() == "/", "{subject} origin has a path");
     match mode {
         TransportMode::ProductionHttps => anyhow::ensure!(
             url.scheme() == "https",
-            "production object-write gateway origin must use HTTPS"
+            "production {subject} origin must use HTTPS"
         ),
         TransportMode::LoopbackTest => anyhow::ensure!(
             url.scheme() == "http"
                 && url
                     .host_str()
                     .is_some_and(|host| matches!(host, "127.0.0.1" | "::1" | "localhost")),
-            "test object-write gateway origin must be loopback HTTP"
+            "test {subject} origin must be loopback HTTP"
         ),
     }
     Ok(url)
@@ -1661,13 +1836,23 @@ impl ObjectWriteCredentialPort for RecordingObjectWriteCredentials {
 }
 
 /// Production [`ObjectWriteCredentialPort`]: one Node state directory, the
-/// installed A19 Node signer, and the ObjectWrite Gateway registration route.
+/// installed A19 Node signer, the Control writer-authority read and the
+/// ObjectWrite Gateway registration route.
+///
+/// The writer authority ID is never configuration. Control derives it from the
+/// Node ID, the fleet deployment writes one shared worker environment, and a
+/// local re-derivation would duplicate Control's rule and could drift, so this
+/// port asks Control for it and treats the answer as the only authority.
 pub struct NodeObjectWriteCredentials {
     state_directory: PathBuf,
     gateway_origin: String,
-    writer_authority_id: Id,
     node_signer: Ed25519RequestSigner,
     registrar: Arc<dyn ObjectWriteCredentialRegistrar>,
+    authority_reader: Arc<dyn ObjectWriteWriterAuthorityResolver>,
+    /// The one authority resolved for the current Agent session. A different
+    /// session re-reads, because a credential is session bound and a
+    /// replacement Agent must not inherit a stale answer.
+    resolved_authority: std::sync::Mutex<Option<(SessionBinding, Id)>>,
 }
 
 impl std::fmt::Debug for NodeObjectWriteCredentials {
@@ -1676,19 +1861,19 @@ impl std::fmt::Debug for NodeObjectWriteCredentials {
             .debug_struct("NodeObjectWriteCredentials")
             .field("state_directory", &self.state_directory)
             .field("gateway_origin", &self.gateway_origin)
-            .field("writer_authority_id", &self.writer_authority_id)
+            .field("resolved_authority", &self.resolved_authority)
             .finish_non_exhaustive()
     }
 }
 
 impl NodeObjectWriteCredentials {
-    /// Composes the production path. `gateway_origin` must be a bare HTTPS
-    /// origin; it is validated here so a misconfigured Node fails at startup
-    /// rather than at its first grant.
+    /// Composes the production path. `gateway_origin` and `control_plane_origin`
+    /// must both be bare HTTPS origins; they are validated here so a
+    /// misconfigured Node fails at startup rather than at its first grant.
     pub fn for_production(
         state_directory: PathBuf,
         gateway_origin: &str,
-        writer_authority_id: Id,
+        control_plane_origin: &str,
         node_signer: Ed25519RequestSigner,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
@@ -1696,34 +1881,89 @@ impl NodeObjectWriteCredentials {
             "object-write credential state directory must be absolute"
         );
         let registrar = ObjectWriteCredentialHttpRegistrar::for_production(gateway_origin)?;
+        let authority_reader = ObjectWriteWriterAuthorityHttpReader::for_production(
+            control_plane_origin,
+            node_signer.clone(),
+        )?;
         Ok(Self {
             state_directory,
             // Keep the exact configured origin: the serving process must be
             // told the same one this Node registered against.
             gateway_origin: gateway_origin.to_owned(),
-            writer_authority_id,
             node_signer,
             registrar: Arc::new(registrar),
+            authority_reader: Arc::new(authority_reader),
+            resolved_authority: std::sync::Mutex::new(None),
         })
     }
 
-    /// Same composition against an in-test Control. The registrar is real; only
-    /// the peer it talks to is supplied by the caller.
+    /// Same composition against an in-test Control. The registrar and the
+    /// authority reader are real; only the peer they talk to is supplied by the
+    /// caller.
     #[cfg(test)]
     pub(crate) fn with_registrar_for_test(
         state_directory: PathBuf,
         gateway_origin: &str,
-        writer_authority_id: Id,
         node_signer: Ed25519RequestSigner,
         registrar: Arc<dyn ObjectWriteCredentialRegistrar>,
+        authority_reader: Arc<dyn ObjectWriteWriterAuthorityResolver>,
     ) -> Self {
         Self {
             state_directory,
             gateway_origin: gateway_origin.to_owned(),
-            writer_authority_id,
             node_signer,
             registrar,
+            authority_reader,
+            resolved_authority: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The writer authority this Agent session's credentials belong to, read
+    /// from Control once per session.
+    ///
+    /// Every non-`Open` answer and every unsettled read fails closed. There is
+    /// deliberately no fallback: a configured, derived or previous-session ID
+    /// would either duplicate Control's derivation or publish under a writer
+    /// Control has already cut off.
+    fn session_writer_authority_id(
+        &self,
+        session: &SessionBinding,
+        deadline: Instant,
+    ) -> Result<Id, ObjectWriteCredentialError> {
+        // A plain blocking mutex in blocking code: no `.await` crosses it. It
+        // is held across the read so exactly one read happens per session even
+        // when two attachments converge at once; `establish` is already
+        // serialized per Node by the credential-directory `flock`, so this adds
+        // no new contention.
+        let mut resolved = self
+            .resolved_authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((cached_session, writer_authority_id)) = resolved.as_ref() {
+            if cached_session == session {
+                return Ok(writer_authority_id.clone());
+            }
+        }
+        let state = self
+            .authority_reader
+            .read(session, deadline)
+            .map_err(ObjectWriteCredentialError::WriterAuthorityUnresolved)?;
+        let writer_authority_id = match &state {
+            ObjectWriteWriterAuthorityStateV1::Open {
+                writer_authority_id,
+            } => writer_authority_id.clone(),
+            ObjectWriteWriterAuthorityStateV1::Absent => {
+                return Err(ObjectWriteCredentialError::WriterAuthorityAbsent)
+            }
+            ObjectWriteWriterAuthorityStateV1::CutoffPending { .. }
+            | ObjectWriteWriterAuthorityStateV1::CutoffComplete { .. } => {
+                return Err(ObjectWriteCredentialError::WriterAuthorityClosed {
+                    state: state.state_name(),
+                })
+            }
+        };
+        *resolved = Some((session.clone(), writer_authority_id.clone()));
+        Ok(writer_authority_id)
     }
 }
 
@@ -1736,15 +1976,17 @@ impl ObjectWriteCredentialPort for NodeObjectWriteCredentials {
         attachment_epoch: FenceEpoch,
         deadline: Instant,
     ) -> Result<ObjectWriteCredentialReference, ObjectWriteCredentialUnavailable> {
+        let failed = |error: &ObjectWriteCredentialError| {
+            ObjectWriteCredentialUnavailable::new(volume_id, attachment_id, attachment_epoch, error)
+        };
         let scope = ObjectWriteCredentialScope {
             session: session.clone(),
-            writer_authority_id: self.writer_authority_id.clone(),
+            writer_authority_id: self
+                .session_writer_authority_id(session, deadline)
+                .map_err(|error| failed(&error))?,
             volume_id: volume_id.clone(),
             attachment_id: attachment_id.clone(),
             attachment_epoch,
-        };
-        let failed = |error: &ObjectWriteCredentialError| {
-            ObjectWriteCredentialUnavailable::new(volume_id, attachment_id, attachment_epoch, error)
         };
         let store = ObjectWriteCredentialStore::open(&self.state_directory)
             .map_err(|error| failed(&error))?;
@@ -1909,6 +2151,56 @@ mod tests {
                 credential: registration.credential.clone(),
                 registered_at_unix_ms: UnixMillis::new(1_720_000_000_000).unwrap(),
             })
+        }
+    }
+
+    /// One assigned writer authority in the exact shape Control derives:
+    /// the `owa1_` prefix plus 64 lowercase hex digits.
+    fn assigned_writer_authority_id() -> Id {
+        id(&format!("owa1_{}", "5b".repeat(32)))
+    }
+
+    /// Control's writer-authority answer for one Node, with a read log so a
+    /// test can prove resolution is once per Agent session rather than once per
+    /// attachment.
+    struct RecordingAuthorityReader {
+        answer: Result<ObjectWriteWriterAuthorityStateV1, ObjectWriteWriterAuthorityReadFailure>,
+        reads: Mutex<Vec<SessionBinding>>,
+    }
+
+    impl RecordingAuthorityReader {
+        fn answering(
+            answer: Result<
+                ObjectWriteWriterAuthorityStateV1,
+                ObjectWriteWriterAuthorityReadFailure,
+            >,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                answer,
+                reads: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn open() -> Arc<Self> {
+            Self::answering(Ok(ObjectWriteWriterAuthorityStateV1::Open {
+                writer_authority_id: assigned_writer_authority_id(),
+            }))
+        }
+
+        fn reads(&self) -> Vec<SessionBinding> {
+            self.reads.lock().unwrap().clone()
+        }
+    }
+
+    impl ObjectWriteWriterAuthorityResolver for RecordingAuthorityReader {
+        fn read(
+            &self,
+            session: &SessionBinding,
+            _deadline: Instant,
+        ) -> Result<ObjectWriteWriterAuthorityStateV1, ObjectWriteWriterAuthorityReadFailure>
+        {
+            self.reads.lock().unwrap().push(session.clone());
+            self.answer.clone()
         }
     }
 
@@ -2854,16 +3146,30 @@ mod tests {
     }
 
     fn port_for_test(root: &Path, control: Arc<ReplayingControl>) -> NodeObjectWriteCredentials {
+        port_with_authority(root, control, RecordingAuthorityReader::open())
+    }
+
+    fn port_with_authority(
+        root: &Path,
+        control: Arc<ReplayingControl>,
+        authority: Arc<RecordingAuthorityReader>,
+    ) -> NodeObjectWriteCredentials {
         NodeObjectWriteCredentials::with_registrar_for_test(
             root.to_path_buf(),
             "https://gateway.invalid",
-            id("writer_a"),
             node_signer(),
             control,
+            authority,
         )
     }
 
+    /// Private-key files under the credential namespace. A namespace that was
+    /// never created counts as none: it is the stronger form of "no key was
+    /// minted", so a fail-closed assertion must accept it.
     fn private_key_files(root: &Path) -> Vec<String> {
+        if !credential_directory(root).exists() {
+            return Vec::new();
+        }
         directory_entries(root)
             .into_iter()
             .filter(|name| {
@@ -3174,5 +3480,301 @@ mod tests {
             verifier_accepted,
             "the Gateway's own verifier must accept the signature this credential produced"
         );
+    }
+
+    /// The authority ID is derived from the Node ID, so it cannot travel in the
+    /// fleet-shared worker environment. It is read from Control once for the
+    /// Agent session, not once per attachment: two attachments in one session
+    /// must produce exactly one read, and a replacement session must re-read
+    /// rather than inherit the previous answer.
+    #[test]
+    fn the_writer_authority_is_read_once_per_agent_session_not_per_attachment() {
+        let root = TempDir::new().unwrap();
+        let control = Arc::new(ReplayingControl::default());
+        let authority = RecordingAuthorityReader::open();
+        let port = port_with_authority(root.path(), control, Arc::clone(&authority));
+        let first_session = session(7);
+        let replacement_session = session(8);
+
+        for attachment in ["attachment_a", "attachment_b"] {
+            port.establish(
+                &first_session,
+                &id("volume_a"),
+                &id(attachment),
+                FenceEpoch::new(9).unwrap(),
+                deadline(),
+            )
+            .expect("an open writer authority credentials every attachment of its session");
+        }
+        assert_eq!(
+            authority.reads(),
+            vec![first_session.clone()],
+            "two attachments of one session must not each ask Control",
+        );
+
+        port.establish(
+            &replacement_session,
+            &id("volume_a"),
+            &id("attachment_a"),
+            FenceEpoch::new(10).unwrap(),
+            deadline(),
+        )
+        .expect("a replacement session resolves its own authority");
+        assert_eq!(
+            authority.reads(),
+            vec![first_session, replacement_session],
+            "a replacement Agent session must re-read rather than inherit",
+        );
+    }
+
+    /// An operator has not opened this Host's authority yet. There is nothing to
+    /// register under and nothing to fall back to, so no key may be minted and
+    /// no registration may be attempted.
+    #[test]
+    fn an_absent_writer_authority_fails_the_credential_path_closed() {
+        let root = TempDir::new().unwrap();
+        let control = Arc::new(ReplayingControl::default());
+        let absent =
+            RecordingAuthorityReader::answering(Ok(ObjectWriteWriterAuthorityStateV1::Absent));
+        let port = port_with_authority(root.path(), Arc::clone(&control), absent);
+        let scope = scope();
+
+        let error = port
+            .establish(
+                &scope.session,
+                &scope.volume_id,
+                &scope.attachment_id,
+                scope.attachment_epoch,
+                deadline(),
+            )
+            .unwrap_err();
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("no object-write writer authority"),
+            "an absent authority must name the missing provisioning step: {rendered}"
+        );
+        assert!(
+            control.accepted_bodies().is_empty(),
+            "an absent authority must not reach Control's registration route"
+        );
+        assert!(
+            private_key_files(root.path()).is_empty(),
+            "an absent authority must not mint an attachment key"
+        );
+
+        // Calibration: the same root, control and attachment succeed as soon as
+        // Control reports an open authority, so the refusal above is the
+        // authority state and not a broken establish path.
+        let opened = port_with_authority(
+            root.path(),
+            Arc::clone(&control),
+            RecordingAuthorityReader::open(),
+        );
+        opened
+            .establish(
+                &scope.session,
+                &scope.volume_id,
+                &scope.attachment_id,
+                scope.attachment_epoch,
+                deadline(),
+            )
+            .expect("an open authority credentials this exact attachment");
+        assert_eq!(control.accepted_bodies().len(), 1);
+    }
+
+    /// A cut-off writer may never take a new credential: its accepted-sequence
+    /// prefix is being sealed, and publishing under it after the cutoff is
+    /// exactly the fence this authority exists to enforce.
+    #[test]
+    fn a_cut_off_writer_authority_fails_the_credential_path_closed() {
+        for state in [
+            ObjectWriteWriterAuthorityStateV1::CutoffPending {
+                writer_authority_id: assigned_writer_authority_id(),
+            },
+            ObjectWriteWriterAuthorityStateV1::CutoffComplete {
+                writer_authority_id: assigned_writer_authority_id(),
+            },
+        ] {
+            let expected = state.state_name();
+            let root = TempDir::new().unwrap();
+            let control = Arc::new(ReplayingControl::default());
+            let port = port_with_authority(
+                root.path(),
+                Arc::clone(&control),
+                RecordingAuthorityReader::answering(Ok(state)),
+            );
+            let scope = scope();
+
+            let error = port
+                .establish(
+                    &scope.session,
+                    &scope.volume_id,
+                    &scope.attachment_id,
+                    scope.attachment_epoch,
+                    deadline(),
+                )
+                .unwrap_err();
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains(expected),
+                "a {expected} authority must say so: {rendered}"
+            );
+            assert!(
+                control.accepted_bodies().is_empty(),
+                "a {expected} authority must not reach Control's registration route"
+            );
+            assert!(
+                private_key_files(root.path()).is_empty(),
+                "a {expected} authority must not mint an attachment key"
+            );
+        }
+    }
+
+    /// An unsettled read is not an answer. It must not be cached, guessed or
+    /// replaced by a locally derived ID, and it must leave no local residue.
+    #[test]
+    fn an_unsettled_writer_authority_read_leaves_no_credential_and_no_cached_answer() {
+        let root = TempDir::new().unwrap();
+        let control = Arc::new(ReplayingControl::default());
+        let refusing = RecordingAuthorityReader::answering(Err(
+            ObjectWriteWriterAuthorityReadFailure::Closed { status: 403 },
+        ));
+        let port = port_with_authority(root.path(), Arc::clone(&control), Arc::clone(&refusing));
+        let scope = scope();
+
+        for _ in 0..2 {
+            let error = port
+                .establish(
+                    &scope.session,
+                    &scope.volume_id,
+                    &scope.attachment_id,
+                    scope.attachment_epoch,
+                    deadline(),
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("status 403"),
+                "the closed status must reach the operator: {error}"
+            );
+        }
+        assert_eq!(
+            refusing.reads().len(),
+            2,
+            "a failed read may not be cached as an answer"
+        );
+        assert!(control.accepted_bodies().is_empty());
+        assert!(private_key_files(root.path()).is_empty());
+    }
+
+    /// The production reader signs the exact method, path and canonical body
+    /// with the A19 Node credential, and refuses a view bound to any other
+    /// session.
+    #[test]
+    fn the_http_authority_reader_signs_its_exact_request_and_refuses_another_session() {
+        let served_session = session(7);
+        let other_session = session(8);
+        let view_body = cats_api::object_write_gateway::encode_object_write_writer_authority_view(
+            &cats_api::object_write_gateway::ObjectWriteWriterAuthorityView {
+                version: ContractVersion::V1,
+                session: other_session,
+                authority: ObjectWriteWriterAuthorityStateV1::Open {
+                    writer_authority_id: assigned_writer_authority_id(),
+                },
+            },
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let served = view_body.clone();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut headers = HashMap::new();
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                let (name, value) = line.trim_end().split_once(':').unwrap();
+                let name = name.to_ascii_lowercase();
+                if name == "content-length" {
+                    content_length = value.trim().parse().unwrap();
+                }
+                headers.insert(name, value.trim().to_owned());
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let mut stream = reader.into_inner();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n",
+                        served.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            stream.write_all(&served).unwrap();
+            (request_line, headers, body)
+        });
+
+        let reader = ObjectWriteWriterAuthorityHttpReader::for_loopback_test(
+            &format!("http://{address}/"),
+            node_signer(),
+        )
+        .unwrap();
+        let failure = reader.read(&served_session, deadline()).unwrap_err();
+        let (request_line, headers, body) = server.join().unwrap();
+
+        assert_eq!(
+            failure,
+            ObjectWriteWriterAuthorityReadFailure::SessionMismatch,
+            "a view for another session is never this Node's answer"
+        );
+        assert!(
+            request_line.starts_with(&format!("POST {OBJECT_WRITE_WRITER_AUTHORITY_READ_PATH} "))
+        );
+        assert_eq!(
+            body,
+            encode_object_write_writer_authority_read(&ObjectWriteWriterAuthorityRead {
+                version: ContractVersion::V1,
+                session: served_session,
+            })
+            .unwrap(),
+            "the request body is the canonical read for this Node's own session"
+        );
+        verify_request_proof(
+            OBJECT_WRITE_GATEWAY_METHOD,
+            OBJECT_WRITE_WRITER_AUTHORITY_READ_PATH,
+            &body,
+            headers.get(NODE_CREDENTIAL_ID_HEADER).unwrap(),
+            headers.get(NODE_PUBLIC_KEY_SPKI_HEADER).unwrap(),
+            headers.get(NODE_SIGNATURE_HEADER).unwrap(),
+        )
+        .expect("the A19 node proof covers the exact authority-read path and body");
+    }
+
+    #[test]
+    fn a_production_authority_reader_refuses_a_plaintext_origin() {
+        assert!(ObjectWriteWriterAuthorityHttpReader::for_production(
+            "http://127.0.0.1:9/",
+            node_signer()
+        )
+        .is_err());
+        assert!(ObjectWriteWriterAuthorityHttpReader::for_production(
+            "https://control.example/v1",
+            node_signer()
+        )
+        .is_err());
+        assert!(ObjectWriteWriterAuthorityHttpReader::for_production(
+            "https://control.example/",
+            node_signer()
+        )
+        .is_ok());
     }
 }

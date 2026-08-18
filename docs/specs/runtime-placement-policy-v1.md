@@ -225,7 +225,7 @@ absent/expired，再把identity置为retired；retired identity不能update/rota
 attachment-scoped object-write credential注册时被检查的那一行。请求只声明object-store一侧的binding；
 Host provider scope、`immutable_host_id`、`node_id`以及空的accepted-sequence初始状态全部由已锁定的
 provisioned identity派生，caller不能提交。`writer_authority_id`同样由Control按下式派生并回传，
-caller不能选择，Node也无法自行推导，必须由operator配置给Node：
+caller不能选择，Node也无法自行推导：
 
 ```text
 writer_authority_id = "owa1_" || lowercase_hex(SHA-256(
@@ -240,6 +240,30 @@ writer_authority_id = "owa1_" || lowercase_hex(SHA-256(
 时固定返回并持久`authority_precondition_failed`。因此changed binding不会覆盖current authority，
 已cutoff的authority也不会被re-apply重开；派生ID已被别处占用时同样fail closed而不是撞primary key。
 同一`apply_id`的exact replay按§3.4返回原始结果与同一`writer_authority_id`。
+
+`writer_authority_id`由`node_id`派生，因此它是per-Node值，而fleet worker deployment只写一份共享
+environment，所以它不能是Node配置；Node也不允许本地重算该派生式（会复制Control的规则并可能drift）。
+Node改为用自己的A19 credential读回本Node的authority：
+
+```text
+POST /v1/internal/runtime/object-write-authority-reads
+request  = { version, session }
+response = { version, session, authority }
+authority.state ∈ { absent, open, cutoff_pending, cutoff_complete }
+```
+
+request只声明asking Node自己的current Agent session：没有任何字段可以声明authority ID或另一个Node。
+Control由已认证的A19 credential选定Node，并要求request里的session与该credential的exact current、未过期
+AgentSession逐字相等；credential unknown/superseded、session属于另一个Node、session已被replacement session
+取代或lease已过期，一律返回`permission_denied`且不泄露任何authority ID。route envelope与其余
+`/v1/internal/runtime/...`一致：method `POST`、query缺席、`Content-Type`/`Accept`恰好
+`application/json`、`Content-Encoding`与`Authorization`缺席、body上界4096 octets，refusal envelope沿用
+object-write credential registration route的`ErrorBody`，Node只按status分类。
+
+只有`open`携带可注册的`writer_authority_id`。`absent`是typed answer（operator尚未
+`object-write-authority provision`），不是error；`cutoff_pending`/`cutoff_complete`携带ID但不可注册。
+Node每个Agent session解析一次并缓存该session的答案；`absent`、任一cutoff状态、以及read未settle都让该
+attachment的credential路径fail closed，绝不回落到配置值、上一个session的答案或本地派生值。
 
 route envelope固定为：exact path、method `POST`、query完全缺席（含裸`?`）、恰好一个无parameter
 `Content-Type: application/json`、`Content-Encoding`缺席、body为无BOM的UTF-8 closed JSON且最大65536
@@ -262,8 +286,9 @@ cats admin runtime-node object-write-authority id <same binding flags>
 `object-write-authority provision`与`provision`/`policy apply`一样由CLI生成`apply_id`并按mutation
 digest建立settled index，因此重复运行同一命令重放原receipt而不是发第二个必被拒的apply；它打印Control
 回传的`writer_authority_id`，并在settle前用同一派生式验证该ID确实属于本次binding。
-`object-write-authority id`只做同一离线派生并打印裸ID（供`--object-write-writer-authority-id`使用），
-不读取local authority state、不需要credential、也不发送任何请求。
+`object-write-authority id`只做同一离线派生并打印裸ID（供operator核对Control所assign的binding），
+不读取local authority state、不需要credential、也不发送任何请求。Node不接受该ID作为配置：它通过
+`POST /v1/internal/runtime/object-write-authority-reads`用自己的A19 credential读回本Node的authority。
 
 每个上述命令只选择一种认证来源。deployment provisioner同时提供
 `--deployment-id <id> --provisioner-credential-id <id>
