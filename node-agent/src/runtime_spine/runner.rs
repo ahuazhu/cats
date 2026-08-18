@@ -3,9 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::panic::{catch_unwind, AssertUnwindSafe, Location};
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -391,6 +389,80 @@ pub struct RuntimeDesiredEffectContext {
     node_global_effect_gate: Arc<NodeGlobalEffectGate>,
     node_global_effect_open: Arc<AtomicBool>,
     effect_worker_id: u64,
+}
+
+/// The blocking boundary a per-Cat effect worker most recently entered.
+///
+/// A worker that never returns from `apply` reports only `EffectDeadlineExceeded`
+/// with a Cat ID, and the runner then re-reports that same abandoned worker every
+/// cycle, so a Host wedges permanently with nothing in the logs. No thread is
+/// visibly in a syscall either: every candidate boundary blocks on a futex, so
+/// `/proc` cannot distinguish them. Recording the section makes an abandoned
+/// worker name its own location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeEffectSection {
+    Running,
+    NodeGlobalEffectGate,
+    KernelNbdAllocator,
+    NetworkAllocator,
+    VolumeAuthority,
+    SystemdUnit,
+    BlockdHandshake,
+}
+
+impl RuntimeEffectSection {
+    const ALL: [Self; 7] = [
+        Self::Running,
+        Self::NodeGlobalEffectGate,
+        Self::KernelNbdAllocator,
+        Self::NetworkAllocator,
+        Self::VolumeAuthority,
+        Self::SystemdUnit,
+        Self::BlockdHandshake,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::NodeGlobalEffectGate => "node-global effect gate",
+            Self::KernelNbdAllocator => "kernel-NBD allocator",
+            Self::NetworkAllocator => "guest-network allocator",
+            Self::VolumeAuthority => "Volume authority",
+            Self::SystemdUnit => "systemd unit",
+            Self::BlockdHandshake => "blockd handshake",
+        }
+    }
+}
+
+impl std::fmt::Display for RuntimeEffectSection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+/// Slots per Host, indexed by worker id. The runner reads a slot while its
+/// worker is still blocked, so this must never need a lock the worker could
+/// hold; a plain relaxed-store table is enough for a diagnostic. Worker ids
+/// increment, so a wrap only ever mislabels a long-abandoned worker.
+const EFFECT_SECTION_SLOTS: usize = 64;
+static EFFECT_SECTIONS: [AtomicUsize; EFFECT_SECTION_SLOTS] =
+    [const { AtomicUsize::new(0) }; EFFECT_SECTION_SLOTS];
+
+fn enter_effect_section(worker_id: u64, section: RuntimeEffectSection) {
+    let index = RuntimeEffectSection::ALL
+        .iter()
+        .position(|candidate| *candidate == section)
+        .unwrap_or(0);
+    EFFECT_SECTIONS[(worker_id as usize) % EFFECT_SECTION_SLOTS].store(index, Ordering::Release);
+}
+
+fn current_effect_section(worker_id: u64) -> RuntimeEffectSection {
+    let index =
+        EFFECT_SECTIONS[(worker_id as usize) % EFFECT_SECTION_SLOTS].load(Ordering::Acquire);
+    RuntimeEffectSection::ALL
+        .get(index)
+        .copied()
+        .unwrap_or(RuntimeEffectSection::Running)
 }
 
 #[derive(Debug, Default)]
@@ -908,7 +980,29 @@ impl RuntimeDesiredEffectContext {
     /// logical ownership remains attached to this worker through the final
     /// provider postcondition even if the returned marker leaves scope.
     pub(crate) fn lock_node_global_effect(&self) -> anyhow::Result<RuntimeNodeGlobalEffectPermit> {
-        self.node_global_effect_gate.acquire(self)
+        self.enter_section(RuntimeEffectSection::NodeGlobalEffectGate);
+        let permit = self.node_global_effect_gate.acquire(self);
+        self.enter_section(RuntimeEffectSection::Running);
+        permit
+    }
+
+    /// Record the blocking boundary this worker is entering, so an abandoned
+    /// worker names its own location instead of only its Cat.
+    pub(crate) fn enter_section(&self, section: RuntimeEffectSection) {
+        enter_effect_section(self.effect_worker_id, section);
+    }
+
+    /// Run `body` inside `section`, restoring the previous section afterwards.
+    pub(crate) fn in_section<T>(
+        &self,
+        section: RuntimeEffectSection,
+        body: impl FnOnce() -> T,
+    ) -> T {
+        let previous = current_effect_section(self.effect_worker_id);
+        self.enter_section(section);
+        let value = body();
+        self.enter_section(previous);
+        value
     }
 
     #[cfg(test)]
@@ -2296,6 +2390,9 @@ struct CatEffectCompletion {
 
 struct CatEffectWorker {
     cancellation: RuntimeInventoryScanCancellation,
+    /// Identifies this worker's slot in the effect-section table, so an
+    /// abandoned worker can be asked where it is while it is still blocked.
+    worker_id: u64,
     deadline: Instant,
     timed_out: bool,
     discard_result: bool,
@@ -2426,6 +2523,7 @@ impl CatEffectWorkers {
             cat_id.clone(),
             CatEffectWorker {
                 cancellation,
+                worker_id: effect_worker_id,
                 deadline,
                 timed_out: false,
                 discard_result: false,
@@ -2481,15 +2579,20 @@ impl CatEffectWorkers {
             let wait_deadline =
                 task_deadline.map_or(poll_deadline, |deadline| deadline.min(poll_deadline));
             if Instant::now() >= wait_deadline {
-                if let Some(cat_id) = self.mark_expired() {
-                    return Ok(CatEffectWait::DeadlineExceeded { cat_id });
+                if let Some((cat_id, worker_id)) = self.mark_expired() {
+                    return Ok(CatEffectWait::DeadlineExceeded { cat_id, worker_id });
                 }
-                let cat_id = self.active.keys().next().cloned().ok_or_else(|| {
-                    RuntimeSpineRunError::WorkerStopped(
-                        "per-Cat Desired effect wait without an active worker".to_owned(),
-                    )
-                })?;
-                return Ok(CatEffectWait::AwaitingLateWorker { cat_id });
+                let (cat_id, worker_id) = self
+                    .active
+                    .iter()
+                    .next()
+                    .map(|(cat_id, worker)| (cat_id.clone(), worker.worker_id))
+                    .ok_or_else(|| {
+                        RuntimeSpineRunError::WorkerStopped(
+                            "per-Cat Desired effect wait without an active worker".to_owned(),
+                        )
+                    })?;
+                return Ok(CatEffectWait::AwaitingLateWorker { cat_id, worker_id });
             }
 
             let timer = tokio::time::sleep_until(tokio::time::Instant::from_std(wait_deadline));
@@ -2507,7 +2610,7 @@ impl CatEffectWorkers {
         }
     }
 
-    fn mark_expired(&mut self) -> Option<Id> {
+    fn mark_expired(&mut self) -> Option<(Id, u64)> {
         let now = Instant::now();
         let expired = self
             .active
@@ -2515,9 +2618,9 @@ impl CatEffectWorkers {
             .filter(|(_, worker)| {
                 !worker.timed_out && !worker.discard_result && now >= worker.deadline
             })
-            .map(|(cat_id, _)| cat_id.clone())
+            .map(|(cat_id, worker)| (cat_id.clone(), worker.worker_id))
             .collect::<Vec<_>>();
-        for cat_id in &expired {
+        for (cat_id, _) in &expired {
             if let Some(worker) = self.active.get_mut(cat_id) {
                 worker.timed_out = true;
                 worker.cancellation.cancel();
@@ -2595,9 +2698,11 @@ enum CatEffectWait {
     },
     DeadlineExceeded {
         cat_id: Id,
+        worker_id: u64,
     },
     AwaitingLateWorker {
         cat_id: Id,
+        worker_id: u64,
     },
     LateWorkerJoined {
         cat_id: Id,
@@ -3369,6 +3474,11 @@ impl RuntimeSpineRunner {
                     .pop_front()
                     .expect("nonempty Desired effect queue has a front");
                 let cat_id = desired.cat_id;
+                tracing::warn!(
+                    cat = %cat_id,
+                    reason = "the batch deadline passed while this Desired unit was still queued",
+                    "effect deadline exceeded",
+                );
                 self.require_refresh_after_cat_failure();
                 return Ok(Some(RuntimeSpineRunStep::EffectDeadlineExceeded { cat_id }));
             }
@@ -3518,11 +3628,26 @@ impl RuntimeSpineRunner {
                         }
                     }
                 }
-                CatEffectWait::DeadlineExceeded { cat_id } => {
+                CatEffectWait::DeadlineExceeded { cat_id, worker_id } => {
+                    tracing::warn!(
+                        cat = %cat_id,
+                        reason = "this worker exceeded its bounded effect step",
+                        section = %current_effect_section(worker_id),
+                        "effect deadline exceeded",
+                    );
                     self.require_refresh_after_cat_failure();
                     return Ok(Some(RuntimeSpineRunStep::EffectDeadlineExceeded { cat_id }));
                 }
-                CatEffectWait::AwaitingLateWorker { cat_id } => {
+                CatEffectWait::AwaitingLateWorker { cat_id, worker_id } => {
+                    // The worker is still inside `apply`. Naming its section is
+                    // the only way to tell a slow provider call from a Host that
+                    // has wedged on a lock, because both look identical here.
+                    tracing::warn!(
+                        cat = %cat_id,
+                        reason = "an abandoned worker from an earlier batch has not returned",
+                        section = %current_effect_section(worker_id),
+                        "effect deadline exceeded",
+                    );
                     return Ok(Some(RuntimeSpineRunStep::EffectDeadlineExceeded { cat_id }));
                 }
                 CatEffectWait::LateWorkerJoined { cat_id }
@@ -4302,6 +4427,61 @@ fn invalid_session(error: &RuntimeSpineError) -> bool {
 #[cfg(test)]
 mod tests {
     use std::ffi::CString;
+
+    /// A per-Cat worker that never returns from `apply` is re-reported every
+    /// cycle as `EffectDeadlineExceeded` with only a Cat ID, so a wedged Host
+    /// looks exactly like a slow one and no thread state distinguishes the
+    /// candidates — they all block on a futex. The section table must therefore
+    /// answer "where is that worker" while it is still blocked, and must keep
+    /// answering after the worker is abandoned.
+    #[test]
+    fn an_abandoned_worker_still_names_the_section_it_entered() {
+        let worker = 4_242_u64;
+        assert_eq!(
+            current_effect_section(worker),
+            RuntimeEffectSection::Running,
+            "an untouched slot reads as running, never as a stale boundary"
+        );
+
+        enter_effect_section(worker, RuntimeEffectSection::VolumeAuthority);
+        assert_eq!(
+            current_effect_section(worker),
+            RuntimeEffectSection::VolumeAuthority
+        );
+        // Reading is what the runner does from another thread while the worker
+        // is blocked, so it must not disturb the record.
+        assert_eq!(
+            current_effect_section(worker),
+            RuntimeEffectSection::VolumeAuthority,
+            "the section survives being read"
+        );
+
+        enter_effect_section(worker, RuntimeEffectSection::KernelNbdAllocator);
+        assert_eq!(
+            current_effect_section(worker),
+            RuntimeEffectSection::KernelNbdAllocator
+        );
+
+        // Distinct workers never mask each other within one slot generation.
+        let sibling = worker + 1;
+        enter_effect_section(sibling, RuntimeEffectSection::SystemdUnit);
+        assert_eq!(
+            current_effect_section(worker),
+            RuntimeEffectSection::KernelNbdAllocator
+        );
+        assert_eq!(
+            current_effect_section(sibling),
+            RuntimeEffectSection::SystemdUnit
+        );
+
+        // Every variant round-trips, so a new boundary cannot silently render
+        // as `running` and read as "not in a boundary".
+        for section in RuntimeEffectSection::ALL {
+            enter_effect_section(worker, section);
+            assert_eq!(current_effect_section(worker), section);
+            assert!(!section.name().is_empty());
+        }
+    }
 
     /// A refresh is the reconciler's only bridge back to a full scan, so a
     /// branch that keeps returning one livelocks the Cat. Production has hit
