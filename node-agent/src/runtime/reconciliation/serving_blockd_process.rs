@@ -1948,7 +1948,10 @@ impl ServingBlockdStartEffect {
         first_lease_expiry: cats_api::runtime_reconciliation::UnixMillis,
     ) -> anyhow::Result<VolumeRecord> {
         context.check_active()?;
-        let current = self.authority.load_volume(volume_id)?;
+        let current = context.in_section(
+            crate::runtime_spine::RuntimeEffectSection::VolumeAuthority,
+            || self.authority.load_volume(volume_id),
+        )?;
         anyhow::ensure!(
             retirement_authority_lease_is_monotonic(first, &current, first_lease_expiry),
             "serving PrepareDevice authority changed across process effect"

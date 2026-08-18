@@ -24,8 +24,8 @@ pub(crate) use desired_effect::{ProductionRuntimeDesiredEffect, RuntimeLaunchPor
 
 pub(crate) use runner::{
     effect_resource_owner_sealed, InventoryCoverageAggregator, RuntimeAssignedCatSet,
-    RuntimeEffectResourceOwner, RuntimeInventoryKeyRing, RuntimeNodeGlobalEffectPermit,
-    RuntimePhysicalReadContext,
+    RuntimeEffectResourceOwner, RuntimeEffectSection, RuntimeInventoryKeyRing,
+    RuntimeNodeGlobalEffectPermit, RuntimePhysicalReadContext,
 };
 pub use runner::{
     CompleteRuntimeInventory, RuntimeDesiredEffect, RuntimeDesiredEffectAdmission,
