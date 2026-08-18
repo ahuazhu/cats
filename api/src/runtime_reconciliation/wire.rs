@@ -4635,6 +4635,23 @@ fn runtime_node_authority_mutation_schema() -> Schema {
                     ),
                 ],
             ),
+            variant(
+                "provision_object_write_authority",
+                vec![
+                    field("expected_policy_revision", epoch()),
+                    field(
+                        "object_provider_scope",
+                        object(vec![
+                            field("provider", id()),
+                            field("partition", id()),
+                            field("account_id", id()),
+                            field("region", id()),
+                        ]),
+                    ),
+                    field("workload_principal_id", string(StringRule::AsciiText)),
+                    field("object_store_scope_id", string(StringRule::AsciiText)),
+                ],
+            ),
         ],
     )
 }
@@ -4660,10 +4677,12 @@ fn runtime_node_authority_apply_result_schema() -> Schema {
                 "policy_updated",
                 "credential_rotated",
                 "retired",
+                "object_write_authority_provisioned",
             ]),
         ),
         field("identity_state", closed(&["provisioned", "retired"])),
         field("policy_revision", epoch()),
+        field("writer_authority_id", nullable(id())),
     ])
 }
 
@@ -5699,6 +5718,9 @@ fn validate_runtime_node_authority_apply(
             }
         }
         RuntimeNodeAuthorityMutation::Retire { .. } => {}
+        // Every field is context-free scalar-validated by the schema, and the
+        // Host side of the binding is deliberately absent from the request.
+        RuntimeNodeAuthorityMutation::ProvisionObjectWriteAuthority { .. } => {}
     }
     if let Some(candidate) = choose(candidates) {
         return Err(malformed(contract, candidate));
@@ -5729,7 +5751,23 @@ fn validate_runtime_node_authority_apply_result(
             result.identity_state == NodeIdentityState::Provisioned
         }
         RuntimeNodeAuthorityOutcome::Retired => result.identity_state == NodeIdentityState::Retired,
+        RuntimeNodeAuthorityOutcome::ObjectWriteAuthorityProvisioned => {
+            result.identity_state == NodeIdentityState::Provisioned
+        }
     };
+    // The assigned writer authority ID belongs to exactly one outcome, and it
+    // is always the closed shape Control derives. A result claiming any other
+    // outcome may not smuggle one in.
+    let valid = valid
+        && match (result.outcome, result.writer_authority_id.as_ref()) {
+            (
+                RuntimeNodeAuthorityOutcome::ObjectWriteAuthorityProvisioned,
+                Some(writer_authority_id),
+            ) => valid_object_write_writer_authority_id(writer_authority_id.as_str()),
+            (RuntimeNodeAuthorityOutcome::ObjectWriteAuthorityProvisioned, None) => false,
+            (_, Some(_)) => false,
+            (_, None) => true,
+        };
     if !valid {
         return Err(malformed(
             ContractName::RuntimeNodeAuthorityApplyResult,

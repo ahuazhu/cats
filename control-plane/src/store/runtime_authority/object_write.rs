@@ -13,12 +13,13 @@ use cats_api::object_write_gateway::{
     ObjectWriteQualificationUnprovenReasonV1,
 };
 use cats_api::runtime_reconciliation::{
-    AsciiText, ContractVersion, CredentialBinding, Id, NodeIdentityState, Sha256Digest, UnixMillis,
+    AsciiText, ContractVersion, CredentialBinding, Id, NodeIdentity, NodeIdentityState,
+    ProviderScope, Sha256Digest, UnixMillis, WireU64,
 };
 use cats_storage::object_write_authority::{
     accept_durable_object_write, advance_object_write_terminal_prefix,
     authorize_object_write_ingress, begin_object_writer_cutoff, classify_object_key_acceptance,
-    complete_object_write_terminal, complete_object_writer_cutoff,
+    complete_object_write_terminal, complete_object_writer_cutoff, empty_terminal_prefix_sha256,
     mark_object_write_provider_issued, mark_object_write_spool_durable,
     mark_terminal_object_write_spool_removed, register_object_write_credential,
     reject_object_write_before_accept, validate_object_put_attempt,
@@ -28,7 +29,7 @@ use cats_storage::object_write_authority::{
     ObjectWriteAuthority, ObjectWriteAuthorityError, ObjectWriteAuthorityState,
     ObjectWriteCredentialBinding, ObjectWriteCredentialRetirementCause, ObjectWriteCredentialState,
     ObjectWriteIngressAttempt, ObjectWriteIngressState, ObjectWriteRejectionReason,
-    StoredObjectWriteAttempt, TerminalObjectWriteSpool,
+    ObjectWriterIdentity, StoredObjectWriteAttempt, TerminalObjectWriteSpool,
 };
 use postgres::{Row, Transaction};
 
@@ -1160,6 +1161,147 @@ fn advance_terminal_prefix_in(
         advance_object_write_terminal_prefix(authority, &contiguous).map_err(authority_error)?;
     persist_authority(transaction, &updated)?;
     Ok(updated)
+}
+
+/// Open the one Host-scoped writer authority inside a caller-owned
+/// transaction, or refuse.
+///
+/// The caller owns A23 authentication, apply-ID replay and the Node's
+/// `node_identities` row lock; this seam owns the object-write table. Every
+/// Host fact and the whole accepted-sequence state are derived from that
+/// locked identity, so an operator apply can only state the object-store side
+/// of the binding.
+///
+/// One Host never holds two writer authorities. A Host that already has any
+/// authority row is refused, whether that row is `open` (already provisioned,
+/// possibly with a different binding) or closed (`cutoff_pending` /
+/// `cutoff_complete`). A cutoff therefore cannot be reopened, and a changed
+/// binding is never silently written over the current one.
+pub(super) fn open_object_write_authority_in(
+    transaction: &mut Transaction<'_>,
+    identity: &NodeIdentity,
+    writer_authority_id: &Id,
+    object_provider_scope: &ProviderScope,
+    workload_principal_id: &AsciiText,
+    object_store_scope_id: &AsciiText,
+) -> AuthorityTxResult<bool> {
+    // Serialize two applies that would open the first authority for one Host.
+    // Only this path takes this advisory, and it takes it while already
+    // holding the Node identity row, so it cannot invert an existing order.
+    transaction.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended(
+            current_schema() || ':object-write-authority-host:' ||
+            jsonb_build_array($1::TEXT,$2::TEXT,$3::TEXT,$4::TEXT,$5::TEXT)::TEXT,
+            0::BIGINT))",
+        &[
+            &identity.provider_scope.provider.as_str(),
+            &identity.provider_scope.partition.as_str(),
+            &identity.provider_scope.account_id.as_str(),
+            &identity.provider_scope.region.as_str(),
+            &identity.immutable_host_id.as_str(),
+        ],
+    )?;
+    let existing = transaction.query(
+        "SELECT writer_authority_id FROM object_write_authorities
+          WHERE host_provider=$1 AND host_partition=$2 AND host_account_id=$3
+            AND host_region=$4 AND immutable_host_id=$5
+          ORDER BY writer_authority_id COLLATE \"C\" LIMIT 1 FOR UPDATE",
+        &[
+            &identity.provider_scope.provider.as_str(),
+            &identity.provider_scope.partition.as_str(),
+            &identity.provider_scope.account_id.as_str(),
+            &identity.provider_scope.region.as_str(),
+            &identity.immutable_host_id.as_str(),
+        ],
+    )?;
+    if !existing.is_empty() {
+        return Ok(false);
+    }
+    // The assigned ID is derived from the Node ID rather than the Host, so a
+    // reused ID would mean the same Node once named another Host. Fail closed.
+    if load_authority_for_update(transaction, writer_authority_id)?.is_some() {
+        return Ok(false);
+    }
+    let authority = ObjectWriteAuthority {
+        writer: ObjectWriterIdentity {
+            authority_id: writer_authority_id.clone(),
+            host_provider_scope: identity.provider_scope.clone(),
+            immutable_host_id: identity.immutable_host_id.clone(),
+            node_id: identity.node_id.clone(),
+            object_provider_scope: object_provider_scope.clone(),
+            workload_principal_id: workload_principal_id.clone(),
+            object_store_scope_id: object_store_scope_id.clone(),
+        },
+        state: ObjectWriteAuthorityState::Open,
+        max_accepted_sequence: zero_sequence()?,
+        terminal_prefix_sequence: zero_sequence()?,
+        terminal_prefix_sha256: empty_terminal_prefix_sha256(),
+    };
+    validate_object_write_authority(&authority).map_err(|error| {
+        corrupt(format!(
+            "assembled object-write authority is invalid: {error}"
+        ))
+    })?;
+    insert_authority(transaction, &authority)?;
+    Ok(true)
+}
+
+#[cfg(test)]
+pub(super) fn insert_authority_for_test(
+    transaction: &mut Transaction<'_>,
+    authority: &ObjectWriteAuthority,
+) -> AuthorityTxResult<()> {
+    insert_authority(transaction, authority)
+}
+
+fn zero_sequence() -> AuthorityTxResult<WireU64> {
+    WireU64::new(0).ok_or_else(|| corrupt("zero is not a wire-safe sequence"))
+}
+
+fn insert_authority(
+    transaction: &mut Transaction<'_>,
+    authority: &ObjectWriteAuthority,
+) -> AuthorityTxResult<()> {
+    let writer = &authority.writer;
+    let record = encode(authority)?;
+    let max = pg(authority.max_accepted_sequence.get())?;
+    let terminal = pg(authority.terminal_prefix_sequence.get())?;
+    let changed = transaction.execute(
+        "INSERT INTO object_write_authorities (
+            writer_authority_id, record, host_provider, host_partition,
+            host_account_id, host_region, immutable_host_id, node_id,
+            object_provider, object_partition, object_account_id,
+            object_region, workload_principal_id, object_store_scope_id,
+            state, max_accepted_sequence, terminal_prefix_sequence,
+            terminal_prefix_sha256
+         ) VALUES (
+            $1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+            $13, $14, 'open', $15, $16, $17
+         )",
+        &[
+            &writer.authority_id.as_str(),
+            &record,
+            &writer.host_provider_scope.provider.as_str(),
+            &writer.host_provider_scope.partition.as_str(),
+            &writer.host_provider_scope.account_id.as_str(),
+            &writer.host_provider_scope.region.as_str(),
+            &writer.immutable_host_id.as_str(),
+            &writer.node_id.as_str(),
+            &writer.object_provider_scope.provider.as_str(),
+            &writer.object_provider_scope.partition.as_str(),
+            &writer.object_provider_scope.account_id.as_str(),
+            &writer.object_provider_scope.region.as_str(),
+            &writer.workload_principal_id.as_str(),
+            &writer.object_store_scope_id.as_str(),
+            &max,
+            &terminal,
+            &authority.terminal_prefix_sha256.as_str(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(corrupt("object-write authority insert changed no row"));
+    }
+    Ok(())
 }
 
 /// Close one exact writer authority inside a caller-owned transaction.

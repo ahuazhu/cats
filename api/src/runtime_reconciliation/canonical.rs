@@ -5,15 +5,17 @@ use sha2::{Digest, Sha256};
 #[cfg(feature = "proposed-node-residue-reclamation")]
 use super::types::AuthorizedServingAcquire;
 use super::types::{
-    Base64UrlNoPad, ContractError, ContractErrorDetail, ContractName, ContractVersion,
-    DesiredRuntimeSpec, Epoch, GuestRuntimeProfileReceipt, JsonPointer, KeyId, MalformedProblem,
-    NodeObservation, RuntimeCheckpoint, RuntimeProvisionerActiveSet, Sha256Digest,
+    AsciiText, Base64UrlNoPad, ContractError, ContractErrorDetail, ContractName, ContractVersion,
+    DesiredRuntimeSpec, Epoch, GuestRuntimeProfileReceipt, Id, JsonPointer, KeyId,
+    MalformedProblem, NodeObservation, ProviderScope, RuntimeCheckpoint,
+    RuntimeProvisionerActiveSet, Sha256Digest,
 };
 
 const SPEC_DOMAIN: &[u8] = b"cats.runtime.desired-spec.v1";
 const CHECKPOINT_DOMAIN: &[u8] = b"cats.runtime.checkpoint-content.v1";
 const INVENTORY_DOMAIN: &[u8] = b"cats.runtime.inventory.v1";
 const KEY_RING_DOMAIN: &[u8] = b"cats.runtime.key-ring.v1";
+const OBJECT_WRITE_WRITER_AUTHORITY_ID_DOMAIN: &[u8] = b"cats.object-write.writer-authority-id.v1";
 const GUEST_RUNTIME_PROFILE_DOMAIN: &[u8] = b"cats.runtime.guest-runtime-profile.v1";
 #[cfg(feature = "proposed-node-residue-reclamation")]
 const RESIDUE_ACQUISITION_DOMAIN: &[u8] = b"cats.runtime.residue-acquisition.v1";
@@ -172,6 +174,38 @@ pub fn runtime_provisioner_active_set_digest(
 ) -> Result<Sha256Digest, ContractError> {
     let canonical = super::wire::encode_runtime_provisioner_active_set(active_set)?;
     Ok(Sha256Digest::from_bytes(Sha256::digest(canonical).into()))
+}
+
+/// Derives the one object-write writer-authority ID assigned to an exact
+/// writer binding.
+///
+/// Control assigns the ID from this closed preimage rather than accepting a
+/// caller-chosen value, so the same binding can never open two authorities and
+/// a stored authority ID is independently verifiable from the apply that
+/// created it. The immutable Host identity is deliberately absent: the Node ID
+/// already resolves to exactly one provisioned Host in the catalog, and the
+/// Host facts are derived from that row instead of restated here.
+pub fn object_write_writer_authority_id(
+    node_id: &Id,
+    object_provider_scope: &ProviderScope,
+    workload_principal_id: &AsciiText,
+    object_store_scope_id: &AsciiText,
+) -> Id {
+    let projection = serde_json::json!({
+        "version": ContractVersion::V1,
+        "node_id": node_id,
+        "object_provider_scope": object_provider_scope,
+        "workload_principal_id": workload_principal_id,
+        "object_store_scope_id": object_store_scope_id,
+    });
+    let digest = digest_value(OBJECT_WRITE_WRITER_AUTHORITY_ID_DOMAIN, &projection);
+    let hex = digest
+        .as_str()
+        .strip_prefix("sha256:")
+        .expect("Sha256Digest always carries its sha256: prefix");
+    // 5 prefix bytes plus 64 lowercase hex digits satisfy the `Id` charset and
+    // its 128-byte bound.
+    Id::new(format!("owa1_{hex}")).expect("owa1_ plus 64 lowercase hex is a valid Id")
 }
 
 /// Computes the ordinary SHA-256 of one exact canonical Ed25519 SPKI DER

@@ -63,6 +63,9 @@ pub(crate) mod product_tests;
 mod placement_policy_tests;
 
 #[cfg(test)]
+mod object_write_authority_tests;
+
+#[cfg(test)]
 mod host_fence_commit_tests;
 
 #[cfg(test)]

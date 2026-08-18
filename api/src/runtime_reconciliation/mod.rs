@@ -45,7 +45,7 @@ pub use canonical::residue_acquisition_digest;
 pub use canonical::{
     canonical_ed25519_spki_sha256, checkpoint_content_digest, guest_config_digest,
     inventory_digest, key_ring_digest, node_observation_canonical_wire_size,
-    runtime_provisioner_active_set_digest, spec_digest,
+    object_write_writer_authority_id, runtime_provisioner_active_set_digest, spec_digest,
 };
 pub use types::*;
 pub use wire::{
