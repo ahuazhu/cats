@@ -196,8 +196,26 @@ impl AwsObjectWriteGatewayDownstream {
         request: ObjectWriteDownstreamPut,
         absolute_deadline: Instant,
     ) -> Result<ObjectWriteDownstreamPutOutcome, ObjectWriteDownstreamError> {
-        validate_downstream_put(&request, absolute_deadline)
-            .map_err(|_| ObjectWriteDownstreamError::InvalidRequest)?;
+        // Flattening every authority verdict into one downstream error made a
+        // production refusal unreadable: the Gateway could only report that the
+        // provider rejected a request it had in fact never sent. Name the exact
+        // rule, and separate "the caller's deadline is already spent" from "this
+        // request or receipt is malformed" — the first is a timeout the caller
+        // can retry, the second never becomes valid.
+        if let Err(error) = validate_downstream_put(&request, absolute_deadline) {
+            tracing::warn!(
+                verdict = %error,
+                key = %request.descriptor.target.canonical_logical_key,
+                request_id = %request.descriptor.request_id.as_str(),
+                deadline_spent = Instant::now() >= absolute_deadline,
+                "object-write downstream refused the sealed request before any provider call",
+            );
+            return Err(if Instant::now() >= absolute_deadline {
+                ObjectWriteDownstreamError::DeadlineExceeded
+            } else {
+                ObjectWriteDownstreamError::InvalidRequest
+            });
+        }
         match self
             .conditional_put(&request.descriptor, &request.spool, absolute_deadline)
             .await?
