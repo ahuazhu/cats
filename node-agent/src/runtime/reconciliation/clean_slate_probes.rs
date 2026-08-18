@@ -5151,8 +5151,87 @@ enum AdmittedManagedProcessInspection {
         vmm: BTreeMap<Id, VmmProcessInspection>,
     },
     Unavailable,
-    IdentityMismatch,
-    DuplicateIdentity,
+    /// The exact set that stopped matching, so the refusal names itself instead
+    /// of collapsing three independent comparisons into one opaque sentence.
+    IdentityMismatch(ManagedProcessSetDivergence),
+    DuplicateIdentity(ManagedProcessSetDivergence),
+}
+
+/// Which node-global managed process set diverged, and how.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ManagedProcessSetDivergence {
+    Root { fresh: String, admitted: String },
+    Serving { fresh: String, admitted: String },
+    Vmm { fresh: String, admitted: String },
+    VmmSuccessorNotAdmitted { cat_id: Id },
+    VmmSuccessorProofRejected { cat_id: Id },
+    DuplicateRootUnit { scope_id: String },
+    DuplicateRootPid { process_id: u32 },
+    DuplicateSocket { path: String },
+    AllowedSocketsNotManaged { allowed: String, managed: String },
+    StaleManagedSocketStillListening { paths: String },
+    NodeGlobalSweepFailed { error: String },
+    NodeGlobalSweepFoundResidue,
+    ManagedSocketRootMoved,
+    SetChangedBetweenReads { first: String, second: String },
+}
+
+impl std::fmt::Display for ManagedProcessSetDivergence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Root { fresh, admitted } => {
+                write!(formatter, "root: fresh={fresh} admitted={admitted}")
+            }
+            Self::Serving { fresh, admitted } => {
+                write!(formatter, "serving: fresh={fresh} admitted={admitted}")
+            }
+            Self::Vmm { fresh, admitted } => {
+                write!(formatter, "vmm: fresh={fresh} admitted={admitted}")
+            }
+            Self::VmmSuccessorNotAdmitted { cat_id } => {
+                write!(formatter, "vmm successor {cat_id} is not admitted")
+            }
+            Self::VmmSuccessorProofRejected { cat_id } => {
+                write!(formatter, "vmm successor {cat_id} proof did not validate")
+            }
+            Self::DuplicateRootUnit { scope_id } => {
+                write!(formatter, "duplicate root unit {scope_id}")
+            }
+            Self::DuplicateRootPid { process_id } => {
+                write!(formatter, "duplicate root pid {process_id}")
+            }
+            Self::DuplicateSocket { path } => write!(formatter, "duplicate socket {path}"),
+            Self::AllowedSocketsNotManaged { allowed, managed } => write!(
+                formatter,
+                "allowed sockets are not a subset of the managed root: allowed={allowed} \
+                 managed={managed}"
+            ),
+            Self::StaleManagedSocketStillListening { paths } => {
+                write!(formatter, "stale managed socket still listening: {paths}")
+            }
+            Self::NodeGlobalSweepFailed { error } => {
+                write!(formatter, "node-global sweep failed: {error}")
+            }
+            Self::NodeGlobalSweepFoundResidue => {
+                write!(
+                    formatter,
+                    "node-global sweep found residue outside the allowed set"
+                )
+            }
+            Self::ManagedSocketRootMoved => {
+                write!(
+                    formatter,
+                    "the managed blockd socket root moved during the scan"
+                )
+            }
+            Self::SetChangedBetweenReads { first, second } => {
+                write!(
+                    formatter,
+                    "set changed between the two reads: first={first} second={second}"
+                )
+            }
+        }
+    }
 }
 
 enum AdmittedRootTargetPurpose {
@@ -5326,9 +5405,17 @@ impl PlatformRootProcessInventoryBridge {
                 Some(ServingBlockdProcessInspection::Absent)
             ),
             (_, AdmittedManagedProcessInspection::Unavailable) => return Ok(None),
-            (_, AdmittedManagedProcessInspection::IdentityMismatch)
-            | (_, AdmittedManagedProcessInspection::DuplicateIdentity) => {
-                anyhow::bail!("Node-global managed process set changed during start absence")
+            (_, AdmittedManagedProcessInspection::IdentityMismatch(divergence)) => {
+                anyhow::bail!(
+                    "Node-global managed process set changed during start absence \
+                     (identity mismatch, {divergence})"
+                )
+            }
+            (_, AdmittedManagedProcessInspection::DuplicateIdentity(divergence)) => {
+                anyhow::bail!(
+                    "Node-global managed process set changed during start absence \
+                     (duplicate identity, {divergence})"
+                )
             }
         };
         if !absent
@@ -6176,12 +6263,20 @@ impl PlatformRootProcessInventoryBridge {
         if let Some(successor_proof) = vmm_successor {
             let successor = successor_proof.successor();
             let Some((accepted, Some(admitted_exact))) = admission.vmm(successor.cat_id()) else {
-                return Ok(AdmittedManagedProcessInspection::IdentityMismatch);
+                return Ok(AdmittedManagedProcessInspection::IdentityMismatch(
+                    ManagedProcessSetDivergence::VmmSuccessorNotAdmitted {
+                        cat_id: successor.cat_id().clone(),
+                    },
+                ));
             };
             if accepted != admitted_exact.expectation()
                 || successor_proof.validate_for(admitted_exact)? != successor
             {
-                return Ok(AdmittedManagedProcessInspection::IdentityMismatch);
+                return Ok(AdmittedManagedProcessInspection::IdentityMismatch(
+                    ManagedProcessSetDivergence::VmmSuccessorProofRejected {
+                        cat_id: successor.cat_id().clone(),
+                    },
+                ));
             }
             vmm_expected.insert(successor.cat_id().clone(), successor.clone());
         }
@@ -6237,8 +6332,29 @@ impl PlatformRootProcessInventoryBridge {
                     .get(key)
                     .is_some_and(|admitted| first.stable_identity_eq(admitted))
             });
-        if root_first != root_admitted || !serving_matches_admitted || vmm_first != vmm_admitted {
-            return Ok(AdmittedManagedProcessInspection::IdentityMismatch);
+        if root_first != root_admitted {
+            return Ok(AdmittedManagedProcessInspection::IdentityMismatch(
+                ManagedProcessSetDivergence::Root {
+                    fresh: format!("{root_first:?}"),
+                    admitted: format!("{root_admitted:?}"),
+                },
+            ));
+        }
+        if !serving_matches_admitted {
+            return Ok(AdmittedManagedProcessInspection::IdentityMismatch(
+                ManagedProcessSetDivergence::Serving {
+                    fresh: format!("{serving_first:?}"),
+                    admitted: format!("{serving_admitted:?}"),
+                },
+            ));
+        }
+        if vmm_first != vmm_admitted {
+            return Ok(AdmittedManagedProcessInspection::IdentityMismatch(
+                ManagedProcessSetDivergence::Vmm {
+                    fresh: format!("{vmm_first:?}"),
+                    admitted: format!("{vmm_admitted:?}"),
+                },
+            ));
         }
 
         let mut allowed_units = BTreeSet::new();
@@ -6246,11 +6362,26 @@ impl PlatformRootProcessInventoryBridge {
         let mut allowed_sockets = BTreeSet::new();
         for inspection in root_first.values() {
             if let RootProvisionProcessInspection::Exact(evidence) = inspection {
-                if !allowed_units.insert(evidence.scope_id.clone())
-                    || !allowed_pids.insert(evidence.process_id)
-                    || !allowed_sockets.insert(PathBuf::from(evidence.control_socket_path.as_str()))
-                {
-                    return Ok(AdmittedManagedProcessInspection::DuplicateIdentity);
+                if !allowed_units.insert(evidence.scope_id.clone()) {
+                    return Ok(AdmittedManagedProcessInspection::DuplicateIdentity(
+                        ManagedProcessSetDivergence::DuplicateRootUnit {
+                            scope_id: evidence.scope_id.to_string(),
+                        },
+                    ));
+                }
+                if !allowed_pids.insert(evidence.process_id) {
+                    return Ok(AdmittedManagedProcessInspection::DuplicateIdentity(
+                        ManagedProcessSetDivergence::DuplicateRootPid {
+                            process_id: evidence.process_id,
+                        },
+                    ));
+                }
+                if !allowed_sockets.insert(PathBuf::from(evidence.control_socket_path.as_str())) {
+                    return Ok(AdmittedManagedProcessInspection::DuplicateIdentity(
+                        ManagedProcessSetDivergence::DuplicateSocket {
+                            path: evidence.control_socket_path.to_string(),
+                        },
+                    ));
                 }
             }
         }
@@ -6262,16 +6393,29 @@ impl PlatformRootProcessInventoryBridge {
                         .insert(PathBuf::from(evidence.control_socket_path().as_str()))
                     || !allowed_sockets.insert(PathBuf::from(evidence.listener_path().as_str()))
                 {
-                    return Ok(AdmittedManagedProcessInspection::DuplicateIdentity);
+                    return Ok(AdmittedManagedProcessInspection::DuplicateIdentity(
+                        ManagedProcessSetDivergence::DuplicateSocket {
+                            path: evidence.control_socket_path().to_string(),
+                        },
+                    ));
                 }
             }
         }
         for inspection in vmm_first.values() {
             if let VmmProcessInspection::Exact(evidence) = inspection {
-                if !allowed_units.insert(evidence.unit_id().clone())
-                    || !allowed_pids.insert(evidence.process_id())
-                {
-                    return Ok(AdmittedManagedProcessInspection::DuplicateIdentity);
+                if !allowed_units.insert(evidence.unit_id().clone()) {
+                    return Ok(AdmittedManagedProcessInspection::DuplicateIdentity(
+                        ManagedProcessSetDivergence::DuplicateRootUnit {
+                            scope_id: evidence.unit_id().to_string(),
+                        },
+                    ));
+                }
+                if !allowed_pids.insert(evidence.process_id()) {
+                    return Ok(AdmittedManagedProcessInspection::DuplicateIdentity(
+                        ManagedProcessSetDivergence::DuplicateRootPid {
+                            process_id: evidence.process_id(),
+                        },
+                    ));
                 }
             }
         }
@@ -6288,7 +6432,12 @@ impl PlatformRootProcessInventoryBridge {
                 .map(|path| PathBuf::from(path.as_str()))
                 .collect::<BTreeSet<_>>();
             if !allowed_sockets.is_subset(&managed_paths) {
-                return Ok(AdmittedManagedProcessInspection::DuplicateIdentity);
+                return Ok(AdmittedManagedProcessInspection::DuplicateIdentity(
+                    ManagedProcessSetDivergence::AllowedSocketsNotManaged {
+                        allowed: format!("{allowed_sockets:?}"),
+                        managed: format!("{managed_paths:?}"),
+                    },
+                ));
             }
             let stale_paths = managed_paths
                 .difference(&allowed_sockets)
@@ -6298,7 +6447,11 @@ impl PlatformRootProcessInventoryBridge {
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
             if !platform_managed_blockd_listeners_absent(stale_paths.iter(), context)? {
-                return Ok(AdmittedManagedProcessInspection::DuplicateIdentity);
+                return Ok(AdmittedManagedProcessInspection::DuplicateIdentity(
+                    ManagedProcessSetDivergence::StaleManagedSocketStillListening {
+                        paths: format!("{stale_paths:?}"),
+                    },
+                ));
             }
         }
         let sweep = match self.sweep_node_global_inventory(
@@ -6309,14 +6462,23 @@ impl PlatformRootProcessInventoryBridge {
             context,
         ) {
             Ok(sweep) => sweep,
-            Err(_) => {
+            Err(error) => {
                 context.check_active()?;
-                return Ok(AdmittedManagedProcessInspection::DuplicateIdentity);
+                // The sweep's own reason is the only description of what the
+                // Node saw; collapsing it into a bare duplicate-identity made
+                // this refusal undiagnosable in production.
+                return Ok(AdmittedManagedProcessInspection::DuplicateIdentity(
+                    ManagedProcessSetDivergence::NodeGlobalSweepFailed {
+                        error: format!("{error:#}"),
+                    },
+                ));
             }
         };
         match sweep {
             ProbeFact::Present => {
-                return Ok(AdmittedManagedProcessInspection::DuplicateIdentity);
+                return Ok(AdmittedManagedProcessInspection::DuplicateIdentity(
+                    ManagedProcessSetDivergence::NodeGlobalSweepFoundResidue,
+                ));
             }
             ProbeFact::Unavailable => {
                 return Ok(AdmittedManagedProcessInspection::Unavailable);
@@ -6327,7 +6489,9 @@ impl PlatformRootProcessInventoryBridge {
         if let Some((root, intents, expected, before)) = managed_blockd.as_ref() {
             let after = root.capture_closed_whole_root(intents, expected)?;
             if !before.same_coordinates(&after) {
-                return Ok(AdmittedManagedProcessInspection::IdentityMismatch);
+                return Ok(AdmittedManagedProcessInspection::IdentityMismatch(
+                    ManagedProcessSetDivergence::ManagedSocketRootMoved,
+                ));
             }
         }
 
@@ -6353,7 +6517,16 @@ impl PlatformRootProcessInventoryBridge {
                     .is_some_and(|second| first.stable_identity_eq(second))
             });
         if root_first != root_second || !serving_stable || vmm_first != vmm_second {
-            return Ok(AdmittedManagedProcessInspection::IdentityMismatch);
+            return Ok(AdmittedManagedProcessInspection::IdentityMismatch(
+                ManagedProcessSetDivergence::SetChangedBetweenReads {
+                    first: format!(
+                        "root={root_first:?} serving={serving_first:?} vmm={vmm_first:?}"
+                    ),
+                    second: format!(
+                        "root={root_second:?} serving={serving_second:?} vmm={vmm_second:?}"
+                    ),
+                },
+            ));
         }
         Ok(AdmittedManagedProcessInspection::Exact {
             root: root_second,
@@ -6403,12 +6576,12 @@ impl PlatformRootProcessInventoryBridge {
             AdmittedManagedProcessInspection::Unavailable => {
                 Ok(RootProvisionProcessInspection::Unavailable)
             }
-            AdmittedManagedProcessInspection::IdentityMismatch => {
+            AdmittedManagedProcessInspection::IdentityMismatch(_) => {
                 Ok(RootProvisionProcessInspection::Conflict(
                     RootProvisionProcessConflict::IdentityMismatch,
                 ))
             }
-            AdmittedManagedProcessInspection::DuplicateIdentity => {
+            AdmittedManagedProcessInspection::DuplicateIdentity(_) => {
                 Ok(RootProvisionProcessInspection::Conflict(
                     RootProvisionProcessConflict::DuplicateIdentity,
                 ))
@@ -6966,12 +7139,12 @@ impl ServingBlockdProcessGlobalPort for PlatformRootProcessInventoryBridge {
             AdmittedManagedProcessInspection::Unavailable => {
                 Ok(ServingBlockdProcessInspection::Unavailable)
             }
-            AdmittedManagedProcessInspection::IdentityMismatch => {
+            AdmittedManagedProcessInspection::IdentityMismatch(_) => {
                 Ok(ServingBlockdProcessInspection::Conflict(
                     ServingBlockdProcessConflict::IdentityMismatch,
                 ))
             }
-            AdmittedManagedProcessInspection::DuplicateIdentity => {
+            AdmittedManagedProcessInspection::DuplicateIdentity(_) => {
                 Ok(ServingBlockdProcessInspection::Conflict(
                     ServingBlockdProcessConflict::DuplicateIdentity,
                 ))
@@ -7076,10 +7249,10 @@ impl VmmProcessGlobalPort for PlatformRootProcessInventoryBridge {
             AdmittedManagedProcessInspection::Unavailable => {
                 Ok(VmmProcessGlobalInspection::Unavailable)
             }
-            AdmittedManagedProcessInspection::IdentityMismatch => Ok(
+            AdmittedManagedProcessInspection::IdentityMismatch(_) => Ok(
                 VmmProcessGlobalInspection::Conflict(VmmProcessConflict::IdentityMismatch),
             ),
-            AdmittedManagedProcessInspection::DuplicateIdentity => Ok(
+            AdmittedManagedProcessInspection::DuplicateIdentity(_) => Ok(
                 VmmProcessGlobalInspection::Conflict(VmmProcessConflict::DuplicateIdentity),
             ),
         }
@@ -7139,10 +7312,10 @@ impl VmmProcessGlobalPort for PlatformRootProcessInventoryBridge {
             AdmittedManagedProcessInspection::Unavailable => {
                 Ok(VmmProcessGlobalInspection::Unavailable)
             }
-            AdmittedManagedProcessInspection::IdentityMismatch => Ok(
+            AdmittedManagedProcessInspection::IdentityMismatch(_) => Ok(
                 VmmProcessGlobalInspection::Conflict(VmmProcessConflict::IdentityMismatch),
             ),
-            AdmittedManagedProcessInspection::DuplicateIdentity => Ok(
+            AdmittedManagedProcessInspection::DuplicateIdentity(_) => Ok(
                 VmmProcessGlobalInspection::Conflict(VmmProcessConflict::DuplicateIdentity),
             ),
         }
@@ -7317,10 +7490,12 @@ impl VmmCidInventoryPort for PlatformRootProcessInventoryBridge {
             AdmittedManagedProcessInspection::Unavailable => {
                 anyhow::bail!("Node-global VMM CID inventory is unavailable")
             }
-            AdmittedManagedProcessInspection::IdentityMismatch => {
-                anyhow::bail!("Node-global VMM CID inventory changed from its admission")
+            AdmittedManagedProcessInspection::IdentityMismatch(divergence) => {
+                anyhow::bail!(
+                    "Node-global VMM CID inventory changed from its admission ({divergence})"
+                )
             }
-            AdmittedManagedProcessInspection::DuplicateIdentity => {
+            AdmittedManagedProcessInspection::DuplicateIdentity(_) => {
                 anyhow::bail!("Node-global VMM CID inventory contains foreign or duplicate state")
             }
         }
