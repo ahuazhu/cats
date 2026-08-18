@@ -106,6 +106,15 @@ QUALIFICATION_FINAL_FLEET_KIND = (
     "cats.production-mutation-qualification-final-fleet-closed.v1"
 )
 MAX_QUALIFICATION_EVIDENCE_BYTES = 1024 * 1024
+
+# The mutation-admission contract version this release pins, i.e. the value of
+# `PRODUCTION_MUTATION_ADMISSION_SCHEMA_VERSION` in the deployed binary. Despite
+# the binding field's name it is NOT the PostgreSQL schema suffix: nothing
+# derives `control_postgres_schema` from it, and a release can deploy into any
+# empty target schema. Setting it to the schema suffix makes Control reject every
+# signed operator command as `authentication_failed`, which names neither side.
+# Bump this only when the Rust constant changes.
+EXPECTED_CONTROL_SCHEMA_VERSION = 16
 ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -408,8 +417,11 @@ def validate_open_binding(value: Any) -> dict[str, Any]:
     for field in ("reset_id", "deployment_id", "release_id"):
         require_string(binding[field], ID, f"binding.{field}")
     require_string(binding["source_commit_sha"], COMMIT, "binding.source_commit_sha")
-    if binding["control_schema_version"] != 16:
-        raise AdmissionError("binding.control_schema_version must be 16")
+    if binding["control_schema_version"] != EXPECTED_CONTROL_SCHEMA_VERSION:
+        raise AdmissionError(
+            "binding.control_schema_version must be "
+            f"{EXPECTED_CONTROL_SCHEMA_VERSION}"
+        )
     for field in OPEN_BINDING_FIELDS - {
         "reset_id",
         "deployment_id",
@@ -437,8 +449,11 @@ def validate_qualification_binding(value: Any) -> dict[str, Any]:
     require_string(
         binding["source_commit_sha"], COMMIT, "qualification binding.source_commit_sha"
     )
-    if binding["control_schema_version"] != 16:
-        raise AdmissionError("qualification binding.control_schema_version must be 16")
+    if binding["control_schema_version"] != EXPECTED_CONTROL_SCHEMA_VERSION:
+        raise AdmissionError(
+            "qualification binding.control_schema_version must be "
+            f"{EXPECTED_CONTROL_SCHEMA_VERSION}"
+        )
     for field in (
         "source_manifest_sha256",
         "source_bundle_sha256",
