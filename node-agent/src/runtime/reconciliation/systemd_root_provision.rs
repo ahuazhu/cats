@@ -686,6 +686,20 @@ fn build_launch_with_authorization(
         arguments.push(OsString::from("--object-store-option"));
         arguments.push(option.into());
     }
+    // Root provision is the first physical step of every new Cat, and its
+    // attachment binds an object-write credential whenever the Node composed the
+    // credential authority. A production worker is denied direct ChunkStore
+    // mutation by IAM, so blockd refuses to start without the one path it may
+    // publish through — the serving launch carried these three arguments while
+    // this one did not, which stopped every Cat at its root disk.
+    if let Some(gateway) = config.blockd.object_write_gateway.as_ref() {
+        arguments.push(OsString::from("--object-write-gateway-url"));
+        arguments.push(OsString::from(&gateway.gateway_url));
+        arguments.push(OsString::from("--object-write-credential-directory"));
+        arguments.push(gateway.credential_directory.clone().into_os_string());
+        arguments.push(OsString::from("--object-write-gateway-ca-file"));
+        arguments.push(gateway.server_ca_bundle_file.clone().into_os_string());
+    }
     Ok(TransientServiceLaunch {
         unit_id: expected.scope_id.clone(),
         cgroup_path: expected.cgroup_path.clone(),
@@ -4142,6 +4156,64 @@ while True:
             );
             assert!(systemd.submissions.lock().unwrap().is_empty());
         }
+    }
+
+    /// Root provision is the first physical step of every new Cat, and its
+    /// attachment binds an object-write credential whenever the Node composed
+    /// the credential authority. Production denies the worker direct ChunkStore
+    /// mutation, so blockd refuses to start without the Gateway origin, the
+    /// credential namespace and the Gateway trust anchor. The serving launch
+    /// carried all three while this launch carried none, and every Cat stopped
+    /// at its root disk with `--object-write-gateway-url is required`.
+    #[test]
+    fn root_provision_command_carries_the_object_write_publish_path() {
+        let mut blockd = blockd_config(postgres_file_authority(), s3_object_store());
+        blockd.object_write_gateway =
+            Some(super::super::authorized_blockd::ObjectWriteGatewayLaunch {
+                gateway_url: "https://gateway.object-write.internal".to_owned(),
+                credential_directory: PathBuf::from(
+                    "/var/lib/cats/node/n1/object-write-credentials",
+                ),
+                server_ca_bundle_file: PathBuf::from(
+                    "/etc/cats/route-v2/node-server-ca-bundle.pem",
+                ),
+            });
+        let credentialed = RootProvisionSystemdConfig::new(blockd).unwrap();
+        let launch = build_launch(&credentialed, &expectation()).unwrap();
+
+        for (flag, value) in [
+            (
+                "--object-write-gateway-url",
+                "https://gateway.object-write.internal",
+            ),
+            (
+                "--object-write-credential-directory",
+                "/var/lib/cats/node/n1/object-write-credentials",
+            ),
+            (
+                "--object-write-gateway-ca-file",
+                "/etc/cats/route-v2/node-server-ca-bundle.pem",
+            ),
+        ] {
+            let position = launch
+                .arguments
+                .iter()
+                .position(|argument| argument == &OsString::from(flag))
+                .unwrap_or_else(|| panic!("root provision must pass {flag}"));
+            assert_eq!(
+                launch.arguments[position + 1],
+                OsString::from(value),
+                "{flag} must carry the composed value"
+            );
+        }
+
+        // A Node that composed no credential authority still launches the exact
+        // credentialless command, so the publish path is never invented.
+        let plain = build_launch(&config(), &expectation()).unwrap();
+        assert!(!plain
+            .arguments
+            .iter()
+            .any(|argument| argument == &OsString::from("--object-write-gateway-url")));
     }
 
     #[test]
