@@ -13,6 +13,7 @@
 //! handshake remain later fresh-inventory effects.
 //! This path does not run a destructive residue/device sweep.
 
+use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,6 +101,11 @@ pub struct SignedRuntimeCutoverConfig {
 pub struct ObjectWriteGatewayComposition {
     /// Bare HTTPS origin, from Node configuration rather than a constant.
     pub gateway_url: String,
+    /// PEM roots that issue server certificates in this deployment's Route v2
+    /// revision. The gateway's certificate comes from that private root, so
+    /// without these roots no serving process can authenticate the one path it
+    /// is allowed to publish through.
+    pub server_ca_bundle_file: PathBuf,
 }
 
 #[cfg(test)]
@@ -491,6 +497,7 @@ async fn spawn_signed_runtime_cutover_with_overrides(
                     .path()
                     .to_path_buf(),
                 &gateway.gateway_url,
+                &gateway.server_ca_bundle_file,
                 &config.control_plane_url,
                 config.agent_registration.runtime_request_signer(),
             )
@@ -503,6 +510,7 @@ async fn spawn_signed_runtime_cutover_with_overrides(
         authorized_blockd_launch.object_write_gateway = Some(ObjectWriteGatewayLaunch {
             gateway_url: credentials.gateway_origin().to_owned(),
             credential_directory: credentials.credential_directory(),
+            server_ca_bundle_file: credentials.server_ca_bundle_file().to_path_buf(),
         });
     }
     let effect_object_write_credentials = object_write_credentials.clone();

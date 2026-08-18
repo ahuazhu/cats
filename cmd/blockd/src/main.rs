@@ -160,6 +160,13 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     object_write_credential_directory: Option<PathBuf>,
 
+    /// Absolute path of the PEM roots that issue the ObjectWrite Gateway's
+    /// server certificate. The Gateway is an internal origin certified by the
+    /// deployment's own Route v2 root, which no public trust store contains, so
+    /// this bundle is the only way a publishing process can authenticate it.
+    #[arg(long, value_name = "PATH")]
+    object_write_gateway_ca_file: Option<PathBuf>,
+
     /// Serve NBD on this unix socket path.
     #[arg(long)]
     listen_unix: Option<PathBuf>,
@@ -1428,6 +1435,7 @@ fn main() -> Result<()> {
         Some(attachment) => match object_write::gateway_publish_store(
             args.object_write_gateway_url.as_deref(),
             args.object_write_credential_directory.as_deref(),
+            args.object_write_gateway_ca_file.as_deref(),
             attachment,
             &blob,
         )
@@ -1829,6 +1837,24 @@ fn validate_process_mode(args: &Args) -> Result<()> {
         }
         (Some(_), Some(directory)) if !directory.is_absolute() => {
             bail!("--object-write-credential-directory must be an absolute path")
+        }
+        _ => {}
+    }
+    // The trust anchor belongs to the same capability: an origin this process
+    // cannot authenticate is not a usable publish path, and discovering that at
+    // the first write would mean an unpublishable attachment already adopted.
+    match (
+        &args.object_write_gateway_url,
+        &args.object_write_gateway_ca_file,
+    ) {
+        (Some(_), None) => {
+            bail!("--object-write-gateway-url requires --object-write-gateway-ca-file")
+        }
+        (None, Some(_)) => {
+            bail!("--object-write-gateway-ca-file requires --object-write-gateway-url")
+        }
+        (Some(_), Some(bundle)) if !bundle.is_absolute() => {
+            bail!("--object-write-gateway-ca-file must be an absolute path")
         }
         _ => {}
     }
@@ -2269,7 +2295,7 @@ mod tests {
         Args::try_parse_from(argv).expect("parse release CLI")
     }
 
-    /// The Node passes these two flags verbatim. Renaming either one silently
+    /// The Node passes these three flags verbatim. Renaming any one silently
     /// disables the only ChunkStore write path production permits.
     #[test]
     fn the_object_write_gateway_flags_parse_under_their_exact_names() {
@@ -2278,6 +2304,8 @@ mod tests {
             "https://gateway.internal:8443",
             "--object-write-credential-directory",
             "/var/lib/cats/object-write-credentials",
+            "--object-write-gateway-ca-file",
+            "/etc/cats/route-v2/node-server-ca-bundle.pem",
         ]);
         assert_eq!(
             args.object_write_gateway_url.as_deref(),
@@ -2287,7 +2315,56 @@ mod tests {
             args.object_write_credential_directory.as_deref(),
             Some(Path::new("/var/lib/cats/object-write-credentials"))
         );
+        assert_eq!(
+            args.object_write_gateway_ca_file.as_deref(),
+            Some(Path::new("/etc/cats/route-v2/node-server-ca-bundle.pem"))
+        );
         validate_process_mode(&args).expect("paired absolute flags are admitted");
+    }
+
+    /// The trust anchor is part of the same capability. An origin this process
+    /// cannot authenticate is not a publish path, so the refusal is at flag
+    /// level rather than at the first write of an already-adopted attachment.
+    #[test]
+    fn the_object_write_gateway_trust_anchor_is_part_of_the_same_capability() {
+        let message = validate_process_mode(&publish_only_args(&[
+            "--object-write-gateway-url",
+            "https://gateway.internal:8443",
+            "--object-write-credential-directory",
+            "/var/lib/cats/object-write-credentials",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            message.contains("requires --object-write-gateway-ca-file"),
+            "{message}"
+        );
+
+        let message = validate_process_mode(&publish_only_args(&[
+            "--object-write-gateway-ca-file",
+            "/etc/cats/route-v2/node-server-ca-bundle.pem",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            message.contains("requires --object-write-gateway-url"),
+            "{message}"
+        );
+
+        let message = validate_process_mode(&publish_only_args(&[
+            "--object-write-gateway-url",
+            "https://gateway.internal:8443",
+            "--object-write-credential-directory",
+            "/var/lib/cats/object-write-credentials",
+            "--object-write-gateway-ca-file",
+            "node-server-ca-bundle.pem",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            message.contains("--object-write-gateway-ca-file must be an absolute path"),
+            "{message}"
+        );
     }
 
     #[test]
