@@ -1088,7 +1088,7 @@ impl SignedRunningAcquireEffect {
             {
                 PrelaunchAdmissionDecision::Exact(admission) => admission,
                 PrelaunchAdmissionDecision::RefreshInventory => {
-                    return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+                    return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()))
                 }
                 PrelaunchAdmissionDecision::StopLocal => return Ok(Some(stop_local())),
             };
@@ -1110,14 +1110,14 @@ impl SignedRunningAcquireEffect {
             .load()
             .context("reread signed Running checkpoint for replan")?
         else {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         };
         if stored.content_digest() != content_digest
             || stored.checkpoint().step != admission.runtime.step
         {
             // The accepted scan no longer names the target file. Do not use
             // its physical evidence to overwrite a concurrent successor.
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         }
         let checkpoint = stored.checkpoint();
         let current_binding = checkpoint.desired_revision == desired.desired_revision
@@ -1152,7 +1152,7 @@ impl SignedRunningAcquireEffect {
                 // Provision execution is a later composed step. Reaching a
                 // current, fully typed checkpoint is successful stale-plan
                 // convergence and must force a new scan, never an acquire.
-                Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+                Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()))
             }
             ReconcileStep::Quarantined => Ok(Some(stop_local())),
             _ => Ok(Some(stop_local())),
@@ -1236,16 +1236,20 @@ impl SignedRunningAcquireEffect {
             context.check_active()?;
             let current_record = match self.authority.load_volume(&admission.volume.volume_id) {
                 Ok(record) => record,
-                Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+                Err(error) => {
+                    return Ok(RuntimeDesiredEffectOutcome::refresh_inventory_after(&error))
+                }
             };
             if !record_is_current_unowned(&current_record, admission.volume) {
-                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+                return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
             }
             let old_is_still_unowned = if old_observed.volume_id != admission.volume.volume_id {
                 context.check_active()?;
                 let old_record = match self.authority.load_volume(&old_observed.volume_id) {
                     Ok(record) => record,
-                    Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+                    Err(error) => {
+                        return Ok(RuntimeDesiredEffectOutcome::refresh_inventory_after(&error))
+                    }
                 };
                 record_matches_unowned_observation(&old_record, old_observed)
             } else {
@@ -1268,14 +1272,14 @@ impl SignedRunningAcquireEffect {
                 store
                     .replace(predecessor, &replacement)
                     .context("atomically rebind superseded pre-effect acquire")?;
-                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+                return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
             }
         }
 
         context.check_active()?;
         let record = match self.authority.load_volume(&old_observed.volume_id) {
             Ok(record) => record,
-            Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+            Err(error) => return Ok(RuntimeDesiredEffectOutcome::refresh_inventory_after(&error)),
         };
         let attachment = match attachment_from_checkpoint_acquire(
             old_checkpoint,
@@ -1318,7 +1322,7 @@ impl SignedRunningAcquireEffect {
             store
                 .replace(predecessor, &replacement)
                 .context("stage current adoption journal for superseded acquire")?;
-            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+            return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
         }
         if release_is_supported_by_current_desired(
             desired,
@@ -1383,7 +1387,7 @@ impl SignedRunningAcquireEffect {
         context.check_active()?;
         let record = match self.authority.load_volume(&admission.volume.volume_id) {
             Ok(record) => record,
-            Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+            Err(error) => return Ok(RuntimeDesiredEffectOutcome::refresh_inventory_after(&error)),
         };
         let attachment = match attachment_from_current_desired(
             desired,
@@ -1500,7 +1504,7 @@ impl SignedRunningAcquireEffect {
         context.check_active()?;
         let record = match self.authority.load_volume(volume_id) {
             Ok(record) => record,
-            Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+            Err(error) => return Ok(RuntimeDesiredEffectOutcome::refresh_inventory_after(&error)),
         };
         let prepared = match AuthorizedBlockdStore::new(context.state_directory().clone())
             .reopen_adopted(desired, admission.volume, &identity)
@@ -1556,7 +1560,7 @@ impl SignedRunningAcquireEffect {
             store
                 .replace(predecessor, &replacement)
                 .context("rebind superseded provision checkpoint to current Desired")?;
-            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+            return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
         }
         if release_is_supported_by_current_desired(
             desired,
@@ -1633,7 +1637,7 @@ impl SignedRunningAcquireEffect {
         store
             .replace(predecessor, &replacement)
             .context("stage exact stale-lineage release before A22")?;
-        Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+        Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
     }
 
     fn stop_unsupported_conflict(
@@ -1724,7 +1728,7 @@ impl SignedRunningAcquireEffect {
             store
                 .replace(predecessor, &replacement)
                 .context("rebind stale cleanup to the current accepted A20 cursor")?;
-            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+            return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
         }
         let expected_head = observed_authority_head(observed).cloned();
         let Some(expected_head) = expected_head else {
@@ -1740,7 +1744,9 @@ impl SignedRunningAcquireEffect {
             context.check_active()?;
             let record = match self.authority.load_volume(volume_id) {
                 Ok(record) => record,
-                Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+                Err(error) => {
+                    return Ok(RuntimeDesiredEffectOutcome::refresh_inventory_after(&error))
+                }
             };
             let request = release_transition_request(desired, cleanup.clone());
             return match recover_normal_release_from_authority(
@@ -1758,7 +1764,7 @@ impl SignedRunningAcquireEffect {
                     predecessor,
                 ),
                 Ok(NormalReleaseAuthorityRecovery::RetryExact) => {
-                    Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                    Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
                 }
                 Ok(NormalReleaseAuthorityRecovery::Blocked) | Err(_) => self
                     .stop_unsupported_conflict(
@@ -1808,10 +1814,12 @@ impl SignedRunningAcquireEffect {
             Err(_) => return Ok(stop_local()),
         };
         match attempt {
-            NormalReleaseAttempt::Released(_) => Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+            NormalReleaseAttempt::Released(_) => {
+                Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
+            }
             NormalReleaseAttempt::RetryExact => Ok(RuntimeDesiredEffectOutcome::RetryExact),
             NormalReleaseAttempt::RefreshInventory => {
-                Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
             }
             NormalReleaseAttempt::ReplanDesired => Ok(RuntimeDesiredEffectOutcome::ReplanDesired),
             NormalReleaseAttempt::SessionReplacementRequired => {
@@ -1832,7 +1840,7 @@ impl SignedRunningAcquireEffect {
                 {
                     return Ok(stop_local());
                 }
-                Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
             }
             NormalReleaseAttempt::StopForLocalContract => Ok(stop_local()),
             NormalReleaseAttempt::StopForDeploymentMismatch => {
@@ -1854,7 +1862,7 @@ impl SignedRunningAcquireEffect {
                     self.credentials.as_deref(),
                 ) {
                     Ok(NormalReleaseAuthorityRecovery::Released(_)) => {
-                        Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                        Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
                     }
                     Ok(NormalReleaseAuthorityRecovery::RetryExact) => {
                         Ok(RuntimeDesiredEffectOutcome::RetryExact)
@@ -1918,7 +1926,7 @@ impl SignedRunningAcquireEffect {
             {
                 AdmissionDecision::Exact(volume) => volume,
                 AdmissionDecision::RefreshInventory => {
-                    return Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                    return Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
                 }
                 AdmissionDecision::StopLocal => return Ok(stop_local()),
             };
@@ -2004,7 +2012,7 @@ impl SignedRunningAcquireEffect {
             NormalAcquireAttempt::Granted(attachment) => attachment,
             NormalAcquireAttempt::RetryExact => return Ok(RuntimeDesiredEffectOutcome::RetryExact),
             NormalAcquireAttempt::RefreshInventory => {
-                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                return Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
             }
             NormalAcquireAttempt::ReplanDesired => {
                 return Ok(RuntimeDesiredEffectOutcome::ReplanDesired)
@@ -2057,7 +2065,7 @@ impl SignedRunningAcquireEffect {
                         return Ok(RuntimeDesiredEffectOutcome::RetryExact)
                     }
                     Ok(NormalAcquireAuthorityRecovery::Blocked) => {
-                        return Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                        return Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
                     }
                     Err(_) => return Ok(stop_local()),
                 }
@@ -2070,7 +2078,7 @@ impl SignedRunningAcquireEffect {
             volume,
             &attachment,
         ) {
-            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+            return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
         }
 
         self.persist_provision_step(
@@ -2104,7 +2112,7 @@ impl SignedRunningAcquireEffect {
         ) {
             MultiAcquireAdmission::Exact(runtime) => runtime,
             MultiAcquireAdmission::RefreshInventory => {
-                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                return Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
             }
             MultiAcquireAdmission::ReplanDesired => {
                 return Ok(RuntimeDesiredEffectOutcome::ReplanDesired)
@@ -2142,7 +2150,7 @@ impl SignedRunningAcquireEffect {
         {
             None => {
                 if !matches!(runtime.checkpoint, CheckpointEvidence::Missing { .. }) {
-                    return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+                    return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
                 }
                 let checkpoint = closed_checkpoint(
                     desired,
@@ -2158,7 +2166,7 @@ impl SignedRunningAcquireEffect {
                 // Checkpoint publication is this accepted-full round's sole
                 // durable effect. A22 is unreachable until a new full scan
                 // proves these exact bytes current.
-                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+                return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
             }
             Some(stored) => {
                 let CheckpointEvidence::Valid {
@@ -2167,7 +2175,7 @@ impl SignedRunningAcquireEffect {
                     ..
                 } = &runtime.checkpoint
                 else {
-                    return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+                    return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
                 };
                 if !path_matches(checkpoint_path, store.path())
                     || stored.content_digest() != content_digest
@@ -2183,7 +2191,7 @@ impl SignedRunningAcquireEffect {
                             if persisted == request_payload
                     )
                 {
-                    return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+                    return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
                 }
                 stored
             }
@@ -2202,7 +2210,7 @@ impl SignedRunningAcquireEffect {
             // independently value-bound that artifact and the request is an
             // idempotent replay. No malformed R0-absent predecessor may reach
             // a remote mutation.
-            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+            return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
         }
 
         let accepted_context = NormalAcquireAcceptedContext {
@@ -2224,7 +2232,7 @@ impl SignedRunningAcquireEffect {
                         return Ok(RuntimeDesiredEffectOutcome::RetryExact)
                     }
                     NormalAcquireAttempt::RefreshInventory => {
-                        return Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                        return Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
                     }
                     NormalAcquireAttempt::ReplanDesired => {
                         return Ok(RuntimeDesiredEffectOutcome::ReplanDesired)
@@ -2253,7 +2261,11 @@ impl SignedRunningAcquireEffect {
                             Err(AuthorityError::BackendUnknown) => {
                                 return Ok(RuntimeDesiredEffectOutcome::RetryExact)
                             }
-                            Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+                            Err(error) => {
+                                return Ok(RuntimeDesiredEffectOutcome::refresh_inventory_after(
+                                    &error,
+                                ))
+                            }
                         };
                         match recover_normal_acquire_from_authority(
                             &request,
@@ -2312,7 +2324,7 @@ impl SignedRunningAcquireEffect {
                         TakeoverAcquireAttempt::RetryExact
                         | TakeoverAcquireAttempt::Ambiguous => None,
                         TakeoverAcquireAttempt::RefreshInventory => {
-                            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                            return Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
                         }
                         TakeoverAcquireAttempt::ReplanDesired => {
                             return Ok(RuntimeDesiredEffectOutcome::ReplanDesired)
@@ -2359,11 +2371,11 @@ impl SignedRunningAcquireEffect {
                             return Ok(if may_submit_takeover {
                                 RuntimeDesiredEffectOutcome::RetryExact
                             } else {
-                                RuntimeDesiredEffectOutcome::RefreshInventory
+                                RuntimeDesiredEffectOutcome::refresh_inventory()
                             })
                         }
                         VolumeEvidenceRecoveryDecision::Blocked => {
-                            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                            return Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
                         }
                         _ => return Ok(stop_local()),
                     },
@@ -2395,14 +2407,14 @@ impl SignedRunningAcquireEffect {
                     || (!may_submit_takeover
                         && !signed_takeover_current_matches_observed(&evidence, accepted_current))
                 {
-                    return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+                    return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
                 }
                 context.check_active()?;
                 let current = self.authority.load_volume(&volume.volume_id);
                 context.check_active()?;
                 match signed_takeover_successor_matches_point_read(&evidence, current) {
                     Ok(true) => {}
-                    Ok(false) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+                    Ok(false) => return Ok(RuntimeDesiredEffectOutcome::refresh_inventory()),
                     Err(_) => return Ok(RuntimeDesiredEffectOutcome::RetryExact),
                 }
                 Box::new(
@@ -2433,7 +2445,7 @@ impl SignedRunningAcquireEffect {
                 &attachment,
             )
         {
-            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+            return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
         }
         let prepared = AuthorizedBlockdStore::new(context.state_directory().clone())
             .prepare(desired, volume, &attachment)
@@ -2517,7 +2529,7 @@ impl SignedRunningAcquireEffect {
                 store
                     .replace(&predecessor, &successor)
                     .context("publish complete existing-Root authorization set")?;
-                return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+                return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
             }
             let (expected_blank_head, expected_provisioned_head) = match expected_provision_heads(
                 self.blob.as_ref(),
@@ -2570,7 +2582,7 @@ impl SignedRunningAcquireEffect {
         store
             .replace(&predecessor, &successor)
             .context("advance one checkpointed multi-volume acquire")?;
-        Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+        Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2588,7 +2600,7 @@ impl SignedRunningAcquireEffect {
         adopted: bool,
     ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
         if attachment.head != expected_blank_head {
-            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+            return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
         }
         context.check_active()?;
         let blockd = AuthorizedBlockdStore::new(context.state_directory().clone());
@@ -2666,7 +2678,7 @@ impl SignedRunningAcquireEffect {
         // The authority mutation, grant files and next-step checkpoint are all
         // physical changes. A new accepted full scan is the only legal bridge
         // to starting the control-only process.
-        Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+        Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
     }
 }
 
@@ -5633,7 +5645,7 @@ mod tests {
 
         let outcome = effect.apply(context, &desired).unwrap();
 
-        assert_eq!(outcome, RuntimeDesiredEffectOutcome::RefreshInventory);
+        assert_eq!(outcome, RuntimeDesiredEffectOutcome::refresh_inventory());
         let calls = calls.lock().unwrap();
         assert_eq!(calls.checkpoint_seen_before_call, [true]);
         assert_eq!(calls.deadlines, [deadline]);
@@ -5738,7 +5750,7 @@ mod tests {
 
         assert_eq!(
             effect.apply(context, &desired).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         assert!(acquire.lock().unwrap().requests.is_empty());
         assert!(evidence.lock().unwrap().requests.is_empty());
@@ -5793,7 +5805,7 @@ mod tests {
         let (initial_context, _) = context(root.path(), &desired, Some(initial));
         assert_eq!(
             effect.apply(initial_context, &desired).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         let first = read_checkpoint(&path);
         let admitted = observed_runtime_with_volumes(
@@ -5805,7 +5817,7 @@ mod tests {
         let (acquire_context, _) = context(root.path(), &desired, Some(admitted));
         assert_eq!(
             effect.apply(acquire_context, &desired).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         assert_eq!(blob.reads.load(Ordering::SeqCst), 0);
         assert_eq!(acquire.lock().unwrap().requests.len(), 1);
@@ -5941,7 +5953,7 @@ mod tests {
         let (initial_context, _) = context(root.path(), &desired, Some(initial));
         assert_eq!(
             effect.apply(initial_context, &desired).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         assert!(acquire.lock().unwrap().requests.is_empty());
         let first = read_checkpoint(&path);
@@ -5954,7 +5966,7 @@ mod tests {
         let (acquire_context, _) = context(root.path(), &desired, Some(admitted));
         assert_eq!(
             effect.apply(acquire_context, &desired).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         let calls = acquire.lock().unwrap();
         assert_eq!(calls.requests.len(), 1);
@@ -6145,7 +6157,7 @@ mod tests {
         let (initial_context, _) = context(producer_root.path(), &desired, Some(initial));
         assert_eq!(
             effect.apply(initial_context, &desired).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         assert!(acquire.lock().unwrap().requests.is_empty());
         assert!(evidence_calls.lock().unwrap().requests.is_empty());
@@ -6160,7 +6172,7 @@ mod tests {
         let (acquire_context, _) = context(producer_root.path(), &desired, Some(admitted));
         assert_eq!(
             effect.apply(acquire_context, &desired).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         let provision = read_checkpoint(&path);
         assert!(matches!(
@@ -6271,7 +6283,7 @@ mod tests {
         let (initial_context, _) = context(root.path(), &desired, Some(initial));
         assert_eq!(
             first_effect.apply(initial_context, &desired).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         assert!(first_calls.lock().unwrap().requests.is_empty());
         assert!(first_evidence.lock().unwrap().requests.is_empty());
@@ -6307,7 +6319,7 @@ mod tests {
         let (acquire_context, _) = context(root.path(), &desired, Some(admitted));
         assert_eq!(
             first_effect.apply(acquire_context, &desired).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         let root_grant_checkpoint = read_checkpoint(&path);
         assert!(matches!(
@@ -6554,7 +6566,7 @@ mod tests {
         );
         assert_eq!(
             restart_effect.apply(context, &desired).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         let calls = restart_calls.lock().unwrap();
         assert!(
@@ -6787,7 +6799,7 @@ mod tests {
         let (initial_context, _) = context(root.path(), &desired, Some(initial));
         assert_eq!(
             effect.apply(initial_context, &desired).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         assert!(calls.lock().unwrap().requests.is_empty());
 
@@ -6813,7 +6825,7 @@ mod tests {
             );
             assert_eq!(
                 effect.apply(effect_context, &desired).unwrap(),
-                RuntimeDesiredEffectOutcome::RefreshInventory
+                RuntimeDesiredEffectOutcome::refresh_inventory()
             );
             records[index] = owned_record(&desired, attachment);
             publish_records(&authority, &records);
@@ -6898,7 +6910,7 @@ mod tests {
         let (context, _) = context(root.path(), &desired, None);
         assert_eq!(
             effect.apply(context, &desired).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         authority.set(Ok(owned_record(&desired, &attachment)));
         let scanner_authority: Arc<dyn VolumeDataAuthority> = authority;
@@ -7015,7 +7027,7 @@ mod tests {
 
         assert_eq!(
             restart_effect.apply(restart_context, &desired).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         assert!(restart_calls.lock().unwrap().requests.is_empty());
         assert_eq!(prepared_file_snapshot(&data_directory), before);
@@ -7115,7 +7127,7 @@ mod tests {
         );
         assert_eq!(
             restart_effect.apply(restart_context, &desired).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         assert!(restart_calls.lock().unwrap().requests.is_empty());
         assert_eq!(prepared_file_snapshot(&data_directory), before);
@@ -7208,7 +7220,7 @@ mod tests {
         );
         assert_eq!(
             restart.apply(restart_context, &desired).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         let first = first_calls.lock().unwrap();
         let restart = restart_calls.lock().unwrap();
@@ -8705,7 +8717,7 @@ mod tests {
             let (context, _) = context(root.path(), &desired, Some(runtime));
             assert_eq!(
                 effect.apply(context, &desired).unwrap(),
-                RuntimeDesiredEffectOutcome::RefreshInventory,
+                RuntimeDesiredEffectOutcome::refresh_inventory(),
                 "live multi Normal predecessor drift case {case}",
             );
             assert!(
@@ -8865,7 +8877,7 @@ mod tests {
                 let (context, _) = context(root.path(), &desired, Some(runtime));
                 assert_eq!(
                     effect.apply(context, &desired).unwrap(),
-                    RuntimeDesiredEffectOutcome::RefreshInventory,
+                    RuntimeDesiredEffectOutcome::refresh_inventory(),
                     "live Takeover {target} predecessor drift case {case}",
                 );
                 assert!(
@@ -8945,7 +8957,7 @@ mod tests {
         let (context, _) = context(root.path(), &desired, Some(runtime));
         assert_eq!(
             effect.apply(context, &desired).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory,
+            RuntimeDesiredEffectOutcome::refresh_inventory(),
         );
         assert!(
             acquire.lock().unwrap().requests.is_empty(),
@@ -9365,7 +9377,7 @@ mod tests {
 
         assert_eq!(
             restart_effect.apply(restart_context, &desired).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         assert_eq!(prepared_file_snapshot(&data_directory), before);
         assert_prepared_provision_checkpoint(
@@ -9483,7 +9495,7 @@ mod tests {
         let (recovered_context, _) = context(root.path(), &desired, Some(owned_runtime));
         assert_eq!(
             effect.apply(recovered_context, &desired).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
 
         assert_eq!(authority.loads.load(Ordering::SeqCst), 2);
@@ -9501,7 +9513,7 @@ mod tests {
         let cases = [
             (
                 NormalAcquireAttempt::RefreshInventory,
-                RuntimeDesiredEffectOutcome::RefreshInventory,
+                RuntimeDesiredEffectOutcome::refresh_inventory(),
             ),
             (
                 NormalAcquireAttempt::ReplanDesired,
@@ -9591,7 +9603,7 @@ mod tests {
 
             assert_eq!(
                 effect.apply(context, &current).unwrap(),
-                RuntimeDesiredEffectOutcome::RefreshInventory,
+                RuntimeDesiredEffectOutcome::refresh_inventory(),
                 "{change}"
             );
             let rebound = read_checkpoint(&path);
@@ -9697,7 +9709,7 @@ mod tests {
         );
         assert_eq!(
             effect.apply(first_context, &current).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         let adoption = read_checkpoint(&path);
         assert_eq!(adoption.desired_revision, current.desired_revision);
@@ -9719,7 +9731,7 @@ mod tests {
         );
         assert_eq!(
             effect.apply(second_context, &current).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         let provision = read_checkpoint(&path);
         assert_eq!(provision.desired_revision, current.desired_revision);
@@ -9757,7 +9769,7 @@ mod tests {
             let (initial_context, _) = context(root.path(), &old, None);
             assert_eq!(
                 initial.apply(initial_context, &old).unwrap(),
-                RuntimeDesiredEffectOutcome::RefreshInventory
+                RuntimeDesiredEffectOutcome::refresh_inventory()
             );
             let old_provision = read_checkpoint(&path);
             let mut record = owned_record(&old, &old_attachment);
@@ -9797,7 +9809,7 @@ mod tests {
             );
             assert_eq!(
                 planner.apply(context, &current).unwrap(),
-                RuntimeDesiredEffectOutcome::RefreshInventory,
+                RuntimeDesiredEffectOutcome::refresh_inventory(),
                 "{head_mode}"
             );
             let rebound = read_checkpoint(&path);
@@ -9862,7 +9874,7 @@ mod tests {
         let (stale_context, _) = context(root.path(), &current, Some(stale));
         assert_eq!(
             planner.apply(stale_context, &current).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         let cleanup_checkpoint = read_checkpoint(&path);
         let ReconcileStep::CleanupRelease { cleanup } = &cleanup_checkpoint.step else {
@@ -9892,7 +9904,7 @@ mod tests {
         );
         assert_eq!(
             planner.apply(restart_context, &current).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         let rebound_cleanup = read_checkpoint(&path);
         let ReconcileStep::CleanupRelease { cleanup } = &rebound_cleanup.step else {
@@ -9940,7 +9952,7 @@ mod tests {
         );
         assert_eq!(
             planner.apply(ready_context, &current).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         assert_eq!(release_calls.lock().unwrap().release_requests.len(), 1);
 
@@ -10032,7 +10044,7 @@ mod tests {
         );
         assert_eq!(
             planner.apply(stage_context, &current).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         let cleanup_bytes = std::fs::read(&path).unwrap();
 
@@ -10041,7 +10053,7 @@ mod tests {
             context_with_session(root.path(), &current, Some(scan), '8', 3, 1_900_000_020_000);
         assert_eq!(
             planner.apply(context, &current).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         assert_eq!(std::fs::read(&path).unwrap(), cleanup_bytes);
         assert_eq!(calls.lock().unwrap().release_requests.len(), 1);
@@ -10143,7 +10155,7 @@ mod tests {
             );
             assert_eq!(
                 planner.apply(stage_context, &current).unwrap(),
-                RuntimeDesiredEffectOutcome::RefreshInventory,
+                RuntimeDesiredEffectOutcome::refresh_inventory(),
                 "{window}"
             );
             let ready = scan_runtime(root.path(), &current, authority.clone(), '8', 3);
@@ -10157,7 +10169,7 @@ mod tests {
             );
             assert_eq!(
                 planner.apply(ready_context, &current).unwrap(),
-                RuntimeDesiredEffectOutcome::RefreshInventory,
+                RuntimeDesiredEffectOutcome::refresh_inventory(),
                 "{window}"
             );
             assert_eq!(calls.lock().unwrap().release_requests.len(), 1, "{window}");
@@ -10844,7 +10856,7 @@ mod tests {
         );
         assert_eq!(
             planner.apply(context, &current).unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         assert_eq!(read_checkpoint(&path), concurrent);
         assert!(calls.lock().unwrap().requests.is_empty());
@@ -10872,7 +10884,7 @@ mod tests {
             superseded_effect
                 .apply(superseded_context, &superseded)
                 .unwrap(),
-            RuntimeDesiredEffectOutcome::RefreshInventory
+            RuntimeDesiredEffectOutcome::refresh_inventory()
         );
         assert!(calls.lock().unwrap().requests.is_empty());
         assert_eq!(blob.reads.load(Ordering::SeqCst), 0);

@@ -453,7 +453,7 @@ impl ServingPrepareDeviceEffect {
             &[store.retained_directory()],
         )?;
         let Some(stored) = store.load()? else {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         };
         let CheckpointEvidence::Valid {
             checkpoint_path,
@@ -461,13 +461,13 @@ impl ServingPrepareDeviceEffect {
             ..
         } = &runtime.checkpoint
         else {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         };
         if Path::new(checkpoint_path.as_str()) != store.path()
             || stored.content_digest() != content_digest
             || stored.checkpoint().step != runtime.step
         {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         }
 
         match &self.frontend {
@@ -543,7 +543,7 @@ impl ServingPrepareDeviceEffect {
                 context.check_active()?;
             }
         }
-        Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+        Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()))
     }
 
     #[cfg(test)]
@@ -2518,7 +2518,7 @@ mod tests {
             effect
                 .try_persist_direct_existing(&context, &desired)
                 .unwrap(),
-            Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
         );
 
         let prepared =

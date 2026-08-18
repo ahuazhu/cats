@@ -323,13 +323,13 @@ impl PersistentFilesystemEffect {
             .load()
             .context("load Persistent filesystem checkpoint")?
         else {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         };
         if stored.content_digest() != content_digest
             || stored.checkpoint().step != runtime.step
             || stored.checkpoint().runtime_launch.identity().is_none()
         {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         }
 
         let _node_global_effect = context.lock_node_global_effect()?;
@@ -346,7 +346,7 @@ impl PersistentFilesystemEffect {
         }
         let Some(vmm) = admitted_vmm else {
             return Ok(if filesystem_phase {
-                Some(RuntimeDesiredEffectOutcome::RefreshInventory)
+                Some(RuntimeDesiredEffectOutcome::refresh_inventory())
             } else {
                 None
             });
@@ -425,14 +425,14 @@ impl PersistentFilesystemEffect {
             .into_iter()
             .next()
         else {
-            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+            return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
         };
         let filesystem = filesystem_binding(desired, stored.checkpoint(), prepared)?;
         let (serving, authority) =
             self.current_serving_authority(processes, desired, &filesystem.volume_id)?;
         let step = first_step(&filesystem, &authority, serving)?;
         persist_step(store, stored, step)?;
-        Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+        Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -465,7 +465,7 @@ impl PersistentFilesystemEffect {
             )?,
         ) {
             Ok(response) => response,
-            Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+            Err(error) => return Ok(RuntimeDesiredEffectOutcome::refresh_inventory_after(&error)),
         };
         if probe.outcome == FilesystemControlOutcomeV1::Conflict {
             return quarantine(store, stored);
@@ -493,10 +493,10 @@ impl PersistentFilesystemEffect {
                 );
                 match format {
                     Ok(response) if response.outcome == FilesystemControlOutcomeV1::Exact => {
-                        Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                        Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
                     }
                     Ok(_) => quarantine(store, stored),
-                    Err(_) => Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+                    Err(error) => Ok(RuntimeDesiredEffectOutcome::refresh_inventory_after(&error)),
                 }
             }
             FilesystemIdentityV1::Ext4 { filesystem_uuid }
@@ -506,7 +506,9 @@ impl PersistentFilesystemEffect {
                     self.current_serving_authority(processes, desired, &filesystem.volume_id)?;
                 let status = match self.blockd.status(context, serving) {
                     Ok(status) => status,
-                    Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+                    Err(error) => {
+                        return Ok(RuntimeDesiredEffectOutcome::refresh_inventory_after(&error))
+                    }
                 };
                 if !serving.validates_status_at_head(&status, &authority.head) {
                     return quarantine(store, stored);
@@ -520,7 +522,7 @@ impl PersistentFilesystemEffect {
                         remote_generation: status_generation(status.remote_durable_generation)?,
                     },
                 )?;
-                Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
             }
             FilesystemIdentityV1::Ext4 { .. } | FilesystemIdentityV1::Foreign => {
                 quarantine(store, stored)
@@ -560,7 +562,7 @@ impl PersistentFilesystemEffect {
             )?,
         ) {
             Ok(response) => response,
-            Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+            Err(error) => return Ok(RuntimeDesiredEffectOutcome::refresh_inventory_after(&error)),
         };
         if probe.outcome != FilesystemControlOutcomeV1::Exact
             || !matches!(
@@ -585,7 +587,7 @@ impl PersistentFilesystemEffect {
         ) {
             Ok(response) if response.outcome == FilesystemControlOutcomeV1::Exact => {}
             Ok(_) => return quarantine(store, stored),
-            Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+            Err(error) => return Ok(RuntimeDesiredEffectOutcome::refresh_inventory_after(&error)),
         }
         let (serving, accepted_authority) =
             self.current_serving_authority(processes, desired, &filesystem.volume_id)?;
@@ -593,7 +595,7 @@ impl PersistentFilesystemEffect {
         serving.assert_listener_current(context)?;
         let status = match self.blockd.drain(context, serving) {
             Ok(status) => status,
-            Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+            Err(error) => return Ok(RuntimeDesiredEffectOutcome::refresh_inventory_after(&error)),
         };
         context.check_active()?;
         let authority = self
@@ -619,7 +621,7 @@ impl PersistentFilesystemEffect {
                 new_remote_head: authority.head,
             },
         )?;
-        Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+        Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -638,7 +640,7 @@ impl PersistentFilesystemEffect {
             self.current_serving_authority(processes, desired, &filesystem.volume_id)?;
         let status = match self.blockd.status(context, serving) {
             Ok(status) => status,
-            Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+            Err(error) => return Ok(RuntimeDesiredEffectOutcome::refresh_inventory_after(&error)),
         };
         if &authority.head != new_remote_head
             || !serving.validates_fully_drained_status_at_head(&status, new_remote_head)
@@ -689,12 +691,12 @@ impl PersistentFilesystemEffect {
                         expected_head: new_remote_head.clone(),
                     },
                 )?;
-                Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
             }
             CommitInitializedAttempt::Committed(_) => quarantine(store, stored),
             CommitInitializedAttempt::RetryExact => Ok(RuntimeDesiredEffectOutcome::RetryExact),
             CommitInitializedAttempt::RefreshInventory | CommitInitializedAttempt::Ambiguous => {
-                Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+                Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
             }
             CommitInitializedAttempt::ReplanDesired => {
                 Ok(RuntimeDesiredEffectOutcome::ReplanDesired)
@@ -755,7 +757,7 @@ impl PersistentFilesystemEffect {
             )?,
         ) {
             Ok(response) => response,
-            Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+            Err(error) => return Ok(RuntimeDesiredEffectOutcome::refresh_inventory_after(&error)),
         };
         if probe.outcome != FilesystemControlOutcomeV1::Exact {
             return quarantine(store, stored);
@@ -783,7 +785,9 @@ impl PersistentFilesystemEffect {
             ) {
                 Ok(response) if response.outcome == FilesystemControlOutcomeV1::Exact => {}
                 Ok(_) => return quarantine(store, stored),
-                Err(_) => return Ok(RuntimeDesiredEffectOutcome::RefreshInventory),
+                Err(error) => {
+                    return Ok(RuntimeDesiredEffectOutcome::refresh_inventory_after(&error))
+                }
             }
         }
         self.advance_after_mount(desired, processes, store, stored, filesystem)
@@ -803,13 +807,13 @@ impl PersistentFilesystemEffect {
             .position(|device| device.volume_id == mounted.volume_id)
             .context("mounted Persistent device is absent from retained launch")?;
         let Some(next) = ordered.get(current + 1) else {
-            return Ok(RuntimeDesiredEffectOutcome::RefreshInventory);
+            return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
         };
         let filesystem = filesystem_binding(desired, stored.checkpoint(), next)?;
         let (serving, authority) =
             self.current_serving_authority(processes, desired, &filesystem.volume_id)?;
         persist_step(store, stored, first_step(&filesystem, &authority, serving)?)?;
-        Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+        Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
     }
 
     fn current_serving_authority<'a>(
@@ -1090,7 +1094,7 @@ fn quarantine(
     current: &StoredCheckpoint,
 ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
     persist_step(store, current, ReconcileStep::Quarantined)?;
-    Ok(RuntimeDesiredEffectOutcome::RefreshInventory)
+    Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
 }
 
 fn monotonic_timestamp(current: &StoredCheckpoint) -> anyhow::Result<UnixMillis> {

@@ -239,7 +239,7 @@ impl StartRuntimeReservationEffect {
         let [network_projection] = expected_networks.as_slice() else {
             // Absent TAP remains exclusively owned by the physical network
             // effect and must force another accepted full scan.
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         };
         if !signed_inventory_admission_is_exact_with_networks(
             accepted,
@@ -264,14 +264,14 @@ impl StartRuntimeReservationEffect {
             "StartRuntime process admission is not bound to the accepted full observation"
         );
         if process_admission.serving_blockd_count(&desired.cat_id) != devices.len() {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         }
         let mut serving_devices = Vec::with_capacity(devices.len());
         for device in devices {
             let Some((expectation, Some(serving))) =
                 process_admission.serving_blockd(&desired.cat_id, &device.volume_id)
             else {
-                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
             };
             if !expectation.matches_device_contract(&desired.cat_id, device) {
                 return Ok(Some(local_contract_stop()));
@@ -359,10 +359,10 @@ impl StartRuntimeReservationEffect {
             "StartRuntime admission names another checkpoint path"
         );
         let Some(stored) = store.load().context("load StartRuntime predecessor")? else {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         };
         if stored.content_digest() != content_digest || stored.checkpoint().step != runtime.step {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         }
 
         let retained_artifacts = match self.artifacts.retain() {
@@ -417,7 +417,7 @@ impl StartRuntimeReservationEffect {
                 )
             },
         )?;
-        Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+        Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()))
     }
 
     #[allow(
@@ -594,7 +594,7 @@ impl StartRuntimePhysicalEffect {
                 desired,
                 runtime,
             );
-            Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+            Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()))
         }
         #[cfg(target_os = "linux")]
         self.try_apply_linux(context, desired, runtime)
@@ -642,12 +642,12 @@ impl StartRuntimePhysicalEffect {
             .load()
             .context("load physical StartRuntime checkpoint")?
         else {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         };
         if stored.content_digest() != content_digest
             || !physical_start_runtime_checkpoint_evidence_is_exact(desired, runtime, &stored)
         {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         }
         let expectation = physical_vmm_expectation(&stored, checkpoint_path.clone())?;
         let process_admission = context.node_global_process()?;
@@ -672,13 +672,13 @@ impl StartRuntimePhysicalEffect {
                     VmmProcessGlobalInspection::Exact(current)
                         if current.as_ref() == admitted_vmm =>
                     {
-                        RuntimeDesiredEffectOutcome::RefreshInventory
+                        RuntimeDesiredEffectOutcome::refresh_inventory()
                     }
                     VmmProcessGlobalInspection::Exact(_)
                     | VmmProcessGlobalInspection::Conflict(_) => local_contract_stop(),
                     VmmProcessGlobalInspection::Absent(_)
                     | VmmProcessGlobalInspection::Unavailable => {
-                        RuntimeDesiredEffectOutcome::RefreshInventory
+                        RuntimeDesiredEffectOutcome::refresh_inventory()
                     }
                 },
             ));
@@ -690,7 +690,7 @@ impl StartRuntimePhysicalEffect {
             return Ok(Some(local_contract_stop()));
         };
         let [_expected_network] = expected_networks.as_slice() else {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         };
         if !signed_start_runtime_inventory_admission_is_exact_with_networks(
             accepted,
@@ -702,14 +702,14 @@ impl StartRuntimePhysicalEffect {
             return Ok(Some(local_contract_stop()));
         }
         if process_admission.serving_blockd_count(&desired.cat_id) != devices.len() {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         }
         let mut serving_devices = Vec::with_capacity(devices.len());
         for device in devices {
             let Some((serving_expectation, Some(serving))) =
                 process_admission.serving_blockd(&desired.cat_id, &device.volume_id)
             else {
-                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
             };
             if !serving_expectation.matches_device_contract(&desired.cat_id, device) {
                 return Ok(Some(local_contract_stop()));
@@ -804,7 +804,7 @@ impl StartRuntimePhysicalEffect {
         // Holding the exclusive namespace guard closes every supported late
         // launcher while the global absence proof is refreshed and consumed.
         let Some(namespace_guard) = self.launch_root.try_lock_effect_namespace()? else {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         };
         let _initial_authority = namespace_guard.bind_fresh_absence(
             self.revalidate_absent_physical_authority(
@@ -905,7 +905,7 @@ impl StartRuntimePhysicalEffect {
         };
         let ready = match preparation {
             ManagedVmmLaunchPreparation::PublishedIntent => {
-                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
             }
             ManagedVmmLaunchPreparation::Residue(residue) => {
                 let cleanup_authority = namespace_guard.bind_fresh_absence(
@@ -920,7 +920,7 @@ impl StartRuntimePhysicalEffect {
                     stored.checkpoint(),
                 )?;
                 residue.recover(&cleanup_authority, stored.checkpoint())?;
-                return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+                return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
             }
             ManagedVmmLaunchPreparation::Ready(ready) => ready,
         };
@@ -967,7 +967,7 @@ impl StartRuntimePhysicalEffect {
             .lock()
             .map_err(|_| anyhow::anyhow!("physical StartRuntime submission gate poisoned"))?;
         if submitted.as_ref() == Some(observation_id) {
-            return Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory));
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         }
         *submitted = Some(observation_id.clone());
         drop(submitted);
@@ -978,7 +978,7 @@ impl StartRuntimePhysicalEffect {
         // any leaf, so it cannot race this proof or its final revalidations.
         drop(submit_authority);
         drop(namespace_guard);
-        Ok(Some(RuntimeDesiredEffectOutcome::RefreshInventory))
+        Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()))
     }
 
     #[cfg(target_os = "linux")]
