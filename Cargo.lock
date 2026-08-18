@@ -1054,6 +1054,7 @@ name = "cats-blockd-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "cats-api",
  "cats-block-client",
  "cats-blockd",
@@ -1062,11 +1063,13 @@ dependencies = [
  "cats-metadata-store-sqlite",
  "cats-object-store-aws-s3",
  "cats-object-store-file",
+ "cats-object-store-gateway",
  "cats-storage",
  "cats-test-support",
  "clap",
  "libc",
  "postgres",
+ "ring",
  "serde_json",
  "tempfile",
  "tracing",
