@@ -52,6 +52,15 @@ ring = { workspace = true }
 cats-object-store-gateway = { workspace = true }
 cats-test-support = { workspace = true }
 cats-control-plane = { workspace = true, features = ["test-support"] }
+# `object_write_end_to_end` installs the reviewed gateway PostgreSQL role and
+# reads the settled `object_write_attempts` projection back. Both are operator
+# and assertion work outside the typed control Store surface.
+postgres = { workspace = true }
+# The same end-to-end chain runs against the production AWS object-write
+# downstream when a disposable bucket is named. `cmd/object-write-gatewayd`
+# already builds both crates, so this adds no new workspace dependency.
+cats-host-fence-aws = { workspace = true }
+aws-config = { workspace = true }
 cats-network = { workspace = true, features = ["test-support"] }
 # The stub control planes in `tests/control_plane_connection.rs` and
 # `tests/heartbeat_independence.rs` need a real `MetadataStore` for

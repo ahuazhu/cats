@@ -1325,6 +1325,7 @@ name = "cats-node-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aws-config",
  "axum",
  "base64",
  "bytes",
@@ -1332,6 +1333,7 @@ dependencies = [
  "cats-block-client",
  "cats-blockd",
  "cats-control-plane",
+ "cats-host-fence-aws",
  "cats-metadata-store-postgres",
  "cats-metadata-store-sqlite",
  "cats-metering",
@@ -1348,6 +1350,7 @@ dependencies = [
  "hyper-util",
  "jsonwebtoken",
  "libc",
+ "postgres",
  "reqwest",
  "ring",
  "rusqlite",

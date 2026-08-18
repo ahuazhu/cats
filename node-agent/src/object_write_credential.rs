@@ -1090,8 +1090,12 @@ impl ObjectWriteCredentialHttpRegistrar {
         Self::new(gateway_origin, TransportMode::ProductionHttps)
     }
 
+    /// Same real registrar against a loopback HTTP peer. `pub(crate)` so the
+    /// crate's object-write end-to-end acceptance test can point it at the
+    /// running gateway; the transport rule it relaxes is only the origin
+    /// scheme, and it is compiled out of every non-test build.
     #[cfg(test)]
-    fn for_loopback_test(gateway_origin: &str) -> anyhow::Result<Self> {
+    pub(crate) fn for_loopback_test(gateway_origin: &str) -> anyhow::Result<Self> {
         Self::new(gateway_origin, TransportMode::LoopbackTest)
     }
 

@@ -15,6 +15,10 @@ pub(crate) mod host_fence_recovery_batch;
 pub(crate) mod image_manifest_resolver;
 pub(crate) mod normal_delete;
 pub(crate) mod object_write;
+/// Cross-crate object-write acceptance fixture. Release binaries never enable
+/// `test-support`, so this composition cannot reach production.
+#[cfg(feature = "test-support")]
+pub(crate) mod object_write_e2e_fixture;
 pub(crate) mod persistent_disk_create_service;
 pub(super) mod pg_codec;
 pub(crate) mod placement_planner;

@@ -376,7 +376,7 @@ DECLARE
     object_key TEXT;
     content_sha256 TEXT;
     content_length BIGINT;
-    request_id TEXT;
+    computed_request_id TEXT;
     hash_input BYTEA;
     target JSONB;
     ingress_record JSONB;
@@ -450,9 +450,9 @@ BEGIN
             RAISE EXCEPTION 'object-write volume data key is invalid'
                 USING ERRCODE = '22023';
         END IF;
-        object_key := 'volumes/' || requested_descriptor #>> '{volume_id}' ||
-            '/data/' || requested_descriptor #>> '{key,transaction_id}' || '-c' ||
-            requested_descriptor #>> '{key,chunk_index}' ||
+        object_key := 'volumes/' || (requested_descriptor #>> '{volume_id}') ||
+            '/data/' || (requested_descriptor #>> '{key,transaction_id}') || '-c' ||
+            (requested_descriptor #>> '{key,chunk_index}') ||
             CASE requested_descriptor #>> '{key,object_kind}'
                 WHEN 'delta' THEN '-d' ELSE '' END;
     ELSIF key_kind = 'volume_map' THEN
@@ -463,7 +463,7 @@ BEGIN
             RAISE EXCEPTION 'object-write volume map key is invalid'
                 USING ERRCODE = '22023';
         END IF;
-        object_key := 'volumes/' || requested_descriptor #>> '{volume_id}' ||
+        object_key := 'volumes/' || (requested_descriptor #>> '{volume_id}') ||
             '/maps/' || pg_catalog.substr(content_sha256, 8) || '.node';
     ELSIF key_kind = 'volume_commit' THEN
         IF pg_catalog.jsonb_typeof(requested_descriptor -> 'key')
@@ -475,9 +475,9 @@ BEGIN
             RAISE EXCEPTION 'object-write volume commit key is invalid'
                 USING ERRCODE = '22023';
         END IF;
-        object_key := 'volumes/' || requested_descriptor #>> '{volume_id}' ||
-            '/commits/' || requested_descriptor #>> '{key,generation}' || '-' ||
-            requested_descriptor #>> '{key,transaction_id}' || '.json';
+        object_key := 'volumes/' || (requested_descriptor #>> '{volume_id}') ||
+            '/commits/' || (requested_descriptor #>> '{key,generation}') || '-' ||
+            (requested_descriptor #>> '{key,transaction_id}') || '.json';
     ELSE
         RAISE EXCEPTION 'object-write key class is invalid'
             USING ERRCODE = '22023';
@@ -551,14 +551,15 @@ BEGIN
                     requested_descriptor #>>
                         '{qualification_fault,qualification_catalog_sha256}', 'UTF8'));
     END IF;
-    request_id := 'sha256:' || pg_catalog.encode(pg_catalog.sha256(hash_input), 'hex');
+    computed_request_id :=
+        'sha256:' || pg_catalog.encode(pg_catalog.sha256(hash_input), 'hex');
     now_ms := pg_catalog.floor(
         pg_catalog.date_part('epoch', pg_catalog.clock_timestamp()) * 1000
     )::BIGINT;
     ingress_record := pg_catalog.jsonb_build_object(
         'ingress', pg_catalog.jsonb_build_object(
             'writer_authority_id', authority_row.writer_authority_id,
-            'request_id', request_id,
+            'request_id', computed_request_id,
             'credential', requested_attachment,
             'volume_id', requested_descriptor -> 'volume_id',
             'key', requested_descriptor -> 'key',
@@ -573,7 +574,7 @@ BEGIN
 
     SELECT attempt.* INTO existing_row
       FROM __CATS_SCHEMA_IDENT__.object_write_attempts attempt
-     WHERE attempt.request_id=request_id
+     WHERE attempt.request_id=computed_request_id
      FOR UPDATE;
     IF FOUND THEN
         IF existing_row.writer_authority_id <> authority_row.writer_authority_id
@@ -606,7 +607,7 @@ BEGIN
         object_region, object_store_scope_id, object_key, content_sha256,
         content_length, receiving_started_at_unix_ms, state
     ) VALUES (
-        request_id, ingress_record, authority_row.writer_authority_id,
+        computed_request_id, ingress_record, authority_row.writer_authority_id,
         credential_row.credential_id, requested_descriptor #>> '{volume_id}',
         key_kind, authority_row.object_provider, authority_row.object_partition,
         authority_row.object_account_id, authority_row.object_region,
@@ -730,12 +731,12 @@ DECLARE
     attempt_row RECORD;
     conflicting_row RECORD;
     now_ms BIGINT;
-    rejection_kind TEXT;
-    rejection_receipt_id TEXT;
+    computed_rejection_kind TEXT;
+    computed_rejection_receipt_id TEXT;
     updated_record JSONB;
     updated_authority JSONB;
     descriptor JSONB;
-    accepted_sequence BIGINT;
+    computed_accepted_sequence BIGINT;
 BEGIN
     IF session_user::TEXT IS DISTINCT FROM 'cats_object_write_gateway' THEN
         RAISE EXCEPTION 'object-write gateway PostgreSQL role mismatch'
@@ -774,9 +775,9 @@ BEGIN
             USING ERRCODE = '55000';
     END IF;
 
-    rejection_kind := CASE WHEN authority_row.state <> 'open'
+    computed_rejection_kind := CASE WHEN authority_row.state <> 'open'
         THEN 'writer_closed' ELSE NULL END;
-    IF rejection_kind IS NULL THEN
+    IF computed_rejection_kind IS NULL THEN
         SELECT existing.* INTO conflicting_row
           FROM __CATS_SCHEMA_IDENT__.object_write_attempts existing
          WHERE existing.writer_authority_id=parent_id
@@ -784,29 +785,30 @@ BEGIN
            AND existing.accepted_sequence IS NOT NULL
          FOR UPDATE;
         IF FOUND THEN
-            rejection_kind := 'object_key_conflict';
+            computed_rejection_kind := 'object_key_conflict';
         END IF;
     END IF;
     now_ms := pg_catalog.floor(
         pg_catalog.date_part('epoch', pg_catalog.clock_timestamp()) * 1000
     )::BIGINT;
-    IF rejection_kind IS NOT NULL THEN
-        rejection_receipt_id := 'owrej1_' ||
-            pg_catalog.substr(requested_request_id, 8) || '_' || rejection_kind;
+    IF computed_rejection_kind IS NOT NULL THEN
+        computed_rejection_receipt_id := 'owrej1_' ||
+            pg_catalog.substr(requested_request_id, 8) || '_' ||
+            computed_rejection_kind;
         updated_record := pg_catalog.jsonb_set(
             attempt_row.record, '{state}',
             pg_catalog.jsonb_build_object(
                 'kind', 'rejected_before_accept',
                 'spool', attempt_row.record #> '{state,spool}',
-                'reason', rejection_kind,
-                'rejection_receipt_id', rejection_receipt_id,
+                'reason', computed_rejection_kind,
+                'rejection_receipt_id', computed_rejection_receipt_id,
                 'rejected_at_unix_ms', now_ms
             ), FALSE
         );
         UPDATE __CATS_SCHEMA_IDENT__.object_write_attempts attempt
            SET record=updated_record, state='rejected_before_accept',
-               rejection_kind=rejection_kind,
-               rejection_receipt_id=rejection_receipt_id,
+               rejection_kind=computed_rejection_kind,
+               rejection_receipt_id=computed_rejection_receipt_id,
                rejected_at_unix_ms=now_ms
          WHERE attempt.request_id=requested_request_id
            AND attempt.state='durable_spooled';
@@ -818,10 +820,10 @@ BEGIN
         RAISE EXCEPTION 'object-write accepted sequence is exhausted'
             USING ERRCODE = '55000';
     END IF;
-    accepted_sequence := authority_row.max_accepted_sequence + 1;
+    computed_accepted_sequence := authority_row.max_accepted_sequence + 1;
     descriptor := pg_catalog.jsonb_build_object(
         'writer_authority_id', attempt_row.record #> '{ingress,writer_authority_id}',
-        'accepted_sequence', pg_catalog.to_jsonb(accepted_sequence),
+        'accepted_sequence', pg_catalog.to_jsonb(computed_accepted_sequence),
         'request_id', attempt_row.record #> '{ingress,request_id}',
         'credential', attempt_row.record #> '{ingress,credential}',
         'volume_id', attempt_row.record #> '{ingress,volume_id}',
@@ -843,11 +845,11 @@ BEGIN
     );
     updated_authority := pg_catalog.jsonb_set(
         authority_row.record, '{max_accepted_sequence}',
-        pg_catalog.to_jsonb(accepted_sequence), FALSE
+        pg_catalog.to_jsonb(computed_accepted_sequence), FALSE
     );
     UPDATE __CATS_SCHEMA_IDENT__.object_write_authorities authority
        SET record=updated_authority,
-           max_accepted_sequence=accepted_sequence
+           max_accepted_sequence=computed_accepted_sequence
      WHERE authority.writer_authority_id=parent_id
        AND authority.state='open'
        AND authority.max_accepted_sequence=authority_row.max_accepted_sequence;
@@ -857,7 +859,8 @@ BEGIN
     END IF;
     UPDATE __CATS_SCHEMA_IDENT__.object_write_attempts attempt
        SET record=updated_record, state='accepted_spooled',
-           accepted_sequence=accepted_sequence, accepted_at_unix_ms=now_ms,
+           accepted_sequence=computed_accepted_sequence,
+           accepted_at_unix_ms=now_ms,
            provider_attempt_id='owpa1_' ||
                 pg_catalog.substr(requested_request_id, 8)
      WHERE attempt.request_id=requested_request_id
