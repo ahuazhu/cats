@@ -9982,6 +9982,19 @@ fn scan_process_residue_allowing(
         Err(source) => return Err(source).context("read proc root"),
     };
     let mut count = 0_usize;
+    // The Agent is this scan's observer, not residue. Its own executable joined
+    // the managed set with the static service identity, so without this exact
+    // exemption a healthy Node reports itself as one unexplained managed
+    // process forever, and a fleet that must prove itself empty never can. The
+    // sibling ProbeFact scan already draws exactly this distinction.
+    let static_process = paths
+        .current_static_service
+        .as_ref()
+        .map(|identity| inspect_static_service_process(paths, identity, context))
+        .transpose()?;
+    if matches!(static_process, Some(StaticProcessInspection::Unavailable)) {
+        return Ok(None);
+    }
     let mut residue = Vec::new();
     for entry in entries {
         context.check_active()?;
@@ -10035,6 +10048,16 @@ fn scan_process_residue_allowing(
             continue;
         }
         if allowed_pids.contains(&process_id) {
+            continue;
+        }
+        // Only the exact current identity is exempt: a conflicting identity, or
+        // any other process running the same executable, stays unexplained.
+        if matches!(static_process, Some(StaticProcessInspection::Exact))
+            && paths
+                .current_static_service
+                .as_ref()
+                .is_some_and(|identity| identity.process_id == process_id)
+        {
             continue;
         }
         let first_exe = match first_exe {
@@ -21977,6 +22000,69 @@ mod tests {
                     )
             ));
         }
+    }
+
+    #[test]
+    fn the_agent_is_the_observer_of_the_node_residue_scan_not_one_of_its_findings() {
+        let environment = TestEnvironment::new();
+        let executable = environment
+            .proc_root
+            .parent()
+            .unwrap()
+            .join("bin/cats-noded");
+        let control_group = "0::/system.slice/cats-worker.service/agent\n";
+        let identity = StaticServiceIdentity::from_process_facts(
+            81,
+            executable.clone(),
+            control_group.as_bytes(),
+        )
+        .unwrap();
+
+        let write_process = |process_id: u32, cgroup: &str| {
+            let process = environment.proc_root.join(process_id.to_string());
+            std::fs::create_dir(&process).unwrap();
+            std::os::unix::fs::symlink(&executable, process.join("exe")).unwrap();
+            let mut command_line = executable.as_os_str().as_bytes().to_vec();
+            command_line.push(0);
+            std::fs::write(process.join("cmdline"), &command_line).unwrap();
+            std::fs::write(process.join("cgroup"), cgroup).unwrap();
+            std::fs::write(
+                process.join("stat"),
+                format!(
+                    "{process_id} (cats-noded) S 1 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 918273 "
+                ),
+            )
+            .unwrap();
+        };
+        write_process(81, control_group);
+
+        let paths = ProcessPaths {
+            root: environment.proc_root.clone(),
+            binaries: vec![executable.clone()],
+            current_static_service: Some(identity.clone()),
+            supported: true,
+            limits: ProbeLimits::default(),
+        };
+
+        assert!(
+            matches!(
+                scan_process_residue_allowing(&paths, &BTreeSet::new(), &context()).unwrap(),
+                Some(residue) if residue.is_empty()
+            ),
+            "the Agent's own process is the observer, not residue"
+        );
+
+        // Calibration: a second process running the same managed executable is
+        // still one unexplained managed process.
+        write_process(82, "0::/system.slice/cats-worker.service/agent\n");
+        assert!(matches!(
+            scan_process_residue_allowing(&paths, &BTreeSet::new(), &context()).unwrap(),
+            Some(residue)
+                if matches!(
+                    residue.as_slice(),
+                    [NodeResidue::Process { process_id: other, .. }] if *other == 82
+                )
+        ));
     }
 
     #[test]
