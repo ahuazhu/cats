@@ -680,6 +680,104 @@ impl FileCheckpointStore {
         self.load_release_rejection_target(expected.checkpoint())
     }
 
+    /// Retire a durable rejection whose checkpoint binding was superseded by
+    /// a rebind. The marker made one exact request non-replayable; once the
+    /// current checkpoint carries the same release coordinate under a fresh
+    /// evidence binding, that request can never be issued again and the
+    /// marker's job is complete. A marker still bound to the current
+    /// checkpoint is preserved untouched, and one naming a different release
+    /// coordinate fails closed.
+    pub(super) fn retire_superseded_release_rejection(
+        &self,
+        expected: &StoredCheckpoint,
+        current: &CurrentCheckpointGuard<'_>,
+    ) -> Result<bool, CheckpointStoreError> {
+        if !std::ptr::eq(current.owner, &self.writer_serialization) {
+            return Err(CheckpointStoreError::ConcurrentUpdate {
+                path: self.release_rejection_path.clone(),
+            });
+        }
+        self.verify_expected(ExpectedTarget::Exact(expected))?;
+        self.ensure_release_rejection_temporary_absent()?;
+        let file = match open_at(
+            &self.directory,
+            &self.release_rejection_name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0,
+        ) {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => {
+                return Err(map_open_error(
+                    "open definite release rejection marker",
+                    &self.release_rejection_path,
+                    source,
+                ))
+            }
+        };
+        let (marker, _, _) =
+            read_definite_release_rejection_raw(&file, &self.release_rejection_path, &[1])?;
+        if marker.checkpoint_content_digest == *expected.content_digest() {
+            return Ok(false);
+        }
+        let checkpoint = expected.checkpoint();
+        let ReconcileStep::CleanupRelease { cleanup } = &checkpoint.step else {
+            return Err(invalid_release_rejection(
+                &self.release_rejection_path,
+                "superseded rejection outlived its CleanupRelease step",
+            ));
+        };
+        let Some(replay) = cleanup.volume_release.as_ref() else {
+            return Err(invalid_release_rejection(
+                &self.release_rejection_path,
+                "superseded rejection outlived its release replay",
+            ));
+        };
+        let RuntimeVolumeTransition::Release {
+            cleanup: request_cleanup,
+        } = &marker.request.transition
+        else {
+            return Err(invalid_release_rejection(
+                &self.release_rejection_path,
+                "bound request is not Release",
+            ));
+        };
+        let Some(request_replay) = request_cleanup.volume_release.as_ref() else {
+            return Err(invalid_release_rejection(
+                &self.release_rejection_path,
+                "bound request lacks its release replay",
+            ));
+        };
+        if marker.cat_id != checkpoint.cat_id
+            || marker.request.cat_id != checkpoint.cat_id
+            || request_cleanup.target != cleanup.target
+            || request_replay.release_transition_id != replay.release_transition_id
+            || request_replay.generation != replay.generation
+            || request_replay.disposition != replay.disposition
+        {
+            return Err(invalid_release_rejection(
+                &self.release_rejection_path,
+                "superseded rejection names another release coordinate",
+            ));
+        }
+        unlink_at_if_exists(&self.directory, &self.release_rejection_name).map_err(|source| {
+            io_error(
+                "retire superseded release rejection marker",
+                &self.release_rejection_path,
+                source,
+            )
+        })?;
+        self.directory.sync_all().map_err(|source| {
+            io_error(
+                "fsync retired release rejection marker",
+                &self.directory_path,
+                source,
+            )
+        })?;
+        self.verify_expected(ExpectedTarget::Exact(expected))?;
+        Ok(true)
+    }
+
     /// Rebuilds the directory durability acknowledgement for an exact visible
     /// target. This closes the response-loss window where `linkat` became
     /// visible but the following directory fsync acknowledgement was lost.
@@ -1528,6 +1626,20 @@ fn read_definite_release_rejection_file(
     checkpoint: &RuntimeCheckpoint,
     allowed_link_counts: &[u64],
 ) -> Result<(DefiniteReleaseRejection, FileIdentity, u64), CheckpointStoreError> {
+    let (marker, identity, link_count) =
+        read_definite_release_rejection_raw(file, path, allowed_link_counts)?;
+    validate_definite_release_rejection(&marker, checkpoint, path)?;
+    Ok((marker, identity, link_count))
+}
+
+/// Read and decode a durable rejection without binding it to a checkpoint.
+/// Only supersession classification may use this: every replay/confirmation
+/// path must keep the exact-checkpoint binding of the validating reader.
+fn read_definite_release_rejection_raw(
+    file: &File,
+    path: &Path,
+    allowed_link_counts: &[u64],
+) -> Result<(DefiniteReleaseRejection, FileIdentity, u64), CheckpointStoreError> {
     let before_metadata = file
         .metadata()
         .map_err(|source| io_error("inspect definite release rejection marker", path, source))?;
@@ -1562,7 +1674,6 @@ fn read_definite_release_rejection_file(
         });
     }
     let marker = decode_definite_release_rejection(&bytes, path)?;
-    validate_definite_release_rejection(&marker, checkpoint, path)?;
     Ok((marker, before, link_count))
 }
 

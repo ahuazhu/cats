@@ -10689,6 +10689,110 @@ mod tests {
     }
 
     #[test]
+    fn superseded_release_rejection_retires_only_the_exact_release_coordinate() {
+        let root = tempfile::tempdir().unwrap();
+        let desired = desired();
+        let attachment = attachment(&desired);
+        let cleanup = CleanupRelease {
+            target: CleanupTarget::Volume {
+                volume_id: attachment.identity.volume_id.clone(),
+                attachment_id: attachment.identity.attachment_id.clone(),
+                attachment_epoch: attachment.identity.attachment_epoch,
+            },
+            inventory_session: SessionBinding {
+                node_id: desired.placement.node_id.clone(),
+                node_boot_id: NodeBootId::new("33333333333333333333333333333333").unwrap(),
+                agent_instance_id: random('8'),
+                agent_session_epoch: epoch(3),
+            },
+            inventory_epoch: epoch(4),
+            inventory_read_position: sequence(12),
+            desired_read_position: sequence(21),
+            volume_release: Some(VolumeReleaseReplay {
+                release_transition_id: random('7'),
+                generation: attachment.head.generation,
+                disposition: desired.volumes[0].disposition.clone(),
+            }),
+        };
+        let checkpoint = closed_checkpoint(
+            &desired,
+            ReconcileStep::CleanupRelease {
+                cleanup: cleanup.clone(),
+            },
+            vec![owned_observed_volume(&desired.volumes[0], &attachment)],
+            unix_ms(1_900_000_000_000),
+        );
+        let directory = root.path().join(CHECKPOINT_NAMESPACE);
+        let store = FileCheckpointStore::open(&directory, &desired.cat_id).unwrap();
+        let stored = store.create(&checkpoint).unwrap();
+        let request = release_transition_request(&desired, cleanup.clone());
+        let marker_path =
+            super::super::checkpoint::release_rejection_path(&directory, &desired.cat_id);
+        let current = store.assert_current(&stored).unwrap();
+        store
+            .persist_definite_release_rejection(
+                &stored,
+                &current,
+                &request,
+                RuntimeVolumeTransitionPreconditionProblem::CleanupEvidenceMismatch,
+            )
+            .unwrap();
+
+        // Bound to the current checkpoint: the rejection stays definite.
+        assert!(!store
+            .retire_superseded_release_rejection(&stored, &current)
+            .unwrap());
+        assert!(marker_path.exists());
+
+        // A rebind carrying the same release coordinate supersedes the
+        // marker: the rejected request can never be issued again.
+        let mut rebound = checkpoint.clone();
+        rebound.updated_at_unix_ms = unix_ms(1_900_000_000_001);
+        let rebound_stored = store.replace_current(&stored, &rebound, &current).unwrap();
+        assert!(store
+            .retire_superseded_release_rejection(&rebound_stored, &current)
+            .unwrap());
+        assert!(!marker_path.exists());
+        assert!(store
+            .load_definite_release_rejection(&rebound_stored)
+            .unwrap()
+            .is_none());
+
+        // A marker naming a different release coordinate fails closed.
+        store
+            .persist_definite_release_rejection(
+                &rebound_stored,
+                &current,
+                &release_transition_request(&desired, {
+                    let ReconcileStep::CleanupRelease { cleanup } = &rebound.step else {
+                        unreachable!()
+                    };
+                    cleanup.clone()
+                }),
+                RuntimeVolumeTransitionPreconditionProblem::CleanupEvidenceMismatch,
+            )
+            .unwrap();
+        let mut foreign = rebound.clone();
+        let ReconcileStep::CleanupRelease { cleanup } = &mut foreign.step else {
+            unreachable!()
+        };
+        cleanup
+            .volume_release
+            .as_mut()
+            .unwrap()
+            .release_transition_id = random('9');
+        foreign.updated_at_unix_ms = unix_ms(1_900_000_000_002);
+        let foreign_stored = store
+            .replace_current(&rebound_stored, &foreign, &current)
+            .unwrap();
+        assert!(store
+            .retire_superseded_release_rejection(&foreign_stored, &current)
+            .is_err());
+        assert!(marker_path.exists());
+        drop(current);
+    }
+
+    #[test]
     fn placement_or_attachment_conflict_stops_without_release_or_overwrite() {
         for conflict in ["placement", "attachment"] {
             let root = tempfile::tempdir().unwrap();

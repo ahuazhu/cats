@@ -1563,7 +1563,7 @@ impl LifecycleStepEffect {
                 rebound_cleanup.inventory_read_position =
                     accepted.attestation().inventory_read_position;
                 rebound_cleanup.desired_read_position = desired_read_position;
-                persist_lifecycle_successor(
+                let rebound_stored = persist_lifecycle_successor(
                     context,
                     &store,
                     &stored,
@@ -1571,6 +1571,31 @@ impl LifecycleStepEffect {
                     &current,
                     "rebind exact lifecycle cleanup to fresh inventory",
                 )?;
+                // Every full scan advances the inventory attestation, so the
+                // control plane's exact-evidence release check can only pass
+                // for a request issued under the same admission this rebind
+                // captured. Returning for a fresh scan would strand the
+                // evidence one attestation behind on every retry.
+                let ReconcileStep::CleanupRelease {
+                    cleanup: rebound_cleanup,
+                } = &rebound_stored.checkpoint().step
+                else {
+                    unreachable!("rebound lifecycle step changed kind")
+                };
+                if matches!(rebound_cleanup.target, CleanupTarget::Volume { .. }) {
+                    return self
+                        .apply_volume_release(
+                            context,
+                            accepted,
+                            desired,
+                            runtime,
+                            &store,
+                            &rebound_stored,
+                            &current,
+                            rebound_cleanup,
+                        )
+                        .map(Some);
+                }
                 return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
             }
             if matches!(cleanup.target, CleanupTarget::Volume { .. }) {
@@ -1836,6 +1861,16 @@ impl LifecycleStepEffect {
                 }
                 Ok(NormalReleaseAuthorityRecovery::Blocked) | Err(_) => Ok(stop_local()),
             };
+        }
+        // A rejection bound to a superseded checkpoint digest guarded a
+        // request that can never be issued again; retire it so the rebound
+        // evidence can retry. A rejection still bound to the current
+        // checkpoint stays definite below.
+        if store
+            .retire_superseded_release_rejection(stored, current)
+            .is_err()
+        {
+            return Ok(stop_local());
         }
         match store.load_definite_release_rejection(stored) {
             Ok(Some(_)) | Err(_) => return Ok(stop_local()),
@@ -4581,7 +4616,7 @@ fn persist_lifecycle_successor(
     successor: &RuntimeCheckpoint,
     current: &super::checkpoint::CurrentCheckpointGuard<'_>,
     operation: &'static str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<StoredCheckpoint> {
     // The cancellation read permit and checkpoint writer/CAS guard stay live
     // together through rename+directory fsync. A cancellation which wins
     // before this point therefore observes the exact predecessor unchanged.
@@ -4593,8 +4628,7 @@ fn persist_lifecycle_successor(
         .context("revalidate lifecycle predecessor before checkpoint CAS")?;
     store
         .replace_current(predecessor, successor, current)
-        .context(operation)?;
-    Ok(())
+        .context(operation)
 }
 
 fn is_lifecycle_step(step: &ReconcileStep) -> bool {
