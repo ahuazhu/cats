@@ -624,6 +624,87 @@ impl RetainedManagedBlockdSocketRoot {
         self.capture_closed_whole_root_unlocked(intents, expected)
     }
 
+    /// Upgrade-only discovery for the historical terminal cleanup gap which
+    /// could drop `RuntimeLaunch` before retiring its serving socket owner.
+    /// The durable intent remains the owner handle: this admits at most one
+    /// additional current-boot Serving generation and immediately proves
+    /// that adding it closes both managed namespaces. It never attributes the
+    /// owner to a Cat and never authorizes data-directory cleanup.
+    pub(crate) fn retain_single_terminal_serving_residue(
+        self: &Arc<Self>,
+        intents: &Arc<BlockdSocketIntentStore>,
+        expected: &[BlockdSocketOwnershipIntentV1],
+        current_boot: &CurrentBlockdSocketBoot,
+    ) -> anyhow::Result<Option<BlockdSocketOwnershipIntentV1>> {
+        let _namespace_lock = intents.lock_exclusive()?;
+        self.assert_current()?;
+        intents.assert_current()?;
+        validate_whole_root_expected_owner_count(expected.len().saturating_add(1))?;
+
+        let mut allowed_receipts = BTreeSet::new();
+        for intent in expected {
+            for name in [
+                intent_file_name(intent.owner())?,
+                intent_staging_file_name(intent.owner())?,
+                intent_quarantine_file_name(intent.owner())?,
+            ] {
+                anyhow::ensure!(
+                    allowed_receipts.insert(name.to_string_lossy().into_owned()),
+                    "terminal blockd expectation repeats an intent receipt"
+                );
+            }
+        }
+        let receipt_names = strict_directory_names_bounded(
+            &intents.directory,
+            BLOCKD_SOCKET_WHOLE_ROOT_SCAN_ENTRY_LIMIT,
+        )?;
+        let additional = receipt_names
+            .difference(&allowed_receipts)
+            .cloned()
+            .collect::<Vec<_>>();
+        let additional_name = match additional.as_slice() {
+            [] => {
+                self.capture_closed_whole_root_unlocked(intents, expected)?;
+                return Ok(None);
+            }
+            [name] => name,
+            _ => anyhow::bail!("terminal blockd recovery found multiple unknown intent receipts"),
+        };
+        let additional_c_name = CString::new(additional_name.as_bytes())
+            .context("terminal blockd intent filename contains NUL")?;
+        let bytes = read_optional_bounded_file(&intents.directory, &additional_c_name)?
+            .context("terminal blockd intent receipt disappeared")?;
+        let candidate = decode_intent(&bytes)?;
+        candidate.validate_against(self, current_boot.node_boot_id())?;
+        anyhow::ensure!(
+            matches!(candidate.owner(), BlockdSocketOwnerV1::Serving { .. }),
+            "terminal blockd recovery found an unexpected Root owner"
+        );
+        let candidate_names = [
+            intent_file_name(candidate.owner())?,
+            intent_staging_file_name(candidate.owner())?,
+            intent_quarantine_file_name(candidate.owner())?,
+        ]
+        .into_iter()
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect::<BTreeSet<_>>();
+        anyhow::ensure!(
+            candidate_names.contains(additional_name),
+            "terminal blockd intent filename differs from its canonical owner mapping"
+        );
+        anyhow::ensure!(
+            expected
+                .iter()
+                .all(|intent| intent.owner() != candidate.owner()),
+            "terminal blockd residue aliases an expected owner generation"
+        );
+
+        let mut closed = expected.to_vec();
+        closed.push(candidate.clone());
+        self.capture_closed_whole_root_unlocked(intents, &closed)?;
+        Ok(Some(candidate))
+    }
+
     fn capture_closed_whole_root_unlocked(
         self: &Arc<Self>,
         intents: &Arc<BlockdSocketIntentStore>,
@@ -2322,6 +2403,18 @@ impl ExactManagedBlockdSocketOwnerStartAbsence {
         self.capture.assert_current(current_boot)?;
         self.whole_root.assert_current()
     }
+
+    /// Consume the sealed Node-global absence proof without exposing the
+    /// retained root or intent-store descriptors to the compatibility caller.
+    pub(crate) fn retire(
+        self,
+        current_boot: &CurrentBlockdSocketBoot,
+    ) -> anyhow::Result<ManagedBlockdSocketOwnerRetirement> {
+        let root = Arc::clone(&self.whole_root.root);
+        let intents = Arc::clone(&self.whole_root.intents);
+        let expected = self.intent().clone();
+        root.retire_absent_owner(&intents, &expected, current_boot, self)
+    }
 }
 
 /// Descriptor-retained proof that the exact receipt-owned directory is public
@@ -3802,6 +3895,56 @@ mod tests {
             std::fs::read(Path::new(intent.owner_marker_path.as_str())).unwrap(),
             intent.encoded_bytes().unwrap()
         );
+    }
+
+    #[test]
+    fn terminal_recovery_retires_only_one_closed_serving_owner() {
+        let fixture = Fixture::new();
+        let intent = fixture.serving_intent('2');
+        let prepared = fixture
+            .root
+            .prepare_for_start(&fixture.intents, &intent, &fixture.current_boot())
+            .unwrap();
+        let control = UnixListener::bind(Path::new(intent.control_socket_path.as_str())).unwrap();
+        let io = UnixListener::bind(Path::new(intent.io_socket_path.as_ref().unwrap().as_str()))
+            .unwrap();
+        drop((control, io, prepared));
+
+        assert_eq!(
+            fixture
+                .root
+                .retain_single_terminal_serving_residue(
+                    &fixture.intents,
+                    &[],
+                    &fixture.current_boot(),
+                )
+                .unwrap(),
+            Some(intent.clone())
+        );
+        assert_eq!(
+            fixture
+                .exact_start_absence(&intent)
+                .retire(&fixture.current_boot())
+                .unwrap(),
+            ManagedBlockdSocketOwnerRetirement::Retired
+        );
+        fixture.assert_owner_and_intent_absent(&intent);
+
+        let first = fixture.serving_intent('3');
+        let second = fixture.serving_intent('4');
+        fixture
+            .intents
+            .publish(&first, &fixture.root, &fixture.current_boot())
+            .unwrap();
+        fixture
+            .intents
+            .publish(&second, &fixture.root, &fixture.current_boot())
+            .unwrap();
+        let error = fixture
+            .root
+            .retain_single_terminal_serving_residue(&fixture.intents, &[], &fixture.current_boot())
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("multiple unknown intent receipts"));
     }
 
     #[test]

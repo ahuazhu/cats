@@ -520,18 +520,37 @@ impl PlatformLifecyclePhysicalPort {
                 )
             });
         match vhost {
-            Some(prepared) => self.retire_exact_vhost_device(context, permit, prepared),
-            None => detach_exact_kernel_nbd_device(
-                self.kernel_nbd_detach.as_deref(),
-                context,
-                permit,
-                volume_id,
-                ownership_token,
-            ),
+            Some(prepared) => self.retire_exact_serving_device(context, permit, prepared),
+            None => {
+                let detached = detach_exact_kernel_nbd_device(
+                    self.kernel_nbd_detach.as_deref(),
+                    context,
+                    permit,
+                    volume_id,
+                    ownership_token,
+                )?;
+                if detached != LifecyclePhysicalAttempt::ExactPostcondition {
+                    return Ok(detached);
+                }
+                let prepared = permit
+                    .checkpoint()
+                    .runtime_launch
+                    .identity()
+                    .and_then(|launch| {
+                        let mut matching = launch.devices.iter().filter(|device| {
+                            &device.volume_id == volume_id
+                                && &device.ownership_token == ownership_token
+                        });
+                        let prepared = matching.next()?;
+                        matching.next().is_none().then_some(prepared)
+                    })
+                    .context("exact kernel-NBD postcondition lost its prepared device")?;
+                self.retire_exact_serving_device(context, permit, prepared)
+            }
         }
     }
 
-    fn retire_exact_vhost_device(
+    fn retire_exact_serving_device(
         &self,
         context: &RuntimeDesiredEffectContext,
         permit: &LifecycleEffectPermit<'_>,
@@ -7145,6 +7164,88 @@ mod tests {
             detach.calls.lock().unwrap().as_slice(),
             &[(desired.cat_id.clone(), volume_id, ownership_token)]
         );
+    }
+
+    #[test]
+    fn absent_kernel_nbd_device_retires_its_serving_socket_owner() {
+        let KernelNbdCleanupFixture {
+            desired,
+            checkpoint,
+            mut runtime,
+            volume_id,
+            ownership_token,
+            ..
+        } = kernel_nbd_cleanup_fixture();
+        runtime.volumes[0].devices.clear();
+        let prepared = checkpoint.runtime_launch.identity().unwrap().devices[0].clone();
+        let expectation =
+            ServingBlockdExpectation::from_lifecycle_checkpoint_for_test(&checkpoint, &desired)
+                .unwrap();
+        let directory = TempDir::new().unwrap();
+        let store = FileCheckpointStore::open(
+            &directory.path().join(CHECKPOINT_NAMESPACE),
+            &checkpoint.cat_id,
+        )
+        .unwrap();
+        let stored = store.create(&checkpoint).unwrap();
+        install_valid_checkpoint_evidence(&mut runtime, &checkpoint, &store, &stored);
+        let key = ManagedServingKey::new(desired.cat_id.clone(), volume_id.clone());
+        let scan = NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .with_serving_blockds(
+            BTreeMap::from([(key.clone(), expectation.clone())]),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .with_absent_serving_owners(BTreeSet::from([key]))
+        .unwrap();
+        let context = deleting_effect_context(&directory, &desired, runtime.clone());
+        let admission = scan
+            .bind(context.accepted_full().unwrap().observation())
+            .unwrap();
+        let context = context.with_node_global_process_for_test(admission);
+        let serving = Arc::new(VhostCleanupServingPort {
+            retirements: Mutex::new(VecDeque::from([
+                ManagedBlockdSocketOwnerRetirement::Retired,
+                ManagedBlockdSocketOwnerRetirement::AlreadyAbsent,
+            ])),
+        });
+        let detach = Arc::new(RecordingKernelNbdDetach {
+            calls: Mutex::new(Vec::new()),
+        });
+        let physical = PlatformLifecyclePhysicalPort {
+            network_ip_binary: PathBuf::new(),
+            serving_process: serving.clone(),
+            vmm_process: Arc::new(NeverVmmProcessPort),
+            kernel_nbd_detach: Some(detach.clone()),
+            blockd: PlatformPersistentBlockdControlPort,
+            volume_authority: Arc::new(UnavailableVolumeAuthority),
+        };
+        let permit = LifecycleEffectPermit {
+            desired: &desired,
+            runtime: &runtime,
+            store: &store,
+            stored: &stored,
+        };
+
+        assert_eq!(
+            physical
+                .detach_exact_device(&context, &permit, &volume_id, &ownership_token)
+                .unwrap(),
+            LifecyclePhysicalAttempt::SubmittedOrAmbiguous
+        );
+        assert_eq!(
+            physical
+                .detach_exact_device(&context, &permit, &volume_id, &ownership_token)
+                .unwrap(),
+            LifecyclePhysicalAttempt::ExactPostcondition
+        );
+        assert!(detach.calls.lock().unwrap().is_empty());
+        assert!(serving.retirements.lock().unwrap().is_empty());
+        assert!(expectation.matches_device_contract(&desired.cat_id, &prepared));
     }
 
     #[test]

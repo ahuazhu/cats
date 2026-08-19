@@ -205,18 +205,69 @@ pub(crate) enum TerminalVmmResidueGlobalInspection {
 /// identity and that a fresh closed Node-global sweep found no VMM unit,
 /// cgroup, Cats process or live provider-private socket which could still use
 /// its launch files.
-#[derive(Debug, PartialEq, Eq)]
 #[cfg(target_os = "linux")]
 pub(crate) struct ExactTerminalVmmResidueAbsenceProof {
     expectation: super::vmm_socket_namespace::TerminalVmmResidueExpectation,
+    terminal_blockd_absence:
+        Option<super::blockd_socket_namespace::ExactManagedBlockdSocketOwnerStartAbsence>,
 }
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for ExactTerminalVmmResidueAbsenceProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExactTerminalVmmResidueAbsenceProof")
+            .field("expectation", &self.expectation)
+            .field(
+                "terminal_blockd_intent",
+                &self
+                    .terminal_blockd_absence
+                    .as_ref()
+                    .map(|absence| absence.intent()),
+            )
+            .finish()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PartialEq for ExactTerminalVmmResidueAbsenceProof {
+    fn eq(&self, other: &Self) -> bool {
+        self.expectation == other.expectation
+            && self
+                .terminal_blockd_absence
+                .as_ref()
+                .map(|absence| absence.intent())
+                == other
+                    .terminal_blockd_absence
+                    .as_ref()
+                    .map(|absence| absence.intent())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Eq for ExactTerminalVmmResidueAbsenceProof {}
 
 #[cfg(target_os = "linux")]
 impl ExactTerminalVmmResidueAbsenceProof {
     pub(super) fn for_expectation(
         expectation: super::vmm_socket_namespace::TerminalVmmResidueExpectation,
     ) -> Self {
-        Self { expectation }
+        Self {
+            expectation,
+            terminal_blockd_absence: None,
+        }
+    }
+
+    pub(super) fn for_terminal_recovery(
+        expectation: super::vmm_socket_namespace::TerminalVmmResidueExpectation,
+        terminal_blockd_absence: Option<
+            super::blockd_socket_namespace::ExactManagedBlockdSocketOwnerStartAbsence,
+        >,
+    ) -> Self {
+        Self {
+            expectation,
+            terminal_blockd_absence,
+        }
     }
 
     pub(crate) fn matches(
@@ -224,6 +275,15 @@ impl ExactTerminalVmmResidueAbsenceProof {
         expectation: &super::vmm_socket_namespace::TerminalVmmResidueExpectation,
     ) -> bool {
         &self.expectation == expectation
+    }
+
+    pub(crate) fn retire_terminal_blockd_owner(&mut self) -> anyhow::Result<()> {
+        let Some(absence) = self.terminal_blockd_absence.take() else {
+            return Ok(());
+        };
+        let current_boot = super::blockd_socket_namespace::CurrentBlockdSocketBoot::read()?;
+        absence.retire(&current_boot)?;
+        Ok(())
     }
 }
 

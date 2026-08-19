@@ -821,10 +821,13 @@ impl ManagedVmmLaunchNamespaceGuard {
     ) -> Result<GuardedTerminalVmmResidueAbsence<'a>> {
         context.check_active()?;
         self.assert_for(&self.root)?;
+        let mut absence = absence;
         anyhow::ensure!(
             absence.matches(&expectation),
             "terminal VMM absence names another residue"
         );
+        absence.retire_terminal_blockd_owner()?;
+        context.check_active()?;
         Ok(GuardedTerminalVmmResidueAbsence {
             guard: self,
             absence,

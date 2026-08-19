@@ -72,7 +72,7 @@ use super::blockd_socket_namespace::ManagedBlockdSocketWholeRootSnapshot;
 use super::blockd_socket_namespace::{
     serving_socket_owner_authority_digest, BlockdSocketIntentStore, BlockdSocketOwnershipIntentV1,
     CurrentBlockdSocketBoot, ExactManagedBlockdSocketOwnerStartAbsence,
-    RetainedManagedBlockdSocketRoot,
+    ManagedBlockdSocketOwnerStartCapture, RetainedManagedBlockdSocketRoot,
 };
 use super::checkpoint::{
     decode_definite_release_rejection, validate_definite_release_rejection,
@@ -5311,6 +5311,7 @@ struct StaleBootRecoveryManagedSet {
     blockd_intents: Arc<BlockdSocketIntentStore>,
     blockd_expected: Vec<BlockdSocketOwnershipIntentV1>,
     blockd_snapshot: ManagedBlockdSocketWholeRootSnapshot,
+    terminal_blockd_capture: Option<ManagedBlockdSocketOwnerStartCapture>,
 }
 
 #[cfg(target_os = "linux")]
@@ -5663,12 +5664,32 @@ impl PlatformRootProcessInventoryBridge {
                 .as_ref()
                 .context("stale-boot recovery lacks the managed blockd intent store")?,
         );
-        let blockd_expected = self.managed_blockd_intents(
+        let mut blockd_expected = self.managed_blockd_intents(
             &root_expected,
             &serving_expected,
             &blockd_root,
             &blockd_boot,
         )?;
+        let terminal_blockd_capture = if terminal_vmm.is_some() {
+            match blockd_root.retain_single_terminal_serving_residue(
+                &blockd_intents,
+                &blockd_expected,
+                &blockd_boot,
+            )? {
+                Some(intent) => {
+                    let capture = blockd_root.capture_start_absence(
+                        &blockd_intents,
+                        &intent,
+                        &blockd_boot,
+                    )?;
+                    blockd_expected.push(intent);
+                    Some(capture)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let blockd_snapshot =
             blockd_root.capture_closed_whole_root(&blockd_intents, &blockd_expected)?;
         for socket in stop_receipt_sockets.values_mut() {
@@ -5687,6 +5708,7 @@ impl PlatformRootProcessInventoryBridge {
             blockd_intents,
             blockd_expected,
             blockd_snapshot,
+            terminal_blockd_capture,
         }))
     }
 
@@ -7649,6 +7671,7 @@ impl StaleBootVmmProcessGlobalPort for PlatformRootProcessInventoryBridge {
         context: &RuntimePreScanRecoveryContext,
     ) -> anyhow::Result<TerminalVmmResidueGlobalInspection> {
         context.check_active()?;
+        let mut node_global_effect = Some(context.lock_node_global_effect()?);
         let socket_root = self
             .managed_vmm_socket_root
             .as_deref()
@@ -7663,7 +7686,7 @@ impl StaleBootVmmProcessGlobalPort for PlatformRootProcessInventoryBridge {
                 VmmProcessConflict::IdentityMismatch,
             ));
         }
-        let Some(expected) =
+        let Some(mut expected) =
             self.stale_boot_recovery_managed_set(checkpoints, Some(selected), context)?
         else {
             return Ok(TerminalVmmResidueGlobalInspection::Unavailable);
@@ -7755,10 +7778,32 @@ impl StaleBootVmmProcessGlobalPort for PlatformRootProcessInventoryBridge {
                 VmmProcessConflict::IdentityMismatch,
             ));
         }
+        let terminal_blockd_absence = match expected.terminal_blockd_capture.take() {
+            Some(capture) => {
+                let after = expected.blockd_root.capture_closed_whole_root(
+                    &expected.blockd_intents,
+                    &expected.blockd_expected,
+                )?;
+                Some(
+                    ExactManagedBlockdSocketOwnerStartAbsence::seal_after_node_global_sweep(
+                        capture,
+                        expected.blockd_snapshot,
+                        after,
+                        &expected.blockd_boot,
+                        node_global_effect
+                            .take()
+                            .context("terminal blockd recovery lost its Node-global permit")?,
+                    )?,
+                )
+            }
+            None => None,
+        };
+        drop(node_global_effect.take());
         context.check_active()?;
         Ok(TerminalVmmResidueGlobalInspection::Absent(Box::new(
-            super::vmm_process::ExactTerminalVmmResidueAbsenceProof::for_expectation(
+            super::vmm_process::ExactTerminalVmmResidueAbsenceProof::for_terminal_recovery(
                 selected.clone(),
+                terminal_blockd_absence,
             ),
         )))
     }
@@ -11549,6 +11594,7 @@ mod tests {
             blockd_intents: Arc::clone(&blockd_intents),
             blockd_expected,
             blockd_snapshot,
+            terminal_blockd_capture: None,
         };
         let process_id = 4_242;
         let inspected = StaleBootRecoveryManagedInspection::Exact {
