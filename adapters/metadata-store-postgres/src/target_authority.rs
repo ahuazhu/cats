@@ -9,11 +9,11 @@ use std::sync::{mpsc, Arc};
 
 use cats_storage::authority::{
     compare_and_swap_head, project_volume_record, renew_lease, validate_volume_owner_binding,
-    AuthorityError, Epoch, FenceEpoch, Generation, Id, NodeVolumeInventoryRecord,
-    NodeVolumeInventorySnapshot, RenewLeaseRequest, RenewLeaseResult, Revision,
-    RuntimeVolumeInventoryAuthority, UnixMillis, VolumeDataAuthority, VolumeHeadCasRequest,
-    VolumeHeadCasResult, VolumeOwnerBinding, VolumeRecord, VolumeRecordProjection,
-    AUTHORITY_RELEASE_SCHEMA_VERSION, MAX_NODE_OWNED_VOLUMES,
+    AuthorityError, DeleteCompletionReceipt, Epoch, FenceEpoch, Generation, Id,
+    NodeVolumeInventoryRecord, NodeVolumeInventorySnapshot, RenewLeaseRequest, RenewLeaseResult,
+    Revision, RuntimeVolumeInventoryAuthority, UnixMillis, VolumeDataAuthority,
+    VolumeHeadCasRequest, VolumeHeadCasResult, VolumeOwnerBinding, VolumeRecord,
+    VolumeRecordProjection, AUTHORITY_RELEASE_SCHEMA_VERSION, MAX_NODE_OWNED_VOLUMES,
 };
 use cats_storage::{AdapterConfig, AdapterError, MetaError};
 use postgres::{Client, IsolationLevel, Row, Transaction};
@@ -439,6 +439,57 @@ fn load_node_volume_inventory(
         }
         records.push(NodeVolumeInventoryRecord { binding, volume });
     }
+    let present: std::collections::BTreeSet<&str> = records
+        .iter()
+        .map(|record| record.volume.volume_id.as_str())
+        .collect();
+    let mut completed_deletes = Vec::new();
+    for candidate in &candidate_volume_ids {
+        if present.contains(candidate.as_str()) {
+            continue;
+        }
+        // §11.3: a completed delete is the only valid proof for a requested
+        // candidate whose row is gone. Both projection arms must agree and
+        // the volume must map to exactly one receipt.
+        let rows = transaction
+            .query(
+                "SELECT record, volume_id, record->>'volume_id' AS json_volume_id,
+                        record->'request'->>'volume_id' AS request_volume_id
+                   FROM delete_completion_receipts
+                  WHERE volume_id=$1 OR record->>'volume_id'=$1
+                     OR record->'request'->>'volume_id'=$1
+                  ORDER BY delete_id COLLATE \"C\" LIMIT 2",
+                &[&candidate.as_str()],
+            )
+            .map_err(|_| AuthorityError::BackendUnknown)?;
+        if rows.is_empty() {
+            continue;
+        }
+        if rows.len() > 1 {
+            return Err(AuthorityError::BackendUnknown);
+        }
+        let row = &rows[0];
+        let json: String = row.try_get(0).map_err(|_| AuthorityError::BackendUnknown)?;
+        let scalar: String = row.try_get(1).map_err(|_| AuthorityError::BackendUnknown)?;
+        let json_volume: Option<String> =
+            row.try_get(2).map_err(|_| AuthorityError::BackendUnknown)?;
+        let request_volume: Option<String> =
+            row.try_get(3).map_err(|_| AuthorityError::BackendUnknown)?;
+        let receipt: DeleteCompletionReceipt =
+            serde_json::from_str(&json).map_err(|_| AuthorityError::BackendUnknown)?;
+        let receipt_volume = match &receipt {
+            DeleteCompletionReceipt::Normal { request, .. } => &request.volume_id,
+            DeleteCompletionReceipt::DisposableRoot { volume_id, .. } => volume_id,
+        };
+        if scalar != *candidate
+            || receipt_volume.as_str() != candidate.as_str()
+            || (json_volume.as_deref() != Some(candidate.as_str())
+                && request_volume.as_deref() != Some(candidate.as_str()))
+        {
+            return Err(AuthorityError::BackendUnknown);
+        }
+        completed_deletes.push(receipt);
+    }
     transaction
         .commit()
         .map_err(|_| AuthorityError::BackendUnknown)?;
@@ -446,6 +497,7 @@ fn load_node_volume_inventory(
         node_id: node_id.clone(),
         read_at_unix_ms,
         records,
+        completed_deletes,
     })
 }
 

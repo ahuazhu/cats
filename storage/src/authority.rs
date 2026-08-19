@@ -339,6 +339,11 @@ pub struct NodeVolumeInventorySnapshot {
     /// transaction. A missing requested candidate is represented by absence
     /// from this vector so the scanner can reject the incomplete set.
     pub records: Vec<NodeVolumeInventoryRecord>,
+    /// §11.3 delete-completion receipts for requested candidates whose Volume
+    /// row no longer exists, read in the same repeatable-read transaction.
+    /// A requested candidate absent from both `records` and this vector is
+    /// still an incomplete read the scanner must reject.
+    pub completed_deletes: Vec<DeleteCompletionReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

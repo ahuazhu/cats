@@ -48,8 +48,8 @@ use cats_blockd::target_control::TARGET_CONTROL_AUTHORIZATION_MAX_BYTES;
 use cats_storage::authority::VolumeDataAuthority;
 use cats_storage::authority::{
     validate_volume_owner_binding, validate_volume_record, AttachmentLineageIdentity,
-    AuthorizedServingAttachment, NodeVolumeInventorySnapshot, RuntimeVolumeInventoryAuthority,
-    VolumeRecord,
+    AuthorizedServingAttachment, DeleteCompletionReceipt, NodeVolumeInventorySnapshot,
+    RuntimeVolumeInventoryAuthority, VolumeRecord,
 };
 use cats_storage::BlobStore;
 use sha2::{Digest as _, Sha256};
@@ -362,6 +362,10 @@ struct MetadataAuthorityPage {
     desired_read_position: Sequence,
     snapshot_read_position: Sequence,
     records: Vec<MetadataAuthorityIndexedRecord>,
+    /// §11.3 receipts for requested candidates whose row no longer exists.
+    /// A whole-snapshot property: carried on the first page only, empty on
+    /// every continuation page.
+    completed_deletes: Vec<DeleteCompletionReceipt>,
     next_after_volume_id: Option<Id>,
 }
 
@@ -424,6 +428,7 @@ struct CachedMetadataAuthoritySnapshot {
     desired_read_position: Sequence,
     snapshot_read_position: Sequence,
     records: Vec<MetadataAuthorityIndexedRecord>,
+    completed_deletes: Vec<DeleteCompletionReceipt>,
 }
 
 /// Owns the one blocking authority read outside the Runtime scan lane, then
@@ -556,6 +561,7 @@ impl RuntimeVolumeInventoryPagePort {
         let Some(snapshot_read_position) = self.allocate_snapshot_read_position() else {
             return Self::unavailable();
         };
+        let completed_deletes = snapshot.completed_deletes;
         let mut records = Vec::with_capacity(snapshot.records.len());
         let mut previous_volume_id: Option<Id> = None;
         for indexed in snapshot.records {
@@ -582,6 +588,27 @@ impl RuntimeVolumeInventoryPagePort {
                 record: indexed.volume,
             });
         }
+        // A completed-delete receipt may only stand in for a volume with no
+        // authority row; duplicates or overlap with live rows fail closed.
+        let mut completed_ids = BTreeSet::new();
+        for receipt in &completed_deletes {
+            let volume_id = match receipt {
+                cats_storage::authority::DeleteCompletionReceipt::Normal { request, .. } => {
+                    &request.volume_id
+                }
+                cats_storage::authority::DeleteCompletionReceipt::DisposableRoot {
+                    volume_id,
+                    ..
+                } => volume_id,
+            };
+            if !completed_ids.insert(volume_id.clone())
+                || records
+                    .iter()
+                    .any(|record| &record.record.volume_id == volume_id)
+            {
+                return Self::unavailable();
+            }
+        }
         let mut cache = match self.cache.lock() {
             Ok(cache) => cache,
             Err(_) => return Self::unavailable(),
@@ -591,6 +618,7 @@ impl RuntimeVolumeInventoryPagePort {
             desired_read_position: request.desired_read_position,
             snapshot_read_position,
             records,
+            completed_deletes,
         });
         drop(cache);
         self.page_from_cache(request, snapshot_read_position)
@@ -653,6 +681,11 @@ impl RuntimeVolumeInventoryPagePort {
             desired_read_position: snapshot.desired_read_position,
             snapshot_read_position,
             records,
+            completed_deletes: if request.after_volume_id.is_none() {
+                snapshot.completed_deletes.clone()
+            } else {
+                Vec::new()
+            },
             next_after_volume_id,
         };
         if page.records.is_empty() {
@@ -742,6 +775,7 @@ impl MetadataAuthorityAbsenceReader for PagedMetadataAuthorityReader {
         let mut snapshot_read_position = None;
         let mut after_volume_id = None;
         let mut records = BTreeMap::new();
+        let mut completed_deletes: BTreeMap<Id, DeleteCompletionReceipt> = BTreeMap::new();
         let max_pages = METADATA_AUTHORITY_MAX_RECORDS.div_ceil(METADATA_AUTHORITY_PAGE_LIMIT) + 1;
 
         for _ in 0..max_pages {
@@ -798,6 +832,23 @@ impl MetadataAuthorityAbsenceReader for PagedMetadataAuthorityReader {
                 return Ok(MetadataAuthorityCandidateInventory::Unavailable);
             }
 
+            if request.snapshot_read_position.is_none() {
+                for receipt in &page.completed_deletes {
+                    let volume_id = match receipt {
+                        DeleteCompletionReceipt::Normal { request, .. } => &request.volume_id,
+                        DeleteCompletionReceipt::DisposableRoot { volume_id, .. } => volume_id,
+                    };
+                    if completed_deletes
+                        .insert(volume_id.clone(), receipt.clone())
+                        .is_some()
+                    {
+                        return Ok(MetadataAuthorityCandidateInventory::Unavailable);
+                    }
+                }
+            } else if !page.completed_deletes.is_empty() {
+                return Ok(MetadataAuthorityCandidateInventory::Unavailable);
+            }
+
             match page.next_after_volume_id {
                 Some(next)
                     if page.records.last().map(|indexed| &indexed.record.volume_id)
@@ -807,13 +858,23 @@ impl MetadataAuthorityAbsenceReader for PagedMetadataAuthorityReader {
                 }
                 Some(_) => return Ok(MetadataAuthorityCandidateInventory::Unavailable),
                 None if page.records.is_empty() => {
-                    if candidate_volume_ids
-                        .iter()
-                        .any(|volume_id| !records.contains_key(volume_id))
-                    {
+                    // A completion receipt stands in only for a requested
+                    // candidate with no live row; anything else fails closed.
+                    if completed_deletes.keys().any(|volume_id| {
+                        records.contains_key(volume_id) || !candidate_volume_ids.contains(volume_id)
+                    }) {
                         return Ok(MetadataAuthorityCandidateInventory::Unavailable);
                     }
-                    return Ok(MetadataAuthorityCandidateInventory::Records(records));
+                    if candidate_volume_ids.iter().any(|volume_id| {
+                        !records.contains_key(volume_id)
+                            && !completed_deletes.contains_key(volume_id)
+                    }) {
+                        return Ok(MetadataAuthorityCandidateInventory::Unavailable);
+                    }
+                    return Ok(MetadataAuthorityCandidateInventory::Records {
+                        records,
+                        completed_deletes,
+                    });
                 }
                 None => return Ok(MetadataAuthorityCandidateInventory::Unavailable),
             }
@@ -848,8 +909,13 @@ enum MetadataAuthorityRead {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MetadataAuthorityCandidateInventory {
     /// An empty map is a complete per-Node authority-index proof only when the
-    /// requested candidate set is also empty.
-    Records(BTreeMap<Id, VolumeRecord>),
+    /// requested candidate set is also empty. Every requested candidate is in
+    /// exactly one of the two maps: a live authority row, or the §11.3
+    /// completion receipt proving its delete finished.
+    Records {
+        records: BTreeMap<Id, VolumeRecord>,
+        completed_deletes: BTreeMap<Id, DeleteCompletionReceipt>,
+    },
     Unavailable,
 }
 
@@ -993,7 +1059,10 @@ impl MetadataAuthorityAbsenceReader for VolumeDataAuthorityMetadataReader {
                 Ok(MetadataAuthorityCandidateInventory::Unavailable)
             }
             MetadataAuthorityRead::Complete { records } => {
-                Ok(MetadataAuthorityCandidateInventory::Records(records))
+                Ok(MetadataAuthorityCandidateInventory::Records {
+                    records,
+                    completed_deletes: BTreeMap::new(),
+                })
             }
         }
     }
@@ -1017,7 +1086,10 @@ impl MetadataAuthorityAbsenceReader for TestAuthoritativeEmptyMetadataReader {
     ) -> anyhow::Result<MetadataAuthorityCandidateInventory> {
         debug_assert_eq!(deadline, context.deadline());
         context.check_active()?;
-        Ok(MetadataAuthorityCandidateInventory::Records(BTreeMap::new()))
+        Ok(MetadataAuthorityCandidateInventory::Records {
+            records: BTreeMap::new(),
+            completed_deletes: BTreeMap::new(),
+        })
     }
 }
 
@@ -9041,8 +9113,14 @@ impl InventoryAbsenceProbe for MetadataStoreProbe {
         }
         match authority_inventory {
             MetadataAuthorityCandidateInventory::Unavailable => Ok(InventoryAbsence::Unavailable),
-            MetadataAuthorityCandidateInventory::Records(records) => {
-                if candidate_volume_ids.is_empty() && records.is_empty() {
+            MetadataAuthorityCandidateInventory::Records {
+                records,
+                completed_deletes,
+            } => {
+                if candidate_volume_ids.is_empty()
+                    && records.is_empty()
+                    && completed_deletes.is_empty()
+                {
                     return Ok(InventoryAbsence::Empty);
                 }
                 if let Some(authority_only) =
@@ -9052,7 +9130,14 @@ impl InventoryAbsenceProbe for MetadataStoreProbe {
                         "metadata authority retains Node-owned volume outside scan candidates: {authority_only}"
                     );
                 }
-                if records.len() != candidate_volume_ids.len() {
+                if records
+                    .len()
+                    .checked_add(completed_deletes.len())
+                    .is_none_or(|covered| covered != candidate_volume_ids.len())
+                    || completed_deletes.keys().any(|volume_id| {
+                        records.contains_key(volume_id) || !candidate_volume_ids.contains(volume_id)
+                    })
+                {
                     return Ok(InventoryAbsence::Unavailable);
                 }
                 if let Some(local_only) = candidate_volume_ids
@@ -9068,7 +9153,41 @@ impl InventoryAbsenceProbe for MetadataStoreProbe {
                     BTreeMap::new();
                 for (volume_id, (desired, intent)) in desired_volumes {
                     let Some(record) = records.get(&volume_id) else {
-                        return Ok(InventoryAbsence::Unavailable);
+                        // §11.3: a completed delete removes both rows; the
+                        // receipt is the only proof under which a Deleted
+                        // disposable Root simply stops being projected. Any
+                        // local trace or coordinate drift fails closed.
+                        let Some(receipt) = completed_deletes.get(&volume_id) else {
+                            return Ok(InventoryAbsence::Unavailable);
+                        };
+                        let (receipt_volume, receipt_disk, receipt_delete) = match receipt {
+                            DeleteCompletionReceipt::Normal { request, .. } => {
+                                (&request.volume_id, &request.disk_id, &request.delete_id)
+                            }
+                            DeleteCompletionReceipt::DisposableRoot {
+                                volume_id,
+                                disk_id,
+                                delete_id,
+                                ..
+                            } => (volume_id, disk_id, delete_id),
+                        };
+                        let cats_api::runtime_reconciliation::VolumeDisposition::DeleteDisposableRoot {
+                            delete_id,
+                        } = &intent.disposition
+                        else {
+                            return Ok(InventoryAbsence::Unavailable);
+                        };
+                        if desired.target
+                            != cats_api::runtime_reconciliation::RuntimeTarget::Deleted
+                            || receipt_volume != &intent.volume_id
+                            || receipt_disk != &intent.disk_id
+                            || receipt_delete != delete_id
+                            || stale_volumes.contains_key(&volume_id)
+                            || cleanup_replays.contains_key(&volume_id)
+                        {
+                            return Ok(InventoryAbsence::Unavailable);
+                        }
+                        continue;
                     };
                     let stale_request = stale_volumes
                         .get(&volume_id)
@@ -12178,7 +12297,10 @@ mod tests {
             assert_eq!(deadline, context.deadline());
             context.check_active()?;
             Ok(if self.records.keys().eq(candidate_volume_ids.iter()) {
-                MetadataAuthorityCandidateInventory::Records(self.records.clone())
+                MetadataAuthorityCandidateInventory::Records {
+                    records: self.records.clone(),
+                    completed_deletes: BTreeMap::new(),
+                }
             } else {
                 MetadataAuthorityCandidateInventory::Unavailable
             })
@@ -12250,6 +12372,7 @@ mod tests {
                 (!records.is_empty()).then(|| Id::new(boundary_volume_id(end - 1)).unwrap());
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(MetadataAuthorityPageRead::Page(MetadataAuthorityPage {
+                completed_deletes: Vec::new(),
                 node_id: request.node_id.clone(),
                 desired_read_position: request.desired_read_position,
                 snapshot_read_position: Sequence::new(77).unwrap(),
@@ -12317,7 +12440,10 @@ mod tests {
             });
             match self.behavior {
                 MetadataReaderBehavior::AuthoritativeEmpty => {
-                    Ok(MetadataAuthorityCandidateInventory::Records(BTreeMap::new()))
+                    Ok(MetadataAuthorityCandidateInventory::Records {
+                        records: BTreeMap::new(),
+                        completed_deletes: BTreeMap::new(),
+                    })
                 }
                 MetadataReaderBehavior::Unavailable
                 | MetadataReaderBehavior::TimedOut
@@ -12330,11 +12456,17 @@ mod tests {
                     while Instant::now() < deadline {
                         std::thread::yield_now();
                     }
-                    Ok(MetadataAuthorityCandidateInventory::Records(BTreeMap::new()))
+                    Ok(MetadataAuthorityCandidateInventory::Records {
+                        records: BTreeMap::new(),
+                        completed_deletes: BTreeMap::new(),
+                    })
                 }
                 MetadataReaderBehavior::CancelDuringRead => {
                     context.cancel_for_test();
-                    Ok(MetadataAuthorityCandidateInventory::Records(BTreeMap::new()))
+                    Ok(MetadataAuthorityCandidateInventory::Records {
+                        records: BTreeMap::new(),
+                        completed_deletes: BTreeMap::new(),
+                    })
                 }
             }
         }
@@ -15467,6 +15599,7 @@ mod tests {
             .collect::<Vec<_>>();
         records.sort_by(|left, right| left.volume.volume_id.cmp(&right.volume.volume_id));
         NodeVolumeInventorySnapshot {
+            completed_deletes: Vec::new(),
             node_id: Id::new("node_a").unwrap(),
             read_at_unix_ms: cats_storage::authority::UnixMillis::new(1).unwrap(),
             records,
@@ -15478,6 +15611,7 @@ mod tests {
         next_after_volume_id: Option<&str>,
     ) -> MetadataAuthorityPageRead {
         MetadataAuthorityPageRead::Page(MetadataAuthorityPage {
+            completed_deletes: Vec::new(),
             node_id: Id::new("node_a").unwrap(),
             desired_read_position: Sequence::new(12).unwrap(),
             snapshot_read_position: Sequence::new(77).unwrap(),
@@ -15896,7 +16030,7 @@ mod tests {
         let reader = PagedMetadataAuthorityReader::new(Arc::new(port));
         let scan_context = context();
 
-        let MetadataAuthorityCandidateInventory::Records(read) = reader
+        let MetadataAuthorityCandidateInventory::Records { records: read, .. } = reader
             .read_candidates(
                 &Id::new("node_a").unwrap(),
                 &candidates,
@@ -16217,7 +16351,7 @@ mod tests {
         let (port, calls) = boundary_metadata_inventory_port(METADATA_AUTHORITY_MAX_RECORDS);
         let reader = PagedMetadataAuthorityReader::new(port);
 
-        let MetadataAuthorityCandidateInventory::Records(records) = reader
+        let MetadataAuthorityCandidateInventory::Records { records, .. } = reader
             .read_candidates(
                 &Id::new("node_a").unwrap(),
                 &candidates,
@@ -16639,7 +16773,7 @@ mod tests {
                 &scan_context,
             )
             .unwrap();
-        let MetadataAuthorityCandidateInventory::Records(records) = records else {
+        let MetadataAuthorityCandidateInventory::Records { records, .. } = records else {
             panic!("complete strict reads must return their typed records")
         };
         assert_eq!(records.keys().cloned().collect::<BTreeSet<_>>(), candidates);
