@@ -2443,6 +2443,32 @@ fn runtime_from_inventory(
             )
             && !current_cold_postcondition_exact
     });
+    let current_deleted_postcondition_exact = checkpoint.as_ref().is_some_and(|evidence| {
+        evidence.binding == DesiredCheckpointBinding::Current
+            && desired.target == cats_api::runtime_reconciliation::RuntimeTarget::Deleted
+            && matches!(
+                evidence.checkpoint.step,
+                ReconcileStep::Stable {
+                    state: StableState::Deleted
+                }
+            )
+            && volumes
+                .iter()
+                .all(|volume| volume.devices.is_empty() && volume.local_lineages.is_empty())
+            && blockds.is_empty()
+            && managed.processes.is_empty()
+            && managed.networks.is_empty()
+    });
+    let current_deleted_postcondition_mismatch = checkpoint.as_ref().is_some_and(|evidence| {
+        evidence.binding == DesiredCheckpointBinding::Current
+            && matches!(
+                evidence.checkpoint.step,
+                ReconcileStep::Stable {
+                    state: StableState::Deleted
+                }
+            )
+            && !current_deleted_postcondition_exact
+    });
     let definite_release_rejected = checkpoint
         .as_ref()
         .is_some_and(|evidence| evidence.definite_release_rejected);
@@ -2540,6 +2566,7 @@ fn runtime_from_inventory(
         || corrupt_checkpoint_present
         || unsupported_superseded
         || current_cold_postcondition_mismatch
+        || current_deleted_postcondition_mismatch
         || definite_release_rejected
         || closed_takeover_history
         || (matches!(&step, ReconcileStep::CleanupRelease { .. })
@@ -2550,6 +2577,14 @@ fn runtime_from_inventory(
         vec![Condition::Ready {
             reason: ReadyReason::PostconditionSatisfied {
                 target: RuntimeTarget::Cold,
+            },
+        }]
+    } else if current_deleted_postcondition_exact {
+        // A settled deletion must report its terminal typed reason: Control's
+        // Operation settlement waits for exactly this Ready evidence.
+        vec![Condition::Ready {
+            reason: ReadyReason::PostconditionSatisfied {
+                target: RuntimeTarget::Deleted,
             },
         }]
     } else if frozen_contract_stop {
