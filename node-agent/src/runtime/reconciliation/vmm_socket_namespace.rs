@@ -28,7 +28,9 @@ use cats_api::runtime_reconciliation::{
     RuntimeCheckpoint, Sha256Digest,
 };
 #[cfg(target_os = "linux")]
-use cats_api::runtime_reconciliation::{CleanupTarget, DiskKind, RuntimeLaunch, VolumeDisposition};
+use cats_api::runtime_reconciliation::{
+    CleanupTarget, ObservedDiskKind, RuntimeLaunch, VolumeDisposition,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::state_directory::StateDirectory;
@@ -1450,7 +1452,7 @@ impl TerminalVmmResidueExpectation {
         };
         let exact_volume = checkpoint.volumes.iter().any(|volume| {
             &volume.volume_id == volume_id
-                && volume.disk_kind == DiskKind::Root
+                && volume.disk_kind == ObservedDiskKind::Root
                 && match &volume.authority {
                     cats_api::runtime_reconciliation::VolumeAuthorityEvidence::Owned {
                         attachment_id: owned_id,
