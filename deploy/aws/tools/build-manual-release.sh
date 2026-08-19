@@ -21,6 +21,10 @@ image_reference=
 gateway_image_reference=
 push_image=false
 export_images=false
+# In-place hotfix builds may pin the embedded release binding to the release
+# whose installed trusts and PostgreSQL registration are already current,
+# instead of the source commit. Default stays the source commit.
+release_binding="${CATS_RELEASE_BINDING:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -61,6 +65,11 @@ done
 
 [[ $source_sha =~ ^[0-9a-f]{40}$ ]] || {
   echo "--source-sha must be one exact 40-hex commit" >&2
+  exit 2
+}
+[[ -z $release_binding ]] && release_binding=$source_sha
+[[ $release_binding =~ ^[0-9a-f]{40}$ ]] || {
+  echo "CATS_RELEASE_BINDING must be one exact 40-hex commit" >&2
   exit 2
 }
 [[ $output_root == /* && $output_root != *$'\n'* ]] || {
@@ -267,7 +276,7 @@ build_arguments=(
   --file deploy/aws/Dockerfile.control-plane
   --target runtime
   --platform linux/amd64
-  --build-arg "CATS_RELEASE_COMMIT_SHA=$source_sha"
+  --build-arg "CATS_RELEASE_COMMIT_SHA=$release_binding"
   --provenance=false
   --metadata-file "$control_metadata"
   --tag "$image_reference"
@@ -408,7 +417,7 @@ docker buildx build \
   --target artifact \
   --platform linux/amd64 \
   --provenance=false \
-  --build-arg "CATS_RELEASE_COMMIT_SHA=$source_sha" \
+  --build-arg "CATS_RELEASE_COMMIT_SHA=$release_binding" \
   --metadata-file "$worker_metadata" \
   --output "type=local,dest=$worker_root" \
   "$source_root"

@@ -444,6 +444,7 @@ EOF
       GIT_CONFIG_NOSYSTEM=1 \
       GIT_CONFIG_GLOBAL=/dev/null \
       GIT_TERMINAL_PROMPT=0 \
+      CATS_RELEASE_BINDING="${CATS_RELEASE_BINDING:-}" \
       bash -c 'cd /srv/cats-build/source && exec deploy/aws/tools/build-manual-release.sh --source-sha "$1" --output "$2" --image "$3" --gateway-image "$4" --export-images' \
       cats-manual-release "${source_sha}" "${release_dir}" \
       "${control_image_reference}" "${gateway_image_reference}" \
