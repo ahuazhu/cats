@@ -12689,9 +12689,11 @@ mod tests {
         let store = FileCheckpointStore::open(&directory, &desired.cat_id).unwrap();
         let stored = store.create(&checkpoint).unwrap();
         let request = release_transition_request(desired, cleanup);
+        let current = store.assert_current(&stored).unwrap();
         store
-            .persist_definite_release_rejection(&stored, &request, problem)
+            .persist_definite_release_rejection(&stored, &current, &request, problem)
             .unwrap();
+        drop(current);
         drop(store);
         (
             Arc::new(FakeAuthority::new(Ok(owned_record(desired, &attachment)))),
