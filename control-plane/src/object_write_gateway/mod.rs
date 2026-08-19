@@ -901,10 +901,63 @@ async fn settle_terminal(
     request_id: &Sha256Digest,
     terminal: ObjectPutTerminalState,
 ) -> Result<ObjectPutAttempt, ApiError> {
-    service
+    let error = match service
         .authority
         .complete_object_write_terminal(request_id, &terminal)
         .await
+    {
+        Ok(attempt) => return Ok(attempt),
+        Err(error) => error,
+    };
+    if error.code != ErrorCode::Conflict {
+        return Err(error);
+    }
+    // Two drivers of one accepted attempt are legal: the request path and a
+    // replica's recovery sweep both re-drive the identical signed bytes, but
+    // each embeds its own receipt ids and timestamps in the terminal outcome,
+    // so the slower driver fails the exact-replay guard even though its PUT
+    // is durably visible. Surfacing that Conflict turned one durably
+    // published strict FLUSH into a Guest-fatal write error. Adopt the stored
+    // terminal when it proves the same semantic outcome; a cross-kind
+    // divergence stays a loud conflict.
+    let (attempt, _) = service
+        .authority
+        .mark_object_write_provider_issued(request_id)
+        .await?;
+    adopt_equivalent_terminal(attempt, &terminal, error)
+}
+
+/// Answers the stored attempt when its terminal outcome is semantically the
+/// one this driver just proved (only driver-local receipt ids and timestamps
+/// differ); otherwise returns the original replay conflict unchanged.
+fn adopt_equivalent_terminal(
+    attempt: ObjectPutAttempt,
+    attempted: &ObjectPutTerminalState,
+    error: ApiError,
+) -> Result<ObjectPutAttempt, ApiError> {
+    let ObjectPutState::Terminal { outcome, .. } = &attempt.state else {
+        return Err(error);
+    };
+    let equivalent = matches!(
+        (outcome, attempted),
+        (
+            ObjectPutTerminalState::SucceededVisible {
+                qualification_ambiguity: None,
+                ..
+            },
+            ObjectPutTerminalState::SucceededVisible {
+                qualification_ambiguity: None,
+                ..
+            },
+        ) | (
+            ObjectPutTerminalState::PermanentlyFailed { .. },
+            ObjectPutTerminalState::PermanentlyFailed { .. },
+        )
+    );
+    if equivalent {
+        return Ok(attempt);
+    }
+    Err(error)
 }
 
 async fn cleanup_terminal(
@@ -1654,5 +1707,83 @@ mod tests {
         );
         assert_eq!(downstream.ordinary_puts.load(Ordering::SeqCst), 0);
         assert_eq!(downstream.qualification_puts.load(Ordering::SeqCst), 0);
+    }
+
+    fn succeeded_visible(tag: &str, at: u64) -> ObjectPutTerminalState {
+        ObjectPutTerminalState::SucceededVisible {
+            put_receipt_id: ascii(&format!("put-{tag}")),
+            put_completed_at_unix_ms: millis(at),
+            visibility_receipt_id: ascii(&format!("visibility-{tag}")),
+            visible_at_unix_ms: millis(at + 1),
+            qualification_ambiguity: None,
+        }
+    }
+
+    fn terminal_attempt(outcome: ObjectPutTerminalState) -> ObjectPutAttempt {
+        let mut attempt = issued_fault_attempt(&authority());
+        let spool = match &attempt.state {
+            ObjectPutState::ProviderIssued { spool, .. }
+            | ObjectPutState::AcceptedSpooled { spool } => spool.clone(),
+            other => panic!("fixture state changed: {other:?}"),
+        };
+        attempt.state = ObjectPutState::Terminal {
+            outcome,
+            spool: cats_storage::object_write_authority::TerminalObjectWriteSpool::Retained {
+                spool,
+            },
+        };
+        attempt
+    }
+
+    /// Two drivers of one accepted attempt publish identical bytes but embed
+    /// their own receipt ids and timestamps. The slower driver's replay
+    /// conflict must adopt the stored equivalent terminal instead of handing
+    /// a durably published write back to the writer as a failure.
+    #[test]
+    fn replayed_terminal_with_equivalent_outcome_adopts_the_stored_receipt() {
+        let stored = terminal_attempt(succeeded_visible("winner", 20));
+        let adopted = adopt_equivalent_terminal(
+            stored.clone(),
+            &succeeded_visible("loser", 25),
+            ApiError::conflict("object-write gateway state or binding is stale"),
+        )
+        .expect("equivalent success terminal must be adopted");
+        assert_eq!(adopted, stored);
+
+        let failed = terminal_attempt(ObjectPutTerminalState::PermanentlyFailed {
+            failure_receipt_id: ascii("failure-winner"),
+            failed_at_unix_ms: millis(20),
+        });
+        let adopted = adopt_equivalent_terminal(
+            failed.clone(),
+            &ObjectPutTerminalState::PermanentlyFailed {
+                failure_receipt_id: ascii("failure-loser"),
+                failed_at_unix_ms: millis(26),
+            },
+            ApiError::conflict("object-write gateway state or binding is stale"),
+        )
+        .expect("equivalent permanent-failure terminal must be adopted");
+        assert_eq!(adopted, failed);
+    }
+
+    /// A cross-kind divergence is a real integrity problem and must keep the
+    /// loud replay conflict, as must a row that is not terminal at all.
+    #[test]
+    fn divergent_or_nonterminal_replay_keeps_the_conflict() {
+        let conflict = || ApiError::conflict("object-write gateway state or binding is stale");
+        let stored = terminal_attempt(succeeded_visible("winner", 20));
+        adopt_equivalent_terminal(
+            stored,
+            &ObjectPutTerminalState::PermanentlyFailed {
+                failure_receipt_id: ascii("failure-loser"),
+                failed_at_unix_ms: millis(26),
+            },
+            conflict(),
+        )
+        .expect_err("cross-kind terminal divergence must stay a conflict");
+
+        let nonterminal = issued_fault_attempt(&authority());
+        adopt_equivalent_terminal(nonterminal, &succeeded_visible("loser", 25), conflict())
+            .expect_err("a non-terminal row cannot answer a terminal replay");
     }
 }
