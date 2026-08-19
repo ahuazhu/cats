@@ -333,7 +333,12 @@ pub(crate) enum CatCreateServiceError {
 impl CatCreateServiceError {
     fn from_api(error: ApiError) -> Self {
         match error.code {
-            ErrorCode::Unavailable | ErrorCode::DeadlineExceeded => Self::TemporarilyUnavailable,
+            ErrorCode::Unavailable | ErrorCode::DeadlineExceeded => {
+                // The public 503 body is deliberately opaque; the operator
+                // still needs the exact unavailable source.
+                tracing::warn!(error = ?error, "Cat create is temporarily unavailable");
+                Self::TemporarilyUnavailable
+            }
             ErrorCode::Internal => Self::Fatal(error),
             _ => Self::Request(error),
         }
