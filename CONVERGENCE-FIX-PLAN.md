@@ -155,11 +155,19 @@ checkpoint 推进到 Volume release(`disposition=delete_disposable_root`);但生
   「行已删」由 receipt 证明并停止投影;无 receipt/坐标漂移/本地残迹仍 fail closed。
 - **D12 = §11.1 converge 无生产入口**(`bc29666c`):维护角色对 Deleted 墓碑执行 converge
   begin_delete(单节点 admission 锁定+全字段证据),**生产首次执行成功**(卷已进 Deleting)。
-- **D13 sweeper S3 权限/未知失败**(进行中):controld 首次做 S3 删除;pod identity 角色补了
+- **D13 sweeper S3 权限/未知失败**(已解决):controld 首次做 S3 删除;pod identity 角色补了
   `cats-fresh/volumes/*` 的 List/Delete(IAM 模拟通过),但 sweep 仍每 2 秒失败且外层日志吞了
   错误链;调试 pod 证实同 SA 可 list(前缀为空!)可疑点已排除凭据/端点/netpol/deadline;
-  `39d7ffb6` 改为输出完整错误链定位中。**注意:卷前缀下没有对象**——1 GiB chunk 的真实布局
-  可能不是 `volumes/<id>/`,若 sweep 修好后 receipt 落地而对象仍在,需按真实布局补删除范围。
+  `39d7ffb6` 输出完整错误链后确认为 IAM 授权缺失 + adapter 5 分钟凭据缓存延迟;缓存过期后
+  sweep 完成:receipt 落地、卷/盘行删除、S3 前缀清空,cat_5dcd16fa 生命周期完整闭合。
+- **D15 生产 product mutations 关闭**(已解决,8/20):create 秒回 `temporarily_unavailable`,
+  加日志后定位为 ADR-0051 资格窗口过期(`production product mutations are Closed`)。恢复路径:
+  旧窗 qual-hotfix-nbd-01 过期但状态机未关 → 用原班工件 `qualification-close`(end_qualification);
+  再以 `make-qual.py` 铸 qual-hotfix-nbd-02(同 receipt d344dcd2、release 32eba16d)
+  `qualification-begin` 开 6 小时新窗。工艺坑:release manifest 必须用
+  `release-manifest.published.json`(binding 记录的是 published 版 sha);macOS 签名必须用
+  root 属主 `/usr/local/bin/openssl3`(系统 LibreSSL 无 `pkeyutl -rawin`);state/evidence
+  目录须 0700。
 - **工程环境修复**:SSM 会话 `ulimit -n 1024` 导致 cap-scaled 测试假失败(loop 脚本已固化
   65536);本地 `cargo check` 必须带 `--tests`;Codex 落盘脚本与执行版本可能不一致。
 - **回归债(合并门禁前必须补)**:D12 converge 的控制面存储测试(夹具在 product_tests);
