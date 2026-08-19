@@ -819,6 +819,7 @@ pub(crate) struct NodeGlobalManagedProcessScanAdmission {
     entries: Vec<NodeGlobalManagedProcessExpectation>,
     stop_receipt_sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
     absent_serving_owners: BTreeSet<ManagedServingKey>,
+    additional_managed_units: BTreeSet<Id>,
 }
 
 /// The same closed set after it is bound to the exact full observation sent
@@ -837,6 +838,7 @@ pub(crate) struct NodeGlobalManagedProcessAdmission {
     entries: Vec<NodeGlobalManagedProcessExpectation>,
     stop_receipt_sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
     absent_serving_owners: BTreeSet<ManagedServingKey>,
+    additional_managed_units: BTreeSet<Id>,
 }
 
 impl NodeGlobalManagedProcessScanAdmission {
@@ -1069,7 +1071,36 @@ impl NodeGlobalManagedProcessScanAdmission {
             entries,
             stop_receipt_sockets: BTreeMap::new(),
             absent_serving_owners: BTreeSet::new(),
+            additional_managed_units: BTreeSet::new(),
         })
+    }
+
+    pub(crate) fn with_additional_managed_units(
+        mut self,
+        units: BTreeSet<Id>,
+    ) -> anyhow::Result<Self> {
+        let managed = self
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                NodeGlobalManagedProcessExpectation::RootControl {
+                    exact: Some(proof), ..
+                } => Some(proof.evidence().scope_id.clone()),
+                NodeGlobalManagedProcessExpectation::ServingBlockd {
+                    exact: Some(proof), ..
+                } => Some(proof.evidence().unit_id().clone()),
+                NodeGlobalManagedProcessExpectation::Vmm {
+                    exact: Some(proof), ..
+                } => Some(proof.evidence().unit_id().clone()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        anyhow::ensure!(
+            managed.is_disjoint(&units),
+            "additional managed systemd unit aliases a runtime process unit"
+        );
+        self.additional_managed_units = units;
+        Ok(self)
     }
 
     /// Bind scanner-private managed owner/intent residue to an absent Serving
@@ -1553,6 +1584,7 @@ impl NodeGlobalManagedProcessScanAdmission {
             entries: self.entries,
             stop_receipt_sockets: self.stop_receipt_sockets,
             absent_serving_owners: self.absent_serving_owners,
+            additional_managed_units: self.additional_managed_units,
         })
     }
 
@@ -1570,6 +1602,7 @@ impl NodeGlobalManagedProcessScanAdmission {
             entries: self.entries,
             stop_receipt_sockets: self.stop_receipt_sockets,
             absent_serving_owners: self.absent_serving_owners,
+            additional_managed_units: self.additional_managed_units,
         }
     }
 }
@@ -1637,12 +1670,17 @@ impl NodeGlobalManagedProcessAdmission {
             entries: self.entries.clone(),
             stop_receipt_sockets: self.stop_receipt_sockets.clone(),
             absent_serving_owners: self.absent_serving_owners.clone(),
+            additional_managed_units: self.additional_managed_units.clone(),
         }
         .bind(observation)
     }
 
     pub(crate) fn stop_receipt_socket(&self, cat_id: &Id) -> Option<&StopReceiptSocketAdmission> {
         self.stop_receipt_sockets.get(cat_id)
+    }
+
+    pub(crate) fn additional_managed_units(&self) -> &BTreeSet<Id> {
+        &self.additional_managed_units
     }
 
     pub(crate) fn stop_receipt_physical_paths(&self) -> BTreeSet<HostPath> {

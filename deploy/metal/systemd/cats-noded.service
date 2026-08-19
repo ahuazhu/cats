@@ -15,10 +15,11 @@ EnvironmentFile=/etc/cats/cats.env
 # Clear even a stale EnvironmentFile/manager value because the CLI otherwise
 # accepts this setting from its process environment.
 UnsetEnvironment=CATS_ROUTE_V2_MACHINE_LISTEN
-# Per-Cat VMM/blockd processes are PID-1-owned sibling transient services in
-# system.slice, not children of this service cgroup. Reap every process that
-# does belong to the Agent while leaving those independently owned services
-# available for checkpoint + full-inventory adoption after restart.
+# Per-Cat VMM/blockd/kernel-NBD client processes are PID-1-owned sibling
+# transient services in system.slice, not children of this service cgroup.
+# Reap every process that does belong to the Agent while leaving those
+# independently owned services available for checkpoint + full-inventory
+# adoption after restart.
 KillMode=control-group
 # Root is required for /dev/kvm, kernel NBD attach and tap devices (Phase A;
 # privilege separation is a hardening milestone). The nbd module is loaded

@@ -46,7 +46,7 @@ use super::{
     classify_current_endpoint_route_retirement, classify_current_global_route_retirement,
     classify_superseded_route_retirement,
     guest_ready::{GuestReadyTransportPort, PlatformGuestReadyTransportPort},
-    kernel_nbd::{KernelNbdInventoryPort, KernelNbdPoolScanOutcome},
+    kernel_nbd::{KernelNbdInventoryPort, KernelNbdPoolScanOutcome, KernelNbdProcessAllowances},
     lifecycle_steps::{
         cold_membership_detach_cleanup_checkpoint_is_supported,
         cold_membership_detach_cleanup_is_supported, cold_membership_rebind_is_supported,
@@ -262,6 +262,46 @@ pub(crate) trait RootProcessInventoryBridge:
         stop_receipt_sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
         context: &RuntimeInventoryScanContext,
     ) -> anyhow::Result<RootProcessInventoryBridgeOutcome>;
+
+    fn inspect_all_with_additional_managed_units(
+        &self,
+        root_expected: BTreeMap<Id, RootProvisionProcessExpectation>,
+        serving_expected: BTreeMap<
+            ManagedServingKey,
+            super::serving_blockd_process::ServingBlockdExpectation,
+        >,
+        vmm_expected: BTreeMap<Id, super::vmm_process::VmmProcessExpectation>,
+        stop_receipt_sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
+        additional_managed_units: BTreeSet<Id>,
+        context: &RuntimeInventoryScanContext,
+    ) -> anyhow::Result<RootProcessInventoryBridgeOutcome> {
+        let outcome = self.inspect_all(
+            root_expected,
+            serving_expected,
+            vmm_expected,
+            stop_receipt_sockets,
+            context,
+        )?;
+        Ok(match outcome {
+            RootProcessInventoryBridgeOutcome::Complete(admission) => {
+                RootProcessInventoryBridgeOutcome::Complete(
+                    admission.with_additional_managed_units(additional_managed_units)?,
+                )
+            }
+            RootProcessInventoryBridgeOutcome::CompleteWithResidue {
+                admission,
+                systemd,
+                processes,
+                control_sockets,
+            } => RootProcessInventoryBridgeOutcome::CompleteWithResidue {
+                admission: admission.with_additional_managed_units(additional_managed_units)?,
+                systemd,
+                processes,
+                control_sockets,
+            },
+            unavailable @ RootProcessInventoryBridgeOutcome::Unavailable { .. } => unavailable,
+        })
+    }
 }
 
 pub(crate) mod network_inventory_bridge_sealed {
@@ -689,6 +729,8 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
         let mut node_global_process_admission = None;
         let mut node_global_network_admission = None;
         let mut kernel_nbd_pool_admission = None;
+        let mut kernel_nbd_process_allowances = KernelNbdProcessAllowances::default();
+        let mut kernel_nbd_pre_scan_available = true;
         let mut exact_physical_negative_cats = BTreeSet::new();
         if let Some(bridge) = &self.root_process_bridge {
             // The process expectation cannot be derived until all three data
@@ -711,6 +753,24 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                     aggregate.unavailable_sources,
                     exact_physical_negative_cats,
                 ));
+            }
+
+            if let Some(kernel_nbd) = &self.kernel_nbd_port {
+                kernel_nbd_process_allowances = match kernel_nbd.scan_process_allowances(&context) {
+                    Ok(allowances) => allowances,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            proof = "kernel-NBD process allowances",
+                            "kernel-NBD pre-scan is unavailable"
+                        );
+                        aggregate
+                            .unavailable_sources
+                            .push(InventorySource::BlockFrontend);
+                        kernel_nbd_pre_scan_available = false;
+                        KernelNbdProcessAllowances::default()
+                    }
+                };
             }
 
             let root_expected = root_process_expectations(
@@ -751,11 +811,12 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
             context
                 .remaining()
                 .context("root-process inventory bridge deadline expired before inspection")?;
-            match bridge.inspect_all(
+            match bridge.inspect_all_with_additional_managed_units(
                 root_expected,
                 serving_expected,
                 vmm_expected,
                 stop_receipt_sockets,
+                kernel_nbd_process_allowances.unit_ids(),
                 &context,
             )? {
                 RootProcessInventoryBridgeOutcome::Complete(admission) => {
@@ -814,9 +875,16 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                     exact_physical_negative_cats,
                 ));
             }
-            if let Some(kernel_nbd) = &self.kernel_nbd_port {
-                if let Some(managed_processes) = node_global_process_admission.as_ref() {
-                    match kernel_nbd.scan_complete_pool(&context, managed_processes)? {
+            if kernel_nbd_pre_scan_available {
+                if let (Some(kernel_nbd), Some(managed_processes)) = (
+                    self.kernel_nbd_port.as_ref(),
+                    node_global_process_admission.as_ref(),
+                ) {
+                    match kernel_nbd.scan_complete_pool_with_allowances(
+                        &context,
+                        managed_processes,
+                        &kernel_nbd_process_allowances,
+                    )? {
                         KernelNbdPoolScanOutcome::Complete(admission) => {
                             if admission.has_unavailable_device() {
                                 aggregate
@@ -864,7 +932,7 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                                 .push(InventorySource::BlockFrontend);
                         }
                     }
-                } else {
+                } else if self.kernel_nbd_port.is_some() {
                     // A failed process bridge has already made this scan
                     // incomplete. Kernel-NBD proof is a join with that exact
                     // same-pass admission, so touching the pool cannot restore

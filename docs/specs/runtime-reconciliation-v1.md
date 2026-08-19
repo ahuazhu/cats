@@ -1150,9 +1150,15 @@ single-link、exact `0600`的Node全局allocation flock；持锁期间重新完�
    `Free`；pid存在但size zero、malformed/oversize属性或扫描中变化使本轮Unavailable；size非零但没有exact live
    client是`Leaked`，不得由allocation effect顺带detach；
 3. live slot只有在前后相同的PID/start ticks、exact `nbd-client` executable及完整
-   `-nonetlink -unix <persisted-listener> /dev/nbdN -b 512 -N ""` argv都闭合时才可成为provider-private
-   `Serving` evidence；public device token仍必须来自同一serving blockd的exact authorized-serving handshake，
-   不能从path、PID或argv猜出；
+   `-nonetlink -persist -nofork -unix <persisted-listener> /dev/nbdN -b 512 -N ""` argv都闭合时才可成为
+   provider-private `Serving` evidence。client必须由PID 1作为独立的
+   `cats-nbd-<device-ownership-token>.service`管理，cgroup精确为`/system.slice/<unit>`，process environment必须有
+   唯一`CATS_NBD_OWNERSHIP_TOKEN=<device-ownership-token>`且不得携任何冻结的secret变量；PID 1自动注入的非secret
+   runtime变量不参与authority。这样Agent重启不能终止data client，
+   daemon fork也不能使systemd跟丢实际client。完整inventory先在allocation flock下冻结这些exact identity，
+   Node-global systemd sweep只豁免该集合，随后第二次pool scan必须看到逐字段相同identity才可投影；中途PID
+   replacement或unit/token/cgroup漂移使整轮Unavailable。public device token仍必须来自同一serving blockd的
+   exact authorized-serving handshake，不能从path、PID、unit或argv猜出；
 4. 从同一个pool snapshot的`Free - durable reservations`按Guest slot/device index稳定选择完整path集合，验证
    current+prospective集合全range、无重复、无foreign后只做一次checkpoint replace；pool不足或任一ABA均零CAS，
    绝不逐盘CAS或跨锁拼装。同一轮不启动blockd、不运行`nbd-client`。下一次accepted fresh full后，attach effect
@@ -1162,7 +1168,10 @@ single-link、exact `0600`的Node全局allocation flock；持锁期间重新完�
 所有会新增、迁移或移除kernel-NBD reservation的Runtime checkpoint replace都必须使用同一个allocation flock；
 旧product allocator不得与该切换composition并存。外部/晚到client即使绕过flock，也只能让后续scan产生Conflict，
 不能使Node把busy device交给第二个Cat。leaked device的disconnect、serving device的detach及token retirement分别
-使用checkpoint-first cleanup effect，不能夹在reserve或attach中。
+使用checkpoint-first cleanup effect，不能夹在reserve或attach中。leaked disconnect只可由accepted fresh full中
+唯一checkpoint runtime、无VMM、精确device path/volume/Guest slot及`ownership_token=missing`的kernel residue触发；
+effect在同一allocation flock下复验checkpoint namespace和相同`Leaked` sysfs tuple后才提交一次detach。live、重复、
+无归属或漂移证据一律Conflict，不能把public device projection的缺失误当成物理absence。
 
 无论vhost还是kernel-NBD，完整PrepareDevice successor构造时可先按slot保留每卷descriptor-stable授权，但在最终
 checkpoint CAS（kernel-NBD为上述allocation-flock callback）内必须再次从同一retained目录复验canonical artifact

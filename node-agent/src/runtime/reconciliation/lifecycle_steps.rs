@@ -909,30 +909,6 @@ fn detach_exact_kernel_nbd_device(
     volume_id: &Id,
     ownership_token: &RandomId128,
 ) -> anyhow::Result<LifecyclePhysicalAttempt> {
-    let classified = classify_unadapted_cleanup(
-        context,
-        permit,
-        &CleanupTarget::Device {
-            volume_id: volume_id.clone(),
-            ownership_token: ownership_token.clone(),
-        },
-    )?;
-    if classified != LifecyclePhysicalAttempt::Unavailable {
-        return Ok(classified);
-    }
-    let mut matching = permit
-        .runtime()
-        .volumes
-        .iter()
-        .filter(|volume| &volume.volume_id == volume_id)
-        .flat_map(|volume| &volume.devices)
-        .filter(|device| device_token(device) == Some(ownership_token));
-    let Some(device) = matching.next() else {
-        return Ok(LifecyclePhysicalAttempt::ExactPostcondition);
-    };
-    if matching.next().is_some() {
-        return Ok(LifecyclePhysicalAttempt::Conflict);
-    }
     if permit
         .runtime()
         .processes
@@ -954,32 +930,106 @@ fn detach_exact_kernel_nbd_device(
     if prepared_matches.next().is_some() || &prepared.ownership_token != ownership_token {
         return Ok(LifecyclePhysicalAttempt::Conflict);
     }
-    match (&prepared.frontend, device) {
-        (
-            cats_api::runtime_reconciliation::PrepareDeviceFrontend::KernelNbd {
-                device_path: expected_path,
-                ..
-            },
-            ObservedDevice::KernelNbd {
-                guest_device,
-                device_path,
-                ..
-            },
-        ) if expected_path == device_path && &prepared.guest_device == guest_device => {}
-        (
-            cats_api::runtime_reconciliation::PrepareDeviceFrontend::VhostUserBlk {
-                socket_path: expected_path,
-                ..
-            },
-            ObservedDevice::VhostUserBlk {
-                guest_device,
-                socket_path,
-                ..
-            },
-        ) if expected_path == socket_path && &prepared.guest_device == guest_device => {
+    match &prepared.frontend {
+        cats_api::runtime_reconciliation::PrepareDeviceFrontend::KernelNbd {
+            device_path: expected_path,
+            ..
+        } => {
+            let matching_devices = permit
+                .runtime()
+                .volumes
+                .iter()
+                .filter(|volume| &volume.volume_id == volume_id)
+                .flat_map(|volume| &volume.devices)
+                .collect::<Vec<_>>();
+            if matching_devices.len() > 1
+                || matching_devices.first().is_some_and(|device| {
+                    !matches!(
+                        device,
+                        ObservedDevice::KernelNbd {
+                            guest_device,
+                            device_path,
+                            ownership_token: observed_token,
+                        } if guest_device == &prepared.guest_device
+                            && device_path == expected_path
+                            && valid_token(observed_token) == Some(ownership_token)
+                    )
+                })
+            {
+                return Ok(LifecyclePhysicalAttempt::Conflict);
+            }
+
+            let mut matching_residue = context
+                .accepted_full()?
+                .observation()
+                .residue
+                .iter()
+                .filter(|residue| matches!(
+                    residue,
+                    NodeResidue::KernelNbd {
+                        volume_id_hint,
+                        device_path,
+                        ..
+                    } if volume_id_hint.as_ref() == Some(volume_id) || device_path == expected_path
+                ));
+            let residue_count = match matching_residue.next() {
+                None => 0,
+                Some(NodeResidue::KernelNbd {
+                    volume_id_hint: Some(observed_volume),
+                    guest_device: Some(observed_guest),
+                    device_path,
+                    ownership_token: OwnershipTokenEvidence::Missing,
+                }) if observed_volume == volume_id
+                    && observed_guest == &prepared.guest_device
+                    && device_path == expected_path
+                    && matching_residue.next().is_none() =>
+                {
+                    1
+                }
+                Some(_) => return Ok(LifecyclePhysicalAttempt::Conflict),
+            };
+            match (matching_devices.len(), residue_count) {
+                (0, 0) => return Ok(LifecyclePhysicalAttempt::ExactPostcondition),
+                (1, 0) | (0, 1) => {}
+                _ => return Ok(LifecyclePhysicalAttempt::Conflict),
+            }
+        }
+        cats_api::runtime_reconciliation::PrepareDeviceFrontend::VhostUserBlk {
+            socket_path: expected_path,
+            ..
+        } => {
+            let classified = classify_unadapted_cleanup(
+                context,
+                permit,
+                &CleanupTarget::Device {
+                    volume_id: volume_id.clone(),
+                    ownership_token: ownership_token.clone(),
+                },
+            )?;
+            if classified != LifecyclePhysicalAttempt::Unavailable {
+                return Ok(classified);
+            }
+            let mut matching = permit
+                .runtime()
+                .volumes
+                .iter()
+                .filter(|volume| &volume.volume_id == volume_id)
+                .flat_map(|volume| &volume.devices)
+                .filter(|device| device_token(device) == Some(ownership_token));
+            let Some(device) = matching.next() else {
+                return Ok(LifecyclePhysicalAttempt::ExactPostcondition);
+            };
+            if matching.next().is_some()
+                || !matches!(device, ObservedDevice::VhostUserBlk {
+                    guest_device,
+                    socket_path,
+                    ..
+                } if socket_path == expected_path && guest_device == &prepared.guest_device)
+            {
+                return Ok(LifecyclePhysicalAttempt::Conflict);
+            }
             return Ok(LifecyclePhysicalAttempt::Unavailable);
         }
-        _ => return Ok(LifecyclePhysicalAttempt::Conflict),
     }
     let Some(detach) = detach else {
         return Ok(LifecyclePhysicalAttempt::Unavailable);
@@ -6429,12 +6479,36 @@ mod tests {
         }
     }
 
+    fn install_valid_checkpoint_evidence(
+        runtime: &mut ObservedRuntimeStatus,
+        checkpoint: &RuntimeCheckpoint,
+        store: &FileCheckpointStore,
+        stored: &StoredCheckpoint,
+    ) {
+        runtime.checkpoint = CheckpointEvidence::Valid {
+            checkpoint_path: HostPath::new(store.path().to_string_lossy().into_owned()).unwrap(),
+            content_digest: stored.content_digest().clone(),
+            version: checkpoint.version,
+            cat_id: checkpoint.cat_id.clone(),
+            node_id: checkpoint.node_id.clone(),
+            desired_revision: checkpoint.desired_revision,
+            spec_digest: checkpoint.spec_digest.clone(),
+            placement_epoch: checkpoint.placement_epoch,
+            runtime_incarnation: checkpoint.runtime_incarnation.clone(),
+            runtime_launch: Box::new(checkpoint.runtime_launch.clone()),
+            stable_state: checkpoint.stable_state,
+            step: Box::new(checkpoint.step.clone()),
+            require_idle: Box::new(checkpoint.require_idle.clone()),
+            updated_at_unix_ms: checkpoint.updated_at_unix_ms,
+        };
+    }
+
     #[test]
     fn exact_kernel_nbd_device_cleanup_submits_once_through_the_checkpointed_port() {
         let KernelNbdCleanupFixture {
             desired,
             checkpoint,
-            runtime,
+            mut runtime,
             volume_id,
             ownership_token,
             ..
@@ -6446,10 +6520,8 @@ mod tests {
         )
         .unwrap();
         let stored = store.create(&checkpoint).unwrap();
-        let context = RuntimeDesiredEffectContext::for_test(
-            crate::state_directory::StateDirectory::unanchored(directory.path().to_path_buf()),
-            std::time::Instant::now() + std::time::Duration::from_secs(5),
-        );
+        install_valid_checkpoint_evidence(&mut runtime, &checkpoint, &store, &stored);
+        let context = deleting_effect_context(&directory, &desired, runtime.clone());
         let permit = LifecycleEffectPermit {
             desired: &desired,
             runtime: &runtime,
@@ -6475,6 +6547,79 @@ mod tests {
             detach.calls.lock().unwrap().as_slice(),
             &[(desired.cat_id.clone(), volume_id, ownership_token)]
         );
+    }
+
+    #[test]
+    fn checkpointed_kernel_nbd_leak_is_not_mistaken_for_an_absent_device() {
+        let KernelNbdCleanupFixture {
+            desired,
+            checkpoint,
+            mut runtime,
+            volume_id,
+            ownership_token,
+            ..
+        } = kernel_nbd_cleanup_fixture();
+        let RuntimeLaunch::Present(launch) = &checkpoint.runtime_launch else {
+            unreachable!()
+        };
+        let prepared = launch.devices[0].clone();
+        let cats_api::runtime_reconciliation::PrepareDeviceFrontend::KernelNbd {
+            device_path, ..
+        } = &prepared.frontend
+        else {
+            unreachable!()
+        };
+        runtime.volumes[0].devices.clear();
+        let directory = TempDir::new().unwrap();
+        let store = FileCheckpointStore::open(
+            &directory.path().join(CHECKPOINT_NAMESPACE),
+            &checkpoint.cat_id,
+        )
+        .unwrap();
+        let stored = store.create(&checkpoint).unwrap();
+        install_valid_checkpoint_evidence(&mut runtime, &checkpoint, &store, &stored);
+        let base = deleting_effect_context(&directory, &desired, runtime.clone());
+        let mut observation = base.accepted_full().unwrap().observation().clone();
+        observation.residue = vec![NodeResidue::KernelNbd {
+            volume_id_hint: Some(volume_id.clone()),
+            guest_device: Some(prepared.guest_device.clone()),
+            device_path: device_path.clone(),
+            ownership_token: OwnershipTokenEvidence::Missing,
+        }];
+        observation.inventory_digest =
+            Some(cats_api::runtime_reconciliation::inventory_digest(&observation).unwrap());
+        let admission = base
+            .accepted_full()
+            .unwrap()
+            .clone()
+            .with_observation_for_test(observation);
+        let context = RuntimeDesiredEffectContext::for_test_with_admission(
+            crate::state_directory::StateDirectory::unanchored(directory.path().to_path_buf()),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            admission,
+        );
+        let permit = LifecycleEffectPermit {
+            desired: &desired,
+            runtime: &runtime,
+            store: &store,
+            stored: &stored,
+        };
+        let detach = RecordingKernelNbdDetach {
+            calls: Mutex::new(Vec::new()),
+        };
+
+        assert_eq!(
+            detach_exact_kernel_nbd_device(
+                Some(&detach),
+                &context,
+                &permit,
+                &volume_id,
+                &ownership_token,
+            )
+            .unwrap(),
+            LifecyclePhysicalAttempt::SubmittedOrAmbiguous
+        );
+        assert_eq!(detach.calls.lock().unwrap().len(), 1);
     }
 
     #[test]

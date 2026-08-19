@@ -110,9 +110,9 @@ Running-only completion claim does not supply an in-place lifecycle drain; if
 the Node is not already empty, stop and use a separately qualified migration
 or replacement procedure.
 
-The signed cutover launches VMM and blockd processes as PID-1-owned sibling
-transient services in `system.slice`, not as processes in the `cats-noded`
-service cgroup. The Agent units therefore explicitly retain
+The signed cutover launches VMM, blockd and kernel-NBD client processes as
+PID-1-owned sibling transient services in `system.slice`, not as processes in
+the `cats-noded` service cgroup. The Agent units therefore explicitly retain
 `KillMode=control-group`: a hard Agent stop reaps any Agent-cgroup helpers,
 while the independently owned per-Cat services remain available for Host-lock,
 checkpoint and complete-inventory adoption. Every per-Cat unit independently

@@ -6441,6 +6441,12 @@ impl PlatformRootProcessInventoryBridge {
                 }
             }
         }
+        if !allowed_units.is_disjoint(admission.additional_managed_units()) {
+            return Ok(AdmittedManagedProcessInspection::DuplicateIdentity(
+                ManagedProcessSetDivergence::NodeGlobalSweepFoundResidue,
+            ));
+        }
+        allowed_units.extend(admission.additional_managed_units().iter().cloned());
         allowed_sockets.extend(
             admission
                 .stop_receipt_physical_paths()
@@ -6645,7 +6651,26 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
         root_expected: BTreeMap<Id, RootProvisionProcessExpectation>,
         serving_expected: BTreeMap<ManagedServingKey, ServingBlockdExpectation>,
         vmm_expected: BTreeMap<Id, VmmProcessExpectation>,
+        stop_receipt_sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
+        context: &RuntimeInventoryScanContext,
+    ) -> anyhow::Result<RootProcessInventoryBridgeOutcome> {
+        self.inspect_all_with_additional_managed_units(
+            root_expected,
+            serving_expected,
+            vmm_expected,
+            stop_receipt_sockets,
+            BTreeSet::new(),
+            context,
+        )
+    }
+
+    fn inspect_all_with_additional_managed_units(
+        &self,
+        root_expected: BTreeMap<Id, RootProvisionProcessExpectation>,
+        serving_expected: BTreeMap<ManagedServingKey, ServingBlockdExpectation>,
+        vmm_expected: BTreeMap<Id, VmmProcessExpectation>,
         mut stop_receipt_sockets: BTreeMap<Id, StopReceiptSocketAdmission>,
+        additional_managed_units: BTreeSet<Id>,
         context: &RuntimeInventoryScanContext,
     ) -> anyhow::Result<RootProcessInventoryBridgeOutcome> {
         let unavailable =
@@ -6833,6 +6858,11 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
             allowed_units.len() == allowed_pids.len(),
             "managed-process inventory contains duplicate unit or PID identity"
         );
+        anyhow::ensure!(
+            allowed_units.is_disjoint(&additional_managed_units),
+            "additional managed systemd unit aliases a runtime process unit"
+        );
+        allowed_units.extend(additional_managed_units.iter().cloned());
 
         let mut managed_socket_residue = Vec::new();
         if let Some((_, _, _, before)) = managed_blockd.as_ref() {
@@ -7050,7 +7080,8 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
             .with_serving_blockds(serving_expected, serving_proofs)?
             .with_absent_serving_owners(absent_serving_owners)?
             .with_vmms(vmm_expected, vmm_proofs)?
-            .with_stop_receipt_sockets(stop_receipt_sockets)?;
+            .with_stop_receipt_sockets(stop_receipt_sockets)?
+            .with_additional_managed_units(additional_managed_units)?;
         Ok(
             if systemd_residue.is_empty()
                 && process_residue.is_empty()
@@ -19398,9 +19429,11 @@ mod tests {
                 else {
                     unreachable!()
                 };
-                let arguments: [&[u8]; 9] = [
+                let arguments: [&[u8]; 11] = [
                     client.as_os_str().as_bytes(),
                     b"-nonetlink",
+                    b"-persist",
+                    b"-nofork",
                     b"-unix",
                     listener_socket_path.as_str().as_bytes(),
                     device_path.as_str().as_bytes(),
@@ -19415,6 +19448,19 @@ mod tests {
                     command_line.push(0);
                 }
                 std::fs::write(process.join("cmdline"), command_line).unwrap();
+                std::fs::write(
+                    process.join("environ"),
+                    format!("CATS_NBD_OWNERSHIP_TOKEN={}\0", device.ownership_token),
+                )
+                .unwrap();
+                std::fs::write(
+                    process.join("cgroup"),
+                    format!(
+                        "0::/system.slice/cats-nbd-{}.service\n",
+                        device.ownership_token
+                    ),
+                )
+                .unwrap();
             }
             records.insert(record.volume_id.clone(), record);
             attachments.push(attachment);

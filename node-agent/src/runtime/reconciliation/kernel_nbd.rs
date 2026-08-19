@@ -16,7 +16,7 @@ use std::ffi::{CStr, CString, OsString};
 use std::fs::{File, Metadata};
 use std::io::{self, Read as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
-use std::os::unix::ffi::OsStringExt as _;
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -27,8 +27,8 @@ use anyhow::{Context as _, Result};
 use cats_api::runtime_reconciliation::{
     checkpoint_content_digest, CheckpointEvidence, Epoch, FenceEpoch, GuestDeviceIdentity,
     HostPath, Id, NodeBootId, NodeObservation, NodeResidue, ObservedDevice, OwnershipTokenEvidence,
-    PrepareDeviceFrontend, PreparedDeviceInput, RandomId128, ReconcileStep, RuntimeCheckpoint,
-    RuntimeTarget, RuntimeTransition, Sequence, Sha256Digest, WireU64,
+    PrepareDeviceFrontend, PreparedDeviceInput, ProcessRole, RandomId128, ReconcileStep,
+    RuntimeCheckpoint, RuntimeTarget, RuntimeTransition, Sequence, Sha256Digest, WireU64,
 };
 use cats_storage::authority::VolumeDataAuthority;
 
@@ -53,17 +53,30 @@ use super::root_provision_process::{ManagedServingKey, NodeGlobalManagedProcessS
 use super::serving_blockd_process::{RetainedServingBlockdAuthority, ServingBlockdListenerProof};
 use super::serving_handoff_effect::checkpoint_is_current_exact;
 use super::signed_root_provision::signed_inventory_admission_is_exact_with_networks;
+use super::systemd_root_provision::{
+    sanitized_systemd_command, submit_fixed_systemd_command, SystemdStartSubmission, SYSTEMD_RUN,
+    UNSET_PROCESS_ENVIRONMENT,
+};
 
 const ALLOCATION_LOCK_BASENAME: &str = "kernel-nbd-allocation.lock";
 const MAX_SYSFS_ATTRIBUTE_BYTES: u64 = 64;
 const MAX_PROC_STAT_BYTES: u64 = 64 * 1024;
 const MAX_PROC_CMDLINE_BYTES: u64 = 64 * 1024;
+const MAX_PROC_CGROUP_BYTES: u64 = 64 * 1024;
+const MAX_PROC_ENVIRON_BYTES: u64 = 64 * 1024;
 const CLIENT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const CLIENT_CLEANUP_GRACE: Duration = Duration::from_millis(50);
 // V1 admits at most 1,024 Cats with 64 volumes each. A Host pool cannot need
 // more slots than that closed product bound, and rejecting it here prevents a
 // misconfigured u32-sized eager allocation before the first deadline probe.
 const MAX_KERNEL_NBD_DEVICE_COUNT: u32 = 1_024 * 64;
+const NBD_CLIENT_UNIT_PREFIX: &str = "cats-nbd-";
+const NBD_CLIENT_UNIT_SUFFIX: &str = ".service";
+const NBD_CLIENT_TOKEN_ENVIRONMENT: &str = "CATS_NBD_OWNERSHIP_TOKEN";
+const NBD_CLIENT_SYSTEM_SLICE: &str = "system.slice";
+const NBD_CLIENT_KILL_MODE: &str = "control-group";
+const NBD_CLIENT_RESTART: &str = "no";
+const NBD_CLIENT_UMASK: &str = "0077";
 
 pub(crate) mod attach_port_sealed {
     pub(crate) trait Sealed {}
@@ -153,6 +166,8 @@ pub(crate) struct KernelNbdClientIdentity {
     pub(crate) process_id: u32,
     pub(crate) process_start_time_ticks: WireU64,
     pub(crate) executable_path: HostPath,
+    pub(crate) scope_id: Id,
+    pub(crate) ownership_token: RandomId128,
     pub(crate) listener_socket_path: HostPath,
     pub(crate) device_path: HostPath,
     pub(crate) size_sectors: WireU64,
@@ -183,6 +198,28 @@ pub(crate) struct KernelNbdPoolSnapshot {
     // attributes.  A same-bytes rename/recreate is therefore a changed pool,
     // not an undetectable ABA between selection and checkpoint CAS.
     coordinates: BTreeMap<HostPath, Option<KernelNbdSlotCoordinate>>,
+}
+
+/// Exact independent NBD services sampled before the Node-global systemd
+/// sweep. The later pool scan must observe the same identity before it may
+/// project a device; this set only prevents those already-proven units from
+/// being misclassified as unrelated systemd residue.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct KernelNbdProcessAllowances {
+    clients_by_device: BTreeMap<HostPath, KernelNbdClientIdentity>,
+}
+
+impl KernelNbdProcessAllowances {
+    pub(crate) fn unit_ids(&self) -> std::collections::BTreeSet<Id> {
+        self.clients_by_device
+            .values()
+            .map(|client| client.scope_id.clone())
+            .collect()
+    }
+
+    fn admits(&self, device_path: &HostPath, client: &KernelNbdClientIdentity) -> bool {
+        self.clients_by_device.get(device_path) == Some(client)
+    }
 }
 
 impl KernelNbdPoolSnapshot {
@@ -427,10 +464,13 @@ impl ExactKernelNbdDeviceProof {
         client: KernelNbdClientIdentity,
         listener: ServingBlockdListenerProof,
     ) -> Result<Self> {
+        let expected_scope = kernel_nbd_client_unit_id(&expected.ownership_token)?;
         anyhow::ensure!(
             client.listener_socket_path == expected.listener_socket_path
                 && client.device_path == expected.device_path
-                && client.size_sectors == expected.expected_size_sectors,
+                && client.size_sectors == expected.expected_size_sectors
+                && client.ownership_token == expected.ownership_token
+                && client.scope_id == expected_scope,
             "kernel-NBD client does not match its persisted device contract"
         );
         expected.assert_serving_listener(&listener)?;
@@ -604,6 +644,8 @@ impl KernelNbdPoolScanAdmission {
                 .context("test kernel-NBD process ticks are positive")?,
             executable_path: HostPath::new("/usr/bin/nbd-client")
                 .context("test kernel-NBD executable path is canonical")?,
+            scope_id: kernel_nbd_client_unit_id(&expected.ownership_token)?,
+            ownership_token: expected.ownership_token.clone(),
             listener_socket_path: expected.listener_socket_path.clone(),
             device_path: expected.device_path.clone(),
             size_sectors: expected.expected_size_sectors,
@@ -615,6 +657,26 @@ impl KernelNbdPoolScanAdmission {
         );
         Self {
             devices_by_key: BTreeMap::from([(key, KernelNbdDeviceScanState::Exact(proof))]),
+        }
+        .bind(observation)
+    }
+
+    #[cfg(test)]
+    fn leaked_for_test(
+        observation: &NodeObservation,
+        checkpoint: &RuntimeCheckpoint,
+        recorded_process_id: Option<u32>,
+    ) -> Result<KernelNbdPoolAdmission> {
+        let expected = Self::expectation_for_test(checkpoint)?;
+        let key = ManagedServingKey::new(expected.cat_id.clone(), expected.volume_id.clone());
+        Self {
+            devices_by_key: BTreeMap::from([(
+                key,
+                KernelNbdDeviceScanState::Leaked {
+                    expected,
+                    recorded_process_id,
+                },
+            )]),
         }
         .bind(observation)
     }
@@ -1245,6 +1307,27 @@ impl KernelNbdInventoryPort {
         self.config.device_count()
     }
 
+    pub(crate) fn scan_process_allowances(
+        &self,
+        context: &dyn RuntimePhysicalReadContext,
+    ) -> Result<KernelNbdProcessAllowances> {
+        let permit = self.lock_and_inspect(context)?;
+        let clients_by_device = permit
+            .snapshot()
+            .iter()
+            .filter_map(|(device_path, state)| match state {
+                KernelNbdSlotState::Serving(client) => Some((device_path.clone(), client.clone())),
+                KernelNbdSlotState::Free
+                | KernelNbdSlotState::Leaked { .. }
+                | KernelNbdSlotState::Unavailable => None,
+            })
+            .collect();
+        permit
+            .release()
+            .context("unlock kernel-NBD allocator after process-allowance scan")?;
+        Ok(KernelNbdProcessAllowances { clients_by_device })
+    }
+
     /// Reinspect the complete kernel-NBD pool under its allocation flock and
     /// prove that one accepted exact device is still the same client joined
     /// to the same persisted PrepareNetwork contract. This is read-only and
@@ -1332,11 +1415,54 @@ impl KernelNbdInventoryPort {
         if !pool.matches_observation(accepted.observation()) {
             return Ok(KernelNbdDetachResult::Conflict);
         }
+        let mut runtimes = accepted
+            .observation()
+            .runtimes
+            .iter()
+            .filter(|runtime| &runtime.cat_id == cat_id);
+        let Some(runtime) = runtimes.next() else {
+            return Ok(KernelNbdDetachResult::Conflict);
+        };
+        if runtimes.next().is_some()
+            || runtime
+                .processes
+                .iter()
+                .any(|process| matches!(process.role, ProcessRole::Vmm { .. }))
+        {
+            return Ok(KernelNbdDetachResult::Conflict);
+        }
+        enum CleanupAdmission {
+            Exact {
+                expected: KernelNbdDeviceExpectation,
+                client: KernelNbdClientIdentity,
+                listener: ServingBlockdListenerProof,
+            },
+            Leaked {
+                expected: KernelNbdDeviceExpectation,
+                recorded_process_id: Option<u32>,
+            },
+        }
         let admitted = match pool.device(cat_id, volume_id) {
             Some(KernelNbdDeviceScanState::Exact(proof))
                 if proof.matches_cleanup_target(cat_id, volume_id, ownership_token) =>
             {
-                proof
+                CleanupAdmission::Exact {
+                    expected: proof.expected.clone(),
+                    client: proof.client.clone(),
+                    listener: proof.listener.clone(),
+                }
+            }
+            Some(KernelNbdDeviceScanState::Leaked {
+                expected,
+                recorded_process_id,
+            }) if expected.cat_id == *cat_id
+                && expected.volume_id == *volume_id
+                && expected.ownership_token == *ownership_token =>
+            {
+                CleanupAdmission::Leaked {
+                    expected: expected.clone(),
+                    recorded_process_id: *recorded_process_id,
+                }
             }
             Some(
                 KernelNbdDeviceScanState::Absent { .. }
@@ -1379,13 +1505,34 @@ impl KernelNbdInventoryPort {
             let Some(expected) = expected else {
                 return Ok(KernelNbdDetachResult::Conflict);
             };
-            if admitted.expected != expected
-                || permit.snapshot().state(&expected.device_path)
-                    != Some(&KernelNbdSlotState::Serving(admitted.client.clone()))
-            {
-                return Ok(KernelNbdDetachResult::Conflict);
+            match &admitted {
+                CleanupAdmission::Exact {
+                    expected: admitted_expected,
+                    client,
+                    listener,
+                } => {
+                    if admitted_expected != &expected
+                        || permit.snapshot().state(&expected.device_path)
+                            != Some(&KernelNbdSlotState::Serving(client.clone()))
+                    {
+                        return Ok(KernelNbdDetachResult::Conflict);
+                    }
+                    listener.assert_current(context)?;
+                }
+                CleanupAdmission::Leaked {
+                    expected: admitted_expected,
+                    recorded_process_id,
+                } => {
+                    if admitted_expected != &expected
+                        || permit.snapshot().state(&expected.device_path)
+                            != Some(&KernelNbdSlotState::Leaked {
+                                recorded_process_id: *recorded_process_id,
+                            })
+                    {
+                        return Ok(KernelNbdDetachResult::Conflict);
+                    }
+                }
             }
-            admitted.listener().assert_current(context)?;
             let current = store
                 .assert_current(stored)
                 .context("retain exact lifecycle checkpoint across kernel-NBD detach")?;
@@ -1471,10 +1618,11 @@ impl KernelNbdInventoryPort {
     /// flock covers both the complete checkpoint namespace and every physical
     /// slot. No public device is projected here unless the independent
     /// serving-blockd proof and strict client identity form one exact join.
-    pub(crate) fn scan_complete_pool(
+    pub(crate) fn scan_complete_pool_with_allowances(
         &self,
         context: &crate::runtime_spine::RuntimeInventoryScanContext,
         managed_processes: &NodeGlobalManagedProcessScanAdmission,
+        process_allowances: &KernelNbdProcessAllowances,
     ) -> Result<KernelNbdPoolScanOutcome> {
         let permit = self.lock_and_inspect(context)?;
         let result = (|| {
@@ -1514,6 +1662,16 @@ impl KernelNbdInventoryPort {
             let mut devices_by_key = BTreeMap::new();
             let mut residue = Vec::new();
             for (device_path, slot) in permit.snapshot().iter() {
+                if let KernelNbdSlotState::Serving(client) = slot {
+                    if !process_allowances.admits(device_path, client) {
+                        tracing::warn!(
+                            device_path = %device_path,
+                            proof = "kernel-NBD process allowance",
+                            "kernel-NBD client changed after the Node-global process sweep"
+                        );
+                        return Ok(KernelNbdPoolScanOutcome::Unavailable);
+                    }
+                }
                 let reservation = reservations.by_device.get(device_path);
                 let expected = expectations.get(device_path);
                 let (Some(reservation), Some(expected)) = (reservation, expected) else {
@@ -1620,6 +1778,16 @@ impl KernelNbdInventoryPort {
                 "kernel-NBD allocation unlock also failed: {unlock:#}"
             ))),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scan_complete_pool(
+        &self,
+        context: &crate::runtime_spine::RuntimeInventoryScanContext,
+        managed_processes: &NodeGlobalManagedProcessScanAdmission,
+    ) -> Result<KernelNbdPoolScanOutcome> {
+        let allowances = self.scan_process_allowances(context)?;
+        self.scan_complete_pool_with_allowances(context, managed_processes, &allowances)
     }
 
     /// Serialize the complete durable-reservation read, deterministic free
@@ -2295,13 +2463,25 @@ impl KernelNbdClientSubmitPort for PlatformKernelNbdClientSubmitPort {
         config: &KernelNbdInventoryConfig,
         request: &KernelNbdAttachRequest,
         context: &RuntimeDesiredEffectContext,
-        cleanup_owner: &KernelNbdClientCleanupOwner,
+        _cleanup_owner: &KernelNbdClientCleanupOwner,
     ) -> KernelNbdClientSubmitAttempt {
-        run_bounded_nbd_client(
-            kernel_nbd_client_command(config, request),
-            context,
-            cleanup_owner,
-        )
+        let command = match kernel_nbd_client_command(config, request) {
+            Ok(command) => command,
+            Err(source) => return KernelNbdClientSubmitAttempt::NotSubmitted(source),
+        };
+        match submit_fixed_systemd_command(command, context) {
+            SystemdStartSubmission::Submitted => {
+                KernelNbdClientSubmitAttempt::Submitted(KernelNbdClientSubmission::Completed)
+            }
+            SystemdStartSubmission::OutcomeUnknown => {
+                KernelNbdClientSubmitAttempt::Submitted(KernelNbdClientSubmission::OutcomeUnknown)
+            }
+            SystemdStartSubmission::DefinitelyNotStarted => {
+                KernelNbdClientSubmitAttempt::NotSubmitted(anyhow::anyhow!(
+                    "PID 1 rejected the kernel-NBD client before start"
+                ))
+            }
+        }
     }
 }
 
@@ -2846,25 +3026,54 @@ fn assert_current_listener(
     listener.assert_current_for(request, context)
 }
 
+fn kernel_nbd_client_unit_id(ownership_token: &RandomId128) -> Result<Id> {
+    Id::new(format!(
+        "{NBD_CLIENT_UNIT_PREFIX}{}{NBD_CLIENT_UNIT_SUFFIX}",
+        ownership_token.as_str()
+    ))
+    .context("kernel-NBD ownership token cannot form a canonical transient unit")
+}
+
 fn kernel_nbd_client_command(
     config: &KernelNbdInventoryConfig,
     request: &KernelNbdAttachRequest,
-) -> Command {
-    let mut command = Command::new(&config.nbd_client_binary);
+) -> Result<Command> {
+    let unit_id = kernel_nbd_client_unit_id(&request.ownership_token)?;
+    let mut command = Command::new(SYSTEMD_RUN);
+    sanitized_systemd_command(&mut command);
     command
-        .env_clear()
-        .stdin(Stdio::null())
-        // Client output is not authority and is deliberately discarded. A
-        // zero-byte retention bound also prevents a daemonized descendant
-        // from keeping a captured pipe (and therefore this effect) alive.
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .arg("--system")
+        .arg("--quiet")
+        .arg("--no-ask-password")
+        .arg("--collect")
+        .arg(format!("--unit={unit_id}"))
+        .arg("--service-type=exec")
+        .arg(format!("--slice={NBD_CLIENT_SYSTEM_SLICE}"))
+        .arg(format!("--property=KillMode={NBD_CLIENT_KILL_MODE}"))
+        .arg(format!("--property=Restart={NBD_CLIENT_RESTART}"))
+        .arg(format!("--property=UMask={NBD_CLIENT_UMASK}"))
+        .arg("--property=TimeoutStopSec=2s")
+        .arg("--property=Environment=")
+        .arg("--property=EnvironmentFile=")
+        .arg("--property=PassEnvironment=")
+        .arg(format!(
+            "--property=UnsetEnvironment={}",
+            UNSET_PROCESS_ENVIRONMENT.join(" ")
+        ))
+        .arg(format!(
+            "--setenv={NBD_CLIENT_TOKEN_ENVIRONMENT}={}",
+            request.ownership_token
+        ))
+        .arg("--")
+        .arg(&config.nbd_client_binary)
         .arg(NBD_IOCTL_MODE)
+        .arg("-persist")
+        .arg("-nofork")
         .arg("-unix")
         .arg(request.listener_socket_path.as_str())
         .arg(request.device_path.as_str())
         .args(["-b", "512", "-N", ""]);
-    command
+    Ok(command)
 }
 
 fn run_bounded_nbd_client(
@@ -3091,6 +3300,13 @@ enum KernelNbdNonExactClientSample {
         executable: PathBuf,
         arguments: Vec<OsString>,
     },
+    ForeignServiceIdentity {
+        process: KernelNbdProcessCoordinate,
+        start_time_ticks: WireU64,
+        executable: PathBuf,
+        control_group: Vec<u8>,
+        environment: Vec<OsString>,
+    },
 }
 
 fn inspect_slot(
@@ -3272,15 +3488,17 @@ fn sample_exact_client(
         read_required_bounded(&process.join("cmdline"), MAX_PROC_CMDLINE_BYTES, context)?;
     let arguments = parse_nul_arguments(&command_line)?;
     let expected_device = OsString::from(device_path.as_str());
-    if !(arguments.len() == 9
+    if !(arguments.len() == 11
         && Path::new(&arguments[0]) == config.nbd_client_binary
         && arguments[1] == NBD_IOCTL_MODE
-        && arguments[2] == "-unix"
-        && arguments[4] == expected_device
-        && arguments[5] == "-b"
-        && arguments[6] == "512"
-        && arguments[7] == "-N"
-        && arguments[8].is_empty())
+        && arguments[2] == "-persist"
+        && arguments[3] == "-nofork"
+        && arguments[4] == "-unix"
+        && arguments[6] == expected_device
+        && arguments[7] == "-b"
+        && arguments[8] == "512"
+        && arguments[9] == "-N"
+        && arguments[10].is_empty())
     {
         return Ok(KernelNbdClientSample::NonExact(
             KernelNbdNonExactClientSample::ForeignArguments {
@@ -3291,7 +3509,7 @@ fn sample_exact_client(
             },
         ));
     }
-    let Some(listener_socket_text) = Path::new(&arguments[3]).to_str() else {
+    let Some(listener_socket_text) = Path::new(&arguments[5]).to_str() else {
         return Ok(KernelNbdClientSample::NonExact(
             KernelNbdNonExactClientSample::ForeignArguments {
                 process: process_coordinate,
@@ -3318,12 +3536,43 @@ fn sample_exact_client(
             .to_owned(),
     )
     .context("kernel-NBD executable is not a canonical HostPath")?;
+    let environment_bytes =
+        read_required_bounded(&process.join("environ"), MAX_PROC_ENVIRON_BYTES, context)?;
+    let environment = parse_nul_arguments(&environment_bytes)?;
+    let Some(ownership_token) = exact_nbd_client_environment(&environment) else {
+        return Ok(KernelNbdClientSample::NonExact(
+            KernelNbdNonExactClientSample::ForeignServiceIdentity {
+                process: process_coordinate,
+                start_time_ticks,
+                executable,
+                control_group: Vec::new(),
+                environment,
+            },
+        ));
+    };
+    let scope_id = kernel_nbd_client_unit_id(&ownership_token)?;
+    let control_group =
+        read_required_bounded(&process.join("cgroup"), MAX_PROC_CGROUP_BYTES, context)?;
+    let expected_control_group = format!("0::/{NBD_CLIENT_SYSTEM_SLICE}/{}\n", scope_id.as_str());
+    if control_group != expected_control_group.as_bytes() {
+        return Ok(KernelNbdClientSample::NonExact(
+            KernelNbdNonExactClientSample::ForeignServiceIdentity {
+                process: process_coordinate,
+                start_time_ticks,
+                executable,
+                control_group,
+                environment,
+            },
+        ));
+    }
     Ok(KernelNbdClientSample::Exact {
         process: process_coordinate,
         identity: KernelNbdClientIdentity {
             process_id,
             process_start_time_ticks: start_time_ticks,
             executable_path,
+            scope_id,
+            ownership_token,
             listener_socket_path,
             device_path: device_path.clone(),
             size_sectors,
@@ -3332,6 +3581,29 @@ fn sample_exact_client(
 }
 
 const NBD_IOCTL_MODE: &str = "-nonetlink";
+
+fn exact_nbd_client_environment(environment: &[OsString]) -> Option<RandomId128> {
+    let mut values = BTreeMap::<Vec<u8>, Vec<u8>>::new();
+    for entry in environment {
+        let entry = entry.as_bytes();
+        let separator = entry.iter().position(|byte| *byte == b'=')?;
+        if separator == 0
+            || values
+                .insert(entry[..separator].to_vec(), entry[separator + 1..].to_vec())
+                .is_some()
+        {
+            return None;
+        }
+    }
+    if UNSET_PROCESS_ENVIRONMENT
+        .iter()
+        .any(|forbidden| values.contains_key(forbidden.as_bytes()))
+    {
+        return None;
+    }
+    let token = values.get(NBD_CLIENT_TOKEN_ENVIRONMENT.as_bytes())?;
+    RandomId128::new(std::str::from_utf8(token).ok()?.to_owned())
+}
 
 fn parse_nul_arguments(bytes: &[u8]) -> Result<Vec<OsString>> {
     anyhow::ensure!(
@@ -3515,14 +3787,14 @@ mod tests {
     use cats_api::runtime_reconciliation::{
         decode_runtime_checkpoint, encode_runtime_checkpoint, AcquireOrigin,
         AdmissionInventoryAttestation, AgentSession, AssignedKind, AssignedPlacement,
-        ContractVersion, DesiredReadSnapshot, DesiredRuntimeSpec, DiskKind, Durability, Epoch,
-        FenceEpoch, Generation, GuestDeviceIdentity, GuestTransportEvidence, Ipv4Address,
-        IsolatedIpv4Kind, LifecycleAdmission, LocalLineageState, LocalVolumeLineage, MacAddress,
-        NetworkConfig, NodeBootId, NodeObservation, ObservedDiskKind, ObservedVolume, RemoteHead,
-        RequireIdleCheckpoint, Revision, RuntimeConfig, RuntimeLaunch, RuntimeTarget,
-        RuntimeTransition, Sequence, ServingAuthorityProvenance, ServingBlockdIdentity,
-        SessionBinding, Sha256Digest, StableState, UnixMillis, VolumeAuthorityEvidence,
-        WarmSnapshotEvidence,
+        CheckpointEvidence, ContractVersion, DesiredReadSnapshot, DesiredRuntimeSpec, DiskKind,
+        Durability, Epoch, FenceEpoch, Generation, GuestDeviceIdentity, GuestTransportEvidence,
+        Ipv4Address, IsolatedIpv4Kind, LifecycleAdmission, LocalLineageState, LocalVolumeLineage,
+        MacAddress, NetworkConfig, NodeBootId, NodeObservation, ObservedDiskKind,
+        ObservedRuntimeStatus, ObservedVolume, RemoteHead, RequireIdleCheckpoint, Revision,
+        RuntimeConfig, RuntimeLaunch, RuntimeTarget, RuntimeTransition, Sequence,
+        ServingAuthorityProvenance, ServingBlockdIdentity, SessionBinding, Sha256Digest,
+        StableState, UnixMillis, VolumeAuthorityEvidence, WarmSnapshotEvidence,
     };
     use tempfile::TempDir;
 
@@ -3683,9 +3955,11 @@ mod tests {
         )
         .unwrap();
         symlink(client, process.join("exe")).unwrap();
-        let argv: [&[u8]; 9] = [
+        let argv: [&[u8]; 11] = [
             client.as_os_str().as_bytes(),
             b"-nonetlink",
+            b"-persist",
+            b"-nofork",
             b"-unix",
             socket.as_bytes(),
             command_device.as_bytes(),
@@ -3695,6 +3969,21 @@ mod tests {
             b"",
         ];
         write_nul_arguments(&process.join("cmdline"), &argv);
+        let ownership_token = random('6');
+        let scope_id = kernel_nbd_client_unit_id(&ownership_token).unwrap();
+        write_nul_arguments(
+            &process.join("environ"),
+            [format!("{NBD_CLIENT_TOKEN_ENVIRONMENT}={ownership_token}")]
+                .iter()
+                .map(String::as_bytes)
+                .collect::<Vec<_>>()
+                .as_slice(),
+        );
+        fs::write(
+            process.join("cgroup"),
+            format!("0::/{NBD_CLIENT_SYSTEM_SLICE}/{scope_id}\n"),
+        )
+        .unwrap();
     }
 
     fn write_nul_arguments(path: &Path, arguments: &[&[u8]]) {
@@ -3755,6 +4044,31 @@ mod tests {
                 Ok(submission) => KernelNbdClientSubmitAttempt::Submitted(submission),
                 Err(source) => KernelNbdClientSubmitAttempt::NotSubmitted(source),
             }
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingDetachSubmitter {
+        calls: Mutex<Vec<HostPath>>,
+    }
+
+    impl KernelNbdDetachSubmitPort for RecordingDetachSubmitter {
+        fn poll_reap(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn pending_count(&self) -> usize {
+            0
+        }
+
+        fn submit(
+            &self,
+            _config: &KernelNbdInventoryConfig,
+            device_path: &HostPath,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> KernelNbdDetachSubmitAttempt {
+            self.calls.lock().unwrap().push(device_path.clone());
+            KernelNbdDetachSubmitAttempt::Submitted
         }
     }
 
@@ -4471,6 +4785,94 @@ mod tests {
                 device_path: host("/dev/nbd0"),
                 ownership_token: OwnershipTokenEvidence::Missing,
             }]
+        );
+    }
+
+    #[test]
+    fn checkpointed_leak_detach_requires_vmm_absence_and_submits_exactly_once() {
+        let fixture = Fixture::new(1);
+        let source = checkpoint("cat_a", "vol_a", "/dev/nbd0", '6');
+        let store =
+            FileCheckpointStore::open(&fixture.state.join(CHECKPOINT_NAMESPACE), &source.cat_id)
+                .unwrap();
+        let stored = store.create(&source).unwrap();
+        fs::write(fixture.sys.join("nbd0/size"), b"4096\n").unwrap();
+        let base = desired_effect_context(&fixture.state, &["cat_a"]);
+        let mut observation = base.accepted_full().unwrap().observation().clone();
+        observation.runtimes = vec![ObservedRuntimeStatus {
+            cat_id: source.cat_id.clone(),
+            applied_desired: None,
+            runtime_incarnation: None,
+            stable_state: None,
+            step: source.step.clone(),
+            checkpoint: CheckpointEvidence::Valid {
+                checkpoint_path: HostPath::new(store.path().to_string_lossy().into_owned())
+                    .unwrap(),
+                content_digest: stored.content_digest().clone(),
+                version: source.version,
+                cat_id: source.cat_id.clone(),
+                node_id: source.node_id.clone(),
+                desired_revision: source.desired_revision,
+                spec_digest: source.spec_digest.clone(),
+                placement_epoch: source.placement_epoch,
+                runtime_incarnation: source.runtime_incarnation.clone(),
+                runtime_launch: Box::new(source.runtime_launch.clone()),
+                stable_state: source.stable_state,
+                step: Box::new(source.step.clone()),
+                require_idle: Box::new(source.require_idle.clone()),
+                updated_at_unix_ms: source.updated_at_unix_ms,
+            },
+            processes: Vec::new(),
+            volumes: Vec::new(),
+            mounts: Vec::new(),
+            networks: Vec::new(),
+            guest_transport: GuestTransportEvidence::Unavailable,
+            warm_snapshot: WarmSnapshotEvidence::Absent,
+            lifecycle_admission: LifecycleAdmission::Closed,
+            routes: Vec::new(),
+            platform_guards: 0,
+            conditions: Vec::new(),
+        }];
+        observation.residue = vec![kernel_nbd_residue(
+            &host("/dev/nbd0"),
+            KernelNbdDeviceExpectation::from_prepare_device(&source)
+                .unwrap()
+                .as_ref(),
+        )];
+        observation.inventory_digest =
+            Some(cats_api::runtime_reconciliation::inventory_digest(&observation).unwrap());
+        let pool =
+            KernelNbdPoolScanAdmission::leaked_for_test(&observation, &source, None).unwrap();
+        let admission = base
+            .accepted_full()
+            .unwrap()
+            .clone()
+            .with_observation_for_test(observation);
+        let context = RuntimeDesiredEffectContext::for_test_with_admission(
+            StateDirectory::unanchored(fixture.state.clone()),
+            Instant::now() + Duration::from_secs(5),
+            admission,
+        )
+        .with_kernel_nbd_pool_for_test(pool);
+        let submitter = RecordingDetachSubmitter::default();
+        let prepared = single_prepared_device(&source);
+        let port = KernelNbdInventoryPort::new(fixture.config(1));
+
+        assert_eq!(
+            port.detach_checkpointed(
+                &submitter,
+                &prepared.volume_id,
+                &prepared.ownership_token,
+                &store,
+                &stored,
+                &context,
+            )
+            .unwrap(),
+            KernelNbdDetachResult::SubmittedOrAmbiguous
+        );
+        assert_eq!(
+            submitter.calls.lock().unwrap().as_slice(),
+            &[host("/dev/nbd0")]
         );
     }
 
@@ -5473,6 +5875,8 @@ mod tests {
             Arguments,
             RelativeListener,
             NonUtf8Listener,
+            ServiceCgroup,
+            ServiceToken,
         }
 
         for foreign in [
@@ -5482,6 +5886,8 @@ mod tests {
             ForeignClient::Arguments,
             ForeignClient::RelativeListener,
             ForeignClient::NonUtf8Listener,
+            ForeignClient::ServiceCgroup,
+            ForeignClient::ServiceToken,
         ] {
             let fixture = Fixture::new(3);
             fixture.serving(0, 42, "/run/cats/a.sock");
@@ -5499,9 +5905,11 @@ mod tests {
                     symlink(foreign_executable, process.join("exe")).unwrap();
                 }
                 ForeignClient::Arguments => {
-                    let arguments: [&[u8]; 9] = [
+                    let arguments: [&[u8]; 11] = [
                         fixture.client.as_os_str().as_bytes(),
                         b"-nonetlink",
+                        b"-persist",
+                        b"-nofork",
                         b"-unix",
                         b"/run/cats/a.sock",
                         b"/dev/nbd0",
@@ -5518,9 +5926,11 @@ mod tests {
                         ForeignClient::NonUtf8Listener => b"/run/cats/\xff.sock",
                         _ => unreachable!(),
                     };
-                    let arguments: [&[u8]; 9] = [
+                    let arguments: [&[u8]; 11] = [
                         fixture.client.as_os_str().as_bytes(),
                         b"-nonetlink",
+                        b"-persist",
+                        b"-nofork",
                         b"-unix",
                         listener,
                         b"/dev/nbd0",
@@ -5530,6 +5940,23 @@ mod tests {
                         b"",
                     ];
                     write_nul_arguments(&process.join("cmdline"), &arguments);
+                }
+                ForeignClient::ServiceCgroup => {
+                    fs::write(
+                        process.join("cgroup"),
+                        b"0::/system.slice/cats-worker.service\n",
+                    )
+                    .unwrap();
+                }
+                ForeignClient::ServiceToken => {
+                    write_nul_arguments(
+                        &process.join("environ"),
+                        [format!("{NBD_CLIENT_TOKEN_ENVIRONMENT}={}", random('7'))]
+                            .iter()
+                            .map(String::as_bytes)
+                            .collect::<Vec<_>>()
+                            .as_slice(),
+                    );
                 }
             }
 
@@ -5554,6 +5981,41 @@ mod tests {
                 "{foreign:?}"
             );
         }
+    }
+
+    #[test]
+    fn process_identity_drift_between_allowance_and_pool_scan_is_unavailable() {
+        let fixture = Fixture::new(1);
+        let source = checkpoint("cat_a", "vol_a", "/dev/nbd0", '6');
+        let store =
+            FileCheckpointStore::open(&fixture.state.join(CHECKPOINT_NAMESPACE), &source.cat_id)
+                .unwrap();
+        store.create(&source).unwrap();
+        fixture.serving(0, 42, "/run/cats/nbd.sock");
+        let port = KernelNbdInventoryPort::new(fixture.config(1));
+        let scan = inventory_scan_context(&["cat_a"]);
+        let allowances = port.scan_process_allowances(&scan).unwrap();
+
+        let mut fields = vec!["S".to_owned()];
+        fields.extend((0..18).map(|_| "0".to_owned()));
+        fields.push("701".to_owned());
+        fields.extend((0..4).map(|_| "0".to_owned()));
+        fs::write(
+            fixture.proc.join("42/stat"),
+            format!("42 (nbd-client) {}\n", fields.join(" ")),
+        )
+        .unwrap();
+        let processes = NodeGlobalManagedProcessScanAdmission::from_root_controls(
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            port.scan_complete_pool_with_allowances(&scan, &processes, &allowances)
+                .unwrap(),
+            KernelNbdPoolScanOutcome::Unavailable
+        ));
     }
 
     #[test]
@@ -5782,7 +6244,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_submit_spawn_failure_is_the_only_plain_attach_error_after_admission() {
+    fn pid1_submission_failure_is_ambiguous_and_never_falls_back_to_a_worker_child() {
         let fixture = Fixture::new(1);
         let source = checkpoint("cat_a", "vol_a", "/dev/nbd0", '6');
         let store =
@@ -5796,14 +6258,11 @@ mod tests {
         let context = desired_effect_context(&fixture.state, &["cat_a"]);
         let listener = FakeListenerGuard::fixed();
 
-        let error = port
+        let result = port
             .attach_checkpointed(&request, &listener, &[], &store, &stored, &context)
-            .unwrap_err();
-        assert!(
-            format!("{error:#}").contains("spawn exact kernel-NBD client"),
-            "{error:#}"
-        );
-        assert_eq!(listener.calls(), 1);
+            .unwrap();
+        assert_eq!(result, KernelNbdAttachResult::OutcomeUnknown);
+        assert!(listener.calls() >= 1);
         let inventory = KernelNbdInventoryPort::new(fixture.config(1));
         let permit = inventory.lock_and_inspect(&TestContext::active()).unwrap();
         assert_eq!(
@@ -6175,7 +6634,7 @@ mod tests {
     }
 
     #[test]
-    fn platform_submitter_uses_frozen_argv_empty_environment_and_bounded_io() {
+    fn platform_submitter_uses_one_frozen_pid1_owned_service_contract() {
         let fixture = Fixture::new(1);
         let source = checkpoint("cat_a", "vol_a", "/dev/nbd0", '6');
         let store =
@@ -6183,46 +6642,123 @@ mod tests {
                 .unwrap();
         let stored = store.create(&source).unwrap();
         let request = KernelNbdAttachRequest::from_checkpoint(&stored).unwrap();
-        fs::write(
-            &fixture.client,
-            br#"#!/bin/sh
-if [ "${CARGO_MANIFEST_DIR+x}" = x ]; then exit 90; fi
-if [ "$#" -ne 8 ]; then exit 91; fi
-if [ "$1" != "-nonetlink" ] || [ "$2" != "-unix" ]; then exit 92; fi
-if [ "$3" != "/run/cats/nbd.sock" ] || [ "$4" != "/dev/nbd0" ]; then exit 93; fi
-if [ "$5" != "-b" ] || [ "$6" != "512" ] || [ "$7" != "-N" ]; then exit 94; fi
-if [ -n "$8" ]; then exit 95; fi
-printf ignored-output
-printf ignored-error >&2
-exit 0
-"#,
-        )
-        .unwrap();
-        fs::set_permissions(&fixture.client, fs::Permissions::from_mode(0o700)).unwrap();
-        let context = RuntimeDesiredEffectContext::for_test(
-            StateDirectory::unanchored(fixture.state.clone()),
-            Instant::now() + Duration::from_secs(2),
+        let command = kernel_nbd_client_command(&fixture.config(1), &request).unwrap();
+        assert_eq!(command.get_program(), std::ffi::OsStr::new(SYSTEMD_RUN));
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let unit = format!("cats-nbd-{}.service", request.ownership_token.as_str());
+        assert_eq!(
+            arguments,
+            vec![
+                "--system",
+                "--quiet",
+                "--no-ask-password",
+                "--collect",
+                &format!("--unit={unit}"),
+                "--service-type=exec",
+                "--slice=system.slice",
+                "--property=KillMode=control-group",
+                "--property=Restart=no",
+                "--property=UMask=0077",
+                "--property=TimeoutStopSec=2s",
+                "--property=Environment=",
+                "--property=EnvironmentFile=",
+                "--property=PassEnvironment=",
+                &format!(
+                    "--property=UnsetEnvironment={}",
+                    UNSET_PROCESS_ENVIRONMENT.join(" ")
+                ),
+                &format!(
+                    "--setenv={NBD_CLIENT_TOKEN_ENVIRONMENT}={}",
+                    request.ownership_token
+                ),
+                "--",
+                fixture.client.to_str().unwrap(),
+                "-nonetlink",
+                "-persist",
+                "-nofork",
+                "-unix",
+                "/run/cats/nbd.sock",
+                "/dev/nbd0",
+                "-b",
+                "512",
+                "-N",
+                "",
+            ]
         );
-        assert!(matches!(
-            PlatformKernelNbdClientSubmitPort.submit(
-                &fixture.config(1),
-                &request,
-                &context,
-                &KernelNbdClientCleanupOwner::new(),
-            ),
-            KernelNbdClientSubmitAttempt::Submitted(KernelNbdClientSubmission::Completed)
-        ));
+        assert_eq!(
+            command.get_envs().collect::<Vec<_>>(),
+            [
+                (
+                    std::ffi::OsStr::new("LANG"),
+                    Some(std::ffi::OsStr::new("C"))
+                ),
+                (
+                    std::ffi::OsStr::new("LC_ALL"),
+                    Some(std::ffi::OsStr::new("C"))
+                ),
+                (
+                    std::ffi::OsStr::new("SYSTEMD_COLORS"),
+                    Some(std::ffi::OsStr::new("0"))
+                ),
+            ]
+        );
     }
 
     #[test]
-    fn platform_submitter_cancels_one_attempt_as_unknown_without_retry() {
+    fn pid1_runtime_environment_is_non_authoritative_but_secrets_fail_closed() {
+        let token = random('6');
+        let target_environment = [
+            format!("{NBD_CLIENT_TOKEN_ENVIRONMENT}={token}"),
+            "INVOCATION_ID=dynamic".to_owned(),
+            "JOURNAL_STREAM=8:9".to_owned(),
+            "LANG=C.UTF-8".to_owned(),
+            "MEMORY_PRESSURE_WATCH=/sys/fs/cgroup/system.slice/unit/memory.pressure".to_owned(),
+            "MEMORY_PRESSURE_WRITE=c29tZQ==".to_owned(),
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin".to_owned(),
+            "SYSTEMD_EXEC_PID=42".to_owned(),
+            "USER=root".to_owned(),
+        ]
+        .map(OsString::from);
+        assert_eq!(
+            exact_nbd_client_environment(&target_environment),
+            Some(token.clone())
+        );
+
+        for forbidden in UNSET_PROCESS_ENVIRONMENT {
+            let mut environment = target_environment.to_vec();
+            environment.push(OsString::from(format!("{forbidden}=secret")));
+            assert_eq!(exact_nbd_client_environment(&environment), None);
+        }
+        for invalid in [
+            vec![OsString::from(format!(
+                "{NBD_CLIENT_TOKEN_ENVIRONMENT}={token}"
+            ))],
+            vec![
+                OsString::from(format!("{NBD_CLIENT_TOKEN_ENVIRONMENT}={token}")),
+                OsString::from(format!("{NBD_CLIENT_TOKEN_ENVIRONMENT}={token}")),
+            ],
+            vec![OsString::from("MALFORMED")],
+        ] {
+            let expected = invalid.len() == 1 && invalid[0].as_bytes().contains(&b'=');
+            assert_eq!(
+                exact_nbd_client_environment(&invalid),
+                expected.then_some(token.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_cli_helper_cancels_one_attempt_as_unknown_without_retry() {
         let fixture = Fixture::new(1);
         let source = checkpoint("cat_a", "vol_a", "/dev/nbd0", '6');
         let store =
             FileCheckpointStore::open(&fixture.state.join(CHECKPOINT_NAMESPACE), &source.cat_id)
                 .unwrap();
         let stored = store.create(&source).unwrap();
-        let request = KernelNbdAttachRequest::from_checkpoint(&stored).unwrap();
+        let _request = KernelNbdAttachRequest::from_checkpoint(&stored).unwrap();
         let pid_file = fixture.state.join("nbd-client.pid");
         fs::write(
             &fixture.client,
@@ -6255,13 +6791,14 @@ exit 0
         });
         let started = Instant::now();
         let cleanup_owner = KernelNbdClientCleanupOwner::new();
+        let mut command = Command::new(&fixture.client);
+        command
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         assert!(matches!(
-            PlatformKernelNbdClientSubmitPort.submit(
-                &fixture.config(1),
-                &request,
-                &context,
-                &cleanup_owner,
-            ),
+            run_bounded_nbd_client(command, &context, &cleanup_owner),
             KernelNbdClientSubmitAttempt::Submitted(KernelNbdClientSubmission::OutcomeUnknown)
         ));
         canceller.join().unwrap();
