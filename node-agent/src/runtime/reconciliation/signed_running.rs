@@ -1224,8 +1224,51 @@ impl SignedRunningAcquireEffect {
                 store,
                 predecessor,
             ),
+            ReconcileStep::StartRuntime { .. } => self.plan_superseded_start_runtime(
+                context,
+                desired,
+                accepted,
+                admission,
+                store,
+                predecessor,
+            ),
             _ => Ok(stop_local()),
         }
+    }
+
+    /// A superseded mid-launch runtime (exact retained VMM still running) has
+    /// no stable state to plan from; without this arm a Deleted intent
+    /// arriving before Running livelocks on `Stop(LocalContract)` with the
+    /// VMM, serving blockd and kernel-NBD attachment all left in place.
+    fn plan_superseded_start_runtime(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        desired: &DesiredRuntimeSpec,
+        accepted: &crate::runtime_spine::RuntimeDesiredEffectAdmission,
+        admission: &PrelaunchAdmission<'_>,
+        store: &FileCheckpointStore,
+        predecessor: &super::StoredCheckpoint,
+    ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
+        let Some(successor) = super::lifecycle_steps::superseded_launch_stop_successor(
+            desired,
+            admission.runtime,
+            predecessor.checkpoint(),
+            accepted.attestation().accepted_at_unix_ms,
+        )?
+        else {
+            return self.stop_unsupported_conflict(
+                desired,
+                accepted,
+                admission.runtime,
+                store,
+                predecessor,
+            );
+        };
+        context.check_active()?;
+        store
+            .replace(predecessor, &successor)
+            .context("rebind superseded StartRuntime checkpoint to a current StopRuntime")?;
+        Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
     }
 
     #[allow(clippy::too_many_arguments)]

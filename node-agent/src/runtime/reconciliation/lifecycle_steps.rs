@@ -4755,6 +4755,77 @@ fn has_only_explicit_disposable_root(desired: &DesiredRuntimeSpec) -> bool {
     )
 }
 
+/// A superseded mid-launch checkpoint (`StartRuntime`) whose physical VMM is
+/// still the exact retained launch converges toward an explicitly disposable
+/// Deleted target by stepping into the same StopRuntime the stable planner
+/// issues. Every retaining target keeps failing closed here: a mid-launch
+/// Guest may hold dirty pages no drain plan has quiesced, and only the
+/// explicitly disposable Root has authority to discard its tail.
+pub(super) fn superseded_launch_stop_successor(
+    desired: &DesiredRuntimeSpec,
+    runtime: &ObservedRuntimeStatus,
+    checkpoint: &RuntimeCheckpoint,
+    observed_at: cats_api::runtime_reconciliation::UnixMillis,
+) -> anyhow::Result<Option<RuntimeCheckpoint>> {
+    let ReconcileStep::StartRuntime { .. } = &checkpoint.step else {
+        return Ok(None);
+    };
+    if checkpoint.desired_revision >= desired.desired_revision
+        || checkpoint.cat_id != desired.cat_id
+        || checkpoint.node_id != desired.placement.node_id
+        || checkpoint.placement_epoch != desired.placement.placement_epoch
+        || desired.target != RuntimeTarget::Deleted
+        || !has_only_explicit_disposable_root(desired)
+        || checkpoint.lifecycle_admission != LifecycleAdmission::Closed
+        || runtime.lifecycle_admission != LifecycleAdmission::Closed
+        || runtime.platform_guards != 0
+        || runtime.routes.iter().any(|route| {
+            route.gate != cats_api::runtime_reconciliation::RouteGateState::Closed
+                || route.active_guards != 0
+                || route.cancellation_pending
+        })
+        || checkpoint
+            .route_gates
+            .iter()
+            .any(|route| route.gate != cats_api::runtime_reconciliation::RouteGateState::Closed)
+        || runtime.runtime_incarnation.is_none()
+        || runtime.runtime_incarnation != checkpoint.runtime_incarnation
+        || !runtime.applied_desired.as_ref().is_some_and(|applied| {
+            applied.desired_revision == desired.desired_revision
+                && applied.spec_digest == desired.spec_digest
+                && applied.placement == desired.placement
+                && applied.target == desired.target
+        })
+        || !current_runtime_matches_retained_launch(desired, runtime, checkpoint)
+    {
+        return Ok(None);
+    }
+    let vmm = exact_vmm_process(runtime)?;
+    let runtime_incarnation = checkpoint
+        .runtime_incarnation
+        .clone()
+        .context("superseded launch checkpoint lost its runtime incarnation")?;
+    let mut successor = checkpoint.clone();
+    successor.desired_revision = desired.desired_revision;
+    successor.spec_digest = desired.spec_digest.clone();
+    successor.processes = runtime.processes.clone();
+    successor.volumes = runtime.volumes.clone();
+    successor.mounts = runtime.mounts.clone();
+    successor.networks = runtime.networks.clone();
+    successor.guest_transport = runtime.guest_transport.clone();
+    successor.warm_snapshot = runtime.warm_snapshot.clone();
+    successor.stable_state = None;
+    successor.step = ReconcileStep::StopRuntime {
+        runtime_incarnation,
+        process_start_time_ticks: vmm.process_start_time_ticks,
+        scope_id: vmm.scope_id.clone(),
+    };
+    successor.updated_at_unix_ms = observed_at;
+    encode_runtime_checkpoint(&successor)
+        .context("validate superseded launch StopRuntime successor")?;
+    Ok(Some(successor))
+}
+
 fn superseded_drain_rebind_successor(
     desired: &DesiredRuntimeSpec,
     runtime: &ObservedRuntimeStatus,
@@ -6588,6 +6659,89 @@ mod tests {
             first_lifecycle_step(&retained, &retained_runtime).unwrap(),
             Some(ReconcileStep::DrainPublish { .. })
         ));
+    }
+
+    /// A Deleted intent that supersedes a mid-launch checkpoint must step
+    /// into StopRuntime instead of stalling: before this successor existed,
+    /// the whole physical launch (VMM, serving blockd, kernel-NBD) livelocked
+    /// behind Stop(LocalContract) forever.
+    #[test]
+    fn superseded_mid_launch_disposable_delete_steps_into_stop_runtime() {
+        let (mut desired, mut checkpoint, mut runtime) = fixtures(RuntimeTarget::Deleted);
+        desired.volumes[0].disposition = VolumeDisposition::DeleteDisposableRoot {
+            delete_id: Id::new("delete_disposable_root").unwrap(),
+        };
+        desired.spec_digest = spec_digest(&desired).unwrap();
+        // The checkpoint is the superseded mid-launch record: one revision
+        // behind, still parked on StartRuntime.
+        checkpoint.desired_revision = cats_api::runtime_reconciliation::Revision::new(7).unwrap();
+        checkpoint.stable_state = None;
+        let original = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+        assert!(matches!(original.step, ReconcileStep::StartRuntime { .. }));
+        checkpoint.step = original.step.clone();
+        runtime.step = checkpoint.step.clone();
+        runtime.stable_state = None;
+        runtime.applied_desired = Some(cats_api::runtime_reconciliation::AppliedDesiredEvidence {
+            desired_revision: desired.desired_revision,
+            spec_digest: desired.spec_digest.clone(),
+            placement: desired.placement.clone(),
+            target: desired.target,
+        });
+        let observed_at = cats_api::runtime_reconciliation::UnixMillis::new(1_900_000_777_000)
+            .unwrap();
+
+        let successor =
+            superseded_launch_stop_successor(&desired, &runtime, &checkpoint, observed_at)
+                .unwrap()
+                .expect("disposable-root Deleted must step a superseded launch into StopRuntime");
+        let process = exact_vmm_process(&runtime).unwrap();
+        assert_eq!(successor.desired_revision, desired.desired_revision);
+        assert_eq!(successor.spec_digest, desired.spec_digest);
+        assert!(matches!(
+            &successor.step,
+            ReconcileStep::StopRuntime {
+                runtime_incarnation,
+                process_start_time_ticks,
+                scope_id,
+            } if Some(runtime_incarnation) == checkpoint.runtime_incarnation.as_ref()
+                && *process_start_time_ticks == process.process_start_time_ticks
+                && scope_id == &process.scope_id
+        ));
+
+        // Calibration: a retaining disposition has no discard authority and
+        // must keep failing closed.
+        let mut retained = desired.clone();
+        retained.volumes[0].disposition = VolumeDisposition::DetachRetained;
+        retained.spec_digest = spec_digest(&retained).unwrap();
+        let mut retained_runtime = runtime.clone();
+        retained_runtime.applied_desired =
+            Some(cats_api::runtime_reconciliation::AppliedDesiredEvidence {
+                desired_revision: retained.desired_revision,
+                spec_digest: retained.spec_digest.clone(),
+                placement: retained.placement.clone(),
+                target: retained.target,
+            });
+        assert!(superseded_launch_stop_successor(
+            &retained,
+            &retained_runtime,
+            &checkpoint,
+            observed_at
+        )
+        .unwrap()
+        .is_none());
+
+        // Calibration: a same-revision checkpoint is not superseded.
+        let mut current = checkpoint.clone();
+        current.desired_revision = desired.desired_revision;
+        assert!(
+            superseded_launch_stop_successor(&desired, &runtime, &current, observed_at)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
