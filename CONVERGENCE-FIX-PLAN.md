@@ -120,8 +120,18 @@ checkpoint 推进到 Volume release(`disposition=delete_disposable_root`);但生
 **当前 metal-1 worker 处于 inactive。**
 
 **根因**:`cats-api` 的 wire 合同变更必须节点与控制面同版部署;昨天只滚了节点。
-**修复**:E8 通道构建分支 `40eb20c3` 控制面镜像 → 只滚 `cats-controld` → 再部署同提交 worker 并启动。
+**修复**:E8 通道构建分支控制面镜像 → 只滚 `cats-controld` → 再部署同提交 worker 并启动。
 **纪律沉淀**:凡 patch 触及 `api/src/runtime_reconciliation/wire.rs`,部署清单必须同时含控制面。
+
+**实施中发现的三层 release 绑定门**(8/20,依次撞出):controld 启动时验证
+(1) Route v2 rotation trust 文件的 `release_commit_sha` 必须等于二进制嵌入的 release;
+(2) 该 trust 文件必须精确重放 PostgreSQL 里已安装的当前行(以前每次换发布都是全新空 schema
+首启即安装,所以「原地升级」这个格子从没被走过);
+(3) production cutover operator trust(ConfigMap)同样绑定 release。
+**最终口径**:原地热修不改任何 trust/DB——控制面与 worker 用同一惯例,**代码取分支新提交、
+嵌入的 release 绑定钉住当前已 qualification 的值**(worker 钉 `930a50d6`,controld 钉
+`32eba16d`);为此给构建通道加了 `CATS_RELEASE_BINDING` 覆盖(`a6de8734`,默认行为不变)。
+换新绑定只能走完整 release switch(空 schema + 重铸两个 trust + qualification)。
 
 ### 8/19 晚新增提交(D1 及其同族,已在分支、部分未部署)
 
