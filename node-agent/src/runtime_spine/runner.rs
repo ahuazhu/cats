@@ -583,6 +583,12 @@ impl NodeGlobalEffectGate {
 /// worker closes and releases it only after the entire effect call returns.
 pub(crate) struct RuntimeNodeGlobalEffectPermit(());
 
+/// Proof that recovery is executing on the runner's single serialized
+/// pre-scan mutation lane. Unlike a Desired-effect permit this does not own a
+/// per-batch gate: the coordinator admits only one recovery command and waits
+/// for its completion before inventory or Desired effects may proceed.
+pub(crate) struct RuntimePreScanRecoveryPermit(());
+
 /// Shared read-only deadline/cancellation boundary for physical identity
 /// inspection. Both a full inventory scan and a Desired effect may inspect
 /// the same systemd/process/socket tuple; creation remains effect-only.
@@ -718,6 +724,11 @@ impl RuntimePreScanRecoveryContext {
             self.deadline,
             self.cancellation.clone(),
         )
+    }
+
+    pub(crate) fn retain_mutation_lane(&self) -> anyhow::Result<RuntimePreScanRecoveryPermit> {
+        self.check_active()?;
+        Ok(RuntimePreScanRecoveryPermit(()))
     }
 
     #[cfg(test)]

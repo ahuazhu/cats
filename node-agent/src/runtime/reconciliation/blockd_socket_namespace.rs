@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
-use crate::runtime_spine::RuntimeNodeGlobalEffectPermit;
+use crate::runtime_spine::{RuntimeNodeGlobalEffectPermit, RuntimePreScanRecoveryPermit};
 use crate::state_directory::StateDirectory;
 
 use super::clean_slate_probes::RUNTIME_V1_MAX_ASSIGNED_CATS;
@@ -2371,7 +2371,16 @@ impl ManagedBlockdSocketOwnerCleanupCapture {
 pub(crate) struct ExactManagedBlockdSocketOwnerStartAbsence {
     capture: ManagedBlockdSocketOwnerStartCapture,
     whole_root: ManagedBlockdSocketWholeRootSnapshot,
-    _node_global_effect: RuntimeNodeGlobalEffectPermit,
+    _absence_authority: ManagedBlockdSocketAbsenceAuthority,
+}
+
+enum ManagedBlockdSocketAbsenceAuthority {
+    DesiredEffect {
+        _permit: RuntimeNodeGlobalEffectPermit,
+    },
+    PreScanRecovery {
+        _permit: RuntimePreScanRecoveryPermit,
+    },
 }
 
 impl ExactManagedBlockdSocketOwnerStartAbsence {
@@ -2382,6 +2391,40 @@ impl ExactManagedBlockdSocketOwnerStartAbsence {
         current_boot: &CurrentBlockdSocketBoot,
         node_global_effect: RuntimeNodeGlobalEffectPermit,
     ) -> anyhow::Result<Self> {
+        Self::seal(
+            capture,
+            before,
+            after,
+            current_boot,
+            ManagedBlockdSocketAbsenceAuthority::DesiredEffect {
+                _permit: node_global_effect,
+            },
+        )
+    }
+
+    pub(crate) fn seal_after_pre_scan_recovery_sweep(
+        capture: ManagedBlockdSocketOwnerStartCapture,
+        before: ManagedBlockdSocketWholeRootSnapshot,
+        after: ManagedBlockdSocketWholeRootSnapshot,
+        current_boot: &CurrentBlockdSocketBoot,
+        recovery: RuntimePreScanRecoveryPermit,
+    ) -> anyhow::Result<Self> {
+        Self::seal(
+            capture,
+            before,
+            after,
+            current_boot,
+            ManagedBlockdSocketAbsenceAuthority::PreScanRecovery { _permit: recovery },
+        )
+    }
+
+    fn seal(
+        capture: ManagedBlockdSocketOwnerStartCapture,
+        before: ManagedBlockdSocketWholeRootSnapshot,
+        after: ManagedBlockdSocketWholeRootSnapshot,
+        current_boot: &CurrentBlockdSocketBoot,
+        absence_authority: ManagedBlockdSocketAbsenceAuthority,
+    ) -> anyhow::Result<Self> {
         capture.assert_current(current_boot)?;
         before.assert_current()?;
         anyhow::ensure!(
@@ -2391,7 +2434,7 @@ impl ExactManagedBlockdSocketOwnerStartAbsence {
         Ok(Self {
             capture,
             whole_root: after,
-            _node_global_effect: node_global_effect,
+            _absence_authority: absence_authority,
         })
     }
 

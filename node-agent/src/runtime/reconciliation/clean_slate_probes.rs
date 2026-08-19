@@ -7671,7 +7671,7 @@ impl StaleBootVmmProcessGlobalPort for PlatformRootProcessInventoryBridge {
         context: &RuntimePreScanRecoveryContext,
     ) -> anyhow::Result<TerminalVmmResidueGlobalInspection> {
         context.check_active()?;
-        let mut node_global_effect = Some(context.lock_node_global_effect()?);
+        let mut recovery_permit = Some(context.retain_mutation_lane()?);
         let socket_root = self
             .managed_vmm_socket_root
             .as_deref()
@@ -7785,20 +7785,20 @@ impl StaleBootVmmProcessGlobalPort for PlatformRootProcessInventoryBridge {
                     &expected.blockd_expected,
                 )?;
                 Some(
-                    ExactManagedBlockdSocketOwnerStartAbsence::seal_after_node_global_sweep(
+                    ExactManagedBlockdSocketOwnerStartAbsence::seal_after_pre_scan_recovery_sweep(
                         capture,
                         expected.blockd_snapshot,
                         after,
                         &expected.blockd_boot,
-                        node_global_effect
+                        recovery_permit
                             .take()
-                            .context("terminal blockd recovery lost its Node-global permit")?,
+                            .context("terminal blockd recovery lost its pre-scan permit")?,
                     )?,
                 )
             }
             None => None,
         };
-        drop(node_global_effect.take());
+        drop(recovery_permit.take());
         context.check_active()?;
         Ok(TerminalVmmResidueGlobalInspection::Absent(Box::new(
             super::vmm_process::ExactTerminalVmmResidueAbsenceProof::for_terminal_recovery(
