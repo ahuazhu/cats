@@ -1104,8 +1104,10 @@ impl NodeGlobalManagedProcessScanAdmission {
     }
 
     /// Bind scanner-private managed owner/intent residue to an absent Serving
-    /// process.  The public Device projection is necessarily empty in this
-    /// state and must not be used to reconstruct this cleanup authority.
+    /// process. The public process projection is necessarily empty in this
+    /// state; for vhost the Device is empty too, while kernel-NBD may retain a
+    /// separately observed frontend. Neither projection may reconstruct this
+    /// cleanup authority.
     pub(crate) fn with_absent_serving_owners(
         mut self,
         owners: BTreeSet<ManagedServingKey>,
@@ -1119,12 +1121,8 @@ impl NodeGlobalManagedProcessScanAdmission {
                         exact: None,
                     } if expectation.cat_id() == key.cat_id()
                         && expectation.volume_id() == key.volume_id()
-                        && matches!(
-                            expectation.frontend(),
-                            cats_api::runtime_reconciliation::PrepareDeviceFrontend::VhostUserBlk { .. }
-                        )
                 )),
-                "absent serving owner lacks its exact vhost expectation"
+                "absent serving owner lacks its exact serving expectation"
             );
         }
         self.absent_serving_owners = owners;
@@ -1828,7 +1826,7 @@ impl NodeGlobalManagedProcessAdmission {
         })
     }
 
-    pub(crate) fn retains_absent_vhost_owner(
+    pub(crate) fn retains_absent_serving_owner(
         &self,
         cat_id: &Id,
         prepared: &cats_api::runtime_reconciliation::PreparedDeviceInput,

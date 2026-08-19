@@ -7168,10 +7168,6 @@ impl RootProcessInventoryBridge for PlatformRootProcessInventoryBridge {
                     .get(key)
                     .expect("inspection keys originate from expectations");
                 if matches!(inspection, ServingBlockdProcessInspection::Absent)
-                    && matches!(
-                        expectation.frontend(),
-                        cats_api::runtime_reconciliation::PrepareDeviceFrontend::VhostUserBlk { .. }
-                    )
                     && before.retains_serving_owner(
                         expectation.device_ownership_token(),
                         &serving_socket_owner_authority_digest(expectation.prepared_device())?,
