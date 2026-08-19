@@ -453,7 +453,7 @@ fn load_node_volume_inventory(
         // the volume must map to exactly one receipt.
         let rows = transaction
             .query(
-                "SELECT record, volume_id, record->>'volume_id' AS json_volume_id,
+                "SELECT record::text, volume_id, record->>'volume_id' AS json_volume_id,
                         record->'request'->>'volume_id' AS request_volume_id
                    FROM delete_completion_receipts
                   WHERE volume_id=$1 OR record->>'volume_id'=$1
