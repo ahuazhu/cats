@@ -22,7 +22,7 @@ use cats_api::runtime_reconciliation::{
     RuntimeTarget, RuntimeTransition, ServingAuthorityProvenance, VolumeAcquire,
     VolumeAuthorityEvidence, WarmSnapshotEvidence,
 };
-use cats_storage::authority::{VolumeDataAuthority, VolumeRecord};
+use cats_storage::authority::{remote_head_is_same_or_later, VolumeDataAuthority, VolumeRecord};
 
 use crate::state_directory::StateDirectory;
 
@@ -411,6 +411,43 @@ pub(super) fn prepared_device_input_is_exact(
     desired: &DesiredRuntimeSpec,
     observed: &ObservedVolume,
 ) -> bool {
+    prepared_device_input_matches(
+        device,
+        desired,
+        observed,
+        PreparedVolumeEvolution::ExactPreparedHead,
+    )
+}
+
+/// Lifecycle journals retain the exact prepared identity but refresh the
+/// accepted live authority/lineage generations.  Only the head and its
+/// matching local/remote durability coordinates may advance; every owner,
+/// acquire, path, device and Desired field remains byte-exact.
+pub(super) fn prepared_device_input_matches_retained_lifecycle(
+    device: &PreparedDeviceInput,
+    desired: &DesiredRuntimeSpec,
+    observed: &ObservedVolume,
+) -> bool {
+    prepared_device_input_matches(
+        device,
+        desired,
+        observed,
+        PreparedVolumeEvolution::MonotonicLiveHead,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum PreparedVolumeEvolution {
+    ExactPreparedHead,
+    MonotonicLiveHead,
+}
+
+fn prepared_device_input_matches(
+    device: &PreparedDeviceInput,
+    desired: &DesiredRuntimeSpec,
+    observed: &ObservedVolume,
+    evolution: PreparedVolumeEvolution,
+) -> bool {
     let Some(intent) = desired
         .volumes
         .iter()
@@ -473,6 +510,19 @@ pub(super) fn prepared_device_input_is_exact(
     };
     let device_projection_is_closed =
         observed.devices.is_empty() || observed.devices == [expected_device];
+    let head_and_durability_are_valid = match evolution {
+        PreparedVolumeEvolution::ExactPreparedHead => {
+            device.expected_head == *head
+                && lineage.local_durable_generation == head.generation
+                && lineage.remote_durable_generation == head.generation
+                && lineage.pending_pack_count.get() == 0
+        }
+        PreparedVolumeEvolution::MonotonicLiveHead => {
+            remote_head_is_same_or_later(head, &device.expected_head)
+                && lineage.local_durable_generation >= lineage.remote_durable_generation
+                && lineage.remote_durable_generation == head.generation
+        }
+    };
 
     device.volume_intent_id == intent.volume_intent_id
         && device.disk_id == intent.disk_id
@@ -483,7 +533,7 @@ pub(super) fn prepared_device_input_is_exact(
         && device.attachment_epoch == *attachment_epoch
         && attachment_epoch_is_desired
         && device.acquire_origin == expected_acquire_origin
-        && device.expected_head == *head
+        && head_and_durability_are_valid
         && device.size_bytes == intent.size_bytes
         && device.durability == intent.durability
         && device.guest_device == intent.guest_device
@@ -499,10 +549,7 @@ pub(super) fn prepared_device_input_is_exact(
         && lineage.acquire_origin == device.acquire_origin
         && lineage.node_id == desired.placement.node_id
         && lineage.placement_epoch == desired.placement.placement_epoch
-        && lineage.local_durable_generation == head.generation
-        && lineage.remote_durable_generation == head.generation
         && lineage.data_directory == device.serving_process.data_directory
-        && lineage.pending_pack_count.get() == 0
         && !lineage.fenced
         && lineage.state == cats_api::runtime_reconciliation::LocalLineageState::Active
 }

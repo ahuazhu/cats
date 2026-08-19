@@ -56,7 +56,9 @@ use super::{
     network::{
         prepare_device_checkpoint_view, prepared_device_inputs, NodeGlobalNetworkScanAdmission,
     },
-    prepare_device_retirement::prepared_device_input_is_exact,
+    prepare_device_retirement::{
+        prepared_device_input_is_exact, prepared_device_input_matches_retained_lifecycle,
+    },
     probe_exact_guest_mounted_set,
     retained_runtime_launch::RetainedRuntimeLaunchAuthority,
     root_provision_process::{
@@ -3864,6 +3866,14 @@ fn validate_current_prepared_checkpoint(
         devices.len() == blockds.len(),
         "prepared-device checkpoint and authorized blockd inventory differ in exact size"
     );
+    let refreshes_live_volume_projection = matches!(
+        checkpoint.step,
+        ReconcileStep::DrainPublish { .. }
+            | ReconcileStep::PauseRuntime { .. }
+            | ReconcileStep::SnapshotWarmRuntime { .. }
+            | ReconcileStep::StopRuntime { .. }
+            | ReconcileStep::CleanupRelease { .. }
+    );
     for device in devices {
         let checkpoint_volume = checkpoint
             .volumes
@@ -3878,8 +3888,13 @@ fn validate_current_prepared_checkpoint(
             device.serving_authority.as_ref(),
             cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
         );
-        anyhow::ensure!(
+        let checkpoint_volume_is_exact = if refreshes_live_volume_projection {
+            prepared_device_input_matches_retained_lifecycle(&device, desired, checkpoint_volume)
+        } else {
             prepared_device_input_is_exact(&device, desired, checkpoint_volume)
+        };
+        anyhow::ensure!(
+            checkpoint_volume_is_exact
                 && device.volume_id == attachment.identity.volume_id
                 && device.attachment_id == attachment.identity.attachment_id
                 && device.attachment_epoch == attachment.identity.attachment_epoch
@@ -4012,16 +4027,16 @@ mod tests {
     use std::time::Instant;
 
     use cats_api::route_grant_v2::decode_route_grant_v2_public_key_ring;
-    use cats_api::runtime_reconciliation::{
-        decode_desired_read_snapshot, decode_runtime_checkpoint, encode_node_observation,
-        encode_runtime_checkpoint, inventory_digest, spec_digest, AssignedKind, AssignedPlacement,
-        ContractVersion, DesiredRuntimeSpec, Epoch, Id, InventorySource, Ipv4Address,
-        IsolatedIpv4Kind, KeyId, MacAddress, NetworkConfig, NodeObservation,
-        OwnershipTokenEvidence, RandomId128, ReconcileStep, Revision, RuntimeConfig, RuntimeTarget,
-        RuntimeTransition, SessionBinding, Sha256Digest, StableState,
-    };
     #[cfg(target_os = "linux")]
-    use cats_api::runtime_reconciliation::{decode_desired_runtime_spec, RuntimeLaunch};
+    use cats_api::runtime_reconciliation::RuntimeLaunch;
+    use cats_api::runtime_reconciliation::{
+        decode_desired_read_snapshot, decode_desired_runtime_spec, decode_runtime_checkpoint,
+        encode_node_observation, encode_runtime_checkpoint, inventory_digest, spec_digest,
+        AssignedKind, AssignedPlacement, ContractVersion, DesiredRuntimeSpec, Epoch, Id,
+        InventorySource, Ipv4Address, IsolatedIpv4Kind, KeyId, MacAddress, NetworkConfig,
+        NodeObservation, OwnershipTokenEvidence, RandomId128, ReconcileStep, Revision,
+        RuntimeConfig, RuntimeTarget, RuntimeTransition, SessionBinding, Sha256Digest, StableState,
+    };
 
     use super::*;
     use crate::route_grant_v2::{RouteGrantV2KeyRing, RouteGrantV2Verifier};
@@ -4356,6 +4371,59 @@ mod tests {
         duplicate_vmm.processes[2].process_id = 43;
         assert!(!checkpoint_process_projections_match_retained_launch(
             &duplicate_vmm
+        ));
+    }
+
+    #[test]
+    fn retained_lifecycle_volume_accepts_only_monotonic_exact_lineage_evolution() {
+        let desired = decode_desired_runtime_spec(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-desired.json"
+        )))
+        .unwrap();
+        let checkpoint = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+        let device = checkpoint.runtime_launch.identity().unwrap().devices[0].clone();
+        let mut evolved = checkpoint.volumes[0].clone();
+        let VolumeAuthorityEvidence::Owned { head, .. } = &mut evolved.authority else {
+            unreachable!()
+        };
+        head.generation = cats_api::runtime_reconciliation::Generation::new(4).unwrap();
+        let lineage = &mut evolved.local_lineages[0];
+        lineage.local_durable_generation =
+            cats_api::runtime_reconciliation::Generation::new(5).unwrap();
+        lineage.remote_durable_generation = head.generation;
+        lineage.pending_pack_count = WireU64::new(1).unwrap();
+        assert!(!prepared_device_input_is_exact(&device, &desired, &evolved));
+        assert!(prepared_device_input_matches_retained_lifecycle(
+            &device, &desired, &evolved
+        ));
+
+        let mut same_generation_conflict = evolved.clone();
+        let VolumeAuthorityEvidence::Owned { head, .. } = &mut same_generation_conflict.authority
+        else {
+            unreachable!()
+        };
+        head.generation = device.expected_head.generation;
+        head.root_hash = Some(Sha256Digest::from_bytes([0x51; 32]));
+        same_generation_conflict.local_lineages[0].remote_durable_generation = head.generation;
+        same_generation_conflict.local_lineages[0].local_durable_generation = head.generation;
+        assert!(!prepared_device_input_matches_retained_lifecycle(
+            &device,
+            &desired,
+            &same_generation_conflict,
+        ));
+
+        let mut remote_drift = evolved;
+        remote_drift.local_lineages[0].remote_durable_generation =
+            cats_api::runtime_reconciliation::Generation::new(3).unwrap();
+        assert!(!prepared_device_input_matches_retained_lifecycle(
+            &device,
+            &desired,
+            &remote_drift,
         ));
     }
 
