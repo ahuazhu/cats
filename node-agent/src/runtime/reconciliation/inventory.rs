@@ -3955,6 +3955,22 @@ fn validate_current_cleanup_checkpoint(
     else {
         anyhow::bail!("current cleanup is not an exact Volume release")
     };
+    let lineage_bound = match blockds.and_then(|blockds| blockds.get(volume_id)) {
+        Some(blockd) => {
+            blockd.checkpoint.attachment.identity.attachment_id == *attachment_id
+                && blockd.checkpoint.attachment.identity.attachment_epoch == *attachment_epoch
+        }
+        // A disposable-root release's authorized reclaim removes the entire
+        // data tree while this same checkpoint is still current; complete
+        // absence is that postcondition, not a binding failure. A partially
+        // present tree never reaches this arm: the strict data-tree walkers
+        // fail the scan on their own. Retaining dispositions keep requiring
+        // their lineage.
+        None => matches!(
+            replay.disposition,
+            cats_api::runtime_reconciliation::VolumeDisposition::DeleteDisposableRoot { .. }
+        ),
+    };
     anyhow::ensure!(
         cleanup.inventory_session.node_id == desired.placement.node_id
             && cleanup.desired_read_position >= cleanup.inventory_read_position
@@ -3967,13 +3983,7 @@ fn validate_current_cleanup_checkpoint(
             && observed.size_bytes == Some(intent.size_bytes)
             && observed.durability == Some(intent.durability)
             && observed.devices.is_empty()
-            && blockds
-                .and_then(|blockds| blockds.get(volume_id))
-                .is_some_and(|blockd| {
-                    blockd.checkpoint.attachment.identity.attachment_id == *attachment_id
-                        && blockd.checkpoint.attachment.identity.attachment_epoch
-                            == *attachment_epoch
-                }),
+            && lineage_bound,
         "current cleanup checkpoint does not bind the exact stale lineage"
     );
     Ok(())
