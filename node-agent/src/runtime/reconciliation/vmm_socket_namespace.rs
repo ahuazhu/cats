@@ -1520,6 +1520,10 @@ impl TerminalVmmResidueExpectation {
     pub(crate) fn receipt(&self) -> &VmmSocketOwnershipReceiptV1 {
         &self.receipt
     }
+
+    pub(crate) fn vmm_executable_path(&self) -> &HostPath {
+        &self.receipt.vmm_executable_path
+    }
 }
 
 #[cfg(target_os = "linux")]

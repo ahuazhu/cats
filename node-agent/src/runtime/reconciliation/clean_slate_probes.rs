@@ -5592,6 +5592,11 @@ impl PlatformRootProcessInventoryBridge {
             if !vmm_expected.is_empty()
                 || checkpoints.checkpoint(&terminal.checkpoint().cat_id)
                     != Some(terminal.checkpoint())
+                || !self
+                    .process_paths
+                    .binaries
+                    .iter()
+                    .any(|binary| binary == Path::new(terminal.vmm_executable_path().as_str()))
             {
                 return Ok(None);
             }

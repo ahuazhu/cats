@@ -3844,6 +3844,47 @@ mod tests {
             .load(forbidden_fixture.receipt.runtime_incarnation())
             .unwrap()
             .is_some());
+
+        let foreign_fixture = LaunchFixture::new();
+        foreign_fixture
+            .receipt_store
+            .publish(&foreign_fixture.receipt)
+            .unwrap();
+        let ready = match foreign_fixture.prepare() {
+            ManagedVmmLaunchPreparation::Ready(ready) => ready,
+            _ => panic!("foreign fixture launch attempt was not ready"),
+        };
+        let foreign_paths = ManagedVmmLaunchFilePaths::paths_from_checkpoint(
+            foreign_fixture.launch_root.state_directory(),
+            &foreign_fixture.checkpoint,
+        )
+        .unwrap();
+        let foreign_leaf = Path::new(foreign_paths.directory().as_str()).join("foreign");
+        std::fs::write(&foreign_leaf, b"foreign").unwrap();
+        drop(ready);
+        let foreign_checkpoint = terminal_cleanup_checkpoint(&foreign_fixture.checkpoint);
+        let foreign_candidate = foreign_fixture
+            .receipt_store
+            .retain_single_terminal_vmm_residue(
+                &foreign_fixture.socket_root,
+                &[&foreign_checkpoint],
+                &scan_context(),
+            )
+            .unwrap()
+            .expect("receipt selection is independent of launch contents");
+        assert!(foreign_fixture
+            .launch_root
+            .assert_single_terminal_residue_accounted(
+                foreign_candidate.expectation(),
+                &scan_context(),
+            )
+            .is_err());
+        assert_eq!(std::fs::read(&foreign_leaf).unwrap(), b"foreign");
+        assert!(foreign_fixture
+            .receipt_store
+            .load(foreign_fixture.receipt.runtime_incarnation())
+            .unwrap()
+            .is_some());
     }
 
     #[cfg(target_os = "linux")]
