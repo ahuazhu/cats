@@ -416,9 +416,17 @@ impl PlatformLifecyclePhysicalPort {
             {
                 return Ok(LifecyclePhysicalAttempt::Conflict);
             }
-            match ExactGuestQuiesce::prepare(context, launch, vmm) {
-                Ok(guest) => Some(guest),
-                Err(_) => return Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous),
+            if unpublished_start_abort_can_skip_guest_quiesce(
+                permit.runtime(),
+                permit.checkpoint(),
+                launch,
+            ) {
+                None
+            } else {
+                match ExactGuestQuiesce::prepare(context, launch, vmm) {
+                    Ok(guest) => Some(guest),
+                    Err(_) => return Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous),
+                }
             }
         } else if permit
             .runtime()
@@ -780,13 +788,32 @@ fn guest_transport_allows_quiesce(
         return false;
     }
     guest_transport_matches_launch(runtime, launch)
-        || (matches!(runtime.guest_transport, GuestTransportEvidence::Unavailable)
-            && checkpoint.stable_state.is_none()
-            && matches!(
-                checkpoint.step,
-                ReconcileStep::DrainPublish { .. } | ReconcileStep::PauseRuntime { .. }
-            )
-            && checkpoint.runtime_launch.identity() == Some(launch))
+        || unpublished_start_abort_can_skip_guest_quiesce(runtime, checkpoint, launch)
+}
+
+fn unpublished_start_abort_can_skip_guest_quiesce(
+    runtime: &ObservedRuntimeStatus,
+    checkpoint: &RuntimeCheckpoint,
+    launch: &cats_api::runtime_reconciliation::RuntimeLaunchIdentity,
+) -> bool {
+    matches!(runtime.guest_transport, GuestTransportEvidence::Unavailable)
+        && matches!(
+            checkpoint.guest_transport,
+            GuestTransportEvidence::Unavailable
+        )
+        && checkpoint.stable_state.is_none()
+        && checkpoint.processes.is_empty()
+        && checkpoint.lifecycle_admission == LifecycleAdmission::Closed
+        && checkpoint.route_gates.is_empty()
+        && matches!(checkpoint.step, ReconcileStep::DrainPublish { .. })
+        && runtime.stable_state.is_none()
+        && runtime.step == checkpoint.step
+        && runtime.lifecycle_admission == LifecycleAdmission::Closed
+        && runtime.platform_guards == 0
+        && runtime.routes.is_empty()
+        && runtime.runtime_incarnation.as_ref() == Some(&launch.runtime_incarnation)
+        && checkpoint.runtime_incarnation.as_ref() == Some(&launch.runtime_incarnation)
+        && checkpoint.runtime_launch.identity() == Some(launch)
 }
 
 struct ExactGuestQuiesce {
@@ -4466,10 +4493,20 @@ fn drain_attempt_successor(
             ),
             "verified final Drain cannot advance a non-Running live VMM"
         );
-        successor.step = ReconcileStep::PauseRuntime {
-            runtime_incarnation: runtime_incarnation.clone(),
-            process_start_time_ticks: process.process_start_time_ticks,
-        };
+        if checkpoint.runtime_launch.identity().is_some_and(|launch| {
+            unpublished_start_abort_can_skip_guest_quiesce(runtime, checkpoint, launch)
+        }) {
+            successor.step = ReconcileStep::StopRuntime {
+                runtime_incarnation: runtime_incarnation.clone(),
+                process_start_time_ticks: process.process_start_time_ticks,
+                scope_id: process.scope_id.clone(),
+            };
+        } else {
+            successor.step = ReconcileStep::PauseRuntime {
+                runtime_incarnation: runtime_incarnation.clone(),
+                process_start_time_ticks: process.process_start_time_ticks,
+            };
+        }
         return Ok(Some(successor));
     }
     anyhow::ensure!(
@@ -6349,6 +6386,7 @@ mod tests {
         let drain = first_lifecycle_step(&desired, &runtime).unwrap().unwrap();
         checkpoint.stable_state = None;
         checkpoint.step = drain.clone();
+        checkpoint.processes.clear();
         checkpoint.guest_transport = GuestTransportEvidence::Unavailable;
         runtime.stable_state = None;
         runtime.step = drain;
@@ -6358,6 +6396,52 @@ mod tests {
             &runtime,
             &checkpoint,
             &launch,
+        ));
+        assert!(unpublished_start_abort_can_skip_guest_quiesce(
+            &runtime,
+            &checkpoint,
+            &launch,
+        ));
+
+        let process = exact_vmm_process(&runtime).unwrap();
+        let successor = drain_attempt_successor(
+            &desired,
+            &runtime,
+            &checkpoint,
+            &LifecyclePhysicalAttempt::VerifiedDrain(exact_drain_receipt(&desired, &runtime)),
+            checkpoint.updated_at_unix_ms,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            successor.step,
+            ReconcileStep::StopRuntime {
+                ref runtime_incarnation,
+                process_start_time_ticks,
+                ref scope_id,
+            } if runtime_incarnation == &launch.runtime_incarnation
+                && process_start_time_ticks == process.process_start_time_ticks
+                && scope_id == &process.scope_id
+        ));
+
+        checkpoint.processes = runtime.processes.clone();
+        assert!(!unpublished_start_abort_can_skip_guest_quiesce(
+            &runtime,
+            &checkpoint,
+            &launch,
+        ));
+        assert!(matches!(
+            drain_attempt_successor(
+                &desired,
+                &runtime,
+                &checkpoint,
+                &LifecyclePhysicalAttempt::VerifiedDrain(exact_drain_receipt(&desired, &runtime)),
+                checkpoint.updated_at_unix_ms,
+            )
+            .unwrap()
+            .unwrap()
+            .step,
+            ReconcileStep::PauseRuntime { .. }
         ));
 
         checkpoint.stable_state = Some(StableState::Running);
