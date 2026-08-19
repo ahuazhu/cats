@@ -37,8 +37,8 @@ use super::vmm_socket_namespace::{
     current_kernel_node_boot_id, scan_receipt_namespace_snapshot,
     scan_stale_boot_receipt_namespace_snapshot, CurrentVmmSocketCleanupAuthority,
     ReceiptNamespaceSnapshot, RetainedManagedVmmSocketRoot, RetainedTerminalVmmResidue,
-    RetainedVmmSocketReceipt, TerminalVmmResidueExpectation, VmmReceiptRetirementAuthority,
-    VmmSocketOwnershipReceiptV1, VmmSocketReceiptStore,
+    RetainedVmmSocketReceipt, TerminalVmmResidueExpectation, TerminalVmmSocketCleanupAuthority,
+    VmmReceiptRetirementAuthority, VmmSocketOwnershipReceiptV1, VmmSocketReceiptStore,
 };
 
 const CHECKPOINT_FD: i32 = 64;
@@ -460,6 +460,8 @@ impl RetainedManagedVmmLaunchRoot {
         let proof = inspect_fresh_global_absence(&namespace_guard, &expectation)?;
         let authority =
             namespace_guard.bind_terminal_residue_absence(proof, expectation.clone(), context)?;
+        candidate.assert_current(receipts, socket_root)?;
+        socket_root.retire_terminal_boot_attempt(receipts, &candidate, &authority)?;
         candidate.assert_current(receipts, socket_root)?;
         if let Some(residue) = self.retain_terminal_launch_residue(&authority, &expectation)? {
             residue.recover_terminal(&authority, expectation.checkpoint())?;
@@ -938,6 +940,23 @@ impl VmmReceiptRetirementAuthority for GuardedTerminalVmmResidueAbsence<'_> {
             "terminal VMM receipt changed compatibility coordinate"
         );
         Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl TerminalVmmSocketCleanupAuthority for GuardedTerminalVmmResidueAbsence<'_> {
+    fn assert_terminal_socket_cleanup(
+        &self,
+        expectation: &TerminalVmmResidueExpectation,
+        root: &RetainedManagedVmmSocketRoot,
+        store: &VmmSocketReceiptStore,
+    ) -> Result<()> {
+        self.assert_for(&self.guard.root, expectation)?;
+        anyhow::ensure!(
+            self.guard.root.state_directory().path() == store.state_directory().path(),
+            "terminal VMM socket cleanup uses another Node state directory"
+        );
+        expectation.assert_socket_root(root)
     }
 }
 
@@ -3515,6 +3534,36 @@ mod tests {
         TestPhysicalContext(std::time::Instant::now() + std::time::Duration::from_secs(5))
     }
 
+    #[cfg(target_os = "linux")]
+    fn publish_terminal_launch_residue(fixture: &LaunchFixture) -> ManagedVmmLaunchFilePaths {
+        let ready = match fixture.prepare() {
+            ManagedVmmLaunchPreparation::Ready(ready) => ready,
+            _ => panic!("fresh terminal launch attempt was not ready"),
+        };
+        let paths = ManagedVmmLaunchFilePaths::paths_from_checkpoint(
+            fixture.launch_root.state_directory(),
+            &fixture.checkpoint,
+        )
+        .unwrap();
+        for path in [
+            paths.memory_file_path(),
+            paths.serial_log_path(),
+            paths.vmm_log_path(),
+        ] {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path.as_str())
+                .unwrap();
+            file.write_all(b"historical-terminal-residue").unwrap();
+            file.sync_all().unwrap();
+        }
+        ready.assert_ready_with_launch_files().unwrap();
+        drop(ready);
+        paths
+    }
+
     #[test]
     fn launch_file_mapping_is_state_selected_and_incarnation_exact() {
         let root = tempfile::tempdir().unwrap();
@@ -3885,6 +3934,161 @@ mod tests {
             .load(foreign_fixture.receipt.runtime_incarnation())
             .unwrap()
             .is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_cleanup_retires_a_current_boot_dead_socket_attempt_first() {
+        let mut fixture = LaunchFixture::new();
+        fixture.receipt_store.publish(&fixture.receipt).unwrap();
+        let launch_paths = publish_terminal_launch_residue(&fixture);
+        let socket_attempt = match fixture
+            .socket_root
+            .prepare_existing_receipt(&fixture.checkpoint, &fixture.receipt_store)
+            .unwrap()
+        {
+            super::super::vmm_socket_namespace::ManagedVmmSocketPreparation::Prepared(attempt) => {
+                *attempt
+            }
+            super::super::vmm_socket_namespace::ManagedVmmSocketPreparation::ExistingLive => {
+                panic!("fresh terminal socket attempt was already live")
+            }
+        };
+        let socket_paths = fixture
+            .socket_root
+            .planner()
+            .paths_for(fixture.receipt.runtime_incarnation())
+            .unwrap();
+        drop(socket_attempt);
+        fixture.checkpoint = terminal_cleanup_checkpoint(&fixture.checkpoint);
+
+        let candidate = fixture
+            .receipt_store
+            .retain_single_terminal_vmm_residue(
+                &fixture.socket_root,
+                &[&fixture.checkpoint],
+                &scan_context(),
+            )
+            .unwrap()
+            .expect("current-boot terminal residue was selected");
+        assert!(fixture
+            .launch_root
+            .recover_terminal_vmm_residue(
+                &fixture.socket_root,
+                &fixture.receipt_store,
+                candidate,
+                &scan_context(),
+                |guard, selected| {
+                    guard.assert_for(&fixture.launch_root)?;
+                    Ok(
+                        super::super::vmm_process::ExactTerminalVmmResidueAbsenceProof::for_expectation(
+                            selected.clone(),
+                        ),
+                    )
+                },
+            )
+            .unwrap());
+
+        assert!(!Path::new(socket_paths.public_directory().as_str()).exists());
+        assert!(!Path::new(launch_paths.directory().as_str()).exists());
+        assert!(fixture
+            .receipt_store
+            .load(fixture.receipt.runtime_incarnation())
+            .unwrap()
+            .is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_cleanup_preserves_a_live_socket_and_replays_its_quarantine() {
+        let mut fixture = LaunchFixture::new();
+        fixture.receipt_store.publish(&fixture.receipt).unwrap();
+        let launch_paths = publish_terminal_launch_residue(&fixture);
+        let socket_attempt = match fixture
+            .socket_root
+            .prepare_existing_receipt(&fixture.checkpoint, &fixture.receipt_store)
+            .unwrap()
+        {
+            super::super::vmm_socket_namespace::ManagedVmmSocketPreparation::Prepared(attempt) => {
+                *attempt
+            }
+            super::super::vmm_socket_namespace::ManagedVmmSocketPreparation::ExistingLive => {
+                panic!("fresh terminal socket attempt was already live")
+            }
+        };
+        let socket_paths = fixture
+            .socket_root
+            .planner()
+            .paths_for(fixture.receipt.runtime_incarnation())
+            .unwrap();
+        fixture.checkpoint = terminal_cleanup_checkpoint(&fixture.checkpoint);
+
+        let candidate = fixture
+            .receipt_store
+            .retain_single_terminal_vmm_residue(
+                &fixture.socket_root,
+                &[&fixture.checkpoint],
+                &scan_context(),
+            )
+            .unwrap()
+            .expect("live current-boot terminal residue was selected");
+        assert!(fixture
+            .launch_root
+            .recover_terminal_vmm_residue(
+                &fixture.socket_root,
+                &fixture.receipt_store,
+                candidate,
+                &scan_context(),
+                |_, selected| {
+                    Ok(
+                        super::super::vmm_process::ExactTerminalVmmResidueAbsenceProof::for_expectation(
+                            selected.clone(),
+                        ),
+                    )
+                },
+            )
+            .is_err());
+        assert!(Path::new(socket_paths.quarantine_directory().as_str()).is_dir());
+        assert!(Path::new(launch_paths.directory().as_str()).is_dir());
+        assert!(fixture
+            .receipt_store
+            .load(fixture.receipt.runtime_incarnation())
+            .unwrap()
+            .is_some());
+
+        drop(socket_attempt);
+        let replay = fixture
+            .receipt_store
+            .retain_single_terminal_vmm_residue(
+                &fixture.socket_root,
+                &[&fixture.checkpoint],
+                &scan_context(),
+            )
+            .unwrap()
+            .expect("quarantined terminal residue remained replayable");
+        assert!(fixture
+            .launch_root
+            .recover_terminal_vmm_residue(
+                &fixture.socket_root,
+                &fixture.receipt_store,
+                replay,
+                &scan_context(),
+                |_, selected| {
+                    Ok(
+                        super::super::vmm_process::ExactTerminalVmmResidueAbsenceProof::for_expectation(
+                            selected.clone(),
+                        ),
+                    )
+                },
+            )
+            .unwrap());
+        assert!(!Path::new(socket_paths.quarantine_directory().as_str()).exists());
+        assert!(!Path::new(launch_paths.directory().as_str()).exists());
+        assert!(fixture
+            .receipt_store
+            .load(fixture.receipt.runtime_incarnation())
+            .unwrap()
+            .is_none());
     }
 
     #[cfg(target_os = "linux")]

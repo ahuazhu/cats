@@ -1535,6 +1535,27 @@ impl TerminalVmmResidueExpectation {
     pub(crate) fn vmm_executable_path(&self) -> &HostPath {
         &self.receipt.vmm_executable_path
     }
+
+    pub(crate) fn assert_socket_root(
+        &self,
+        root: &RetainedManagedVmmSocketRoot,
+    ) -> anyhow::Result<()> {
+        let paths = root.planner.paths_for(&self.receipt.runtime_incarnation)?;
+        anyhow::ensure!(
+            self.receipt.managed_root_path == *paths.root()
+                && self.receipt.public_name == paths.public_name()
+                && self.receipt.staging_name == paths.staging_name()
+                && self.receipt.quarantine_name == paths.quarantine_name(),
+            "terminal VMM socket cleanup uses another managed root"
+        );
+        if self.receipt.node_boot_id == current_kernel_node_boot_id()? {
+            anyhow::ensure!(
+                self.receipt.managed_root_identity == root.identity,
+                "current-boot terminal VMM socket cleanup uses another root identity"
+            );
+        }
+        root.assert_current()
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1550,13 +1571,17 @@ impl RetainedTerminalVmmResidue {
         &self.expectation
     }
 
+    pub(crate) fn retained_receipt(&self) -> &RetainedVmmSocketReceipt {
+        &self.receipt
+    }
+
     pub(crate) fn assert_current(
         &self,
         store: &VmmSocketReceiptStore,
         root: &RetainedManagedVmmSocketRoot,
     ) -> anyhow::Result<()> {
         self.receipt.assert_current(store)?;
-        root.assert_stale_boot_attempt_absent(self.expectation.receipt())?;
+        root.assert_terminal_attempt_accounted(self.expectation.receipt())?;
         let current = TerminalVmmResidueExpectation::new(
             self.expectation.checkpoint(),
             self.receipt.receipt(),
@@ -1713,6 +1738,22 @@ pub(crate) trait CurrentVmmSocketCleanupAuthority:
         &self,
         checkpoint: &RuntimeCheckpoint,
         receipt: &VmmSocketOwnershipReceiptV1,
+        root: &RetainedManagedVmmSocketRoot,
+        store: &VmmSocketReceiptStore,
+    ) -> anyhow::Result<()>;
+}
+
+/// Only the launch-root module may authorize removal of the one exact
+/// current-boot socket attempt retained by terminal compatibility recovery.
+/// This proof binds the terminal expectation because its RuntimeLaunch is
+/// deliberately absent.
+#[cfg(target_os = "linux")]
+pub(crate) trait TerminalVmmSocketCleanupAuthority:
+    receipt_retirement_sealed::Sealed
+{
+    fn assert_terminal_socket_cleanup(
+        &self,
+        expectation: &TerminalVmmResidueExpectation,
         root: &RetainedManagedVmmSocketRoot,
         store: &VmmSocketReceiptStore,
     ) -> anyhow::Result<()>;
@@ -2094,7 +2135,7 @@ fn scan_single_terminal_vmm_residue(
         location,
     };
     retained.assert_current(store)?;
-    root.assert_stale_boot_attempt_absent(retained.receipt())?;
+    root.assert_terminal_attempt_accounted(retained.receipt())?;
     context.check_active()?;
     Ok(Some(RetainedTerminalVmmResidue {
         expectation,
@@ -2353,6 +2394,57 @@ impl RetainedManagedVmmSocketRoot {
         self.assert_current()
     }
 
+    /// Account the one boot-local socket attempt that may accompany the
+    /// historical terminal receipt. Receipts from another kernel boot retain
+    /// the stronger absence rule because a new `/run` namespace cannot
+    /// contain their socket inode.
+    fn assert_terminal_attempt_accounted(
+        &self,
+        receipt: &VmmSocketOwnershipReceiptV1,
+    ) -> anyhow::Result<()> {
+        self.assert_current()?;
+        if receipt.node_boot_id != current_kernel_node_boot_id()? {
+            return self.assert_stale_boot_attempt_absent(receipt);
+        }
+        anyhow::ensure!(
+            receipt.managed_root_identity == self.identity,
+            "current-boot terminal VMM receipt names another socket root"
+        );
+        let (expected_user, expected_group) = self.owner();
+        let public = open_owned_attempt_directory(
+            &self.descriptor,
+            &receipt.public_name,
+            expected_user,
+            expected_group,
+        )?;
+        let staging = open_owned_attempt_directory(
+            &self.descriptor,
+            &receipt.staging_name,
+            expected_user,
+            expected_group,
+        )?;
+        let quarantine = open_owned_attempt_directory(
+            &self.descriptor,
+            &receipt.quarantine_name,
+            expected_user,
+            expected_group,
+        )?;
+        anyhow::ensure!(
+            usize::from(public.is_some())
+                + usize::from(staging.is_some())
+                + usize::from(quarantine.is_some())
+                <= 1,
+            "terminal VMM socket attempt has multiple physical names"
+        );
+        if let Some(directory) = public.as_ref().or(quarantine.as_ref()) {
+            verify_closed_owned_directory(directory, receipt, false)?;
+        }
+        if let Some(directory) = staging.as_ref() {
+            verify_closed_owned_directory(directory, receipt, true)?;
+        }
+        self.assert_current()
+    }
+
     /// Quarantine and drain the exact socket attempt owned by one current
     /// StopRuntime receipt. The caller's sealed authority proves the VMM
     /// absent under the launch-root EX lock; socket liveness is nevertheless
@@ -2368,26 +2460,57 @@ impl RetainedManagedVmmSocketRoot {
     ) -> anyhow::Result<()> {
         authority.assert_socket_cleanup(checkpoint, retained.receipt(), self, store)?;
         retained.assert_current(store)?;
-        let paths =
-            retained
-                .receipt()
-                .validate_against(checkpoint, store.state_directory(), self)?;
+        retained
+            .receipt()
+            .validate_against(checkpoint, store.state_directory(), self)?;
+        self.retire_owned_attempt_inner(retained.receipt(), || {
+            authority.assert_socket_cleanup(checkpoint, retained.receipt(), self, store)
+        })?;
+        retained.assert_current(store)?;
+        authority.assert_socket_cleanup(checkpoint, retained.receipt(), self, store)
+    }
+
+    /// Retire the boot-local socket member of one exact terminal
+    /// compatibility residue. Unlike StopRuntime, the authority is checked
+    /// against the terminal expectation because RuntimeLaunch is absent.
+    pub(crate) fn retire_terminal_boot_attempt(
+        &self,
+        store: &VmmSocketReceiptStore,
+        retained: &RetainedTerminalVmmResidue,
+        authority: &impl TerminalVmmSocketCleanupAuthority,
+    ) -> anyhow::Result<()> {
+        authority.assert_terminal_socket_cleanup(retained.expectation(), self, store)?;
+        retained.assert_current(store, self)?;
+        self.retire_owned_attempt_inner(retained.retained_receipt().receipt(), || {
+            authority.assert_terminal_socket_cleanup(retained.expectation(), self, store)
+        })?;
+        retained.retained_receipt().assert_current(store)?;
+        retained.assert_current(store, self)?;
+        authority.assert_terminal_socket_cleanup(retained.expectation(), self, store)
+    }
+
+    fn retire_owned_attempt_inner(
+        &self,
+        receipt: &VmmSocketOwnershipReceiptV1,
+        mut assert_authority: impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        assert_authority()?;
         let (expected_user, expected_group) = self.owner();
         let mut public = open_owned_attempt_directory(
             &self.descriptor,
-            paths.public_name(),
+            &receipt.public_name,
             expected_user,
             expected_group,
         )?;
         let mut staging = open_owned_attempt_directory(
             &self.descriptor,
-            paths.staging_name(),
+            &receipt.staging_name,
             expected_user,
             expected_group,
         )?;
         let quarantine = open_owned_attempt_directory(
             &self.descriptor,
-            paths.quarantine_name(),
+            &receipt.quarantine_name,
             expected_user,
             expected_group,
         )?;
@@ -2403,40 +2526,36 @@ impl RetainedManagedVmmSocketRoot {
             // the marker fsync can therefore leave only an empty exact name;
             // bind that one replay state to the durable receipt before
             // quarantining it.
-            ensure_owner_marker(&directory, retained.receipt(), true)?;
-            authority.assert_socket_cleanup(checkpoint, retained.receipt(), self, store)?;
+            ensure_owner_marker(&directory, receipt, true)?;
+            assert_authority()?;
             quarantine_owned_attempt_directory(
                 self,
-                paths.staging_name(),
-                paths.quarantine_name(),
+                &receipt.staging_name,
+                &receipt.quarantine_name,
                 &directory,
-                retained.receipt(),
+                receipt,
                 expected_user,
                 expected_group,
             )?;
         } else if let Some(directory) = public.take() {
             quarantine_owned_attempt_directory(
                 self,
-                paths.public_name(),
-                paths.quarantine_name(),
+                &receipt.public_name,
+                &receipt.quarantine_name,
                 &directory,
-                retained.receipt(),
+                receipt,
                 expected_user,
                 expected_group,
             )?;
         }
-        authority.assert_socket_cleanup(checkpoint, retained.receipt(), self, store)?;
-        settle_quarantine(
-            self,
-            retained.receipt(),
-            expected_user,
-            expected_group,
-            &mut |_| authority.assert_socket_cleanup(checkpoint, retained.receipt(), self, store),
-        )?;
+        assert_authority()?;
+        settle_quarantine(self, receipt, expected_user, expected_group, &mut |_| {
+            assert_authority()
+        })?;
         for name in [
-            paths.public_name(),
-            paths.staging_name(),
-            paths.quarantine_name(),
+            &receipt.public_name,
+            &receipt.staging_name,
+            &receipt.quarantine_name,
         ] {
             anyhow::ensure!(
                 open_owned_attempt_directory(
@@ -2446,11 +2565,10 @@ impl RetainedManagedVmmSocketRoot {
                     expected_group,
                 )?
                 .is_none(),
-                "StopRuntime VMM socket attempt remained after retirement"
+                "VMM socket attempt remained after retirement"
             );
         }
-        retained.assert_current(store)?;
-        authority.assert_socket_cleanup(checkpoint, retained.receipt(), self, store)
+        assert_authority()
     }
 
     /// Recover or prepare one exact-owned public directory and pre-bound API
