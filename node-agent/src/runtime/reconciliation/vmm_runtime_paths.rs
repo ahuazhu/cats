@@ -638,6 +638,34 @@ impl RetainedManagedVmmLaunchAttempt {
     /// Proves the exact marker-owned directory is still empty immediately
     /// before PID 1 is asked to start the fixed launcher.
     pub(crate) fn assert_ready(&self) -> Result<()> {
+        self.assert_ready_with_names(std::collections::BTreeSet::from([
+            VMM_LAUNCH_OWNER_BASENAME.to_owned(),
+        ]))
+    }
+
+    /// Proves the directory holds exactly the owner marker plus the three
+    /// launch files the launcher itself creates.
+    ///
+    /// The launcher writes `memory.bin`, `serial.log` and `vmm.log` into this
+    /// same attempt directory between its first readiness proof and exec, so
+    /// its later proofs must demand exactly that closed four-name set. They
+    /// demanded the empty set instead, which made every real launch die at
+    /// "not empty before submit" and loop the Cat between submit and residue
+    /// recovery forever — the enumeration bound of four names below was chosen
+    /// for exactly this set, but no assertion ever accepted it.
+    pub(crate) fn assert_ready_with_launch_files(&self) -> Result<()> {
+        self.assert_ready_with_names(std::collections::BTreeSet::from([
+            VMM_LAUNCH_OWNER_BASENAME.to_owned(),
+            VMM_MEMORY_BASENAME.to_owned(),
+            VMM_SERIAL_LOG_BASENAME.to_owned(),
+            VMM_LOG_BASENAME.to_owned(),
+        ]))
+    }
+
+    fn assert_ready_with_names(
+        &self,
+        expected_names: std::collections::BTreeSet<String>,
+    ) -> Result<()> {
         self.root.assert_current()?;
         let metadata = self.directory.metadata()?;
         ensure_launch_directory(
@@ -656,10 +684,10 @@ impl RetainedManagedVmmLaunchAttempt {
                 == self.directory_identity,
             "VMM launch attempt pathname changed identity"
         );
+        let names = launch_attempt_names(&self.directory)?;
         anyhow::ensure!(
-            launch_attempt_names(&self.directory)?
-                == std::collections::BTreeSet::from([VMM_LAUNCH_OWNER_BASENAME.to_owned()]),
-            "VMM launch attempt is not empty before submit"
+            names == expected_names,
+            "VMM launch attempt holds {names:?} but this phase requires exactly {expected_names:?}"
         );
         let marker = open_launch_leaf(&self.directory, VMM_LAUNCH_OWNER_BASENAME)?
             .context("VMM launch owner marker disappeared")?;
@@ -693,6 +721,10 @@ pub(crate) struct RetainedManagedVmmLauncherAttempt {
 impl RetainedManagedVmmLauncherAttempt {
     pub(crate) fn assert_ready(&self) -> Result<()> {
         self.attempt.assert_ready()
+    }
+
+    pub(crate) fn assert_ready_with_launch_files(&self) -> Result<()> {
+        self.attempt.assert_ready_with_launch_files()
     }
 }
 
@@ -3051,6 +3083,53 @@ mod tests {
             checkpoint.runtime_incarnation.as_ref().unwrap()
         )
         .is_err());
+    }
+
+    /// The launcher creates `memory.bin`, `serial.log` and `vmm.log` inside
+    /// the attempt directory between its first readiness proof and exec, so
+    /// its later proofs must accept exactly that four-name set. They demanded
+    /// the empty set instead, so every real launch died at "not empty before
+    /// submit" and the Cat looped between submit and residue recovery forever.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launch_attempt_readiness_accepts_exactly_the_launcher_created_files() {
+        let fixture = LaunchFixture::new();
+        let ready = match fixture.prepare() {
+            ManagedVmmLaunchPreparation::Ready(ready) => ready,
+            _ => unreachable!("fresh launch namespace prepares Ready"),
+        };
+        ready.assert_ready().unwrap();
+
+        let paths = ManagedVmmLaunchFilePaths::paths_from_checkpoint(
+            fixture.launch_root.state_directory(),
+            &fixture.checkpoint,
+        )
+        .unwrap();
+        for path in [
+            paths.memory_file_path(),
+            paths.serial_log_path(),
+            paths.vmm_log_path(),
+        ] {
+            std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(path.as_str())
+                .unwrap();
+        }
+
+        // The pre-file proof correctly refuses the populated directory…
+        assert!(ready.assert_ready().is_err());
+        // …and the launcher's post-create proof accepts exactly this set.
+        ready.assert_ready_with_launch_files().unwrap();
+
+        // One foreign name fails the closed set in both phases.
+        std::fs::write(
+            std::path::Path::new(paths.directory().as_str()).join("foreign"),
+            b"foreign",
+        )
+        .unwrap();
+        assert!(ready.assert_ready().is_err());
+        assert!(ready.assert_ready_with_launch_files().is_err());
     }
 
     #[cfg(target_os = "linux")]
