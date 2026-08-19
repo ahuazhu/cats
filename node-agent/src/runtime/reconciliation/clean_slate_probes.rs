@@ -100,9 +100,9 @@ use super::serving_blockd_process::{
 };
 use super::serving_handoff::{
     scanned_target_control_process_launch, validate_scanned_serving_handoff_artifacts,
-    ScannedServingHandoffArtifact, ServingHandoffTempKind, SERVING_HANDOFF_RECORD_FILE,
-    SERVING_HANDOFF_RECORD_MAX_BYTES, SERVING_HANDOFF_RETIREMENT_FILE,
-    SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
+    validate_scanned_terminal_cleanup_handoff_artifacts, ScannedServingHandoffArtifact,
+    ServingHandoffTempKind, SERVING_HANDOFF_RECORD_FILE, SERVING_HANDOFF_RECORD_MAX_BYTES,
+    SERVING_HANDOFF_RETIREMENT_FILE, SERVING_HANDOFF_RETIREMENT_MAX_BYTES,
 };
 use super::signed_running::request_matches_volume;
 use super::systemd_root_provision::platform_managed_blockd_listeners_absent;
@@ -3343,6 +3343,19 @@ fn scan_authorized_blockd_data_with_projection_barrier(
             let has_unvalidated_handoff_artifact = by_name
                 .keys()
                 .any(|name| is_serving_handoff_artifact_name(name));
+            let terminal_cleanup_without_launch = has_unvalidated_handoff_artifact
+                && checkpoint_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.get(&desired.cat_id))
+                    .is_some_and(|runtime_checkpoint| {
+                        runtime_checkpoint.runtime_launch.identity().is_none()
+                            && matches!(
+                                &runtime_checkpoint.step,
+                                ReconcileStep::CleanupRelease { cleanup }
+                                    if matches!(cleanup.target, cats_api::runtime_reconciliation::CleanupTarget::Volume { .. })
+                                        && cleanup.volume_release.is_some()
+                            )
+                    });
             let allowed = [
                 IDENTITY_FILE,
                 IDENTITY_TEMP,
@@ -3707,7 +3720,7 @@ fn scan_authorized_blockd_data_with_projection_barrier(
                 // Once the sealed serving handoff exists, the serving lineage
                 // owns the engine files: Relaxed writes legitimately dirty the
                 // bitmap, so only a still-control-only dir must stay clean.
-                if !has_unvalidated_handoff_artifact
+                if (!has_unvalidated_handoff_artifact || terminal_cleanup_without_launch)
                     && inspect_empty_dirty_bitmap_at(
                         &epoch_directory,
                         &by_name["dirty.bitmap"],
@@ -3739,7 +3752,8 @@ fn scan_authorized_blockd_data_with_projection_barrier(
                 // owns these engine files and Relaxed pending packs are its
                 // unique data; only a still-control-only dir must stay empty.
                 anyhow::ensure!(
-                    pending_entries.is_empty() || has_unvalidated_handoff_artifact,
+                    pending_entries.is_empty()
+                        || (has_unvalidated_handoff_artifact && !terminal_cleanup_without_launch),
                     "root-provision control-only blockd retains a pending pack"
                 );
                 AuthorizedBlockdControlState::ExactControlOnlyEmpty
@@ -3819,66 +3833,81 @@ fn scan_authorized_blockd_data_with_projection_barrier(
                     } else {
                         &runtime_checkpoint
                     };
-                let provision_transition_id = match &handoff_checkpoint.step {
-                ReconcileStep::ProvisionRootImage {
-                    provision_transition_id,
-                    ..
-                } => provision_transition_id.clone(),
-                ReconcileStep::PrepareDevice { devices } => {
-                    let mut roots = devices.iter().filter(|device| matches!(
-                        device.serving_authority.as_ref(),
-                        cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
-                    ));
-                    let root_device = roots.next().context(
-                        "PrepareDevice handoff artifacts lack their Root device",
-                    )?;
+                let target_name = if terminal_cleanup_without_launch {
+                    let mut targets = by_name.keys().filter(|name| {
+                        name.starts_with("authorized-target-control-") && name.ends_with(".json")
+                    });
+                    let target = targets
+                        .next()
+                        .context("terminal Volume cleanup lacks its target-control artifact")?
+                        .clone();
                     anyhow::ensure!(
-                        roots.next().is_none(),
-                        "PrepareDevice handoff artifacts have duplicate Root devices"
+                        targets.next().is_none(),
+                        "terminal Volume cleanup retains multiple target-control artifacts"
                     );
-                    let cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision {
-                        handoff,
-                    } = root_device.serving_authority.as_ref()
-                    else {
-                        unreachable!("root filter selected after-root-provision authority")
+                    target
+                } else {
+                    let provision_transition_id = match &handoff_checkpoint.step {
+                        ReconcileStep::ProvisionRootImage {
+                            provision_transition_id,
+                            ..
+                        } => provision_transition_id.clone(),
+                        ReconcileStep::PrepareDevice { devices } => {
+                            let mut roots = devices.iter().filter(|device| matches!(
+                                device.serving_authority.as_ref(),
+                                cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision { .. }
+                            ));
+                            let root_device = roots.next().context(
+                                "PrepareDevice handoff artifacts lack their Root device",
+                            )?;
+                            anyhow::ensure!(
+                                roots.next().is_none(),
+                                "PrepareDevice handoff artifacts have duplicate Root devices"
+                            );
+                            let cats_api::runtime_reconciliation::ServingAuthorityProvenance::AfterRootProvision {
+                                handoff,
+                            } = root_device.serving_authority.as_ref()
+                            else {
+                                unreachable!("root filter selected after-root-provision authority")
+                            };
+                            let Some(entry) = by_name.get(SERVING_HANDOFF_RECORD_FILE) else {
+                                bail!("after-root-provision checkpoint lacks its sealed handoff record")
+                            };
+                            let Some(record_file) = read_scanned_handoff_artifact(
+                                &epoch_directory,
+                                entry,
+                                root,
+                                data_directory_path.join(SERVING_HANDOFF_RECORD_FILE),
+                                SERVING_HANDOFF_RECORD_MAX_BYTES,
+                                context,
+                            )? else {
+                                scan.complete = false;
+                                continue;
+                            };
+                            let record = super::serving_handoff::decode_serving_handoff_record(
+                                &record_file.bytes,
+                            )?;
+                            anyhow::ensure!(
+                                record_file.path == handoff.record.path
+                                    && record_file.device == handoff.record.device
+                                    && record_file.inode == handoff.record.inode
+                                    && record_file.length == handoff.record.length
+                                    && record_file.content_sha256 == handoff.record.content_sha256
+                                    && record.checkpoint_content_digest
+                                        == handoff.predecessor_checkpoint_content_digest,
+                                "after-root-provision handoff record changed physical identity or predecessor"
+                            );
+                            record.provision_transition_id
+                        }
+                        _ => bail!(
+                            "serving handoff artifacts require provision_root_image or an after-root-provision prepared-device phase"
+                        ),
                     };
-                    let Some(entry) = by_name.get(SERVING_HANDOFF_RECORD_FILE) else {
-                        bail!("after-root-provision checkpoint lacks its sealed handoff record")
-                    };
-                    let Some(record_file) = read_scanned_handoff_artifact(
-                        &epoch_directory,
-                        entry,
-                        root,
-                        data_directory_path.join(SERVING_HANDOFF_RECORD_FILE),
-                        SERVING_HANDOFF_RECORD_MAX_BYTES,
-                        context,
-                    )? else {
-                        scan.complete = false;
-                        continue;
-                    };
-                    let record = super::serving_handoff::decode_serving_handoff_record(
-                        &record_file.bytes,
-                    )?;
-                    anyhow::ensure!(
-                        record_file.path == handoff.record.path
-                            && record_file.device == handoff.record.device
-                            && record_file.inode == handoff.record.inode
-                            && record_file.length == handoff.record.length
-                            && record_file.content_sha256 == handoff.record.content_sha256
-                            && record.checkpoint_content_digest
-                                == handoff.predecessor_checkpoint_content_digest,
-                        "after-root-provision handoff record changed physical identity or predecessor"
-                    );
-                    record.provision_transition_id
-                }
-                _ => bail!(
-                    "serving handoff artifacts require provision_root_image or an after-root-provision prepared-device phase"
-                ),
-            };
-                let target_name = format!(
-                    "authorized-target-control-{}.json",
-                    provision_transition_id.as_str()
-                );
+                    format!(
+                        "authorized-target-control-{}.json",
+                        provision_transition_id.as_str()
+                    )
+                };
                 let target_temp = format!(".{target_name}.tmp");
                 let expected_reserved = [
                     target_name.as_str(),
@@ -3991,18 +4020,28 @@ fn scan_authorized_blockd_data_with_projection_barrier(
                 let retirement = retirement
                     .as_ref()
                     .map(OwnedScannedHandoffArtifact::borrowed);
-                retained_root_process = validate_scanned_serving_handoff_artifacts(
-                    &runtime_checkpoint,
-                    &checkpoint,
-                    &target,
-                    record.as_ref(),
-                    retirement.as_ref(),
-                )?;
-                target_control_launch = Some(scanned_target_control_process_launch(
-                    &runtime_checkpoint,
-                    &checkpoint,
-                    &target,
-                )?);
+                if terminal_cleanup_without_launch {
+                    validate_scanned_terminal_cleanup_handoff_artifacts(
+                        &runtime_checkpoint,
+                        &checkpoint,
+                        &target,
+                        record.as_ref(),
+                        retirement.as_ref(),
+                    )?;
+                } else {
+                    retained_root_process = validate_scanned_serving_handoff_artifacts(
+                        &runtime_checkpoint,
+                        &checkpoint,
+                        &target,
+                        record.as_ref(),
+                        retirement.as_ref(),
+                    )?;
+                    target_control_launch = Some(scanned_target_control_process_launch(
+                        &runtime_checkpoint,
+                        &checkpoint,
+                        &target,
+                    )?);
+                }
             }
             projection_barrier(DataDirectoryProjectionBoundary::Epoch);
             if !revalidate_directory_entry(
@@ -20342,6 +20381,137 @@ mod tests {
         );
         assert!(gate_inventory.take_running_tail_admission().is_some());
         drop(listeners);
+    }
+
+    #[test]
+    fn terminal_volume_cleanup_without_launch_treats_exact_handoff_as_inert_metadata() {
+        let environment = TestEnvironment::new();
+        let fixture = full_root_scanner_fixture(&environment);
+        install_exact_control_only_files(
+            &fixture.data_directory,
+            fixture.expected.attachment.size_bytes,
+        );
+        let proof = fixture
+            .expected
+            .clone()
+            .prove_exact_process(exact_process_evidence(&fixture.expected, 79))
+            .unwrap();
+        let handoff_store = super::super::serving_handoff::ServingHandoffStore::new(
+            StateDirectory::unanchored(environment.state.clone()),
+        );
+        let ready = handoff_store
+            .seal_serving_ready(
+                &fixture.stored_checkpoint,
+                &fixture.acquired,
+                &fixture.authority,
+                &proof,
+            )
+            .unwrap();
+        let checkpoint_store = FileCheckpointStore::open(
+            &environment.state.join(CHECKPOINT_NAMESPACE),
+            &fixture.expected.cat_id,
+        )
+        .unwrap();
+        let prepared = ready
+            .consume_for_prepare_device(&fixture.stored_checkpoint, |handoff| {
+                let successor = prepare_device_successor(&fixture, handoff);
+                checkpoint_store
+                    .replace(&fixture.stored_checkpoint, &successor)
+                    .map_err(anyhow::Error::from)
+            })
+            .unwrap();
+        drop(ready);
+
+        let mut scan_context = fixture.scan_context.clone();
+        let (desired_revision, desired_digest, disposition) = {
+            let desired = &mut scan_context.coordinates_mut().desired.desired_specs[0];
+            desired.target = RuntimeTarget::Deleted;
+            desired.desired_revision = Revision::new(desired.desired_revision.get() + 1).unwrap();
+            desired.volumes[0].disposition = VolumeDisposition::DeleteDisposableRoot {
+                delete_id: Id::new("delete_terminal_cleanup").unwrap(),
+            };
+            desired.spec_digest = spec_digest(desired).unwrap();
+            (
+                desired.desired_revision,
+                desired.spec_digest.clone(),
+                desired.volumes[0].disposition.clone(),
+            )
+        };
+
+        let attachment = &fixture.acquired.attachment.identity;
+        let mut cleanup_checkpoint = prepared.checkpoint().clone();
+        cleanup_checkpoint.desired_revision = desired_revision;
+        cleanup_checkpoint.spec_digest = desired_digest;
+        cleanup_checkpoint.processes.clear();
+        cleanup_checkpoint.volumes[0].devices.clear();
+        cleanup_checkpoint.mounts.clear();
+        cleanup_checkpoint.networks.clear();
+        cleanup_checkpoint.guest_transport = GuestTransportEvidence::Unavailable;
+        cleanup_checkpoint.step = ReconcileStep::CleanupRelease {
+            cleanup: CleanupRelease {
+                target: CleanupTarget::Volume {
+                    volume_id: attachment.volume_id.clone(),
+                    attachment_id: attachment.attachment_id.clone(),
+                    attachment_epoch: attachment.attachment_epoch,
+                },
+                inventory_session: scan_context.coordinates().session.clone(),
+                inventory_epoch: scan_context.coordinates().inventory_epoch,
+                inventory_read_position: scan_context.coordinates().desired.read_position,
+                desired_read_position: scan_context.coordinates().desired.read_position,
+                volume_release: Some(VolumeReleaseReplay {
+                    release_transition_id: RandomId128::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+                        .unwrap(),
+                    generation: fixture.record.head.generation,
+                    disposition,
+                }),
+            },
+        };
+        cleanup_checkpoint.updated_at_unix_ms =
+            UnixMillis::new(cleanup_checkpoint.updated_at_unix_ms.get() + 1).unwrap();
+        checkpoint_store
+            .replace(&prepared, &cleanup_checkpoint)
+            .unwrap();
+
+        let scanner = full_root_scanner(&fixture, []);
+        let RuntimeInventoryScanOutcome::Complete(mut inventory) =
+            scanner.scan_complete(scan_context.clone()).unwrap()
+        else {
+            panic!("exact terminal cleanup handoff metadata must remain fully scannable")
+        };
+        let [runtime] = inventory.runtimes() else {
+            panic!("terminal cleanup must project one Runtime")
+        };
+        assert!(runtime.processes.is_empty());
+        assert!(matches!(
+            runtime.step,
+            ReconcileStep::CleanupRelease { ref cleanup }
+                if matches!(cleanup.target, CleanupTarget::Volume { .. })
+        ));
+        let process_admission = inventory
+            .take_node_global_process_admission()
+            .expect("complete terminal cleanup retains a negative process admission");
+        assert!(process_admission.root_control_proofs().is_empty());
+        assert!(process_admission.serving_blockd_proofs().is_empty());
+
+        let pending = fixture
+            .data_directory
+            .join(PENDING_PACK_DIR)
+            .join("late.pack");
+        std::fs::write(&pending, b"not a retained pack").unwrap();
+        assert!(full_root_scanner(&fixture, [])
+            .scan_complete(scan_context.clone())
+            .is_err());
+        std::fs::remove_file(pending).unwrap();
+
+        let record_path = fixture.data_directory.join(SERVING_HANDOFF_RECORD_FILE);
+        let exact_record = std::fs::read(&record_path).unwrap();
+        let mut noncanonical = exact_record.clone();
+        noncanonical.push(b' ');
+        std::fs::write(&record_path, noncanonical).unwrap();
+        assert!(full_root_scanner(&fixture, [])
+            .scan_complete(scan_context)
+            .is_err());
+        std::fs::write(record_path, exact_record).unwrap();
     }
 
     #[test]

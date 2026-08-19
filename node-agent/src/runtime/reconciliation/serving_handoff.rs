@@ -30,10 +30,12 @@ use std::sync::Mutex;
 
 use anyhow::{Context as _, Result};
 use cats_api::runtime_reconciliation::{
-    checkpoint_content_digest, encode_runtime_checkpoint, ContractVersion, DesiredRuntimeSpec,
-    Epoch, HostPath, Id, NodeBootId, PrepareDeviceFrontend, RandomId128, ReconcileStep, RemoteHead,
-    RootServingHandoff, RootServingHandoffRecordIdentity, RuntimeCheckpoint, Sequence,
-    ServingAuthorityProvenance, Sha256Digest, VolumeRecord, WireU64,
+    checkpoint_content_digest, encode_runtime_checkpoint, CleanupTarget, ContractVersion,
+    DesiredRuntimeSpec, Epoch, GuestTransportEvidence, HostPath, Id, LifecycleAdmission,
+    LocalLineageState, NodeBootId, ObservedDiskKind, PrepareDeviceFrontend, RandomId128,
+    ReconcileStep, RemoteHead, RootServingHandoff, RootServingHandoffRecordIdentity,
+    RuntimeCheckpoint, RuntimeLaunch, Sequence, ServingAuthorityProvenance, Sha256Digest,
+    VolumeAuthorityEvidence, VolumeRecord, WarmSnapshotEvidence, WireU64,
 };
 #[cfg(test)]
 use cats_api::runtime_reconciliation::{AcquireOrigin, Durability, FenceEpoch, Revision};
@@ -2854,6 +2856,205 @@ pub(crate) fn validate_scanned_serving_handoff_artifacts(
         }
     }
     Ok(retained_process)
+}
+
+/// Validate handoff files left inside an exact, fully drained Volume cleanup
+/// checkpoint that was persisted without its retained Runtime launch.
+///
+/// Such a checkpoint cannot recover the descriptor identity carried by the
+/// removed launch, so this path deliberately projects no process or launch
+/// authority. A live old process remains foreign to the Node-global sweep and
+/// fails closed. The files are accepted only as inert metadata inside the one
+/// exact R == L lineage that the already-persisted release step names.
+pub(crate) fn validate_scanned_terminal_cleanup_handoff_artifacts(
+    checkpoint: &RuntimeCheckpoint,
+    acquired: &AuthorizedBlockdCheckpoint,
+    target: &ScannedServingHandoffArtifact<'_>,
+    record: Option<&ScannedServingHandoffArtifact<'_>>,
+    retirement: Option<&ScannedServingHandoffArtifact<'_>>,
+) -> Result<()> {
+    anyhow::ensure!(
+        checkpoint.runtime_incarnation.is_none()
+            && matches!(checkpoint.runtime_launch, RuntimeLaunch::Absent)
+            && checkpoint.stable_state.is_none()
+            && checkpoint.processes.is_empty()
+            && checkpoint
+                .volumes
+                .iter()
+                .all(|volume| volume.devices.is_empty())
+            && checkpoint.mounts.is_empty()
+            && checkpoint.networks.is_empty()
+            && matches!(
+                checkpoint.guest_transport,
+                GuestTransportEvidence::Unavailable
+            )
+            && matches!(checkpoint.warm_snapshot, WarmSnapshotEvidence::Absent)
+            && checkpoint.lifecycle_admission == LifecycleAdmission::Closed
+            && checkpoint.route_gates.is_empty(),
+        "terminal Volume cleanup handoff retains runtime residue"
+    );
+    let ReconcileStep::CleanupRelease { cleanup } = &checkpoint.step else {
+        anyhow::bail!("terminal handoff recovery requires CleanupRelease")
+    };
+    let (
+        CleanupTarget::Volume {
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+        },
+        Some(release),
+    ) = (&cleanup.target, &cleanup.volume_release)
+    else {
+        anyhow::bail!("terminal handoff recovery requires one exact Volume release")
+    };
+    let identity = &acquired.attachment.identity;
+    anyhow::ensure!(
+        volume_id == &identity.volume_id
+            && attachment_id == &identity.attachment_id
+            && *attachment_epoch == identity.attachment_epoch,
+        "terminal handoff recovery names another attachment"
+    );
+
+    validate_scanned_artifact_bytes(target, target.bytes)?;
+    let target_artifact = decode_target_control_authorization(target.bytes)?;
+    anyhow::ensure!(
+        Path::new(target.path.as_str())
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some(target_control_file_name(&target_artifact.provision_transition_id).as_str())
+            && target_artifact.attachment.identity == *identity
+            && target_artifact.attachment.acquire == acquired.attachment.acquire
+            && target_artifact.attachment.size_bytes == acquired.attachment.size_bytes
+            && target_artifact.attachment.durability == acquired.attachment.durability,
+        "terminal cleanup target-control artifact changed attachment lineage"
+    );
+
+    let decoded_record = record
+        .map(|file| {
+            validate_scanned_artifact_bytes(file, file.bytes)?;
+            let decoded = decode_serving_handoff_record(file.bytes)?;
+            anyhow::ensure!(
+                Path::new(file.path.as_str())
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    == Some(SERVING_HANDOFF_RECORD_FILE)
+                    && record_target_matches_scan(&decoded, &target_artifact, target),
+                "terminal cleanup handoff record changed physical or target identity"
+            );
+            Ok(decoded)
+        })
+        .transpose()?;
+    let decoded_retirement = retirement
+        .map(|file| {
+            validate_scanned_artifact_bytes(file, file.bytes)?;
+            let decoded = decode_serving_handoff_retirement_receipt(file.bytes)?;
+            anyhow::ensure!(
+                Path::new(file.path.as_str())
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    == Some(SERVING_HANDOFF_RETIREMENT_FILE)
+                    && record_target_matches_scan(&decoded.record, &target_artifact, target),
+                "terminal cleanup retirement receipt changed physical or target identity"
+            );
+            Ok(decoded)
+        })
+        .transpose()?;
+    let lineage_record = decoded_record
+        .as_ref()
+        .or_else(|| decoded_retirement.as_ref().map(|receipt| &receipt.record))
+        .context("terminal cleanup handoff lacks a record or retirement receipt")?;
+    validate_terminal_cleanup_handoff_lineage(
+        checkpoint,
+        acquired,
+        release.generation,
+        &target_artifact,
+        lineage_record,
+    )?;
+
+    if let (Some(current), Some(retired)) = (&decoded_record, &decoded_retirement) {
+        anyhow::ensure!(
+            retired.record != *current
+                && retired.old_checkpoint_content_digest != current.checkpoint_content_digest
+                && retired.record.target_control_authorization
+                    == current.target_control_authorization
+                && retired.old_process_identity_token
+                    != current.old_control_process.ownership_token,
+            "terminal cleanup handoff record conflicts with its predecessor retirement"
+        );
+    }
+    Ok(())
+}
+
+fn validate_terminal_cleanup_handoff_lineage(
+    checkpoint: &RuntimeCheckpoint,
+    acquired: &AuthorizedBlockdCheckpoint,
+    release_generation: cats_api::runtime_reconciliation::Generation,
+    target: &TargetControlAuthorizationArtifact,
+    record: &ServingHandoffRecord,
+) -> Result<()> {
+    let mut volumes = checkpoint
+        .volumes
+        .iter()
+        .filter(|volume| volume.volume_id == acquired.volume.volume_id);
+    let volume = volumes
+        .next()
+        .context("terminal cleanup lost its checkpoint Volume")?;
+    anyhow::ensure!(
+        volumes.next().is_none(),
+        "terminal cleanup duplicated its checkpoint Volume"
+    );
+    let VolumeAuthorityEvidence::Owned {
+        attachment_id,
+        attachment_epoch,
+        head,
+    } = &volume.authority
+    else {
+        anyhow::bail!("terminal cleanup handoff requires Owned authority")
+    };
+    let [lineage] = volume.local_lineages.as_slice() else {
+        anyhow::bail!("terminal cleanup handoff requires one local lineage")
+    };
+    let observed_disk_kind = match acquired.volume.disk_kind {
+        cats_api::runtime_reconciliation::DiskKind::Root => ObservedDiskKind::Root,
+        cats_api::runtime_reconciliation::DiskKind::Persistent => ObservedDiskKind::Persistent,
+    };
+    anyhow::ensure!(
+        checkpoint.cat_id == record.cat_id
+            && checkpoint.node_id == record.node_id
+            && checkpoint.placement_epoch == record.placement_epoch
+            && record.desired_revision <= checkpoint.desired_revision
+            && (record.desired_revision != checkpoint.desired_revision
+                || record.spec_digest == checkpoint.spec_digest)
+            && record.volume_id == acquired.volume.volume_id
+            && record.attachment_id == acquired.attachment.identity.attachment_id
+            && record.attachment_epoch == acquired.attachment.identity.attachment_epoch
+            && record.acquire_origin == acquired.attachment.identity.acquire_origin
+            && record.expected_provisioned_head == target.attachment.head
+            && record.target_control_authorization.artifact == *target
+            && record.old_control_process.data_directory == lineage.data_directory
+            && record.old_control_process.handshake.identity == acquired.attachment.identity
+            && volume.volume_intent_id.as_ref() == Some(&acquired.volume.volume_intent_id)
+            && volume.disk_id.as_ref() == Some(&acquired.volume.disk_id)
+            && volume.disk_kind == observed_disk_kind
+            && volume.size_bytes == Some(acquired.volume.size_bytes)
+            && volume.durability == Some(acquired.volume.durability)
+            && attachment_id == &acquired.attachment.identity.attachment_id
+            && *attachment_epoch == acquired.attachment.identity.attachment_epoch
+            && head.generation == release_generation
+            && remote_head_is_same_or_later(head, &record.expected_provisioned_head)
+            && lineage.attachment_id == acquired.attachment.identity.attachment_id
+            && lineage.attachment_epoch == acquired.attachment.identity.attachment_epoch
+            && lineage.acquire_origin == acquired.attachment.identity.acquire_origin
+            && lineage.node_id == checkpoint.node_id
+            && lineage.placement_epoch == checkpoint.placement_epoch
+            && lineage.local_durable_generation == release_generation
+            && lineage.remote_durable_generation == release_generation
+            && lineage.pending_pack_count.get() == 0
+            && !lineage.fenced
+            && lineage.state == LocalLineageState::Active,
+        "terminal cleanup handoff does not close one exact drained lineage"
+    );
+    Ok(())
 }
 
 /// Provider-private target-wrapper identity from the same canonical bytes and

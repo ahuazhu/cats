@@ -3710,10 +3710,8 @@ fn remaining_cleanup_successor_at_with_absent_vhost(
                     && runtime.mounts.is_empty()
                     && runtime.networks.is_empty()
                     && matches!(runtime.guest_transport, GuestTransportEvidence::Unavailable),
-                "Volume cleanup cannot retire the retained launch while runtime residue remains"
+                "Volume cleanup cannot begin while runtime residue remains"
             );
-            successor.runtime_incarnation = None;
-            successor.runtime_launch = RuntimeLaunch::Absent;
         }
         successor.step = ReconcileStep::CleanupRelease {
             cleanup: CleanupRelease {
@@ -7552,7 +7550,11 @@ mod tests {
                 }
             }
         ));
-        assert_eq!(volume_cleanup.runtime_launch, RuntimeLaunch::Absent);
+        assert_eq!(volume_cleanup.runtime_launch, checkpoint.runtime_launch);
+        assert_eq!(
+            volume_cleanup.runtime_incarnation,
+            checkpoint.runtime_incarnation
+        );
 
         runtime.networks.clear();
         runtime.mounts.clear();
@@ -7647,8 +7649,11 @@ mod tests {
             cursor.inventory_read_position
         );
         assert_eq!(cleanup.desired_read_position, cursor.desired_read_position);
-        assert!(successor.runtime_incarnation.is_none());
-        assert!(matches!(successor.runtime_launch, RuntimeLaunch::Absent));
+        assert_eq!(
+            successor.runtime_incarnation,
+            checkpoint.runtime_incarnation
+        );
+        assert_eq!(successor.runtime_launch, checkpoint.runtime_launch);
         encode_runtime_checkpoint(&successor).unwrap();
 
         let (attachment_epoch, head) = match &runtime.volumes[0].authority {
@@ -7668,7 +7673,7 @@ mod tests {
         };
         runtime.volumes[0].local_lineages.clear();
         let stable =
-            cleanup_postcondition_successor_at(&desired, &runtime, &checkpoint, &[], &cursor)
+            cleanup_postcondition_successor_at(&desired, &runtime, &successor, &[], &cursor)
                 .unwrap()
                 .expect("no remaining physical target must settle Cold");
         assert_eq!(stable.stable_state, Some(StableState::Cold));
@@ -7743,6 +7748,11 @@ mod tests {
             successor.step,
             ReconcileStep::DeleteDisposableRoot { .. }
         ));
+        assert_eq!(
+            successor.runtime_incarnation,
+            checkpoint.runtime_incarnation
+        );
+        assert_eq!(successor.runtime_launch, checkpoint.runtime_launch);
         encode_runtime_checkpoint(&successor).unwrap();
     }
 
