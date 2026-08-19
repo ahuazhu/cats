@@ -4550,17 +4550,27 @@ fn cleanup_is_fresh(
     accepted: &crate::runtime_spine::RuntimeDesiredEffectAdmission,
     cleanup: &cats_api::runtime_reconciliation::CleanupRelease,
 ) -> bool {
-    let session = accepted.session();
-    let attestation = accepted.attestation();
+    cleanup_execution_context_is_fresh(
+        accepted.session(),
+        accepted.attestation(),
+        accepted.desired_read_position(),
+        cleanup,
+    )
+}
+
+fn cleanup_execution_context_is_fresh(
+    session: &cats_api::runtime_reconciliation::AgentSession,
+    attestation: &cats_api::runtime_reconciliation::AdmissionInventoryAttestation,
+    desired_read_position: Option<cats_api::runtime_reconciliation::Sequence>,
+    cleanup: &cats_api::runtime_reconciliation::CleanupRelease,
+) -> bool {
     cleanup.inventory_session.node_id == session.node_id
         && cleanup.inventory_session.node_boot_id == session.node_boot_id
         && cleanup.inventory_session.agent_instance_id == session.agent_instance_id
         && cleanup.inventory_session.agent_session_epoch == session.agent_session_epoch
-        && cleanup.inventory_epoch == attestation.inventory_epoch
-        && cleanup.inventory_read_position == attestation.inventory_read_position
-        && accepted
-            .desired_read_position()
-            .is_some_and(|position| position >= cleanup.desired_read_position)
+        && cleanup.inventory_epoch <= attestation.inventory_epoch
+        && cleanup.inventory_read_position <= attestation.inventory_read_position
+        && desired_read_position.is_some_and(|position| position >= cleanup.desired_read_position)
         && match &cleanup.target {
             CleanupTarget::Volume { .. } => cleanup.volume_release.is_some(),
             _ => cleanup.volume_release.is_none(),
@@ -6460,6 +6470,102 @@ mod tests {
         assert!(matches!(
             first_lifecycle_step(&retained, &retained_runtime).unwrap(),
             Some(ReconcileStep::DrainPublish { .. })
+        ));
+    }
+
+    #[test]
+    fn cleanup_execution_accepts_later_scan_in_same_session_without_rebind_livelock() {
+        let session = AgentSession {
+            version: ContractVersion::V1,
+            node_id: Id::new("node_cleanup_freshness").unwrap(),
+            immutable_host_id: Id::new("host_cleanup_freshness").unwrap(),
+            node_boot_id: cats_api::runtime_reconciliation::NodeBootId::new(
+                "11111111111111111111111111111111",
+            )
+            .unwrap(),
+            agent_instance_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
+            agent_session_epoch: cats_api::runtime_reconciliation::Epoch::new(3).unwrap(),
+            registration_attempt_id: RandomId128::new("33333333333333333333333333333333").unwrap(),
+            guest_config_digest: cats_api::runtime_reconciliation::Sha256Digest::from_bytes(
+                [0x44; 32],
+            ),
+            lease_deadline_unix_ms: cats_api::runtime_reconciliation::UnixMillis::new(
+                1_900_000_120_000,
+            )
+            .unwrap(),
+        };
+        let attestation = AdmissionInventoryAttestation {
+            version: ContractVersion::V1,
+            node_id: session.node_id.clone(),
+            agent_session_epoch: session.agent_session_epoch,
+            inventory_epoch: cats_api::runtime_reconciliation::Epoch::new(7).unwrap(),
+            inventory_digest: cats_api::runtime_reconciliation::Sha256Digest::from_bytes(
+                [0x55; 32],
+            ),
+            inventory_read_position: cats_api::runtime_reconciliation::Sequence::new(9).unwrap(),
+            accepted_at_unix_ms: cats_api::runtime_reconciliation::UnixMillis::new(
+                1_900_000_000_100,
+            )
+            .unwrap(),
+        };
+        let desired_read_position = cats_api::runtime_reconciliation::Sequence::new(9).unwrap();
+        let mut cleanup = CleanupRelease {
+            target: CleanupTarget::Network {
+                network_id: Id::new("net_cleanup_freshness").unwrap(),
+                ownership_token: RandomId128::new("abababababababababababababababab").unwrap(),
+            },
+            inventory_session: SessionBinding {
+                node_id: session.node_id.clone(),
+                node_boot_id: session.node_boot_id.clone(),
+                agent_instance_id: session.agent_instance_id.clone(),
+                agent_session_epoch: session.agent_session_epoch,
+            },
+            inventory_epoch: attestation.inventory_epoch,
+            inventory_read_position: attestation.inventory_read_position,
+            desired_read_position,
+            volume_release: None,
+        };
+        assert!(cleanup_execution_context_is_fresh(
+            &session,
+            &attestation,
+            Some(desired_read_position),
+            &cleanup,
+        ));
+
+        cleanup.inventory_epoch =
+            cats_api::runtime_reconciliation::Epoch::new(attestation.inventory_epoch.get() - 1)
+                .unwrap();
+        cleanup.inventory_read_position = cats_api::runtime_reconciliation::Sequence::new(
+            attestation.inventory_read_position.get() - 1,
+        )
+        .unwrap();
+        assert!(
+            cleanup_execution_context_is_fresh(
+                &session,
+                &attestation,
+                Some(desired_read_position),
+                &cleanup,
+            ),
+            "the mandatory post-checkpoint full scan is later than the planning scan"
+        );
+
+        cleanup.inventory_epoch =
+            cats_api::runtime_reconciliation::Epoch::new(attestation.inventory_epoch.get() + 1)
+                .unwrap();
+        assert!(!cleanup_execution_context_is_fresh(
+            &session,
+            &attestation,
+            Some(desired_read_position),
+            &cleanup,
+        ));
+        cleanup.inventory_epoch = attestation.inventory_epoch;
+        cleanup.inventory_session.agent_instance_id =
+            RandomId128::new("cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd").unwrap();
+        assert!(!cleanup_execution_context_is_fresh(
+            &session,
+            &attestation,
+            Some(desired_read_position),
+            &cleanup,
         ));
     }
 
