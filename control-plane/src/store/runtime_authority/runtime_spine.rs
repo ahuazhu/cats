@@ -1847,7 +1847,7 @@ fn compare_partial_inventory_epoch(
     Ok(Ok(()))
 }
 
-fn applied_projection(desired: &DesiredRuntimeSpec) -> AppliedDesiredEvidence {
+pub(super) fn applied_projection(desired: &DesiredRuntimeSpec) -> AppliedDesiredEvidence {
     AppliedDesiredEvidence {
         desired_revision: desired.desired_revision,
         spec_digest: desired.spec_digest.clone(),

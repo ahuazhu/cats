@@ -35,6 +35,7 @@ pub(crate) struct RuntimeMaintenanceReport {
     pub(crate) settled_host_lost_operations: u64,
     pub(crate) retained_suspected_operations: u64,
     pub(crate) sampled_deleted_tombstones: u64,
+    pub(crate) converged_disposable_root_begins: u64,
     pub(crate) sampled_retained_api_results: u64,
     pub(crate) next_cursor: RuntimeMaintenanceCursor,
 }
@@ -61,6 +62,7 @@ impl Store {
         &self,
         cursor: &RuntimeMaintenanceCursor,
         request: &AuthorityRequestContext,
+        active_guest_config_digest: &cats_api::runtime_reconciliation::Sha256Digest,
     ) -> Result<RuntimeMaintenanceReport> {
         ensure_runtime_maintenance_active(request)?;
         let (pending, pending_has_more) =
@@ -97,6 +99,22 @@ impl Store {
             self.runtime_deleted_candidates_after(cursor.deleted_after.as_ref(), request)?;
         report.sampled_deleted_tombstones =
             u64::try_from(deleted.len()).map_err(crate::store::internal)?;
+        // §11.1 Deleted converge: a tombstone whose released disposable Root
+        // the Node already reclaimed moves to normal Deleting here so the
+        // delete sweeper can finish rows and the completion receipt.
+        for cat_id in &deleted {
+            ensure_runtime_maintenance_active(request)?;
+            if self.authority_transaction(|transaction| {
+                super::normal_delete::begin_released_disposable_root_delete_in(
+                    transaction,
+                    cat_id,
+                    active_guest_config_digest,
+                    &mut |_| Ok(()),
+                )
+            })? {
+                report.converged_disposable_root_begins += 1;
+            }
+        }
         report.next_cursor.deleted_after = if deleted_has_more {
             deleted.last().cloned()
         } else {
@@ -125,11 +143,18 @@ impl Store {
     }
 
     #[cfg(test)]
-    pub(crate) fn runtime_maintenance_scan(&self) -> Result<RuntimeMaintenanceReport> {
+    pub(crate) fn runtime_maintenance_scan(
+        &self,
+        active_guest_config_digest: &cats_api::runtime_reconciliation::Sha256Digest,
+    ) -> Result<RuntimeMaintenanceReport> {
         let request = AuthorityRequestContext::new(
             std::time::Instant::now() + std::time::Duration::from_secs(30),
         );
-        self.runtime_maintenance_scan_page(&RuntimeMaintenanceCursor::default(), &request)
+        self.runtime_maintenance_scan_page(
+            &RuntimeMaintenanceCursor::default(),
+            &request,
+            active_guest_config_digest,
+        )
     }
 
     fn runtime_pending_candidates_after(

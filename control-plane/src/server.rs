@@ -1315,7 +1315,11 @@ async fn run_reconciler_role(controller: Arc<Controller>, store: Arc<Store>, int
     tokio::join!(controller.run(interval), reap_interrupted_deploys);
 }
 
-pub(crate) async fn run_runtime_maintenance_role(store: Arc<Store>, period: Duration) {
+pub(crate) async fn run_runtime_maintenance_role(
+    store: Arc<Store>,
+    period: Duration,
+    active_guest_config_digest: cats_api::runtime_reconciliation::Sha256Digest,
+) {
     let mut cursor = crate::store::runtime_authority::sweepers::RuntimeMaintenanceCursor::default();
     let mut interval = tokio::time::interval(period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1326,9 +1330,10 @@ pub(crate) async fn run_runtime_maintenance_role(store: Arc<Store>, period: Dura
             AuthorityRequestContext::new(Instant::now() + RUNTIME_MAINTENANCE_PAGE_DEADLINE);
         let cancel_on_drop = CancelAuthorityRequestOnDrop(request.clone());
         let store_request = request.clone();
+        let scan_digest = active_guest_config_digest.clone();
         match store
             .execute_authority_request_owned(&request, move |store| {
-                store.runtime_maintenance_scan_page(&page_cursor, &store_request)
+                store.runtime_maintenance_scan_page(&page_cursor, &store_request, &scan_digest)
             })
             .await
         {
@@ -1722,10 +1727,20 @@ async fn spawn_inner(
     } else {
         let maintenance_store = state.store.clone();
         let maintenance_interval = interval.max(Duration::from_secs(5));
+        let maintenance_guest_digest = state
+            .agent_session_registration_policy
+            .approved_guest_config_digest()
+            .clone();
         spawn_managed_singleton_task(
             state.store.clone(),
             SingletonRole::RuntimeSweeper,
-            move || run_runtime_maintenance_role(maintenance_store.clone(), maintenance_interval),
+            move || {
+                run_runtime_maintenance_role(
+                    maintenance_store.clone(),
+                    maintenance_interval,
+                    maintenance_guest_digest.clone(),
+                )
+            },
         )
     });
     let billing_enforcer_task = cfg.billing_enforcement_enabled.then(|| {

@@ -285,3 +285,205 @@ fn lock_and_revalidate_desired_set(
     }
     Ok(())
 }
+
+/// §11.1 Deleted converge path for one released disposable Root.
+///
+/// A Cat Destroy that already committed its current Deleted Desired and
+/// Operation leaves a Root whose exact release the Node performs itself.
+/// Once the current complete observation proves that release settled —
+/// fenced Unowned at the observed epoch and head, no local lineage, no
+/// devices, no runtime residue — this transaction moves Disk and Volume to
+/// the same normal `Deleting(delete_id)` so the delete sweeper can finish
+/// object removal, rows and the §11.3 receipt. Every unmet precondition
+/// returns `Ok(false)` without touching state; drift inside locked rows
+/// fails the transaction.
+pub(super) fn begin_released_disposable_root_delete_in<F>(
+    transaction: &mut Transaction<'_>,
+    cat_id: &Id,
+    active_guest_config_digest: &Sha256Digest,
+    checkpoint: &mut F,
+) -> AuthorityTxResult<bool>
+where
+    F: FnMut(&mut Transaction<'_>) -> AuthorityTxResult<()>,
+{
+    use cats_api::runtime_reconciliation::{
+        DiskKind, GuestTransportEvidence, RuntimeTarget, VolumeAuthorityEvidence,
+        VolumeDisposition, WarmSnapshotEvidence,
+    };
+
+    checkpoint(transaction)?;
+    let now = super::rows::database_now(transaction)?;
+    let Some(desired_hint) = super::product_rows::load_desired_unlocked(transaction, cat_id)?
+    else {
+        return Ok(false);
+    };
+    if desired_hint.target != RuntimeTarget::Deleted {
+        return Ok(false);
+    }
+    let admission = match load_placement_admission_at_in_checked(
+        transaction,
+        &desired_hint.placement.node_id,
+        active_guest_config_digest,
+        now,
+        checkpoint,
+    )? {
+        PlacementAdmissionLoad::Accepted(snapshot) => snapshot,
+        PlacementAdmissionLoad::Rejected(_) => return Ok(false),
+    };
+    if !admission.full_inventory_observation.complete_inventory
+        || admission
+            .assigned_desired_specs
+            .iter()
+            .filter(|assigned| &assigned.cat_id == cat_id)
+            .count()
+            != 1
+    {
+        return Ok(false);
+    }
+    let Some(desired) = admission
+        .assigned_desired_specs
+        .iter()
+        .find(|assigned| &assigned.cat_id == cat_id)
+        .cloned()
+    else {
+        return Ok(false);
+    };
+    if desired.target != RuntimeTarget::Deleted {
+        return Ok(false);
+    }
+    let [intent] = desired.volumes.as_slice() else {
+        return Ok(false);
+    };
+    let VolumeDisposition::DeleteDisposableRoot { delete_id } = intent.disposition.clone() else {
+        return Ok(false);
+    };
+    if intent.disk_kind != DiskKind::Root {
+        return Ok(false);
+    }
+    let observation = &admission.full_inventory_observation;
+    if !observation.residue.is_empty() {
+        return Ok(false);
+    }
+    let mut runtimes = observation
+        .runtimes
+        .iter()
+        .filter(|runtime| &runtime.cat_id == cat_id);
+    let Some(runtime) = runtimes.next() else {
+        return Ok(false);
+    };
+    if runtimes.next().is_some()
+        || runtime.applied_desired.as_ref()
+            != Some(&super::runtime_spine::applied_projection(&desired))
+        || runtime.runtime_incarnation.is_some()
+        || !runtime.processes.is_empty()
+        || !runtime.mounts.is_empty()
+        || !runtime.networks.is_empty()
+        || !runtime.routes.is_empty()
+        || runtime.platform_guards != 0
+        || !matches!(runtime.guest_transport, GuestTransportEvidence::Unavailable)
+        || !matches!(runtime.warm_snapshot, WarmSnapshotEvidence::Absent)
+    {
+        return Ok(false);
+    }
+    let mut observed_volumes = runtime
+        .volumes
+        .iter()
+        .filter(|volume| volume.volume_id == intent.volume_id);
+    let Some(observed) = observed_volumes.next() else {
+        return Ok(false);
+    };
+    if observed_volumes.next().is_some()
+        || !observed.devices.is_empty()
+        || !observed.local_lineages.is_empty()
+    {
+        return Ok(false);
+    }
+    let VolumeAuthorityEvidence::Unowned {
+        attachment_epoch: observed_epoch,
+        head: observed_head,
+    } = &observed.authority
+    else {
+        return Ok(false);
+    };
+
+    checkpoint(transaction)?;
+    let Some(volume) = load_any_volume_by_id_for_update(transaction, &intent.volume_id)? else {
+        return Ok(false);
+    };
+    checkpoint(transaction)?;
+    let Some(mut disk) = load_any_disk_by_id_for_update(transaction, &intent.disk_id)? else {
+        return Ok(false);
+    };
+    if disk.volume_id != volume.volume_id
+        || disk.size_bytes != volume.size_bytes
+        || disk.durability != volume.durability
+        || disk.size_bytes != intent.size_bytes
+        || !matches!(&disk.role, DiskRole::Root { cat_id: role_cat } if role_cat == cat_id)
+        || !matches!(disk.admin_state, DiskAdminState::Active)
+        || !matches!(volume.admin_state, VolumeAdminState::Active)
+        || volume.lease_owner.is_some()
+        || volume.lease_epoch != *observed_epoch
+        || volume.head != *observed_head
+    {
+        return Ok(false);
+    }
+    checkpoint(transaction)?;
+    let Some(locked_desired) = load_desired_for_update(transaction, cat_id)? else {
+        return Ok(false);
+    };
+    if locked_desired != desired {
+        return Ok(false);
+    }
+    checkpoint(transaction)?;
+    let operation_hint = transaction.query(
+        "SELECT operation_id FROM runtime_operations
+          WHERE cat_id=$1 AND terminal_kind IS NULL
+          ORDER BY operation_id COLLATE \"C\" LIMIT 2",
+        &[&cat_id.as_str()],
+    )?;
+    let [operation_row] = operation_hint.as_slice() else {
+        return Ok(false);
+    };
+    let Some(operation_id) = Id::new(operation_row.try_get::<_, String>("operation_id")?) else {
+        return Err(AuthorityError::BackendUnknown.into());
+    };
+    let Some(operation) =
+        super::product_rows::load_operation_for_update(transaction, &operation_id)?
+    else {
+        return Ok(false);
+    };
+    if operation.cat_id != *cat_id
+        || operation.target != RuntimeTarget::Deleted
+        || operation.terminal.is_some()
+        || operation.desired_revision != desired.desired_revision
+        || operation.desired_spec_digest != desired.spec_digest
+        || operation.placement != desired.placement
+    {
+        return Ok(false);
+    }
+    checkpoint(transaction)?;
+    if load_any_disk_snapshot_for_update(
+        transaction,
+        &disk.disk_id,
+        &volume.volume_id,
+        disk.size_bytes,
+    )?
+    .is_some()
+    {
+        return Ok(false);
+    }
+    let request = BeginDeleteRequest {
+        delete_id: delete_id.clone(),
+        disk_id: disk.disk_id.clone(),
+        volume_id: volume.volume_id.clone(),
+        expected_unowned_epoch: volume.lease_epoch,
+        expected_head: volume.head.clone(),
+    };
+    let (updated_volume, _result) = begin_delete(&volume, &request)?;
+    disk.admin_state = DiskAdminState::Deleting { delete_id };
+    checkpoint(transaction)?;
+    update_volume(transaction, &updated_volume)?;
+    checkpoint(transaction)?;
+    update_disk(transaction, &disk)?;
+    Ok(true)
+}

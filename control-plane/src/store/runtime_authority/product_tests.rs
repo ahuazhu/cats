@@ -1453,7 +1453,9 @@ fn maintenance_scan_retains_session_expiry_as_suspicion() {
         .unwrap();
     assert_eq!(expired, (1, 1));
 
-    let report = store.runtime_maintenance_scan().unwrap();
+    let report = store
+        .runtime_maintenance_scan(&Sha256Digest::from_bytes([0x5d; 32]))
+        .unwrap();
     assert_eq!(report.sampled_pending_operations, 1);
     assert_eq!(report.retained_suspected_operations, 1);
     assert_eq!(report.settled_host_lost_operations, 0);
@@ -1489,7 +1491,9 @@ fn maintenance_scan_settles_exact_active_fence_as_host_lost() {
     store
         .authority_transaction(|transaction| insert_event(transaction, &event))
         .unwrap();
-    let report = store.runtime_maintenance_scan().unwrap();
+    let report = store
+        .runtime_maintenance_scan(&Sha256Digest::from_bytes([0x5d; 32]))
+        .unwrap();
     assert_eq!(report.sampled_pending_operations, 1);
     assert_eq!(report.settled_host_lost_operations, 1);
     assert_eq!(report.retained_suspected_operations, 0);
@@ -1587,6 +1591,7 @@ async fn runtime_sweeper_leadership_loss_cancels_the_rest_of_a_claimed_page() {
                     Store::connect(&with_application_name(&url, LEADER_APPLICATION), None).unwrap(),
                 ),
                 Duration::from_millis(10),
+                Sha256Digest::from_bytes([0x5d; 32]),
             )
         });
     wait_for_advisory_lock_wait(&setup, LEADER_APPLICATION);
@@ -1675,7 +1680,9 @@ fn maintenance_scan_retains_deleted_tombstone_and_api_replay_rows() {
         })
         .unwrap();
 
-    let report = store.runtime_maintenance_scan().unwrap();
+    let report = store
+        .runtime_maintenance_scan(&Sha256Digest::from_bytes([0x5d; 32]))
+        .unwrap();
     assert_eq!(report.sampled_deleted_tombstones, 1);
     assert_eq!(report.sampled_retained_api_results, 1);
     let retained: (String, i64) = store
