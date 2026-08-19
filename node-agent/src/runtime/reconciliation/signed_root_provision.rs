@@ -16,9 +16,9 @@ use cats_api::runtime_reconciliation::{
     ContractVersion, ControlHandshakeEvidence, DesiredRuntimeSpec, DiskKind,
     GuestTransportEvidence, HostPath, LifecycleAdmission, LocalLineageState, ObservedDiskKind,
     ObservedNetwork, ObservedRuntimeStatus, OwnershipTokenEvidence, ProcessRole, ProcessState,
-    ProgressingReason, ProvisionRootImageError, RandomId128, ReconcileStep, RuntimeTarget,
-    RuntimeTransition, VolumeAccess, VolumeAuthorityEvidence, VolumeDisposition, VolumeIntent,
-    WarmSnapshotEvidence,
+    ProgressingReason, ProvisionRootImageError, RandomId128, ReadyReason, ReconcileStep,
+    RuntimeTarget, RuntimeTransition, VolumeAccess, VolumeAuthorityEvidence, VolumeDisposition,
+    VolumeIntent, WarmSnapshotEvidence,
 };
 use cats_blockd::target_control::provision_root_image_request;
 use cats_storage::authority::{AttachmentLineageIdentity, VolumeDataAuthority, VolumeRecord};
@@ -382,6 +382,9 @@ impl RuntimeDesiredEffect for SignedRunningEffect {
         context: RuntimeDesiredEffectContext,
         desired: &DesiredRuntimeSpec,
     ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
+        if let Some(outcome) = settled_terminal_convergence(&context, desired)? {
+            return Ok(outcome);
+        }
         if let Some(running_admission) = &self.running_admission {
             context
                 .enter_section(crate::runtime_spine::RuntimeEffectSection::RunningAdmissionRetire);
@@ -474,6 +477,43 @@ impl RuntimeDesiredEffect for SignedRunningEffect {
         context.enter_section(crate::runtime_spine::RuntimeEffectSection::NormalAcquire);
         self.acquire.apply(context, desired)
     }
+}
+
+/// A Cat whose accepted full inventory binds the exact current Desired and
+/// carries `Ready(PostconditionSatisfied)` for this exact terminal target is
+/// converged: the scanner only emits that condition after proving the empty
+/// physical envelope, so no section has work left. Answer `Applied` before
+/// entering any section. Falling through instead ends in the acquire
+/// planner's `Stop(LocalContract)`, and one Stop closes the batch's shared
+/// Node-global admission — a settled Deleted tombstone would then starve
+/// every sibling with real work on every scan round.
+fn settled_terminal_convergence(
+    context: &RuntimeDesiredEffectContext,
+    desired: &DesiredRuntimeSpec,
+) -> anyhow::Result<Option<RuntimeDesiredEffectOutcome>> {
+    context.check_active()?;
+    if !matches!(desired.target, RuntimeTarget::Cold | RuntimeTarget::Deleted) {
+        return Ok(None);
+    }
+    let accepted = context.accepted_full()?;
+    let Some(runtime) = unique_runtime(&accepted.observation().runtimes, desired) else {
+        return Ok(None);
+    };
+    let applied_current = runtime.applied_desired.as_ref().is_some_and(|applied| {
+        applied.desired_revision == desired.desired_revision
+            && applied.spec_digest == desired.spec_digest
+            && applied.placement == desired.placement
+            && applied.target == desired.target
+    });
+    let postcondition_ready = runtime.conditions.iter().any(|condition| {
+        matches!(
+            condition,
+            Condition::Ready {
+                reason: ReadyReason::PostconditionSatisfied { target },
+            } if *target == desired.target
+        )
+    });
+    Ok((applied_current && postcondition_ready).then_some(RuntimeDesiredEffectOutcome::Applied))
 }
 
 fn current_prelaunch_waits_for_later_effect(
@@ -2639,6 +2679,15 @@ mod tests {
             if let Some(lineage_path) = lineage_path {
                 runtime.volumes[0].local_lineages[0].data_directory = lineage_path;
             }
+            self.context_with_observed_runtime(runtime, inventory_epoch, inventory_read_position)
+        }
+
+        fn context_with_observed_runtime(
+            &self,
+            runtime: ObservedRuntimeStatus,
+            inventory_epoch: u64,
+            inventory_read_position: u64,
+        ) -> RuntimeDesiredEffectContext {
             let session = AgentSession {
                 version: ContractVersion::V1,
                 node_id: self.desired.placement.node_id.clone(),
@@ -5665,5 +5714,141 @@ mod tests {
         assert_eq!(retirement.calls.load(Ordering::SeqCst), 1);
         assert_eq!(request.calls.load(Ordering::SeqCst), 0);
         assert_eq!(mutations.calls.load(Ordering::SeqCst), 0);
+    }
+    fn settled_terminal_runtime(
+        fixture: &Fixture,
+        conditions: Vec<Condition>,
+    ) -> ObservedRuntimeStatus {
+        use cats_api::runtime_reconciliation::{RuntimeLaunch, StableState};
+        let mut checkpoint = fixture.checkpoint.clone();
+        checkpoint.step = ReconcileStep::Stable {
+            state: StableState::Deleted,
+        };
+        checkpoint.stable_state = Some(StableState::Deleted);
+        checkpoint.runtime_incarnation = None;
+        checkpoint.runtime_launch = RuntimeLaunch::Absent;
+        checkpoint.lifecycle_admission = LifecycleAdmission::Closed;
+        ObservedRuntimeStatus {
+            cat_id: fixture.desired.cat_id.clone(),
+            applied_desired: Some(AppliedDesiredEvidence {
+                desired_revision: fixture.desired.desired_revision,
+                spec_digest: fixture.desired.spec_digest.clone(),
+                placement: fixture.desired.placement.clone(),
+                target: fixture.desired.target,
+            }),
+            runtime_incarnation: None,
+            stable_state: Some(StableState::Deleted),
+            step: ReconcileStep::Stable {
+                state: StableState::Deleted,
+            },
+            checkpoint: CheckpointEvidence::Valid {
+                checkpoint_path: HostPath::new(
+                    super::super::runtime_checkpoint_path(
+                        &fixture.state.path().join(CHECKPOINT_NAMESPACE),
+                        &fixture.desired.cat_id,
+                    )
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+                )
+                .unwrap(),
+                content_digest: checkpoint_content_digest(&checkpoint).unwrap(),
+                version: checkpoint.version,
+                cat_id: checkpoint.cat_id.clone(),
+                node_id: checkpoint.node_id.clone(),
+                desired_revision: checkpoint.desired_revision,
+                spec_digest: checkpoint.spec_digest.clone(),
+                placement_epoch: checkpoint.placement_epoch,
+                runtime_incarnation: None,
+                runtime_launch: Box::new(checkpoint.runtime_launch.clone()),
+                stable_state: checkpoint.stable_state,
+                step: Box::new(checkpoint.step.clone()),
+                require_idle: Box::new(checkpoint.require_idle.clone()),
+                updated_at_unix_ms: checkpoint.updated_at_unix_ms,
+            },
+            processes: Vec::new(),
+            volumes: Vec::new(),
+            mounts: Vec::new(),
+            networks: Vec::new(),
+            guest_transport: GuestTransportEvidence::Unavailable,
+            warm_snapshot: WarmSnapshotEvidence::Absent,
+            lifecycle_admission: LifecycleAdmission::Closed,
+            routes: Vec::new(),
+            platform_guards: 0,
+            conditions,
+        }
+    }
+
+    /// A settled Deleted tombstone must converge as `Applied` without
+    /// entering any effect section. Falling through the chain ends in the
+    /// acquire planner's `Stop(LocalContract)`, and one `Stop` closes the
+    /// batch's shared Node-global admission — a permanent tombstone would
+    /// then starve every sibling Cat with real work on every scan round.
+    #[test]
+    fn settled_deleted_tombstone_converges_as_applied() {
+        let mut fixture = Fixture::new();
+        fixture.desired.target = RuntimeTarget::Deleted;
+        let process = Arc::new(FakeProcessPort::default());
+        let retirement = Arc::new(FakeRetirementPort::unavailable());
+        let request = Arc::new(FakeRequestPort {
+            authority: Arc::clone(&fixture.authority),
+            calls: AtomicUsize::new(0),
+            conflict: false,
+            mutate_owner: false,
+            connect_failure: false,
+            identity_mismatch: false,
+        });
+        let mutations = Arc::new(NoSignedMutationPort::default());
+        let dispatcher = fixture.dispatcher_with_retirement(
+            Arc::clone(&process),
+            Arc::clone(&retirement),
+            Arc::clone(&request),
+            Arc::clone(&mutations),
+        );
+
+        let ready = settled_terminal_runtime(
+            &fixture,
+            vec![Condition::Ready {
+                reason: ReadyReason::PostconditionSatisfied {
+                    target: RuntimeTarget::Deleted,
+                },
+            }],
+        );
+        assert_eq!(
+            dispatcher
+                .apply(
+                    fixture.context_with_observed_runtime(ready, 4, 12),
+                    &fixture.desired,
+                )
+                .unwrap(),
+            RuntimeDesiredEffectOutcome::Applied
+        );
+        assert_eq!(process.inspections.load(Ordering::SeqCst), 0);
+        assert_eq!(retirement.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(request.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(mutations.calls.load(Ordering::SeqCst), 0);
+
+        // Calibration: the same tombstone without its Ready postcondition
+        // must NOT be treated as converged — the unproven case keeps today's
+        // fail-closed local-contract stop.
+        let unproven = settled_terminal_runtime(
+            &fixture,
+            vec![Condition::Progressing {
+                reason: ProgressingReason::ReconcileStep {
+                    step: ReconcileStep::Stable {
+                        state: cats_api::runtime_reconciliation::StableState::Deleted,
+                    },
+                },
+            }],
+        );
+        assert_eq!(
+            dispatcher
+                .apply(
+                    fixture.context_with_observed_runtime(unproven, 4, 12),
+                    &fixture.desired,
+                )
+                .unwrap(),
+            RuntimeDesiredEffectOutcome::Stop(RuntimeDesiredEffectStopReason::LocalContract)
+        );
     }
 }
