@@ -1402,8 +1402,31 @@ impl LifecycleStepEffect {
             return Ok(Some(stop_local()));
         }
         if !checkpoint_is_current(desired, stored.checkpoint()) {
-            // A late pause/stop is containable only by the current revision's
-            // explicit repair plan.  This stale invocation performs no I/O.
+            if let Some(successor) = superseded_drain_rebind_successor(
+                desired,
+                runtime,
+                stored.checkpoint(),
+                accepted.attestation().accepted_at_unix_ms,
+            )? {
+                encode_runtime_checkpoint(&successor)
+                    .context("validate current lifecycle repair successor checkpoint")?;
+                context.check_active()?;
+                let current = store
+                    .assert_current(&stored)
+                    .context("retain superseded lifecycle checkpoint for current repair CAS")?;
+                persist_lifecycle_successor(
+                    context,
+                    &store,
+                    &stored,
+                    &successor,
+                    &current,
+                    "rebind exact superseded Drain to current lifecycle intent",
+                )?;
+                return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
+            }
+            // A late pause/stop is containable only by a current revision's
+            // explicit repair plan. Unsupported stale invocations perform no
+            // I/O and retain their complete physical identity for diagnosis.
             return Ok(Some(stop_local()));
         }
         context.check_active()?;
@@ -4566,11 +4589,24 @@ fn first_lifecycle_step(
             process_start_time_ticks: vmm.process_start_time_ticks,
         }));
     }
+    if desired.target == RuntimeTarget::Deleted && has_only_explicit_disposable_root(desired) {
+        let runtime_incarnation = runtime
+            .runtime_incarnation
+            .as_ref()
+            .context("disposable Deleted lifecycle planner lost its runtime incarnation")?;
+        return Ok(Some(ReconcileStep::StopRuntime {
+            runtime_incarnation: runtime_incarnation.clone(),
+            process_start_time_ticks: vmm.process_start_time_ticks,
+            scope_id: vmm.scope_id.clone(),
+        }));
+    }
     // An accepted R==L observation predates this effect batch and says
     // nothing about Guest/page-cache writes after the scan.  Warm, Cold, and
-    // Deleted therefore start with a fresh quiesce+remote-durability token.
-    // Suspended performs its Guest-local quiesce in PauseRuntime and retains
-    // any Relaxed R<L journal on this Host.
+    // every Deleted intent which retains a volume therefore start with a
+    // fresh quiesce+remote-durability token.  The sole explicitly disposable
+    // Root exception above has authority to discard its tail after stopping
+    // the VMM.  Suspended performs its Guest-local quiesce in PauseRuntime and
+    // retains any Relaxed R<L journal on this Host.
     anyhow::ensure!(
         !desired.volumes.is_empty() && runtime.volumes.len() == desired.volumes.len(),
         "lifecycle drain planner lacks the complete Desired volume set"
@@ -4581,6 +4617,217 @@ fn first_lifecycle_step(
         .min_by_key(|volume| volume.guest_device.slot)
         .context("lifecycle drain planner lacks a canonical first volume")?;
     Ok(Some(drain_step_for_intent(desired, runtime, first)?))
+}
+
+fn has_only_explicit_disposable_root(desired: &DesiredRuntimeSpec) -> bool {
+    matches!(
+        desired.volumes.as_slice(),
+        [intent]
+            if intent.disk_kind == DiskKind::Root
+                && matches!(intent.disposition, VolumeDisposition::DeleteDisposableRoot { .. })
+    )
+}
+
+fn superseded_drain_rebind_successor(
+    desired: &DesiredRuntimeSpec,
+    runtime: &ObservedRuntimeStatus,
+    checkpoint: &RuntimeCheckpoint,
+    observed_at: cats_api::runtime_reconciliation::UnixMillis,
+) -> anyhow::Result<Option<RuntimeCheckpoint>> {
+    let ReconcileStep::DrainPublish {
+        volume_id,
+        attachment_epoch,
+        local_generation,
+        remote_generation,
+    } = &checkpoint.step
+    else {
+        return Ok(None);
+    };
+    if checkpoint.desired_revision >= desired.desired_revision
+        || checkpoint.cat_id != desired.cat_id
+        || checkpoint.node_id != desired.placement.node_id
+        || checkpoint.placement_epoch != desired.placement.placement_epoch
+        || !matches!(desired.target, RuntimeTarget::Cold | RuntimeTarget::Deleted)
+        || checkpoint.lifecycle_admission != LifecycleAdmission::Closed
+        || runtime.lifecycle_admission != LifecycleAdmission::Closed
+        || runtime.platform_guards != 0
+        || runtime.routes.iter().any(|route| {
+            route.gate != cats_api::runtime_reconciliation::RouteGateState::Closed
+                || route.active_guards != 0
+                || route.cancellation_pending
+        })
+        || checkpoint
+            .route_gates
+            .iter()
+            .any(|route| route.gate != cats_api::runtime_reconciliation::RouteGateState::Closed)
+        || runtime.runtime_incarnation != checkpoint.runtime_incarnation
+        || !runtime.applied_desired.as_ref().is_some_and(|applied| {
+            applied.desired_revision == desired.desired_revision
+                && applied.spec_digest == desired.spec_digest
+                && applied.placement == desired.placement
+                && applied.target == desired.target
+        })
+        || !current_runtime_matches_retained_launch(desired, runtime, checkpoint)
+    {
+        return Ok(None);
+    }
+
+    let Some(observed) = runtime
+        .volumes
+        .iter()
+        .find(|observed| &observed.volume_id == volume_id)
+    else {
+        return Ok(None);
+    };
+    let VolumeAuthorityEvidence::Owned {
+        attachment_epoch: observed_epoch,
+        ..
+    } = &observed.authority
+    else {
+        return Ok(None);
+    };
+    let mut lineages = observed.local_lineages.iter().filter(|lineage| {
+        lineage.attachment_epoch == *observed_epoch
+            && lineage.node_id == desired.placement.node_id
+            && lineage.placement_epoch == desired.placement.placement_epoch
+    });
+    let Some(lineage) = lineages.next() else {
+        return Ok(None);
+    };
+    if lineages.next().is_some()
+        || observed_epoch != attachment_epoch
+        || lineage.local_durable_generation < *local_generation
+        || lineage.remote_durable_generation < *remote_generation
+    {
+        return Ok(None);
+    }
+
+    let Some(step) = first_lifecycle_step(desired, runtime)? else {
+        return Ok(None);
+    };
+    let mut successor = checkpoint.clone();
+    successor.desired_revision = desired.desired_revision;
+    successor.spec_digest = desired.spec_digest.clone();
+    successor.processes = runtime.processes.clone();
+    successor.volumes = runtime.volumes.clone();
+    successor.mounts = runtime.mounts.clone();
+    successor.networks = runtime.networks.clone();
+    successor.guest_transport = runtime.guest_transport.clone();
+    successor.warm_snapshot = runtime.warm_snapshot.clone();
+    successor.stable_state = None;
+    successor.step = step;
+    successor.updated_at_unix_ms = observed_at;
+    Ok(Some(successor))
+}
+
+fn current_runtime_matches_retained_launch(
+    desired: &DesiredRuntimeSpec,
+    runtime: &ObservedRuntimeStatus,
+    checkpoint: &RuntimeCheckpoint,
+) -> bool {
+    let Some(launch) = checkpoint.runtime_launch.identity() else {
+        return false;
+    };
+    let Ok(process) = exact_vmm_process(runtime) else {
+        return false;
+    };
+    let cats_api::runtime_reconciliation::OwnershipTokenEvidence::Valid { ownership_token } =
+        &process.ownership_token
+    else {
+        return false;
+    };
+    let expected_shape = cats_api::runtime_reconciliation::ObservedVmShape {
+        vcpus: launch.vcpus,
+        memory_bytes: launch.memory_bytes,
+        boot_image_digest: launch.boot_image_digest.clone(),
+        guest_config_digest: launch.guest_config_digest.clone(),
+    };
+    if checkpoint.runtime_incarnation.as_ref() != Some(&launch.runtime_incarnation)
+        || runtime.runtime_incarnation.as_ref() != Some(&launch.runtime_incarnation)
+        || launch.vcpus != desired.runtime.vcpus
+        || launch.memory_bytes != desired.runtime.memory_bytes
+        || launch.boot_image_digest != desired.runtime.boot_image_digest
+        || launch.guest_config_digest != desired.runtime.guest_config_digest
+        || launch.network.network_config != desired.runtime.network_config
+        || process.state != cats_api::runtime_reconciliation::ProcessState::Running
+        || process.executable_path != launch.boot.vmm_executable.path
+        || !matches!(
+            process.control_handshake,
+            cats_api::runtime_reconciliation::ControlHandshakeEvidence::Verified
+        )
+        || process.observed_vm_shape.as_ref() != Some(&expected_shape)
+        || !process_matches_launch(process, ownership_token, Some(launch))
+        || launch.devices.len() != desired.volumes.len()
+        || runtime.volumes.len() != desired.volumes.len()
+    {
+        return false;
+    }
+    desired.volumes.iter().all(|intent| {
+        let mut prepared_matches = launch
+            .devices
+            .iter()
+            .filter(|prepared| prepared.volume_id == intent.volume_id);
+        let Some(prepared) = prepared_matches.next() else {
+            return false;
+        };
+        let acquire_matches = match (&prepared.acquire_origin, &intent.acquire) {
+            (
+                cats_api::runtime_reconciliation::AcquireOrigin::Normal { transition_id },
+                VolumeAcquire::Normal {
+                    transition_id: intended,
+                    ..
+                },
+            ) => transition_id == intended,
+            (
+                cats_api::runtime_reconciliation::AcquireOrigin::Takeover { authorization_id },
+                VolumeAcquire::Takeover {
+                    authorization_id: intended,
+                },
+            ) => authorization_id == intended,
+            _ => false,
+        };
+        if prepared_matches.next().is_some()
+            || prepared.volume_intent_id != intent.volume_intent_id
+            || prepared.disk_id != intent.disk_id
+            || prepared.disk_kind != intent.disk_kind
+            || prepared.attachment_id != intent.attachment_id
+            || prepared.size_bytes != intent.size_bytes
+            || prepared.durability != intent.durability
+            || prepared.guest_device != intent.guest_device
+            || !acquire_matches
+        {
+            return false;
+        }
+        let mut observed_matches = runtime
+            .volumes
+            .iter()
+            .filter(|observed| observed.volume_id == intent.volume_id);
+        let Some(observed) = observed_matches.next() else {
+            return false;
+        };
+        let mut current_lineages = observed.local_lineages.iter().filter(|lineage| {
+            lineage.attachment_id == prepared.attachment_id
+                && lineage.attachment_epoch == prepared.attachment_epoch
+                && lineage.acquire_origin == prepared.acquire_origin
+                && lineage.node_id == desired.placement.node_id
+                && lineage.placement_epoch == desired.placement.placement_epoch
+        });
+        let exact_current_lineage =
+            current_lineages.next().is_some() && current_lineages.next().is_none();
+        observed_matches.next().is_none()
+            && cold_observed_identity_matches_intent(observed, intent)
+            && matches!(
+                &observed.authority,
+                VolumeAuthorityEvidence::Owned {
+                    attachment_id,
+                    attachment_epoch,
+                    ..
+                } if attachment_id == &prepared.attachment_id
+                    && attachment_epoch == &prepared.attachment_epoch
+            )
+            && exact_current_lineage
+            && drain_step_for_intent(desired, runtime, intent).is_ok()
+    })
 }
 
 fn drain_step_for_intent(
@@ -6177,6 +6424,189 @@ mod tests {
                     && remote_generation == lineage.remote_durable_generation
             ));
         }
+    }
+
+    #[test]
+    fn explicit_disposable_only_delete_stops_without_forging_a_guest_drain() {
+        let (mut desired, _, runtime) = fixtures(RuntimeTarget::Deleted);
+        desired.volumes[0].disposition = VolumeDisposition::DeleteDisposableRoot {
+            delete_id: Id::new("delete_disposable_root").unwrap(),
+        };
+        desired.spec_digest = spec_digest(&desired).unwrap();
+        let process = exact_vmm_process(&runtime).unwrap();
+        assert!(matches!(
+            first_lifecycle_step(&desired, &runtime).unwrap(),
+            Some(ReconcileStep::StopRuntime {
+                ref runtime_incarnation,
+                process_start_time_ticks,
+                ref scope_id,
+            }) if Some(runtime_incarnation) == runtime.runtime_incarnation.as_ref()
+                && process_start_time_ticks == process.process_start_time_ticks
+                && scope_id == &process.scope_id
+        ));
+
+        let (mut retained, mut checkpoint, mut retained_runtime) = fixtures(RuntimeTarget::Deleted);
+        retained.volumes[0].disposition = VolumeDisposition::DeleteDisposableRoot {
+            delete_id: Id::new("delete_disposable_root").unwrap(),
+        };
+        add_second_drain_volume(&mut retained, &mut checkpoint, &mut retained_runtime);
+        retained.volumes[1].disposition = VolumeDisposition::DetachRetained;
+        retained.volumes[1].mount = Some(cats_api::runtime_reconciliation::Ext4MountIntent {
+            filesystem_uuid: RandomId128::new("abababababababababababababababab").unwrap(),
+            mount_path: HostPath::new("/data".to_owned()).unwrap(),
+            initialization: FilesystemInitialization::Existing,
+        });
+        retained.spec_digest = spec_digest(&retained).unwrap();
+        assert!(matches!(
+            first_lifecycle_step(&retained, &retained_runtime).unwrap(),
+            Some(ReconcileStep::DrainPublish { .. })
+        ));
+    }
+
+    #[test]
+    fn superseded_drain_rebinds_exact_disposable_delete_before_physical_io() {
+        let (old_desired, mut predecessor, mut runtime) = fixtures(RuntimeTarget::Cold);
+        predecessor.stable_state = None;
+        predecessor.step = first_lifecycle_step(&old_desired, &runtime)
+            .unwrap()
+            .expect("Cold predecessor must begin with DrainPublish");
+        runtime.stable_state = None;
+        runtime.step = predecessor.step.clone();
+        runtime.guest_transport = GuestTransportEvidence::Unavailable;
+        for volume in &mut runtime.volumes {
+            volume.devices.clear();
+        }
+
+        let mut desired = old_desired.clone();
+        desired.desired_revision =
+            cats_api::runtime_reconciliation::Revision::new(old_desired.desired_revision.get() + 1)
+                .unwrap();
+        desired.target = RuntimeTarget::Deleted;
+        desired.volumes[0].disposition = VolumeDisposition::DeleteDisposableRoot {
+            delete_id: Id::new("delete_superseded_drain").unwrap(),
+        };
+        desired.spec_digest = spec_digest(&desired).unwrap();
+        runtime.applied_desired = Some(AppliedDesiredEvidence {
+            desired_revision: desired.desired_revision,
+            spec_digest: desired.spec_digest.clone(),
+            placement: desired.placement.clone(),
+            target: desired.target,
+        });
+
+        let observed_at = cats_api::runtime_reconciliation::UnixMillis::new(
+            predecessor.updated_at_unix_ms.get() + 1,
+        )
+        .unwrap();
+        assert!(
+            superseded_drain_rebind_successor(&desired, &runtime, &predecessor, observed_at,)
+                .unwrap()
+                .is_some()
+        );
+
+        let mut owner_drift = runtime.clone();
+        let VolumeAuthorityEvidence::Owned { attachment_id, .. } =
+            &mut owner_drift.volumes[0].authority
+        else {
+            unreachable!()
+        };
+        *attachment_id = Id::new("att_foreign_owner").unwrap();
+        assert!(superseded_drain_rebind_successor(
+            &desired,
+            &owner_drift,
+            &predecessor,
+            observed_at,
+        )
+        .unwrap()
+        .is_none());
+
+        let mut active_gate = predecessor.clone();
+        let endpoint = &desired.endpoints[0];
+        let launch = active_gate.runtime_launch.identity().unwrap();
+        active_gate
+            .route_gates
+            .push(cats_api::runtime_reconciliation::CheckpointRouteGate {
+                binding: cats_api::runtime_reconciliation::RouteGateBinding {
+                    workspace_id: desired.workspace_id.clone(),
+                    endpoint_id: endpoint.endpoint_id.clone(),
+                    hostname: endpoint.hostname.clone(),
+                    cat_id: desired.cat_id.clone(),
+                    node_id: desired.placement.node_id.clone(),
+                    runtime_incarnation: launch.runtime_incarnation.clone(),
+                    route_epoch: endpoint.route_epoch,
+                    protocol: endpoint.protocol,
+                    target_port: endpoint.target_port,
+                },
+                gate: cats_api::runtime_reconciliation::RouteGateState::Active,
+            });
+        assert!(
+            superseded_drain_rebind_successor(&desired, &runtime, &active_gate, observed_at,)
+                .unwrap()
+                .is_none()
+        );
+
+        let directory = TempDir::new().unwrap();
+        let checkpoint_directory = directory.path().join(CHECKPOINT_NAMESPACE);
+        let store = FileCheckpointStore::open(&checkpoint_directory, &desired.cat_id).unwrap();
+        let stored = store.create(&predecessor).unwrap();
+        runtime.checkpoint = CheckpointEvidence::Valid {
+            checkpoint_path: HostPath::new(store.path().to_string_lossy().into_owned()).unwrap(),
+            content_digest: stored.content_digest().clone(),
+            version: predecessor.version,
+            cat_id: predecessor.cat_id.clone(),
+            node_id: predecessor.node_id.clone(),
+            desired_revision: predecessor.desired_revision,
+            spec_digest: predecessor.spec_digest.clone(),
+            placement_epoch: predecessor.placement_epoch,
+            runtime_incarnation: predecessor.runtime_incarnation.clone(),
+            runtime_launch: Box::new(predecessor.runtime_launch.clone()),
+            stable_state: predecessor.stable_state,
+            step: Box::new(predecessor.step.clone()),
+            require_idle: Box::new(predecessor.require_idle.clone()),
+            updated_at_unix_ms: predecessor.updated_at_unix_ms,
+        };
+        drop(store);
+
+        let volume = Arc::new(ScriptedLifecycleVolumePort {
+            recovery: Mutex::new(None),
+            evidence_calls: AtomicUsize::new(0),
+            delete_calls: AtomicUsize::new(0),
+            delete_attempts: Mutex::new(VecDeque::new()),
+            delete_authorization_ids: Mutex::new(Vec::new()),
+        });
+        let effect = LifecycleStepEffect {
+            credentials: None,
+            physical: Arc::new(NeverLifecyclePhysical),
+            volume_transition: Arc::clone(&volume) as Arc<dyn SignedLifecycleVolumePort>,
+            volume_authority: Arc::new(UnavailableVolumeAuthority),
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            data_directory_reclaim: None,
+        };
+        let context = deleting_effect_context(&directory, &desired, runtime);
+        assert_eq!(
+            effect.try_apply(&context, &desired).unwrap(),
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
+        );
+        assert_eq!(volume.evidence_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(volume.delete_calls.load(Ordering::SeqCst), 0);
+
+        let rebound = FileCheckpointStore::open(&checkpoint_directory, &desired.cat_id)
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rebound.checkpoint().desired_revision,
+            desired.desired_revision
+        );
+        assert_eq!(rebound.checkpoint().spec_digest, desired.spec_digest);
+        assert!(matches!(
+            rebound.checkpoint().step,
+            ReconcileStep::StopRuntime { .. }
+        ));
+        assert_eq!(
+            rebound.checkpoint().runtime_launch,
+            predecessor.runtime_launch
+        );
     }
 
     #[test]
