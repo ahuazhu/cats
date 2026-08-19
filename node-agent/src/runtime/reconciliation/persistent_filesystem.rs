@@ -331,6 +331,9 @@ impl PersistentFilesystemEffect {
         {
             return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
         }
+        if !filesystem_phase && ordered_persistent_devices(stored.checkpoint())?.is_empty() {
+            return Ok(None);
+        }
 
         let _node_global_effect = context.lock_node_global_effect()?;
         let processes = context.node_global_process()?;

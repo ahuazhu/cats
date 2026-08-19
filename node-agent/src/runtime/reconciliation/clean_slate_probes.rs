@@ -19082,8 +19082,12 @@ mod tests {
         )
         .with_node_global_process_for_test(process_admission)
         .with_node_global_network_for_test(network_admission);
-        let authority: Arc<dyn VolumeDataAuthority> = Arc::new(ExactVolumeSetDataAuthority {
-            records: BTreeMap::from([(fixture.record.volume_id.clone(), fixture.record.clone())]),
+        let authority_records = Arc::new(Mutex::new(BTreeMap::from([(
+            fixture.record.volume_id.clone(),
+            fixture.record.clone(),
+        )])));
+        let authority: Arc<dyn VolumeDataAuthority> = Arc::new(SharedVolumeSetDataAuthority {
+            records: Arc::clone(&authority_records),
         });
         let process_port = Arc::new(AcceptedRunningProcessPort);
         let network = Arc::new(
@@ -19103,10 +19107,10 @@ mod tests {
         );
         let revalidator = Arc::new(
             super::super::RunningLaunchAuthorityRevalidator::platform_parts(
-                state_directory,
+                state_directory.clone(),
                 test_root_provision_systemd(&environment.blockd_binary),
                 network,
-                authority,
+                Arc::clone(&authority),
                 Arc::clone(&process_port)
                     as Arc<
                         dyn super::super::serving_blockd_process::ServingBlockdProcessGlobalPort,
@@ -19115,6 +19119,36 @@ mod tests {
                 None,
             ),
         );
+        let filesystem_effect = super::super::PersistentFilesystemEffect::for_test(
+            Arc::clone(&authority),
+            Arc::new(CommitInitializedPort {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ScriptedPersistentGuest {
+                formatted: AtomicBool::new(false),
+                lose_first_format_response: AtomicBool::new(false),
+                operations: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(AdvancingRelaxedBlockd {
+                records: Arc::clone(&authority_records),
+                volume_id: fixture.record.volume_id.clone(),
+                initialized_head: fixture.record.head.clone(),
+                drains: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::clone(&revalidator),
+        );
+        assert_eq!(
+            filesystem_effect.try_apply(&context, desired).unwrap(),
+            None,
+            "root-only StartRuntime must fall through the Persistent filesystem effect"
+        );
+        // Renewal is live authority, not process identity. The exact process
+        // admitted above must remain reusable after this monotonic extension.
+        let mut renewed = authority_records.lock().unwrap();
+        let current = renewed.get_mut(&fixture.record.volume_id).unwrap();
+        current.lease_expires_at =
+            Some(UnixMillis::new(current.lease_expires_at.unwrap().get() + 60_000).unwrap());
+        drop(renewed);
         let effect_guest_calls = Arc::new(AtomicUsize::new(0));
         let effect = super::super::RunningAdmissionEffect::with_launch_authority(
             Arc::clone(&registry),

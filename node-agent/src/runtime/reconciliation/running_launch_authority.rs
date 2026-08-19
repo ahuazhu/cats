@@ -591,13 +591,14 @@ impl RunningLaunchAuthorityRevalidator {
                 &first_authority,
             )
             .context("reopen retained Running AuthorizedBlockd authority")?;
+            let current_expectation = retained.expectation_running(
+                &self.systemd,
+                accepted_checkpoint.checkpoint(),
+                physical_launch_desired,
+                &first_authority,
+            )?;
             anyhow::ensure!(
-                retained.expectation_running(
-                    &self.systemd,
-                    accepted_checkpoint.checkpoint(),
-                    physical_launch_desired,
-                    &first_authority,
-                )? == *expectation,
+                current_expectation.matches_admitted(expectation),
                 "retained Running AuthorizedBlockd authority changed its process expectation"
             );
             let first_lease_expiry = first_authority
