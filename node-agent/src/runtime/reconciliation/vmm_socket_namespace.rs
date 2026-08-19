@@ -1515,18 +1515,17 @@ impl RetainedTerminalVmmResidue {
     ) -> anyhow::Result<()> {
         self.receipt.assert_current(store)?;
         root.assert_stale_boot_attempt_absent(self.expectation.receipt())?;
-        TerminalVmmResidueExpectation::new(
+        let current = TerminalVmmResidueExpectation::new(
             self.expectation.checkpoint(),
             self.receipt.receipt(),
             store.state_directory(),
             root,
-        )
-        .map(|current| {
-            anyhow::ensure!(
-                current == self.expectation,
-                "terminal VMM residue expectation changed"
-            );
-        })?
+        )?;
+        anyhow::ensure!(
+            current == self.expectation,
+            "terminal VMM residue expectation changed"
+        );
+        Ok(())
     }
 
     pub(crate) fn into_receipt(self) -> RetainedVmmSocketReceipt {
