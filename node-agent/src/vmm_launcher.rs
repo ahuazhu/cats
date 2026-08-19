@@ -381,7 +381,7 @@ mod linux {
         memory.assert_current(*memory_bytes)?;
         serial_log.assert_current(0)?;
         vmm_log.assert_current(0)?;
-        launch_attempt.assert_ready()?;
+        launch_attempt.assert_ready_with_launch_files()?;
 
         install_fixed_fd(&checkpoint_file, CHECKPOINT_FD)?;
         install_fixed_fd(&vmm, VMM_FD)?;
@@ -423,7 +423,7 @@ mod linux {
         memory.assert_current(*memory_bytes)?;
         serial_log.assert_current(0)?;
         vmm_log.assert_current(0)?;
-        launch_attempt.assert_ready()?;
+        launch_attempt.assert_ready_with_launch_files()?;
         let error = command.exec();
         Err(error).context("exec exact Cloud Hypervisor descriptor")
     }

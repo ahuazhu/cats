@@ -3884,8 +3884,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    #[cfg(not(target_os = "linux"))]
     use cats_api::object_write_gateway::ObjectWriteCredentialReference;
+    #[cfg(not(target_os = "linux"))]
     use cats_api::runtime_reconciliation::NodeBootId;
     use cats_api::runtime_reconciliation::{
         decode_runtime_checkpoint, spec_digest, AdmissionInventoryAttestation, AgentSession,
