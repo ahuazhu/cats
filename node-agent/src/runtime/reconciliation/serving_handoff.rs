@@ -11634,6 +11634,33 @@ mod tests {
         .expect("later Desired retains the checkpointed immutable handoff predecessor")
         .expect("later Desired retains the old root-provision process attempt");
 
+        let launch = later.runtime_launch.identity().unwrap();
+        let [root] = launch.devices.as_slice() else {
+            panic!("single-Root fixture must retain one launched device")
+        };
+        later.step = ReconcileStep::DrainPublish {
+            volume_id: root.volume_id.clone(),
+            attachment_epoch: root.attachment_epoch,
+            local_generation: root.expected_head.generation,
+            remote_generation: root.expected_head.generation,
+        };
+        assert!(
+            super::super::inventory::current_checkpoint_adopts_blockd_for_test(
+                &later,
+                &fixture.acquired.attachment,
+            ),
+            "a current lifecycle checkpoint must adopt its superseded physical blockd Desired"
+        );
+        let mut foreign_attachment = fixture.acquired.attachment.clone();
+        foreign_attachment.identity.attachment_id = id("att_foreign");
+        assert!(
+            !super::super::inventory::current_checkpoint_adopts_blockd_for_test(
+                &later,
+                &foreign_attachment,
+            ),
+            "retained launch adoption must not cross an attachment identity"
+        );
+
         let mut same_revision_wrong_spec = later.clone();
         same_revision_wrong_spec.desired_revision = original_revision;
         same_revision_wrong_spec.spec_digest = digest('f');

@@ -2880,6 +2880,31 @@ fn current_checkpoint_adopts_blockd(
     checkpoint: &RuntimeCheckpoint,
     attachment: &cats_storage::authority::AuthorizedServingAttachment,
 ) -> bool {
+    if checkpoint
+        .runtime_launch
+        .identity()
+        .and_then(|launch| {
+            launch
+                .devices
+                .iter()
+                .find(|device| device.volume_id == attachment.identity.volume_id)
+        })
+        .is_some_and(|device| {
+            device.attachment_id == attachment.identity.attachment_id
+                && device.attachment_epoch == attachment.identity.attachment_epoch
+                && device.acquire_origin == attachment.identity.acquire_origin
+                && device.size_bytes == attachment.size_bytes
+                && device.durability == attachment.durability
+                && remote_head_is_same_or_later(&device.expected_head, &attachment.head)
+        })
+    {
+        // Later lifecycle checkpoints deliberately carry the immutable
+        // Running launch while their top-level Desired coordinates advance.
+        // That launch is the durable adoption edge for the older physical
+        // AuthorizedBlockd artifact; validate_scanned_checkpoint separately
+        // joins its complete device set and sealed Desired predecessor.
+        return true;
+    }
     match &checkpoint.step {
         ReconcileStep::ProvisionRootImage {
             volume_id,
@@ -2927,6 +2952,14 @@ fn current_checkpoint_adopts_blockd(
         }),
         _ => false,
     }
+}
+
+#[cfg(test)]
+pub(super) fn current_checkpoint_adopts_blockd_for_test(
+    checkpoint: &RuntimeCheckpoint,
+    attachment: &cats_storage::authority::AuthorizedServingAttachment,
+) -> bool {
+    current_checkpoint_adopts_blockd(checkpoint, attachment)
 }
 
 fn authority_owner_or_exact_release_matches(
