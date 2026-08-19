@@ -40,7 +40,7 @@ use super::persistent_filesystem::{
     post_drain_authority_is_same_attachment, status_generation, PersistentBlockdControlPort,
     PlatformPersistentBlockdControlPort,
 };
-use super::prepare_device_retirement::unique_runtime;
+use super::prepare_device_retirement::{prepared_device_set_is_exact, unique_runtime};
 use super::serving_blockd_process::{
     ServingBlockdProcessGlobalPort, ServingBlockdProcessInspection,
 };
@@ -254,9 +254,7 @@ impl LifecyclePhysicalPort for PlatformLifecyclePhysicalPort {
                 let Some(launch) = permit.checkpoint().runtime_launch.identity() else {
                     return Ok(LifecyclePhysicalAttempt::Conflict);
                 };
-                if permit.runtime().guest_transport != permit.checkpoint().guest_transport
-                    || !guest_transport_matches_launch(permit.runtime(), launch)
-                {
+                if !guest_transport_allows_quiesce(permit.runtime(), permit.checkpoint(), launch) {
                     return Ok(LifecyclePhysicalAttempt::Conflict);
                 }
                 let guest = match ExactGuestQuiesce::prepare(context, launch, exact) {
@@ -414,8 +412,7 @@ impl PlatformLifecyclePhysicalPort {
             };
             if vmm.clone().into_process_evidence() != *public_vmm
                 || vmm.evidence().state() != cats_api::runtime_reconciliation::ProcessState::Running
-                || permit.runtime().guest_transport != permit.checkpoint().guest_transport
-                || !guest_transport_matches_launch(permit.runtime(), launch)
+                || !guest_transport_allows_quiesce(permit.runtime(), permit.checkpoint(), launch)
             {
                 return Ok(LifecyclePhysicalAttempt::Conflict);
             }
@@ -772,6 +769,24 @@ fn guest_transport_matches_launch(
             && *guest_cid == launch.guest_cid
             && u32::from(*guest_port) == GUEST_HOST_CONTROL_VSOCK_PORT_V1
     )
+}
+
+fn guest_transport_allows_quiesce(
+    runtime: &ObservedRuntimeStatus,
+    checkpoint: &RuntimeCheckpoint,
+    launch: &cats_api::runtime_reconciliation::RuntimeLaunchIdentity,
+) -> bool {
+    if runtime.guest_transport != checkpoint.guest_transport {
+        return false;
+    }
+    guest_transport_matches_launch(runtime, launch)
+        || (matches!(runtime.guest_transport, GuestTransportEvidence::Unavailable)
+            && checkpoint.stable_state.is_none()
+            && matches!(
+                checkpoint.step,
+                ReconcileStep::DrainPublish { .. } | ReconcileStep::PauseRuntime { .. }
+            )
+            && checkpoint.runtime_launch.identity() == Some(launch))
 }
 
 struct ExactGuestQuiesce {
@@ -1314,6 +1329,14 @@ impl LifecycleStepEffect {
             return Ok(Some(stop_local()));
         }
 
+        if matches!(runtime.step, ReconcileStep::StartRuntime { .. })
+            && matches!(desired.target, RuntimeTarget::Cold | RuntimeTarget::Deleted)
+        {
+            return self
+                .plan_live_start_runtime_abort(context, accepted, desired, runtime)
+                .map(Some);
+        }
+
         if !is_lifecycle_step(&runtime.step) {
             if let Some(outcome) = self.plan_first(context, desired, runtime)? {
                 return Ok(Some(outcome));
@@ -1518,6 +1541,106 @@ impl LifecycleStepEffect {
             }
             LifecyclePhysicalAttempt::Conflict => stop_local(),
         }))
+    }
+
+    /// Rebinds one fully inventoried live `StartRuntime` attempt to the first
+    /// current lifecycle drain token. The VMM may have crossed its physical
+    /// start boundary before a newer Cold/Deleted Desired arrived, while the
+    /// Running-only filesystem suffix intentionally refuses to finish. This
+    /// bridge performs no physical effect: it accepts only the exact old
+    /// launch, unchanged volume identities and a closed, guard-free admission,
+    /// then publishes the current revision before the existing lifecycle
+    /// executor may quiesce or stop anything.
+    fn plan_live_start_runtime_abort(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        accepted: &crate::runtime_spine::RuntimeDesiredEffectAdmission,
+        desired: &DesiredRuntimeSpec,
+        runtime: &ObservedRuntimeStatus,
+    ) -> anyhow::Result<RuntimeDesiredEffectOutcome> {
+        let ReconcileStep::StartRuntime { devices, .. } = &runtime.step else {
+            return Ok(stop_local());
+        };
+        let CheckpointEvidence::Valid {
+            checkpoint_path,
+            content_digest,
+            ..
+        } = &runtime.checkpoint
+        else {
+            return Ok(stop_local());
+        };
+        let store = FileCheckpointStore::open_preserving_checkpoint_temp(
+            &context.state_directory().path().join(CHECKPOINT_NAMESPACE),
+            &desired.cat_id,
+        )
+        .context("open live StartRuntime abort checkpoint")?;
+        if store.path() != Path::new(checkpoint_path.as_str()) {
+            return Ok(stop_local());
+        }
+        let Some(stored) = store
+            .load()
+            .context("load live StartRuntime abort checkpoint")?
+        else {
+            return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
+        };
+        if stored.content_digest() != content_digest || stored.checkpoint().step != runtime.step {
+            return Ok(RuntimeDesiredEffectOutcome::refresh_inventory());
+        }
+        let checkpoint = stored.checkpoint();
+        if checkpoint.cat_id != desired.cat_id
+            || checkpoint.node_id != desired.placement.node_id
+            || checkpoint.placement_epoch != desired.placement.placement_epoch
+            || checkpoint.desired_revision >= desired.desired_revision
+            || checkpoint.stable_state.is_some()
+            || checkpoint.lifecycle_admission != LifecycleAdmission::Closed
+            || checkpoint
+                .route_gates
+                .iter()
+                .any(|gate| gate.gate != cats_api::runtime_reconciliation::RouteGateState::Closed)
+            || runtime.lifecycle_admission != LifecycleAdmission::Closed
+            || runtime.platform_guards != 0
+            || runtime
+                .routes
+                .iter()
+                .any(|route| route.active_guards != 0 || route.cancellation_pending)
+            || !prepared_device_set_is_exact(desired, devices)
+            || checkpoint.runtime_incarnation != runtime.runtime_incarnation
+            || checkpoint.runtime_launch.identity().is_none()
+        {
+            return Ok(stop_local());
+        }
+        let Some(step) = first_lifecycle_step(desired, runtime)? else {
+            return Ok(stop_local());
+        };
+        let mut successor = checkpoint.clone();
+        successor.desired_revision = desired.desired_revision;
+        successor.spec_digest = desired.spec_digest.clone();
+        successor.placement_epoch = desired.placement.placement_epoch;
+        successor.stable_state = None;
+        successor.step = step;
+        successor.lifecycle_admission = LifecycleAdmission::Closed;
+        successor.require_idle = RequireIdleCheckpoint::NotApplicable;
+        successor.updated_at_unix_ms = accepted.attestation().accepted_at_unix_ms;
+        encode_runtime_checkpoint(&successor)
+            .context("validate live StartRuntime lifecycle abort checkpoint")?;
+        let current = store
+            .assert_current(&stored)
+            .context("retain live StartRuntime checkpoint for lifecycle abort")?;
+        persist_lifecycle_successor(
+            context,
+            &store,
+            &stored,
+            &successor,
+            &current,
+            "rebind live StartRuntime to current lifecycle drain",
+        )?;
+        tracing::info!(
+            cat_id = %desired.cat_id,
+            predecessor_revision = ?checkpoint.desired_revision,
+            desired_revision = ?desired.desired_revision,
+            "rebound live StartRuntime to current lifecycle drain"
+        );
+        Ok(RuntimeDesiredEffectOutcome::refresh_inventory())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6127,6 +6250,125 @@ mod tests {
                     && remote_generation == lineage.remote_durable_generation
             ));
         }
+    }
+
+    #[test]
+    fn cold_superseding_live_start_runtime_adopts_one_drain_before_any_stop() {
+        let (mut desired, mut checkpoint, mut runtime) = fixtures(RuntimeTarget::Cold);
+        desired.spec_digest = spec_digest(&desired).unwrap();
+
+        let start = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+        checkpoint.desired_revision = cats_api::runtime_reconciliation::Revision::new(7).unwrap();
+        checkpoint.spec_digest =
+            cats_api::runtime_reconciliation::Sha256Digest::from_bytes([0x3a; 32]);
+        checkpoint.stable_state = None;
+        checkpoint.step = start.step;
+        checkpoint.processes.clear();
+        checkpoint.lifecycle_admission = LifecycleAdmission::Closed;
+        for gate in &mut checkpoint.route_gates {
+            gate.gate = cats_api::runtime_reconciliation::RouteGateState::Closed;
+        }
+        runtime.applied_desired = None;
+        runtime.stable_state = None;
+        runtime.step = checkpoint.step.clone();
+        runtime.lifecycle_admission = LifecycleAdmission::Closed;
+        runtime.routes.clear();
+        runtime.platform_guards = 0;
+
+        let directory = TempDir::new().unwrap();
+        let checkpoint_directory = directory.path().join(CHECKPOINT_NAMESPACE);
+        let store = FileCheckpointStore::open(&checkpoint_directory, &desired.cat_id).unwrap();
+        let stored = store.create(&checkpoint).unwrap();
+        runtime.checkpoint = CheckpointEvidence::Valid {
+            checkpoint_path: HostPath::new(store.path().to_string_lossy().into_owned()).unwrap(),
+            content_digest: stored.content_digest().clone(),
+            version: checkpoint.version,
+            cat_id: checkpoint.cat_id.clone(),
+            node_id: checkpoint.node_id.clone(),
+            desired_revision: checkpoint.desired_revision,
+            spec_digest: checkpoint.spec_digest.clone(),
+            placement_epoch: checkpoint.placement_epoch,
+            runtime_incarnation: checkpoint.runtime_incarnation.clone(),
+            runtime_launch: Box::new(checkpoint.runtime_launch.clone()),
+            stable_state: checkpoint.stable_state,
+            step: Box::new(checkpoint.step.clone()),
+            require_idle: Box::new(checkpoint.require_idle.clone()),
+            updated_at_unix_ms: checkpoint.updated_at_unix_ms,
+        };
+        drop(store);
+
+        let effect = LifecycleStepEffect {
+            credentials: None,
+            physical: Arc::new(NeverLifecyclePhysical),
+            volume_transition: Arc::new(ScriptedLifecycleVolumePort {
+                recovery: Mutex::new(None),
+                evidence_calls: AtomicUsize::new(0),
+                delete_calls: AtomicUsize::new(0),
+                delete_attempts: Mutex::new(VecDeque::new()),
+                delete_authorization_ids: Mutex::new(Vec::new()),
+            }),
+            volume_authority: Arc::new(UnavailableVolumeAuthority),
+            #[cfg(feature = "proposed-node-residue-reclamation")]
+            data_directory_reclaim: None,
+        };
+        let context = deleting_effect_context(&directory, &desired, runtime.clone());
+
+        assert_eq!(
+            effect.try_apply(&context, &desired).unwrap(),
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
+        );
+        let adopted = FileCheckpointStore::open(&checkpoint_directory, &desired.cat_id)
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            adopted.checkpoint().desired_revision,
+            desired.desired_revision
+        );
+        assert_eq!(adopted.checkpoint().spec_digest, desired.spec_digest);
+        assert!(matches!(
+            adopted.checkpoint().step,
+            ReconcileStep::DrainPublish { .. }
+        ));
+        assert_eq!(
+            adopted.checkpoint().runtime_launch,
+            checkpoint.runtime_launch
+        );
+        assert!(adopted.checkpoint().processes.is_empty());
+    }
+
+    #[test]
+    fn unpublished_start_abort_guest_transport_is_usable_only_for_its_lifecycle_suffix() {
+        let (desired, mut checkpoint, mut runtime) = fixtures(RuntimeTarget::Cold);
+        let launch = checkpoint.runtime_launch.identity().unwrap().clone();
+        let drain = first_lifecycle_step(&desired, &runtime).unwrap().unwrap();
+        checkpoint.stable_state = None;
+        checkpoint.step = drain.clone();
+        checkpoint.guest_transport = GuestTransportEvidence::Unavailable;
+        runtime.stable_state = None;
+        runtime.step = drain;
+        runtime.guest_transport = GuestTransportEvidence::Unavailable;
+
+        assert!(guest_transport_allows_quiesce(
+            &runtime,
+            &checkpoint,
+            &launch,
+        ));
+
+        checkpoint.stable_state = Some(StableState::Running);
+        checkpoint.step = ReconcileStep::Stable {
+            state: StableState::Running,
+        };
+        assert!(!guest_transport_allows_quiesce(
+            &runtime,
+            &checkpoint,
+            &launch,
+        ));
     }
 
     #[test]

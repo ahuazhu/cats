@@ -1989,6 +1989,17 @@ fn runtime_from_inventory(
     )
     .ok_or_else(|| anyhow::anyhow!("checkpoint path is not a valid HostPath"))?;
 
+    // A current lifecycle checkpoint deliberately carries the new
+    // Cold/Deleted Desired coordinates while its immutable VMM and blockd
+    // launch artifacts remain sealed to the old Running Desired. Recover
+    // that physical predecessor from the complete AuthorizedBlockd set;
+    // never reinterpret the current lifecycle Desired as launch authority.
+    let retained_physical_desired = checkpoint
+        .as_ref()
+        .filter(|evidence| evidence.checkpoint.runtime_launch.identity().is_some())
+        .map(|evidence| sealed_running_predecessor(&evidence.checkpoint, Some(&blockds)))
+        .transpose()?;
+
     for blockd in blockds.values() {
         if checkpoint.is_none() {
             anyhow::ensure!(
@@ -2211,19 +2222,16 @@ fn runtime_from_inventory(
             (ReconcileStep::Quarantined, VolumeAuthorityEvidence::Unowned { .. }) => true,
             _ => false,
         };
-        let retained_running_physical_launch =
-            runtime_checkpoint.runtime_launch.identity().is_some()
-                && super::authorized_blockd::validate_running_physical_desired_successor(
-                    &blockd.checkpoint.desired,
-                    desired,
-                )
-                .is_ok();
-        let mixed_binding_is_closed = checkpoint_binding == DesiredCheckpointBinding::Current
-            && blockd.binding == DesiredCheckpointBinding::Superseded
-            && (current_checkpoint_adopts_blockd(runtime_checkpoint, attachment)
-                || retained_running_physical_launch);
+        let retained_running_physical_launch = retained_physical_desired
+            .as_ref()
+            .is_some_and(|physical| physical == &blockd.checkpoint.desired);
         anyhow::ensure!(
-            blockd.binding == checkpoint_binding || mixed_binding_is_closed,
+            runtime_and_blockd_bindings_agree(
+                checkpoint_binding,
+                blockd.binding,
+                current_checkpoint_adopts_blockd(runtime_checkpoint, attachment),
+                retained_running_physical_launch,
+            ),
             "Runtime and authorized blockd checkpoint bindings disagree"
         );
         let current_attachment_is_exact = authority_owner_or_exact_release_matches(
@@ -2859,6 +2867,18 @@ fn current_checkpoint_adopts_blockd(
         }),
         _ => false,
     }
+}
+
+fn runtime_and_blockd_bindings_agree(
+    checkpoint: DesiredCheckpointBinding,
+    blockd: DesiredCheckpointBinding,
+    current_checkpoint_adopts_blockd: bool,
+    retained_physical_launch_is_exact: bool,
+) -> bool {
+    blockd == checkpoint
+        || (checkpoint == DesiredCheckpointBinding::Current
+            && blockd == DesiredCheckpointBinding::Superseded
+            && (current_checkpoint_adopts_blockd || retained_physical_launch_is_exact))
 }
 
 fn authority_owner_or_exact_release_matches(
@@ -4090,6 +4110,28 @@ mod tests {
             &blank,
             &launch,
             &head(1, 9),
+        ));
+    }
+
+    #[test]
+    fn current_lifecycle_accepts_only_an_exact_superseded_physical_launch_binding() {
+        assert!(runtime_and_blockd_bindings_agree(
+            DesiredCheckpointBinding::Current,
+            DesiredCheckpointBinding::Superseded,
+            false,
+            true,
+        ));
+        assert!(!runtime_and_blockd_bindings_agree(
+            DesiredCheckpointBinding::Current,
+            DesiredCheckpointBinding::Superseded,
+            false,
+            false,
+        ));
+        assert!(!runtime_and_blockd_bindings_agree(
+            DesiredCheckpointBinding::Superseded,
+            DesiredCheckpointBinding::Current,
+            false,
+            true,
         ));
     }
 

@@ -2628,7 +2628,18 @@ pub(crate) fn validate_scanned_serving_handoff_artifacts(
     let checkpoint = if matches!(checkpoint.step, ReconcileStep::PrepareNetwork { .. })
         || checkpoint.runtime_launch.identity().is_some()
     {
-        prepared_checkpoint = prepare_device_checkpoint_view(checkpoint)?;
+        let mut physical = prepare_device_checkpoint_view(checkpoint)?;
+        if checkpoint.runtime_launch.identity().is_some() {
+            // A closed lifecycle or live-gate checkpoint may bind a newer
+            // Desired while retaining the immutable physical launch. The
+            // handoff artifacts belong to the authorized blockd's original
+            // physical Desired, just as serving-process reconstruction does;
+            // validate that lineage instead of reinterpreting it as the newer
+            // top-level revision.
+            physical.desired_revision = acquired.desired.desired_revision;
+            physical.spec_digest = acquired.desired.spec_digest.clone();
+        }
+        prepared_checkpoint = physical;
         &prepared_checkpoint
     } else {
         checkpoint
@@ -11514,6 +11525,45 @@ mod tests {
                 handshake_peer_process_id: fixture.process.handshake.peer_process_id,
             }
         );
+
+        let devices = match &current.checkpoint().step {
+            ReconcileStep::PrepareDevice { devices } => devices.clone(),
+            _ => unreachable!("fresh handoff successor changed phase"),
+        };
+        let device = devices[0].clone();
+        let launch_checkpoint = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+        let cats_api::runtime_reconciliation::RuntimeLaunch::Present(mut launch) =
+            launch_checkpoint.runtime_launch
+        else {
+            unreachable!("StartRuntime fixture lacks a launch")
+        };
+        launch.devices = devices;
+        let mut lifecycle = current.checkpoint().clone();
+        lifecycle.desired_revision =
+            Revision::new(lifecycle.desired_revision.get().checked_add(1).unwrap()).unwrap();
+        lifecycle.spec_digest = Sha256Digest::from_bytes([0xa5; 32]);
+        lifecycle.runtime_incarnation = Some(launch.runtime_incarnation.clone());
+        lifecycle.runtime_launch = cats_api::runtime_reconciliation::RuntimeLaunch::Present(launch);
+        lifecycle.stable_state = None;
+        lifecycle.lifecycle_admission = LifecycleAdmission::Closed;
+        lifecycle.step = ReconcileStep::DrainPublish {
+            volume_id: device.volume_id,
+            attachment_epoch: device.attachment_epoch,
+            local_generation: device.expected_head.generation,
+            remote_generation: device.expected_head.generation,
+        };
+        validate_scanned_serving_handoff_artifacts(
+            &lifecycle,
+            &fixture.acquired,
+            &target_scan,
+            Some(&record_scan),
+            Some(&retirement_scan),
+        )
+        .expect("lifecycle rebind must retain the immutable physical handoff lineage");
 
         let mut oversized_record = decode_serving_handoff_record(&record_bytes).unwrap();
         let oversized_pid = WireU64::new(u64::from(u32::MAX) + 1).unwrap();
