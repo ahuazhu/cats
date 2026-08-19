@@ -46,6 +46,10 @@ use super::serving_blockd_process::{
 };
 use super::signed_running::SignedLifecycleVolumePort;
 use super::vmm_process::{VmmProcessGlobalInspection, VmmProcessGlobalPort};
+#[cfg(target_os = "linux")]
+use super::vmm_runtime_paths::RetainedManagedVmmLaunchRoot;
+#[cfg(target_os = "linux")]
+use super::vmm_socket_namespace::{RetainedManagedVmmSocketRoot, VmmSocketReceiptStore};
 use super::{
     recover_lifecycle_release_from_authority, DisposableRootDeleteAttempt, FileCheckpointStore,
     NormalAcquireAcceptedContext, NormalReleaseAttempt, NormalReleaseAuthorityRecovery,
@@ -233,7 +237,7 @@ impl LifecyclePhysicalPort for PlatformLifecyclePhysicalPort {
                             if observed == runtime_incarnation
                     )
                 }) {
-                Ok(LifecyclePhysicalAttempt::ExactPostcondition)
+                self.retire_stopped_vmm_private_state(context, expected, permit.checkpoint())
             } else {
                 Ok(LifecyclePhysicalAttempt::Conflict)
             };
@@ -671,7 +675,7 @@ impl PlatformLifecyclePhysicalPort {
             .inspect_vmm_exact_or_absent_after_node_global_sweep(expected, context)?
         {
             VmmProcessGlobalInspection::Absent(_) => {
-                Ok(LifecyclePhysicalAttempt::SubmittedOrAmbiguous)
+                self.retire_stopped_vmm_private_state(context, expected, expected.checkpoint())
             }
             VmmProcessGlobalInspection::Exact(fresh)
                 if fresh.expectation() == admitted.expectation()
@@ -689,6 +693,60 @@ impl PlatformLifecyclePhysicalPort {
             VmmProcessGlobalInspection::Exact(_) | VmmProcessGlobalInspection::Conflict(_) => {
                 Ok(LifecyclePhysicalAttempt::Conflict)
             }
+        }
+    }
+
+    fn retire_stopped_vmm_private_state(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        expected: &super::vmm_process::VmmProcessExpectation,
+        checkpoint: &RuntimeCheckpoint,
+    ) -> anyhow::Result<LifecyclePhysicalAttempt> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (context, expected, checkpoint);
+            return Ok(LifecyclePhysicalAttempt::Unavailable);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            anyhow::ensure!(
+                expected.checkpoint() == checkpoint,
+                "StopRuntime private retirement names another checkpoint"
+            );
+            let socket_root = RetainedManagedVmmSocketRoot::open_installed()
+                .context("open StopRuntime VMM socket root")?;
+            let state = context.state_directory().clone();
+            let launch_root = Arc::new(
+                RetainedManagedVmmLaunchRoot::open_existing(state.clone())
+                    .context("open StopRuntime VMM launch root")?,
+            );
+            let receipts = VmmSocketReceiptStore::open_existing(state)
+                .context("open StopRuntime VMM receipt store")?;
+            let retired = launch_root.retire_current_boot_stop(
+                &socket_root,
+                &receipts,
+                checkpoint,
+                context,
+                |_| {
+                    Ok(
+                        match self
+                            .vmm_process
+                            .inspect_vmm_exact_or_absent_after_node_global_sweep(
+                                expected, context,
+                            )? {
+                            VmmProcessGlobalInspection::Absent(absence) => Some(*absence),
+                            VmmProcessGlobalInspection::Exact(_)
+                            | VmmProcessGlobalInspection::Conflict(_)
+                            | VmmProcessGlobalInspection::Unavailable => None,
+                        },
+                    )
+                },
+            )?;
+            Ok(if retired {
+                LifecyclePhysicalAttempt::ExactPostcondition
+            } else {
+                LifecyclePhysicalAttempt::SubmittedOrAmbiguous
+            })
         }
     }
 

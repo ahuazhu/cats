@@ -1233,7 +1233,8 @@ mod tests {
         ExactVmmProcessAbsenceProof, InstalledStaleBootVmmRecoveryPorts, ManagedVmmLaunchFilePaths,
         RetainedManagedBlockdSocketRoot, RetainedManagedVmmLaunchRoot,
         RetainedManagedVmmSocketRoot, RuntimeCheckpointRecoverySet,
-        StaleBootVmmProcessGlobalInspection, StaleBootVmmProcessGlobalPort, VmmProcessExpectation,
+        StaleBootVmmProcessGlobalInspection, StaleBootVmmProcessGlobalPort,
+        TerminalVmmResidueExpectation, TerminalVmmResidueGlobalInspection, VmmProcessExpectation,
         VmmSocketOwnershipReceiptV1, VmmSocketReceiptStore, BLOCKD_SOCKET_INTENT_NAMESPACE,
         INSTALLED_VMM_SOCKET_ROOT, VMM_LAUNCH_FILE_NAMESPACE,
     };
@@ -1273,6 +1274,15 @@ mod tests {
             Ok(StaleBootVmmProcessGlobalInspection::Absent(Box::new(
                 ExactVmmProcessAbsenceProof::for_test_expectation(selected.clone()),
             )))
+        }
+
+        fn inspect_terminal_residue_absence_after_node_global_sweep(
+            &self,
+            _selected: &TerminalVmmResidueExpectation,
+            _checkpoints: &RuntimeCheckpointRecoverySet,
+            _context: &crate::runtime_spine::RuntimePreScanRecoveryContext,
+        ) -> anyhow::Result<TerminalVmmResidueGlobalInspection> {
+            Ok(TerminalVmmResidueGlobalInspection::Unavailable)
         }
     }
 

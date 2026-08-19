@@ -172,6 +172,17 @@ pub(crate) trait StaleBootVmmProcessGlobalPort:
         checkpoints: &super::clean_slate_probes::RuntimeCheckpointRecoverySet,
         context: &crate::runtime_spine::RuntimePreScanRecoveryContext,
     ) -> anyhow::Result<StaleBootVmmProcessGlobalInspection>;
+
+    /// Upgrade-only proof for the historical terminal checkpoint bug which
+    /// dropped RuntimeLaunch before its provider-private receipt and launch
+    /// journal. Implementations must require a VMM-empty complete checkpoint
+    /// set and bracket the same closed Node-global sweep used by inventory.
+    fn inspect_terminal_residue_absence_after_node_global_sweep(
+        &self,
+        selected: &super::vmm_socket_namespace::TerminalVmmResidueExpectation,
+        checkpoints: &super::clean_slate_probes::RuntimeCheckpointRecoverySet,
+        context: &crate::runtime_spine::RuntimePreScanRecoveryContext,
+    ) -> anyhow::Result<TerminalVmmResidueGlobalInspection>;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -180,6 +191,40 @@ pub(crate) enum StaleBootVmmProcessGlobalInspection {
     Absent(Box<ExactVmmProcessAbsenceProof>),
     Conflict(VmmProcessConflict),
     Unavailable,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[cfg(target_os = "linux")]
+pub(crate) enum TerminalVmmResidueGlobalInspection {
+    Absent(Box<ExactTerminalVmmResidueAbsenceProof>),
+    Conflict(VmmProcessConflict),
+    Unavailable,
+}
+
+/// Opaque proof that the compatibility residue was the only retained VMM
+/// identity and that a fresh closed Node-global sweep found no VMM unit,
+/// cgroup, Cats process or live provider-private socket which could still use
+/// its launch files.
+#[derive(Debug, PartialEq, Eq)]
+#[cfg(target_os = "linux")]
+pub(crate) struct ExactTerminalVmmResidueAbsenceProof {
+    expectation: super::vmm_socket_namespace::TerminalVmmResidueExpectation,
+}
+
+#[cfg(target_os = "linux")]
+impl ExactTerminalVmmResidueAbsenceProof {
+    pub(super) fn for_expectation(
+        expectation: super::vmm_socket_namespace::TerminalVmmResidueExpectation,
+    ) -> Self {
+        Self { expectation }
+    }
+
+    pub(crate) fn matches(
+        &self,
+        expectation: &super::vmm_socket_namespace::TerminalVmmResidueExpectation,
+    ) -> bool {
+        &self.expectation == expectation
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

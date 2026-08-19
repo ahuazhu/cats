@@ -240,6 +240,7 @@ pub(crate) use vmm_process::VmmProcessExpectation;
 pub(crate) use vmm_process::{
     stale_boot_recovery_global_sealed, ExactVmmProcessAbsenceProof,
     StaleBootVmmProcessGlobalInspection, StaleBootVmmProcessGlobalPort,
+    TerminalVmmResidueGlobalInspection,
 };
 #[allow(unused_imports)]
 pub(crate) use vmm_runtime_paths::ManagedVmmLaunchFilePaths;
@@ -250,7 +251,9 @@ pub(crate) use vmm_runtime_paths::VMM_LAUNCH_FILE_NAMESPACE;
 #[cfg(target_os = "linux")]
 pub(crate) use vmm_socket_namespace::ManagedVmmSocketPreparation;
 #[cfg(all(test, target_os = "linux"))]
-pub(crate) use vmm_socket_namespace::{current_kernel_node_boot_id, VmmSocketOwnershipReceiptV1};
+pub(crate) use vmm_socket_namespace::{
+    current_kernel_node_boot_id, TerminalVmmResidueExpectation, VmmSocketOwnershipReceiptV1,
+};
 #[allow(unused_imports)]
 pub(crate) use vmm_socket_namespace::{
     vmm_state_directory_from_checkpoint, ManagedVmmSocketPaths, ManagedVmmSocketRoot,

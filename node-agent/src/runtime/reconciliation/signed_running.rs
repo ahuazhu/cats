@@ -399,7 +399,10 @@ impl SignedRunningPublicationRecovery {
         &self,
         context: &RuntimePreScanRecoveryContext,
     ) -> anyhow::Result<RuntimePreScanRecoveryOutcome> {
-        use super::vmm_process::{StaleBootVmmProcessGlobalInspection, VmmProcessExpectation};
+        use super::vmm_process::{
+            StaleBootVmmProcessGlobalInspection, TerminalVmmResidueGlobalInspection,
+            VmmProcessExpectation,
+        };
         use super::vmm_socket_namespace::StaleVmmSocketReceiptScan;
 
         let Some(ports) = &self.stale_boot_vmm else {
@@ -409,11 +412,46 @@ impl SignedRunningPublicationRecovery {
         else {
             return Ok(RuntimePreScanRecoveryOutcome::NoChange);
         };
+        let all_checkpoints = checkpoints.iter_checkpoints().collect::<Vec<_>>();
+        let physical = context.inventory_context();
+        if let Some(candidate) = ports.receipts.retain_single_terminal_vmm_residue(
+            &ports.socket_root,
+            &all_checkpoints,
+            &physical,
+        )? {
+            let cat_id = candidate.expectation().checkpoint().cat_id.clone();
+            let recovered = ports.launch_root.recover_terminal_vmm_residue(
+                &ports.socket_root,
+                &ports.receipts,
+                candidate,
+                &physical,
+                |_, selected| match ports
+                    .global
+                    .inspect_terminal_residue_absence_after_node_global_sweep(
+                        selected,
+                        &checkpoints,
+                        context,
+                    )? {
+                    TerminalVmmResidueGlobalInspection::Absent(absence) => Ok(*absence),
+                    TerminalVmmResidueGlobalInspection::Conflict(problem) => anyhow::bail!(
+                        "terminal VMM recovery found conflicting global identity: {problem:?}"
+                    ),
+                    TerminalVmmResidueGlobalInspection::Unavailable => {
+                        anyhow::bail!("terminal VMM recovery global sweep is unavailable")
+                    }
+                },
+            )?;
+            context.check_active()?;
+            return Ok(if recovered {
+                RuntimePreScanRecoveryOutcome::Recovered { cat_id }
+            } else {
+                RuntimePreScanRecoveryOutcome::NoChange
+            });
+        }
         let expected_checkpoints = checkpoints
             .iter_checkpoints()
             .filter(|checkpoint| matches!(checkpoint.runtime_launch, RuntimeLaunch::Present(_)))
             .collect::<Vec<_>>();
-        let physical = context.inventory_context();
         let candidate = ports.receipts.retain_one_stale_boot_receipt(
             &ports.socket_root,
             &expected_checkpoints,
@@ -10986,6 +11024,17 @@ mod tests {
             Ok(StaleBootVmmProcessGlobalInspection::Absent(Box::new(
                 ExactVmmProcessAbsenceProof::for_expectation(selected.clone()),
             )))
+        }
+
+        fn inspect_terminal_residue_absence_after_node_global_sweep(
+            &self,
+            _selected: &crate::runtime::reconciliation::vmm_socket_namespace::TerminalVmmResidueExpectation,
+            _checkpoints: &RuntimeCheckpointRecoverySet,
+            _context: &RuntimePreScanRecoveryContext,
+        ) -> anyhow::Result<
+            crate::runtime::reconciliation::vmm_process::TerminalVmmResidueGlobalInspection,
+        > {
+            Ok(crate::runtime::reconciliation::vmm_process::TerminalVmmResidueGlobalInspection::Unavailable)
         }
     }
 

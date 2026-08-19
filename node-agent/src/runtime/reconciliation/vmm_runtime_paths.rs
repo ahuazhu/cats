@@ -35,9 +35,10 @@ use super::vmm_launch_artifacts::VmmLaunchArtifactDescriptors;
 #[cfg(target_os = "linux")]
 use super::vmm_socket_namespace::{
     current_kernel_node_boot_id, scan_receipt_namespace_snapshot,
-    scan_stale_boot_receipt_namespace_snapshot, ReceiptNamespaceSnapshot,
-    RetainedManagedVmmSocketRoot, RetainedStaleVmmSocketReceipt,
-    StaleVmmReceiptRetirementAuthority, VmmSocketOwnershipReceiptV1, VmmSocketReceiptStore,
+    scan_stale_boot_receipt_namespace_snapshot, CurrentVmmSocketCleanupAuthority,
+    ReceiptNamespaceSnapshot, RetainedManagedVmmSocketRoot, RetainedTerminalVmmResidue,
+    RetainedVmmSocketReceipt, TerminalVmmResidueExpectation, VmmReceiptRetirementAuthority,
+    VmmSocketOwnershipReceiptV1, VmmSocketReceiptStore,
 };
 
 const CHECKPOINT_FD: i32 = 64;
@@ -332,7 +333,7 @@ impl RetainedManagedVmmLaunchRoot {
         socket_root: &RetainedManagedVmmSocketRoot,
         receipts: &VmmSocketReceiptStore,
         checkpoint: &RuntimeCheckpoint,
-        candidate: RetainedStaleVmmSocketReceipt,
+        candidate: RetainedVmmSocketReceipt,
         context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
         inspect_fresh_global_absence: impl FnOnce(
             &ManagedVmmLaunchNamespaceGuard,
@@ -378,6 +379,293 @@ impl RetainedManagedVmmLaunchRoot {
         candidate.retire(receipts, &authority)?;
         context.check_active()?;
         Ok(true)
+    }
+
+    /// Finish the provider-private suffix of one current StopRuntime. The
+    /// launch-root EX lock is acquired before the fresh closed Node-global
+    /// absence proof and remains held while the socket attempt, launch files,
+    /// and finally the durable receipt are retired. Every intermediate
+    /// quarantine is admitted by the same StopRuntime checkpoint, making the
+    /// sequence restartable at each fsync boundary.
+    pub(crate) fn retire_current_boot_stop(
+        self: &Arc<Self>,
+        socket_root: &RetainedManagedVmmSocketRoot,
+        receipts: &VmmSocketReceiptStore,
+        checkpoint: &RuntimeCheckpoint,
+        context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+        inspect_fresh_global_absence: impl FnOnce(
+            &ManagedVmmLaunchNamespaceGuard,
+        ) -> Result<
+            Option<super::vmm_process::ExactVmmProcessAbsenceProof>,
+        >,
+    ) -> Result<bool> {
+        context.check_active()?;
+        let Some(namespace_guard) = self.try_lock_effect_namespace()? else {
+            return Ok(false);
+        };
+        let Some(absence) = inspect_fresh_global_absence(&namespace_guard)? else {
+            return Ok(false);
+        };
+        let authority = namespace_guard.bind_fresh_absence(absence, checkpoint)?;
+        authority.assert_for(self, checkpoint)?;
+        match receipts.retain_current_stop_receipt(socket_root, checkpoint)? {
+            Some(candidate) => {
+                candidate.assert_current(receipts)?;
+                socket_root
+                    .retire_current_boot_attempt(receipts, checkpoint, &candidate, &authority)?;
+                if let Some(residue) =
+                    self.retain_current_launch_residue(&authority, checkpoint, candidate.receipt())?
+                {
+                    residue.recover(&authority, checkpoint)?;
+                }
+                context.check_active()?;
+                candidate.assert_current(receipts)?;
+                candidate.retire(receipts, &authority)?;
+            }
+            None => {
+                // Missing publication is a valid StartRuntime crash point,
+                // but it cannot coexist with any derived attempt name.
+                socket_root.assert_checkpoint_attempt_absent(checkpoint)?;
+                self.assert_checkpoint_attempt_absent(checkpoint)?;
+            }
+        }
+        authority.assert_for(self, checkpoint)?;
+        context.check_active()?;
+        Ok(true)
+    }
+
+    /// Retire the single compatibility residue after the recovery bridge has
+    /// proven the Node contains no retained/live VMM at all. Unlike normal
+    /// StopRuntime this never reconstructs a missing RuntimeLaunch and never
+    /// grants start, process or socket authority.
+    pub(crate) fn recover_terminal_vmm_residue(
+        self: &Arc<Self>,
+        socket_root: &RetainedManagedVmmSocketRoot,
+        receipts: &VmmSocketReceiptStore,
+        candidate: RetainedTerminalVmmResidue,
+        context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+        inspect_fresh_global_absence: impl FnOnce(
+            &ManagedVmmLaunchNamespaceGuard,
+            &TerminalVmmResidueExpectation,
+        ) -> Result<
+            super::vmm_process::ExactTerminalVmmResidueAbsenceProof,
+        >,
+    ) -> Result<bool> {
+        context.check_active()?;
+        let Some(namespace_guard) = self.try_lock_effect_namespace()? else {
+            return Ok(false);
+        };
+        candidate.assert_current(receipts, socket_root)?;
+        let expectation = candidate.expectation().clone();
+        let proof = inspect_fresh_global_absence(&namespace_guard, &expectation)?;
+        let authority =
+            namespace_guard.bind_terminal_residue_absence(proof, expectation.clone(), context)?;
+        candidate.assert_current(receipts, socket_root)?;
+        if let Some(residue) = self.retain_terminal_launch_residue(&authority, &expectation)? {
+            residue.recover_terminal(&authority, expectation.checkpoint())?;
+        }
+        context.check_active()?;
+        candidate.assert_current(receipts, socket_root)?;
+        candidate.into_receipt().retire(receipts, &authority)?;
+        authority.assert_for(self, &expectation)?;
+        context.check_active()?;
+        Ok(true)
+    }
+
+    fn retain_terminal_launch_residue(
+        self: &Arc<Self>,
+        authority: &GuardedTerminalVmmResidueAbsence<'_>,
+        expectation: &TerminalVmmResidueExpectation,
+    ) -> Result<Option<Box<RetainedManagedVmmLaunchResidue>>> {
+        authority.assert_for(self, expectation)?;
+        self.assert_current()?;
+        let receipt = expectation.receipt();
+        let paths = ManagedVmmLaunchFilePaths::for_incarnation(
+            &self.state_directory,
+            receipt.runtime_incarnation(),
+        )?;
+        let public_name = launch_attempt_name(&paths)?;
+        let quarantine_name = quarantine_attempt_name(&public_name)?;
+        let public = open_launch_attempt(self, &public_name)?;
+        let quarantine = open_launch_attempt(self, &quarantine_name)?;
+        anyhow::ensure!(
+            public.is_none() || quarantine.is_none(),
+            "terminal VMM launch residue has public and quarantine aliases"
+        );
+        let marker_bytes = receipt.encoded_bytes()?;
+        if let Some(directory) = public {
+            let names = launch_attempt_names(&directory)?;
+            if !names.contains(VMM_LAUNCH_OWNER_BASENAME) {
+                anyhow::ensure!(
+                    names.is_empty(),
+                    "unmarked terminal VMM launch residue contains foreign leaves"
+                );
+                create_launch_owner_marker(&directory, &marker_bytes)?;
+                directory.sync_all()?;
+                authority.assert_for(self, expectation)?;
+            }
+            return Ok(Some(Box::new(RetainedManagedVmmLaunchResidue::new(
+                Arc::clone(self),
+                public_name,
+                quarantine_name,
+                directory,
+                marker_bytes,
+                LaunchResidueLocation::Public,
+            )?)));
+        }
+        if let Some(directory) = quarantine {
+            return Ok(Some(Box::new(RetainedManagedVmmLaunchResidue::new(
+                Arc::clone(self),
+                public_name,
+                quarantine_name,
+                directory,
+                marker_bytes,
+                LaunchResidueLocation::Quarantine,
+            )?)));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn assert_single_terminal_residue_accounted(
+        &self,
+        expectation: &TerminalVmmResidueExpectation,
+        context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+    ) -> Result<()> {
+        context.check_active()?;
+        let first = self.capture_single_terminal_residue(expectation, context)?;
+        let second = self.capture_single_terminal_residue(expectation, context)?;
+        anyhow::ensure!(
+            first == second,
+            "terminal VMM launch namespace changed across closed scan"
+        );
+        self.assert_current()?;
+        context.check_active()
+    }
+
+    fn capture_single_terminal_residue(
+        &self,
+        expectation: &TerminalVmmResidueExpectation,
+        context: &dyn crate::runtime_spine::RuntimePhysicalReadContext,
+    ) -> Result<Option<(String, LaunchAttemptSnapshot)>> {
+        self.assert_current()?;
+        let receipt = expectation.receipt();
+        let paths = ManagedVmmLaunchFilePaths::for_incarnation(
+            &self.state_directory,
+            receipt.runtime_incarnation(),
+        )?;
+        let public_name = launch_attempt_name(&paths)?;
+        let quarantine_name = quarantine_attempt_name(&public_name)?;
+        let public = public_name.to_string_lossy().into_owned();
+        let quarantine = quarantine_name.to_string_lossy().into_owned();
+        let mut entries =
+            std::fs::read_dir(format!("/proc/self/fd/{}", self.descriptor.as_raw_fd()))
+                .context("enumerate terminal VMM launch namespace")?;
+        let Some(entry) = entries.next().transpose()? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            entries.next().transpose()?.is_none(),
+            "terminal VMM compatibility recovery requires a single launch attempt"
+        );
+        context.check_active()?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("terminal VMM launch name is not UTF-8"))?;
+        anyhow::ensure!(
+            name == public || name == quarantine,
+            "terminal VMM launch residue has a noncanonical name"
+        );
+        let directory = open_directory_at_name(&self.descriptor, &CString::new(name.as_bytes())?)?;
+        ensure_launch_directory(
+            &directory.metadata()?,
+            self.identity.user,
+            self.identity.group,
+            0o700,
+        )?;
+        let names = launch_attempt_names(&directory)?;
+        validate_launch_attempt_entries(&directory, &names)?;
+        anyhow::ensure!(
+            names.is_empty() || names.contains(VMM_LAUNCH_OWNER_BASENAME),
+            "terminal VMM launch residue lacks its owner marker"
+        );
+        if names.contains(VMM_LAUNCH_OWNER_BASENAME) {
+            verify_launch_owner_marker(&directory, &receipt.encoded_bytes()?)?;
+        }
+        let snapshot = LaunchAttemptSnapshot {
+            directory: LaunchDirectoryIdentity::from_metadata(&directory.metadata()?),
+            leaves: launch_attempt_leaf_identities(&directory, &names)?,
+            names,
+        };
+        context.check_active()?;
+        Ok(Some((name, snapshot)))
+    }
+
+    fn retain_current_launch_residue(
+        self: &Arc<Self>,
+        authority: &GuardedVmmLaunchAbsence<'_>,
+        checkpoint: &RuntimeCheckpoint,
+        receipt: &VmmSocketOwnershipReceiptV1,
+    ) -> Result<Option<Box<RetainedManagedVmmLaunchResidue>>> {
+        authority.assert_for(self, checkpoint)?;
+        self.assert_current()?;
+        let paths =
+            ManagedVmmLaunchFilePaths::paths_from_checkpoint(&self.state_directory, checkpoint)?;
+        receipt.validate_launch_paths(checkpoint, &self.state_directory, &paths)?;
+        let public_name = launch_attempt_name(&paths)?;
+        let quarantine_name = quarantine_attempt_name(&public_name)?;
+        let public = open_launch_attempt(self, &public_name)?;
+        let quarantine = open_launch_attempt(self, &quarantine_name)?;
+        anyhow::ensure!(
+            public.is_none() || quarantine.is_none(),
+            "StopRuntime VMM launch attempt has public and quarantine aliases"
+        );
+        let marker_bytes = receipt.encoded_bytes()?;
+        if let Some(directory) = public {
+            let names = launch_attempt_names(&directory)?;
+            if !names.contains(VMM_LAUNCH_OWNER_BASENAME) {
+                anyhow::ensure!(
+                    names.is_empty(),
+                    "unmarked StopRuntime VMM launch attempt contains foreign leaves"
+                );
+                create_launch_owner_marker(&directory, &marker_bytes)?;
+                directory.sync_all()?;
+                authority.assert_for(self, checkpoint)?;
+            }
+            return Ok(Some(Box::new(RetainedManagedVmmLaunchResidue::new(
+                Arc::clone(self),
+                public_name,
+                quarantine_name,
+                directory,
+                marker_bytes,
+                LaunchResidueLocation::Public,
+            )?)));
+        }
+        if let Some(directory) = quarantine {
+            return Ok(Some(Box::new(RetainedManagedVmmLaunchResidue::new(
+                Arc::clone(self),
+                public_name,
+                quarantine_name,
+                directory,
+                marker_bytes,
+                LaunchResidueLocation::Quarantine,
+            )?)));
+        }
+        Ok(None)
+    }
+
+    fn assert_checkpoint_attempt_absent(&self, checkpoint: &RuntimeCheckpoint) -> Result<()> {
+        self.assert_current()?;
+        let paths =
+            ManagedVmmLaunchFilePaths::paths_from_checkpoint(&self.state_directory, checkpoint)?;
+        let public_name = launch_attempt_name(&paths)?;
+        let quarantine_name = quarantine_attempt_name(&public_name)?;
+        anyhow::ensure!(
+            open_launch_attempt(self, &public_name)?.is_none()
+                && open_launch_attempt(self, &quarantine_name)?.is_none(),
+            "checkpointed VMM launch attempt remains without its receipt"
+        );
+        self.assert_current()
     }
 
     fn retain_stale_boot_launch_residue(
@@ -522,6 +810,26 @@ impl ManagedVmmLaunchNamespaceGuard {
             context,
         })
     }
+
+    pub(crate) fn bind_terminal_residue_absence<'a>(
+        &'a self,
+        absence: super::vmm_process::ExactTerminalVmmResidueAbsenceProof,
+        expectation: TerminalVmmResidueExpectation,
+        context: &'a dyn crate::runtime_spine::RuntimePhysicalReadContext,
+    ) -> Result<GuardedTerminalVmmResidueAbsence<'a>> {
+        context.check_active()?;
+        self.assert_for(&self.root)?;
+        anyhow::ensure!(
+            absence.matches(&expectation),
+            "terminal VMM absence names another residue"
+        );
+        Ok(GuardedTerminalVmmResidueAbsence {
+            guard: self,
+            absence,
+            expectation,
+            context,
+        })
+    }
 }
 
 /// Non-cloneable effect-time absence authority whose lifetime cannot outlive
@@ -544,6 +852,90 @@ impl GuardedVmmLaunchAbsence<'_> {
         anyhow::ensure!(
             self.absence.matches_checkpoint(checkpoint),
             "guarded VMM absence names another checkpoint"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl super::vmm_socket_namespace::receipt_retirement_sealed::Sealed
+    for GuardedVmmLaunchAbsence<'_>
+{
+}
+
+#[cfg(target_os = "linux")]
+impl VmmReceiptRetirementAuthority for GuardedVmmLaunchAbsence<'_> {
+    fn assert_receipt_retirement(&self, receipt: &VmmSocketOwnershipReceiptV1) -> Result<()> {
+        let checkpoint = self.absence.expectation().checkpoint();
+        self.assert_for(&self.guard.root, checkpoint)?;
+        let retained = RetainedRuntimeLaunchAuthority::from_checkpoint(checkpoint)?;
+        anyhow::ensure!(
+            receipt.node_boot_id() == &current_kernel_node_boot_id()?
+                && receipt.cat_id() == &checkpoint.cat_id
+                && receipt.runtime_incarnation() == &retained.identity().runtime_incarnation,
+            "current-boot VMM receipt changed StopRuntime coordinate"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl CurrentVmmSocketCleanupAuthority for GuardedVmmLaunchAbsence<'_> {
+    fn assert_socket_cleanup(
+        &self,
+        checkpoint: &RuntimeCheckpoint,
+        receipt: &VmmSocketOwnershipReceiptV1,
+        root: &RetainedManagedVmmSocketRoot,
+        store: &VmmSocketReceiptStore,
+    ) -> Result<()> {
+        self.assert_for(&self.guard.root, checkpoint)?;
+        anyhow::ensure!(
+            self.guard.root.state_directory().path() == store.state_directory().path(),
+            "VMM socket cleanup uses another Node state directory"
+        );
+        receipt.validate_against(checkpoint, store.state_directory(), root)?;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct GuardedTerminalVmmResidueAbsence<'a> {
+    guard: &'a ManagedVmmLaunchNamespaceGuard,
+    absence: super::vmm_process::ExactTerminalVmmResidueAbsenceProof,
+    expectation: TerminalVmmResidueExpectation,
+    context: &'a dyn crate::runtime_spine::RuntimePhysicalReadContext,
+}
+
+#[cfg(target_os = "linux")]
+impl GuardedTerminalVmmResidueAbsence<'_> {
+    fn assert_for(
+        &self,
+        root: &Arc<RetainedManagedVmmLaunchRoot>,
+        expectation: &TerminalVmmResidueExpectation,
+    ) -> Result<()> {
+        self.guard.assert_for(root)?;
+        self.context.check_active()?;
+        anyhow::ensure!(
+            self.expectation == *expectation && self.absence.matches(expectation),
+            "terminal VMM cleanup authority changed coordinate"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl super::vmm_socket_namespace::receipt_retirement_sealed::Sealed
+    for GuardedTerminalVmmResidueAbsence<'_>
+{
+}
+
+#[cfg(target_os = "linux")]
+impl VmmReceiptRetirementAuthority for GuardedTerminalVmmResidueAbsence<'_> {
+    fn assert_receipt_retirement(&self, receipt: &VmmSocketOwnershipReceiptV1) -> Result<()> {
+        self.assert_for(&self.guard.root, &self.expectation)?;
+        anyhow::ensure!(
+            receipt == self.expectation.receipt(),
+            "terminal VMM receipt changed compatibility coordinate"
         );
         Ok(())
     }
@@ -581,13 +973,13 @@ impl GuardedStaleBootVmmLaunchAbsence<'_> {
 }
 
 #[cfg(target_os = "linux")]
-impl super::vmm_socket_namespace::stale_receipt_retirement_sealed::Sealed
+impl super::vmm_socket_namespace::receipt_retirement_sealed::Sealed
     for GuardedStaleBootVmmLaunchAbsence<'_>
 {
 }
 
 #[cfg(target_os = "linux")]
-impl StaleVmmReceiptRetirementAuthority for GuardedStaleBootVmmLaunchAbsence<'_> {
+impl VmmReceiptRetirementAuthority for GuardedStaleBootVmmLaunchAbsence<'_> {
     fn assert_receipt_retirement(&self, receipt: &VmmSocketOwnershipReceiptV1) -> Result<()> {
         self.assert_for(&self.guard.root, &self.checkpoint)?;
         anyhow::ensure!(
@@ -867,6 +1259,21 @@ impl VmmLaunchCleanupAuthority for GuardedStaleBootVmmLaunchAbsence<'_> {
 }
 
 #[cfg(target_os = "linux")]
+impl VmmLaunchCleanupAuthority for GuardedTerminalVmmResidueAbsence<'_> {
+    fn assert_cleanup_for(
+        &self,
+        root: &Arc<RetainedManagedVmmLaunchRoot>,
+        checkpoint: &RuntimeCheckpoint,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            checkpoint == self.expectation.checkpoint(),
+            "terminal VMM cleanup received another checkpoint"
+        );
+        self.assert_for(root, &self.expectation)
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl RetainedManagedVmmLaunchResidue {
     fn new(
         root: Arc<RetainedManagedVmmLaunchRoot>,
@@ -922,6 +1329,14 @@ impl RetainedManagedVmmLaunchResidue {
     pub(crate) fn recover_stale_boot(
         self,
         authority: &GuardedStaleBootVmmLaunchAbsence<'_>,
+        checkpoint: &RuntimeCheckpoint,
+    ) -> Result<()> {
+        self.recover_inner(authority, checkpoint, |_| Ok(()))
+    }
+
+    pub(crate) fn recover_terminal(
+        self,
+        authority: &GuardedTerminalVmmResidueAbsence<'_>,
         checkpoint: &RuntimeCheckpoint,
     ) -> Result<()> {
         self.recover_inner(authority, checkpoint, |_| Ok(()))
@@ -2544,6 +2959,28 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn stop_runtime_checkpoint(launch_checkpoint: &RuntimeCheckpoint) -> RuntimeCheckpoint {
+        let mut checkpoint = launch_checkpoint.clone();
+        checkpoint.desired_revision =
+            Revision::new(launch_checkpoint.desired_revision.get() + 1).unwrap();
+        checkpoint.spec_digest = Sha256Digest::from_bytes([0x93; 32]);
+        let launch = checkpoint
+            .runtime_launch
+            .identity()
+            .expect("StopRuntime fixture retains its launch")
+            .clone();
+        checkpoint.stable_state = None;
+        checkpoint.step = ReconcileStep::StopRuntime {
+            runtime_incarnation: launch.runtime_incarnation,
+            process_start_time_ticks: cats_api::runtime_reconciliation::WireU64::new(1).unwrap(),
+            scope_id: launch.scope_id,
+        };
+        encode_runtime_checkpoint(&checkpoint)
+            .unwrap_or_else(|error| panic!("StopRuntime checkpoint is invalid: {:?}", error.error));
+        checkpoint
+    }
+
+    #[cfg(target_os = "linux")]
     fn launch_checkpoint_for_paths(root: &Path) -> RuntimeCheckpoint {
         let mut checkpoint = start_runtime_checkpoint();
         let ReconcileStep::StartRuntime {
@@ -2974,7 +3411,7 @@ mod tests {
             self.receipt_store.publish(&self.receipt).unwrap();
         }
 
-        fn stale_candidate(&self) -> RetainedStaleVmmSocketReceipt {
+        fn stale_candidate(&self) -> RetainedVmmSocketReceipt {
             match self
                 .receipt_store
                 .retain_one_stale_boot_receipt(
@@ -3187,6 +3624,76 @@ mod tests {
             .prepare_existing_receipt(&authority, &fixture.checkpoint, &fixture.receipt,)
             .is_err());
         assert_eq!(std::fs::read(foreign).unwrap(), b"foreign");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_runtime_retires_launch_files_before_the_current_receipt() {
+        let mut fixture = LaunchFixture::new();
+        fixture.receipt_store.publish(&fixture.receipt).unwrap();
+        let ready = match fixture.prepare() {
+            ManagedVmmLaunchPreparation::Ready(ready) => ready,
+            _ => panic!("fresh launch attempt was not ready"),
+        };
+        let paths = ManagedVmmLaunchFilePaths::paths_from_checkpoint(
+            fixture.launch_root.state_directory(),
+            &fixture.checkpoint,
+        )
+        .unwrap();
+        for (path, bytes) in [
+            (paths.memory_file_path(), b"memory".as_slice()),
+            (paths.serial_log_path(), b"serial".as_slice()),
+            (paths.vmm_log_path(), b"vmm".as_slice()),
+        ] {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path.as_str())
+                .unwrap();
+            file.write_all(bytes).unwrap();
+            file.sync_all().unwrap();
+        }
+        ready.assert_ready_with_launch_files().unwrap();
+        drop(ready);
+        fixture.checkpoint = stop_runtime_checkpoint(&fixture.checkpoint);
+
+        assert!(fixture
+            .launch_root
+            .retire_current_boot_stop(
+                &fixture.socket_root,
+                &fixture.receipt_store,
+                &fixture.checkpoint,
+                &scan_context(),
+                |guard| {
+                    guard.assert_for(&fixture.launch_root)?;
+                    anyhow::ensure!(
+                        fixture.launch_root.try_lock_effect_namespace()?.is_none(),
+                        "StopRuntime absence was sampled without launch-root exclusion"
+                    );
+                    Ok(Some(fixture.absence()))
+                },
+            )
+            .unwrap());
+        assert!(!Path::new(paths.directory().as_str()).exists());
+        assert!(fixture
+            .receipt_store
+            .load(fixture.receipt.runtime_incarnation())
+            .unwrap()
+            .is_none());
+
+        // Exact replay after all three provider-private namespaces are empty
+        // is a settled postcondition, not a new mutation.
+        assert!(fixture
+            .launch_root
+            .retire_current_boot_stop(
+                &fixture.socket_root,
+                &fixture.receipt_store,
+                &fixture.checkpoint,
+                &scan_context(),
+                |_| Ok(Some(fixture.absence())),
+            )
+            .unwrap());
     }
 
     #[cfg(target_os = "linux")]
