@@ -1808,7 +1808,7 @@ async fn spawn_inner(
                             }
                         }
                         Err(error) => {
-                            tracing::warn!(%error, "volume delete sweep pass failed");
+                            tracing::warn!(error = ?error, "volume delete sweep pass failed");
                         }
                     }
                 }
