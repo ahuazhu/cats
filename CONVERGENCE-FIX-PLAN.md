@@ -139,6 +139,32 @@ checkpoint 推进到 Volume release(`disposition=delete_disposable_root`);但生
 - `85ffaf18` terminal blockd socket owner 退休、`065ac9ab` pre-scan lane 密封、
   `40eb20c3` absent kernel serving owner 保留 —— D1 同族的连环空格,**已提交未部署**。
 
+### 夜间推进台账(8/20 02:00–05:30,按撞击顺序)
+
+- **D7 拒绝路径自死锁**(`0fe19f3a`/`ccbe8660`):`persist_definite_release_rejection`
+  在持 guard 调用链上重取不可重入 writer 锁,gdb 栈精确定位;签名强制传 guard,类型级修复。
+- **D8 证据游标竞态**(`988b8550`):attestation 每轮扫描推进,rebind→refresh→release 的两轮结构
+  使控制面「游标精确相等」检查永不可能通过(结构性活锁);rebind 现同 admission 内就地续入
+  release;被取代 digest 的持久 409 标记加受限退休(坐标精确一致才可退)。
+- **D9 回收后扫描形态**(`02256c45`):授权 reclaim 删光数据树后,验证器仍要求 blockd lineage
+  绑定 → 全节点扫描不可用;DeleteDisposableRoot 的完全缺席=回收后置条件,予以接纳。
+- **D10 Deleted 终态未编码**(`42e0b44e`/`bdae61b9`/`1f676efc`):`Stable{Deleted}` 首次可达后,
+  planner 守卫、settle 谓词、扫描 phase envelope、Ready 条件四处都只认 Cold;逐一补 Deleted
+  (节点侧义务止于 released+reclaimed,行/远端删除归控制面)。
+- **D11 = N2**(`2a581c27`):inventory port 学会携带 §11.3 delete completion receipt,
+  「行已删」由 receipt 证明并停止投影;无 receipt/坐标漂移/本地残迹仍 fail closed。
+- **D12 = §11.1 converge 无生产入口**(`bc29666c`):维护角色对 Deleted 墓碑执行 converge
+  begin_delete(单节点 admission 锁定+全字段证据),**生产首次执行成功**(卷已进 Deleting)。
+- **D13 sweeper S3 权限/未知失败**(进行中):controld 首次做 S3 删除;pod identity 角色补了
+  `cats-fresh/volumes/*` 的 List/Delete(IAM 模拟通过),但 sweep 仍每 2 秒失败且外层日志吞了
+  错误链;调试 pod 证实同 SA 可 list(前缀为空!)可疑点已排除凭据/端点/netpol/deadline;
+  `39d7ffb6` 改为输出完整错误链定位中。**注意:卷前缀下没有对象**——1 GiB chunk 的真实布局
+  可能不是 `volumes/<id>/`,若 sweep 修好后 receipt 落地而对象仍在,需按真实布局补删除范围。
+- **工程环境修复**:SSM 会话 `ulimit -n 1024` 导致 cap-scaled 测试假失败(loop 脚本已固化
+  65536);本地 `cargo check` 必须带 `--tests`;Codex 落盘脚本与执行版本可能不一致。
+- **回归债(合并门禁前必须补)**:D12 converge 的控制面存储测试(夹具在 product_tests);
+  D9/D10 的 inventory 校验器直测;既有 47 个相关控制面测试已在本地 Postgres 验证全绿。
+
 ### 待并入
 
 四模态缺陷扫描被 API 额度中断:**资产负债表与崩溃点矩阵两个模态未运行**;陈旧权威+进程生命周期
