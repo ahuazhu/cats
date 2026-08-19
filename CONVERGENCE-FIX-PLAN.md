@@ -168,8 +168,32 @@ checkpoint 推进到 Volume release(`disposition=delete_disposable_root`);但生
   `release-manifest.published.json`(binding 记录的是 published 版 sha);macOS 签名必须用
   root 属主 `/usr/local/bin/openssl3`(系统 LibreSSL 无 `pkeyutl -rawin`);state/evidence
   目录须 0700。
+- **D16 已结清墓碑饿死全节点**(已修复+部署,`d8f0e6b0`):settled 终态 cat 每轮走完 effect 链
+  在 acquire 里 Stop(LocalContract),一个 Stop 就关掉整批共享的 node-global admission——
+  只要节点上有一个 Deleted 墓碑,任何新 cat 的 effect 永远 `EffectUnavailable`(闭环第 2 轮起
+  必死)。链入口加「applied 绑定当前 Desired + Ready(PostconditionSatisfied) → Applied」短路;
+  未证明的收敛保持 fail-closed Stop。带回归测试(修前 Stop/修后 Applied)。
+- **D17 重启后 serving blockd 判 conflict**(瞬态,诊断已埋,`bdf6f0de`):worker 原地替换重启后
+  扫描对存活 blockd 报 `serving blockd process conflict`,全节点清点不可用约 10 分钟,再次重启后
+  自愈。原 Conflict 不吐是哪一环:已给全部 4 个检查阶段 + 17 个身份合取逐一具名(命令行不一致时
+  dump 双方 argv),复发即可定位。
+- **D18 网关 terminal replay 竞态杀死 strict FLUSH**(已修复+网关已上线,`1e6962cd`):请求路径
+  与(任一副本的)恢复扫描可同时驱动同一 accepted attempt;terminal outcome 含驱动方本地的
+  receipt id/时间戳,慢者撞上「replay 不得改 outcome」守卫(PG 55000→409)。blockd 把 4xx 当
+  确定拒绝 → NBD flush 失败 → guest ext4 弃 journal 转只读 → grow-root 失败 → guest-agent
+  依赖失败 → RuntimeReady 永不可达。修复:settle 输者读回已存 terminal,语义同类(同为
+  SucceededVisible/同为 PermanentlyFailed)即采纳存储版收据返回成功;跨类分歧保留响亮冲突。
+  纯函数单测覆盖。遗留:恢复扫描无年龄下限,会与在飞请求重复 PUT(浪费,不再致错)。
+- **D19 superseded 中途启动无拆除路径**(已修复,`5fc943dd`,待部署):Deleted 意图追上还停在
+  StartRuntime 的 checkpoint 时,`plan_superseded_checkpoint` 只认 AcquireVolume/Provision
+  两种前驱,其余一律 Stop(LocalContract) → VMM/serving/nbd 全套物理栈永久滞留。新增 rebind:
+  校验精确保留 launch + 仅显式可弃 Root,步进到与稳定 planner 同款 StopRuntime;保留型目标
+  继续 fail closed(中途 guest 可能有未 quiesce 的脏页)。带回归测试。
+- **guest 探针诊断**(`c10d3d40`):RuntimeReady 探针失败原因原先被 `Err(_)` 吞掉,
+  「永远起不来的 guest」与「还在 boot」不可区分;现输出完整错误链。
 - **工程环境修复**:SSM 会话 `ulimit -n 1024` 导致 cap-scaled 测试假失败(loop 脚本已固化
-  65536);本地 `cargo check` 必须带 `--tests`;Codex 落盘脚本与执行版本可能不一致。
+  65536);本地 `cargo check` 必须带 `--tests`;Codex 落盘脚本与执行版本可能不一致;
+  CLI 已退役 stop/destroy 动词,闭环脚本改走 v2 HTTP(POST actions/stop、DELETE cat)。
 - **回归债(合并门禁前必须补)**:D12 converge 的控制面存储测试(夹具在 product_tests);
   D9/D10 的 inventory 校验器直测;既有 47 个相关控制面测试已在本地 Postgres 验证全绿。
 
