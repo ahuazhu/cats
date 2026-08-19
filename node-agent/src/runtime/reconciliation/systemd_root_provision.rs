@@ -842,9 +842,14 @@ impl PlatformSystemdServingBlockdProcessPort {
                 return Ok(ServingBlockdProcessInspection::Unavailable)
             }
             SystemdInspection::Conflict => {
+                tracing::warn!(
+                    unit = %launch.unit_id,
+                    stage = "systemd first inspection",
+                    "serving blockd identity mismatch",
+                );
                 return Ok(ServingBlockdProcessInspection::Conflict(
                     ServingBlockdProcessConflict::IdentityMismatch,
-                ))
+                ));
             }
             SystemdInspection::Exact(proof) => proof,
         };
@@ -860,9 +865,14 @@ impl PlatformSystemdServingBlockdProcessPort {
                 return Ok(ServingBlockdProcessInspection::Unavailable)
             }
             BlockdHandshakeInspection::Malformed => {
+                tracing::warn!(
+                    unit = %launch.unit_id,
+                    stage = "control handshake",
+                    "serving blockd identity mismatch",
+                );
                 return Ok(ServingBlockdProcessInspection::Conflict(
                     ServingBlockdProcessConflict::IdentityMismatch,
-                ))
+                ));
             }
         };
         let listener_identity = match platform_listener_peer(
@@ -876,9 +886,14 @@ impl PlatformSystemdServingBlockdProcessPort {
                 return Ok(ServingBlockdProcessInspection::Unavailable)
             }
             ListenerPeerInspection::Conflict => {
+                tracing::warn!(
+                    unit = %launch.unit_id,
+                    stage = "listener peer",
+                    "serving blockd identity mismatch",
+                );
                 return Ok(ServingBlockdProcessInspection::Conflict(
                     ServingBlockdProcessConflict::IdentityMismatch,
-                ))
+                ));
             }
         };
         let second = match self.systemd.inspect(launch, context)? {
@@ -889,9 +904,14 @@ impl PlatformSystemdServingBlockdProcessPort {
             SystemdInspection::Absent
             | SystemdInspection::Exact(_)
             | SystemdInspection::Conflict => {
+                tracing::warn!(
+                    unit = %launch.unit_id,
+                    stage = "systemd second inspection",
+                    "serving blockd identity mismatch",
+                );
                 return Ok(ServingBlockdProcessInspection::Conflict(
                     ServingBlockdProcessConflict::IdentityMismatch,
-                ))
+                ));
             }
         };
         let start_ticks = WireU64::new(second.process_start_time_ticks)
@@ -918,6 +938,27 @@ impl PlatformSystemdServingBlockdProcessPort {
             if peer_process_id == second.process_id && evidence.exactly_matches(expected) {
                 ServingBlockdProcessInspection::Exact(Box::new(evidence))
             } else {
+                let reason = if peer_process_id != second.process_id {
+                    "handshake peer differs from unit main process"
+                } else {
+                    evidence
+                        .mismatch_reason(expected)
+                        .unwrap_or("unnamed mismatch")
+                };
+                tracing::warn!(
+                    unit = %launch.unit_id,
+                    stage = "evidence comparison",
+                    reason,
+                    "serving blockd identity mismatch",
+                );
+                if reason == "command line" {
+                    tracing::warn!(
+                        unit = %launch.unit_id,
+                        expected_command_line = ?expected.command_line(),
+                        observed_command_line = ?evidence.observed_command_line(),
+                        "serving blockd command line mismatch detail",
+                    );
+                }
                 ServingBlockdProcessInspection::Conflict(
                     ServingBlockdProcessConflict::IdentityMismatch,
                 )

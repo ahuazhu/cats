@@ -1099,22 +1099,69 @@ impl ServingBlockdProcessEvidence {
     }
 
     pub(super) fn exactly_matches(&self, expected: &ServingBlockdExpectation) -> bool {
-        self.process_id > 0
-            && self.unit_main_process_id == self.process_id
-            && self.process_start_time_ticks.get() > 0
-            && self.cgroup_process_ids == [self.process_id]
-            && self.handshake_peer_process_id == self.process_id
-            && self.executable_path == expected.executable_path
-            && self.unit_id == expected.unit_id
-            && self.cgroup_path == expected.cgroup_path
-            && self.command_line == expected.command_line
-            && self.control_socket_path == expected.control_socket_path
-            && self.data_directory == expected.data_directory
-            && self.process_identity_token == expected.process_identity_token
-            && self.device_ownership_token == expected.device_ownership_token
-            && self.frontend == expected.frontend
-            && self.listener_identity.process_id == self.process_id
-            && expected.status_is_exact(&self.status)
+        self.mismatch_reason(expected).is_none()
+    }
+
+    /// Names the first failing identity conjunct, or `None` when this
+    /// evidence exactly matches. Diagnostic only: a conflict without the
+    /// failing field is undebuggable on a wedged production Node.
+    pub(super) fn mismatch_reason(
+        &self,
+        expected: &ServingBlockdExpectation,
+    ) -> Option<&'static str> {
+        if self.process_id == 0 {
+            return Some("process id is zero");
+        }
+        if self.unit_main_process_id != self.process_id {
+            return Some("unit main process id");
+        }
+        if self.process_start_time_ticks.get() == 0 {
+            return Some("process start ticks are zero");
+        }
+        if self.cgroup_process_ids != [self.process_id] {
+            return Some("cgroup process set");
+        }
+        if self.handshake_peer_process_id != self.process_id {
+            return Some("handshake peer process id");
+        }
+        if self.executable_path != expected.executable_path {
+            return Some("executable path");
+        }
+        if self.unit_id != expected.unit_id {
+            return Some("unit id");
+        }
+        if self.cgroup_path != expected.cgroup_path {
+            return Some("cgroup path");
+        }
+        if self.command_line != expected.command_line {
+            return Some("command line");
+        }
+        if self.control_socket_path != expected.control_socket_path {
+            return Some("control socket path");
+        }
+        if self.data_directory != expected.data_directory {
+            return Some("data directory");
+        }
+        if self.process_identity_token != expected.process_identity_token {
+            return Some("process identity token");
+        }
+        if self.device_ownership_token != expected.device_ownership_token {
+            return Some("device ownership token");
+        }
+        if self.frontend != expected.frontend {
+            return Some("frontend");
+        }
+        if self.listener_identity.process_id != self.process_id {
+            return Some("listener peer process id");
+        }
+        if !expected.status_is_exact(&self.status) {
+            return Some("durability status");
+        }
+        None
+    }
+
+    pub(super) fn observed_command_line(&self) -> &[OsString] {
+        &self.command_line
     }
 
     pub(crate) fn unit_id(&self) -> &Id {
