@@ -2624,9 +2624,10 @@ pub(crate) fn validate_scanned_serving_handoff_artifacts(
     record: Option<&ScannedServingHandoffArtifact<'_>>,
     retirement: Option<&ScannedServingHandoffArtifact<'_>>,
 ) -> Result<Option<RetainedRootProvisionProcessAttempt>> {
+    let retained_runtime_launch = checkpoint.runtime_launch.identity().is_some();
     let prepared_checkpoint;
     let checkpoint = if matches!(checkpoint.step, ReconcileStep::PrepareNetwork { .. })
-        || checkpoint.runtime_launch.identity().is_some()
+        || retained_runtime_launch
     {
         prepared_checkpoint = prepare_device_checkpoint_view(checkpoint)?;
         &prepared_checkpoint
@@ -2690,13 +2691,31 @@ pub(crate) fn validate_scanned_serving_handoff_artifacts(
                     && file.device == handoff.record.device
                     && file.inode == handoff.record.inode
                     && file.length == handoff.record.length
-                    && file.content_sha256 == handoff.record.content_sha256
-                    && decoded.cat_id == checkpoint.cat_id
+                    && file.content_sha256 == handoff.record.content_sha256,
+                "PrepareDevice handoff does not preserve its checkpointed predecessor artifact"
+            );
+            anyhow::ensure!(
+                decoded.cat_id == checkpoint.cat_id
                     && decoded.node_id == checkpoint.node_id
-                    && decoded.placement_epoch == checkpoint.placement_epoch
-                    && decoded.desired_revision == checkpoint.desired_revision
-                    && decoded.spec_digest == checkpoint.spec_digest
-                    && decoded.volume_id == device.volume_id
+                    && decoded.placement_epoch == checkpoint.placement_epoch,
+                "PrepareDevice handoff does not preserve its Runtime placement lineage"
+            );
+            if retained_runtime_launch {
+                anyhow::ensure!(
+                    decoded.desired_revision < checkpoint.desired_revision
+                        || (decoded.desired_revision == checkpoint.desired_revision
+                            && decoded.spec_digest == checkpoint.spec_digest),
+                    "retained Runtime handoff predecessor is not the same or an older Desired"
+                );
+            } else {
+                anyhow::ensure!(
+                    decoded.desired_revision == checkpoint.desired_revision
+                        && decoded.spec_digest == checkpoint.spec_digest,
+                    "PrepareDevice handoff does not preserve the current Desired coordinates"
+                );
+            }
+            anyhow::ensure!(
+                decoded.volume_id == device.volume_id
                     && decoded.attachment_id == device.attachment_id
                     && decoded.attachment_epoch == device.attachment_epoch
                     && decoded.acquire_origin == device.acquire_origin
@@ -2704,8 +2723,11 @@ pub(crate) fn validate_scanned_serving_handoff_artifacts(
                     && remote_head_is_same_or_later(
                         &device.expected_head,
                         &decoded.expected_provisioned_head,
-                    )
-                    && target_artifact.attachment.identity == acquired.attachment.identity
+                    ),
+                "PrepareDevice handoff does not preserve its Volume attachment lineage"
+            );
+            anyhow::ensure!(
+                target_artifact.attachment.identity == acquired.attachment.identity
                     && target_artifact.attachment.acquire == acquired.attachment.acquire
                     && target_artifact.attachment.size_bytes
                         == acquired.attachment.size_bytes
@@ -2715,7 +2737,7 @@ pub(crate) fn validate_scanned_serving_handoff_artifacts(
                     && acquired.attachment.durability == device.durability
                     && decoded.old_control_process.data_directory
                         == device.serving_process.data_directory,
-                "PrepareDevice handoff does not preserve the exact predecessor lineage"
+                "PrepareDevice handoff does not preserve its authorized physical lineage"
             );
             Some(RetainedRootProvisionProcessAttempt {
                 cat_id: decoded.cat_id.clone(),
@@ -11570,6 +11592,76 @@ mod tests {
         )
         .is_err());
         assert_eq!(process_port.inspect_calls(), 2);
+    }
+
+    #[test]
+    fn retained_runtime_handoff_accepts_only_an_exact_older_desired_predecessor() {
+        let mut fixture = fixture();
+        advance_fixture_to_start_runtime(&mut fixture);
+        let checkpoint = fixture.stored_checkpoint.checkpoint();
+        assert!(
+            checkpoint.runtime_launch.identity().is_some(),
+            "StartRuntime must retain the PrepareDevice authority used by later lifecycle steps"
+        );
+
+        let target_bytes = std::fs::read(fixture.target_path()).unwrap();
+        let record_bytes = std::fs::read(fixture.record_path()).unwrap();
+        let target_scan = scanned_file(&fixture.target_path(), &target_bytes);
+        let record_scan = scanned_file(&fixture.record_path(), &record_bytes);
+        validate_scanned_serving_handoff_artifacts(
+            checkpoint,
+            &fixture.acquired,
+            &target_scan,
+            Some(&record_scan),
+            None,
+        )
+        .expect("same-Desired retained Runtime handoff remains exact")
+        .expect("retained Runtime handoff keeps the old root-provision process attempt");
+
+        let original_revision = checkpoint.desired_revision;
+        let original_spec_digest = checkpoint.spec_digest.clone();
+        let mut later = checkpoint.clone();
+        later.desired_revision =
+            Revision::new(original_revision.get().checked_add(1).unwrap()).unwrap();
+        later.spec_digest = digest('e');
+        validate_scanned_serving_handoff_artifacts(
+            &later,
+            &fixture.acquired,
+            &target_scan,
+            Some(&record_scan),
+            None,
+        )
+        .expect("later Desired retains the checkpointed immutable handoff predecessor")
+        .expect("later Desired retains the old root-provision process attempt");
+
+        let mut same_revision_wrong_spec = later.clone();
+        same_revision_wrong_spec.desired_revision = original_revision;
+        same_revision_wrong_spec.spec_digest = digest('f');
+        assert!(validate_scanned_serving_handoff_artifacts(
+            &same_revision_wrong_spec,
+            &fixture.acquired,
+            &target_scan,
+            Some(&record_scan),
+            None,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("same or an older Desired"));
+
+        let mut future_predecessor = later;
+        future_predecessor.desired_revision =
+            Revision::new(original_revision.get().checked_sub(1).unwrap()).unwrap();
+        future_predecessor.spec_digest = original_spec_digest;
+        assert!(validate_scanned_serving_handoff_artifacts(
+            &future_predecessor,
+            &fixture.acquired,
+            &target_scan,
+            Some(&record_scan),
+            None,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("same or an older Desired"));
     }
 
     #[test]
