@@ -1434,8 +1434,35 @@ impl TerminalVmmResidueExpectation {
         let ReconcileStep::CleanupRelease { cleanup } = &checkpoint.step else {
             anyhow::bail!("terminal VMM residue checkpoint is not CleanupRelease")
         };
+        let CleanupTarget::Volume {
+            volume_id,
+            attachment_id,
+            attachment_epoch,
+        } = &cleanup.target
+        else {
+            anyhow::bail!("terminal VMM residue cleanup does not target a Volume")
+        };
+        let exact_volume = checkpoint.volumes.iter().any(|volume| {
+            &volume.volume_id == volume_id
+                && match &volume.authority {
+                    cats_api::runtime_reconciliation::VolumeAuthorityEvidence::Owned {
+                        attachment_id: owned_id,
+                        attachment_epoch: owned_epoch,
+                        ..
+                    } => owned_id == attachment_id && owned_epoch == attachment_epoch,
+                    cats_api::runtime_reconciliation::VolumeAuthorityEvidence::Deleting {
+                        attachment_epoch: deleting_epoch,
+                        ..
+                    } => deleting_epoch == attachment_epoch,
+                    cats_api::runtime_reconciliation::VolumeAuthorityEvidence::Unavailable
+                    | cats_api::runtime_reconciliation::VolumeAuthorityEvidence::Absent
+                    | cats_api::runtime_reconciliation::VolumeAuthorityEvidence::Unowned {
+                        ..
+                    } => false,
+                }
+        });
         anyhow::ensure!(
-            matches!(cleanup.target, CleanupTarget::Volume { .. })
+            exact_volume
                 && cleanup
                     .volume_release
                     .as_ref()

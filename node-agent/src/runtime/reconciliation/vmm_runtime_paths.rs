@@ -2882,7 +2882,9 @@ mod tests {
     };
     #[cfg(target_os = "linux")]
     use cats_api::runtime_reconciliation::{
-        encode_runtime_checkpoint, Epoch, Id, Revision, StableState,
+        encode_runtime_checkpoint, CleanupRelease, CleanupTarget, Epoch, Id, Revision, Sequence,
+        SessionBinding, StableState, VolumeAuthorityEvidence, VolumeDisposition,
+        VolumeReleaseReplay,
     };
     use std::io::Write as _;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
@@ -2977,6 +2979,54 @@ mod tests {
         };
         encode_runtime_checkpoint(&checkpoint)
             .unwrap_or_else(|error| panic!("StopRuntime checkpoint is invalid: {:?}", error.error));
+        checkpoint
+    }
+
+    #[cfg(target_os = "linux")]
+    fn terminal_cleanup_checkpoint(launch_checkpoint: &RuntimeCheckpoint) -> RuntimeCheckpoint {
+        let mut checkpoint = launch_checkpoint.clone();
+        checkpoint.desired_revision =
+            Revision::new(launch_checkpoint.desired_revision.get() + 2).unwrap();
+        checkpoint.spec_digest = Sha256Digest::from_bytes([0x94; 32]);
+        checkpoint.runtime_incarnation = None;
+        checkpoint.runtime_launch = RuntimeLaunch::Absent;
+        checkpoint.stable_state = None;
+        let volume = &checkpoint.volumes[0];
+        let (attachment_id, attachment_epoch, generation) = match &volume.authority {
+            VolumeAuthorityEvidence::Owned {
+                attachment_id,
+                attachment_epoch,
+                head,
+            } => (attachment_id.clone(), *attachment_epoch, head.generation),
+            _ => panic!("terminal fixture volume is not Owned"),
+        };
+        checkpoint.step = ReconcileStep::CleanupRelease {
+            cleanup: CleanupRelease {
+                target: CleanupTarget::Volume {
+                    volume_id: volume.volume_id.clone(),
+                    attachment_id,
+                    attachment_epoch,
+                },
+                inventory_session: SessionBinding {
+                    node_id: checkpoint.node_id.clone(),
+                    node_boot_id: current_kernel_node_boot_id().unwrap(),
+                    agent_instance_id: RandomId128::new("dddddddddddddddddddddddddddddddd")
+                        .unwrap(),
+                    agent_session_epoch: Epoch::new(1).unwrap(),
+                },
+                inventory_epoch: Epoch::new(1).unwrap(),
+                inventory_read_position: Sequence::new(1).unwrap(),
+                desired_read_position: Sequence::new(1).unwrap(),
+                volume_release: Some(VolumeReleaseReplay {
+                    release_transition_id: RandomId128::new("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+                        .unwrap(),
+                    generation,
+                    disposition: VolumeDisposition::DeleteDisposableRoot {
+                        delete_id: Id::new("delete_terminal_vmm").unwrap(),
+                    },
+                }),
+            },
+        };
         checkpoint
     }
 
@@ -3694,6 +3744,106 @@ mod tests {
                 |_| Ok(Some(fixture.absence())),
             )
             .unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_cleanup_recovers_only_the_single_exact_historical_vmm_residue() {
+        let mut fixture = LaunchFixture::new();
+        fixture.receipt_store.publish(&fixture.receipt).unwrap();
+        let ready = match fixture.prepare() {
+            ManagedVmmLaunchPreparation::Ready(ready) => ready,
+            _ => panic!("fresh launch attempt was not ready"),
+        };
+        let paths = ManagedVmmLaunchFilePaths::paths_from_checkpoint(
+            fixture.launch_root.state_directory(),
+            &fixture.checkpoint,
+        )
+        .unwrap();
+        for path in [
+            paths.memory_file_path(),
+            paths.serial_log_path(),
+            paths.vmm_log_path(),
+        ] {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path.as_str())
+                .unwrap();
+            file.write_all(b"historical-terminal-residue").unwrap();
+            file.sync_all().unwrap();
+        }
+        ready.assert_ready_with_launch_files().unwrap();
+        drop(ready);
+        fixture.checkpoint = terminal_cleanup_checkpoint(&fixture.checkpoint);
+        let checkpoints = [&fixture.checkpoint];
+        let candidate = fixture
+            .receipt_store
+            .retain_single_terminal_vmm_residue(&fixture.socket_root, &checkpoints, &scan_context())
+            .unwrap()
+            .expect("exact terminal residue was selected");
+        fixture
+            .launch_root
+            .assert_single_terminal_residue_accounted(candidate.expectation(), &scan_context())
+            .unwrap();
+        assert!(fixture
+            .launch_root
+            .recover_terminal_vmm_residue(
+                &fixture.socket_root,
+                &fixture.receipt_store,
+                candidate,
+                &scan_context(),
+                |guard, selected| {
+                    guard.assert_for(&fixture.launch_root)?;
+                    anyhow::ensure!(
+                        fixture.launch_root.try_lock_effect_namespace()?.is_none(),
+                        "terminal absence was sampled without launch-root exclusion"
+                    );
+                    Ok(
+                        super::super::vmm_process::ExactTerminalVmmResidueAbsenceProof::for_expectation(
+                            selected.clone(),
+                        ),
+                    )
+                },
+            )
+            .unwrap());
+        assert!(!Path::new(paths.directory().as_str()).exists());
+        assert!(
+            fixture
+                .receipt_store
+                .retain_single_terminal_vmm_residue(
+                    &fixture.socket_root,
+                    &checkpoints,
+                    &scan_context(),
+                )
+                .unwrap()
+                .is_none()
+        );
+
+        let forbidden_fixture = LaunchFixture::new();
+        forbidden_fixture
+            .receipt_store
+            .publish(&forbidden_fixture.receipt)
+            .unwrap();
+        let mut forbidden = terminal_cleanup_checkpoint(&forbidden_fixture.checkpoint);
+        let ReconcileStep::CleanupRelease { cleanup } = &mut forbidden.step else {
+            unreachable!()
+        };
+        cleanup.volume_release.as_mut().unwrap().disposition = VolumeDisposition::Retain;
+        assert!(forbidden_fixture
+            .receipt_store
+            .retain_single_terminal_vmm_residue(
+                &forbidden_fixture.socket_root,
+                &[&forbidden],
+                &scan_context(),
+            )
+            .is_err());
+        assert!(forbidden_fixture
+            .receipt_store
+            .load(forbidden_fixture.receipt.runtime_incarnation())
+            .unwrap()
+            .is_some());
     }
 
     #[cfg(target_os = "linux")]
