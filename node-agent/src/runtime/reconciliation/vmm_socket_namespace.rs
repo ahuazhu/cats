@@ -28,7 +28,7 @@ use cats_api::runtime_reconciliation::{
     RuntimeCheckpoint, Sha256Digest,
 };
 #[cfg(target_os = "linux")]
-use cats_api::runtime_reconciliation::{CleanupTarget, RuntimeLaunch, VolumeDisposition};
+use cats_api::runtime_reconciliation::{CleanupTarget, DiskKind, RuntimeLaunch, VolumeDisposition};
 use serde::{Deserialize, Serialize};
 
 use crate::state_directory::StateDirectory;
@@ -1442,18 +1442,34 @@ impl TerminalVmmResidueExpectation {
         else {
             anyhow::bail!("terminal VMM residue cleanup does not target a Volume")
         };
+        let Some(release) = cleanup.volume_release.as_ref() else {
+            anyhow::bail!("terminal VMM residue lacks its Volume release replay")
+        };
+        let VolumeDisposition::DeleteDisposableRoot { delete_id } = &release.disposition else {
+            anyhow::bail!("terminal VMM residue release is not disposable-root Delete")
+        };
         let exact_volume = checkpoint.volumes.iter().any(|volume| {
             &volume.volume_id == volume_id
+                && volume.disk_kind == DiskKind::Root
                 && match &volume.authority {
                     cats_api::runtime_reconciliation::VolumeAuthorityEvidence::Owned {
                         attachment_id: owned_id,
                         attachment_epoch: owned_epoch,
-                        ..
-                    } => owned_id == attachment_id && owned_epoch == attachment_epoch,
+                        head,
+                    } => {
+                        owned_id == attachment_id
+                            && owned_epoch == attachment_epoch
+                            && head.generation == release.generation
+                    }
                     cats_api::runtime_reconciliation::VolumeAuthorityEvidence::Deleting {
+                        delete_id: deleting_id,
                         attachment_epoch: deleting_epoch,
-                        ..
-                    } => deleting_epoch == attachment_epoch,
+                        head,
+                    } => {
+                        deleting_id == delete_id
+                            && deleting_epoch == attachment_epoch
+                            && head.generation == release.generation
+                    }
                     cats_api::runtime_reconciliation::VolumeAuthorityEvidence::Unavailable
                     | cats_api::runtime_reconciliation::VolumeAuthorityEvidence::Absent
                     | cats_api::runtime_reconciliation::VolumeAuthorityEvidence::Unowned {
@@ -1462,14 +1478,7 @@ impl TerminalVmmResidueExpectation {
                 }
         });
         anyhow::ensure!(
-            exact_volume
-                && cleanup
-                    .volume_release
-                    .as_ref()
-                    .is_some_and(|release| matches!(
-                        release.disposition,
-                        VolumeDisposition::DeleteDisposableRoot { .. }
-                    )),
+            exact_volume,
             "terminal VMM residue is not an authorized disposable-root release"
         );
         anyhow::ensure!(
