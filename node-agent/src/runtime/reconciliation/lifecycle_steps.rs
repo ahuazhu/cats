@@ -3848,15 +3848,20 @@ fn remaining_cleanup_successor_at_with_absent_serving(
                 .iter()
                 .find(|volume| volume.volume_id == intent.volume_id)
                 .is_none_or(|volume| {
-                    !matches!(volume.authority, VolumeAuthorityEvidence::Absent)
-                        || !volume.local_lineages.is_empty()
+                    !matches!(
+                        volume.authority,
+                        VolumeAuthorityEvidence::Absent | VolumeAuthorityEvidence::Unowned { .. }
+                    ) || !volume.local_lineages.is_empty()
                 })
         })
     {
         // The current contract has no local authority to turn an Owned or
         // Deleting Root into the physical delete step.  Keep the completed
         // non-Volume token as a zero-I/O fail-closed checkpoint until A2
-        // supplies that exact transition/postcondition.
+        // supplies that exact transition/postcondition.  A released disposable
+        // Root whose local lineage was already reclaimed is different: the
+        // Node has no remaining physical obligation, and the row/remote-object
+        // removal is Control authority, so it settles below.
         return Ok(None);
     }
 
@@ -4423,8 +4428,15 @@ fn settle_cleanup_target(
                                     VolumeAuthorityEvidence::Unowned { .. }
                                 ),
                                 VolumeDisposition::DeleteDisposableRoot { .. } => {
-                                    matches!(volume.authority, VolumeAuthorityEvidence::Absent)
-                                        && volume.local_lineages.is_empty()
+                                    // The Node's disposable-root obligation
+                                    // ends at released-and-reclaimed; the
+                                    // row/remote-object removal is Control
+                                    // authority.
+                                    matches!(
+                                        volume.authority,
+                                        VolumeAuthorityEvidence::Absent
+                                            | VolumeAuthorityEvidence::Unowned { .. }
+                                    ) && volume.local_lineages.is_empty()
                                 }
                                 VolumeDisposition::Retain => false,
                             })
@@ -7961,6 +7973,54 @@ mod tests {
         );
         assert_eq!(successor.runtime_launch, checkpoint.runtime_launch);
         encode_runtime_checkpoint(&successor).unwrap();
+
+        // The released-and-reclaimed shape settles: a disposable Root whose
+        // lease is fenced Unowned and whose local lineage was reclaimed
+        // leaves the Node no remaining physical obligation. Row and remote
+        // object removal is Control authority and must not park the Cat.
+        let volume_cleanup = successor;
+        let mut released = runtime.clone();
+        released.step = volume_cleanup.step.clone();
+        released.mounts.clear();
+        let (attachment_epoch, head) = match &released.volumes[0].authority {
+            VolumeAuthorityEvidence::Owned {
+                attachment_epoch,
+                head,
+                ..
+            } => (*attachment_epoch, head.clone()),
+            _ => panic!("disposable Root fixture lost its Owned authority"),
+        };
+        released.volumes[0].authority = VolumeAuthorityEvidence::Unowned {
+            attachment_epoch: FenceEpoch::new(attachment_epoch.get() + 1).unwrap(),
+            head,
+        };
+
+        // Reclaim has not finished: a retained local lineage keeps the
+        // completed token parked instead of forging a terminal state.
+        assert!(cleanup_postcondition_successor_at(
+            &desired,
+            &released,
+            &volume_cleanup,
+            &[],
+            &cursor
+        )
+        .unwrap()
+        .is_none());
+
+        released.volumes[0].local_lineages.clear();
+        let terminal =
+            cleanup_postcondition_successor_at(&desired, &released, &volume_cleanup, &[], &cursor)
+                .unwrap()
+                .expect("released and reclaimed disposable Root settles Deleted");
+        assert!(matches!(
+            terminal.step,
+            ReconcileStep::Stable {
+                state: StableState::Deleted
+            }
+        ));
+        assert_eq!(terminal.runtime_launch, RuntimeLaunch::Absent);
+        assert_eq!(terminal.runtime_incarnation, None);
+        encode_runtime_checkpoint(&terminal).unwrap();
     }
 
     #[test]
