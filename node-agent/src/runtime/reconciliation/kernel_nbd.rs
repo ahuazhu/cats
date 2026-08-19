@@ -2759,6 +2759,13 @@ impl KernelNbdAttachEffect {
             expected.matches_attach_request(&request),
             "kernel-NBD scanner admission changed from the current checkpoint"
         );
+        // Validate under the store's writer guard, then release it before the
+        // attach. `attach_checkpointed` re-asserts the same store itself after
+        // taking the Host allocation lock — the documented order — and the
+        // writer serialization is a non-reentrant `Mutex`, so carrying this
+        // guard across the call self-deadlocks the worker forever: production
+        // wedged exactly here, at `assert_current` under a held guard, and the
+        // abandoned worker pinned its Cat until the Host was reset.
         let guard = store.assert_current(&stored)?;
         for entry in &admitted {
             let current = self.authority.load_volume(&entry.device.volume_id)?;
@@ -2785,6 +2792,7 @@ impl KernelNbdAttachEffect {
             )?;
         }
         store.revalidate_current(&stored, &guard)?;
+        drop(guard);
         context.check_active()?;
         let observation_id = &accepted.observation().observation_id;
         let mut submitted = self

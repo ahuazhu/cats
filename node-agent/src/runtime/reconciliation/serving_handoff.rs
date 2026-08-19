@@ -6374,6 +6374,35 @@ mod tests {
 
     impl kernel_attach_sealed::Sealed for FakeKernelNbdAttachPort {}
 
+    /// Mirrors the platform attach port's first store interaction: it re-asserts
+    /// the current checkpoint under its own guard, exactly as documented for the
+    /// installed port. The fake above never touches the store, which is why the
+    /// effect could hold the store's non-reentrant writer guard across this call
+    /// in production and self-deadlock without any test noticing.
+    struct StoreAssertingKernelNbdAttachPort {
+        calls: AtomicUsize,
+    }
+
+    impl kernel_attach_sealed::Sealed for StoreAssertingKernelNbdAttachPort {}
+
+    impl KernelNbdAttachPort for StoreAssertingKernelNbdAttachPort {
+        fn attach_checkpointed(
+            &self,
+            _request: &KernelNbdAttachRequest,
+            _listener: &dyn RetainedKernelNbdListenerGuard,
+            _admitted_exact_devices: &[&super::super::kernel_nbd::ExactKernelNbdDeviceProof],
+            store: &FileCheckpointStore,
+            stored: &StoredCheckpoint,
+            _context: &RuntimeDesiredEffectContext,
+        ) -> Result<KernelNbdAttachResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let current = store.assert_current(stored)?;
+            store.revalidate_current(stored, &current)?;
+            drop(current);
+            Ok(KernelNbdAttachResult::OutcomeUnknown)
+        }
+    }
+
     impl KernelNbdAttachPort for FakeKernelNbdAttachPort {
         fn attach_checkpointed(
             &self,
@@ -9203,6 +9232,98 @@ mod tests {
             current.checkpoint().step,
             ReconcileStep::PrepareNetwork { .. }
         ));
+    }
+
+    /// The installed attach port re-asserts the current checkpoint under its
+    /// own guard after taking the Host allocation lock, so the effect must not
+    /// carry the store's non-reentrant writer guard into the call. It did, and
+    /// because every fake port skipped the store, the resulting self-deadlock
+    /// shipped: in production the per-Cat worker blocked forever on its own
+    /// guard at the first kernel-NBD attach, and the abandoned worker pinned
+    /// the Cat until the Host was reset. Drive the effect with a port that
+    /// asserts the store exactly like the platform one; without the fix this
+    /// times out instead of completing.
+    #[test]
+    fn kernel_nbd_attach_must_not_hold_the_checkpoint_guard_across_the_port() {
+        let mut fixture = fixture();
+        complete_old_process_retirement(&mut fixture);
+        replace_with_kernel_nbd_prepare_device(&mut fixture);
+
+        let reservation = prepare_network_reservation_effect(
+            &fixture,
+            Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone())),
+            Arc::new(FakeServingBlockdPort::new(
+                [
+                    ServingBlockdProcessInspectionKind::Exact,
+                    ServingBlockdProcessInspectionKind::Exact,
+                ],
+                ServingBlockdProcessStart::Submitted,
+            )),
+        );
+        let reservation_context = with_exact_kernel_nbd_admission(
+            &fixture,
+            effect_context_with_processes(&fixture, vec![accepted_serving_process(&fixture)]),
+        );
+        assert_eq!(
+            reservation
+                .try_apply(&reservation_context, &fixture.acquired.desired)
+                .unwrap(),
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
+        );
+        fixture.stored_checkpoint = current_runtime_checkpoint(&fixture);
+        assert!(matches!(
+            fixture.stored_checkpoint.checkpoint().step,
+            ReconcileStep::PrepareNetwork { .. }
+        ));
+
+        let expected = serving_expectation(&fixture);
+        let exact_serving = expected
+            .clone()
+            .prove_exact_process(expected.exact_evidence_for_test(51))
+            .unwrap();
+        let attach_context = with_absent_network_admission(
+            effect_context_with_processes(
+                &fixture,
+                vec![exact_serving.clone().into_process_evidence()],
+            ),
+            fixture.stored_checkpoint.checkpoint(),
+        );
+        let pool = KernelNbdPoolScanAdmission::absent_for_test(
+            attach_context.accepted_full().unwrap().observation(),
+            fixture.stored_checkpoint.checkpoint(),
+            exact_serving.listener_proof(),
+        )
+        .unwrap();
+        let attach_context = attach_context.with_kernel_nbd_pool_for_test(pool);
+
+        let attach = Arc::new(StoreAssertingKernelNbdAttachPort {
+            calls: AtomicUsize::new(0),
+        });
+        let attach_effect = KernelNbdAttachEffect::for_test(
+            Arc::new(FixedEffectAuthority::new(fixture.authority.volume.clone())),
+            attach.clone() as Arc<dyn KernelNbdAttachPort>,
+        );
+
+        // A deadlocked effect blocks forever, so a raw call would hang the
+        // suite in exactly the way it hung production. Fail by timeout instead.
+        let desired = fixture.acquired.desired.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let outcome = attach_effect.try_apply(&attach_context, &desired);
+            let _ = done_tx.send(outcome);
+        });
+        let outcome = done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect(
+                "kernel-NBD attach deadlocked on its own checkpoint writer guard;                  the effect must release the guard before invoking the attach port",
+            );
+        worker.join().expect("attach worker completes");
+        assert_eq!(
+            outcome.unwrap(),
+            Some(RuntimeDesiredEffectOutcome::refresh_inventory()),
+            "an OutcomeUnknown submission settles as a refresh"
+        );
+        assert_eq!(attach.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
