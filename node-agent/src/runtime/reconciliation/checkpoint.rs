@@ -715,17 +715,22 @@ impl FileCheckpointStore {
     /// release non-replayable. The target is no-replace; an existing exact
     /// marker is an idempotent replay, while any mismatch or partial publish
     /// remains untouched and fails closed.
+    ///
+    /// The caller supplies its held writer guard: lifecycle effects reach
+    /// this rejection while already inside [`Self::assert_current`], and the
+    /// non-reentrant writer mutex must never be re-acquired on that path.
     pub(super) fn persist_definite_release_rejection(
         &self,
         expected: &StoredCheckpoint,
+        current: &CurrentCheckpointGuard<'_>,
         request: &RuntimeVolumeTransitionRequest,
         problem: RuntimeVolumeTransitionPreconditionProblem,
     ) -> Result<DefiniteReleaseRejection, CheckpointStoreError> {
-        let _writer = self.writer_serialization.lock().map_err(|_| {
-            CheckpointStoreError::WriterSerializationPoisoned {
+        if !std::ptr::eq(current.owner, &self.writer_serialization) {
+            return Err(CheckpointStoreError::ConcurrentUpdate {
                 path: self.release_rejection_path.clone(),
-            }
-        })?;
+            });
+        }
         self.verify_expected(ExpectedTarget::Exact(expected))?;
         self.ensure_release_rejection_temporary_absent()?;
         let marker = DefiniteReleaseRejection {

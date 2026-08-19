@@ -1872,8 +1872,11 @@ impl SignedRunningAcquireEffect {
                 ))
             }
             NormalReleaseAttempt::DefiniteCleanupConflict(problem) => {
+                let Ok(current) = store.assert_current(predecessor) else {
+                    return Ok(stop_local());
+                };
                 if store
-                    .persist_definite_release_rejection(predecessor, &request, problem)
+                    .persist_definite_release_rejection(predecessor, &current, &request, problem)
                     .is_err()
                 {
                     return Ok(stop_local());
@@ -10302,10 +10305,17 @@ mod tests {
         store.inject_release_rejection_crash_once(
             super::super::checkpoint::ReleaseRejectionWriteStage::BeforeTempFileSync,
         );
+        let current = store.assert_current(&stored).unwrap();
         assert!(matches!(
-            store.persist_definite_release_rejection(&stored, &marker.request, marker.problem,),
+            store.persist_definite_release_rejection(
+                &stored,
+                &current,
+                &marker.request,
+                marker.problem,
+            ),
             Err(super::super::CheckpointStoreError::InjectedCrash)
         ));
+        drop(current);
         drop(store);
         assert!(!marker_path.exists());
         assert_eq!(std::fs::read(&temporary_path).unwrap(), canonical);
@@ -10651,9 +10661,18 @@ mod tests {
             FileCheckpointStore::open(&root.path().join(CHECKPOINT_NAMESPACE), &desired.cat_id)
                 .unwrap();
         let stored = store.load().unwrap().unwrap();
+        // The guard stays held across both calls: the production lifecycle
+        // lane reaches this rejection while already inside `assert_current`,
+        // and re-locking the writer mutex there deadlocked the effect worker.
+        let current = store.assert_current(&stored).unwrap();
         assert_eq!(
             store
-                .persist_definite_release_rejection(&stored, &marker.request, marker.problem,)
+                .persist_definite_release_rejection(
+                    &stored,
+                    &current,
+                    &marker.request,
+                    marker.problem,
+                )
                 .unwrap(),
             marker
         );
@@ -10661,6 +10680,7 @@ mod tests {
         assert!(store
             .persist_definite_release_rejection(
                 &stored,
+                &current,
                 &marker.request,
                 RuntimeVolumeTransitionPreconditionProblem::AuthorizationBranchConflict,
             )

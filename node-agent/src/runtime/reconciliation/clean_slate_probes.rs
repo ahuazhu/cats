@@ -21439,13 +21439,16 @@ mod tests {
             placement: rejection_desired.placement.clone(),
             transition: RuntimeVolumeTransition::Release { cleanup },
         };
+        let rejection_guard = rejection_store.assert_current(&cleanup_checkpoint).unwrap();
         rejection_store
             .persist_definite_release_rejection(
                 &cleanup_checkpoint,
+                &rejection_guard,
                 &release_request,
                 RuntimeVolumeTransitionPreconditionProblem::CleanupEvidenceMismatch,
             )
             .unwrap();
+        drop(rejection_guard);
         drop(rejection_store);
 
         let limits = ProbeLimits {

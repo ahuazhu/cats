@@ -1870,7 +1870,7 @@ impl LifecycleStepEffect {
             ),
             NormalReleaseAttempt::DefiniteCleanupConflict(problem) => {
                 if store
-                    .persist_definite_release_rejection(stored, &request, problem)
+                    .persist_definite_release_rejection(stored, current, &request, problem)
                     .is_err()
                 {
                     return Ok(stop_local());
