@@ -898,6 +898,11 @@ fn fault_injected_release_installer(
 fn private_deployment_helper(template: &str, path: &Path, lock: &Path, uid: &str, gid: &str) {
     use std::os::unix::fs::PermissionsExt as _;
 
+    let root_lock_directory_install =
+        r#"install -d -o root -g root -m 0700 "$(dirname "$CATS_WORKER_DEPLOYMENT_LOCK_PATH")""#;
+    let private_lock_directory_install = format!(
+        r#"install -d -o {uid} -g {gid} -m 0700 "$(dirname "$CATS_WORKER_DEPLOYMENT_LOCK_PATH")""#
+    );
     let transformed = template
         .replace(
             "/run/lock/cats/worker-deployment.lock",
@@ -907,8 +912,15 @@ fn private_deployment_helper(template: &str, path: &Path, lock: &Path, uid: &str
             "CATS_WORKER_DEPLOYMENT_HELPER=/opt/cats/bin/worker-deployment-transaction",
             &format!("CATS_WORKER_DEPLOYMENT_HELPER={}", path.display()),
         )
+        .replace(root_lock_directory_install, &private_lock_directory_install)
         .replace("'0:0:600:1'", &format!("'{uid}:{gid}:600:1'"));
     assert_ne!(transformed, template);
+    assert_eq!(
+        transformed.matches(&private_lock_directory_install).count(),
+        1,
+        "private helper must create its lock directory with the test process identity"
+    );
+    assert!(!transformed.contains(root_lock_directory_install));
     std::fs::write(path, transformed).expect("write private deployment helper");
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
