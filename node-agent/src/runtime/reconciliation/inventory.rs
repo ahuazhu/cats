@@ -3589,6 +3589,9 @@ pub(super) fn validate_scanned_checkpoint(
         ReconcileStep::Stable {
             state: StableState::Cold,
         } => validate_stable_cold_checkpoint(checkpoint, blockds)?,
+        ReconcileStep::Stable {
+            state: StableState::Deleted,
+        } => validate_stable_deleted_checkpoint(checkpoint, blockds)?,
         _ => anyhow::bail!("pre-launch scanner encountered an unsupported Runtime step"),
     }
     Ok(())
@@ -3660,6 +3663,13 @@ fn scanned_checkpoint_phase_envelope_is_valid(checkpoint: &RuntimeCheckpoint) ->
                         checkpoint.step,
                         ReconcileStep::Stable {
                             state: StableState::Cold
+                        }
+                    ))
+                || (checkpoint.stable_state == Some(StableState::Deleted)
+                    && matches!(
+                        checkpoint.step,
+                        ReconcileStep::Stable {
+                            state: StableState::Deleted
                         }
                     ));
             checkpoint.runtime_incarnation.is_none()
@@ -3769,6 +3779,50 @@ pub(super) fn checkpoint_process_projections_match_retained_launch(
             }
         }
     })
+}
+
+/// A settled deletion holds the window between the Node terminal and
+/// Control's Desired retirement. Nothing physical may remain: the volume
+/// projections are lineage- and device-free, and no authorized blockd
+/// evidence may still bind this Cat's volumes.
+fn validate_stable_deleted_checkpoint(
+    checkpoint: &RuntimeCheckpoint,
+    blockds: Option<&BTreeMap<Id, AuthorizedBlockdInventoryEvidence>>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        checkpoint.stable_state == Some(StableState::Deleted)
+            && checkpoint.runtime_incarnation.is_none()
+            && checkpoint.runtime_launch.identity().is_none()
+            && checkpoint.processes.is_empty()
+            && checkpoint.mounts.is_empty()
+            && checkpoint.networks.is_empty()
+            && matches!(
+                checkpoint.guest_transport,
+                GuestTransportEvidence::Unavailable
+            )
+            && matches!(checkpoint.warm_snapshot, WarmSnapshotEvidence::Absent)
+            && checkpoint.lifecycle_admission == LifecycleAdmission::Closed
+            && checkpoint.route_gates.is_empty()
+            && matches!(
+                checkpoint.require_idle,
+                RequireIdleCheckpoint::NotApplicable
+            )
+            && checkpoint
+                .volumes
+                .iter()
+                .all(|volume| volume.devices.is_empty() && volume.local_lineages.is_empty()),
+        "Stable Deleted checkpoint retains a live physical envelope"
+    );
+    anyhow::ensure!(
+        !blockds.is_some_and(|by_volume| {
+            checkpoint
+                .volumes
+                .iter()
+                .any(|volume| by_volume.contains_key(&volume.volume_id))
+        }),
+        "Stable Deleted checkpoint still binds cache lineage"
+    );
+    Ok(())
 }
 
 fn validate_stable_cold_checkpoint(
