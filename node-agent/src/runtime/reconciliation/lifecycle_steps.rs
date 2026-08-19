@@ -7743,6 +7743,7 @@ mod tests {
             successor.step,
             ReconcileStep::DeleteDisposableRoot { .. }
         ));
+        encode_runtime_checkpoint(&successor).unwrap();
     }
 
     #[test]

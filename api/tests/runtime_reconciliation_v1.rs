@@ -3111,9 +3111,7 @@ fn cleanup_release_intrinsic_constraints_are_bidirectional() {
     let mut destructive_release = checkpoint;
     destructive_release["step"]["cleanup"]["volume_release"]["disposition"] =
         serde_json::json!({"kind": "delete_disposable_root", "delete_id": "delete_01"});
-    let error =
-        decode_runtime_checkpoint(&serde_json::to_vec(&destructive_release).unwrap()).unwrap_err();
-    assert_eq!(malformed(&error).0.as_str(), "/step/cleanup");
+    decode_runtime_checkpoint(&serde_json::to_vec(&destructive_release).unwrap()).unwrap();
 }
 
 #[test]

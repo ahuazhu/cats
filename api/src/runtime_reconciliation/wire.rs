@@ -9381,14 +9381,6 @@ fn collect_cleanup_cross(
     if is_volume != cleanup.volume_release.is_some() {
         output.push(Candidate::at(path, MalformedProblem::InvalidValue));
     }
-    if let Some(release) = &cleanup.volume_release {
-        if !matches!(
-            release.disposition,
-            VolumeDisposition::Retain | VolumeDisposition::DetachRetained
-        ) {
-            output.push(Candidate::at(path, MalformedProblem::InvalidValue));
-        }
-    }
     let is_checkpoint_file = matches!(cleanup.target, CleanupTarget::CheckpointFile { .. });
     if checkpoint_file_required != is_checkpoint_file {
         output.push(Candidate::at(path, MalformedProblem::InvalidValue));
