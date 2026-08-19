@@ -6607,6 +6607,12 @@ mod tests {
             rebound.checkpoint().runtime_launch,
             predecessor.runtime_launch
         );
+        assert!(
+            super::super::inventory::checkpoint_process_projections_match_retained_launch(
+                rebound.checkpoint()
+            ),
+            "the rebound lifecycle journal must remain admissible to the next full scan"
+        );
     }
 
     #[test]

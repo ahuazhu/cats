@@ -13,10 +13,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::{
     checkpoint_content_digest, sort_node_residue_canonically, AppliedDesiredEvidence,
-    CheckpointEvidence, Condition, DesiredRuntimeSpec, GuestTransportEvidence, HostPath, Id,
-    InventorySource, LastVolumeTransition, LifecycleAdmission, LocalLineageState,
-    LocalVolumeLineage, NodeResidue, ObservedDevice, ObservedRuntimeStatus, ObservedVolume,
-    ProcessEvidence, ProgressingReason, ReadyReason, ReconcileStep, RequireIdleCheckpoint,
+    CheckpointEvidence, Condition, ControlHandshakeEvidence, DesiredRuntimeSpec,
+    GuestTransportEvidence, HostPath, Id, InventorySource, LastVolumeTransition,
+    LifecycleAdmission, LocalLineageState, LocalVolumeLineage, NodeResidue, ObservedDevice,
+    ObservedRuntimeStatus, ObservedVolume, OwnershipTokenEvidence, ProcessEvidence, ProcessRole,
+    ProcessState, ProgressingReason, ReadyReason, ReconcileStep, RequireIdleCheckpoint,
     RuntimeCheckpoint, RuntimeTarget, Sha256Digest, StableState, UnixMillis, VolumeAdminState,
     VolumeAuthorityEvidence, WarmSnapshotEvidence, WireU64, NODE_OBSERVATION_MAX_RESIDUE_ITEMS,
 };
@@ -3184,7 +3185,7 @@ pub(super) fn validate_checkpoint_recovery_structure(
             && checkpoint.node_id == desired.placement.node_id
             && binding_is_valid
             && scanned_checkpoint_phase_envelope_is_valid(checkpoint)
-            && checkpoint.processes.is_empty()
+            && checkpoint_process_projections_match_retained_launch(checkpoint)
             && checkpoint.mounts.is_empty()
             && matches!(
                 checkpoint.guest_transport,
@@ -3393,7 +3394,7 @@ pub(super) fn validate_scanned_checkpoint(
             && checkpoint.node_id == desired.placement.node_id
             && top_level_binding_is_valid
             && phase_envelope_is_valid
-            && checkpoint.processes.is_empty()
+            && checkpoint_process_projections_match_retained_launch(checkpoint)
             && checkpoint.mounts.is_empty()
             && matches!(
                 checkpoint.guest_transport,
@@ -3670,6 +3671,102 @@ fn scanned_checkpoint_phase_envelope_is_valid(checkpoint: &RuntimeCheckpoint) ->
                 )
         }
     }
+}
+
+pub(super) fn checkpoint_process_projections_match_retained_launch(
+    checkpoint: &RuntimeCheckpoint,
+) -> bool {
+    let Some(launch) = checkpoint.runtime_launch.identity() else {
+        return checkpoint.processes.is_empty();
+    };
+    checkpoint.processes.iter().all(|process| {
+        if checkpoint
+            .processes
+            .iter()
+            .filter(|other| other.role == process.role)
+            .count()
+            != 1
+        {
+            return false;
+        }
+        match &process.role {
+            ProcessRole::Vmm {
+                runtime_incarnation,
+            } => {
+                let state_is_valid = match (&checkpoint.step, checkpoint.stable_state) {
+                    (_, Some(StableState::Suspended))
+                    | (ReconcileStep::SnapshotWarmRuntime { .. }, _) => {
+                        process.state == ProcessState::Paused
+                    }
+                    (ReconcileStep::StopRuntime { .. }, _) => {
+                        matches!(process.state, ProcessState::Running | ProcessState::Paused)
+                    }
+                    _ => process.state == ProcessState::Running,
+                };
+                let effect_identity_is_valid = match &checkpoint.step {
+                    ReconcileStep::PauseRuntime {
+                        runtime_incarnation: effect_incarnation,
+                        process_start_time_ticks,
+                    } => {
+                        runtime_incarnation == effect_incarnation
+                            && process.process_start_time_ticks == *process_start_time_ticks
+                    }
+                    ReconcileStep::StopRuntime {
+                        runtime_incarnation: effect_incarnation,
+                        process_start_time_ticks,
+                        scope_id,
+                    } => {
+                        runtime_incarnation == effect_incarnation
+                            && process.process_start_time_ticks == *process_start_time_ticks
+                            && process.scope_id == *scope_id
+                    }
+                    _ => true,
+                };
+                runtime_incarnation == &launch.runtime_incarnation
+                    && process.executable_path == launch.boot.vmm_executable.path
+                    && process.scope_id == launch.scope_id
+                    && process.control_socket_path == launch.api_socket_path
+                    && state_is_valid
+                    && effect_identity_is_valid
+                    && process.ownership_token
+                        == OwnershipTokenEvidence::Valid {
+                            ownership_token: launch.process_identity_token.clone(),
+                        }
+                    && process.control_handshake == ControlHandshakeEvidence::Verified
+                    && process.observed_vm_shape.as_ref().is_some_and(|shape| {
+                        shape.vcpus == launch.vcpus
+                            && shape.memory_bytes == launch.memory_bytes
+                            && shape.boot_image_digest == launch.boot_image_digest
+                            && shape.guest_config_digest == launch.guest_config_digest
+                    })
+            }
+            ProcessRole::Blockd {
+                volume_id,
+                attachment_id,
+                attachment_epoch,
+            } => {
+                let mut devices = launch.devices.iter().filter(|device| {
+                    device.volume_id == *volume_id
+                        && device.attachment_id == *attachment_id
+                        && device.attachment_epoch == *attachment_epoch
+                });
+                let Some(device) = devices.next() else {
+                    return false;
+                };
+                devices.next().is_none()
+                    && process.executable_path == device.serving_process.executable_path
+                    && process.scope_id == device.serving_process.scope_id
+                    && process.control_socket_path == device.serving_process.control_socket_path
+                    && process.state == ProcessState::Running
+                    && process.ownership_token
+                        == OwnershipTokenEvidence::Valid {
+                            ownership_token: device.serving_process.process_identity_token.clone(),
+                        }
+                    && process.control_handshake == ControlHandshakeEvidence::Verified
+                    && process.observed_vm_shape.is_none()
+            }
+        }
+    })
 }
 
 fn validate_stable_cold_checkpoint(
@@ -4165,6 +4262,101 @@ mod tests {
                 .launch_identity(),
             expectation.launch_identity()
         );
+    }
+
+    #[test]
+    fn persisted_lifecycle_processes_require_exact_launch_and_effect_identity() {
+        let mut checkpoint = decode_runtime_checkpoint(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../testdata/runtime-reconciliation-v1-start-runtime-checkpoint.json"
+        )))
+        .unwrap();
+        assert!(checkpoint_process_projections_match_retained_launch(
+            &checkpoint
+        ));
+        let launch = checkpoint.runtime_launch.identity().unwrap().clone();
+        let process_start_time_ticks = WireU64::new(99).unwrap();
+        checkpoint.step = ReconcileStep::StopRuntime {
+            runtime_incarnation: launch.runtime_incarnation.clone(),
+            process_start_time_ticks,
+            scope_id: launch.scope_id.clone(),
+        };
+        checkpoint.processes = vec![
+            ProcessEvidence {
+                role: ProcessRole::Vmm {
+                    runtime_incarnation: launch.runtime_incarnation.clone(),
+                },
+                process_id: 41,
+                process_start_time_ticks,
+                executable_path: launch.boot.vmm_executable.path.clone(),
+                scope_id: launch.scope_id.clone(),
+                control_socket_path: launch.api_socket_path.clone(),
+                state: ProcessState::Running,
+                ownership_token: OwnershipTokenEvidence::Valid {
+                    ownership_token: launch.process_identity_token.clone(),
+                },
+                control_handshake: ControlHandshakeEvidence::Verified,
+                observed_vm_shape: Some(cats_api::runtime_reconciliation::ObservedVmShape {
+                    vcpus: launch.vcpus,
+                    memory_bytes: launch.memory_bytes,
+                    boot_image_digest: launch.boot_image_digest.clone(),
+                    guest_config_digest: launch.guest_config_digest.clone(),
+                }),
+            },
+            ProcessEvidence {
+                role: ProcessRole::Blockd {
+                    volume_id: launch.devices[0].volume_id.clone(),
+                    attachment_id: launch.devices[0].attachment_id.clone(),
+                    attachment_epoch: launch.devices[0].attachment_epoch,
+                },
+                process_id: 42,
+                process_start_time_ticks: WireU64::new(100).unwrap(),
+                executable_path: launch.devices[0].serving_process.executable_path.clone(),
+                scope_id: launch.devices[0].serving_process.scope_id.clone(),
+                control_socket_path: launch.devices[0]
+                    .serving_process
+                    .control_socket_path
+                    .clone(),
+                state: ProcessState::Running,
+                ownership_token: OwnershipTokenEvidence::Valid {
+                    ownership_token: launch.devices[0]
+                        .serving_process
+                        .process_identity_token
+                        .clone(),
+                },
+                control_handshake: ControlHandshakeEvidence::Verified,
+                observed_vm_shape: None,
+            },
+        ];
+        encode_runtime_checkpoint(&checkpoint).unwrap();
+        assert!(checkpoint_process_projections_match_retained_launch(
+            &checkpoint
+        ));
+
+        let mut stale_effect_pid = checkpoint.clone();
+        stale_effect_pid.processes[0].process_start_time_ticks = WireU64::new(101).unwrap();
+        assert!(!checkpoint_process_projections_match_retained_launch(
+            &stale_effect_pid
+        ));
+
+        let mut foreign_blockd = checkpoint.clone();
+        let ProcessRole::Blockd { attachment_id, .. } = &mut foreign_blockd.processes[1].role
+        else {
+            unreachable!()
+        };
+        *attachment_id = Id::new("att_foreign").unwrap();
+        assert!(!checkpoint_process_projections_match_retained_launch(
+            &foreign_blockd
+        ));
+
+        let mut duplicate_vmm = checkpoint;
+        duplicate_vmm
+            .processes
+            .push(duplicate_vmm.processes[0].clone());
+        duplicate_vmm.processes[2].process_id = 43;
+        assert!(!checkpoint_process_projections_match_retained_launch(
+            &duplicate_vmm
+        ));
     }
 
     #[test]
