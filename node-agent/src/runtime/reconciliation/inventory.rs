@@ -1276,7 +1276,15 @@ impl RuntimeInventoryScanner for CleanSlateInventoryScanner {
                     &vmm,
                 ) {
                     Ok(evidence) => evidence,
-                    Err(_) => {
+                    Err(error) => {
+                        // A booting Guest is expected here for a while; the
+                        // same silent arm also hides a permanently unready
+                        // Guest, so the cause must be visible on the Node.
+                        tracing::warn!(
+                            cat = %desired.cat_id,
+                            error = format!("{error:#}"),
+                            "Guest RuntimeReady probe failed; Running tail stays unminted",
+                        );
                         // A booting Guest or an earlier Format/Mount phase is
                         // an exact closed observation. If a process-local cell
                         // nevertheless exists, its routes remain observable
