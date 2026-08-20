@@ -16,7 +16,7 @@ receipt、第二份grant ledger或新的volume state。
 
 blockd继续只通过`VolumeDataAuthority`读取`VolumeRecord`、renew exact owner/epoch和CAS exact head；它不能
 acquire、release、takeover或delete。Control内部的authorization derive、normal begin-delete、sweeper、
-same-disk restore、snapshot与HostFence/Rejoin也不暴露在本文route。Node不能直接调用Control Store的pure
+same-disk restore、snapshot与HostFence也不暴露在本文route。Node不能直接调用Control Store的pure
 single-row acquire/release helper，因为那会跳过current AgentSession、fresh complete inventory、current
 Desired、Disk和delete分支的同事务校验。
 
@@ -621,7 +621,7 @@ cross-binding。
 | release binding | current session guest digest必须等于Control active exact receipt；旧release session即使其他字段匹配也零卷副作用 |
 | assigned-set lock | 真实PG双connection双向pause：Desired INSERT先锁/提交则旧cursor full/transition拒绝且零写；full先锁/提交则INSERT只能在后，旧attestation随即以assigned-set changed不可消费；所有Desired mutation、A20 mutation和transition先锁同一NodeIdentity；两Control replicas双session覆盖 |
 | normal acquire | current Desired/intent/Disk/Volume逐字段；fresh complete inventory；same transition exact replay不刷新expiry；异payload、other writer、epoch mismatch、Deleting和epoch max零副作用 |
-| takeover | caller只传ID；event/auth/volume固定锁序；immutable `authorized_node_id`与caller、current intent/new attachment/revision/placement绑定；首次consume、Rejoined并发、not-after过期、`db_now + duration`溢出的exact typed错误、exact receipt replay且receipt不重复Node ID |
+| takeover | caller只传ID；event/auth/volume固定锁序；immutable `authorized_node_id`与caller、current intent/new attachment/revision/placement绑定；首次consume、not-after过期、`db_now + duration`溢出的exact typed错误、exact receipt replay且receipt不重复Node ID |
 | grant | size/durability/head/owner/epoch/expiry/origin来自同一updated VolumeRecord；Node落checkpoint后才spawn/adopt；success字段替换或late old-session response不能开Guest I/O |
 | release | CleanupRelease唯一导出ReleaseRequest；current full evidence、origin、stop、R==L==generation、Desired/tombstone和disposition；same ID replay、异payload、response loss、epoch max |
 | release/auth race | 两session按Volume锁后fresh重验；release先则derive全rollback，derive先则release exact 409零写；无auth+Unowned |

@@ -862,7 +862,7 @@ LIMIT 64
 第一页没有cursor；下一页使用上一页最后一个`node_id`，禁止OFFSET。每页在同一transaction/snapshot批量加载
 64个identity各自的current policy、A20 §7.1完整facts和该Node的current Active
 `HostFenceEvent`（无则null）；不能为每页/每Node另开snapshot或取新clock。一个NodeIdentity
-同时最多一个Active event；Runtime rejoin/Host replacement状态机保证这个约束，Store读到多个是
+同时最多一个Active event；Runtime Host replacement状态机保证这个约束，Store读到多个是
 fatal corruption而不是选最小ID。实现每次只
 保留当前page和当前候选，内存O(64)，一直翻页到EOF；没有1024/4096等fleet cap，也不把“页数过多”当capacity
 不足。10000 ms deadline到期是infrastructure unavailable，不是no capacity。
@@ -1084,10 +1084,9 @@ policy apply、Agent registration/session replacement、Desired read cursor、ob
 NodeIdentity作为唯一per-Node serialization row，并共用
 `NodeIdentity -> current credential lineage（A19-auth path）-> AgentSession -> observation receive/cursor ->
 HostFenceEvent -> Volume`前缀；不涉及的row跳过。不能
-`credential-lineage|AgentSession|receive-state|Desired|HostFenceEvent -> NodeIdentity`逆序。一个HostFenceEvent的新建、
-`Active -> Rejoined`或任何会改变placement eligibility的state/lineage mutation也必须先锁该
-NodeIdentity，再锁event；这使target NodeIdentity锁下的“无Active event”重验不会被并发插入或
-rejoin越过。只消费已有event且不改event eligibility state的Volume authorization继续可按
+`credential-lineage|AgentSession|receive-state|Desired|HostFenceEvent -> NodeIdentity`逆序。一个HostFenceEvent的新建
+或任何会改变placement eligibility的state/lineage mutation也必须先锁该
+NodeIdentity，再锁event；这使target NodeIdentity锁下的“无Active event”重验不会被并发插入越过。只消费已有event且不改event eligibility state的Volume authorization继续可按
 `HostFenceEvent -> Authorization -> Volume`走，因为它不会再反向取NodeIdentity。
 
 Desired writer的affected set是old assigned node与new assigned node的并集：insert只取new，remove只取old，
@@ -1314,7 +1313,7 @@ body_sha256 = sha256:a4636d17031808e21932b2f54dc3b0d104243a1e9e56e33962f678cd4d8
 | pages/replicas | 0、1、64、65和超过1024 Node；keyset无漏重；一个snapshot/DB now；两个Control replica稳定选同一最小eligible node；无fleet cap |
 | capacity/count | lifecycle各态都计完整shape；equality fit、超1拒绝；vCPU/memory分别边界；checked sum/add/sub/count overflow fatal；count 1023->1024成功、1024->1025在plan和commit均零business/result；stored 1025使replica unready；不读heartbeat/legacy node capacity |
 | post-mutation plan | same-node resize只评估current node、精确`total-old+new`且保留network；planned migration/takeover/retry从source删、target加并fresh network/revision/epoch；current revision/digest/placement/old shape/network任一变化就stale；两replica resize/move只一个CAS胜出；纯remove也锁source NodeIdentity |
-| source/fence | exclusion只由server从current source派生且source不能当move target；任何Active event target都拒绝；plan后event create/rejoin在NodeIdentity锁下重验；non-takeover要求source无Active，takeover要求exact Active event/lineage；错/null event零Desired/result |
+| source/fence | exclusion只由server从current source派生且source不能当move target；任何Active event target都拒绝；plan后event create在NodeIdentity锁下重验；non-takeover要求source无Active，takeover要求exact Active event/lineage；错/null event零Desired/result |
 | simultaneous create | 同Node剩余恰好一份capacity或一个assigned-set slot时只有一个commit；不同idempotency key不超卖；同key只一组identity/result；无reservation row |
 | network hash/probe | fixed vector；slot0永不用；首slot collision、连续collision、16383->1 wrap；full 16383 exhaustion；duplicate/malformed assigned config fatal |
 | reuse/migration | Desired移除但旧full inventory/tap residue仍拒绝；new full absence后可复用；跨Node或CIDR变化fresh network ID/config/revision；MAC只由selected slot导出 |

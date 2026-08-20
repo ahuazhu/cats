@@ -80,7 +80,7 @@ lifecycle cutover或release qualification。下表把已实现边界与仍开放
 | route | v2 Grant、Node AdmissionCell/guard、退役/重启恢复、mTLS machine tunnel及gatewayd public proxy composition已实现 | ring/mTLS artifacts与gatewayd deployment尚未接线，production ingress保持Closed；跨Node overlay仍deferred |
 | Node restart | Host lock、per-Cat scopes、union inventory、current-authority checkpoint/receipt恢复与stale-boot清理已实现 | superseded pre-acquire publication与其他lifecycle恢复不在已完成声明内；systemd 255 + KVM/Cloud Hypervisor exact-SHA证据仍是release gate |
 | HA | bounded PostgreSQL执行、多副本锁序与Operation读取已实现；PG跨组件测试到达signed runner的recording effect dispatch seam | [当前跨组件证据边界](architecture-cross-review.md#当前跨组件证据边界)之后的真实installed effect、control-plane takeover、RDS failover和自动Host fence仍需证据 |
-| PersistentDisk | current-Desired Running路径的多卷Normal/Takeover、NBD/vhost、ext4 UUID、一次性Format、Drain/Commit及private mounted-set gate已实现 | superseded publication、完整lifecycle、Snapshot/GC、跨Host rejoin和delete crash矩阵仍按独立合同验收 |
+| PersistentDisk | current-Desired Running路径的多卷Normal/Takeover、NBD/vhost、ext4 UUID、一次性Format、Drain/Commit及private mounted-set gate已实现 | superseded publication、完整lifecycle、Snapshot/GC和delete crash矩阵仍按独立合同验收 |
 | Placement/Guest network | A23 provisioner policy、同snapshot planner、exact Desired `/30`和per-Cat tap已实现 | 跨Node Guest overlay仍deferred |
 
 除本节明确标成“当前事实”的内容外，后文描述的是accepted终态合同及其上线门，不能从规范中的
@@ -412,13 +412,9 @@ Route正确性只依赖签名Grant、当前Node gate和原子guard。详见
 尚未进入当前完成声明。provider receipt只建立
 绑定不可变Host/boot、旧session和fence attempt的Active HostFenceEvent，不直接创建placement或
 writer。Control Plane以一个事务失败旧Operation并创建新完整Desired/Operation/placement及全部
-逐卷授权；每卷CAS后才恢复。旧Host网络持续隔离，rejoin把旧`R < L`lineage quarantine并核对全部
-派生授权/current owner。授权派生、首次consume和`Active -> Rejoined`都锁同一event行；首次consume
+逐卷授权；每卷CAS后才恢复。旧Host网络持续隔离。首次consume
 只从服务器端immutable authorization row读取payload，在同一PostgreSQL事务完成Volume CAS并写closed、
-不可变receipt。rejoin验证receipt以及当前卷是其直接结果或合法单调后继；VolumeRecord已删除时，精确
-`DeleteCompletionReceipt`还必须证明normal exact `BeginDeleteRequest`或同一disposable authorization的begin identity、
-deleting epoch/head、object sweep和两边row原子删除。未消费授权必须已过期。
-HostRejoinProof把event持久转为Rejoined后才恢复网络，此后未消费授权不能首次生效。
+不可变receipt。
 
 数据库调用在有界blocking executor/连接池中执行，不能让同步driver占住Tokio worker。
 拓扑、故障检测、告警和测试机资格合同见[Operations and HA](operations-ha.md)。
@@ -443,7 +439,7 @@ HostRejoinProof把event持久转为Rejoined后才恢复网络，此后未消费�
 | B. Node convergence | Host lock、per-Cat reconciler、checkpoint、scope、inventory、Host资源分配 | inspect -> plan one step -> persist -> act -> verify | A的revision/session |
 | C. Volume and disk | RWO lease、逐卷takeover、pack lineage、ext4、snapshot、delete | transition-id CAS、`R/L`屏障、Cold-only磁盘变化 | A的disk intent、B的checkpoint |
 | D. Route and work admission | Endpoint lookup、Grant、Gateway cache、Node gate/guard、RequireIdle | signer一致快照、pre-admission verify、AdmissionCell线性化 | A、B，且C mount Ready |
-| E. Operations and HA | 有界DB执行、控制面/Gateway副本、Host fence/rejoin、告警、资格测试 | suspicion -> proof -> recovery，固定故障oracle | A-D全部稳定 |
+| E. Operations and HA | 有界DB执行、控制面/Gateway副本、Host fence、告警、资格测试 | suspicion -> proof -> recovery，固定故障oracle | A-D全部稳定 |
 
 依赖顺序是 `A -> B -> C -> D -> E`，但A的schema、B的Host基础和C的MetadataStore合同可在
 接口冻结后并行实现。D只能在revision、incarnation和mount readiness已经可用后接入；E中的
@@ -453,7 +449,7 @@ Host恢复必须同时调用AgentSession、逐卷takeover和route close，不能
 
 1. **阻止数据损坏或双写**：revision/session、normal acquire/takeover、pack lineage、checkpoint、
    `R/L`屏障、ext4初始化和route close。
-2. **阻止单点故障进入用户面**：有界DB、Agent restart、控制面/Gateway副本、Host fence/rejoin。
+2. **阻止单点故障进入用户面**：有界DB、Agent restart、控制面/Gateway副本、Host fence。
 3. **不阻塞本轮的能力**：跨Host Warm/live migration、hotplug、Disk clone、Golden Image自动GC、
    overlay、privilege separation和新billing形态。
 
@@ -461,7 +457,7 @@ Host恢复必须同时调用AgentSession、逐卷takeover和route close，不能
 
 1. 支撑current-Desired Running路径的A-D production slices和外部行为oracle已经落地；旧NodeJob、heartbeat、
    shared route mirror及旧work入口不在production composition，只保留显式retired test harness。
-2. 这不覆盖superseded pre-acquire publication、完整四态、Snapshot/GC、外部Host fence/rejoin或RDS failover；
+2. 这不覆盖superseded pre-acquire publication、完整四态、Snapshot/GC、外部Host fence或RDS failover；
    这些边界只能在实现和各自故障矩阵都闭合后升级状态。
 3. 先增加从production public spawn与真实PostgreSQL开始、穿过installed scanner和
    `SignedRunningEffect`的组合E2E。当前PG测试只到recording `RefreshInventory` seam，不能替代该门。
@@ -507,8 +503,7 @@ virtio/ext4 和四态，是因为它们是已验证且合适的终态设计，�
   原子写双方Deleting和202 result；多sweeper只能在provider cutoff/late PUT barrier和LIST强一致后以
   prefix-empty和exact completion CAS删除row；stale-empty adapter fail gate，且不创建job/第二Operation；
 - `R < L` 时 Warm/Cold/detach/migrate 被阻止，远端恢复后能 drain；
-- Host 未 fence 时不跨 Node 启动；takeover后旧epoch永久fail closed，旧Host通过rejoin清场
-  前不恢复workload网络；
+- Host 未 fence 时不跨 Node 启动；takeover后旧epoch永久fail closed，旧Host不恢复workload网络；
 - route先在AdmissionCell停止admission并drain guards，再触碰runtime；慢reconcile I/O不阻塞
   已Active gate；
 - 未变Endpoint不因其他Endpoint mutation失效；任何实际close后的gate只以更高route epoch重开；

@@ -127,7 +127,7 @@ Deleted 是保留到物理 runtime、route 和 volume disposition 全部完成�
 Node当前session的complete inventory、精确确认该tombstone绑定的RuntimeCheckpoint不存在，或验证
 现有HostFenceEvent中逐字段绑定旧Host且证明Host state storage永久销毁的provider HostDestroyed
 receipt，并在GC事务用该Cat保留的tombstone/placement与immutable Host/state-path lineage精确匹配event，
-才能GC。event的expected boot/session继续绑定fence/rejoin序列，但不要求等于该Cat index最近接受的
+才能GC。event的expected boot/session继续绑定fence序列，但不要求等于该Cat index最近接受的
 session。一个
 Host级event可分别验证多个Cat，不复制Cat列表。两条absence路径严格二选一；HostDestroyed路径不伪造
 AgentSession/inventory，普通network/power isolation不够。两条路径都不授予placement/writer，全部
@@ -276,7 +276,7 @@ different-valid、corrupt或other-Cat文件必须保留，并拒绝旧cleanup/GC
 
 ## Inventory 与稳定服务
 
-Agent 启动、Host rejoin、adoption、orphan 判断、破坏性 cleanup 和不确定恢复必须先完成全量
+Agent 启动、adoption、orphan 判断、破坏性 cleanup 和不确定恢复必须先完成全量
 union inventory，期间gate保持Closed。full scan在当前AgentSession下建立单调inventory epoch、
 digest、read position与PostgreSQL `accepted_at_unix_ms`组成的`AdmissionInventoryAttestation`。普通增量
 heartbeat引用该epoch，只upsert具体Cat，缺项不代表不存在，也不能覆盖attestation。Route signer
@@ -335,7 +335,7 @@ BlobStore PUT，且cutoff前已被接受的PUT已经成功并对后继强一致L
 必须跨过这个可验证barrier；单独power/network隔离、异步IAM revoke或进程消失不够。不支持者保持Blocked，
 Deleting中的对象清理也不得写completion receipt；这不增加event字段或第二个proof authority。
 
-HostDestroyed永不Rejoined。没有tombstone/recovery引用且全部authorization已terminal、逐卷disposition
+没有tombstone/recovery引用且全部authorization已terminal、逐卷disposition
 闭合后，可按审计策略回收逐卷恢复记录；compact event/receipt仍按现有Operation/审计引用保留。
 
 Control Plane先把旧Pending Operation置为HostLost，再在一个事务中创建新完整Desired/Operation、
@@ -349,15 +349,11 @@ epoch；同一 authorization 幂等，
 逐卷授权的 schema、CAS 和状态机由 [Volume Authority](../specs/volume-authority.md) 定义。它与
 本 ADR 是 Runtime Host-loss 路径的硬依赖；Node reconciler 不另设 lease revoke 路径。
 
-旧Host仍保持workload网络隔离。新boot/session下完成全量inventory，把旧epoch的`R < L` lineage
-移入quarantine，并核对该event派生的全部takeover/delete authorization与每卷current owner/epoch。
+旧Host仍保持workload网络隔离。
 `isolated -> host_destroyed`用`state=Active + isolation_state=isolated + 完整event tuple`做exact CAS。
-该更新、授权派生、首次consume、`Active -> Rejoined`和HostDestroyed tombstone GC都锁同一event行到
+该更新、授权派生、首次consume和HostDestroyed tombstone GC都锁同一event行到
 事务提交并在取得锁后重验；竞争只有一个顺序能提交。首次consume在同一PostgreSQL事务
-完成Volume CAS并写不可变receipt。rejoin验证receipt以及当前卷是其直接结果或合法单调后继；
-VolumeRecord已删除时验证精确`DeleteCompletionReceipt`。未消费授权必须已过`not_after`；Control
-Plane接受HostRejoinProof并把event持久转为Rejoined后才恢复网络，此后未消费授权不能首次生效，
-已消费授权仍可幂等读取原receipt。
+完成Volume CAS并写不可变receipt。
 
 Root direct Disk DELETE始终拒绝。对current stable Cold且Root已`R == L`、Unowned的Cat，covered Destroy
 事务可原子验证current session/observation并写Deleted Desired/Pending Operation、normal BeginDelete与API
