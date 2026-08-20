@@ -1,6 +1,4 @@
-//! Cats node agent: executes control-plane jobs by supervising the fake VMM
-//! (guest-agent process) and one cats-blockd per attachment. See
-//! `runtime.rs` for the FakeVmm / Cloud Hypervisor seam.
+//! Cats node agent.
 
 pub mod admission;
 pub mod agent_registration;

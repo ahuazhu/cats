@@ -42,7 +42,6 @@ use cats_api::runtime_reconciliation::{
     GUEST_DEVICE_SERIAL_MAX_BYTES_V1,
 };
 
-use crate::proc::ProcHandle;
 use crate::runtime_spine::{RuntimeDesiredEffectContext, RuntimePhysicalReadContext};
 
 /// Guest-agent vsock port (must match the guest image's init script).
@@ -2999,25 +2998,6 @@ pub fn page_out_memory(_pid: u32, _backing: &Path) -> Result<PageOutStats> {
     bail!("Guest memory page-out requires Linux")
 }
 
-pub(crate) fn wait_api_ready(api_sock: &Path, vmm: &mut ProcHandle) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        // vmm.ping (not vm.ping): confirms the VMM HTTP thread is serving.
-        if let Ok((status, _)) = ch_api(api_sock, "GET", "/api/v1/vmm.ping", None) {
-            if (200..300).contains(&status) {
-                return Ok(());
-            }
-        }
-        if vmm.exited()? {
-            bail!("cloud-hypervisor exited during startup");
-        }
-        if Instant::now() > deadline {
-            bail!("timed out waiting for CH api socket");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
 pub fn pause(api_sock: &Path) -> Result<()> {
     ch_api_ok(api_sock, "PUT", "/api/v1/vm.pause", None)
 }
@@ -3048,19 +3028,6 @@ pub fn snapshot(api_sock: &Path, dest_dir: &Path) -> Result<()> {
     })
     .to_string();
     ch_api_ok(api_sock, "PUT", "/api/v1/vm.snapshot", Some(&body))
-}
-
-pub(crate) fn shutdown_vmm(api_sock: &Path, vmm: &mut ProcHandle) {
-    let _ = ch_api_ok(api_sock, "PUT", "/api/v1/vmm.shutdown", None);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        // A probe that fails is not evidence of an exit; keep waiting.
-        if vmm.exited().unwrap_or(false) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    vmm.kill_and_reap();
 }
 
 #[cfg(test)]

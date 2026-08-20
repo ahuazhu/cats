@@ -11,8 +11,7 @@
 //! converge through independent device, Host-network reservation/TAP, and
 //! checkpoint-only StartRuntime CID rounds. Physical VMM launch and Guest
 //! handshake remain later fresh-inventory effects.
-//! This path does not construct `NodeRuntime`, adopt a legacy ledger, or run a
-//! destructive residue/device sweep.
+//! This path does not run a destructive residue/device sweep.
 
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;

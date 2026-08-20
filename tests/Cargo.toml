@@ -8,23 +8,11 @@ publish = false
 [dependencies]
 
 [dev-dependencies]
-cats-api = { workspace = true }
-cats-metering = { workspace = true }
-cats-control-plane = { workspace = true }
 cats-node-agent = { workspace = true }
-cats-blockd = { workspace = true }
-cats-block-client = { workspace = true }
 cats-storage = { workspace = true }
 cats-metadata-store-sqlite = { workspace = true }
-cats-metadata-store-postgres = { workspace = true }
-cats-object-store-aws-s3 = { workspace = true }
-cats-object-store-file = { workspace = true }
 cats-test-support = { workspace = true }
 anyhow = { workspace = true }
-serde_json = { workspace = true }
-tokio = { workspace = true }
-reqwest = { workspace = true }
-hex = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]
