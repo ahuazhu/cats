@@ -1314,13 +1314,6 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let state_path = temp.path().join("state");
         let registration = loopback_registration(state_path.clone());
-        #[cfg(target_os = "linux")]
-        let _runtime = {
-            let mut config =
-                crate::runtime::stub_node_config(temp.path(), crate::runtime::VmmMode::Fake);
-            config.state_dir = registration.runtime_state_directory();
-            crate::runtime::NodeRuntime::new(config).unwrap()
-        };
         let old_registration_directory = ensure_registration_directory(
             &registration.state_directory,
             RegistrationTransport::LoopbackTest,

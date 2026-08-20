@@ -1170,24 +1170,11 @@ name = "cats-e2e"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "cats-api",
- "cats-block-client",
- "cats-blockd",
- "cats-control-plane",
- "cats-metadata-store-postgres",
  "cats-metadata-store-sqlite",
- "cats-metering",
- "cats-network",
  "cats-node-agent",
- "cats-object-store-aws-s3",
- "cats-object-store-file",
  "cats-storage",
  "cats-test-support",
- "hex",
- "reqwest",
- "serde_json",
  "tempfile",
- "tokio",
 ]
 
 [[package]]
@@ -1297,25 +1284,19 @@ name = "cats-network"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
- "base64",
  "bytes",
  "cats-api",
  "cats-test-support",
  "clap",
- "futures-util",
  "http-body-util",
  "hyper",
  "hyper-util",
  "reqwest",
  "rustls",
- "serde",
- "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.19",
  "tokio",
  "tokio-rustls",
- "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1468,7 +1449,6 @@ dependencies = [
  "cats-storage",
  "rusqlite",
  "serde_json",
- "tempfile",
  "tokio",
 ]
 
