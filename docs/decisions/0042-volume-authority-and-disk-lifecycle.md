@@ -48,16 +48,14 @@ lease请求只接受positive `lease_duration_ms`。唯一PostgreSQL事务owner�
 始终是`generation + nullable root hash + nullable root object ID`的exact tuple：generation为0时后两者都
 null，非0时后两者都non-null。
 
-HostFenceEvent的授权派生、首次消费与Rejoined转换都先锁同一个PostgreSQL event行。authorization由唯一
+HostFenceEvent的授权派生与首次消费都先锁同一个PostgreSQL event行。authorization由唯一
 Control Store writer在同一PG trust/transaction域写完整immutable payload；takeover与disposable payload都把
 派生时的takeover目标new placement Node或disposable Deleted placement Node写为`authorized_node_id`，不因
 后续session/revision改变。Node只携ID，不再增加第二套
 签名。receipt留在同一AuthorizationRecord且不重复该字段。首次消费还锁authorization和VolumeRecord，
 在同一事务完成卷CAS并写closed、不可变
-`AuthorizationConsumedReceipt`；
-Rejoined先提交后，未消费授权不能首次生效。rejoin校验receipt以及当前卷是其直接结果或合法的
-单调后继；卷已删除时改验精确`DeleteCompletionReceipt`。这些安全回执保留到相关event Rejoined，
-随后按审计策略GC。
+`AuthorizationConsumedReceipt`；卷已删除后由精确`DeleteCompletionReceipt`证明合法后继。这些安全回执
+按审计策略保留和GC。
 
 ### 3. Node取得grant，blockd只采用grant
 
@@ -159,7 +157,7 @@ Deleting rows本身就是level-triggered work。sweeper不建job/claim/opaque pr
 提交；这不是跨PG/object的两阶段事务或第二authority。
 completion receipt保存disk/volume/delete、normal exact `BeginDeleteRequest`或disposable authorization/prior
 attachment的closed begin variant、deleting epoch和exact head。owner已清、object sweep完成及两边row已删除
-是该receipt的固定语义，不存bool；因此Host rejoin在row删除后仍能验证同authorization的合法后继。
+是该receipt的固定语义，不存bool；因此row删除后仍能验证同authorization的合法后继。
 
 ADR-0025的disposable Root例外使用唯一的第二个入口：Control Plane根据当前Deleted Desired与
 精确stop observation或Active HostFenceEvent签发

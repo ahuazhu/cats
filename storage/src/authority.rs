@@ -416,7 +416,6 @@ pub enum HostIsolationState {
 #[serde(rename_all = "snake_case")]
 pub enum HostFenceEventState {
     Active,
-    Rejoined,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -854,8 +853,7 @@ pub fn classify_residue_reclaim_authority(
 
 pub fn validate_host_fence_event(event: &HostFenceEvent) -> Result<()> {
     if let HostIsolationState::HostDestroyed { receipt } = &event.isolation_state {
-        if event.state == HostFenceEventState::Rejoined
-            || receipt.provider != event.provider
+        if receipt.provider != event.provider
             || receipt.immutable_host_id != event.immutable_host_id
             || receipt.node_id != event.node_id
             || receipt.expected_node_boot_id != event.expected_node_boot_id
@@ -1206,9 +1204,6 @@ fn consume_takeover_bound_to_event(
 ///
 /// A replay is owned by the authorization row, not by the volume's current
 /// state: the volume may since have been released, reacquired, or removed.
-/// The PostgreSQL transaction owner still locks the event and authorization
-/// rows before calling this helper so an unconsumed authorization cannot race
-/// an `Active -> Rejoined` transition.
 pub fn replay_consumed_takeover(
     authorization_record: &AuthorizationRecord,
     authorization_id: &Id,
@@ -1309,7 +1304,7 @@ pub fn consume_disposable_root_delete(
     {
         return Err(AuthorityError::InvalidAuthorization);
     }
-    validate_disposable_event_basis(authorization, host_fence_event, false)?;
+    validate_disposable_event_basis(authorization, host_fence_event)?;
 
     if let AuthorizationState::Consumed(receipt) = &authorization_record.state {
         let AuthorizationConsumedReceipt::BeginDisposableDelete(receipt) = receipt.as_ref() else {
@@ -1325,7 +1320,7 @@ pub fn consume_disposable_root_delete(
         ));
     }
 
-    validate_disposable_event_basis(authorization, host_fence_event, true)?;
+    validate_disposable_event_basis(authorization, host_fence_event)?;
     if db_now > authorization.not_after
         || !matches!(record.admin_state, VolumeAdminState::Active)
         || record.lease_owner.as_ref() != Some(&authorization.expected_attachment_id)
@@ -1589,13 +1584,11 @@ fn validate_disposable_receipt(
 fn validate_disposable_event_basis(
     authorization: &DisposableRootDeleteAuthorization,
     event: Option<&HostFenceEvent>,
-    require_active: bool,
 ) -> Result<()> {
     match (&authorization.isolation_basis, event) {
         (DisposableDeleteIsolationBasis::RuntimeStopped { .. }, None) => Ok(()),
         (DisposableDeleteIsolationBasis::HostFenceEvent { event_id }, Some(event))
-            if event_id == &event.event_id
-                && (!require_active || event.state == HostFenceEventState::Active) =>
+            if event_id == &event.event_id =>
         {
             Ok(())
         }

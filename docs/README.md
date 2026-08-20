@@ -27,7 +27,7 @@ artifact与单一Guest release payload见
 | Route | Route Grant v2、Node AdmissionCell/guard、Gateway-to-Node mTLS tunnel、gatewayd、revision-1 deployment、Node durable successor installer及schema 15 rotation state machine已实现 | ADR尚未授予production rotation caller/transport；真实production mTLS/rotation E2E qualification仍开放，跨Node overlay仍deferred |
 | Agent restart | Host lock、per-Cat systemd scopes、union inventory、current-authority receipt/checkpoint恢复与旧boot清理已实现 | superseded pre-acquire publication不在已完成声明内；具体release仍须在systemd 255 + KVM/Cloud Hypervisor上保留exact-SHA证据 |
 | 控制面 HA | PostgreSQL A19/A20/A22/A23、bounded executor、Operation查询与多副本锁序已实现 | 真实RDS failover与外部Host fence仍需独立qualification，不从timeout推断隔离 |
-| PersistentDisk | current-Desired Running路径的多卷Normal/Takeover、NBD/vhost、ext4 UUID、一次性Format、Drain/Commit及private mounted-set gate已实现 | superseded publication、完整lifecycle、Snapshot/GC和跨Host rejoin仍按各自合同/故障矩阵验收 |
+| PersistentDisk | current-Desired Running路径的多卷Normal/Takeover、NBD/vhost、ext4 UUID、一次性Format、Drain/Commit及private mounted-set gate已实现 | superseded publication、完整lifecycle和Snapshot/GC仍按各自合同/故障矩阵验收 |
 | placement/网络 | A23 provisioner policy、同snapshot planner、exact Desired `/30`与per-Cat tap已实现 | 跨Node Guest overlay仍deferred |
 | privilege | 进程权限仍较集中 | privilege separation尚未实现 |
 
@@ -51,7 +51,7 @@ production `SignedRunningEffect`，终点为`ProvisionRootImage`/root-blockd、c
 | [architecture.md](architecture.md) | Target + current boundary | 系统总图、authority matrix、HA合同和路线 |
 | [runtime-lifecycle.md](runtime-lifecycle.md) | Product contract | 四态、work/admission、数据屏障、Host loss |
 | [storage.md](storage.md) | Implemented core + explicit gaps | ChunkStore格式、FLUSH、L/R、lease/fencing、GC |
-| [operations-ha.md](operations-ha.md) | Target operations contract | failure domain、有界DB、Host fence/rejoin、分层qualification |
+| [operations-ha.md](operations-ha.md) | Target operations contract | failure domain、有界DB、Host fence、分层qualification |
 | [architecture-cross-review.md](architecture-cross-review.md) | Accepted review + current evidence boundary | 三边界交叉复核、阻断项关闭与可复现证据终点 |
 | [实验总报告](experiments-2026-07-21-storage-lifecycle.md) | Evidence | 2026-07-21方法、样本、结果和失败尝试 |
 

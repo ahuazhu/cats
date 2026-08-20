@@ -855,7 +855,7 @@ session可先fail-close后正常返回。pre-scan本身超时、取消、队列/
 
 以下场景必须先完成一次有边界的全量扫描，期间所有 AdmissionCell 保持 Closed：
 
-- Agent 启动或 Host rejoin；
+- Agent 启动；
 - adoption、orphan 判断和任何破坏性 cleanup；
 - checkpoint 损坏或上一步结果不确定。
 
@@ -1390,7 +1390,7 @@ HostFenceEvent {
   event_id, provider, immutable_host_id, node_id, expected_node_boot_id,
   expected_agent_session_epoch, fence_attempt_id,
   isolation_state: HostIsolationState, observed_at,
-  state: Active | Rejoined
+  state: Active
 }
 
 HostIsolationState =
@@ -1418,7 +1418,7 @@ HostDestroyedReceipt {
 
 同一 fence attempt 只保留一个 event，同一`NodeIdentity`同时最多一个Active event。创建时在
 NodeIdentity lock下发现已有Active event，只有同fence attempt和完整tuple的exact replay可读原结果；
-任何另一attempt都必须等旧event Rejoined，`host_destroyed`则必须使用new NodeIdentity。
+替换Host必须使用new NodeIdentity。
 Active event 是 Host 级隔离事实，不是卷权限。Control
 Plane 对旧 placement 中每个需要恢复的卷分别创建：
 
@@ -1438,7 +1438,7 @@ trust/transaction域写入；Node只携
 `HostFenceEvent -> authorization -> VolumeRecord`，要求event仍为Active和数据库
 时间未超过`not_after`，在同一PostgreSQL事务完成精确逐卷CAS并写不可变
 `AuthorizationConsumedReceipt`。相同authorization只读取receipt并返回同一LeaseGrant，不再次改变
-volume；换卷、换旧owner、换attachment、换placement、过期或Rejoined后的首次消费都失败。运行时
+volume；换卷、换旧owner、换attachment、换placement或过期的首次消费都失败。运行时
 Desired的`attachment_id`、revision、placement必须与authorization一致，对应`VolumeIntent.acquire`
 必须引用该authorization。精确schema/CAS以[Volume Authority](volume-authority.md)为准。
 
@@ -1453,7 +1453,7 @@ provider storage已
 `isolation_state={kind:"isolated"}`及未改变的完整event tuple
 （`event_id`、provider、immutable host、node、expected boot/session、fence attempt和`observed_at`）做
 exact CAS；receipt一经提交不可变，相同receipt重放只读原结果，任何字段不同的重放都拒绝。
-`host_destroyed`不会转为Rejoined；替换Host必须使用新的provisioned identity。两种receipt都不直接授予
+替换Host必须使用新的provisioned identity。两种receipt都不直接授予
 placement或writer。Control Plane先把旧
 Pending Operation置为`Failed(HostLost)`，再在一个事务中创建新完整Desired/Operation、placement、
 全部新attachments和每卷VolumeTakeoverAuthorization；新Desired逐卷引用授权。目标Node消费所有
@@ -1462,20 +1462,13 @@ MetadataStore CAS后才能Ready，不存在另一种writer-proof fallback。
 session失效或提高attachment epoch不是解除旧Host隔离的条件。旧Host重用前必须在隔离网络内以
 新boot/session完成完整inventory，保持gates Closed，停止旧runtime/transport/socket/tap/guards，
 并把旧epoch的`R < L` lineage移入quarantine而非删除。所有改变placement eligibility或
-需要重读Node lineage的event事务（event创建、`isolated -> host_destroyed`、
-`Active -> Rejoined`和HostDestroyed tombstone GC）都固定按
+需要重读Node lineage的event事务（event创建、`isolated -> host_destroyed`和
+HostDestroyed tombstone GC）都固定按
 `NodeIdentity -> HostFenceEvent`锁序并持有到commit。会创建新Desired/placement的授权派生也先按
 目标/源`node_id`锁全部NodeIdentity，再锁event。只消费已有authorization、不改event
 state且不再读NodeIdentity的事务仍按`HostFenceEvent -> authorization -> VolumeRecord`。各路径
 都在锁后重验自己要求的state、isolation variant和完整event tuple；竞争事务只能按
-锁取得顺序提交，后一方必须基于前一方已提交状态重新判定。rejoin再按稳定顺序锁定该event的
-全部授权，所以不会漏掉
-in-flight首次消费。Control Plane核对每个Unconsumed授权都已过`not_after`，每个Consumed授权都有
-匹配payload的不可变receipt；当前VolumeRecord必须是receipt直接结果或更大epoch的合法状态机后继，
-receipt含Disk postcondition时Control Disk也必须匹配同一Deleting；两边记录已删除时必须有精确
-`DeleteCompletionReceipt`。缺失、倒退或冲突保持Blocked。接受
-`HostRejoinProof`并在同一事务把event持久转为Rejoined后provider才恢复workload网络；此后未消费
-授权不能首次生效，已消费授权只幂等读取receipt。相关authorization和`DeleteCompletionReceipt`保留到Rejoined。
+锁取得顺序提交，后一方必须基于前一方已提交状态重新判定。
 
 ## 10. Observation 与 Conditions
 
@@ -2477,7 +2470,6 @@ BlockedReason =
     remote_generation: Generation
   }
 | { kind: "authorization_unavailable", volume_id: Id, authorization_id: Id }
-| { kind: "host_rejoin_pending", host_fence_event_id: Id }
 | { kind: "control_plane_unavailable", last_desired_revision: Revision | null }
 | {
     kind: "key_ring_unavailable",
@@ -2947,7 +2939,7 @@ lineage时拒绝该observation，不能覆盖。retire后只要仍有index、tom
    `AssignedPlacement`必须等于index中该Cat的旧placement，二者的`node_id`等于event，index的
    `immutable_host_id`等于event、receipt及该NodeIdentity，`state_path_id`等于receipt及该NodeIdentity。
    index中最近接受的boot/session可以晚于event的expected boot/session，不能参与此GC匹配；event的expected tuple仍只绑定
-   原fence/rejoin序列，不能被新session改写。
+   原fence序列，不能被新session改写。
    receipt的`state_storage_disposition="permanently_destroyed"`必须已由provider adapter证明承载Host state
    path的storage永久销毁。一个Host级event可用同一Host tuple分别验证多个Cat，各Cat仍只使用自己的
    tombstone/index绑定，不在event中复制Cat列表或placement。此分支不要求、也不得伪造AgentSession、
@@ -2963,11 +2955,10 @@ lineage时拒绝该observation，不能覆盖。retire后只要仍有index、tom
 Control Plane已GC后，本地NodeCleanupCheckpoint可按§5的“target已精确不存在”规则在无
 tombstone时清槽。Node删除checkpoint前还必须证明无runtime、无未跟踪volume residue和
 无route gate。授权丢弃的Root lineage必须已删除；Active
-HostFenceEvent上的隔离lineage由event/rejoin记录继续跟踪，关联的authorization与
-`DeleteCompletionReceipt`不能因VolumeRecord或本地目录缺席猜测消失。普通`isolated` event至少保留到
-Rejoined；`host_destroyed`永不Rejoined，因此在没有tombstone、其他HostFenceEvent或live recovery引用、
+HostFenceEvent上的隔离lineage由event记录继续跟踪，关联的authorization与
+`DeleteCompletionReceipt`不能因VolumeRecord或本地目录缺席猜测消失。在没有tombstone、其他HostFenceEvent或live recovery引用、
 全部authorization已Consumed并验证receipt或已过`not_after`且不能首次消费、且逐卷disposition闭合后，
-相关逐卷恢复记录可按审计策略GC，不等待Rejoined。compact HostFenceEvent/HostDestroyed receipt仍按
+相关逐卷恢复记录可按审计策略GC。compact HostFenceEvent/HostDestroyed receipt仍按
 现有Operation及审计引用保留；只有所有引用都不存在时才可GC。
 
 ## 14. 最小验收矩阵
@@ -3035,8 +3026,7 @@ Rejoined；`host_destroyed`永不Rejoined，因此在没有tombstone、其他Hos
 | Node A observation结算Node B Operation | 顶层Node、Operation/applied/current placement Node不全等时返回`wrong_placement`；不接受observation、不推进sequence/freshness且不结算任何Operation |
 | identity conflict | gates Closed，Quarantined，当前 Pending Operation Failed |
 | Host fence 与多个卷 | 一个 HostFenceEvent 派生多个独立逐卷授权；错 tuple 全部拒绝 |
-| authorization consume 与Rejoined并发 | Node只传ID且AuthorizationRecord为payload/receipt唯一权威；两者锁同一event，只能consume先提交并留下closed receipt，或Rejoined先提交且epoch不变 |
-| consumed授权后继 | Volume只存authorization ID marker；takeover→release与delete→sweep按closed状态/epoch/head及精确DeleteCompletionReceipt完成rejoin，不复制中间链；错receipt保持Blocked |
+| consumed授权后继 | Volume只存authorization ID marker；takeover→release与delete→sweep按closed状态/epoch/head及精确DeleteCompletionReceipt验证合法后继，不复制中间链；错receipt保持Blocked |
 | normal acquire与begin-delete并发 | 同一VolumeRecord串行且只能一方提交；Control Disk与Volume不会出现单边Deleting |
 | disposable Root `R < L` | event/auth/volume/control同事务写receipt和两边Deleting后才删lineage；PersistentDisk拒绝 |
 | Snapshot create crash/响应丢失 | exact record与成功result同时提交或都不存在；重放只读result，不从record缺席推断可重建 |
@@ -3371,9 +3361,9 @@ host或state path，都必须拒绝，network isolation/断电也必须拒绝，
 拒绝、全部authorization terminal且disposition闭合后允许、事务crash全有或全无；compact event若仍被
 Operation引用则保留。
 
-HostFenceEvent concurrency tests必须覆盖`isolated -> host_destroyed`与authorization派生/首次消费、
-`Active -> Rejoined`及HostDestroyed tombstone GC并发：所有事务都先取得同一event行锁再重验。upgrade与
-rejoin只能由先提交者决定终态，后一方的exact CAS必须拒绝；GC先取得锁时因尚无HostDestroyed proof拒绝，
+HostFenceEvent concurrency tests必须覆盖`isolated -> host_destroyed`与authorization派生/首次消费
+及HostDestroyed tombstone GC并发：所有事务都先取得同一event行锁再重验。upgrade
+只能由先提交者决定终态，后一方的exact CAS必须拒绝；GC先取得锁时因尚无HostDestroyed proof拒绝，
 upgrade先提交时GC只能看到完整不可变receipt；derive/consume与upgrade可以依锁序先后完成，但不能基于旧
 `isolated`读取越过已提交状态。每个锁取得顺序和事务crash点都不得出现半个receipt、漏authorization或
 proof与tombstone/index非原子。

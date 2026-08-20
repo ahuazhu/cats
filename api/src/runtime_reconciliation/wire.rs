@@ -3664,10 +3664,6 @@ fn blocked_reason_schema() -> Schema {
                 vec![field("volume_id", id()), field("authorization_id", id())],
             ),
             variant(
-                "host_rejoin_pending",
-                vec![field("host_fence_event_id", id())],
-            ),
-            variant(
                 "control_plane_unavailable",
                 vec![field("last_desired_revision", nullable(revision()))],
             ),
@@ -8634,7 +8630,6 @@ fn condition_ranks(condition: &Condition) -> (u64, u64) {
                 BlockedReason::VolumeAuthorityUnavailable { .. } => 3,
                 BlockedReason::RemoteDurabilityLag { .. } => 4,
                 BlockedReason::AuthorizationUnavailable { .. } => 5,
-                BlockedReason::HostRejoinPending { .. } => 6,
                 BlockedReason::ControlPlaneUnavailable { .. } => 7,
                 BlockedReason::KeyRingUnavailable { .. } => 8,
                 BlockedReason::RootImageUnavailable { .. } => 9,

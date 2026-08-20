@@ -2671,9 +2671,6 @@ pub enum BlockedReason {
         volume_id: Id,
         authorization_id: Id,
     },
-    HostRejoinPending {
-        host_fence_event_id: Id,
-    },
     ControlPlaneUnavailable {
         last_desired_revision: Option<Revision>,
     },

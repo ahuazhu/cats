@@ -116,7 +116,7 @@ content-type/body表达，不能依赖未保存的ETag、Location等header。
 数据库慢或pool饱和时，readiness、队列拒绝和延迟指标必须先于全局超时告警；Running数据面不因
 controller retry而停止。
 
-## 4. Host fence 与rejoin
+## 4. Host fence
 
 heartbeat缺失、AgentSession过期、EC2状态查询或Gateway不可达都只是suspicion。它们不能单独授权
 新placement、writer epoch或route publication。
@@ -155,16 +155,7 @@ completion的BlobStore LIST必须对已完成PUT/DELETE线性可见；normal sto
 adapter必须在返回/提交event前以provider cutoff阻止新PUT，并等待已经接受的PUT成功可见或永久失败。
 不能完成barrier时保持Deleting；empty之后仍能落地late PUT的adapter/路径不得提交receipt。
 
-旧Host即使恢复供电也持续隔离。它只能以新boot/session进入cordoned rejoin：完成union inventory，
-停止旧VMM/blockd/tap/socket/gate/guard，把旧epoch的`R < L`lineage移入quarantine；随后核对该event
-派生的全部takeover/delete authorizations。授权派生、首次消费与`Active -> Rejoined`都先锁同一
-event行；rejoin取得该锁后再按稳定顺序锁全部授权，所以不会漏掉in-flight首次消费。Unconsumed授权
-必须已过`not_after`；Consumed授权必须有匹配payload的不可变receipt，当前VolumeRecord必须是直接
-结果或更大epoch的合法后继；receipt含Disk postcondition时Control Disk也必须匹配，两边记录已删除
-时必须有精确`DeleteCompletionReceipt`。任何缺失、倒退或
-冲突保持Blocked。Control Plane在同一事务接受`HostRejoinProof`并持久改为Rejoined后，provider才
-恢复workload网络。此后未消费授权不能首次生效，已消费授权只读取原receipt；相关authorization和
-`DeleteCompletionReceipt`至少保留到Rejoined。没有可验证external fence的平台保持Blocked等待人工处置。
+旧Host即使恢复供电也持续隔离。没有可验证external fence的平台保持Blocked等待人工处置。
 
 ## 5. 运行监控
 
@@ -186,7 +177,7 @@ event行；rejoin取得该锁后再按稳定顺序锁全部授权，所以不会
 - Storage/lifecycle：逐卷owner/epoch、`R/L` gap、Strict FLUSH、object-store error、Cold fallback、
   `DataLossPossible`、orphan/quarantine、Deleting row age、sweeper scan/delete/re-list-empty failure和completion
   CAS contention；
-- HA：replica/failure-domain count、public probe、fence attempt age/result、replacement/rejoin phase。
+- HA：replica/failure-domain count、public probe、fence attempt age/result、replacement phase。
 
 告警阈值必须来自部署容量和经验证基线，不能把单次实验数字写成SLA。每个page指向一个按
 `observe -> stop unsafe progress -> collect bounded evidence -> recover -> verify postcondition`编排的
@@ -209,9 +200,7 @@ runbook；禁止以“重启看看”跳过fence或durability proof。
    normal begin、direct/live-Cold/旧revision拒绝、release/auth derive双提交顺序、R==L后release前Host loss、
    双sweeper/adapter contract positive PUT/
    strong prefix-empty/provider fence paused accepted PUT barrier/completion CAS、receipt后再次empty，
-   以及disposable Root两边Deleting的每个crash点；
-   还要用PostgreSQL双session覆盖authorization
-   首次consume与Rejoined竞争以及合法后继receipt校验；用真实PG pause双向覆盖
+   以及disposable Root两边Deleting的每个crash点；用真实PG pause双向覆盖
    Desired INSERT/full observation的`NodeIdentity -> credential lineage -> AgentSession -> receive/cursor`锁序；饱和A22/
    ordinary Store时保留observation lane仍续期，并在queue/running/commit三个取消点证明无
    detached late mutation。Control-signed authorization evidence read还必须覆盖consume commit丢response后的
@@ -239,9 +228,8 @@ runbook；禁止以“重启看看”跳过fence或durability proof。
    Hypervisor基线，再用下节同一个oracle分别设置`kernel-nbd`和`vhost-user`，覆盖真实HTTP/WS、
    Agent restart、gate rebuild、Endpoint rebind、RequireIdle active-stream race、key overlap、Control
    Plane/Gateway interruption和cleanup。provider adapter还必须跑两卷HostFenceEvent→逐卷CAS→旧
-   writer拒绝→quarantine→Rejoined矩阵，包含错tuple、consume/Rejoined边界竞争、未消费授权阻止
-   rejoin、takeover后release、HostFence disposable event/auth/volume/control原子提交和delete完成
-   receipt两种合法后继。
+   writer拒绝→quarantine矩阵，包含错tuple、takeover后release、HostFence disposable
+   event/auth/volume/control原子提交和delete完成receipt。
 4. **生产拓扑smoke**：前三层全绿后，才运行已有
    [control-plane HA workflow](../.github/workflows/verify-control-plane-ha.yml)的diagnose/disrupt模式，
    保存public probe和Pod/EndpointSlice evidence。该workflow目前只证明Control Plane副本切换；它不

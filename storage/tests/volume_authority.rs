@@ -750,7 +750,7 @@ fn takeover_keeps_the_current_locked_head_without_a_second_head_claim() {
 }
 
 #[test]
-fn consumed_takeover_replays_after_event_rejoined() {
+fn consumed_takeover_replays_exact_authorization() {
     let owned = acquired_volume();
     let active = host_fence_event(HostFenceEventState::Active);
     let authorization = takeover_authorization(&owned);
@@ -762,10 +762,9 @@ fn consumed_takeover_replays_after_event_rejoined() {
         time(20_000),
     )
     .unwrap();
-    let rejoined = host_fence_event(HostFenceEventState::Rejoined);
     let (unchanged, same_row, replay) = consume_takeover(
         &taken_over,
-        &rejoined,
+        &active,
         &consumed,
         &id("takeover-auth-1"),
         time(29_000),
@@ -777,13 +776,10 @@ fn consumed_takeover_replays_after_event_rejoined() {
 }
 
 #[test]
-fn unconsumed_takeover_rejects_expiry_rejoin_and_wrong_binding() {
+fn unconsumed_takeover_rejects_expiry_and_wrong_binding() {
     let owned = acquired_volume();
     let authorization = takeover_authorization(&owned);
-    for (event, now) in [
-        (host_fence_event(HostFenceEventState::Rejoined), 20_000),
-        (host_fence_event(HostFenceEventState::Active), 30_001),
-    ] {
+    for (event, now) in [(host_fence_event(HostFenceEventState::Active), 30_001)] {
         assert_eq!(
             consume_takeover(
                 &owned,
@@ -921,10 +917,9 @@ fn disposable_delete_moves_owned_directly_to_deleting() {
     assert_eq!(deleting.lease_epoch, fence_epoch(9));
     assert_eq!(receipt.prior_attachment_id, id("attachment-old"));
 
-    let rejoined = host_fence_event(HostFenceEventState::Rejoined);
     let replay = consume_disposable_root_delete(
         &deleting,
-        Some(&rejoined),
+        Some(&event),
         &consumed,
         &id("delete-auth-1"),
         time(29_000),

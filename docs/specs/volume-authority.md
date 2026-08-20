@@ -33,8 +33,8 @@
 
 Control Store 与 MetadataStore 是逻辑边界，不是两套提交authority。生产终态把`HostFenceEvent`、
 由它派生的authorization、不可变消费回执和`VolumeRecord`放在同一PostgreSQL事务域；SQLite只作
-pure-domain/data-row fixture，不提供Control cross-row authority。首次消费授权与`Active -> Rejoined`
-都通过唯一PG事务域的固定锁序完成。
+pure-domain/data-row fixture，不提供Control cross-row authority。首次消费授权
+通过唯一PG事务域的固定锁序完成。
 
 全局锁DAG是`ApiIdempotencyResult key reservation -> CatNameLock -> DiskNameLock -> NodeIdentity（写old/new assigned
 current Desired任一字段或消费current Node evidence时）-> current credential lineage（A19 auth适用时）
@@ -387,7 +387,7 @@ typed request逐字段相同时返回原result，ID相同但payload不同返回`
 安全拒绝且零副作用，绝不重新执行或猜回旧result。
 `AuthorizationConsumedReceipt`一经写入不可修改，并保留到相关HostFenceEvent完成后继验证。
 `DeleteCompletionReceipt`只在对象sweep完成且Control Disk/Volume rows同事务删除时写入，供row删除后的
-精确重放和Host rejoin验证；保留规则见§4.5与§11.3。
+精确重放；保留规则见§11.3。
 
 `lease_epoch` 在 acquire、release、takeover 以及会改变 attach 前提的 restore/delete
 边界单调增加。这样，晚到的旧 acquire 即使看到 volume 再次 Unowned，也不能用旧
@@ -615,7 +615,7 @@ authorization，同时验证event仍为Active、authorization仍为Unconsumed、
 receipt不重复`authorized_node_id`；它仍嵌在同一个不可变`AuthorizationRecord`，validator必须把receipt
 逐字段绑定父authorization，不能把receipt拆成第二份授权或ledger。
 
-相同授权重试只读取不可变receipt并返回原grant，即使event已经Rejoined也不再次修改VolumeRecord。
+相同授权重试只读取不可变receipt并返回原grant，不再次修改VolumeRecord。
 换卷、换placement、换attachment、payload不同、过期、duration非法/溢出或event不再Active的首次消费
 全部拒绝且零副作用；duration错误返回`InvalidLeaseDuration`，其他授权错误返回`InvalidAuthorization`。
 
@@ -634,7 +634,7 @@ HostFenceEvent {
   fence_attempt_id,
   isolation_state: HostIsolationState,
   observed_at,
-  state: Active | Rejoined
+  state: Active
 }
 
 HostIsolationState =
@@ -664,49 +664,22 @@ state path绑定该event创建时锁定的`NodeIdentity` immutable lineage（该
 adapter还必须证明承载该state path的storage永久销毁。network isolation、power state或普通`isolated`
 不能升级推断出这个事实。
 Active event可以直接以`host_destroyed`建立，或从`isolated`单调更新；receipt一经提交不可变，相同
-receipt重放只读原结果，任一字段不同都拒绝。`host_destroyed`不会转为Rejoined；替换Host必须使用新的
+receipt重放只读原结果，任一字段不同都拒绝。替换Host必须使用新的
 provisioned identity。
 该receipt只可作为Runtime tombstone GC的Host缺席证据，不授予placement/writer，也不跳过本规格的逐卷
 authorization、receipt或disposition闭环。
 
-旧 Host 恢复时先进入隔离rejoin流程：提高AgentSession epoch，枚举并停止全部旧VMM/blockd，按
-`VolumeLocalIdentity`把所有失效epoch目录移入quarantine，并证明旧route、socket和进程均不可用。
-
 从`isolated`升级时先锁该event绑定的NodeIdentity并重验immutable lineage，再锁同一event行，
 并用`state=Active`、`isolation_state={kind:"isolated"}`及未改变的
 完整event tuple（`event_id`、provider、immutable host、node、expected boot/session、fence attempt和
-`observed_at`）做exact CAS。event创建、`isolated -> host_destroyed`、`Active -> Rejoined`、
+`observed_at`）做exact CAS。event创建、`isolated -> host_destroyed`、
 使用HostDestroyed proof的Runtime tombstone GC以及会创建Desired placement的授权派生都先按
 node ID锁全部NodeIdentity，再锁event；只有不改event eligibility state、不再读NodeIdentity的授权
 首次消费保持`HostFenceEvent -> Authorization -> Volume`顺序。这些事务都持有event行锁到commit并重验
 各自要求的state、isolation variant和event tuple；竞争事务只能按锁取得顺序提交，后一方不得
-沿用旧读取。rejoin事务取得该锁后，按
-`authorization_id`稳定顺序锁定该event的全部授权，因此不存在已经开始但尚未被它观察的首次消费。
-它逐项验证：
+沿用旧读取。旧epoch的`R < L`目录保留作人工恢复证据，永不参与新Root。
 
-1. Unconsumed授权必须按PostgreSQL当前时间超过`not_after`；否则保持Active/Blocked。
-2. Consumed授权的closed receipt variant和全部字段必须与服务器端authorization逐字段匹配。
-   `TakeoverConsumedReceipt`的direct state是Active、owner为`new_attachment_id`、epoch为
-   `resulting_epoch`，且`last_transition`必须精确为`takeover {authorization_id}`；同epoch下只允许该owner
-   按数据面CAS发布出的generation非倒退head或renew expiry。更大epoch的当前状态或completion必须位于
-   §3.1、§8和§11的closed successor closure，精确绑定同一volume，epoch单调且head generation不倒退；
-   当前`last_transition`非null时必须逐字段匹配其request/result或authorization marker，null只可由§10.3
-   same-disk restore的immutable API result及当前exact postcondition证明。这里不复制中间链，只凭数字更大
-   不能通过。
-3. `BeginDisposableDeleteConsumedReceipt`的direct state要求Volume owner/expiry为null、Volume和Control
-   Disk都精确为receipt中的同一Deleting(delete ID)、epoch/head相同，且Volume `last_transition`精确为
-   `begin_disposable_delete {authorization_id}`。Deleting没有另一个可写后继。
-4. 若Volume/Disk rows已删除，必须存在§11.3的精确`DeleteCompletionReceipt`。对disposable consume，
-   `kind="disposable_root"`的authorization/prior attachment必须匹配同一receipt；对takeover后继，completion的normal
-   exact `BeginDeleteRequest`或另一个已验证的disposable authorization必须构成closed state machine后继。receipt缺失、
-   head/generation/epoch倒退、只比较delete ID或任何identity冲突都保持Blocked。
-
-同一事务接受`HostRejoinProof`并把event持久改为Rejoined后，provider才可恢复workload网络。
-Rejoined event不能再派生授权；Unconsumed授权因首次消费必须检查Active event而永久不能生效；
-Consumed授权仍可幂等读取receipt。相关authorization与`DeleteCompletionReceipt`至少保留到event
-Rejoined，之后才可按审计策略GC。旧epoch的`R < L`目录保留作人工恢复证据，永不参与新Root。
-
-`host_destroyed`不等待永远不会发生的Rejoined。没有Runtime tombstone、其他HostFenceEvent或live
+没有Runtime tombstone、其他HostFenceEvent或live
 recovery引用相关逐卷记录，所有Unconsumed authorization都已过`not_after`、所有Consumed authorization
 的receipt及最终volume disposition都已验证后，相关逐卷authorization/receipt/
 `DeleteCompletionReceipt`可在一个事务中按审计策略GC；任一引用、仍可首次消费的authorization或未闭合
@@ -1341,9 +1314,6 @@ epoch永久不能publish，Node才可删除授权所指lineage的`R < L` tail。
 `Active + Unowned`，也不能扩展到PersistentDisk。被授权lineage可能有`R < L`tail，也可能因Host在
 `R == L`后、release前失联而没有未发布tail；两者使用同一exact owner/epoch/head安全边界。
 
-HostFenceEvent路径上的本地lineage在旧Host rejoin时进入quarantine；删除授权记录至少保留到该
-event转为Rejoined，使rejoin仍能核对所有派生结果。
-
 ### 11.3 共同清理
 
 1. sweeper只按稳定ID分页扫描Control Disk/Volume双方同一`Deleting(delete_id)`的level-triggered状态；
@@ -1384,16 +1354,9 @@ completion只允许一个exact compare/CAS事务提交，后到者看到rows已�
 跨PostgreSQL/object store的两阶段事务：PG Deleting始终是唯一待清理authority，对象操作可重放，最终receipt
 只在empty reread之后的单个PG commit产生；receipt提交后再次LIST同prefix仍必须为empty。
 
-Host rejoin在rows已删除时，必须把Consumed authorization逐字段匹配receipt：disposable路径要求
-`DeleteCompletionReceipt.disposable_root`的authorization ID和prior attachment等于同一
-`BeginDisposableDeleteConsumedReceipt`。对更早的takeover receipt，completion必须是同volume、
-deleting epoch严格更大、head generation非倒退，并且closed begin variant本身可由normal exact request或
-另一个已验证的disposable authorization唯一解释；不复制中间Release链。仅有更大的数字、相同delete ID或
-目录缺席都不够。
-
 不存在根据控制面一列状态、lease TTL或目录缺失直接删除volume的路径。删除完成后无需保留兼容
 tombstone；但只要某个Active HostFenceEvent的Consumed authorization引用该卷，精确
-`DeleteCompletionReceipt`、event和authorization都必须保留到Rejoined，供合法后继校验。
+`DeleteCompletionReceipt`、event和authorization都必须保留，供合法后继校验。
 
 ## 12. 两 revision Cold 迁移
 
@@ -1416,7 +1379,7 @@ tombstone；但只要某个Active HostFenceEvent的Consumed authorization引用�
 1. 先建立旧实现必失败的 characterization tests：普通抢占、重复 acquire、silent release、旧 pack
    新 epoch replay、expired-owner delete、snapshot create/delete/GC和初始化 crash点。
 2. 一次替换pure domain/MetadataStore schema、trait和唯一PostgreSQL authority adapter；SQLite只复用窄
-   data-domain fixture。HostFenceEvent、`AuthorizationConsumedReceipt`、VolumeRecord与Rejoined使用同一
+   data-domain fixture。HostFenceEvent、`AuthorizationConsumedReceipt`与VolumeRecord使用同一
    PG事务域和固定锁序。
 3. 一次替换 pack header、data-dir identity、blockd启动参数和status；删除旧 pack parser。
 4. 接入 RuntimeCheckpoint、VolumeIntent/Observation和Node lease executor。
@@ -1457,8 +1420,6 @@ tombstone；但只要某个Active HostFenceEvent的Consumed authorization引用�
 | authorization response-loss/delete completion | disposable consume commit后断response，sweeper随即写exact completion并删除Volume/Disk；按原authorization ID的snapshot必须返回`current_volume=null`+唯一matching receipt并闭合；row absent但receipt缺失/错variant/错volume/delete/prior attachment/epoch/head均Blocked |
 | authorization evidence corruption/isolation | 破坏primary/current/receipt/direct任一JSON/projection、制造current+completion并存、同volume重复completion或缺少/跨volume引用都fail closed；先用已知授权正例校准查询探针，再证明wrong/retired Node、无关authorization和任何额外key不能读到其volume/receipt/auth；absent/wrong Node同类404；Node无authorization/completion raw SQL credential，Control read零write |
 | Host takeover | 只有精确逐卷授权成功；跨volume/placement/replay失败；receipt精确记录event/volume/new attachment/resulting epoch/head |
-| 首次consume与Host rejoin并发 | 两者锁同一event；consume先提交则rejoin观察receipt，Rejoined先提交则consume失败且epoch不变 |
-| Host rejoin遇到未消费授权 | 未过`not_after`时保持Active/Blocked；过期后才可Rejoined，且不能首次消费 |
 | consumed授权的后继 | direct takeover/disposable state缺失或写错对应authorization marker必须Blocked；更大epoch的takeover→release/restore/delete按closed状态机、epoch单调和head generation非倒退验证；delete→sweep以精确DeleteCompletionReceipt重连；缺失/错receipt保持Blocked，不复制中间链 |
 | pure D / cross-row split | pure-domain table只输入Volume/Event/Authorization rows且可复用于SQLite fixture；唯一PG integration逐项改变Cold、R==L、blockd stop、Desired、Disk、Snapshot、stop observation并断言同事务拒绝；不存在bool/VerifiedContext旁路 |
 | acquire origin namespace | normal/takeover即使携带相同文本ID也不是同一lineage并进入quarantine；缺失/unknown variant和旧裸字段严格拒绝，不能猜namespace |

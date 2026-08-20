@@ -58,7 +58,7 @@ use super::rows::{
     database_now, disposable_root_authorization_candidates_sql, insert_authorization,
     insert_delete_completion, insert_event, insert_volume, load_active_event_by_node_unlocked,
     load_authorization_for_update, load_delete_completion_for_update, load_event_for_update,
-    load_stored_volume_for_update, load_volume_for_update, update_authorization, update_event,
+    load_stored_volume_for_update, load_volume_for_update, update_authorization,
     update_volume_owner, volume_has_disposable_root_authorization_for_delete,
 };
 use super::runtime_spine::{
@@ -5831,55 +5831,6 @@ fn corrupted_authorization_payload_fails_closed_without_writes() {
         stored_authorization_row(&store, &authorization_id),
         before_authorization
     );
-}
-
-#[test]
-fn rejoin_event_lock_serializes_before_unconsumed_takeover() {
-    let (_url, seed, consumer) = store_pair();
-    let owned = acquire_owned_volume(&seed);
-    let event = host_fence_event(HostFenceEventState::Active);
-    let authorization = takeover_authorization(&owned);
-    seed_takeover(&seed, &event, &authorization);
-    let node = transition_node(&seed, "node-new");
-    let desired = prepare_takeover_runtime(&seed, &node, &id("takeover-auth-1"));
-    let request = takeover_consume_request(&node, &desired, &id("takeover-auth-1"));
-
-    let rejoin = Store::connect_from(&seed.dsn, None).unwrap();
-    let (locked_tx, locked_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel();
-    let rejoin_worker = std::thread::spawn(move || {
-        rejoin.authority_transaction(move |transaction| {
-            let mut event = load_event_for_update(transaction, &id("fence-event-1"))?.unwrap();
-            locked_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-            event.state = HostFenceEventState::Rejoined;
-            update_event(transaction, &event)
-        })
-    });
-    locked_rx.recv().unwrap();
-    let consume_worker = std::thread::spawn(move || {
-        consumer.runtime_consume_volume_takeover(
-            &node.authenticated,
-            &request,
-            &node.active_guest_config_digest,
-        )
-    });
-    release_tx.send(()).unwrap();
-    rejoin_worker.join().unwrap().unwrap();
-    assert_eq!(
-        consume_worker.join().unwrap().unwrap(),
-        VolumeTransitionStoreOutcome::Rejected(
-            VolumeTransitionStoreRejection::VolumeAuthorizationRejected {
-                authorization_id: id("takeover-auth-1"),
-                reason: RuntimeVolumeAuthorizationRejection::InvalidAuthorization,
-            }
-        )
-    );
-    assert_eq!(stored_volume(&seed, &owned.volume_id), owned);
-    assert!(matches!(
-        stored_authorization(&seed, &id("takeover-auth-1")).state,
-        AuthorizationState::Unconsumed
-    ));
 }
 
 #[test]

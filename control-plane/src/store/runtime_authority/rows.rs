@@ -420,7 +420,6 @@ impl EventProjection {
             observed_at: event.observed_at,
             state: match event.state {
                 HostFenceEventState::Active => "active",
-                HostFenceEventState::Rejoined => "rejoined",
             },
             destroyed_at,
         })
@@ -516,46 +515,6 @@ pub(super) fn insert_event(
         ],
     )?;
     Ok(())
-}
-
-// Host rejoin is not an F1 public mutation. This remains transaction-local for
-// the later owner and for lock-order contract tests.
-#[allow(dead_code)]
-pub(super) fn update_event(
-    transaction: &mut Transaction<'_>,
-    event: &HostFenceEvent,
-) -> AuthorityTxResult<()> {
-    let projection = EventProjection::from_record(event)?;
-    let record_json = encode(event)?;
-    let expected_session = projection
-        .expected_agent_session_epoch
-        .to_pg()
-        .map_err(corrupt)?;
-    let observed_at = projection.observed_at.to_pg().map_err(corrupt)?;
-    let destroyed_at = optional_to_pg(projection.destroyed_at)?;
-    let changed = transaction.execute(
-        "UPDATE host_fence_events SET
-            record=$2::TEXT::jsonb, provider=$3, immutable_host_id=$4, node_id=$5,
-            expected_node_boot_id=$6, expected_agent_session_epoch=$7,
-            fence_attempt_id=$8, isolation_state=$9, observed_at=$10,
-            state=$11, destroyed_at=$12
-          WHERE event_id=$1",
-        &[
-            &projection.event_id,
-            &record_json,
-            &projection.provider,
-            &projection.immutable_host_id,
-            &projection.node_id,
-            &projection.expected_node_boot_id,
-            &expected_session,
-            &projection.fence_attempt_id,
-            &projection.isolation_state,
-            &observed_at,
-            &projection.state,
-            &destroyed_at,
-        ],
-    )?;
-    exactly_one(changed)
 }
 
 fn decode_event(row: &Row) -> AuthorityTxResult<HostFenceEvent> {

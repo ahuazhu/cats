@@ -110,15 +110,14 @@ Destroy先关闭admission并停止Guest/VMM。PersistentDisk必须完整drain/re
 stop/fence证据的精确授权，
 HostFenceEvent来源按`event -> authorization -> VolumeRecord -> Control rows`锁序，在同一事务写
 Consumed receipt、把Volume从Owned转为Deleting并提高epoch、把Control Disk转为相同Deleting；提交后
-才删除该lineage。未知卷、冲突identity或未完成fence/rejoin都阻止Deleted Operation成功。
+才删除该lineage。未知卷、冲突identity或未完成fence都阻止Deleted Operation成功。
 
 待删除Disk必须没有live `DiskSnapshotRecord`，否则保持原状态并返回`SnapshotInUse`。Snapshot创建
 先取得认证Workspace/route/key reservation，再锁VolumeRecord并重验Disk owner、Active/Cold/unowned，
 与通用result同事务插入一条exact record；Snapshot删除同样原子删除该row并写result，Disk delete
 不负责cascade。普通begin-delete同样锁VolumeRecord，并在
 一个PostgreSQL事务原子把Control Disk与VolumeRecord从Active改为同一Deleting；normal acquire与它
-只能一方提交。Volume对象清空后写`DeleteCompletionReceipt`并同时删除两边row；若相关
-HostFenceEvent仍Active，该receipt保留到Rejoined。
+只能一方提交。Volume对象清空后写`DeleteCompletionReceipt`并同时删除两边row。
 
 Deleted Desired 作为 tombstone 保留，直到无可服务runtime/route、卷 disposition完成，且GC absence
 proof严格二选一：负责Node当前session接受的complete inventory精确证明
@@ -200,17 +199,11 @@ Strict 从 remote `R` 恢复。Relaxed 也只能从 `R` 恢复并标记
 `DataLossPossible(last_remote, last_observed_local)`；最后 observation 的 `L-R` 不是故障瞬间的
 精确损失。
 
-失联Host返回后，旧epoch永久不能publish，旧`R < L` lineage移入quarantine而不删除。它必须在
-workload网络仍隔离时，以新boot/session完成完整inventory和清场；Control Plane还要核对该event
-派生的全部takeover/delete authorizations。授权派生、首次消费和`Active -> Rejoined`共用event行
-串行点：未消费授权必须已过`not_after`；已消费授权必须有匹配payload的不可变receipt，当前卷必须
-是直接结果或更大epoch的合法后继；receipt包含Disk postcondition时Control Disk也必须匹配，两边row
-已删除时必须有精确`DeleteCompletionReceipt`。
-接受HostRejoinProof并把event持久转为Rejoined后，未消费授权不能首次生效，provider才恢复网络。
+失联Host返回后，旧epoch永久不能publish，旧`R < L` lineage移入quarantine而不删除。
 
 ## 6. Inventory、故障与 Operation
 
-Agent 启动/rejoin、adoption、orphan 判断、破坏性 cleanup 和不确定恢复都要求完整 union
+Agent 启动、adoption、orphan 判断、破坏性 cleanup 和不确定恢复都要求完整 union
 inventory，期间 gates Closed。扫描不完整时报告 `Blocked(IncompleteInventory)`，不能推断 Cold
 或先删再建。
 
@@ -266,7 +259,7 @@ Condition 语义：
 - live record使Disk delete返回SnapshotInUse；显式snapshot delete原子删除该row并写通用result。
 - Host 未 fence 时不迁移；fence 后逐卷 takeover 错 tuple 全部失败，旧 writer/route/session 永久
   失效。
-- authorization首次consume与Rejoined并发时只有一方先提交；takeover后release、delete后sweep都可
+- takeover后release、delete后sweep都可
   用`AuthorizationConsumedReceipt`/`DeleteCompletionReceipt`证明合法后继，错或缺失receipt保持Blocked。
 - normal acquire与begin-delete只能一方提交；HostFence disposable Root只有event/auth/volume/control
   同事务写receipt和两边Deleting后可删`R < L`，PersistentDisk同请求必须拒绝。
