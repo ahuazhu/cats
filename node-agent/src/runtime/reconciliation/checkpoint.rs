@@ -176,7 +176,7 @@ impl Drop for CheckpointWriterLock {
 /// replacing the target between the assertion and the caller's bounded
 /// physical effect. The borrow also keeps `_writer_lock` alive, so the
 /// cross-process lock remains held for the same interval.
-pub(super) struct CurrentCheckpointGuard<'a> {
+pub(crate) struct CurrentCheckpointGuard<'a> {
     _writer: MutexGuard<'a, ()>,
     owner: &'a Mutex<()>,
 }

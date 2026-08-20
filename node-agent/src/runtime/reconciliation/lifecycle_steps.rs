@@ -1581,6 +1581,32 @@ impl LifecycleStepEffect {
                 rebound_cleanup.inventory_read_position =
                     accepted.attestation().inventory_read_position;
                 rebound_cleanup.desired_read_position = desired_read_position;
+                let rebinds_volume_release =
+                    matches!(rebound_cleanup.target, CleanupTarget::Volume { .. });
+                if rebinds_volume_release {
+                    // A rebind refreshes this token against current evidence,
+                    // and the Volume stage's evidence says the runtime is no
+                    // longer incarnate. A token first persisted by an older
+                    // build (or before the launch-attributed targets were
+                    // reclaimed) would otherwise keep a stale launch forever
+                    // and Control would reject every release attempt.
+                    anyhow::ensure!(
+                        runtime.processes.is_empty()
+                            && runtime
+                                .volumes
+                                .iter()
+                                .all(|volume| volume.devices.is_empty())
+                            && runtime.mounts.is_empty()
+                            && runtime.networks.is_empty()
+                            && matches!(
+                                runtime.guest_transport,
+                                GuestTransportEvidence::Unavailable
+                            ),
+                        "Volume cleanup rebind found remaining runtime residue"
+                    );
+                    rebound.runtime_incarnation = None;
+                    rebound.runtime_launch = RuntimeLaunch::Absent;
+                }
                 let rebound_stored = persist_lifecycle_successor(
                     context,
                     &store,
