@@ -12,14 +12,12 @@ pub mod object_write_credential;
 #[cfg(test)]
 mod object_write_end_to_end;
 pub(crate) mod proc;
-pub mod route_grant;
 pub mod route_grant_v2;
 pub mod route_signing_rotation;
 pub mod route_v2_machine;
 pub mod runtime;
 pub mod runtime_cutover;
 pub mod runtime_spine;
-pub mod server;
 pub(crate) mod signed_usage;
 pub mod state_directory;
 pub(crate) mod usage_delivery;

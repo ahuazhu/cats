@@ -1,7 +1,6 @@
 //! Production entry point for the signed Runtime spine cutover.
 //!
-//! The legacy [`crate::server`] remains available to the pre-cutover test
-//! suite, but the shipped Node binary starts here. The first production
+//! The shipped Node binary starts here. The first production
 //! scanner covers the physical clean-slate sources, including the bounded
 //! owner-Node Volume authority snapshot; no production full inventory is
 //! claimed from point reads. The first production effect is exactly one A22
