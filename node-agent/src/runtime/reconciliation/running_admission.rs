@@ -1263,6 +1263,19 @@ impl RunningAdmissionEffect {
             // are still draining. Only the exact Stable/Open replay is a
             // completed unit; every other no-action state needs fresh guard
             // evidence.
+            if !converged {
+                // A Running Cat whose tail never reports converged refreshes
+                // every round, and each refresh closes the batch's shared
+                // admission, starving every sibling Cat. Name the difference.
+                tracing::warn!(
+                    cat = %desired.cat_id,
+                    cell = ?session.cell().snapshot(),
+                    checkpoint = ?AdmissionSnapshot::from_checkpoint(checkpoint)?,
+                    stable_state = ?checkpoint.stable_state,
+                    step = ?checkpoint.step,
+                    "Running admission tail is not converged",
+                );
+            }
             return Ok(Some(if converged {
                 RuntimeDesiredEffectOutcome::Applied
             } else {
