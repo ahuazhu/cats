@@ -69,8 +69,7 @@ Read in this order before a cross-component change:
    - [`docs/specs/blockd-protocol.md`](docs/specs/blockd-protocol.md)
 5. Experiment reports and raw evidence only when a measured claim matters.
 
-Superseded ADRs are tombstones, not implementation authority. Git history is the documentation
-archive.
+Git history is the documentation archive.
 
 ## Source-of-truth precedence
 
@@ -249,6 +248,6 @@ live canonically in `agent-skills/` and are symlinked into `.agents/skills/` and
 - Keep one canonical explanation per fact and link to it; do not copy rolling status or benchmark
   tables across README/ADRs.
 - A decision changing a protocol, persisted format, failure semantic or authority gets a new ADR.
-- Leave superseded ADRs as short tombstones. Delete rejected/unimplemented specs; Git is the archive.
+- Delete rejected/unimplemented specs; Git is the archive.
 - Preserve experiment source, CSVs, environment reports, raw logs and failed crash evidence.
 - Generated caches such as `__pycache__` must not be committed.

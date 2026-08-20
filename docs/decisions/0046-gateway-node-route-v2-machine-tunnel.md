@@ -59,18 +59,6 @@ Control resolve已经由current PostgreSQL Gateway credential签发Grant。若Gr
     `0644`，private key `0600`，用no-follow、single-link、stable descriptor合同一次性读取。显式配置listener
     后，任何缺失或无效artifact都在bind前失败；未配置listener则不读取artifact且ingress保持关闭。
 
-## 当前实现边界
-
-Node machine listener、Gateway client primitive、fixed artifact readers、`noded`显式配置后的runtime
-composition，以及`cats-gatewayd`的Control resolve→bounded cache→public Host listener→Node tunnel
-byte proxy已经实现；HTTP与WebSocket当前请求都只尝试一次且不恢复legacy ingress。production模板通过
-pre-created immutable Secret name/ARN分发Control七件、Node四件与Gateway固定三件closed set；private bytes
-不进入Terraform state、argv、environment或log。Kubernetes init renderer把projected symlink source复制成
-reader要求的root-owned real files，Control/Gateway分别打开7443/8080，Node打开独立7444 listener，ALB wildcard
-只指向`cats-gatewayd`。Gateway唯一`node-server-ca-bundle.pem`同时验证Control与Node server chain，没有第四
-artifact或独立Control CA artifact。未配置machine listener的非production组合仍以`None`明确保持Closed；
-production systemd已删除旧`--route-grant-public-key-file`参数。
-
 ## 后果
 
 - Grant既是短期route capability，也是取得它的Gateway TLS credential的proof-of-possession binding；正常

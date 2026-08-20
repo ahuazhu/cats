@@ -55,18 +55,6 @@ keepalive连接越过撤销继续签发。
     public proxy。Gateway到Node的TLS/proxy frame随后由[ADR-0046](0046-gateway-node-route-v2-machine-tunnel.md)
     冻结，并把本request授权的leaf SPKI digest签入Grant。
 
-## 当前实现边界
-
-Control现已从唯一固定目录用descriptor/stable-reopen合同读取policy、client CA、server chain与server key；
-启动在任何bind前验证TLS 1.3配置、Ed25519 server pair、Gateway PG candidate及Route signer PG exact current。
-独立machine listener只协商HTTP/1.1，每个request从verified leaf重新做pre-body PG认证，并在最终shared-lock
-snapshot内闭合hostname-derived Workspace、Route/Desired/ring ACK、Gateway scope与signer current后才签名。
-认证/resolve拥有独立bounded RAII owner，shutdown关闭两类admission并join Store closure与listener task。
-
-本实现仍不包含public proxy、Route signer rotation writer或Node public-ring全量ACK rollout；Gateway到Node
-machine tunnel由ADR-0046独立组成。Gateway与signer表共同属于clean-slate authority schema 15最终形态；中间
-提交不构成可单独部署migration。
-
 ## 后果
 
 - credential撤销在PG线性化；旧replica、旧keepalive连接和TLS恢复session的下一request都必须重新失败。

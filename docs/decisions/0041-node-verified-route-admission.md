@@ -2,7 +2,6 @@
 
 - 状态：Accepted
 - 日期：2026-08-08
-- 取代：ADR-0033、ADR-0039
 - 依赖：[ADR-0040](0040-level-triggered-runtime-reconciliation.md)
 - 规格：[Route Grant v2](../specs/route-grant-v2.md)
 
