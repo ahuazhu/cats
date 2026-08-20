@@ -1924,6 +1924,17 @@ impl LifecycleStepEffect {
                 RuntimeDesiredEffectStopReason::AuthorityRejected(reason),
             ),
             NormalReleaseAttempt::DefiniteCleanupConflict(problem) => {
+                if problem
+                    == cats_api::runtime_reconciliation::RuntimeVolumeTransitionPreconditionProblem::CleanupEvidenceMismatch
+                {
+                    // Control judged the evidence against its moving admission
+                    // snapshot (heartbeats advance it every round); losing that
+                    // race is retryable, and persisting it as definite turned a
+                    // benign race into a permanent release livelock.
+                    return Ok(RuntimeDesiredEffectOutcome::refresh_inventory_because(
+                        "cleanup evidence raced a newer Control admission",
+                    ));
+                }
                 if store
                     .persist_definite_release_rejection(stored, current, &request, problem)
                     .is_err()

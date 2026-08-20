@@ -10744,7 +10744,24 @@ mod tests {
             )
             .unwrap();
 
-        // Bound to the current checkpoint: the rejection stays definite.
+        // An evidence mismatch is judged against Control's moving admission
+        // snapshot, so even a marker bound to the current checkpoint retires:
+        // the same coordinate can succeed under fresher evidence.
+        assert!(store
+            .retire_superseded_release_rejection(&stored, &current)
+            .unwrap());
+        assert!(!marker_path.exists());
+
+        // A request-terminal problem bound to the current checkpoint stays
+        // definite.
+        store
+            .persist_definite_release_rejection(
+                &stored,
+                &current,
+                &request,
+                RuntimeVolumeTransitionPreconditionProblem::AuthorizationBranchConflict,
+            )
+            .unwrap();
         assert!(!store
             .retire_superseded_release_rejection(&stored, &current)
             .unwrap());

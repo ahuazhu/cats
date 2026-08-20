@@ -717,9 +717,17 @@ impl FileCheckpointStore {
         };
         let (marker, _, _) =
             read_definite_release_rejection_raw(&file, &self.release_rejection_path, &[1])?;
-        if marker.checkpoint_content_digest == *expected.content_digest() {
+        if marker.checkpoint_content_digest == *expected.content_digest()
+            && marker.problem
+                != RuntimeVolumeTransitionPreconditionProblem::CleanupEvidenceMismatch
+        {
             return Ok(false);
         }
+        // An evidence mismatch is judged against Control's moving admission
+        // snapshot, so it is transient by construction: the same release
+        // coordinate can succeed under the next accepted evidence binding.
+        // Such a marker retires even while still bound to the current
+        // checkpoint; genuinely request-terminal problems stay preserved.
         let checkpoint = expected.checkpoint();
         let ReconcileStep::CleanupRelease { cleanup } = &checkpoint.step else {
             return Err(invalid_release_rejection(
