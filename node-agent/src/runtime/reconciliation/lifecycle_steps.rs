@@ -1442,6 +1442,13 @@ impl LifecycleStepEffect {
         }
 
         if !is_lifecycle_step(&runtime.step) {
+            if matches!(runtime.step, ReconcileStep::StartRuntime { .. }) {
+                if let Some(outcome) =
+                    self.rebind_superseded_launch(context, accepted, desired, runtime)?
+                {
+                    return Ok(Some(outcome));
+                }
+            }
             if let Some(outcome) = self.plan_first(context, desired, runtime)? {
                 return Ok(Some(outcome));
             }
@@ -2206,6 +2213,68 @@ impl LifecycleStepEffect {
             | VolumeEvidenceRecovery::RetrySameRequest
             | VolumeEvidenceRecovery::Ambiguous => RuntimeDesiredEffectOutcome::RetryExact,
         })
+    }
+
+    /// A Deleted intent that supersedes a mid-launch checkpoint (`StartRuntime`
+    /// with the exact retained VMM still running) rebinds into the same
+    /// StopRuntime step the stable planner issues. Without this the effect
+    /// chain falls through to the acquire planner's Stop(LocalContract) on
+    /// every round and the whole physical launch (VMM, serving blockd,
+    /// kernel-NBD attachment) stays up forever.
+    fn rebind_superseded_launch(
+        &self,
+        context: &RuntimeDesiredEffectContext,
+        accepted: &crate::runtime_spine::RuntimeDesiredEffectAdmission,
+        desired: &DesiredRuntimeSpec,
+        runtime: &ObservedRuntimeStatus,
+    ) -> anyhow::Result<Option<RuntimeDesiredEffectOutcome>> {
+        let CheckpointEvidence::Valid {
+            checkpoint_path,
+            content_digest,
+            ..
+        } = &runtime.checkpoint
+        else {
+            return Ok(None);
+        };
+        let store = FileCheckpointStore::open_preserving_checkpoint_temp(
+            &context.state_directory().path().join(CHECKPOINT_NAMESPACE),
+            &desired.cat_id,
+        )
+        .context("open superseded launch checkpoint store")?;
+        if store.path() != Path::new(checkpoint_path.as_str()) {
+            return Ok(None);
+        }
+        let Some(stored) = store.load().context("load superseded launch checkpoint")? else {
+            return Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()));
+        };
+        if stored.content_digest() != content_digest
+            || stored.checkpoint().step != runtime.step
+            || checkpoint_is_current(desired, stored.checkpoint())
+        {
+            return Ok(None);
+        }
+        let Some(successor) = superseded_launch_stop_successor(
+            desired,
+            runtime,
+            stored.checkpoint(),
+            accepted.attestation().accepted_at_unix_ms,
+        )?
+        else {
+            return Ok(None);
+        };
+        context.check_active()?;
+        let current = store
+            .assert_current(&stored)
+            .context("retain superseded launch checkpoint for StopRuntime rebind CAS")?;
+        persist_lifecycle_successor(
+            context,
+            &store,
+            &stored,
+            &successor,
+            &current,
+            "rebind superseded launch to a current StopRuntime",
+        )?;
+        Ok(Some(RuntimeDesiredEffectOutcome::refresh_inventory()))
     }
 
     fn plan_first(
