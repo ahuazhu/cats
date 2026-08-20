@@ -14,32 +14,15 @@ default = []
 # Explicitly opt-in test fixture composition for cross-crate E2E tests. The
 # shipped Gateway binary never enables this feature.
 test-support = []
-# The V1 resolve/wake/Node-proxy implementation is retained only so the
-# historical process E2E can keep exercising pre-cutover behavior. The shipped
-# binary never enables or calls it.
-legacy-test-harness = [
-  "dep:axum",
-  "dep:base64",
-  "dep:futures-util",
-  "dep:serde",
-  "dep:serde_json",
-  "dep:tokio-tungstenite",
-]
 
 [dependencies]
 cats-api = { workspace = true }
 anyhow = { workspace = true }
-serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
 tokio = { workspace = true }
-axum = { workspace = true, optional = true }
 reqwest = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
-futures-util = { workspace = true, optional = true }
-tokio-tungstenite = { workspace = true, optional = true }
-base64 = { workspace = true, optional = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }

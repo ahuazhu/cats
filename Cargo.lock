@@ -399,33 +399,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aws-sdk-ec2"
-version = "1.241.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36d274d82dfee2c5f8c43c023a32605521ff86a0342ed2279c6c02ed5401cefc"
-dependencies = [
- "arc-swap",
- "aws-credential-types",
- "aws-runtime",
- "aws-smithy-async",
- "aws-smithy-http",
- "aws-smithy-json",
- "aws-smithy-observability",
- "aws-smithy-query",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-schema",
- "aws-smithy-types",
- "aws-smithy-xml",
- "aws-types",
- "fastrand",
- "http 0.2.12",
- "http 1.4.2",
- "regex-lite",
- "tracing",
-]
-
-[[package]]
 name = "aws-sdk-kinesis"
 version = "1.111.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1054,7 +1027,6 @@ name = "cats-blockd-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64",
  "cats-api",
  "cats-block-client",
  "cats-blockd",
@@ -1063,13 +1035,11 @@ dependencies = [
  "cats-metadata-store-sqlite",
  "cats-object-store-aws-s3",
  "cats-object-store-file",
- "cats-object-store-gateway",
  "cats-storage",
  "cats-test-support",
  "clap",
  "libc",
  "postgres",
- "ring",
  "serde_json",
  "tempfile",
  "tracing",
@@ -1084,19 +1054,15 @@ dependencies = [
  "anyhow",
  "base64",
  "cats-api",
- "cats-test-support",
  "clap",
  "crossterm",
  "directories",
  "fs2",
  "futures-util",
- "hex",
  "keyring",
  "libc",
  "open",
  "reqwest",
- "ring",
- "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1119,7 +1085,6 @@ dependencies = [
  "cats-metadata-store-sqlite",
  "cats-metering",
  "cats-storage",
- "cats-test-support",
  "futures-util",
  "hex",
  "hmac 0.12.1",
@@ -1153,6 +1118,8 @@ dependencies = [
  "anyhow",
  "cats-api",
  "cats-control-plane",
+ "cats-metadata-store-postgres",
+ "cats-metadata-store-sqlite",
  "cats-metering",
  "cats-object-store-aws-s3",
  "cats-object-store-file",
@@ -1177,7 +1144,6 @@ dependencies = [
  "cats-metadata-store-postgres",
  "cats-metadata-store-sqlite",
  "cats-metering",
- "cats-network",
  "cats-node-agent",
  "cats-object-store-aws-s3",
  "cats-object-store-file",
@@ -1214,44 +1180,6 @@ dependencies = [
  "tungstenite",
  "uuid",
  "zstd",
-]
-
-[[package]]
-name = "cats-host-fence-aws"
-version = "0.1.0"
-dependencies = [
- "aws-config",
- "aws-sdk-ec2",
- "aws-sdk-s3",
- "aws-sdk-sts",
- "base64",
- "cats-api",
- "cats-storage",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "cats-host-fence-provider-daemon"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "aws-config",
- "cats-api",
- "cats-control-plane",
- "cats-host-fence-aws",
- "cats-storage",
- "clap",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
@@ -1296,28 +1224,17 @@ dependencies = [
 name = "cats-network"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "axum",
- "base64",
  "bytes",
  "cats-api",
- "cats-test-support",
- "clap",
- "futures-util",
  "http-body-util",
  "hyper",
  "hyper-util",
  "reqwest",
  "rustls",
- "serde",
- "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.19",
  "tokio",
  "tokio-rustls",
- "tokio-tungstenite",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1325,7 +1242,6 @@ name = "cats-node-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "aws-config",
  "axum",
  "base64",
  "bytes",
@@ -1333,14 +1249,10 @@ dependencies = [
  "cats-block-client",
  "cats-blockd",
  "cats-control-plane",
- "cats-host-fence-aws",
  "cats-metadata-store-postgres",
  "cats-metadata-store-sqlite",
  "cats-metering",
- "cats-network",
- "cats-object-store-aws-s3",
  "cats-object-store-file",
- "cats-object-store-gateway",
  "cats-storage",
  "cats-test-support",
  "futures-util",
@@ -1350,7 +1262,6 @@ dependencies = [
  "hyper-util",
  "jsonwebtoken",
  "libc",
- "postgres",
  "reqwest",
  "ring",
  "rusqlite",
@@ -1375,24 +1286,13 @@ dependencies = [
  "anyhow",
  "cats-api",
  "cats-metadata-store-postgres",
- "cats-metering",
  "cats-node-agent",
  "cats-object-store-aws-s3",
  "cats-object-store-file",
  "cats-storage",
- "cats-test-support",
- "cats-usage-store-postgres",
  "clap",
- "futures-util",
- "hex",
- "libc",
- "reqwest",
- "serde",
- "serde_json",
- "sha2 0.10.9",
  "tempfile",
  "tokio",
- "tokio-tungstenite",
  "tracing-subscriber",
 ]
 
@@ -1409,7 +1309,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tracing",
- "xmlparser",
 ]
 
 [[package]]
@@ -1419,34 +1318,6 @@ dependencies = [
  "cats-storage",
  "cats-test-support",
  "tempfile",
-]
-
-[[package]]
-name = "cats-object-store-gateway"
-version = "0.1.0"
-dependencies = [
- "cats-api",
- "cats-storage",
- "reqwest",
- "ring",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.19",
- "tracing",
-]
-
-[[package]]
-name = "cats-object-write-gateway-daemon"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "aws-config",
- "cats-api",
- "cats-control-plane",
- "cats-host-fence-aws",
- "clap",
- "tokio",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1464,12 +1335,8 @@ dependencies = [
 name = "cats-test-support"
 version = "0.1.0"
 dependencies = [
- "cats-api",
  "cats-storage",
- "rusqlite",
- "serde_json",
  "tempfile",
- "tokio",
 ]
 
 [[package]]
@@ -1482,11 +1349,8 @@ dependencies = [
  "aws-sdk-kinesis",
  "aws-sdk-s3",
  "cats-metering",
- "cats-test-support",
  "futures-util",
- "hex",
  "serde_json",
- "sha2 0.10.9",
  "tokio",
  "tracing",
 ]
@@ -1497,7 +1361,6 @@ version = "0.1.0"
 dependencies = [
  "cats-api",
  "cats-metering",
- "cats-test-support",
  "native-tls",
  "postgres",
  "postgres-native-tls",

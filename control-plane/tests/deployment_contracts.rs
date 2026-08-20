@@ -869,7 +869,7 @@ fn production_artifacts_remove_the_v1_gateway_and_shared_route_mirror() {
     }
 
     let manifest = read_workspace_file("network/Cargo.toml");
-    assert!(manifest.contains("legacy-test-harness"));
+    assert!(!manifest.contains("legacy-test-harness"));
     assert!(!manifest.contains("aws-sdk-dynamodb"));
     assert!(!manifest.contains("aws-config"));
 

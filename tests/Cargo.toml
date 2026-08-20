@@ -14,7 +14,6 @@ cats-control-plane = { workspace = true }
 cats-node-agent = { workspace = true }
 cats-blockd = { workspace = true }
 cats-block-client = { workspace = true }
-cats-network = { workspace = true, features = ["legacy-test-harness"] }
 cats-storage = { workspace = true }
 cats-metadata-store-sqlite = { workspace = true }
 cats-metadata-store-postgres = { workspace = true }
