@@ -3917,6 +3917,14 @@ fn remaining_cleanup_successor_at_with_absent_serving(
                     && matches!(runtime.guest_transport, GuestTransportEvidence::Unavailable),
                 "Volume cleanup cannot begin while runtime residue remains"
             );
+            // Every launch-attributed target is reclaimed and the exact VMM is
+            // proven absent, so this runtime is no longer incarnate. Control's
+            // release precondition demands exactly that; retaining the launch
+            // through the Volume stage made the release permanently rejected
+            // as an evidence mismatch. CleanupRelease permits either launch
+            // presence, and the terminal settle retires it anyway.
+            successor.runtime_incarnation = None;
+            successor.runtime_launch = RuntimeLaunch::Absent;
         }
         successor.step = ReconcileStep::CleanupRelease {
             cleanup: CleanupRelease {
