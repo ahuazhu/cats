@@ -103,6 +103,11 @@ pub(crate) struct LifecycleEffectPermit<'a> {
     runtime: &'a ObservedRuntimeStatus,
     store: &'a FileCheckpointStore,
     stored: &'a StoredCheckpoint,
+    /// The live writer guard for `stored`. Physical ports revalidate through
+    /// this guard; re-locking the same store from a call chain that already
+    /// holds it self-deadlocks the effect worker forever (the D7 family —
+    /// third occurrence, kernel-NBD detach).
+    current: &'a super::checkpoint::CurrentCheckpointGuard<'a>,
 }
 
 impl LifecycleEffectPermit<'_> {
@@ -116,6 +121,10 @@ impl LifecycleEffectPermit<'_> {
 
     pub(crate) fn checkpoint(&self) -> &RuntimeCheckpoint {
         self.stored.checkpoint()
+    }
+
+    fn current_guard(&self) -> &super::checkpoint::CurrentCheckpointGuard<'_> {
+        self.current
     }
 
     fn store(&self) -> &FileCheckpointStore {
@@ -1117,6 +1126,7 @@ fn detach_exact_kernel_nbd_device(
             ownership_token,
             permit.store(),
             permit.stored(),
+            permit.current_guard(),
             context,
         )? {
             KernelNbdDetachResult::SubmittedOrAmbiguous => {
@@ -1539,6 +1549,7 @@ impl LifecycleStepEffect {
                     runtime,
                     store: &store,
                     stored: &stored,
+                    current: &current,
                 };
                 if !cleanup_can_rebind(context, &permit, cleanup)? {
                     return Ok(Some(stop_local()));
@@ -1631,6 +1642,7 @@ impl LifecycleStepEffect {
                 runtime,
                 store: &store,
                 stored: &stored,
+                current: &current,
             },
         )?;
         // A successful mutation can legitimately change the physical target,
@@ -1753,6 +1765,7 @@ impl LifecycleStepEffect {
             runtime,
             store,
             stored,
+            current,
         };
         if !volume_cleanup_observation_is_compatible(&permit, cleanup) {
             return Ok(stop_local());
@@ -6380,6 +6393,7 @@ mod tests {
             ownership_token: &RandomId128,
             _store: &FileCheckpointStore,
             stored: &StoredCheckpoint,
+            _current: &super::super::checkpoint::CurrentCheckpointGuard<'_>,
             _context: &RuntimeDesiredEffectContext,
         ) -> anyhow::Result<KernelNbdDetachResult> {
             self.calls.lock().unwrap().push((
@@ -7413,11 +7427,13 @@ mod tests {
         let stored = store.create(&checkpoint).unwrap();
         install_valid_checkpoint_evidence(&mut runtime, &checkpoint, &store, &stored);
         let context = deleting_effect_context(&directory, &desired, runtime.clone());
+        let current = store.assert_current(&stored).unwrap();
         let permit = LifecycleEffectPermit {
             desired: &desired,
             runtime: &runtime,
             store: &store,
             stored: &stored,
+            current: &current,
         };
         let detach = RecordingKernelNbdDetach {
             calls: Mutex::new(Vec::new()),
@@ -7516,11 +7532,13 @@ mod tests {
             blockd: PlatformPersistentBlockdControlPort,
             volume_authority: Arc::new(UnavailableVolumeAuthority),
         };
+        let current = store.assert_current(&stored).unwrap();
         let permit = LifecycleEffectPermit {
             desired: &desired,
             runtime: &runtime,
             store: &store,
             stored: &stored,
+            current: &current,
         };
 
         assert_eq!(
@@ -7589,11 +7607,13 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_secs(5),
             admission,
         );
+        let current = store.assert_current(&stored).unwrap();
         let permit = LifecycleEffectPermit {
             desired: &desired,
             runtime: &runtime,
             store: &store,
             stored: &stored,
+            current: &current,
         };
         let detach = RecordingKernelNbdDetach {
             calls: Mutex::new(Vec::new()),
@@ -7713,11 +7733,13 @@ mod tests {
                 crate::state_directory::StateDirectory::unanchored(directory.path().to_path_buf()),
                 std::time::Instant::now() + std::time::Duration::from_secs(5),
             );
+            let current = store.assert_current(&stored).unwrap();
             let permit = LifecycleEffectPermit {
                 desired: &desired,
                 runtime: &runtime,
                 store: &store,
                 stored: &stored,
+                current: &current,
             };
             let detach = RecordingKernelNbdDetach {
                 calls: Mutex::new(Vec::new()),
@@ -7921,11 +7943,13 @@ mod tests {
             .unwrap();
         let replacement_context =
             replacement_context.with_node_global_process_for_test(replacement_admission);
+        let current = store.assert_current(&stored).unwrap();
         let permit = LifecycleEffectPermit {
             desired: &desired,
             runtime: &runtime,
             store: &store,
             stored: &stored,
+            current: &current,
         };
         assert_eq!(
             physical
@@ -7958,11 +7982,13 @@ mod tests {
             .unwrap();
         assert!(admission.retains_absent_serving_owner(&desired.cat_id, &prepared));
         let context = context.with_node_global_process_for_test(admission);
+        let current = store.assert_current(&stored).unwrap();
         let permit = LifecycleEffectPermit {
             desired: &desired,
             runtime: &runtime,
             store: &store,
             stored: &stored,
+            current: &current,
         };
         assert_eq!(
             physical
@@ -8618,6 +8644,67 @@ mod tests {
                 .collect()
         );
         assert!(plans.iter().all(|plan| plan.volume_release.is_some()));
+    }
+
+    /// The direct StopRuntime->cleanup path reaches the plan builder with
+    /// the kernel-NBD device still attached. The builder must plan the
+    /// detach and defer the volume release to a later round instead of
+    /// failing closed (which wedged the mid-launch disposable-root delete).
+    #[test]
+    fn cleanup_plan_detaches_a_live_device_before_planning_the_release() {
+        let (mut desired, mut checkpoint, mut runtime) = fixtures(RuntimeTarget::Deleted);
+        desired.volumes[0].disposition = VolumeDisposition::DeleteDisposableRoot {
+            delete_id: Id::new("delete_disposable_root").unwrap(),
+        };
+        desired.spec_digest = spec_digest(&desired).unwrap();
+        let launch = checkpoint
+            .runtime_launch
+            .identity()
+            .expect("fixture retains launch");
+        let prepared = launch
+            .devices
+            .iter()
+            .find(|prepared| prepared.volume_id == desired.volumes[0].volume_id)
+            .expect("fixture launch carries the root device");
+        runtime.volumes[0].devices = vec![ObservedDevice::KernelNbd {
+            guest_device: desired.volumes[0].guest_device.clone(),
+            device_path: HostPath::new("/dev/nbd0".to_owned()).unwrap(),
+            ownership_token: cats_api::runtime_reconciliation::OwnershipTokenEvidence::Valid {
+                ownership_token: prepared.ownership_token.clone(),
+            },
+        }];
+        runtime.processes.clear();
+        runtime.networks.clear();
+        runtime.mounts.clear();
+        runtime.guest_transport = GuestTransportEvidence::Unavailable;
+        checkpoint.processes.clear();
+        checkpoint.networks.clear();
+        checkpoint.mounts.clear();
+        checkpoint.guest_transport = GuestTransportEvidence::Unavailable;
+
+        let plans = canonical_remaining_cleanup(&desired, &runtime, &checkpoint, &[])
+            .expect("a live device must not wedge the cleanup plan");
+        assert!(
+            plans.iter().any(|plan| matches!(
+                &plan.target,
+                CleanupTarget::Device { volume_id, .. }
+                    if volume_id == &desired.volumes[0].volume_id
+            )),
+            "detach must be planned first: {plans:?}"
+        );
+        assert!(
+            !plans
+                .iter()
+                .any(|plan| matches!(&plan.target, CleanupTarget::Volume { .. })),
+            "the release must wait for the detach: {plans:?}"
+        );
+
+        // Calibration: with the device gone, the same state plans the release.
+        runtime.volumes[0].devices.clear();
+        let plans = canonical_remaining_cleanup(&desired, &runtime, &checkpoint, &[]).unwrap();
+        assert!(plans
+            .iter()
+            .any(|plan| matches!(&plan.target, CleanupTarget::Volume { .. })));
     }
 
     #[test]

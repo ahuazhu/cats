@@ -915,6 +915,7 @@ pub(crate) trait KernelNbdDetachPort:
         ownership_token: &RandomId128,
         store: &FileCheckpointStore,
         stored: &StoredCheckpoint,
+        current: &super::checkpoint::CurrentCheckpointGuard<'_>,
         context: &RuntimeDesiredEffectContext,
     ) -> Result<KernelNbdDetachResult>;
 }
@@ -1406,6 +1407,7 @@ impl KernelNbdInventoryPort {
         ownership_token: &RandomId128,
         store: &FileCheckpointStore,
         stored: &StoredCheckpoint,
+        current: &super::checkpoint::CurrentCheckpointGuard<'_>,
         context: &RuntimeDesiredEffectContext,
     ) -> Result<KernelNbdDetachResult> {
         context.check_active()?;
@@ -1533,10 +1535,12 @@ impl KernelNbdInventoryPort {
                     }
                 }
             }
-            let current = store
-                .assert_current(stored)
-                .context("retain exact lifecycle checkpoint across kernel-NBD detach")?;
-            store.revalidate_current(stored, &current)?;
+            // The caller (lifecycle effect) already holds this store's writer
+            // guard; taking it again here self-deadlocked the effect worker
+            // forever. Revalidate through the caller's live guard instead.
+            store
+                .revalidate_current(stored, current)
+                .context("revalidate exact lifecycle checkpoint across kernel-NBD detach")?;
             permit.assert_current_publication_paths(&namespace, store)?;
             context.check_active()?;
             submitter.poll_reap()?;
@@ -1544,7 +1548,7 @@ impl KernelNbdInventoryPort {
                 return Ok(KernelNbdDetachResult::Unavailable);
             }
             let submitted = submitter.submit(&self.config, &expected.device_path, context);
-            let still_current = store.revalidate_current(stored, &current).is_ok()
+            let still_current = store.revalidate_current(stored, current).is_ok()
                 && permit
                     .assert_current_publication_paths(&namespace, store)
                     .is_ok();
@@ -2597,6 +2601,7 @@ impl KernelNbdDetachPort for PlatformKernelNbdDetachPort {
         ownership_token: &RandomId128,
         store: &FileCheckpointStore,
         stored: &StoredCheckpoint,
+        current: &super::checkpoint::CurrentCheckpointGuard<'_>,
         context: &RuntimeDesiredEffectContext,
     ) -> Result<KernelNbdDetachResult> {
         self.inventory.detach_checkpointed(
@@ -2605,6 +2610,7 @@ impl KernelNbdDetachPort for PlatformKernelNbdDetachPort {
             ownership_token,
             store,
             stored,
+            current,
             context,
         )
     }
@@ -4865,6 +4871,7 @@ mod tests {
                 &prepared.ownership_token,
                 &store,
                 &stored,
+                &store.assert_current(&stored).unwrap(),
                 &context,
             )
             .unwrap(),
