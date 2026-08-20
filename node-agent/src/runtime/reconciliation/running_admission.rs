@@ -1248,15 +1248,26 @@ impl RunningAdmissionEffect {
             plan_running_tail_action(desired, &stored, &live, session.checkpoint_store())?
         else {
             let checkpoint = stored.checkpoint();
-            let converged = session.cell().snapshot()
-                == AdmissionSnapshot::from_checkpoint(checkpoint)?
-                && checkpoint.stable_state == Some(StableState::Running)
+            let checkpoint_cell = AdmissionSnapshot::from_checkpoint(checkpoint)?;
+            let exact_stable_running = checkpoint.stable_state == Some(StableState::Running)
                 && matches!(
                     checkpoint.step,
                     ReconcileStep::Stable {
                         state: StableState::Running
                     }
                 );
+            // A restart closes the process-local cell for good: ADR-0041
+            // forbids republishing a burned Endpoint epoch, so the planner
+            // deliberately has no action here and Control must issue a higher
+            // route epoch. That is a completed unit of work, not a failure —
+            // answering refresh made this Cat re-close the batch's shared
+            // Node-global admission every round and starve every sibling.
+            let cell_snapshot = session.cell().snapshot();
+            let restart_closed = cell_snapshot == checkpoint_cell.fail_closed()
+                && cell_snapshot != checkpoint_cell
+                && exact_stable_running;
+            let converged =
+                (cell_snapshot == checkpoint_cell && exact_stable_running) || restart_closed;
             // A scanner-sealed admission tail owns this dispatch. In
             // particular, a Closed endpoint with live guards must not fall
             // through into storage/network teardown while its tunnel tasks
@@ -4361,11 +4372,16 @@ mod tests {
 
         let successor = fixture.registry();
         let successor_effect = RunningAdmissionEffect::new(Arc::clone(&successor));
+        // The restart-closed state is a completed unit of work: the Node has
+        // nothing to do until Control raises the route epochs, and the closed
+        // cell is already exposed in the next observation. Answering refresh
+        // here re-closed the batch's shared Node-global admission every round
+        // and starved every sibling Cat on the Host.
         assert_eq!(
             successor_effect
                 .try_apply(&fixture.context(&successor, true), &fixture.desired)
                 .expect("old Endpoint epochs remain fail-closed after restart"),
-            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
+            Some(RuntimeDesiredEffectOutcome::Applied)
         );
         let closed = successor
             .get(&fixture.desired.cat_id)
@@ -4386,7 +4402,8 @@ mod tests {
             successor_effect
                 .try_apply(&fixture.context(&successor, true), &fixture.desired)
                 .expect("old Endpoint epoch replay stays closed"),
-            Some(RuntimeDesiredEffectOutcome::refresh_inventory())
+            Some(RuntimeDesiredEffectOutcome::Applied),
+            "a replayed restart-closed tail must stay a no-op, not churn the batch"
         );
         let restart_scan = fixture.scan(&successor);
         let sealed = RunningTailScanAdmission::for_test_from_authorities(
