@@ -3,7 +3,7 @@
 //! Two Guest block data paths, selected by [`ChConfig::block_path`]:
 //!
 //! ```text
-//! kernel-nbd (Phase A, the correctness-first path of ADR-0001):
+//! kernel-nbd (Phase A, the correctness-first path):
 //!   guest virtio-blk -> CH built-in block backend -> /dev/nbdN (kernel NBD
 //!   client) -> cats-blockd NBD server -> ChunkEngine -> storage adapters
 //!

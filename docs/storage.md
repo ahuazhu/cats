@@ -194,7 +194,6 @@ empty，再执行exact PG completion CAS；weak/stale LIST或暂停的late PUT�
 - 没有面向当前 release 的长期、多故障组合和大规模生产资格测试，也没有可引用的可用性或性能 SLA。
 - S3/RDS 的 Multi-AZ failover、备份恢复、区域灾难恢复和 CAS 超时风暴仍需在目标部署形态验证。
 - Relaxed 的未发布数据没有跨 Host 副本；如产品要求 Host 丢失下 `RPO=0`，需要另一种明确的持久性方案，不能重新解释现有模式。
-- ADR-0042的幂等lease transition、精确release、逐卷takeover授权和blockd grant adoption未实现。
 - attachment lineage绑定、Cold-only磁盘API、ext4初始化、snapshot-aware GC、same-disk restore和
   delete sweeper未实现。
 - clone、hot disk mutation与Golden Image GC明确不在第一版目标内。

@@ -82,7 +82,6 @@ production `SignedRunningEffect`，终点为`ProvisionRootImage`/root-blockd、c
 
 ### 基础与资源边界
 
-- [0001 Greenfield baseline](decisions/0001-greenfield-implementation-baseline.md)
 - [0002 四态生命周期](decisions/0002-lifecycle-states-running-suspended-warm-cold.md)
 - [0003 Direct-OS ChunkStore](decisions/0003-direct-s3-chunkstore-backend.md)
 - [0004 Rust 技术栈](decisions/0004-implementation-stack-and-dev-environment.md)
@@ -129,11 +128,6 @@ production `SignedRunningEffect`，终点为`ProvisionRootImage`/root-blockd、c
 - [0045 独立Gateway workload identity authority](decisions/0045-independent-gateway-workload-identity.md)
 - [0046 Gateway到Node Route v2 machine tunnel](decisions/0046-gateway-node-route-v2-machine-tunnel.md)
 
-### Deferred
-
-- [0020 S3 Express One Zone hot commits](decisions/0020-s3-express-one-zone-hot-commits.md)：
-  不属于当前实现路线；需要新的成本/可用性证据才重新评估。
-
 ## Evidence
 
 实验源码、正式 CSV、环境报告、原始日志和失败 crash evidence保留在 `experiments/`，入口见
@@ -164,7 +158,7 @@ correctness oracle。
 
 - 一个事实只在一个 authority文档展开；其他位置用链接，不复制滚动状态和 benchmark表。
 - 改公开 API、persisted format、Guest ABI、故障语义或组件 authority必须新增 ADR。
-- Superseded ADR留短 tombstone；未实现且被否决的 spec直接删除，Git就是 archive。
+- 未实现且被否决的 spec直接删除，Git就是 archive。
 - architecture Markdown不再生成/手工维护 static HTML。
 - 实验源码、CSV、环境报告、原始日志和失败 evidence不得因结论变化而删除。
 - 任何实现变更仍执行 `./scripts/quality.sh fast`，handoff前执行 `./scripts/quality.sh full`；
