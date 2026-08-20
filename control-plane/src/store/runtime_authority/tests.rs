@@ -3327,6 +3327,60 @@ fn a22_release_rejects_duplicate_or_other_runtime_writers() {
     }
 }
 
+/// The Node issues a release under the admission it captured while its own
+/// scan loop keeps advancing Control's attestation, so an older evidence
+/// cursor must be accepted; only a cursor claiming to be newer than this
+/// admission is rejected. Demanding exact equality made every release
+/// permanently unsatisfiable.
+#[test]
+fn a22_root_release_accepts_an_older_cursor_and_rejects_a_newer_one() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let owned = acquire_owned_volume(&store);
+    let (node, _desired, admission, request) =
+        prepare_root_delete_release_fixture(&store, &owned);
+
+    let mut newer = request.clone();
+    let RuntimeVolumeTransition::Release { cleanup } = &mut newer.transition else {
+        panic!("fixture builds a Release transition")
+    };
+    cleanup.inventory_epoch = epoch(
+        admission
+            .inventory_attestation
+            .inventory_epoch
+            .get()
+            .checked_add(1)
+            .unwrap(),
+    );
+    let before = stored_volume(&store, &owned.volume_id);
+    assert_eq!(
+        execute_transition(&store, &node, &newer).unwrap(),
+        VolumeTransitionStoreOutcome::Rejected(
+            VolumeTransitionStoreRejection::TransitionPreconditionFailed {
+                cat_id: request.cat_id.clone(),
+                problem: RuntimeVolumeTransitionPreconditionProblem::CleanupEvidenceMismatch,
+            }
+        ),
+        "a cursor newer than this admission must stay closed"
+    );
+    assert_eq!(stored_volume(&store, &owned.volume_id), before);
+
+    let mut older = request.clone();
+    let RuntimeVolumeTransition::Release { cleanup } = &mut older.transition else {
+        panic!("fixture builds a Release transition")
+    };
+    let current = admission.inventory_attestation.inventory_epoch.get();
+    if current > 1 {
+        cleanup.inventory_epoch = epoch(current - 1);
+    }
+    assert!(
+        matches!(
+            execute_transition(&store, &node, &older).unwrap(),
+            VolumeTransitionStoreOutcome::Accepted(_)
+        ),
+        "an older cursor with exact physical evidence must be accepted"
+    );
+}
+
 #[test]
 fn a22_root_release_ignores_a_historical_consumed_takeover() {
     let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();

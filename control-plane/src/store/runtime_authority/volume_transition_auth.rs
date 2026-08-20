@@ -1579,11 +1579,18 @@ fn release_evidence_matches(
         &context.admission.full_inventory_observation,
         &intent.volume_id,
     );
+    // The evidence cursor must not claim to be newer than this admission, but
+    // it may legitimately be older: the Node issues a release under the
+    // admission it captured, while its own scan loop keeps advancing Control's
+    // attestation. Demanding exact equality made every release unsatisfiable
+    // (the request can never overtake the next full observation). Freshness is
+    // still proven, because every physical conjunct below is re-evaluated
+    // against Control's current observation.
     if physical.has_residue
         || cleanup.inventory_session != session_binding_from_agent(&context.admission.agent_session)
-        || cleanup.inventory_epoch != context.admission.inventory_attestation.inventory_epoch
+        || cleanup.inventory_epoch > context.admission.inventory_attestation.inventory_epoch
         || cleanup.inventory_read_position
-            != context
+            > context
                 .admission
                 .inventory_attestation
                 .inventory_read_position
