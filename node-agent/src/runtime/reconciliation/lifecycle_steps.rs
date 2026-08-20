@@ -8007,7 +8007,6 @@ mod tests {
             .unwrap();
         assert!(admission.retains_absent_serving_owner(&desired.cat_id, &prepared));
         let context = context.with_node_global_process_for_test(admission);
-        let current = store.assert_current(&stored).unwrap();
         let permit = LifecycleEffectPermit {
             desired: &desired,
             runtime: &runtime,
@@ -8052,11 +8051,11 @@ mod tests {
                 }
             }
         ));
-        assert_eq!(volume_cleanup.runtime_launch, checkpoint.runtime_launch);
-        assert_eq!(
-            volume_cleanup.runtime_incarnation,
-            checkpoint.runtime_incarnation
-        );
+        // The Volume stage proves every launch-attributed target reclaimed and
+        // the exact VMM absent, so the retained launch retires there: Control's
+        // release precondition requires an unincarnate runtime.
+        assert_eq!(volume_cleanup.runtime_launch, RuntimeLaunch::Absent);
+        assert_eq!(volume_cleanup.runtime_incarnation, None);
 
         runtime.networks.clear();
         runtime.mounts.clear();
@@ -8151,11 +8150,9 @@ mod tests {
             cursor.inventory_read_position
         );
         assert_eq!(cleanup.desired_read_position, cursor.desired_read_position);
-        assert_eq!(
-            successor.runtime_incarnation,
-            checkpoint.runtime_incarnation
-        );
-        assert_eq!(successor.runtime_launch, checkpoint.runtime_launch);
+        // The Volume stage retires the retained launch (see above).
+        assert_eq!(successor.runtime_incarnation, None);
+        assert_eq!(successor.runtime_launch, RuntimeLaunch::Absent);
         encode_runtime_checkpoint(&successor).unwrap();
 
         let (attachment_epoch, head) = match &runtime.volumes[0].authority {
@@ -8250,11 +8247,9 @@ mod tests {
             successor.step,
             ReconcileStep::DeleteDisposableRoot { .. }
         ));
-        assert_eq!(
-            successor.runtime_incarnation,
-            checkpoint.runtime_incarnation
-        );
-        assert_eq!(successor.runtime_launch, checkpoint.runtime_launch);
+        // The Volume stage retires the retained launch (see above).
+        assert_eq!(successor.runtime_incarnation, None);
+        assert_eq!(successor.runtime_launch, RuntimeLaunch::Absent);
         encode_runtime_checkpoint(&successor).unwrap();
 
         // The released-and-reclaimed shape settles: a disposable Root whose
