@@ -4311,9 +4311,18 @@ fn canonical_remaining_cleanup_with_absent_serving(
                     head,
                 } => {
                     anyhow::ensure!(
-                        attachment_id == &intent.attachment_id && volume.devices.is_empty(),
-                        "cleanup successor cannot release a changed or published attachment"
+                        attachment_id == &intent.attachment_id,
+                        "cleanup successor cannot release a changed attachment"
                     );
+                    if !volume.devices.is_empty() {
+                        // The `0-device` plan above detaches this attachment
+                        // first; a later successor round finds the device
+                        // gone and plans the release. Failing here instead
+                        // wedged the direct StopRuntime->cleanup path, which
+                        // reaches this builder with the kernel-NBD device
+                        // still attached.
+                        continue;
+                    }
                     let mut exact = volume.local_lineages.iter().filter(|lineage| {
                         lineage.attachment_id == *attachment_id
                             && lineage.attachment_epoch == *attachment_epoch
