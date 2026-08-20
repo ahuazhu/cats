@@ -5136,7 +5136,13 @@ fn host_path(path: &std::path::Path, label: &str) -> anyhow::Result<HostPath> {
     HostPath::new(value.to_owned()).with_context(|| format!("{label} is not canonical"))
 }
 
+#[track_caller]
 fn stop_local() -> RuntimeDesiredEffectOutcome {
+    // A silent Stop is undebuggable on a wedged Node; name the deciding line.
+    tracing::warn!(
+        site = %std::panic::Location::caller(),
+        "effect stopped for the local contract",
+    );
     RuntimeDesiredEffectOutcome::Stop(RuntimeDesiredEffectStopReason::LocalContract)
 }
 

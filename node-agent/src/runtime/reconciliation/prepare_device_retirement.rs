@@ -642,7 +642,13 @@ fn public_process_matches_expectation(
         && process.observed_vm_shape.is_none()
 }
 
+#[track_caller]
 fn stop_local() -> RuntimeDesiredEffectOutcome {
+    // A silent Stop is undebuggable on a wedged Node; name the deciding line.
+    tracing::warn!(
+        site = %std::panic::Location::caller(),
+        "effect stopped for the local contract",
+    );
     RuntimeDesiredEffectOutcome::Stop(RuntimeDesiredEffectStopReason::LocalContract)
 }
 

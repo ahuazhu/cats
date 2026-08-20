@@ -771,7 +771,13 @@ fn authority_request(
     })
 }
 
+#[track_caller]
 fn stop_local() -> RuntimeDesiredEffectOutcome {
+    // A silent Stop is undebuggable on a wedged Node; name the deciding line.
+    tracing::warn!(
+        site = %std::panic::Location::caller(),
+        "effect stopped for the local contract",
+    );
     RuntimeDesiredEffectOutcome::Stop(RuntimeDesiredEffectStopReason::LocalContract)
 }
 
