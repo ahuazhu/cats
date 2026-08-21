@@ -50,6 +50,14 @@ struct Args {
     /// management Control origin.
     #[arg(long, env = "CATS_OBJECT_WRITE_GATEWAY_URL")]
     object_write_gateway_url: Option<String>,
+    /// PEM roots that issue this deployment's ObjectWrite Gateway server
+    /// certificate. The artifact is installed with the Route v2 revision.
+    #[arg(
+        long,
+        env = "CATS_OBJECT_WRITE_GATEWAY_CA_FILE",
+        default_value = cats_api::route_grant_v2::NODE_ROUTE_V2_SERVER_CA_BUNDLE_PATH
+    )]
+    object_write_gateway_ca_file: PathBuf,
     #[arg(
         long,
         env = "CATS_GATEWAY_CLIENT_CA_BUNDLE_FILE",
@@ -336,6 +344,7 @@ async fn main() -> anyhow::Result<()> {
     let object_write_mode = match args.object_write_gateway_url {
         Some(gateway_origin) => InstalledAtomicStartObjectWriteMode::Gateway {
             gateway_origin,
+            server_ca_bundle_file: args.object_write_gateway_ca_file.clone(),
             control_plane_origin: args.control_plane_url.clone(),
             registration: Arc::new(agent_registration.clone()),
         },

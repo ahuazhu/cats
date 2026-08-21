@@ -140,6 +140,8 @@ pub enum ObjectWriteError {
     InvalidBaseUrl { message: String },
     #[error("the ObjectWrite Gateway HTTP client could not be built: {message}")]
     Client { message: String },
+    #[error("the ObjectWrite Gateway server trust anchor is unusable: {message}")]
+    InvalidServerTrust { message: String },
 }
 
 impl ObjectWriteError {
@@ -164,6 +166,18 @@ impl ObjectWriteError {
             },
         }
     }
+}
+
+/// How this adapter authenticates the ObjectWrite Gateway it publishes through.
+///
+/// There is deliberately no public-root fallback: production Gateway
+/// certificates are issued by the deployment's own root.
+#[derive(Debug, Clone, Copy)]
+pub enum ObjectWriteGatewayServerTrust<'a> {
+    /// Verify the Gateway against exactly these PEM roots and nothing else.
+    Roots(&'a [u8]),
+    /// Plaintext is accepted only for an in-process or local loopback peer.
+    PlaintextLoopback,
 }
 
 /// A [`BlobStore`] whose writes are published by the ObjectWrite Gateway.
@@ -207,17 +221,18 @@ impl ObjectWriteGatewayBlobStore {
         volume_id: Id,
         signer: Ed25519RequestSigner,
         reads: Arc<dyn BlobStore>,
+        trust: ObjectWriteGatewayServerTrust<'_>,
     ) -> Result<Self, ObjectWriteError> {
         let origin = validated_origin(gateway_base_url)?;
-        let client = reqwest::blocking::Client::builder()
+        let mut client = reqwest::blocking::Client::builder()
             // A signed body must never be replayed to a Location that was not
             // part of the request the attachment key authorized.
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .map_err(|error| ObjectWriteError::Client {
-                message: error.to_string(),
-            })?;
+            .timeout(REQUEST_TIMEOUT);
+        client = install_server_trust(client, &origin, trust)?;
+        let client = client.build().map_err(|error| ObjectWriteError::Client {
+            message: error.to_string(),
+        })?;
         Ok(Self {
             endpoint: format!("{origin}{OBJECT_WRITE_GATEWAY_PATH}"),
             volume_id,
@@ -440,6 +455,38 @@ fn interpret(key: &str, receipt: &ObjectWriteGatewayReceipt) -> Result<(), Objec
     }
 }
 
+fn install_server_trust(
+    builder: reqwest::blocking::ClientBuilder,
+    origin: &str,
+    trust: ObjectWriteGatewayServerTrust<'_>,
+) -> Result<reqwest::blocking::ClientBuilder, ObjectWriteError> {
+    let invalid = |message: &str| ObjectWriteError::InvalidServerTrust {
+        message: message.to_owned(),
+    };
+    let plaintext = origin.starts_with("http://");
+    match trust {
+        ObjectWriteGatewayServerTrust::PlaintextLoopback if plaintext => Ok(builder),
+        ObjectWriteGatewayServerTrust::PlaintextLoopback => Err(invalid(
+            "an https gateway origin requires explicit server roots",
+        )),
+        ObjectWriteGatewayServerTrust::Roots(_) if plaintext => Err(invalid(
+            "a plaintext loopback origin cannot authenticate server roots",
+        )),
+        ObjectWriteGatewayServerTrust::Roots(pem) => {
+            let roots = reqwest::tls::Certificate::from_pem_bundle(pem)
+                .map_err(|error| invalid(&format!("unreadable PEM bundle: {error}")))?;
+            if roots.is_empty() {
+                return Err(invalid("the PEM bundle contains no certificate"));
+            }
+            let mut builder = builder.https_only(true).tls_built_in_root_certs(false);
+            for root in roots {
+                builder = builder.add_root_certificate(root);
+            }
+            Ok(builder)
+        }
+    }
+}
+
 fn validated_origin(base_url: &str) -> Result<String, ObjectWriteError> {
     let url = reqwest::Url::parse(base_url).map_err(|error| ObjectWriteError::InvalidBaseUrl {
         message: error.to_string(),
@@ -597,18 +644,28 @@ impl BlobStoreFactory for ObjectWriteGatewayBlobStoreFactory {
     }
 
     fn open(&self, config: &AdapterConfig) -> Result<Arc<dyn BlobStore>, AdapterError> {
-        config.ensure_only(ADAPTER_NAME, &["gateway-url", "volume-id"])?;
+        config.ensure_only(
+            ADAPTER_NAME,
+            &["gateway-url", "volume-id", "server-ca-file"],
+        )?;
         let gateway_url = config.required(ADAPTER_NAME, "gateway-url")?;
         let volume_id = config.required(ADAPTER_NAME, "volume-id")?;
         let volume_id = Id::new(volume_id).ok_or_else(|| AdapterError::InvalidConfig {
             adapter: ADAPTER_NAME,
             message: "volume-id is not a valid identifier".into(),
         })?;
+        let server_ca_file = config.required(ADAPTER_NAME, "server-ca-file")?;
+        let server_ca_bundle =
+            std::fs::read(server_ca_file).map_err(|error| AdapterError::InvalidConfig {
+                adapter: ADAPTER_NAME,
+                message: format!("server-ca-file is unreadable: {error}"),
+            })?;
         ObjectWriteGatewayBlobStore::new(
             gateway_url,
             volume_id,
             self.signer.clone(),
             Arc::clone(&self.reads),
+            ObjectWriteGatewayServerTrust::Roots(&server_ca_bundle),
         )
         .map(|store| Arc::new(store) as Arc<dyn BlobStore>)
         .map_err(|error| AdapterError::Open {

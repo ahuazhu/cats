@@ -1,8 +1,10 @@
 data "aws_partition" "current" {}
 
 locals {
-  resource_name = "${var.name_prefix}-${var.environment}-worker"
-  artifact_key  = "worker/${var.worker_bundle_sha256}/cats-worker.tar.zst"
+  resource_name                = "${var.name_prefix}-${var.environment}-worker"
+  artifact_key                 = "worker/${var.worker_bundle_sha256}/cats-worker.tar.zst"
+  route_v2_install_root        = "/etc/cats/route-v2"
+  object_write_gateway_ca_file = "${local.route_v2_install_root}/node-server-ca-bundle.pem"
   tags = merge(var.tags, {
     Component   = "metal-worker-deployment"
     Environment = var.environment
@@ -23,6 +25,7 @@ locals {
       "CATS_POSTGRES_SCHEMA=${var.control_postgres_schema}",
       "CATS_ROUTE_V2_ROTATION_ORIGIN=${var.route_v2_rotation_origin}",
       "CATS_OBJECT_WRITE_GATEWAY_URL=${var.object_write_gateway_url}",
+      "CATS_OBJECT_WRITE_GATEWAY_CA_FILE=${local.object_write_gateway_ca_file}",
     ],
   ))
 
@@ -42,6 +45,7 @@ locals {
       "CATS_POSTGRES_SCHEMA=${var.control_postgres_schema}",
       "CATS_ROUTE_V2_ROTATION_ORIGIN=${var.route_v2_rotation_origin}",
       "CATS_OBJECT_WRITE_GATEWAY_URL=${var.object_write_gateway_url}",
+      "CATS_OBJECT_WRITE_GATEWAY_CA_FILE=${local.object_write_gateway_ca_file}",
     ],
     var.database_master_user_secret_arn == null ? [] : [
       "CATS_POSTGRES_SECRET_ARN=${var.database_master_user_secret_arn}",
@@ -206,7 +210,7 @@ locals {
     # replay; conflicting bytes fail without a service mutation.
     route_v2_install_state="$(cats_classify_route_v2_node_r1 \
       "$stage_path/cats-route-v2-node-r1-validator" \
-      "$route_v2_stage" /etc/cats/route-v2)"
+      "$route_v2_stage" "${local.route_v2_install_root}")"
     case "$route_v2_install_state" in absent|exact) ;; *) exit 1 ;; esac
 
     # Only after that classification may the installer query systemd. Before
@@ -224,7 +228,7 @@ locals {
     if [ "$route_v2_install_state" = absent ]; then
       cats_publish_route_v2_node_r1 \
         "$stage_path/cats-route-v2-node-r1-validator" \
-        "$route_v2_stage" /etc/cats/route-v2
+        "$route_v2_stage" "${local.route_v2_install_root}"
       cats_worker_deployment_crash_probe after-install-route-v2-artifacts
     fi
     install -D -m 0755 "$stage_path/install-guest-runtime-release.sh" "$release_installer"
