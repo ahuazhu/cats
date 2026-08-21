@@ -1137,6 +1137,10 @@ fn private_deployment_helper(template: &str, path: &Path, lock: &Path, uid: &str
             "CATS_WORKER_DEPLOYMENT_HELPER=/opt/cats/bin/worker-deployment-transaction",
             &format!("CATS_WORKER_DEPLOYMENT_HELPER={}", path.display()),
         )
+        .replace(
+            "install -d -o root -g root -m 0700",
+            &format!("install -d -o {uid} -g {gid} -m 0700"),
+        )
         .replace("'0:0:600:1'", &format!("'{uid}:{gid}:600:1'"));
     assert_ne!(transformed, template);
     std::fs::write(path, transformed).expect("write private deployment helper");
