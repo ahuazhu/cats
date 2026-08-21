@@ -466,10 +466,9 @@ remove_owned_container() {
   if [[ "$graceful" == true ]]; then
     cleanup_docker_cli capture 250 stop --time 20 "$id" || true
   fi
-  # `postgres:16` declares an anonymous data volume. Remove anonymous volumes
-  # with their already owner-verified immutable container ID; Docker preserves
-  # the explicitly named Cargo/target cache volumes mounted by the other two
-  # containers.
+  # Remove any image-declared anonymous volumes with the already owner-verified
+  # immutable container ID. Docker preserves the explicitly named Cargo/target
+  # cache volumes mounted by the other two containers.
   cleanup_docker_cli capture 50 rm --force --volumes "$id" || true
 }
 
@@ -624,10 +623,16 @@ main() {
   docker_create_cli network "$LINUX_NETWORK" capture 100 \
     network create --label "$LINUX_OWNER_LABEL" "$LINUX_NETWORK" \
     || return $?
+  # This compatibility gate exercises SQL and transaction semantics, not a
+  # PostgreSQL process/power-loss boundary. Keep its disposable data in memory
+  # and avoid Docker VM sync overhead. Native `quality.sh full` and CI retain
+  # PostgreSQL's default durability settings.
   LINUX_PG_INTENDED=true
   docker_create_cli container "$LINUX_PG" capture 300 \
     create --name "$LINUX_PG" --label "$LINUX_OWNER_LABEL" \
-    --network "$LINUX_NETWORK" -e POSTGRES_PASSWORD=cats postgres:16 || return $?
+    --tmpfs /var/lib/postgresql/data:rw,noexec,nosuid,size=2g \
+    --network "$LINUX_NETWORK" -e POSTGRES_PASSWORD=cats postgres:16 \
+    -c fsync=off -c synchronous_commit=off -c full_page_writes=off || return $?
   docker_cli capture 300 start "$LINUX_PG" || return $?
 
   # The workspace-wide gate remains unprivileged.
@@ -659,21 +664,25 @@ main() {
            run_linux_stage() {
              stage_name="$1"
              shift
+             stage_started_at="$(date +%s)"
              if "$@"; then
                if [ "$stage_name" = build ]; then
                  linux_build_ready=true
                fi
-               echo "==> Linux quality stage passed: $stage_name"
+               stage_finished_at="$(date +%s)"
+               stage_elapsed_seconds=$((stage_finished_at - stage_started_at))
+               echo "==> Linux quality stage passed: $stage_name (${stage_elapsed_seconds}s)"
              else
                stage_status=$?
+               stage_finished_at="$(date +%s)"
+               stage_elapsed_seconds=$((stage_finished_at - stage_started_at))
                linux_status=1
                linux_failures="$linux_failures $stage_name(exit=$stage_status)"
-               echo "==> Linux quality stage failed: $stage_name (exit $stage_status)" >&2
+               echo "==> Linux quality stage failed: $stage_name (exit $stage_status, ${stage_elapsed_seconds}s)" >&2
              fi
            }
            run_linux_stage skills ./scripts/quality.sh skills
            run_linux_stage fmt cargo fmt --all -- --check
-           run_linux_stage check cargo check --workspace --all-targets --locked --keep-going --target-dir "$CATS_LINUX_TARGET_DIRECTORY"
            run_linux_stage build cargo build --workspace --locked --keep-going --target-dir "$CATS_LINUX_TARGET_DIRECTORY"
            run_linux_stage clippy cargo clippy --workspace --all-targets --locked --target-dir "$CATS_LINUX_TARGET_DIRECTORY" -- -D warnings
            run_linux_stage tests cargo test --workspace --locked --no-fail-fast --target-dir "$CATS_LINUX_TARGET_DIRECTORY" -- --test-threads=4

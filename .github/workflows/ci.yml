@@ -70,9 +70,6 @@ jobs:
       - name: Formatting
         run: ./scripts/quality.sh fmt
 
-      - name: Check
-        run: ./scripts/quality.sh check
-
       # `cargo build` must come first: some integration tests shell out to
       # `cargo build` for helper binaries and would otherwise deadlock on the
       # build-directory lock (AGENTS.md).

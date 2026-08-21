@@ -301,13 +301,17 @@ run_collected_stage() {
   local label="$1"
   local runner="$2"
   local stage_status=0
+  local stage_started_at="$SECONDS"
+  local elapsed_seconds
 
   if "$runner"; then
-    echo "==> quality stage passed: $label"
+    elapsed_seconds=$((SECONDS - stage_started_at))
+    echo "==> quality stage passed: $label (${elapsed_seconds}s)"
   else
     stage_status=$?
+    elapsed_seconds=$((SECONDS - stage_started_at))
     QUALITY_FAILURES+=("$label (exit $stage_status)")
-    echo "==> quality stage failed: $label (exit $stage_status)" >&2
+    echo "==> quality stage failed: $label (exit $stage_status, ${elapsed_seconds}s)" >&2
   fi
 
   # A failed stage is recorded rather than returned so later independent
@@ -349,7 +353,6 @@ run_fast() {
     fmt run_fmt \
     skills run_skills \
     release-images run_release_images \
-    check run_check \
     clippy run_clippy
 }
 
@@ -359,7 +362,6 @@ run_full() {
     skills run_skills \
     release-images run_release_images \
     dependencies run_deps \
-    check run_check \
     build run_build \
     clippy run_clippy \
     tests run_test \

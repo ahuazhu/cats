@@ -1365,9 +1365,11 @@ fn assert_active_release(cats_root: &Path, expected: &Path) {
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-fn every_guest_release_durability_boundary_recovers_to_one_complete_set() {
+fn run_guest_release_durability_boundary_shard(shard_index: usize, shard_count: usize) {
     use std::os::unix::fs::PermissionsExt as _;
+
+    assert!(shard_count > 0);
+    assert!(shard_index < shard_count);
 
     let fixture = tempfile::tempdir().expect("release crash fixture");
     let old = fixture.path().join("old");
@@ -1465,6 +1467,9 @@ fn every_guest_release_durability_boundary_recovers_to_one_complete_set() {
     );
 
     for kill_at in 1..=boundary_count {
+        if (kill_at - 1) % shard_count != shard_index {
+            continue;
+        }
         let case = fixture.path().join(format!("case-{kill_at}"));
         std::fs::create_dir(&case).unwrap();
         let installer = case.join("installer");
@@ -1570,6 +1575,10 @@ fn every_guest_release_durability_boundary_recovers_to_one_complete_set() {
         assert!(!cats_root.join("releases/activation.v1").exists());
     }
 
+    if shard_index != 0 {
+        return;
+    }
+
     // Exercise the exact retry window that matters for journal replacement.
     // The first interruption leaves a durable new->old activation journal.
     // The retry recovers the old release, persists the complete candidate, and
@@ -1645,6 +1654,30 @@ fn every_guest_release_durability_boundary_recovers_to_one_complete_set() {
         .status
         .success());
     assert_active_release(&cats_root, &new);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn every_guest_release_durability_boundary_recovers_to_one_complete_set_shard_1_of_4() {
+    run_guest_release_durability_boundary_shard(0, 4);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn every_guest_release_durability_boundary_recovers_to_one_complete_set_shard_2_of_4() {
+    run_guest_release_durability_boundary_shard(1, 4);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn every_guest_release_durability_boundary_recovers_to_one_complete_set_shard_3_of_4() {
+    run_guest_release_durability_boundary_shard(2, 4);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn every_guest_release_durability_boundary_recovers_to_one_complete_set_shard_4_of_4() {
+    run_guest_release_durability_boundary_shard(3, 4);
 }
 
 #[cfg(target_os = "linux")]

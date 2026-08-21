@@ -1476,10 +1476,40 @@ fn linux_quality_gate_installs_the_postgres_probe_runtime() {
         linux_gate
             .matches("--target-dir \"$CATS_LINUX_TARGET_DIRECTORY\"")
             .count(),
-        5,
-        "check, build, Clippy, tests and rustdoc must share the isolated target root"
+        4,
+        "build, Clippy, tests and rustdoc must share the isolated target root"
     );
     assert!(!linux_gate.contains("--target-dir /target"));
+}
+
+#[test]
+fn linux_quality_gate_uses_disposable_postgres_without_weakening_other_gates() {
+    let quality = read_workspace_file("scripts/quality.sh");
+    let linux_gate = read_workspace_file("scripts/linux-gate.sh");
+    let ci = read_workspace_file(".github/workflows/ci.yml");
+
+    assert!(
+        linux_gate.contains("--tmpfs /var/lib/postgresql/data:rw,noexec,nosuid,size=2g"),
+        "the Docker Linux compatibility gate should keep disposable PostgreSQL I/O in memory"
+    );
+    for setting in [
+        "-c fsync=off",
+        "-c synchronous_commit=off",
+        "-c full_page_writes=off",
+    ] {
+        assert!(
+            linux_gate.contains(setting),
+            "the disposable Linux PostgreSQL fixture lost {setting:?}"
+        );
+        assert!(
+            !quality.contains(setting),
+            "the native full gate must retain PostgreSQL's default durability settings"
+        );
+        assert!(
+            !ci.contains(setting),
+            "CI must retain PostgreSQL's default durability settings"
+        );
+    }
 }
 
 #[test]
@@ -1963,7 +1993,8 @@ case "${1:-} ${2:-}" in
       : >"$state/idempotent-name-reserved"
       exit 125
     fi
-    if [[ "$name" == cats-linux-pg-* ]]; then
+    if [[ "$name" == cats-linux-pg-* \
+      && " $* " != *" --tmpfs /var/lib/postgresql/data:"* ]]; then
       : >"$state/anonymous-volume.$name"
       : >"$state/anonymous-volume-created.$name"
     fi
@@ -2313,12 +2344,12 @@ fn linux_quality_gate_retries_response_loss_until_exact_owned_create_is_observab
         );
     }
     assert!(
-        state
+        !state
             .join(format!(
                 "anonymous-volume-created.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"
             ))
             .exists(),
-        "the response-loss regression did not model postgres:16's anonymous data volume"
+        "the PostgreSQL tmpfs should override postgres:16's anonymous data volume"
     );
 
     let trace = std::fs::read_to_string(state.join("trace")).expect("fake Docker trace");
@@ -2886,9 +2917,20 @@ printf 'args=%s\n' "$*" >> "$CATS_QUALITY_CAPTURE"
 }
 
 #[test]
-fn quality_gates_collect_all_independent_stage_failures() {
+fn quality_gates_collect_all_nonredundant_stage_failures() {
     let quality = read_workspace_file("scripts/quality.sh");
     let linux = read_workspace_file("scripts/linux-gate.sh");
+
+    let fast = quality
+        .split_once("run_fast() {")
+        .and_then(|(_, rest)| rest.split_once("\n}"))
+        .map(|(body, _)| body)
+        .expect("fast quality gate");
+    let full = quality
+        .split_once("run_full() {")
+        .and_then(|(_, rest)| rest.split_once("\n}"))
+        .map(|(body, _)| body)
+        .expect("full quality gate");
 
     assert!(quality.contains("run_collected_gates \\\n"));
     for stage in [
@@ -2896,7 +2938,6 @@ fn quality_gates_collect_all_independent_stage_failures() {
         "skills run_skills",
         "release-images run_release_images",
         "dependencies run_deps",
-        "check run_check",
         "build run_build",
         "clippy run_clippy",
         "tests run_test",
@@ -2910,11 +2951,17 @@ fn quality_gates_collect_all_independent_stage_failures() {
     assert!(quality.contains("QUALITY_FAILURES+=("));
     assert!(quality.contains("quality stage failures"));
     assert!(quality.contains("cargo test --workspace --locked --no-fail-fast"));
+    assert!(quality.contains("check) run_check ;;"));
+    assert!(!fast.contains("check run_check"));
+    assert!(!full.contains("check run_check"));
+    assert!(quality.contains("quality stage passed: $label (${elapsed_seconds}s)"));
 
-    assert!(linux.contains("run_linux_stage check cargo check"));
+    assert!(!linux.contains("run_linux_stage check cargo check"));
+    assert!(linux.contains("cargo clippy --workspace --all-targets"));
     assert!(linux.contains("--locked --keep-going --target-dir"));
     assert!(linux.contains("run_linux_stage tests cargo test"));
     assert!(linux.contains("--locked --no-fail-fast --target-dir"));
+    assert!(linux.contains("Linux quality stage passed: $stage_name (${stage_elapsed_seconds}s)"));
     assert!(linux.contains("Linux quality stage failures:"));
     assert!(linux.contains("collect_gate_failure workspace"));
     assert!(linux.contains("collect_gate_failure root-control-inventory"));
