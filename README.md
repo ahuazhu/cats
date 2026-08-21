@@ -85,8 +85,8 @@ Linux bare metal，见 [deploy/metal/README.md](deploy/metal/README.md)。AWS部
 ## 质量门
 
 ```bash
-./scripts/quality.sh fast   # 迭代：format/build/clippy/主要测试
-./scripts/quality.sh full   # handoff：依赖策略、workspace测试、rustdoc等完整门
+./scripts/quality.sh fast   # 迭代：format、静态契约和workspace/all-targets Clippy
+./scripts/quality.sh full   # handoff：依赖策略、build、workspace测试、rustdoc等完整门
 ./scripts/quality.sh linux  # 无native Linux host时的Docker兼容门
 ```
 

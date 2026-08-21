@@ -392,13 +392,14 @@ Pending until EKS Auto Mode supplies another eligible node, rather than
 silently co-locating both replicas; singleton loops elect independently through
 PostgreSQL.
 
-### Automatic main deployment
+### Manual main deployment
 
-`Deploy production` starts after the `CI` workflow succeeds for a `main`
-commit. It builds and pushes separate control-plane and Gateway images, pins
-both registry digests, creates a saved application plan, applies that exact
-plan and verifies each Deployment against its own immutable image reference. A
-failed build, plan, apply or rollout records a failed GitHub deployment.
+An operator starts `Deploy production` explicitly from a `main` commit after
+the required repository and native Linux gates have passed. The workflow
+builds and pushes separate control-plane and Gateway images, pins both registry
+digests, creates a saved application plan, applies that exact plan and verifies
+each Deployment against its own immutable image reference. A failed build,
+plan, apply or rollout records a failed GitHub deployment.
 
 That workflow updates the Terraform-managed Control and Gateway applications;
 its green result is not the missing production-public-spawn PostgreSQL/Linux
@@ -515,8 +516,8 @@ Never use dual writers during the cutover.
 
 ## Local checks
 
-These checks do not contact or mutate AWS/EKS, and the `terraform` job in
-`.github/workflows/ci.yml` runs the same set on every pull request:
+These checks do not contact or mutate AWS/EKS. Run them locally before handing
+off a Terraform change:
 
 ```sh
 terraform fmt -check -recursive deploy/aws/terraform

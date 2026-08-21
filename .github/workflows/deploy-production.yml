@@ -1,13 +1,8 @@
 name: Deploy production
 
-# A main deployment starts only after the CI workflow for that exact main SHA
-# succeeds. workflow_dispatch is a break-glass retry and is accepted only from
-# main. The AWS role's OIDC subject is also pinned to refs/heads/main.
+# Production deployment is an explicit operator action accepted only from main.
+# The AWS role's OIDC subject is also pinned to refs/heads/main.
 on:
-  workflow_run:
-    workflows: ["CI"]
-    types: [completed]
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -29,18 +24,11 @@ env:
 jobs:
   deploy:
     name: Build image and deploy
-    if: >-
-      (github.event_name == 'workflow_run' &&
-       github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.head_branch == 'main' &&
-       github.event.workflow_run.head_repository.full_name == github.repository) ||
-      (github.event_name == 'workflow_dispatch' &&
-       github.ref == 'refs/heads/main')
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
-      RELEASE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+      RELEASE_SHA: ${{ github.sha }}
       TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
       TF_STATE_APPLICATION_KEY: ${{ vars.TF_STATE_APPLICATION_KEY }}
       EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
@@ -496,7 +484,7 @@ jobs:
                 environment: "production",
                 auto_merge: false,
                 required_contexts: [],
-                description: "Terraform deployment after successful main CI"
+                description: "Manually approved Terraform production deployment"
               }' \
               | gh api \
                   --method POST \
