@@ -821,6 +821,164 @@ fn poll_authenticates_current_session_and_renews_lease_without_observation() {
 }
 
 #[test]
+fn corrupt_sibling_operation_does_not_block_healthy_cat_poll_or_settlement() {
+    let store = test_store();
+    let workspace = workspace_id(&store, "lifecycle-poll-corrupt-sibling");
+    let node = id("node-lifecycle-poll-corrupt-sibling");
+    let corrupt_cat = id("cat-a-lifecycle-poll-corrupt-sibling");
+    let healthy_cat = id("cat-b-lifecycle-poll-corrupt-sibling");
+    let corrupt_creation = id("creation-cat-a-lifecycle-poll-corrupt-sibling");
+    let healthy_creation = id("creation-cat-b-lifecycle-poll-corrupt-sibling");
+    let corrupt_config = seed_cat(&store, &workspace, &corrupt_cat, &corrupt_creation);
+    let healthy_config = seed_cat(&store, &workspace, &healthy_cat, &healthy_creation);
+    let corrupt_command = genesis_start(
+        &workspace,
+        &node,
+        &corrupt_cat,
+        &corrupt_creation,
+        "operation-a-lifecycle-poll-corrupt-sibling",
+        &corrupt_config,
+    );
+    let healthy_command = genesis_start(
+        &workspace,
+        &node,
+        &healthy_cat,
+        &healthy_creation,
+        "operation-b-lifecycle-poll-corrupt-sibling",
+        &healthy_config,
+    );
+    for command in [&corrupt_command, &healthy_command] {
+        assert!(matches!(
+            store.admit_lifecycle_command(&workspace, command).unwrap(),
+            LifecycleCommandAdmission::Admitted(_)
+        ));
+    }
+
+    let malformed_request = b"{}".to_vec();
+    store
+        .with(|client| {
+            client.batch_execute("ALTER TABLE runtime_operations DISABLE TRIGGER USER")?;
+            let update = client.execute(
+                "UPDATE runtime_operations
+                    SET canonical_request_bytes=$2
+                  WHERE operation_id=$1",
+                &[&corrupt_command.operation_id.as_str(), &malformed_request],
+            );
+            let enable = client.batch_execute("ALTER TABLE runtime_operations ENABLE TRIGGER USER");
+            update?;
+            enable?;
+            Ok(())
+        })
+        .unwrap();
+
+    let (authenticated, session) = register_node(&store, &node);
+    let poll = LifecycleCommandPollRequest {
+        version: ContractVersion::V1,
+        session: session_binding(&session),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    let LifecycleCommandPollOutcome::Batch(batch) = store
+        .poll_lifecycle_commands(&authenticated, &poll)
+        .unwrap()
+    else {
+        panic!("current session poll rejected")
+    };
+    assert_eq!(batch.commands, vec![healthy_command.clone()]);
+
+    let slot = &healthy_config.volumes[0];
+    let attachment_id = id("attachment-b-lifecycle-poll-corrupt-sibling");
+    let (acquire, grant_digest) = acquire_genesis_start_volume(
+        &store,
+        &authenticated,
+        &session,
+        &healthy_command,
+        &healthy_config,
+        attachment_id.clone(),
+    );
+    let runtime_incarnation = random(91);
+    let response = cats_api::runtime_lifecycle::LifecycleCommandResponse::new(
+        &healthy_command,
+        NodeResult::RuntimeReady(Box::new(RuntimeReadyResult {
+            runtime_incarnation: runtime_incarnation.clone(),
+            runtime_config_digest: healthy_config.config_digest.clone(),
+            execution_receipt_digest: digest(92),
+            guest_ready_receipt_digest: digest(93),
+            volume_receipts: vec![VolumeTerminalReceipt {
+                volume_id: slot.volume_id.clone(),
+                disk_id: slot.disk_id.clone(),
+                disk_role: slot.disk_role,
+                attachment_id,
+                attachment_epoch: acquire.resulting_epoch,
+                local_durable_generation: acquire.resulting_head.generation,
+                remote_durable_generation: acquire.resulting_head.generation,
+                authority_receipt_digest: Some(grant_digest),
+            }],
+        })),
+    )
+    .unwrap();
+    let commit =
+        cats_api::runtime_lifecycle::LifecycleResultCommitRequest::new(&session, response).unwrap();
+    assert!(matches!(
+        store
+            .commit_lifecycle_result(&authenticated, &commit)
+            .unwrap(),
+        LifecycleResultCommitOutcome::Stored { .. }
+    ));
+
+    store
+        .with(|client| {
+            let corrupt = client.query_one(
+                "SELECT state, canonical_request_bytes
+                   FROM runtime_operations WHERE operation_id=$1",
+                &[&corrupt_command.operation_id.as_str()],
+            )?;
+            assert_eq!(corrupt.get::<_, String>(0), "unresolved");
+            assert_eq!(corrupt.get::<_, Vec<u8>>(1), malformed_request);
+            let healthy_state: String = client
+                .query_one(
+                    "SELECT state FROM runtime_operations WHERE operation_id=$1",
+                    &[&healthy_command.operation_id.as_str()],
+                )?
+                .get(0);
+            assert_eq!(healthy_state, "terminal");
+            let corrupt_projection = client.query_one(
+                "SELECT lifecycle_head_operation_id, stable_state,
+                        effective_runtime_ready_operation_id, runtime_incarnation
+                   FROM cat_records WHERE cat_id=$1",
+                &[&corrupt_cat.as_str()],
+            )?;
+            assert_eq!(corrupt_projection.get::<_, Option<String>>(0), None);
+            assert_eq!(corrupt_projection.get::<_, Option<String>>(1), None);
+            assert_eq!(corrupt_projection.get::<_, Option<String>>(2), None);
+            assert_eq!(corrupt_projection.get::<_, Option<String>>(3), None);
+            let healthy_projection = client.query_one(
+                "SELECT lifecycle_head_operation_id, stable_state,
+                        effective_runtime_ready_operation_id, runtime_incarnation
+                   FROM cat_records WHERE cat_id=$1",
+                &[&healthy_cat.as_str()],
+            )?;
+            assert_eq!(
+                healthy_projection.get::<_, Option<String>>(0).as_deref(),
+                Some(healthy_command.operation_id.as_str())
+            );
+            assert_eq!(
+                healthy_projection.get::<_, Option<String>>(1).as_deref(),
+                Some("running")
+            );
+            assert_eq!(
+                healthy_projection.get::<_, Option<String>>(2).as_deref(),
+                Some(healthy_command.operation_id.as_str())
+            );
+            assert_eq!(
+                healthy_projection.get::<_, Option<String>>(3).as_deref(),
+                Some(runtime_incarnation.as_str())
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
 fn terminal_result_is_immutable_and_replacement_agent_replays_same_bytes() {
     let store = test_store();
     let workspace = workspace_id(&store, "lifecycle-result");

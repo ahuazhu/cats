@@ -922,19 +922,32 @@ fn poll_lifecycle_commands_in(
     let limit = i64::try_from(cats_api::runtime_lifecycle::LIFECYCLE_COMMAND_BATCH_MAX_COMMANDS)
         .expect("command batch limit fits PostgreSQL BIGINT");
     let rows = transaction.query(&sql, &[&session.node_id.as_str(), &limit])?;
-    let operations = rows
-        .iter()
-        .map(decode_operation_row)
-        .collect::<AuthorityTxResult<Vec<_>>>()?;
-    let commands = operations
-        .into_iter()
-        .map(|operation| {
-            if !matches!(operation.state, LifecycleOperationState::Unresolved) {
-                return Err(corrupt("unresolved command query returned terminal row"));
+    let mut commands = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let operation = match decode_operation_row(row) {
+            Ok(operation) => operation,
+            Err(error) => {
+                // One corrupt Cat remains unresolved and receives no effect
+                // authority, but it must not turn the Node delivery lane into
+                // a second cross-Cat lifecycle authority.  Do not repair or
+                // reinterpret the row here; omit only that Cat and surface
+                // the durable corruption for operator intervention.
+                let cat_id = row
+                    .try_get::<_, String>("cat_id")
+                    .unwrap_or_else(|_| "<invalid-cat-id>".to_owned());
+                tracing::error!(
+                    cat_id,
+                    error = ?error,
+                    "omitting corrupt per-Cat lifecycle Operation from command poll"
+                );
+                continue;
             }
-            Ok(*operation.canonical_request)
-        })
-        .collect::<AuthorityTxResult<Vec<_>>>()?;
+        };
+        if !matches!(operation.state, LifecycleOperationState::Unresolved) {
+            return Err(corrupt("unresolved command query returned terminal row"));
+        }
+        commands.push(*operation.canonical_request);
+    }
     let batch = LifecycleCommandBatch {
         version: ContractVersion::V1,
         session: poll.session.clone(),
