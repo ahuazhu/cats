@@ -122,6 +122,28 @@ def run(command: list[str], description: str) -> subprocess.CompletedProcess[byt
     return result
 
 
+def run_authority_replay(
+    command: list[str], description: str, timeout_seconds: int
+) -> subprocess.CompletedProcess[bytes]:
+    deadline = time.monotonic() + timeout_seconds
+    pending_marker = "was not terminal; retry the same command to replay apply"
+    while True:
+        try:
+            result = subprocess.run(command, check=False, capture_output=True)
+        except OSError as error:
+            raise ProvisionError(f"cannot run {description}: {error}") from error
+        if result.returncode == 0:
+            return result
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        if pending_marker not in detail:
+            raise ProvisionError(f"{description} failed: {detail[-4000:]}")
+        if time.monotonic() >= deadline:
+            raise ProvisionError(
+                f"{description} remained non-terminal for {timeout_seconds} seconds"
+            )
+        time.sleep(1)
+
+
 class SsmRunner:
     def __init__(self, region: str, timeout_seconds: int) -> None:
         self.region = region
@@ -342,6 +364,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--nodes", required=True, type=Path)
     parser.add_argument("--cats-cli", required=True, type=Path)
     parser.add_argument("--cats-cli-sha256", required=True)
+    parser.add_argument("--operator-cats-cli", type=Path)
+    parser.add_argument("--operator-cats-cli-sha256")
     parser.add_argument("--worker-bundle-s3-uri", required=True)
     parser.add_argument("--worker-bundle-sha256", required=True)
     parser.add_argument("--api-url", required=True)
@@ -350,7 +374,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--provisioner-private-key-file", required=True, type=Path)
     parser.add_argument("--evidence-dir", required=True, type=Path)
     parser.add_argument("--aws-region", required=True)
-    parser.add_argument("--ssm-timeout-seconds", type=int, default=600)
+    parser.add_argument("--authority-timeout-seconds", type=int, default=15)
+    parser.add_argument("--ssm-timeout-seconds", type=int, default=60)
     return parser.parse_args(argv)
 
 
@@ -371,14 +396,39 @@ def main(argv: list[str]) -> int:
         args.provisioner_credential_id, "provisioner credential ID"
     )
     checked_component(args.aws_region, "AWS region")
-    if args.ssm_timeout_seconds <= 0:
-        raise ProvisionError("--ssm-timeout-seconds must be positive")
+    if not 1 <= args.ssm_timeout_seconds <= 60:
+        raise ProvisionError("--ssm-timeout-seconds must be between 1 and 60")
+    if not 1 <= args.authority_timeout_seconds <= 60:
+        raise ProvisionError("--authority-timeout-seconds must be between 1 and 60")
+
+    if (args.operator_cats_cli is None) != (
+        args.operator_cats_cli_sha256 is None
+    ):
+        raise ProvisionError(
+            "--operator-cats-cli and --operator-cats-cli-sha256 must be supplied together"
+        )
+    if (
+        args.operator_cats_cli_sha256 is not None
+        and DIGEST_RE.fullmatch(args.operator_cats_cli_sha256) is None
+    ):
+        raise ProvisionError(
+            "operator Cats CLI SHA-256 must be 64 lowercase hex characters"
+        )
 
     cats_cli = read_bytes(args.cats_cli, "Cats CLI")
     if sha256(cats_cli) != args.cats_cli_sha256:
         raise ProvisionError("Cats CLI digest does not match --cats-cli-sha256")
     if not os.access(args.cats_cli, os.X_OK):
         raise ProvisionError("Cats CLI is not executable")
+    operator_cats_cli = args.operator_cats_cli or args.cats_cli
+    if args.operator_cats_cli is not None:
+        operator_cli = read_bytes(args.operator_cats_cli, "operator Cats CLI")
+        if sha256(operator_cli) != args.operator_cats_cli_sha256:
+            raise ProvisionError(
+                "operator Cats CLI digest does not match --operator-cats-cli-sha256"
+            )
+        if not os.access(args.operator_cats_cli, os.X_OK):
+            raise ProvisionError("operator Cats CLI is not executable")
     require_private_key(args.provisioner_private_key_file)
     nodes = load_nodes(args.nodes)
 
@@ -423,9 +473,9 @@ def main(argv: list[str]) -> int:
         identity_path = args.evidence_dir / f"{node_id}-node-identity.v1.json"
         write_exact(identity_path, identity_raw)
 
-        provisioned = run(
+        provisioned = run_authority_replay(
             [
-                str(args.cats_cli),
+                str(operator_cats_cli),
                 "--api-url",
                 args.api_url,
                 "--json",
@@ -444,6 +494,7 @@ def main(argv: list[str]) -> int:
                 node["policy_file"],
             ],
             f"provision Node authority {node_id}",
+            args.authority_timeout_seconds,
         ).stdout
         try:
             result = json.loads(provisioned)

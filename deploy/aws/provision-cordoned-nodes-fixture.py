@@ -98,6 +98,7 @@ else:
 
 FAKE_CATS = r'''#!/usr/bin/env python3
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -105,6 +106,15 @@ args = sys.argv[1:]
 if "provision" not in args:
     raise SystemExit("unexpected fake cats command")
 identity = json.loads(Path(args[args.index("--identity") + 1]).read_text())
+pending = Path(os.environ["FAKE_AWS_STATE"]) / f"{identity['node_id']}.authority-pending"
+if not pending.exists():
+    pending.write_text("pending")
+    print(
+        "error: Runtime Node authority response was not terminal; retry the same "
+        "command to replay apply fixture (pending fixture)",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
 result = {
     "apply_id": "apply-" + identity["node_id"],
     "identity_state": "provisioned",
@@ -127,6 +137,7 @@ def invoke(
     state = root / "aws-state"
     evidence = root / "evidence"
     cats = fake_bin / "cats"
+    operator_cats = fake_bin / "operator-cats"
     env = os.environ.copy()
     env["PATH"] = f"{fake_bin}:{env['PATH']}"
     env["FAKE_AWS_STATE"] = str(state)
@@ -141,6 +152,10 @@ def invoke(
         str(cats),
         "--cats-cli-sha256",
         hashlib.sha256(cats.read_bytes()).hexdigest(),
+        "--operator-cats-cli",
+        str(operator_cats),
+        "--operator-cats-cli-sha256",
+        hashlib.sha256(operator_cats.read_bytes()).hexdigest(),
         "--worker-bundle-s3-uri",
         "s3://fixture-bucket/worker/release/cats-worker.tar.zst",
         "--worker-bundle-sha256",
@@ -168,6 +183,7 @@ def make_fixture(root: Path) -> None:
     fake_bin.mkdir()
     write(fake_bin / "aws", FAKE_AWS.encode(), 0o755)
     write(fake_bin / "cats", FAKE_CATS.encode(), 0o755)
+    write(fake_bin / "operator-cats", FAKE_CATS.encode() + b"\n# operator build\n", 0o755)
     write(root / "provisioner.pem", b"fixture-private-key\n", 0o600)
 
     nodes = []
