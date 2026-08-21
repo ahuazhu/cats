@@ -645,8 +645,14 @@ impl Chain {
         let signer = credential.signer().clone();
         let reads = Arc::clone(&self.reads);
         tokio::task::spawn_blocking(move || {
-            ObjectWriteGatewayBlobStore::new(&origin, volume_id, signer, reads)?
-                .publish(&key, &body)
+            ObjectWriteGatewayBlobStore::new(
+                &origin,
+                volume_id,
+                signer,
+                reads,
+                cats_object_store_gateway::ObjectWriteGatewayServerTrust::PlaintextLoopback,
+            )?
+            .publish(&key, &body)
         })
         .await
         .expect("write adapter did not panic")

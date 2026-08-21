@@ -141,6 +141,7 @@ pub struct InstalledAtomicStartBlockdConfig {
 pub enum InstalledAtomicStartObjectWriteMode {
     Gateway {
         gateway_origin: String,
+        server_ca_bundle_file: PathBuf,
         control_plane_origin: String,
         registration: Arc<AgentRegistrationConfig>,
     },
@@ -330,6 +331,7 @@ enum PlannedObjectWriteMode {
         session: SessionBinding,
         gateway_origin: String,
         credential_directory: HostPath,
+        server_ca_bundle_file: HostPath,
         expected_credential_ids: Vec<Id>,
     },
     DirectProvider,
@@ -942,6 +944,7 @@ impl InstalledAtomicStartRuntimePort {
             match &config.object_write_mode {
                 InstalledAtomicStartObjectWriteMode::Gateway {
                     gateway_origin,
+                    server_ca_bundle_file,
                     control_plane_origin,
                     registration,
                 } => {
@@ -954,6 +957,7 @@ impl InstalledAtomicStartRuntimePort {
                     Some(Arc::new(
                         NodeObjectWriteCredentials::for_agent_registration(
                             gateway_origin,
+                            server_ca_bundle_file,
                             control_plane_origin,
                             registration,
                         )?,
@@ -1580,12 +1584,20 @@ fn validate_production_config(config: &InstalledAtomicStartRuntimeConfig) -> Res
     match &config.object_write_mode {
         InstalledAtomicStartObjectWriteMode::Gateway {
             gateway_origin,
+            server_ca_bundle_file,
             control_plane_origin,
             ..
-        } => anyhow::ensure!(
-            gateway_origin.starts_with("https://") && control_plane_origin.starts_with("https://"),
-            "atomic Start Gateway mode requires HTTPS origins"
-        ),
+        } => {
+            anyhow::ensure!(
+                gateway_origin.starts_with("https://")
+                    && control_plane_origin.starts_with("https://"),
+                "atomic Start Gateway mode requires HTTPS origins"
+            );
+            anyhow::ensure!(
+                server_ca_bundle_file.is_absolute(),
+                "atomic Start Gateway server CA bundle path must be absolute"
+            );
+        }
         InstalledAtomicStartObjectWriteMode::DirectProvider => anyhow::ensure!(
             config.blockd.object_store.name == "file",
             "DirectProvider is closed to the installed file adapter; remote providers require Gateway credentials"
@@ -2662,6 +2674,8 @@ impl InstalledAtomicStartRuntimePort {
                     "object-write AgentSession belongs to another Node"
                 );
                 let directory = host_path(credentials.credential_directory())?;
+                let server_ca_bundle_file =
+                    host_path(credentials.server_ca_bundle_file().to_path_buf())?;
                 let expected_credential_ids = context
                     .volume_grants
                     .iter()
@@ -2678,6 +2692,7 @@ impl InstalledAtomicStartRuntimePort {
                     session,
                     gateway_origin: credentials.gateway_origin().to_owned(),
                     credential_directory: directory,
+                    server_ca_bundle_file,
                     expected_credential_ids,
                 })
             }
@@ -8062,19 +8077,7 @@ fn serving_blockd_arguments(
         "--object-store-option",
         &blockd.object_store_options,
     );
-    if let PlannedObjectWriteMode::Gateway {
-        gateway_origin,
-        credential_directory,
-        ..
-    } = object_write
-    {
-        arguments.extend([
-            "--object-write-gateway-url".into(),
-            gateway_origin.as_str().into(),
-            "--object-write-credential-directory".into(),
-            credential_directory.as_str().into(),
-        ]);
-    }
+    append_object_write_arguments(&mut arguments, object_write);
     Ok(arguments)
 }
 
@@ -8448,9 +8451,18 @@ fn root_blockd_arguments(
         "--object-store-option",
         &blockd.object_store_options,
     );
+    append_object_write_arguments(&mut arguments, object_write);
+    Ok(arguments)
+}
+
+fn append_object_write_arguments(
+    arguments: &mut Vec<std::ffi::OsString>,
+    object_write: &PlannedObjectWriteMode,
+) {
     if let PlannedObjectWriteMode::Gateway {
         gateway_origin,
         credential_directory,
+        server_ca_bundle_file,
         ..
     } = object_write
     {
@@ -8459,9 +8471,10 @@ fn root_blockd_arguments(
             gateway_origin.as_str().into(),
             "--object-write-credential-directory".into(),
             credential_directory.as_str().into(),
+            "--object-write-gateway-ca-file".into(),
+            server_ca_bundle_file.as_str().into(),
         ]);
     }
-    Ok(arguments)
 }
 
 fn append_adapter_options(arguments: &mut Vec<std::ffi::OsString>, flag: &str, options: &[String]) {
@@ -9243,6 +9256,10 @@ mod tests {
             session: original.clone(),
             gateway_origin: "http://127.0.0.1:9000".to_owned(),
             credential_directory: HostPath::new("/run/cats/object-write".to_owned()).unwrap(),
+            server_ca_bundle_file: HostPath::new(
+                "/etc/cats/route-v2/node-server-ca-bundle.pem".to_owned(),
+            )
+            .unwrap(),
             expected_credential_ids: vec![id("credential_a")],
         };
         assert!(object_write_session_is_current(
@@ -9258,6 +9275,20 @@ mod tests {
             &original,
             &replacement,
         ));
+        let mut arguments = Vec::new();
+        append_object_write_arguments(&mut arguments, &gateway);
+        assert_eq!(
+            arguments,
+            [
+                "--object-write-gateway-url",
+                "http://127.0.0.1:9000",
+                "--object-write-credential-directory",
+                "/run/cats/object-write",
+                "--object-write-gateway-ca-file",
+                "/etc/cats/route-v2/node-server-ca-bundle.pem",
+            ]
+            .map(std::ffi::OsString::from)
+        );
         assert!(object_write_session_is_current(
             &PlannedObjectWriteMode::DirectProvider,
             &replacement,

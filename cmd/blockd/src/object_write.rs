@@ -41,7 +41,7 @@ use cats_api::object_write_gateway::{
     object_write_registered_artifact_file_name, ObjectWriteCredentialReference,
     OBJECT_WRITE_CREDENTIAL_DIRECTORY_BASENAME, OBJECT_WRITE_REGISTERED_ARTIFACT_MAX_BYTES,
 };
-use cats_object_store_gateway::ObjectWriteGatewayBlobStore;
+use cats_object_store_gateway::{ObjectWriteGatewayBlobStore, ObjectWriteGatewayServerTrust};
 use cats_storage::authority::AuthorizedServingAttachment;
 use cats_storage::blob::BlobStore;
 
@@ -63,6 +63,7 @@ const CREDENTIAL_FILE_MODE: u32 = 0o600;
 pub(crate) fn gateway_publish_store(
     gateway_url: Option<&str>,
     credential_directory: Option<&Path>,
+    server_ca_bundle_file: Option<&Path>,
     attachment: &AuthorizedServingAttachment,
     reads: &Arc<dyn BlobStore>,
 ) -> Result<Option<ObjectWriteGatewayBlobStore>> {
@@ -86,11 +87,24 @@ pub(crate) fn gateway_publish_store(
         )
     })?;
     let signer = load_attachment_signer(directory, attachment, reference)?;
+    let bundle_file = server_ca_bundle_file.with_context(|| {
+        format!(
+            "attachment {attachment_id} binds object-write credential {credential_id}, so \
+             --object-write-gateway-ca-file is required to authenticate the Gateway"
+        )
+    })?;
+    let bundle = std::fs::read(bundle_file).with_context(|| {
+        format!(
+            "read the ObjectWrite Gateway server CA bundle {}",
+            bundle_file.display()
+        )
+    })?;
     let store = ObjectWriteGatewayBlobStore::new(
         gateway_url,
         attachment.identity.volume_id.clone(),
         signer,
         Arc::clone(reads),
+        ObjectWriteGatewayServerTrust::Roots(&bundle),
     )
     .with_context(|| {
         format!("bind object-write credential {credential_id} to the ObjectWrite Gateway")
@@ -387,6 +401,17 @@ mod tests {
     use super::*;
 
     const GATEWAY_URL: &str = "https://object-write-gateway.invalid:8443";
+    const TEST_ROOT_PEM: &str = "\
+-----BEGIN CERTIFICATE-----\n\
+MIIBYzCCARWgAwIBAgIULICwc/RLnF4bSmGzzr94Ux2eOTIwBQYDK2VwMCYxJDAi\n\
+BgNVBAMMG0NhdHMgb2JqZWN0LXdyaXRlIHRlc3Qgcm9vdDAgFw0yNjA4MTgxMTAx\n\
+NTZaGA8yMTI2MDcyNTExMDE1NlowJjEkMCIGA1UEAwwbQ2F0cyBvYmplY3Qtd3Jp\n\
+dGUgdGVzdCByb290MCowBQYDK2VwAyEA1NilIB8rScb67W7/kKsQ7WB/zvZaT1BG\n\
+f2zFVOq+kZOjUzBRMB0GA1UdDgQWBBQkQswCbzxcDl5pz/rGPiUdFSpISDAfBgNV\n\
+HSMEGDAWgBQkQswCbzxcDl5pz/rGPiUdFSpISDAPBgNVHRMBAf8EBTADAQH/MAUG\n\
+AytlcANBAD1/4EhOQ+aymAJVDBlUSZR9rfAwzGDkp3HohSGR+goWZV++BRdaMN/a\n\
+AOyU0kuaUva+bGyoQ8A95rEzSQMTmw4=\n\
+-----END CERTIFICATE-----\n";
     const VOLUME_ID: &str = "vol_owgateway";
     const ATTACHMENT_ID: &str = "att_owgateway";
     const ATTACHMENT_EPOCH: u64 = 9;
@@ -441,6 +466,7 @@ mod tests {
     struct Fixture {
         _root: tempfile::TempDir,
         directory: PathBuf,
+        server_ca_bundle_file: PathBuf,
         attachment: AuthorizedServingAttachment,
         registration: ObjectWriteCredentialRegistration,
         reads: Arc<dyn BlobStore>,
@@ -477,6 +503,7 @@ mod tests {
             gateway_publish_store(
                 Some(GATEWAY_URL),
                 Some(self.directory.as_path()),
+                Some(self.server_ca_bundle_file.as_path()),
                 &self.attachment,
                 &self.reads,
             )
@@ -569,6 +596,8 @@ mod tests {
         let directory = state.join(OBJECT_WRITE_CREDENTIAL_DIRECTORY_BASENAME);
         std::fs::create_dir(&directory).unwrap();
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let server_ca_bundle_file = state.join("node-server-ca-bundle.pem");
+        std::fs::write(&server_ca_bundle_file, TEST_ROOT_PEM).unwrap();
 
         let session = session();
         let volume_id = id(VOLUME_ID);
@@ -633,6 +662,7 @@ mod tests {
         Fixture {
             _root: root,
             directory,
+            server_ca_bundle_file,
             attachment: attachment_with(Some(credential)),
             registration,
             reads,
@@ -713,13 +743,14 @@ mod tests {
         assert!(gateway_publish_store(
             Some(GATEWAY_URL),
             Some(fixture.directory.as_path()),
+            Some(fixture.server_ca_bundle_file.as_path()),
             &attachment,
             &fixture.reads,
         )
         .unwrap()
         .is_none());
         assert!(
-            gateway_publish_store(None, None, &attachment, &fixture.reads)
+            gateway_publish_store(None, None, None, &attachment, &fixture.reads)
                 .unwrap()
                 .is_none()
         );
@@ -731,6 +762,7 @@ mod tests {
         let message = refusal(gateway_publish_store(
             None,
             Some(fixture.directory.as_path()),
+            Some(fixture.server_ca_bundle_file.as_path()),
             &fixture.attachment,
             &fixture.reads,
         ));
@@ -746,6 +778,7 @@ mod tests {
         let message = refusal(gateway_publish_store(
             Some(GATEWAY_URL),
             None,
+            Some(fixture.server_ca_bundle_file.as_path()),
             &fixture.attachment,
             &fixture.reads,
         ));
@@ -753,6 +786,32 @@ mod tests {
             message.contains("--object-write-credential-directory is required"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn a_credential_without_gateway_server_roots_is_refused() {
+        let fixture = fixture();
+        let message = refusal(gateway_publish_store(
+            Some(GATEWAY_URL),
+            Some(fixture.directory.as_path()),
+            None,
+            &fixture.attachment,
+            &fixture.reads,
+        ));
+        assert!(
+            message.contains("--object-write-gateway-ca-file"),
+            "{message}"
+        );
+
+        let missing = fixture.directory.join("absent-root.pem");
+        let message = refusal(gateway_publish_store(
+            Some(GATEWAY_URL),
+            Some(fixture.directory.as_path()),
+            Some(missing.as_path()),
+            &fixture.attachment,
+            &fixture.reads,
+        ));
+        assert!(message.contains("server CA bundle"), "{message}");
     }
 
     /// The attachment names a public key the registered artifact does not
@@ -907,6 +966,7 @@ mod tests {
         let message = refusal(gateway_publish_store(
             Some(GATEWAY_URL),
             Some(parent.as_path()),
+            Some(fixture.server_ca_bundle_file.as_path()),
             &fixture.attachment,
             &fixture.reads,
         ));
@@ -922,6 +982,7 @@ mod tests {
         let message = refusal(gateway_publish_store(
             Some(GATEWAY_URL),
             Some(Path::new("object-write-credentials")),
+            Some(fixture.server_ca_bundle_file.as_path()),
             &fixture.attachment,
             &fixture.reads,
         ));
@@ -949,6 +1010,7 @@ mod tests {
         let message = refusal(gateway_publish_store(
             Some("http://object-write-gateway.invalid"),
             Some(fixture.directory.as_path()),
+            Some(fixture.server_ca_bundle_file.as_path()),
             &fixture.attachment,
             &fixture.reads,
         ));

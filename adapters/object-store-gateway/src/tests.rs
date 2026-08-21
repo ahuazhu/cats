@@ -509,6 +509,7 @@ fn fixture(script: Vec<Reply>) -> Fixture {
         Id::new(VOLUME).expect("a valid volume id"),
         signer("credential-1"),
         Arc::clone(&reads) as Arc<dyn BlobStore>,
+        ObjectWriteGatewayServerTrust::PlaintextLoopback,
     )
     .expect("open the gateway store");
     Fixture {
@@ -957,6 +958,18 @@ fn deletion_and_destructive_listing_fail_closed() {
 // Construction
 // ---------------------------------------------------------------------------
 
+const SELF_SIGNED_ROOT_PEM: &str = "\
+-----BEGIN CERTIFICATE-----\n\
+MIIBYzCCARWgAwIBAgIULICwc/RLnF4bSmGzzr94Ux2eOTIwBQYDK2VwMCYxJDAi\n\
+BgNVBAMMG0NhdHMgb2JqZWN0LXdyaXRlIHRlc3Qgcm9vdDAgFw0yNjA4MTgxMTAx\n\
+NTZaGA8yMTI2MDcyNTExMDE1NlowJjEkMCIGA1UEAwwbQ2F0cyBvYmplY3Qtd3Jp\n\
+dGUgdGVzdCByb290MCowBQYDK2VwAyEA1NilIB8rScb67W7/kKsQ7WB/zvZaT1BG\n\
+f2zFVOq+kZOjUzBRMB0GA1UdDgQWBBQkQswCbzxcDl5pz/rGPiUdFSpISDAfBgNV\n\
+HSMEGDAWgBQkQswCbzxcDl5pz/rGPiUdFSpISDAPBgNVHRMBAf8EBTADAQH/MAUG\n\
+AytlcANBAD1/4EhOQ+aymAJVDBlUSZR9rfAwzGDkp3HohSGR+goWZV++BRdaMN/a\n\
+AOyU0kuaUva+bGyoQ8A95rEzSQMTmw4=\n\
+-----END CERTIFICATE-----\n";
+
 /// The gateway serves TLS only. A plaintext origin is accepted for a loopback
 /// literal — the test double and local development — and refused everywhere
 /// else, so volume bytes are never shipped in the clear to a routable host.
@@ -964,11 +977,17 @@ fn deletion_and_destructive_listing_fail_closed() {
 fn a_plaintext_origin_is_accepted_only_for_a_loopback_literal() {
     let reads = Arc::new(RecordingReads::default()) as Arc<dyn BlobStore>;
     let open = |base: &str| {
+        let trust = if base.starts_with("https://") {
+            ObjectWriteGatewayServerTrust::Roots(SELF_SIGNED_ROOT_PEM.as_bytes())
+        } else {
+            ObjectWriteGatewayServerTrust::PlaintextLoopback
+        };
         ObjectWriteGatewayBlobStore::new(
             base,
             Id::new(VOLUME).expect("a valid volume id"),
             signer("credential-1"),
             Arc::clone(&reads),
+            trust,
         )
     };
 
@@ -1001,9 +1020,17 @@ fn the_factory_opens_from_configuration_without_credentials() {
     let factory = ObjectWriteGatewayBlobStoreFactory::new(signer("credential-1"), reads);
     assert_eq!(factory.name(), ADAPTER_NAME);
 
+    let bundle_path = std::env::temp_dir().join(format!(
+        "cats-object-write-test-root-{}.pem",
+        std::process::id()
+    ));
+    std::fs::write(&bundle_path, SELF_SIGNED_ROOT_PEM).expect("write the test trust anchor");
+    let bundle = bundle_path.to_str().expect("a UTF-8 temporary path");
+
     let config = AdapterConfig::from_pairs([
         ("gateway-url", "https://gateway.internal:8443"),
         ("volume-id", VOLUME),
+        ("server-ca-file", bundle),
     ])
     .expect("valid options");
     assert!(factory.open(&config).is_ok());
@@ -1015,9 +1042,20 @@ fn the_factory_opens_from_configuration_without_credentials() {
         Err(AdapterError::MissingOption { .. })
     ));
 
+    let no_trust = AdapterConfig::from_pairs([
+        ("gateway-url", "https://gateway.internal:8443"),
+        ("volume-id", VOLUME),
+    ])
+    .expect("valid options");
+    assert!(matches!(
+        factory.open(&no_trust),
+        Err(AdapterError::MissingOption { .. })
+    ));
+
     let unsupported = AdapterConfig::from_pairs([
         ("gateway-url", "https://gateway.internal:8443"),
         ("volume-id", VOLUME),
+        ("server-ca-file", bundle),
         ("secret-key", "leaked"),
     ])
     .expect("valid options");
@@ -1025,4 +1063,54 @@ fn the_factory_opens_from_configuration_without_credentials() {
         factory.open(&unsupported),
         Err(AdapterError::UnsupportedOptions { .. })
     ));
+    std::fs::remove_file(bundle_path).expect("remove the test trust anchor");
+}
+
+#[test]
+fn gateway_server_trust_fails_closed() {
+    let reads = Arc::new(RecordingReads::default()) as Arc<dyn BlobStore>;
+    let open = |base: &str, trust| {
+        ObjectWriteGatewayBlobStore::new(
+            base,
+            Id::new(VOLUME).expect("a valid volume id"),
+            signer("credential-1"),
+            Arc::clone(&reads),
+            trust,
+        )
+    };
+
+    for (base, trust) in [
+        (
+            "https://gateway.internal:8443",
+            ObjectWriteGatewayServerTrust::PlaintextLoopback,
+        ),
+        (
+            "http://127.0.0.1:8443",
+            ObjectWriteGatewayServerTrust::Roots(SELF_SIGNED_ROOT_PEM.as_bytes()),
+        ),
+    ] {
+        assert!(matches!(
+            open(base, trust),
+            Err(ObjectWriteError::InvalidServerTrust { .. })
+        ));
+    }
+
+    for unusable in [
+        b"".as_slice(),
+        b"-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n".as_slice(),
+    ] {
+        assert!(matches!(
+            open(
+                "https://gateway.internal:8443",
+                ObjectWriteGatewayServerTrust::Roots(unusable),
+            ),
+            Err(ObjectWriteError::InvalidServerTrust { .. })
+        ));
+    }
+
+    open(
+        "https://gateway.internal:8443",
+        ObjectWriteGatewayServerTrust::Roots(SELF_SIGNED_ROOT_PEM.as_bytes()),
+    )
+    .expect("a usable private root is admitted");
 }
