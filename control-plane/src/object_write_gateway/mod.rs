@@ -8,6 +8,8 @@
 mod listener;
 mod spool;
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -482,7 +484,8 @@ async fn drive_ordinary_put(
                     failed_at_unix_ms,
                 };
                 attempt =
-                    settle_terminal(service, &attempt.descriptor.request_id, terminal).await?;
+                    settle_terminal(&service.authority, &attempt.descriptor.request_id, terminal)
+                        .await?;
                 return cleanup_terminal(service, attempt, deadline).await;
             }
             Ok(ObjectWriteDownstreamPutOutcome::Succeeded {
@@ -515,9 +518,12 @@ async fn drive_ordinary_put(
                                 visible_at_unix_ms: observed_at_unix_ms,
                                 qualification_ambiguity: None,
                             };
-                            attempt =
-                                settle_terminal(service, &attempt.descriptor.request_id, terminal)
-                                    .await?;
+                            attempt = settle_terminal(
+                                &service.authority,
+                                &attempt.descriptor.request_id,
+                                terminal,
+                            )
+                            .await?;
                             return cleanup_terminal(service, attempt, deadline).await;
                         }
                         Ok(ObjectWriteVisibilityOutcome::VisibleExact { .. }) => {
@@ -896,16 +902,45 @@ fn qualification_error(error: QualificationFaultAuthorityError) -> ApiError {
     }
 }
 
-async fn settle_terminal(
-    service: &Arc<GatewayService>,
+type ObjectWriteTerminalSettlementFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, ApiError>> + Send + 'a>>;
+
+trait ObjectWriteTerminalSettlementAuthority: Send + Sync {
+    fn complete_terminal<'a>(
+        &'a self,
+        request_id: &'a Sha256Digest,
+        terminal: &'a ObjectPutTerminalState,
+    ) -> ObjectWriteTerminalSettlementFuture<'a, ObjectPutAttempt>;
+
+    fn reread_attempt<'a>(
+        &'a self,
+        request_id: &'a Sha256Digest,
+    ) -> ObjectWriteTerminalSettlementFuture<'a, (ObjectPutAttempt, ObjectWriteAuthority)>;
+}
+
+impl ObjectWriteTerminalSettlementAuthority for Arc<ObjectWriteGatewayClient> {
+    fn complete_terminal<'a>(
+        &'a self,
+        request_id: &'a Sha256Digest,
+        terminal: &'a ObjectPutTerminalState,
+    ) -> ObjectWriteTerminalSettlementFuture<'a, ObjectPutAttempt> {
+        Box::pin(self.complete_object_write_terminal(request_id, terminal))
+    }
+
+    fn reread_attempt<'a>(
+        &'a self,
+        request_id: &'a Sha256Digest,
+    ) -> ObjectWriteTerminalSettlementFuture<'a, (ObjectPutAttempt, ObjectWriteAuthority)> {
+        Box::pin(self.mark_object_write_provider_issued(request_id))
+    }
+}
+
+async fn settle_terminal<A: ObjectWriteTerminalSettlementAuthority + ?Sized>(
+    authority: &A,
     request_id: &Sha256Digest,
     terminal: ObjectPutTerminalState,
 ) -> Result<ObjectPutAttempt, ApiError> {
-    let error = match service
-        .authority
-        .complete_object_write_terminal(request_id, &terminal)
-        .await
-    {
+    let error = match authority.complete_terminal(request_id, &terminal).await {
         Ok(attempt) => return Ok(attempt),
         Err(error) => error,
     };
@@ -920,10 +955,7 @@ async fn settle_terminal(
     // published strict FLUSH into a Guest-fatal write error. Adopt the stored
     // terminal when it proves the same semantic outcome; a cross-kind
     // divergence stays a loud conflict.
-    let (attempt, _) = service
-        .authority
-        .mark_object_write_provider_issued(request_id)
-        .await?;
+    let (attempt, _) = authority.reread_attempt(request_id).await?;
     adopt_equivalent_terminal(attempt, &terminal, error)
 }
 
@@ -1719,6 +1751,114 @@ mod tests {
             },
         };
         attempt
+    }
+
+    struct ScriptedTerminalSettlementAuthority {
+        completion: Mutex<Option<Result<ObjectPutAttempt, ApiError>>>,
+        reread: Mutex<Option<Result<(ObjectPutAttempt, ObjectWriteAuthority), ApiError>>>,
+        completion_calls: AtomicUsize,
+        reread_calls: AtomicUsize,
+    }
+
+    impl ObjectWriteTerminalSettlementAuthority for ScriptedTerminalSettlementAuthority {
+        fn complete_terminal<'a>(
+            &'a self,
+            _request_id: &'a Sha256Digest,
+            _terminal: &'a ObjectPutTerminalState,
+        ) -> ObjectWriteTerminalSettlementFuture<'a, ObjectPutAttempt> {
+            self.completion_calls.fetch_add(1, Ordering::SeqCst);
+            let result = self
+                .completion
+                .lock()
+                .unwrap()
+                .take()
+                .expect("unexpected second terminal completion");
+            Box::pin(async move { result })
+        }
+
+        fn reread_attempt<'a>(
+            &'a self,
+            _request_id: &'a Sha256Digest,
+        ) -> ObjectWriteTerminalSettlementFuture<'a, (ObjectPutAttempt, ObjectWriteAuthority)>
+        {
+            self.reread_calls.fetch_add(1, Ordering::SeqCst);
+            let result = self
+                .reread
+                .lock()
+                .unwrap()
+                .take()
+                .expect("unexpected terminal reread");
+            Box::pin(async move { result })
+        }
+    }
+
+    #[tokio::test]
+    async fn settlement_conflict_rereads_and_adopts_the_stored_equivalent_terminal() {
+        let stored = terminal_attempt(succeeded_visible("winner", 20));
+        let request_id = stored.descriptor.request_id.clone();
+        let scripted = ScriptedTerminalSettlementAuthority {
+            completion: Mutex::new(Some(Err(ApiError::conflict(
+                "object-write gateway state or binding is stale",
+            )))),
+            reread: Mutex::new(Some(Ok((stored.clone(), authority())))),
+            completion_calls: AtomicUsize::new(0),
+            reread_calls: AtomicUsize::new(0),
+        };
+
+        let adopted = settle_terminal(
+            &scripted,
+            &request_id,
+            succeeded_visible("slower-driver", 25),
+        )
+        .await
+        .expect("equivalent stored terminal must settle the conflict");
+
+        assert_eq!(adopted, stored);
+        assert_eq!(scripted.completion_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(scripted.reread_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn settlement_preserves_non_conflict_and_reread_authority_errors() {
+        let attempt = terminal_attempt(succeeded_visible("stored", 20));
+        let request_id = attempt.descriptor.request_id.clone();
+        let non_conflict = ScriptedTerminalSettlementAuthority {
+            completion: Mutex::new(Some(Err(ApiError::unavailable(
+                "terminal authority is unavailable",
+            )))),
+            reread: Mutex::new(None),
+            completion_calls: AtomicUsize::new(0),
+            reread_calls: AtomicUsize::new(0),
+        };
+        let error = settle_terminal(
+            &non_conflict,
+            &request_id,
+            succeeded_visible("attempted", 25),
+        )
+        .await
+        .expect_err("non-conflict completion errors must propagate");
+        assert_eq!(error.code, ErrorCode::Unavailable);
+        assert_eq!(non_conflict.reread_calls.load(Ordering::SeqCst), 0);
+
+        let reread_failure = ScriptedTerminalSettlementAuthority {
+            completion: Mutex::new(Some(Err(ApiError::conflict(
+                "object-write gateway state or binding is stale",
+            )))),
+            reread: Mutex::new(Some(Err(ApiError::unavailable(
+                "terminal reread is unavailable",
+            )))),
+            completion_calls: AtomicUsize::new(0),
+            reread_calls: AtomicUsize::new(0),
+        };
+        let error = settle_terminal(
+            &reread_failure,
+            &request_id,
+            succeeded_visible("attempted", 25),
+        )
+        .await
+        .expect_err("reread authority errors must propagate");
+        assert_eq!(error.code, ErrorCode::Unavailable);
+        assert_eq!(reread_failure.reread_calls.load(Ordering::SeqCst), 1);
     }
 
     /// Two drivers of one accepted attempt publish identical bytes but embed
