@@ -36,7 +36,18 @@ args = sys.argv[1:]
 def option(name):
     return args[args.index(name) + 1]
 
-if args[:2] == ["ssm", "send-command"]:
+if args[:2] == ["sts", "get-caller-identity"]:
+    if args != [
+        "sts", "get-caller-identity", "--region", "us-east-1", "--output", "json"
+    ]:
+        raise SystemExit("unexpected STS arguments: " + repr(args))
+    account = os.environ.get("FAKE_AWS_ACCOUNT_ID", "123456789012")
+    arn = os.environ.get(
+        "FAKE_AWS_CALLER_ARN",
+        f"arn:aws:iam::{account}:role/cats-provisioner-fixture",
+    )
+    print(json.dumps({"Account": account, "Arn": arn, "UserId": "fixture"}))
+elif args[:2] == ["ssm", "send-command"]:
     instance = option("--instance-ids")
     program = json.loads(option("--parameters"))["commands"][0]
     counter_path = root / "counter"
@@ -54,30 +65,34 @@ if args[:2] == ["ssm", "send-command"]:
         stdout = ""
         stderr = "calibrated fake SSM failure"
     elif " node-identity prepare " in program:
-        def program_option(name):
-            match = re.search(rf"{re.escape(name)} ([A-Za-z0-9._:-]+)", program)
-            if match is None:
-                raise SystemExit(f"missing {name}")
-            return match.group(1)
-        identity = {
-            "credential_binding": {
-                "kind": "public_key",
-                "public_key_spki_sha256": "sha256:" + "a" * 64,
-            },
-            "immutable_host_id": program_option("--immutable-host-id"),
-            "node_id": program_option("--node-id"),
-            "provider_scope": {
-                "account_id": program_option("--host-account-id"),
-                "partition": program_option("--host-partition"),
-                "provider": program_option("--host-provider"),
-                "region": program_option("--host-region"),
-            },
-            "state": "provisioned",
-            "state_path_id": program_option("--state-path-id"),
-            "version": 1,
-        }
-        raw = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
-        identity_path.write_bytes(raw)
+        if identity_path.exists():
+            raw = identity_path.read_bytes()
+        else:
+            def program_option(name):
+                match = re.search(rf"{re.escape(name)} ([A-Za-z0-9._:-]+)", program)
+                if match is None:
+                    raise SystemExit(f"missing {name}")
+                return match.group(1)
+            identity = {
+                "credential_binding": {
+                    "kind": "public_key",
+                    "public_key_spki_sha256": "sha256:" + "a" * 64,
+                },
+                "credential_id": program_option("--credential-id"),
+                "immutable_host_id": program_option("--immutable-host-id"),
+                "node_id": program_option("--node-id"),
+                "provider_scope": {
+                    "account_id": program_option("--host-account-id"),
+                    "partition": program_option("--host-partition"),
+                    "provider": program_option("--host-provider"),
+                    "region": program_option("--host-region"),
+                },
+                "state": "provisioned",
+                "state_path_id": program_option("--state-path-id"),
+                "version": 1,
+            }
+            raw = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+            identity_path.write_bytes(raw)
         stdout = base64.b64encode(raw).decode()
     elif " node-identity activate " in program:
         stdout = base64.b64encode(identity_path.read_bytes()).decode()
@@ -132,6 +147,8 @@ def invoke(
     root: Path,
     *,
     fail_instance: str | None = None,
+    aws_account_id: str | None = None,
+    aws_caller_arn: str | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     fake_bin = root / "bin"
     state = root / "aws-state"
@@ -143,6 +160,10 @@ def invoke(
     env["FAKE_AWS_STATE"] = str(state)
     if fail_instance is not None:
         env["FAKE_AWS_FAIL_INSTANCE"] = fail_instance
+    if aws_account_id is not None:
+        env["FAKE_AWS_ACCOUNT_ID"] = aws_account_id
+    if aws_caller_arn is not None:
+        env["FAKE_AWS_CALLER_ARN"] = aws_caller_arn
     command = [
         sys.executable,
         str(script),
@@ -223,6 +244,86 @@ def make_fixture(root: Path) -> None:
     write(root / "nodes.json", canonical(nodes), 0o600)
 
 
+def mutate_first_node(root: Path, field: str, value: str) -> None:
+    nodes = json.loads((root / "nodes.json").read_bytes())
+    nodes[0][field] = value
+    write(root / "nodes.json", canonical(nodes), 0o600)
+
+
+def existing_identity(root: Path) -> dict[str, object]:
+    nodes = json.loads((root / "nodes.json").read_bytes())
+    node = nodes[0]
+    return {
+        "credential_binding": {
+            "kind": "public_key",
+            "public_key_spki_sha256": "sha256:" + "a" * 64,
+        },
+        "credential_id": node["credential_id"],
+        "immutable_host_id": node["immutable_host_id"],
+        "node_id": node["node_id"],
+        "provider_scope": {
+            "account_id": node["host_account_id"],
+            "partition": node["host_partition"],
+            "provider": node["host_provider"],
+            "region": node["host_region"],
+        },
+        "state": "provisioned",
+        "state_path_id": node["state_path_id"],
+        "version": 1,
+    }
+
+
+def install_existing_identity(root: Path, identity: dict[str, object]) -> None:
+    nodes = json.loads((root / "nodes.json").read_bytes())
+    state = root / "aws-state"
+    state.mkdir()
+    write(state / f"{nodes[0]['instance_id']}.identity", canonical(identity), 0o600)
+
+
+def assert_manifest_drift_rejected(
+    field: str, value: str, expected_error: bytes
+) -> None:
+    with tempfile.TemporaryDirectory(
+        prefix=f"cats-node-provision-{field}-negative-"
+    ) as temporary:
+        root = Path(temporary)
+        make_fixture(root)
+        mutate_first_node(root, field, value)
+        failed = invoke(
+            Path(__file__).resolve().with_name("provision-cordoned-nodes.py"), root
+        )
+        assert failed.returncode != 0, field
+        assert expected_error in failed.stderr, failed.stderr.decode()
+        assert not (root / "aws-state/programs.jsonl").exists(), field
+
+
+def assert_existing_identity_drift_rejected(
+    description: str, path: tuple[str, ...], value: object
+) -> None:
+    with tempfile.TemporaryDirectory(
+        prefix=f"cats-node-provision-identity-{description}-negative-"
+    ) as temporary:
+        root = Path(temporary)
+        make_fixture(root)
+        identity = existing_identity(root)
+        target = identity
+        for component in path[:-1]:
+            child = target[component]
+            assert isinstance(child, dict)
+            target = child
+        target[path[-1]] = value
+        install_existing_identity(root, identity)
+        failed = invoke(
+            Path(__file__).resolve().with_name("provision-cordoned-nodes.py"), root
+        )
+        assert failed.returncode != 0, description
+        assert b"returned a different public identity" in failed.stderr, (
+            description,
+            failed.stderr.decode(),
+        )
+        assert not (root / "aws-state/metal-1.authority-pending").exists(), description
+
+
 def main() -> int:
     script = Path(__file__).resolve().with_name("provision-cordoned-nodes.py")
     with tempfile.TemporaryDirectory(prefix="cats-node-provision-fixture-") as temporary:
@@ -249,6 +350,69 @@ def main() -> int:
         failed = invoke(script, root, fail_instance="i-00000000000000001")
         assert failed.returncode != 0
         assert b"calibrated fake SSM failure" in failed.stderr
+
+    for field, value, expected_error in [
+        (
+            "immutable_host_id",
+            "i-000000000000000ff",
+            b"does not match its SSM instance",
+        ),
+        ("host_provider", "not_aws", b"provider scope"),
+        ("host_partition", "aws-us-gov", b"provider scope"),
+        ("host_account_id", "999999999999", b"provider scope"),
+        ("host_region", "us-west-2", b"provider scope"),
+    ]:
+        assert_manifest_drift_rejected(field, value, expected_error)
+
+    with tempfile.TemporaryDirectory(
+        prefix="cats-node-provision-sts-account-negative-"
+    ) as temporary:
+        root = Path(temporary)
+        make_fixture(root)
+        failed = invoke(
+            script,
+            root,
+            aws_account_id="not-an-account",
+            aws_caller_arn="arn:aws:iam::not-an-account:role/fixture",
+        )
+        assert failed.returncode != 0
+        assert b"account ID is not 12 decimal digits" in failed.stderr
+        assert not (root / "aws-state/programs.jsonl").exists()
+
+    with tempfile.TemporaryDirectory(
+        prefix="cats-node-provision-sts-arn-negative-"
+    ) as temporary:
+        root = Path(temporary)
+        make_fixture(root)
+        failed = invoke(
+            script,
+            root,
+            aws_caller_arn="arn:aws:s3::123456789012:bucket/fixture",
+        )
+        assert failed.returncode != 0
+        assert b"AWS caller ARN is malformed" in failed.stderr
+        assert not (root / "aws-state/programs.jsonl").exists()
+
+    for description, path, value in [
+        ("version", ("version",), 2),
+        ("state", ("state",), "retired"),
+        (
+            "provider-scope",
+            ("provider_scope", "account_id"),
+            "999999999999",
+        ),
+        ("credential-id", ("credential_id",), "stale-credential"),
+        (
+            "binding-kind",
+            ("credential_binding",),
+            {
+                "kind": "provider_principal",
+                "principal": "stale-principal",
+                "provider": "aws",
+            },
+        ),
+    ]:
+        assert_existing_identity_drift_rejected(description, path, value)
     print("provision-cordoned-nodes fixture: ok")
     return 0
 

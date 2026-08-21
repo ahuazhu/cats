@@ -24,6 +24,10 @@ from typing import Any
 
 COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+WIRE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+AWS_ACCOUNT_ID_RE = re.compile(r"^[0-9]{12}$")
+AWS_PARTITION_RE = re.compile(r"^aws(?:-[a-z0-9]+)*$")
+AWS_REGION_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)+-[0-9]+$")
 INSTANCE_RE = re.compile(r"^i-[0-9a-f]{8,32}$")
 HTTPS_ORIGIN_RE = re.compile(r"^https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?$")
 S3_URI_RE = re.compile(r"^s3://[A-Za-z0-9][A-Za-z0-9.-]{1,62}/[^\s]+$")
@@ -120,6 +124,72 @@ def run(command: list[str], description: str) -> subprocess.CompletedProcess[byt
         detail = result.stderr.decode("utf-8", "replace").strip()
         raise ProvisionError(f"{description} failed: {detail[-4000:]}")
     return result
+
+
+def authenticated_aws_scope(region: str) -> dict[str, str]:
+    result = run(
+        [
+            "aws",
+            "sts",
+            "get-caller-identity",
+            "--region",
+            region,
+            "--output",
+            "json",
+        ],
+        "authenticate AWS provisioner scope",
+    )
+    try:
+        identity = json.loads(result.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ProvisionError("AWS caller identity is not JSON") from error
+    if not isinstance(identity, dict):
+        raise ProvisionError("AWS caller identity is not an object")
+    account_id = identity.get("Account")
+    if not isinstance(account_id, str) or AWS_ACCOUNT_ID_RE.fullmatch(account_id) is None:
+        raise ProvisionError("AWS caller account ID is not 12 decimal digits")
+    arn = identity.get("Arn")
+    if not isinstance(arn, str):
+        raise ProvisionError("AWS caller identity has no ARN")
+    arn_parts = arn.split(":", 5)
+    if (
+        len(arn_parts) != 6
+        or arn_parts[0] != "arn"
+        or AWS_PARTITION_RE.fullmatch(arn_parts[1]) is None
+        or arn_parts[2] not in {"iam", "sts"}
+        or arn_parts[3] != ""
+        or arn_parts[4] != account_id
+        or not arn_parts[5]
+    ):
+        raise ProvisionError("AWS caller ARN is malformed or does not bind the account ID")
+    partition = arn_parts[1]
+    return {
+        "provider": "aws",
+        "partition": partition,
+        "account_id": account_id,
+        "region": region,
+    }
+
+
+def require_ssm_target_binding(
+    node: dict[str, str], authenticated_scope: dict[str, str]
+) -> None:
+    node_id = node["node_id"]
+    if node["immutable_host_id"] != node["instance_id"]:
+        raise ProvisionError(
+            f"{node_id} immutable_host_id does not match its SSM instance target"
+        )
+    for manifest_field, scope_field in [
+        ("host_provider", "provider"),
+        ("host_partition", "partition"),
+        ("host_account_id", "account_id"),
+        ("host_region", "region"),
+    ]:
+        if node[manifest_field] != authenticated_scope[scope_field]:
+            raise ProvisionError(
+                f"{node_id} {manifest_field} provider scope does not match the "
+                "authenticated SSM target scope"
+            )
 
 
 def run_authority_replay(
@@ -395,7 +465,8 @@ def main(argv: list[str]) -> int:
     provisioner_credential_id = checked_component(
         args.provisioner_credential_id, "provisioner credential ID"
     )
-    checked_component(args.aws_region, "AWS region")
+    if AWS_REGION_RE.fullmatch(args.aws_region) is None:
+        raise ProvisionError("--aws-region is not a valid AWS region identifier")
     if not 1 <= args.ssm_timeout_seconds <= 60:
         raise ProvisionError("--ssm-timeout-seconds must be between 1 and 60")
     if not 1 <= args.authority_timeout_seconds <= 60:
@@ -431,6 +502,9 @@ def main(argv: list[str]) -> int:
             raise ProvisionError("operator Cats CLI is not executable")
     require_private_key(args.provisioner_private_key_file)
     nodes = load_nodes(args.nodes)
+    aws_scope = authenticated_aws_scope(args.aws_region)
+    for node in nodes:
+        require_ssm_target_binding(node, aws_scope)
 
     args.evidence_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     evidence_metadata = args.evidence_dir.lstat()
@@ -462,11 +536,50 @@ def main(argv: list[str]) -> int:
             identity = json.loads(identity_raw)
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ProvisionError(f"{node_id} returned an invalid public identity") from error
+        expected_provider_scope = {
+            "provider": node["host_provider"],
+            "partition": node["host_partition"],
+            "account_id": node["host_account_id"],
+            "region": node["host_region"],
+        }
+        credential_binding = (
+            identity.get("credential_binding") if isinstance(identity, dict) else None
+        )
         if not isinstance(identity, dict) or any(
             [
+                set(identity)
+                != {
+                    "version",
+                    "node_id",
+                    "provider_scope",
+                    "immutable_host_id",
+                    "credential_id",
+                    "credential_binding",
+                    "state_path_id",
+                    "state",
+                },
+                type(identity.get("version")) is not int
+                or identity.get("version") != 1,
                 identity.get("node_id") != node_id,
+                identity.get("provider_scope") != expected_provider_scope,
                 identity.get("immutable_host_id") != node["immutable_host_id"],
+                identity.get("credential_id") != node["credential_id"],
+                not isinstance(credential_binding, dict),
+                isinstance(credential_binding, dict)
+                and (
+                    set(credential_binding)
+                    != {"kind", "public_key_spki_sha256"}
+                    or credential_binding.get("kind") != "public_key"
+                    or not isinstance(
+                        credential_binding.get("public_key_spki_sha256"), str
+                    )
+                    or WIRE_DIGEST_RE.fullmatch(
+                        credential_binding.get("public_key_spki_sha256", "")
+                    )
+                    is None
+                ),
                 identity.get("state_path_id") != node["state_path_id"],
+                identity.get("state") != "provisioned",
             ]
         ):
             raise ProvisionError(f"{node_id} returned a different public identity")
