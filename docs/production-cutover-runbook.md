@@ -132,7 +132,7 @@ Take `<QUALIFICATION_JOB_ID>` from the successful Host-local immutable build rec
 publisher only after `cats-run-build` returns zero and freezes that exact root-owned job output;
 never select a job by recency or publish a still-running log.
 
-On the approved native x86_64 release builder, build the two digest-pinned images and worker
+On the approved native x86_64 release builder, build the three digest-pinned images and worker
 bundle from the same clean checkout:
 
 ```sh
@@ -140,6 +140,7 @@ deploy/aws/tools/build-manual-release.sh \
   --source-sha <FINAL_RELEASE_SHA> \
   --output /approved/release/<FINAL_RELEASE_SHA> \
   --image <CONTROL_ECR_REPOSITORY>:<CUTOVER_ID> \
+  --credential-refresher-image <CONTROL_ECR_REPOSITORY>:refresher-<CUTOVER_ID> \
   --gateway-image <GATEWAY_ECR_REPOSITORY>:<CUTOVER_ID> \
   --push
 ```
@@ -149,7 +150,7 @@ The builder's `release-manifest.v1.json` is the artifact authority. Confirm that
 do not rebuild after credentials or fresh targets are selected.
 
 **Retain.** `source-provenance.txt`, `source-bundle.json`, the Host-local build receipt, its
-content-addressed publication receipt, `release-manifest.v1.json`, both registry digests and the
+content-addressed publication receipt, `release-manifest.v1.json`, all three registry digests and the
 worker bundle digest under `/approved/evidence/<CUTOVER_ID>/00-release/`.
 
 **Cancel point.** No production state has changed. Stop on a dirty source, digest mismatch, failed

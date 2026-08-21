@@ -111,16 +111,21 @@ def run_verifier(
     output: Path,
     *,
     expect_success: bool,
+    credential_refresher_digest: str = "sha256:" + "8" * 64,
     gateway_digest: str = "sha256:" + "6" * 64,
     control_reference: str = "registry.example/cats/control-plane:fixture",
+    credential_refresher_reference: str = "registry.example/cats/credential-refresher:fixture",
     gateway_reference: str = "registry.example/cats/gateway:fixture",
 ) -> subprocess.CompletedProcess[bytes]:
     shared = workspace / "shared"
     control = workspace / "control"
+    credential_refresher = workspace / "credential-refresher"
     gateway = workspace / "gateway"
     bundle = workspace / "cats-worker.tar.zst"
     source_input = workspace / "Cargo.lock"
     reviewed_positive_stop = workspace / "reviewed-old-host-positive-stop.py"
+    reviewed_refresh_program = workspace / "reviewed-refresh-database-credential.sh"
+    reviewed_swap_dsn_program = workspace / "reviewed-swap-dsn-password.py"
     command = [
         sys.executable,
         "-B",
@@ -138,6 +143,16 @@ def run_verifier(
         "--control-image-config-digest",
         "sha256:" + "2" * 64,
         "--control-image-registry-verified",
+        "false",
+        "--credential-refresher-root",
+        str(credential_refresher),
+        "--credential-refresher-image-reference",
+        credential_refresher_reference,
+        "--credential-refresher-image-digest",
+        credential_refresher_digest,
+        "--credential-refresher-image-config-digest",
+        "sha256:" + "9" * 64,
+        "--credential-refresher-image-registry-verified",
         "false",
         "--gateway-image-root",
         str(gateway),
@@ -159,6 +174,10 @@ def run_verifier(
         f"cargo_lock={source_input}",
         "--input-file",
         f"old_host_positive_stop={reviewed_positive_stop}",
+        "--input-file",
+        f"credential_refresher_program={reviewed_refresh_program}",
+        "--input-file",
+        f"swap_dsn_program={reviewed_swap_dsn_program}",
         "--output",
         str(output),
     ]
@@ -236,6 +255,20 @@ def prepare_workspace(root: Path) -> dict[str, bytes]:
         (root / "worker/old-host-positive-stop.py").read_bytes(),
         0o755,
     )
+    refresh_program = b"#!/bin/sh\nfixture-refresh\n"
+    swap_dsn_program = b"#!/usr/bin/python3\n# fixture swap\n"
+    write_member(root / "reviewed-refresh-database-credential.sh", refresh_program, 0o755)
+    write_member(root / "reviewed-swap-dsn-password.py", swap_dsn_program, 0o755)
+    write_member(
+        root / "credential-refresher/usr/local/bin/refresh-database-credential",
+        refresh_program,
+        0o755,
+    )
+    write_member(
+        root / "credential-refresher/usr/local/bin/swap-dsn-password.py",
+        swap_dsn_program,
+        0o755,
+    )
     control_release = root / "control/opt/cats/release"
     write_member(control_release / "guest-runtime-release-manifest.v1.json", members["manifest"])
     write_member(control_release / "guest-runtime-profile.v1.json", members["profile"])
@@ -273,6 +306,16 @@ def main() -> int:
             "tree": "4" * 40,
         }
         assert parsed["artifacts"]["control_plane"]["registry_verified"] is False
+        assert parsed["artifacts"]["credential_refresher"] == {
+            "image_config_digest": "sha256:" + "9" * 64,
+            "image_digest": "sha256:" + "8" * 64,
+            "image_reference": "registry.example/cats/credential-refresher:fixture",
+            "refresh_program_sha256": digest(b"#!/bin/sh\nfixture-refresh\n"),
+            "registry_verified": False,
+            "swap_dsn_program_sha256": digest(
+                b"#!/usr/bin/python3\n# fixture swap\n"
+            ),
+        }
         assert parsed["artifacts"]["gateway"] == {
             "binary_sha256": digest(b"fixture-gateway\n"),
             "binary_size_bytes": len(b"fixture-gateway\n"),
@@ -307,6 +350,7 @@ def main() -> int:
         )
         candidate_identity = json.loads(candidate.stdout)
         assert candidate_identity["control_plane"]["image_digest"] == "sha256:" + "1" * 64
+        assert candidate_identity["credential_refresher"]["image_digest"] == "sha256:" + "8" * 64
         assert candidate_identity["gateway"]["image_digest"] == "sha256:" + "6" * 64
 
         promoted = root / "release-manifest.registry-verified.v1.json"
@@ -322,6 +366,8 @@ def main() -> int:
                 manifest_digest,
                 "--control-registry-digest",
                 "sha256:" + "1" * 64,
+                "--credential-refresher-registry-digest",
+                "sha256:" + "8" * 64,
                 "--gateway-registry-digest",
                 "sha256:" + "6" * 64,
                 "--output",
@@ -332,8 +378,10 @@ def main() -> int:
         )
         promoted_value = json.loads(promoted.read_bytes())
         assert promoted_value["artifacts"]["control_plane"]["registry_verified"] is True
+        assert promoted_value["artifacts"]["credential_refresher"]["registry_verified"] is True
         assert promoted_value["artifacts"]["gateway"]["registry_verified"] is True
         promoted_value["artifacts"]["control_plane"]["registry_verified"] = False
+        promoted_value["artifacts"]["credential_refresher"]["registry_verified"] = False
         promoted_value["artifacts"]["gateway"]["registry_verified"] = False
         assert canonical(promoted_value) == raw
 
@@ -441,9 +489,10 @@ def main() -> int:
             output,
             expect_success=False,
             control_reference="registry.example/cats/shared:fixture",
+            credential_refresher_reference="registry.example/cats/credential-refresher:fixture",
             gateway_reference="REGISTRY.EXAMPLE:443/cats/shared:fixture",
         )
-        assert b"same mutable tag" in same_image.stderr
+        assert b"distinct mutable tags" in same_image.stderr
         assert not output.exists()
 
         docker_hub_alias = run_verifier(
@@ -454,7 +503,7 @@ def main() -> int:
             control_reference="cats:fixture",
             gateway_reference="index.docker.io/library/cats:fixture",
         )
-        assert b"same mutable tag" in docker_hub_alias.stderr
+        assert b"distinct mutable tags" in docker_hub_alias.stderr
         assert not output.exists()
 
         cats = root / "worker/cats"

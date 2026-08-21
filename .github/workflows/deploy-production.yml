@@ -516,6 +516,7 @@ jobs:
             -var="expected_aws_partition=$EXPECTED_AWS_PARTITION" \
             -var="aws_region=$EXPECTED_AWS_REGION" \
             -var="control_plane_image=$IMAGE_REF" \
+            -var="object_write_gateway_image=$IMAGE_REF" \
             -var="gateway_image=$GATEWAY_REF" \
             -var="route_v2_control_artifact_secret_name=$ROUTE_V2_CONTROL_ARTIFACT_SECRET_NAME" \
             -var="route_v2_gateway_artifact_secret_name=$ROUTE_V2_GATEWAY_ARTIFACT_SECRET_NAME" \
@@ -540,6 +541,7 @@ jobs:
         shell: bash
         env:
           IMAGE_REF: ${{ steps.image.outputs.ref }}
+          REFRESHER_REF: ${{ steps.image.outputs.refresher_ref }}
           GATEWAY_REF: ${{ steps.image.outputs.gateway_ref }}
         run: |
           set -euo pipefail
@@ -561,7 +563,16 @@ jobs:
             [[ "$observed" == "$expected_image" ]]
           }
           verify_deployment cats-controld "$IMAGE_REF"
+          verify_deployment cats-object-write-gateway "$IMAGE_REF"
           verify_deployment cats-gatewayd "$GATEWAY_REF"
+          observed_refresher="$(
+            kubectl \
+              --kubeconfig "$RUNNER_TEMP/kubeconfig" \
+              --namespace cats \
+              get cronjob/cats-credential-refresher \
+              --output jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].image}'
+          )"
+          [[ "$observed_refresher" == "$REFRESHER_REF" ]]
 
       - name: Mark deployment successful
         if: success() && steps.deployment.outputs.id != ''

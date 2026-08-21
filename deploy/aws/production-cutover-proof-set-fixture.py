@@ -801,6 +801,7 @@ def validate_release_manifest_catalog_cross_check() -> None:
     manifest = {
         "artifacts": {
             "control_plane": {"marker": "control"},
+            "credential_refresher": {"marker": "credential-refresher"},
             "gateway": {"marker": "gateway"},
             "worker": {
                 "bundle_name": "cats-worker.tar.zst",

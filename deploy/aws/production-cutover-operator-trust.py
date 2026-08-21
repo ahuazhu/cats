@@ -1350,7 +1350,7 @@ def validate_release_manifest_binding(
     trust: dict[str, Any],
 ) -> str:
     # The current manual-release manifest closes exactly {control_plane,
-    # gateway, worker}; it carries no operator trust member.  Release binding
+    # credential_refresher, gateway, worker}; it carries no operator trust member. Release binding
     # is therefore the independently approved manifest digest plus the exact
     # source-commit equality between that manifest and the public trust.
     manifest_raw = stable_read(
@@ -1372,7 +1372,7 @@ def validate_release_manifest_binding(
         raise TrustError("manual release manifest version is not 1")
     artifacts = require_exact_fields(
         manifest["artifacts"],
-        {"control_plane", "gateway", "worker"},
+        {"control_plane", "credential_refresher", "gateway", "worker"},
         "manual release artifacts",
     )
     control_image = require_exact_fields(
@@ -1399,8 +1399,21 @@ def validate_release_manifest_binding(
         },
         "manual release Gateway image",
     )
+    credential_refresher_image = require_exact_fields(
+        artifacts["credential_refresher"],
+        {
+            "image_config_digest",
+            "image_digest",
+            "image_reference",
+            "refresh_program_sha256",
+            "registry_verified",
+            "swap_dsn_program_sha256",
+        },
+        "manual release credential-refresher image",
+    )
     for image_name, image in (
         ("control_plane", control_image),
+        ("credential_refresher", credential_refresher_image),
         ("gateway", gateway_image),
     ):
         if image["registry_verified"] is not True:
@@ -1423,6 +1436,11 @@ def validate_release_manifest_binding(
         )
     for field in ("guest_manifest_sha256", "guest_profile_sha256"):
         require_sha256(control_image[field], f"manual release Control {field}")
+    for field in ("refresh_program_sha256", "swap_dsn_program_sha256"):
+        require_sha256(
+            credential_refresher_image[field],
+            f"manual release credential-refresher {field}",
+        )
     require_sha256(gateway_image["binary_sha256"], "manual release Gateway binary")
     if (
         type(gateway_image["binary_size_bytes"]) is not int
