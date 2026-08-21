@@ -115,6 +115,11 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     object_write_credential_directory: Option<PathBuf>,
 
+    /// Absolute path of the PEM roots that issue the ObjectWrite Gateway's
+    /// server certificate.
+    #[arg(long, value_name = "PATH")]
+    object_write_gateway_ca_file: Option<PathBuf>,
+
     /// Serve NBD on this unix socket path.
     #[arg(long)]
     listen_unix: Option<PathBuf>,
@@ -498,6 +503,7 @@ fn main() -> Result<()> {
         Some(attachment) => match object_write::gateway_publish_store(
             args.object_write_gateway_url.as_deref(),
             args.object_write_credential_directory.as_deref(),
+            args.object_write_gateway_ca_file.as_deref(),
             attachment,
             &blob,
         )
@@ -860,6 +866,21 @@ fn validate_process_mode(args: &Args) -> Result<()> {
         }
         (Some(_), Some(directory)) if !directory.is_absolute() => {
             bail!("--object-write-credential-directory must be an absolute path")
+        }
+        _ => {}
+    }
+    match (
+        &args.object_write_gateway_url,
+        &args.object_write_gateway_ca_file,
+    ) {
+        (Some(_), None) => {
+            bail!("--object-write-gateway-url requires --object-write-gateway-ca-file")
+        }
+        (None, Some(_)) => {
+            bail!("--object-write-gateway-ca-file requires --object-write-gateway-url")
+        }
+        (Some(_), Some(bundle)) if !bundle.is_absolute() => {
+            bail!("--object-write-gateway-ca-file must be an absolute path")
         }
         _ => {}
     }
@@ -1229,7 +1250,7 @@ mod tests {
         Args::try_parse_from(argv).expect("parse release CLI")
     }
 
-    /// The Node passes these two flags verbatim. Renaming either one silently
+    /// The Node passes these three flags verbatim. Renaming any one silently
     /// disables the only ChunkStore write path production permits.
     #[test]
     fn the_object_write_gateway_flags_parse_under_their_exact_names() {
@@ -1238,6 +1259,8 @@ mod tests {
             "https://gateway.internal:8443",
             "--object-write-credential-directory",
             "/var/lib/cats/object-write-credentials",
+            "--object-write-gateway-ca-file",
+            "/etc/cats/route-v2/node-server-ca-bundle.pem",
         ]);
         assert_eq!(
             args.object_write_gateway_url.as_deref(),
@@ -1246,6 +1269,10 @@ mod tests {
         assert_eq!(
             args.object_write_credential_directory.as_deref(),
             Some(Path::new("/var/lib/cats/object-write-credentials"))
+        );
+        assert_eq!(
+            args.object_write_gateway_ca_file.as_deref(),
+            Some(Path::new("/etc/cats/route-v2/node-server-ca-bundle.pem"))
         );
         validate_process_mode(&args).expect("paired absolute flags are admitted");
     }
@@ -1288,12 +1315,52 @@ mod tests {
         assert!(message.contains("must be an absolute path"), "{message}");
     }
 
+    #[test]
+    fn the_gateway_trust_anchor_is_part_of_the_same_capability() {
+        let message = validate_process_mode(&publish_only_args(&[
+            "--object-write-gateway-url",
+            "https://gateway.internal:8443",
+            "--object-write-credential-directory",
+            "/var/lib/cats/object-write-credentials",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            message.contains("requires --object-write-gateway-ca-file"),
+            "{message}"
+        );
+
+        let message = validate_process_mode(&publish_only_args(&[
+            "--object-write-gateway-ca-file",
+            "/etc/cats/route-v2/node-server-ca-bundle.pem",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            message.contains("requires --object-write-gateway-url"),
+            "{message}"
+        );
+
+        let message = validate_process_mode(&publish_only_args(&[
+            "--object-write-gateway-url",
+            "https://gateway.internal:8443",
+            "--object-write-credential-directory",
+            "/var/lib/cats/object-write-credentials",
+            "--object-write-gateway-ca-file",
+            "node-server-ca-bundle.pem",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("must be an absolute path"), "{message}");
+    }
+
     /// A release CLI that names neither flag must stay exactly as it was.
     #[test]
     fn omitting_both_object_write_gateway_flags_remains_admitted() {
         let args = publish_only_args(&[]);
         assert!(args.object_write_gateway_url.is_none());
         assert!(args.object_write_credential_directory.is_none());
+        assert!(args.object_write_gateway_ca_file.is_none());
         validate_process_mode(&args).expect("the pre-gateway CLI is unchanged");
     }
 

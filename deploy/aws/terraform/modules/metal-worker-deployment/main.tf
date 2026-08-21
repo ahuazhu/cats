@@ -23,6 +23,7 @@ locals {
       "CATS_POSTGRES_SCHEMA=${var.control_postgres_schema}",
       "CATS_ROUTE_V2_ROTATION_ORIGIN=${var.route_v2_rotation_origin}",
       "CATS_OBJECT_WRITE_GATEWAY_URL=${var.object_write_gateway_url}",
+      "CATS_OBJECT_WRITE_GATEWAY_CA_FILE=/etc/cats/route-v2/node-server-ca-bundle.pem",
     ],
   ))
 
@@ -42,6 +43,7 @@ locals {
       "CATS_POSTGRES_SCHEMA=${var.control_postgres_schema}",
       "CATS_ROUTE_V2_ROTATION_ORIGIN=${var.route_v2_rotation_origin}",
       "CATS_OBJECT_WRITE_GATEWAY_URL=${var.object_write_gateway_url}",
+      "CATS_OBJECT_WRITE_GATEWAY_CA_FILE=/etc/cats/route-v2/node-server-ca-bundle.pem",
     ],
     var.database_master_user_secret_arn == null ? [] : [
       "CATS_POSTGRES_SECRET_ARN=${var.database_master_user_secret_arn}",
