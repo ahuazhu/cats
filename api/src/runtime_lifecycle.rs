@@ -3934,6 +3934,45 @@ mod tests {
         .unwrap();
         validate_lifecycle_successor(Some(&terminal), &start).unwrap();
 
+        // Killed proves execution absence on the old Node, but it does not
+        // prove R == L or normal release.  It may therefore restart only on
+        // that same Node and must never be accepted as a planned handoff.
+        let target = placement("node.b", 2);
+        let killed_handoff = LifecycleCommandEnvelope::new(
+            id("operation.start.after.stop.cross-node"),
+            killed.workspace_id.clone(),
+            killed.cat_id.clone(),
+            target.node_id.clone(),
+            target.clone(),
+            config.clone(),
+            Some(killed.operation_id.clone()),
+            LifecyclePredecessor::CrossNodeColdHandoff {
+                cold_operation_id: killed.operation_id.clone(),
+                cold_result_digest: lifecycle_terminal_result_digest(&terminal).unwrap(),
+                source_node_id: killed.node_id.clone(),
+                source_placement: killed.placement_identity.clone(),
+                volume_disposition_receipts: config
+                    .volumes
+                    .iter()
+                    .enumerate()
+                    .map(
+                        |(index, volume)| ColdVolumeDispositionDigest::NormallyReleased {
+                            volume_id: volume.volume_id.clone(),
+                            normal_release_receipt_digest: digest(110 + index as u8),
+                        },
+                    )
+                    .collect(),
+                target_placement: target,
+            },
+            LifecycleCommand::Start(Box::new(StartSpec {
+                volume_authorities: normal_authorities(&config),
+                source: StartSource::ColdHandoff,
+                effect_deadline_unix_ms: millis(2_000),
+            })),
+        )
+        .unwrap();
+        assert!(validate_lifecycle_successor(Some(&terminal), &killed_handoff).is_err());
+
         let mut wrong = start;
         let LifecycleCommand::Start(spec) = &mut wrong.command else {
             unreachable!();

@@ -3,13 +3,15 @@ use std::time::Duration;
 
 use cats_api::agent_registration::AuthenticatedNodeCredential;
 use cats_api::runtime_lifecycle::{
-    ColdResult, ColdSpec, ColdVolumeDisposition, CommandFailedResult, CommandFailureReason,
-    DiskRole, ExecutionAbsenceProof, ImmutableRuntimeConfig, LifecycleCommand,
-    LifecycleCommandEnvelope, LifecycleCommandPollRequest, LifecycleOperation,
-    LifecycleOperationState, LifecyclePredecessor, NodeResult, PlacementIdentity, RetainedEvidence,
+    lifecycle_terminal_result_digest, ColdResult, ColdSpec, ColdVolumeDisposition,
+    CommandFailedResult, CommandFailureReason, DiskRole, ExecutionAbsenceProof,
+    ImmutableRuntimeConfig, LifecycleCommand, LifecycleCommandEnvelope,
+    LifecycleCommandPollRequest, LifecycleOperation, LifecycleOperationState, LifecyclePredecessor,
+    LifecycleTerminalResult, NodeResult, OldNodeIdentity, PlacementIdentity, RetainedEvidence,
     RuntimeNetworkConfig, RuntimeReadyResult, RuntimeVolumeAuthorityInput, RuntimeVolumeConfig,
     RuntimeVolumeGuestBinding, StartSource, StartSpec, StartVolumeAuthority, StopSpec,
-    SuspendAdmissionPolicy, SuspendSpec, SuspendedResult, VolumeTerminalReceipt,
+    SuspendAdmissionPolicy, SuspendSpec, SuspendedResult, VolumeAuthorizationId,
+    VolumeTerminalReceipt,
 };
 use cats_api::runtime_lifecycle_volume::{
     LifecycleStartVolumeAction, LifecycleStartVolumeBatch, LifecycleStartVolumeGrantAuthority,
@@ -774,6 +776,135 @@ fn exact_replay_and_second_command_do_not_supersede_unresolved_start() {
             }
         )
     );
+}
+
+#[test]
+fn host_lost_wire_does_not_enable_unimplemented_recovery_admission() {
+    let store = test_store();
+    let workspace = workspace_id(&store, "lifecycle-host-fence-unavailable");
+    let source_node = id("node-a-lifecycle-host-fence-unavailable");
+    let target_node = id("node-b-lifecycle-host-fence-unavailable");
+    let cat = id("cat-lifecycle-host-fence-unavailable");
+    let creation = id("creation-cat-lifecycle-host-fence-unavailable");
+    let config = seed_cat(&store, &workspace, &cat, &creation);
+    let start = genesis_start(
+        &workspace,
+        &source_node,
+        &cat,
+        &creation,
+        "operation-interrupted-host-fence-unavailable",
+        &config,
+    );
+    assert!(matches!(
+        store.admit_lifecycle_command(&workspace, &start).unwrap(),
+        LifecycleCommandAdmission::Admitted(_)
+    ));
+
+    // There is deliberately no production HostLost composer yet.  Seed the
+    // exact terminal wire to characterize the Store boundary after that
+    // predecessor exists, without manufacturing HostFenceEvent authority.
+    let host_fence_event_id = id("host-fence-event-unavailable");
+    let host_lost = LifecycleTerminalResult::HostLost {
+        host_fence_event_id: host_fence_event_id.clone(),
+        interrupted_operation_id: start.operation_id.clone(),
+    };
+    let host_lost_bytes = serde_json::to_vec(&host_lost).unwrap();
+    let host_lost_digest = lifecycle_terminal_result_digest(&host_lost).unwrap();
+    store
+        .authority_transaction(|transaction| {
+            let transitioned = transaction.execute(
+                "UPDATE runtime_operations
+                    SET state='terminal', terminal_source='host_lost',
+                        terminal_result_kind='host_lost', canonical_result_bytes=$2,
+                        canonical_result_sha256=$3,
+                        terminal_at_unix_ms=created_at_unix_ms
+                  WHERE operation_id=$1 AND state='unresolved'",
+                &[
+                    &start.operation_id.as_str(),
+                    &host_lost_bytes,
+                    &host_lost_digest.as_str(),
+                ],
+            )?;
+            assert_eq!(transitioned, 1);
+            let projected = transaction.execute(
+                "UPDATE cat_records
+                    SET lifecycle_head_operation_id=$2
+                  WHERE workspace_id=$1 AND cat_id=$3
+                    AND lifecycle_head_operation_id IS NULL",
+                &[
+                    &workspace.as_str(),
+                    &start.operation_id.as_str(),
+                    &cat.as_str(),
+                ],
+            )?;
+            assert_eq!(projected, 1);
+            Ok(())
+        })
+        .unwrap();
+    let stored_head = store
+        .lifecycle_operation(&workspace, &start.operation_id)
+        .unwrap()
+        .expect("seeded HostLost head remains readable");
+
+    let slot = &config.volumes[0];
+    let authorization_id = id("takeover-authorization-unavailable");
+    let target_placement = placement(&target_node);
+    let recovery = LifecycleCommandEnvelope::new(
+        id("operation-recovery-unavailable"),
+        workspace.clone(),
+        cat,
+        target_node.clone(),
+        target_placement.clone(),
+        config.clone(),
+        Some(start.operation_id.clone()),
+        LifecyclePredecessor::HostFenceRecovery {
+            interrupted_operation_id: start.operation_id.clone(),
+            host_lost_result_digest: host_lost_digest,
+            host_fence_event_id,
+            old_node_identity: OldNodeIdentity {
+                node_id: source_node,
+                immutable_host_id: id("host-a-lifecycle-host-fence-unavailable"),
+                state_path_id: id("state-a-lifecycle-host-fence-unavailable"),
+            },
+            takeover_authorization_ids: vec![VolumeAuthorizationId {
+                volume_id: slot.volume_id.clone(),
+                authorization_id: authorization_id.clone(),
+            }],
+            target_placement,
+        },
+        LifecycleCommand::Start(Box::new(StartSpec {
+            volume_authorities: vec![StartVolumeAuthority {
+                volume_id: slot.volume_id.clone(),
+                disk_id: slot.disk_id.clone(),
+                authority: RuntimeVolumeAuthorityInput::Takeover { authorization_id },
+            }],
+            source: StartSource::HostFenceRecovery,
+            effect_deadline_unix_ms: millis(20_000),
+        })),
+    )
+    .unwrap();
+    let LifecycleOperationState::Terminal { terminal, .. } = &stored_head.state else {
+        panic!("seeded lifecycle head is not terminal")
+    };
+    cats_api::runtime_lifecycle::validate_lifecycle_successor_with_predecessor_command(
+        Some(terminal.as_ref()),
+        Some(&start),
+        &recovery,
+    )
+    .unwrap();
+
+    assert_eq!(
+        store
+            .admit_lifecycle_command(&workspace, &recovery)
+            .unwrap(),
+        LifecycleCommandAdmission::Rejected(
+            LifecycleAdmissionRejection::HostFenceRecoveryUnavailable
+        )
+    );
+    assert!(store
+        .lifecycle_operation(&workspace, &recovery.operation_id)
+        .unwrap()
+        .is_none());
 }
 
 #[test]
