@@ -40,7 +40,9 @@ use super::rows::database_now;
 use crate::store::agent_sessions::{
     load_current_session_for_update, renew_current_session_deadline,
 };
-use crate::store::transaction::{AuthorityTransactionError, AuthorityTxResult};
+use crate::store::transaction::{
+    authority_rejection, AuthorityRequestDisposition, AuthorityTransactionError, AuthorityTxResult,
+};
 use crate::store::{internal, Result, Store};
 
 const ROUTE_OPERATION_COLUMNS: &str = "
@@ -111,6 +113,11 @@ struct RouteControllerCandidate {
     endpoint_id: Id,
 }
 
+enum RouteControllerCandidateOutcome {
+    Completed(bool),
+    Corrupt(ApiError),
+}
+
 impl Store {
     /// Poll the independent per-Endpoint Route lanes for one authenticated
     /// current AgentSession. A valid public-ring ACK advances its own durable
@@ -171,56 +178,39 @@ impl Store {
         let last = candidates
             .last()
             .map(|candidate| candidate.endpoint_id.clone());
-        let mut mutations = 0usize;
-        let mut failures = 0usize;
-        let mut completed = 0usize;
-        let mut first_failure = None;
-        for candidate in candidates {
-            // Generated outside the retrying transaction closure so an
-            // ambiguous PostgreSQL attempt replays one exact operation ID.
-            let proposed_operation_id = Id::new(format!("route_{}", uuid::Uuid::new_v4().simple()))
-                .ok_or_else(|| ApiError::internal("cannot construct Route operation identity"))?;
-            let result = self.authority_transaction(|transaction| {
-                reconcile_route_controller_candidate(
-                    transaction,
-                    &candidate,
-                    &proposed_operation_id,
-                )
-            });
-            match result {
-                Ok(changed) => {
-                    completed = completed.checked_add(1).ok_or_else(|| {
-                        ApiError::internal("Route controller completion count overflow")
-                    })?;
-                    mutations = mutations.checked_add(usize::from(changed)).ok_or_else(|| {
-                        ApiError::internal("Route controller mutation count overflow")
-                    })?;
-                }
-                Err(error) => {
-                    failures = failures.checked_add(1).ok_or_else(|| {
-                        ApiError::internal("Route controller failure count overflow")
-                    })?;
-                    tracing::warn!(
-                        cat_id = %candidate.cat_id,
-                        endpoint_id = %candidate.endpoint_id,
-                        %error,
-                        "one Endpoint Route candidate failed without aborting its sibling page"
-                    );
-                    if first_failure.is_none() {
-                        first_failure = Some(error);
+        let (mutations, failures) =
+            reconcile_route_controller_candidates(&candidates, |candidate| {
+                // Generated outside the retrying transaction closure so an
+                // ambiguous PostgreSQL attempt replays one exact operation ID.
+                let proposed_operation_id =
+                    Id::new(format!("route_{}", uuid::Uuid::new_v4().simple())).ok_or_else(
+                        || ApiError::internal("cannot construct Route operation identity"),
+                    )?;
+                self.authority_transaction_disposition(|transaction| {
+                    match reconcile_route_controller_candidate(
+                        transaction,
+                        candidate,
+                        &proposed_operation_id,
+                    ) {
+                        Ok(changed) => Ok(AuthorityRequestDisposition::Commit(
+                            RouteControllerCandidateOutcome::Completed(changed),
+                        )),
+                        Err(AuthorityTransactionError::Application(error)) => {
+                            Ok(AuthorityRequestDisposition::Reject(
+                                RouteControllerCandidateOutcome::Corrupt(error),
+                            ))
+                        }
+                        Err(AuthorityTransactionError::Domain(error)) => {
+                            Ok(AuthorityRequestDisposition::Reject(
+                                RouteControllerCandidateOutcome::Corrupt(authority_rejection(
+                                    error,
+                                )),
+                            ))
+                        }
+                        Err(error) => Err(error),
                     }
-                }
-            }
-        }
-        // A backend-wide failure generally affects every candidate. Preserve
-        // that signal instead of reporting a successful page. As soon as one
-        // independent candidate completed, however, the failed Cat cannot
-        // pin the ordered cursor in front of healthy siblings forever.
-        if completed == 0 {
-            if let Some(error) = first_failure {
-                return Err(error);
-            }
-        }
+                })
+            })?;
         Ok(RouteControllerPage {
             examined,
             mutations,
@@ -228,6 +218,36 @@ impl Store {
             next_after_endpoint_id: (examined == limit).then_some(last).flatten(),
         })
     }
+}
+
+fn reconcile_route_controller_candidates(
+    candidates: &[RouteControllerCandidate],
+    mut reconcile: impl FnMut(&RouteControllerCandidate) -> Result<RouteControllerCandidateOutcome>,
+) -> Result<(usize, usize)> {
+    let mut mutations = 0usize;
+    let mut failures = 0usize;
+    for candidate in candidates {
+        match reconcile(candidate) {
+            Ok(RouteControllerCandidateOutcome::Completed(changed)) => {
+                mutations = mutations.checked_add(usize::from(changed)).ok_or_else(|| {
+                    ApiError::internal("Route controller mutation count overflow")
+                })?;
+            }
+            Ok(RouteControllerCandidateOutcome::Corrupt(error)) => {
+                failures = failures
+                    .checked_add(1)
+                    .ok_or_else(|| ApiError::internal("Route controller failure count overflow"))?;
+                tracing::warn!(
+                    cat_id = %candidate.cat_id,
+                    endpoint_id = %candidate.endpoint_id,
+                    %error,
+                    "one Endpoint Route candidate failed without aborting its sibling page"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((mutations, failures))
 }
 
 fn list_route_controller_candidates(
@@ -1617,4 +1637,37 @@ fn corrupt(error: impl std::fmt::Display) -> AuthorityTransactionError {
     AuthorityTransactionError::Application(internal(format!(
         "atomic Route authority invariant failed: {error}"
     )))
+}
+
+#[cfg(test)]
+mod failure_isolation_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    #[test]
+    fn backend_failure_aborts_candidate_page_before_second_attempt() {
+        let candidates = [
+            RouteControllerCandidate {
+                workspace_id: Id::new("workspace-route-backend-failure").unwrap(),
+                cat_id: Id::new("cat-a-route-backend-failure").unwrap(),
+                endpoint_id: Id::new("endpoint-a-route-backend-failure").unwrap(),
+            },
+            RouteControllerCandidate {
+                workspace_id: Id::new("workspace-route-backend-failure").unwrap(),
+                cat_id: Id::new("cat-b-route-backend-failure").unwrap(),
+                endpoint_id: Id::new("endpoint-b-route-backend-failure").unwrap(),
+            },
+        ];
+        let attempts = AtomicUsize::new(0);
+
+        let error = reconcile_route_controller_candidates(&candidates, |_| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err(ApiError::unavailable("injected PostgreSQL outage"))
+        })
+        .expect_err("backend failure must abort the candidate page");
+
+        assert_eq!(error.code, cats_api::error::ErrorCode::Unavailable);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
 }

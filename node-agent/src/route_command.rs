@@ -18,7 +18,7 @@ use cats_api::agent_registration::{
     NODE_CREDENTIAL_ID_HEADER, NODE_PUBLIC_KEY_SPKI_HEADER, NODE_SIGNATURE_HEADER,
 };
 use cats_api::runtime_reconciliation::{
-    AgentSession, ContractVersion, RandomId128, RouteGateBinding, Sequence, SessionBinding,
+    AgentSession, ContractVersion, Id, RandomId128, RouteGateBinding, Sequence, SessionBinding,
     Sha256Digest,
 };
 use cats_api::runtime_route::{
@@ -203,9 +203,27 @@ pub enum RouteCommandRunnerError {
 }
 
 struct ActiveRouteWorker {
-    operation_id: cats_api::runtime_reconciliation::Id,
+    operation_id: Id,
     request_fingerprint: Sha256Digest,
+    installed_serving: Option<InstalledServing>,
     task: tokio::task::JoinHandle<Result<(), RouteCommandRunnerError>>,
+}
+
+struct InstalledServing {
+    cat_id: Id,
+    endpoint_id: Id,
+    operation_id: Id,
+}
+
+struct RouteWorkerCompletion {
+    endpoint_id: Id,
+    completed: tokio::sync::mpsc::UnboundedSender<Id>,
+}
+
+impl Drop for RouteWorkerCompletion {
+    fn drop(&mut self) {
+        let _ = self.completed.send(self.endpoint_id.clone());
+    }
 }
 
 /// One process-owned Route delivery lane. Polling remains Node-scoped, but
@@ -217,8 +235,10 @@ pub struct RouteCommandRunner {
     registry: Arc<LifecycleAdmissionRegistry>,
     verifier: Arc<RouteGrantV2Verifier>,
     request_sequence: u64,
-    blocked: BTreeMap<cats_api::runtime_reconciliation::Id, String>,
-    workers: BTreeMap<cats_api::runtime_reconciliation::Id, ActiveRouteWorker>,
+    blocked: BTreeMap<Id, String>,
+    workers: BTreeMap<Id, ActiveRouteWorker>,
+    worker_finished_tx: tokio::sync::mpsc::UnboundedSender<Id>,
+    worker_finished_rx: tokio::sync::mpsc::UnboundedReceiver<Id>,
     shutdown: tokio::sync::watch::Receiver<bool>,
     worker_shutdown: tokio::sync::watch::Sender<bool>,
 }
@@ -237,6 +257,7 @@ impl RouteCommandRunner {
             });
         }
         let (worker_shutdown, _) = tokio::sync::watch::channel(false);
+        let (worker_finished_tx, worker_finished_rx) = tokio::sync::mpsc::unbounded_channel();
         Ok(Self {
             session,
             transport,
@@ -245,6 +266,8 @@ impl RouteCommandRunner {
             request_sequence: 1,
             blocked: BTreeMap::new(),
             workers: BTreeMap::new(),
+            worker_finished_tx,
+            worker_finished_rx,
             shutdown,
             worker_shutdown,
         })
@@ -277,7 +300,34 @@ impl RouteCommandRunner {
             // that request: Control's monotonic ACK replay guard correctly
             // treats a different body at the same sequence as a conflict.
             let batch = loop {
-                match self.transport.poll(exact_poll.clone()).await {
+                let poll_attempt = self.transport.poll(exact_poll.clone());
+                tokio::pin!(poll_attempt);
+                let event = tokio::select! {
+                    biased;
+                    endpoint_id = self.worker_finished_rx.recv() => {
+                        RoutePollEvent::WorkerFinished(endpoint_id)
+                    }
+                    changed = self.shutdown.changed() => RoutePollEvent::Shutdown(changed),
+                    attempt = &mut poll_attempt => RoutePollEvent::Attempt(attempt),
+                };
+                let attempt = match event {
+                    RoutePollEvent::Attempt(attempt) => attempt,
+                    RoutePollEvent::WorkerFinished(Some(endpoint_id)) => {
+                        self.reap_worker(&endpoint_id).await?;
+                        continue;
+                    }
+                    RoutePollEvent::WorkerFinished(None) => return Ok(()),
+                    RoutePollEvent::Shutdown(changed) => {
+                        if changed.is_err() {
+                            self.shutdown = closed_shutdown_receiver();
+                        }
+                        if *self.shutdown.borrow() {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                };
+                match attempt {
                     RouteTransportAttempt::Accepted(batch) => {
                         validate_route_command_batch_for_poll(&batch, &poll, &self.session)
                             .map_err(|_| RouteCommandRunnerError::InvalidContract {
@@ -286,7 +336,7 @@ impl RouteCommandRunner {
                         break batch;
                     }
                     RouteTransportAttempt::RetryExact(_) => {
-                        self.wait_or_shutdown().await;
+                        self.wait_or_shutdown().await?;
                         if *self.shutdown.borrow() {
                             return Ok(());
                         }
@@ -312,7 +362,7 @@ impl RouteCommandRunner {
             // held long-poll. Pace an empty lane so a healthy idle Node does
             // not spin a signed HTTP/PG transaction loop.
             if idle || !made_progress {
-                self.wait_or_shutdown().await;
+                self.wait_or_shutdown().await?;
             }
         }
     }
@@ -340,11 +390,24 @@ impl RouteCommandRunner {
             }
 
             let response = execute_route_command(&self.registry, &command);
+            let installed_serving = match &response.result {
+                RouteNodeResult::Serving(serving) => Some(InstalledServing {
+                    cat_id: serving.binding.cat_id.clone(),
+                    endpoint_id: serving.binding.endpoint_id.clone(),
+                    operation_id: response.operation_id.clone(),
+                }),
+                RouteNodeResult::Closed(_) | RouteNodeResult::Rejected(_) => None,
+            };
             let transport = Arc::clone(&self.transport);
             let registry = Arc::clone(&self.registry);
             let session = self.session.clone();
             let shutdown = self.worker_shutdown.subscribe();
+            let completion = RouteWorkerCompletion {
+                endpoint_id: endpoint_id.clone(),
+                completed: self.worker_finished_tx.clone(),
+            };
             let task = tokio::spawn(async move {
+                let _completion = completion;
                 settle_exact_response(registry, transport, session, response, shutdown).await
             });
             self.workers.insert(
@@ -352,6 +415,7 @@ impl RouteCommandRunner {
                 ActiveRouteWorker {
                     operation_id: command.operation_id,
                     request_fingerprint: command.request_fingerprint,
+                    installed_serving,
                     task,
                 },
             );
@@ -370,36 +434,42 @@ impl RouteCommandRunner {
             .collect::<Vec<_>>();
         let mut global_error = None;
         for endpoint_id in finished {
-            let worker = self
-                .workers
-                .remove(&endpoint_id)
-                .expect("finished Route worker remained present");
-            match worker.task.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) if route_worker_error_is_node_global(&error) => {
-                    if global_error.is_none() {
-                        global_error = Some(error);
-                    }
-                }
-                Ok(Err(error)) => {
-                    tracing::error!(
-                        endpoint_id = %endpoint_id,
-                        %error,
-                        "blocking one failed Endpoint Route lane without stopping siblings"
-                    );
-                    self.blocked.insert(endpoint_id, error.to_string());
-                }
-                Err(error) => {
-                    tracing::error!(
-                        endpoint_id = %endpoint_id,
-                        %error,
-                        "blocking one panicked Endpoint Route lane without stopping siblings"
-                    );
-                    self.blocked.insert(endpoint_id, error.to_string());
+            if let Err(error) = self.reap_worker(&endpoint_id).await {
+                if global_error.is_none() {
+                    global_error = Some(error);
                 }
             }
         }
         global_error.map_or(Ok(()), Err)
+    }
+
+    async fn reap_worker(&mut self, endpoint_id: &Id) -> Result<(), RouteCommandRunnerError> {
+        let Some(worker) = self.workers.remove(endpoint_id) else {
+            return Ok(());
+        };
+        match worker.task.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) if route_worker_error_is_node_global(&error) => Err(error),
+            Ok(Err(error)) => {
+                tracing::error!(
+                    endpoint_id = %endpoint_id,
+                    %error,
+                    "blocking one failed Endpoint Route lane without stopping siblings"
+                );
+                self.blocked.insert(endpoint_id.clone(), error.to_string());
+                Ok(())
+            }
+            Err(error) => {
+                self.close_installed_serving(worker.installed_serving.as_ref())?;
+                tracing::error!(
+                    endpoint_id = %endpoint_id,
+                    %error,
+                    "closed and blocked one panicked Endpoint Route lane without stopping siblings"
+                );
+                self.blocked.insert(endpoint_id.clone(), error.to_string());
+                Ok(())
+            }
+        }
     }
 
     async fn finish_shutdown(&mut self) -> Result<(), RouteCommandRunnerError> {
@@ -420,6 +490,13 @@ impl RouteCommandRunner {
                     );
                 }
                 Err(error) => {
+                    if let Err(close_error) =
+                        self.close_installed_serving(worker.installed_serving.as_ref())
+                    {
+                        if first_global_error.is_none() {
+                            first_global_error = Some(close_error);
+                        }
+                    }
                     tracing::error!(
                         endpoint_id = %endpoint_id,
                         %error,
@@ -429,6 +506,19 @@ impl RouteCommandRunner {
             }
         }
         first_global_error.map_or(Ok(()), Err)
+    }
+
+    fn close_installed_serving(
+        &self,
+        installed: Option<&InstalledServing>,
+    ) -> Result<(), RouteCommandRunnerError> {
+        let Some(installed) = installed else {
+            return Ok(());
+        };
+        if let Some(cell) = self.registry.lookup(&installed.cat_id)? {
+            let _ = cell.emergency_close_route(&installed.endpoint_id, &installed.operation_id)?;
+        }
+        Ok(())
     }
 
     fn current_poll(&self) -> Result<RouteCommandPollRequest, RouteCommandRunnerError> {
@@ -484,16 +574,43 @@ impl RouteCommandRunner {
         Ok(())
     }
 
-    async fn wait_or_shutdown(&mut self) {
-        tokio::select! {
-            _ = tokio::time::sleep(RETRY_DELAY) => {}
-            changed = self.shutdown.changed() => {
+    async fn wait_or_shutdown(&mut self) -> Result<(), RouteCommandRunnerError> {
+        let event = tokio::select! {
+            biased;
+            endpoint_id = self.worker_finished_rx.recv() => {
+                RouteWaitEvent::WorkerFinished(endpoint_id)
+            }
+            changed = self.shutdown.changed() => RouteWaitEvent::Shutdown(changed),
+            _ = tokio::time::sleep(RETRY_DELAY) => RouteWaitEvent::Elapsed,
+        };
+        match event {
+            RouteWaitEvent::Elapsed => {}
+            RouteWaitEvent::WorkerFinished(Some(endpoint_id)) => {
+                self.reap_worker(&endpoint_id).await?;
+            }
+            RouteWaitEvent::WorkerFinished(None) => {
+                self.shutdown = closed_shutdown_receiver();
+            }
+            RouteWaitEvent::Shutdown(changed) => {
                 if changed.is_err() {
                     self.shutdown = closed_shutdown_receiver();
                 }
             }
         }
+        Ok(())
     }
+}
+
+enum RoutePollEvent {
+    Attempt(RouteTransportAttempt<RouteCommandBatch>),
+    WorkerFinished(Option<Id>),
+    Shutdown(Result<(), tokio::sync::watch::error::RecvError>),
+}
+
+enum RouteWaitEvent {
+    Elapsed,
+    WorkerFinished(Option<Id>),
+    Shutdown(Result<(), tokio::sync::watch::error::RecvError>),
 }
 
 async fn settle_exact_response(
@@ -891,6 +1008,7 @@ fn declared_response_exceeds(headers: &reqwest::header::HeaderMap, cap: usize) -
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     use cats_api::runtime_lifecycle::{
@@ -917,6 +1035,17 @@ mod tests {
     }
 
     struct AuthenticationRejectTransport;
+
+    struct AuthenticationRejectedWhilePollRetriesTransport {
+        command: RouteCommandEnvelope,
+        poll_calls: AtomicUsize,
+        retry_poll_started: Arc<tokio::sync::Notify>,
+    }
+
+    struct PanicAfterEnableCommitTransport {
+        panicked_endpoint_id: Id,
+        healthy_committed: Arc<tokio::sync::Notify>,
+    }
 
     impl RouteCommandTransport for DefinitiveRejectTransport {
         fn poll(&self, _exact_body: Vec<u8>) -> RoutePollFuture {
@@ -958,6 +1087,68 @@ mod tests {
                     status: 401,
                     error: RuntimeRouteError::AuthenticationFailed,
                 }
+            })
+        }
+    }
+
+    impl RouteCommandTransport for AuthenticationRejectedWhilePollRetriesTransport {
+        fn poll(&self, exact_body: Vec<u8>) -> RoutePollFuture {
+            let poll = cats_api::runtime_route::decode_route_command_poll_request(&exact_body)
+                .expect("runner emits one exact canonical poll");
+            if self.poll_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                let command = self.command.clone();
+                return Box::pin(async move {
+                    RouteTransportAttempt::Accepted(RouteCommandBatch {
+                        version: ContractVersion::V1,
+                        session: poll.session,
+                        request_sequence: poll.request_sequence,
+                        commands: vec![command],
+                    })
+                });
+            }
+            self.retry_poll_started.notify_one();
+            Box::pin(async {
+                RouteTransportAttempt::RetryExact(RouteTransportRetryReason::Transport)
+            })
+        }
+
+        fn commit(&self, _exact_body: Vec<u8>) -> RouteCommitFuture {
+            let retry_poll_started = Arc::clone(&self.retry_poll_started);
+            Box::pin(async move {
+                retry_poll_started.notified().await;
+                RouteTransportAttempt::Rejected {
+                    status: 401,
+                    error: RuntimeRouteError::AuthenticationFailed,
+                }
+            })
+        }
+    }
+
+    impl RouteCommandTransport for PanicAfterEnableCommitTransport {
+        fn poll(&self, _exact_body: Vec<u8>) -> RoutePollFuture {
+            Box::pin(async { panic!("direct dispatch test must not poll") })
+        }
+
+        fn commit(&self, exact_body: Vec<u8>) -> RouteCommitFuture {
+            let commit = cats_api::runtime_route::decode_route_result_commit_request(&exact_body)
+                .expect("runner emits one exact canonical commit");
+            if commit.response.endpoint_id == self.panicked_endpoint_id {
+                return Box::pin(async move {
+                    panic!("injected panic after the Enable result reached Control")
+                });
+            }
+            let healthy_committed = Arc::clone(&self.healthy_committed);
+            let acknowledgement = RouteResultStoredAck {
+                version: ContractVersion::V1,
+                node_id: commit.session.node_id,
+                endpoint_id: commit.response.endpoint_id.clone(),
+                operation_id: commit.response.operation_id.clone(),
+                request_fingerprint: commit.response.request_fingerprint.clone(),
+                terminal_result_digest: commit.terminal_result_digest,
+            };
+            Box::pin(async move {
+                healthy_committed.notify_one();
+                RouteTransportAttempt::Accepted(acknowledgement)
             })
         }
     }
@@ -1215,6 +1406,122 @@ mod tests {
             None,
             "an unaccepted Serving result retained a local gate"
         );
+    }
+
+    #[tokio::test]
+    async fn authentication_rejection_interrupts_a_permanently_retrying_poll() {
+        let session = session();
+        let admission_session = session_binding(&session);
+        let registry = LifecycleAdmissionRegistry::for_machine_test(admission_session.clone());
+        let (command, endpoint_id) =
+            enable_command(&registry, &admission_session, "auth-during-poll", 29);
+        let cat_id = command.binding.cat_id.clone();
+        let retry_poll_started = Arc::new(tokio::sync::Notify::new());
+        let transport = Arc::new(AuthenticationRejectedWhilePollRetriesTransport {
+            command,
+            poll_calls: AtomicUsize::new(0),
+            retry_poll_started,
+        });
+        let verifier = Arc::new(RouteGrantV2Verifier::new(
+            RouteGrantV2KeyRing::new(Epoch::new(1).unwrap(), Vec::new()).unwrap(),
+        ));
+        let (_shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+        let runner = RouteCommandRunner::new(
+            session,
+            transport.clone(),
+            registry.clone(),
+            verifier,
+            shutdown_rx,
+        )
+        .unwrap();
+
+        let error = tokio::time::timeout(Duration::from_secs(1), runner.run())
+            .await
+            .expect("Node-global commit rejection did not interrupt the retrying poll")
+            .expect_err("authentication rejection must stop the Route runner");
+        assert!(matches!(
+            error,
+            RouteCommandRunnerError::Rejected {
+                error: RuntimeRouteError::AuthenticationFailed,
+                ..
+            }
+        ));
+        assert!(transport.poll_calls.load(Ordering::SeqCst) >= 2);
+        assert_eq!(
+            registry
+                .lookup(&cat_id)
+                .unwrap()
+                .unwrap()
+                .current_serving_route(&endpoint_id)
+                .unwrap(),
+            None,
+            "the authentication-rejected Serving result retained its gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn panicked_enable_settlement_closes_only_its_exact_gate() {
+        let session = session();
+        let admission_session = session_binding(&session);
+        let registry = LifecycleAdmissionRegistry::for_machine_test(admission_session.clone());
+        let (panicked_command, panicked_endpoint) =
+            enable_command(&registry, &admission_session, "panic-after-enable", 31);
+        let panicked_cat = panicked_command.binding.cat_id.clone();
+        let (healthy_command, healthy_endpoint) =
+            enable_command(&registry, &admission_session, "panic-healthy", 37);
+        let healthy_cat = healthy_command.binding.cat_id.clone();
+        let healthy_committed = Arc::new(tokio::sync::Notify::new());
+        let transport = Arc::new(PanicAfterEnableCommitTransport {
+            panicked_endpoint_id: panicked_endpoint.clone(),
+            healthy_committed: Arc::clone(&healthy_committed),
+        });
+        let verifier = Arc::new(RouteGrantV2Verifier::new(
+            RouteGrantV2KeyRing::new(Epoch::new(1).unwrap(), Vec::new()).unwrap(),
+        ));
+        let (_shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut runner =
+            RouteCommandRunner::new(session, transport, registry.clone(), verifier, shutdown_rx)
+                .unwrap();
+
+        assert!(runner
+            .dispatch_batch(vec![panicked_command, healthy_command])
+            .unwrap());
+        tokio::time::timeout(Duration::from_secs(1), healthy_committed.notified())
+            .await
+            .expect("healthy sibling did not settle around the panicked worker");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runner
+                .workers
+                .values()
+                .any(|worker| !worker.task.is_finished())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Route workers did not reach terminal join states");
+        runner.reap_finished().await.unwrap();
+
+        assert!(runner.blocked.contains_key(&panicked_endpoint));
+        assert!(!runner.blocked.contains_key(&healthy_endpoint));
+        assert_eq!(
+            registry
+                .lookup(&panicked_cat)
+                .unwrap()
+                .unwrap()
+                .current_serving_route(&panicked_endpoint)
+                .unwrap(),
+            None,
+            "panicked Enable settlement retained its installed gate"
+        );
+        assert!(registry
+            .lookup(&healthy_cat)
+            .unwrap()
+            .unwrap()
+            .current_serving_route(&healthy_endpoint)
+            .unwrap()
+            .is_some());
+        runner.finish_shutdown().await.unwrap();
     }
 
     struct SupersededCommitTransport {
