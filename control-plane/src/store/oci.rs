@@ -61,7 +61,7 @@ impl Store {
             let row = match cats.as_slice() {
                 [] => return Err(ApiError::not_found("cat")),
                 [row] => row,
-                _ => return Err(internal("ambiguous Cat name or ID in v17 catalog")),
+                _ => return Err(internal("ambiguous Cat name or ID in v18 catalog")),
             };
             let cat_id = Id::new(row.try_get::<_, String>("cat_id").map_err(internal)?)
                 .ok_or_else(|| internal("stored Cat ID is invalid"))?;

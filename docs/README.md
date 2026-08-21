@@ -21,7 +21,7 @@ artifact与单一Guest release payload见
 决策状态、软件组成与production qualification是三个不同边界。当前Rust/SQL的唯一
 rolling inventory维护在[Architecture §3.1](architecture.md#31-当前实现事实)：
 
-- clean-slate schema 17的lifecycle、Volume、Route signed command lanes、Node-private journal/
+- clean-slate schema 18的lifecycle、Volume、Route signed command lanes、Node-private journal/
   StopFence、installed inventory与exact Control settlement已组成；
 - product route、CLI与Operation read已采用`create/run/suspend/warm/cold/destroy`，并隐藏private
   `Start/Stop/Delete/Killed`；这些Node-Control执行名称可保留，不增加产品状态。Route resolve使用
@@ -57,7 +57,7 @@ work-status和work acquire/release不在生产route map，显式retired harness�
 | [blockd protocol](specs/blockd-protocol.md) | Implemented data plane + target Volume Authority | Chunk/Map/FLUSH已实现；pack v2/grant adoption未实现 |
 | [Guest Runtime API](specs/guest-runtime-api.md) | Frozen v1 | `/run/cats/runtime.sock`、work lease |
 | [Interactive Shell](specs/interactive-shell-protocol.md) | Implemented v1 | WorkOS鉴权 WebSocket PTY |
-| [Atomic Runtime Lifecycle v1](specs/atomic-runtime-lifecycle-v1.md) | Implemented/Frozen internal v1 + product action projection；release gates open | schema 17、signed lane、journal/replay、Route/Volume interlock与六动作product adapter已组成；private Start/Stop/Delete/Killed不外泄，`run_required`与其他release gate见规格§11 |
+| [Atomic Runtime Lifecycle v1](specs/atomic-runtime-lifecycle-v1.md) | Implemented/Frozen internal v1 + product action projection；release gates open | schema 18、signed lane、journal/replay、Route/Volume interlock与六动作product adapter已组成；private Start/Stop/Delete/Killed不外泄，`run_required`与其他release gate见规格§11 |
 | [Runtime Reconciliation v1](specs/runtime-reconciliation-v1.md) | Superseded as lifecycle coordination | 已实现NodeIdentity/AgentSession/Host lock/full inventory foundation保留；Desired/reconcile/Observation settlement不进入atomic release |
 | [Agent Registration and Internal Transport v1](specs/agent-registration-transport-v1.md) | Implemented frozen v1 | per-Node签名、注册wire、lease与Guest receipt部署路径 |
 | [Runtime Inventory and Telemetry v1](specs/runtime-inventory-observation-v1.md) | Implemented/Frozen v1 | Full/Partial session-bound acceptance与freshness；无Desired delivery或settlement |
@@ -67,7 +67,7 @@ work-status和work acquire/release不在生产route map，显式retired harness�
 | [Immutable Image Manifest Read v1](specs/immutable-image-manifest-read-v1.md) | Implemented frozen v1 | golden manifest唯一DTO、canonical bytes、有界读取、Control只读组合与Cat-create v2 |
 | [Old Host Positive Stop Evidence v1](specs/old-host-positive-stop-v1.md) | Producer implemented；contract Proposed，未接受 | E13 systemd/process-tree正向停止与EC2 deny-all SG隔离候选receipt；非HostFence authority，production reset仍机械Blocked |
 | [Route Grant v2](specs/route-grant-v2.md) | Implemented/Frozen v2 | signed per-Endpoint lane、Serving/Session/RuntimeReady interlock、mandatory Node listener/delivery、Grant/guard/tunnel/gatewayd与`run_required` fixed vector已组成；旧`wake_required`严格拒绝，production mTLS/rotation qualification单列 |
-| [Route v2 Signing Authority v1](specs/route-signing-authority-v1.md) | Frozen，rotation core已组入schema 17 | 独立signer/ring、closed初装工件、Node durable successor安装与PG轮换/ACK/retirement；production trigger authority尚未Accepted |
+| [Route v2 Signing Authority v1](specs/route-signing-authority-v1.md) | Frozen，rotation core已组入schema 18 | 独立signer/ring、closed初装工件、Node durable successor安装与PG轮换/ACK/retirement；production trigger authority尚未Accepted |
 | [Volume Authority](specs/volume-authority.md) | Implemented/Frozen atomic authority；release gates open | internal run-grant renewal、Cold/destroy mixed disposition、Cold-only membership与Persistent initialization vertical已组成；product E2E、Snapshot/GC/Host-fence按qualification矩阵验收 |
 
 协议状态必须明确写 `Implemented/Frozen` 或 `Target, not implemented`。不存在“文档写了就算
@@ -120,6 +120,7 @@ work-status和work acquire/release不在生产route map，显式retired harness�
 - [0041 Node-verified route admission](decisions/0041-node-verified-route-admission.md)
 - [0056 atomic per-Cat runtime lifecycle](decisions/0056-atomic-per-cat-runtime-lifecycle.md)
 - [0057 产品动作与内部执行证据分层](decisions/0057-product-lifecycle-actions-and-internal-execution-evidence.md)
+- [0058 Route ring ACK 绑定不可变 AgentSession 历史](decisions/0058-route-ring-acknowledges-immutable-agent-session.md)
 - [0043 Provisioner-owned runtime placement policy](decisions/0043-provisioner-owned-runtime-placement-policy.md)
 - [0044 独立Route v2 signing authority](decisions/0044-independent-route-v2-signing-authority.md)
 - [0045 独立Gateway workload identity authority](decisions/0045-independent-gateway-workload-identity.md)

@@ -1,6 +1,6 @@
 # Atomic Runtime Lifecycle v1
 
-- 状态：Implemented/Frozen internal v1 + product action projection；release gates open。clean-slate schema 17、
+- 状态：Implemented/Frozen internal v1 + product action projection；release gates open。clean-slate schema 18、
   Control command/volume/Route lanes、Node installed lifecycle executor/journal/inventory/Route composition已组成，
   product route、CLI与Operation read已投影`create/run/suspend/warm/cold/destroy`并隐藏private
   `Start/Stop/Delete/Killed`。Node-Control private wire可保留这些执行名称；Route resolve已使用
@@ -1135,7 +1135,7 @@ physical/cgroup事实，但不能因此创造lifecycle authority。
 1. offline 构建并验证 exact Controller/Node/Route/Volume bundle；
 2. 停止所有旧写入者与数据面组件；
 3. 删除旧 Desired/reconcile/observation-settlement schema、parser、write path 与 credential；
-4. 清空开发 product/runtime state，创建 empty atomic schema 17；
+4. 清空开发 product/runtime state，创建 empty atomic schema 18；
 5. 所有 Node 以 Host lock + fresh AgentSession + complete inventory、AdmissionCell Closed 启动；
 6. Node/Route/Volume compatible version全部 ACK 后才启动 API/Gateway。
 

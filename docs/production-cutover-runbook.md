@@ -507,51 +507,36 @@ deploy/aws/run-postgres-probe.sh \
 The schema query must return exactly `15`. Starting Gateway here does not open public ingress;
 E12 and the future atomic qualifier still require every Node-local lifecycle/route gate Closed.
 
-For each Host, prepare/export its Host-local identity while the Node service is stopped:
+Prepare the canonical root-only Node manifest from reviewed provider/IaC
+inventory. Each entry contains exactly `node_id`, `instance_id`,
+`host_provider`, `host_partition`, `host_account_id`, `host_region`,
+`immutable_host_id`, `state_path_id`, `credential_id` and the absolute
+`policy_file`. Every policy is initial revision 1 and `cordoned`.
+
+Then run the one provisioning subflow. It stages the digest-pinned release CLI
+through SSM, performs Host-local prepare/export, signs and applies the public
+identity centrally, returns only the apply result to the same Host, activates
+the identity and retains exact-replay evidence:
 
 ```sh
-sudo /approved/staged-worker/cats \
-  admin runtime-provisioner node-identity prepare \
-  --node-id <EXACT_NODE_ID> \
-  --immutable-host-id <PROVIDER_VERIFIED_IMMUTABLE_HOST_ID> \
-  --state-path-id <FRESH_STATE_PATH_ID> \
-  --credential-id <FRESH_NODE_CREDENTIAL_ID>
-
-sudo /approved/staged-worker/cats \
-  admin runtime-provisioner node-identity export \
-  > /approved/cutover/<CUTOVER_ID>/<EXACT_NODE_ID>-node-identity.v1.json
-```
-
-From the central provisioner, apply the public identity and reviewed cordoned policy through the
-only signed authority route:
-
-```sh
-/approved/staged-worker/cats \
-  --api-url <FRESH_PRIVATE_CONTROL_ORIGIN> --json \
-  admin runtime-node provision \
-  --identity /approved/cutover/<CUTOVER_ID>/<EXACT_NODE_ID>-node-identity.v1.json \
-  --policy /approved/cutover/<CUTOVER_ID>/<EXACT_NODE_ID>-cordoned-policy.v1.json \
+deploy/aws/provision-cordoned-nodes.py \
+  --nodes /approved/cutover/<CUTOVER_ID>/cordoned-nodes.v1.json \
+  --cats-cli /approved/staged-worker/cats \
+  --cats-cli-sha256 <RELEASE_CATS_CLI_SHA256> \
+  --worker-bundle-s3-uri s3://<WORKER_ARTIFACT_BUCKET>/worker/<WORKER_BUNDLE_SHA256>/cats-worker.tar.zst \
+  --worker-bundle-sha256 <WORKER_BUNDLE_SHA256> \
+  --api-url <FRESH_PRIVATE_CONTROL_ORIGIN> \
   --deployment-id <FRESH_DEPLOYMENT_ID> \
   --provisioner-credential-id <FRESH_PROVISIONER_CREDENTIAL_ID> \
   --provisioner-private-key-file /approved/secrets/<CUTOVER_ID>/runtime-provisioner-key.pem \
-  > /approved/cutover/<CUTOVER_ID>/<EXACT_NODE_ID>-authority-result.tmp
-
-install -m 0600 \
-  /approved/cutover/<CUTOVER_ID>/<EXACT_NODE_ID>-authority-result.tmp \
-  /approved/evidence/<CUTOVER_ID>/50-<EXACT_NODE_ID>-authority-result.v1.json
+  --evidence-dir /approved/evidence/<CUTOVER_ID>/50-node-provisioning \
+  --aws-region <AWS_REGION>
 ```
 
-Return that exact result to the same Host and activate it:
-
-```sh
-sudo install -o root -g root -m 0600 \
-  /approved/evidence/<CUTOVER_ID>/50-<EXACT_NODE_ID>-authority-result.v1.json \
-  /approved/host-input/node-authority-result.v1.json
-
-sudo /approved/staged-worker/cats \
-  admin runtime-provisioner node-identity activate \
-  --apply-result /approved/host-input/node-authority-result.v1.json
-```
+The script fails if a worker is active, an identity or result conflicts with
+an exact replay, a policy is not initially cordoned, SSM fails, or activation
+does not reproduce the exported identity. The private provisioner key remains
+only on the central operator Host.
 
 Finally, update the existing production-infrastructure state with the exact worker bundle, Node
 Secret ARN/version and explicit Host map. Its reviewed plan must keep the current Usage resources

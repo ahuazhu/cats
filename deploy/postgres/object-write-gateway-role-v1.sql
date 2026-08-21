@@ -20,9 +20,24 @@ BEGIN
             LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE
             NOREPLICATION NOBYPASSRLS;
     ELSE
+        -- RDS master users have CREATEROLE but are deliberately not real
+        -- PostgreSQL superusers. PostgreSQL therefore rejects even an
+        -- idempotent ALTER ... NOSUPERUSER/NOREPLICATION/NOBYPASSRLS. Prove
+        -- those three privileged attributes are already closed, then only
+        -- normalize attributes a managed-service role administrator may
+        -- change.
+        IF EXISTS (
+            SELECT 1
+              FROM pg_roles
+             WHERE rolname='cats_object_write_gateway'
+               AND (rolsuper OR rolreplication OR rolbypassrls)
+        ) THEN
+            RAISE EXCEPTION
+                'object-write gateway PostgreSQL role has a privileged attribute'
+                USING ERRCODE = '42501';
+        END IF;
         ALTER ROLE cats_object_write_gateway
-            LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE
-            NOREPLICATION NOBYPASSRLS;
+            LOGIN NOINHERIT NOCREATEDB NOCREATEROLE;
     END IF;
 
     FOR membership IN

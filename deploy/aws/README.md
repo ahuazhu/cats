@@ -298,10 +298,25 @@ persists or exact-replays its monotonic trust revision before opening the
 administrator listener.
 
 The worker artifact also contains the exact release `cats` binary. Before the
-first worker association, an operator uses its offline
-`admin runtime-provisioner node-identity` prepare/export/activate flow and the
-official signed `admin runtime-node provision` command; the frozen crash-safe
-contract is [A23 Production Provisioner Tooling v1](../../docs/specs/a23-production-provisioner-tooling-v1.md).
+first worker association, the operator runs
+[`provision-cordoned-nodes.py`](provision-cordoned-nodes.py) once. It stages the
+digest-pinned CLI through SSM, performs the offline Host-local
+prepare/export, applies each public identity through the official signed
+`admin runtime-node provision` command, returns only the public apply result
+to that Host, activates it and writes exact-replay evidence. The provisioner
+private key never enters SSM, Terraform, a Node environment or an argument on
+the Node. The frozen crash-safe contract is
+[A23 Production Provisioner Tooling v1](../../docs/specs/a23-production-provisioner-tooling-v1.md).
+
+The `--nodes` file is a JSON array. Every entry contains exactly `node_id`,
+`instance_id`, `host_provider`, `host_partition`, `host_account_id`,
+`host_region`, `immutable_host_id`, `state_path_id`, `credential_id` and the
+absolute `policy_file`. Each policy must be canonical initial revision 1 and
+`cordoned`. Run the offline fixture after changing the orchestration:
+
+```sh
+python3 deploy/aws/provision-cordoned-nodes-fixture.py
+```
 
 The same cutover provisioner installs the canonical root-only local identity at
 `/etc/cats/identity/node-identity.v1.json`, with its matching per-Node key and credential ID. `cats-noded`

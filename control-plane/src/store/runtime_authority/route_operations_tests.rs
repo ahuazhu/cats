@@ -18,8 +18,9 @@ use cats_api::runtime_route::{
 
 use super::lifecycle_commands::{LifecycleCommandAdmission, LifecycleResultCommitOutcome};
 use super::lifecycle_commands_tests::{
-    digest, genesis_start, id, random, register_node, same_node_suspend, seed_cat, session_binding,
-    settle_genesis_runtime_ready, settle_genesis_runtime_ready_in_session, workspace_id,
+    digest, genesis_start, id, random, register_node, replace_session, same_node_suspend, seed_cat,
+    session_binding, settle_genesis_runtime_ready, settle_genesis_runtime_ready_in_session,
+    workspace_id,
 };
 use super::placement_policy::insert_policy_on_store_for_test;
 use super::placement_policy_tests::install_initial_signer_for_test;
@@ -35,6 +36,68 @@ struct EndpointRouteProjection {
     route_epoch: i64,
     route_head_operation_id: Option<String>,
     effective_serving_operation_id: Option<String>,
+}
+
+#[test]
+fn agent_session_replacement_survives_a_prior_route_ring_ack() {
+    let store = super::lifecycle_commands_tests::test_store();
+    let node = id("node-route-ring-ack-session-replacement");
+    let (authenticated, first_session) = register_node(&store, &node);
+    let ring = install_initial_signer_for_test(&store);
+    let loaded_kids = ring
+        .keys
+        .iter()
+        .map(|entry| entry.kid.clone())
+        .collect::<Vec<_>>();
+
+    let first_ack = RouteNodeRingAck::new(
+        session_binding(&first_session),
+        random(110),
+        Sequence::new(1).unwrap(),
+        ring.ring_version,
+        loaded_kids.clone(),
+    )
+    .unwrap();
+    assert!(matches!(
+        store
+            .poll_route_commands(
+                &authenticated,
+                &RouteCommandPollRequest::new(
+                    &first_session,
+                    Sequence::new(1).unwrap(),
+                    Some(first_ack),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        RouteCommandPollOutcome::Batch(_)
+    ));
+
+    let replacement = replace_session(&store, &authenticated, &first_session);
+    assert_eq!(replacement.agent_session_epoch.get(), 2);
+
+    let replacement_ack = RouteNodeRingAck::new(
+        session_binding(&replacement),
+        random(111),
+        Sequence::new(1).unwrap(),
+        ring.ring_version,
+        loaded_kids,
+    )
+    .unwrap();
+    assert!(matches!(
+        store
+            .poll_route_commands(
+                &authenticated,
+                &RouteCommandPollRequest::new(
+                    &replacement,
+                    Sequence::new(1).unwrap(),
+                    Some(replacement_ack),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        RouteCommandPollOutcome::Batch(_)
+    ));
 }
 
 #[test]

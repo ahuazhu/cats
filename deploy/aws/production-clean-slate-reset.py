@@ -80,7 +80,7 @@ CUTOVER_AUTHORITY_FIELDS = {
 MAX_JSON_BYTES = 64 * 1024
 MAX_LIST_PAGES = 100_000
 MAX_S3_ENTRIES = 5_000_000
-EXPECTED_FRESH_CONTROL_SCHEMA_VERSION = "16"
+EXPECTED_FRESH_CONTROL_SCHEMA_VERSION = "18"
 EXPECTED_FRESH_USAGE_SCHEMA_VERSION = "16"
 POST_GREEN_MAX_AGE_SECONDS = 15 * 60
 POSTGRES_QUERY_PARAMETERS = {
@@ -1713,7 +1713,7 @@ FROM outside;
         )
         if fresh_control["schema_version"] != EXPECTED_FRESH_CONTROL_SCHEMA_VERSION:
             raise ResetError(
-                "fresh control schema is not the required terminal schema version 16"
+                "fresh control schema is not the required terminal schema version 18"
             )
         fresh_usage = self._database_schema(
             self.new_usage_dsn,

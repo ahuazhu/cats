@@ -408,8 +408,8 @@ def validate_open_binding(value: Any) -> dict[str, Any]:
     for field in ("reset_id", "deployment_id", "release_id"):
         require_string(binding[field], ID, f"binding.{field}")
     require_string(binding["source_commit_sha"], COMMIT, "binding.source_commit_sha")
-    if binding["control_schema_version"] != 16:
-        raise AdmissionError("binding.control_schema_version must be 16")
+    if binding["control_schema_version"] != 18:
+        raise AdmissionError("binding.control_schema_version must be 18")
     for field in OPEN_BINDING_FIELDS - {
         "reset_id",
         "deployment_id",
@@ -437,8 +437,8 @@ def validate_qualification_binding(value: Any) -> dict[str, Any]:
     require_string(
         binding["source_commit_sha"], COMMIT, "qualification binding.source_commit_sha"
     )
-    if binding["control_schema_version"] != 16:
-        raise AdmissionError("qualification binding.control_schema_version must be 16")
+    if binding["control_schema_version"] != 18:
+        raise AdmissionError("qualification binding.control_schema_version must be 18")
     for field in (
         "source_manifest_sha256",
         "source_bundle_sha256",

@@ -83,7 +83,7 @@ ProductionCutoverProofSetV1 {
     aws_region: canonical region,
     cell_id: Id,
     cell_namespace: DNS label,
-    control_schema_version: 16,
+    control_schema_version: 18,
     targets: FreshTargetsV1
   },
   proofs: {
@@ -138,7 +138,7 @@ successful frozen build receipt must bind those four values, `exit_status=0`, `o
 `job_cgroup_drained=true`, and no forwarded AWS environment or reusable home. The manual release
 manifest must be v1, bind `source.commit`, and its exact file digest is the proof set's
 `artifact_sha256`. Both qualification manifests must bind that same release manifest, build receipt,
-source commit, schema 16 and worker bundle.
+source commit, Control schema 18 and worker bundle.
 
 ## 3. Terminal proof closed set
 
@@ -285,7 +285,7 @@ usage_terminal_sha256
 
 The ordered chain remains `reset-started -> s3-empty -> usage-transport-empty ->
 control-schema-empty -> usage-schema-empty -> reset-complete`. Each stage binds its predecessor.
-The terminal `fresh_namespace_proof` binds both `control_schema_version: "16"` and
+The terminal `fresh_namespace_proof` binds both `control_schema_version: "18"` and
 `usage_schema_version: "16"`; either fresh schema at another version fails before
 `reset-started` and on every forward replay.
 After `reset-started`, only the same exact invocation may resume. A missing receipt triggers live
@@ -296,14 +296,14 @@ resumable.
 
 ### 4.1 Bounded Qualification mode
 
-The same schema-16 build starts `Closed`, so its own G3/V3/V5 qualification cannot depend on a
+The same Control schema-18 build starts `Closed`, so its own G3/V3/V5 qualification cannot depend on a
 final Open receipt that does not exist yet. [ADR-0052](../decisions/0052-bounded-production-qualification-admission.md)
 adds the independent sum variant below; it is not a partial `OpenBinding`:
 
 ```text
 QualificationAdmissionBinding {
   qualification_id, deployment_id, release_id,
-  source_commit_sha, control_schema_version: 16,
+  source_commit_sha, control_schema_version: 18,
   source_manifest_sha256, source_bundle_sha256, build_receipt_sha256,
   release_manifest_sha256, worker_bundle_sha256,
   qualification_catalog_sha256, qualification_cell_manifest_sha256,

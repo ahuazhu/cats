@@ -1457,7 +1457,7 @@ fn partial_catalog_object(name: &str) -> ApiError {
     ))
 }
 
-/// The Control Store owns the exact clean-slate release stamp. Version 17 has
+/// The Control Store owns the exact clean-slate release stamp. Version 18 has
 /// no migration or compatibility reader/writer for an earlier authority shape.
 pub(super) const SCHEMA_VERSION: i64 = AUTHORITY_RELEASE_SCHEMA_VERSION;
 
@@ -1521,7 +1521,7 @@ const CONTROL_TABLES: &[&str] = &[
     "route_v2_public_ring_deliveries",
 ];
 
-// Version 17 is an empty-database cutover, not an additive migration. A
+// Version 18 is an empty-database cutover, not an additive migration. A
 // manually stamped database that still exposes any former product or Desired
 // authority must fail closed instead of letting old and atomic writers coexist.
 const FORBIDDEN_LEGACY_CONTROL_TABLES: &[&str] = &[
@@ -2589,7 +2589,7 @@ const REQUIRED_DEFERRED_FOREIGN_KEYS: &[RequiredDeferredForeignKey] = &[
     (
         "route_node_ring_acks",
         "route_node_ring_acks_exact_session_fkey",
-        "current_agent_sessions",
+        "agent_registration_attempts",
         "node_id,node_boot_id,agent_instance_id,admission_session_epoch",
         "node_id,node_boot_id,agent_instance_id,agent_session_epoch",
         "r",
@@ -2993,6 +2993,12 @@ const REQUIRED_UNIQUE_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
         "route_operations_one_successor_per_predecessor",
         "endpoint_id,expected_predecessor_operation_id",
         Some("(expected_predecessor_operation_id IS NOT NULL)"),
+    ),
+    (
+        "agent_registration_attempts",
+        "agent_registration_attempts_exact_session_binding_key",
+        "node_id,node_boot_id,agent_instance_id,agent_session_epoch",
+        None,
     ),
     (
         "current_agent_sessions",
@@ -6180,7 +6186,7 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission_commands (
         CHECK (source_commit_sha ~ '^[0-9a-f]{40}$'),
     control_schema_version BIGINT NOT NULL
         CONSTRAINT production_mutation_admission_commands_schema_ck
-        CHECK (control_schema_version = 17),
+        CHECK (control_schema_version = 18),
     source_manifest_sha256 TEXT NOT NULL
         CONSTRAINT production_mutation_admission_commands_source_manifest_ck
         CHECK (source_manifest_sha256 ~ '^sha256:[0-9a-f]{64}$'),
@@ -6372,7 +6378,7 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission (
         CHECK (source_commit_sha ~ '^[0-9a-f]{40}$'),
     control_schema_version BIGINT NULL
         CONSTRAINT production_mutation_admission_schema_ck
-        CHECK (control_schema_version = 17),
+        CHECK (control_schema_version = 18),
     source_manifest_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_source_manifest_ck
         CHECK (source_manifest_sha256 ~ '^sha256:[0-9a-f]{64}$'),
@@ -8486,7 +8492,12 @@ CREATE TABLE IF NOT EXISTS agent_registration_attempts (
     lease_deadline_unix_ms BIGINT NOT NULL CHECK (lease_deadline_unix_ms >= 0),
     PRIMARY KEY (node_id, registration_attempt_id),
     UNIQUE (node_id, agent_session_epoch),
-    UNIQUE (node_id, registration_attempt_id, agent_session_epoch)
+    UNIQUE (node_id, registration_attempt_id, agent_session_epoch),
+    CONSTRAINT agent_registration_attempts_exact_session_binding_key
+        UNIQUE (
+            node_id, node_boot_id, agent_instance_id,
+            agent_session_epoch
+        )
 );
 CREATE TABLE IF NOT EXISTS current_agent_sessions (
     node_id TEXT PRIMARY KEY REFERENCES node_identities(node_id),
@@ -8551,7 +8562,7 @@ CREATE TABLE IF NOT EXISTS route_node_ring_acks (
         FOREIGN KEY (
             node_id, node_boot_id, agent_instance_id,
             admission_session_epoch
-        ) REFERENCES current_agent_sessions (
+        ) REFERENCES agent_registration_attempts (
             node_id, node_boot_id, agent_instance_id,
             agent_session_epoch
         ) ON UPDATE RESTRICT ON DELETE RESTRICT
@@ -9140,6 +9151,29 @@ mod object_write_gateway_catalog_tests {
     }
 
     #[test]
+    fn existing_gateway_role_is_normalized_without_superuser_only_alter_options() {
+        let existing_role_alter = ROLE_INSTALLER
+            .split_once("ALTER ROLE cats_object_write_gateway")
+            .expect("role installer normalizes an existing role")
+            .1
+            .split_once(';')
+            .expect("existing-role ALTER terminates")
+            .0;
+        for privileged_option in ["NOSUPERUSER", "NOREPLICATION", "NOBYPASSRLS"] {
+            assert!(
+                !existing_role_alter.contains(privileged_option),
+                "RDS rejects privileged ALTER option {privileged_option}"
+            );
+        }
+        for catalog_flag in ["rolsuper", "rolreplication", "rolbypassrls"] {
+            assert!(
+                ROLE_INSTALLER.contains(catalog_flag),
+                "existing role does not fail closed on {catalog_flag}"
+            );
+        }
+    }
+
+    #[test]
     fn every_physical_dial_checks_identity_prosrc_and_ambient_privileges() {
         for required in [
             "current_user::TEXT, session_user::TEXT, current_schema()::TEXT",
@@ -9296,8 +9330,8 @@ mod atomic_lifecycle_schema_tests {
     };
 
     #[test]
-    fn v17_manifest_has_no_parallel_v1_or_desired_authority() {
-        assert_eq!(SCHEMA_VERSION, 17);
+    fn v18_manifest_has_no_parallel_v1_or_desired_authority() {
+        assert_eq!(SCHEMA_VERSION, 18);
         for table in FORBIDDEN_LEGACY_CONTROL_TABLES {
             assert!(!CONTROL_TABLES.contains(table));
             assert!(

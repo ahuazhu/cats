@@ -775,7 +775,8 @@ pub(crate) fn run(
             state.pending_path().display()
         ),
         ResponseClassification::Nonterminal => bail!(
-            "Runtime Node authority response was not terminal; retry the same command to replay apply {} (pending {})",
+            "Runtime Node authority HTTP status {} was not terminal; retry the same command to replay apply {} (pending {})",
+            response.status,
             pending.apply_id,
             state.pending_path().display()
         ),
