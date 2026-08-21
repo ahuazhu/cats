@@ -1289,11 +1289,11 @@ mod tests {
     use cats_api::runtime_inventory::{ObservedCatRuntimeTelemetry, ObservedRuntimePhysicalState};
     use cats_api::runtime_lifecycle::{
         decode_lifecycle_command_poll_request, decode_lifecycle_result_commit_request,
-        encode_lifecycle_command_batch, DiskRole, ImmutableRuntimeConfig, LifecycleCommand,
-        LifecyclePredecessor, NodeResult, PlacementIdentity, RuntimeNetworkConfig,
-        RuntimeReadyResult, RuntimeVolumeAuthorityInput, RuntimeVolumeConfig,
-        RuntimeVolumeGuestBinding, StartSource, StartSpec, StartVolumeAuthority,
-        VolumeTerminalReceipt,
+        encode_lifecycle_command_batch, DiskRole, ExecutionAbsenceProof, ImmutableRuntimeConfig,
+        KilledResult, LifecycleCommand, LifecyclePredecessor, NodeResult, PlacementIdentity,
+        RetainedEvidence, RuntimeNetworkConfig, RuntimeReadyResult, RuntimeVolumeAuthorityInput,
+        RuntimeVolumeConfig, RuntimeVolumeGuestBinding, StartSource, StartSpec,
+        StartVolumeAuthority, StopSpec, TerminalResultKind, VolumeTerminalReceipt,
     };
     use cats_api::runtime_reconciliation::{
         Durability, Epoch, FenceEpoch, Generation, Ipv4Address, MacAddress, NodeBootId,
@@ -1376,23 +1376,23 @@ mod tests {
             .expect("valid lifecycle response")
     }
 
-    fn runtime_config() -> ImmutableRuntimeConfig {
+    fn runtime_config(cat_id: &str) -> ImmutableRuntimeConfig {
         ImmutableRuntimeConfig::new(
-            id("config_runner"),
+            id(&format!("config_{cat_id}")),
             digest(5),
             2,
             512 * 1024 * 1024,
             digest(6),
             RuntimeNetworkConfig::IsolatedIpv4 {
-                network_id: id("network_runner"),
+                network_id: id(&format!("network_{cat_id}")),
                 guest_mac: MacAddress::new("02:00:00:00:00:11").expect("valid MAC"),
                 guest_ipv4: Ipv4Address::new("10.0.0.2").expect("valid guest IP"),
                 prefix_length: 30,
                 gateway_ipv4: Ipv4Address::new("10.0.0.1").expect("valid gateway IP"),
             },
             vec![RuntimeVolumeConfig {
-                volume_id: id("volume_runner_root"),
-                disk_id: id("disk_runner_root"),
+                volume_id: id(&format!("volume_{cat_id}_root")),
+                disk_id: id(&format!("disk_{cat_id}_root")),
                 disk_role: DiskRole::Root,
                 size_bytes: 1024 * 1024,
                 durability: Durability::Strict,
@@ -1413,13 +1413,16 @@ mod tests {
             node_id: id("node_runner"),
             placement_epoch: Epoch::new(1).expect("positive placement epoch"),
         };
+        let runtime_config = runtime_config(cat_id);
+        let root_volume_id = runtime_config.volumes[0].volume_id.clone();
+        let root_disk_id = runtime_config.volumes[0].disk_id.clone();
         LifecycleCommandEnvelope::new(
             id(operation_id),
             id("workspace_runner"),
             id(cat_id),
             placement.node_id.clone(),
             placement.clone(),
-            runtime_config(),
+            runtime_config,
             None,
             LifecyclePredecessor::Genesis {
                 cat_creation_id: id(cat_creation_id),
@@ -1427,8 +1430,8 @@ mod tests {
             },
             LifecycleCommand::Start(Box::new(StartSpec {
                 volume_authorities: vec![StartVolumeAuthority {
-                    volume_id: id("volume_runner_root"),
-                    disk_id: id("disk_runner_root"),
+                    volume_id: root_volume_id,
+                    disk_id: root_disk_id,
                     authority: RuntimeVolumeAuthorityInput::NormalUnowned {
                         expected_unowned_epoch: FenceEpoch::new(0).expect("zero fence epoch"),
                         transition_id: random(7),
@@ -1445,7 +1448,40 @@ mod tests {
         command_for("operation_runner_start", "cat_runner", "creation_runner")
     }
 
+    fn stop_command_for(
+        operation_id: &str,
+        predecessor_command: &LifecycleCommandEnvelope,
+        predecessor_response: &LifecycleCommandResponse,
+    ) -> LifecycleCommandEnvelope {
+        let terminal_result_digest =
+            LifecycleResultCommitRequest::new(&session(), predecessor_response.clone())
+                .expect("valid predecessor commit")
+                .terminal_result_digest;
+        LifecycleCommandEnvelope::new(
+            id(operation_id),
+            predecessor_response.workspace_id.clone(),
+            predecessor_response.cat_id.clone(),
+            predecessor_response.node_id.clone(),
+            predecessor_response.placement_identity.clone(),
+            predecessor_command.runtime_config().clone(),
+            Some(predecessor_response.operation_id.clone()),
+            LifecyclePredecessor::SameNode {
+                operation_id: predecessor_response.operation_id.clone(),
+                terminal_result_kind: TerminalResultKind::RuntimeReady,
+                terminal_result_digest,
+                node_id: predecessor_response.node_id.clone(),
+                placement_identity: predecessor_response.placement_identity.clone(),
+            },
+            LifecycleCommand::Stop(StopSpec {
+                grace_deadline_unix_ms: UnixMillis::new(9_000_000)
+                    .expect("valid Stop grace deadline"),
+            }),
+        )
+        .expect("valid Stop successor")
+    }
+
     fn ready_response(command: &LifecycleCommandEnvelope) -> LifecycleCommandResponse {
+        let root = &command.runtime_config.volumes[0];
         LifecycleCommandResponse::new(
             command,
             NodeResult::RuntimeReady(Box::new(RuntimeReadyResult {
@@ -1454,10 +1490,10 @@ mod tests {
                 execution_receipt_digest: digest(9),
                 guest_ready_receipt_digest: digest(10),
                 volume_receipts: vec![VolumeTerminalReceipt {
-                    volume_id: id("volume_runner_root"),
-                    disk_id: id("disk_runner_root"),
+                    volume_id: root.volume_id.clone(),
+                    disk_id: root.disk_id.clone(),
                     disk_role: DiskRole::Root,
-                    attachment_id: id("attachment_runner_root"),
+                    attachment_id: id(&format!("attachment_{}_root", command.cat_id)),
                     attachment_epoch: FenceEpoch::new(1).expect("positive fence epoch"),
                     local_durable_generation: Generation::new(1).expect("valid generation"),
                     remote_durable_generation: Generation::new(1).expect("valid generation"),
@@ -1466,6 +1502,40 @@ mod tests {
             })),
         )
         .expect("valid RuntimeReady result")
+    }
+
+    fn killed_response(command: &LifecycleCommandEnvelope) -> LifecycleCommandResponse {
+        LifecycleCommandResponse::new(
+            command,
+            NodeResult::Killed(Box::new(KilledResult {
+                stopped_runtime_incarnation: Some(random(8)),
+                execution_absence: ExecutionAbsenceProof {
+                    stop_fence_receipt_digest: digest(44),
+                    admission_closed_receipt_digest: digest(45),
+                    dedicated_scope_absence_receipt_digest: digest(46),
+                    frontend_absence_receipt_digest: digest(47),
+                    restart_source_absence_receipt_digest: digest(48),
+                },
+                stop_fence_receipt_digest: digest(44),
+                retained_volume_receipts: Vec::new(),
+                retained_evidence: RetainedEvidence {
+                    artifact_manifest_digest: digest(49),
+                    adoptable_count: 0,
+                    gc_candidate_count: 0,
+                    retained_authority_or_data_count: 0,
+                    quarantined_count: 0,
+                },
+            })),
+        )
+        .expect("valid Killed result")
+    }
+
+    fn terminal_response(command: &LifecycleCommandEnvelope) -> LifecycleCommandResponse {
+        match command.command {
+            LifecycleCommand::Start(_) => ready_response(command),
+            LifecycleCommand::Stop(_) => killed_response(command),
+            _ => panic!("test executor supports only Start and Stop"),
+        }
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -1660,6 +1730,13 @@ mod tests {
         release: Arc<tokio::sync::Notify>,
     }
 
+    struct OneCatBlockingExecutor {
+        blocked_cat_id: Id,
+        blocked_started: Arc<tokio::sync::Notify>,
+        release_blocked: Arc<tokio::sync::Notify>,
+        executed_cats: Mutex<Vec<Id>>,
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct StartupScanMarker {
         scan_id: RandomId128,
@@ -1685,8 +1762,8 @@ mod tests {
                         placement_epoch: Epoch::new(1).expect("positive placement epoch"),
                     },
                     observed_command_journal: None,
-                    observed_physical_state: ObservedRuntimePhysicalState::StoppedRetained,
-                    observed_runtime_incarnation: None,
+                    observed_physical_state: ObservedRuntimePhysicalState::Executing,
+                    observed_runtime_incarnation: Some(random(79)),
                     observed_artifact_manifest_digest: digest(80),
                     observed_artifact_classifications: Vec::new(),
                     observed_volumes: Vec::new(),
@@ -1843,6 +1920,17 @@ mod tests {
         }
     }
 
+    impl OneCatBlockingExecutor {
+        fn new(blocked_cat_id: Id) -> Arc<Self> {
+            Arc::new(Self {
+                blocked_cat_id,
+                blocked_started: Arc::new(tokio::sync::Notify::new()),
+                release_blocked: Arc::new(tokio::sync::Notify::new()),
+                executed_cats: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
     impl LifecycleCommandExecutor for BlockingExecutor {
         fn physical_inventory(&self) -> LifecycleInventoryFuture {
             Box::pin(async {
@@ -1891,6 +1979,81 @@ mod tests {
         }
     }
 
+    impl LifecycleCommandExecutor for OneCatBlockingExecutor {
+        fn physical_inventory(&self) -> LifecycleInventoryFuture {
+            Box::pin(async {
+                Ok(LifecyclePhysicalInventorySnapshot::physical_only(
+                    empty_physical_inventory(),
+                ))
+            })
+        }
+
+        fn bind_startup_inventory(
+            &self,
+            startup: LifecycleJournalStartupInventory,
+            _snapshot: Arc<LifecyclePhysicalInventorySnapshot>,
+        ) -> LifecycleStartupBindingFuture {
+            Box::pin(async move { Ok(startup) })
+        }
+
+        fn recover_terminal_admission(
+            &self,
+            _session: SessionBinding,
+            _current: StoredLifecycleJournal,
+            _startup_inventory: Arc<StartupPhysicalInventory>,
+        ) -> LifecycleTerminalAdmissionRecoveryFuture {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn execute(
+            &self,
+            journal: Arc<FileLifecycleCommandJournal>,
+            current: StoredLifecycleJournal,
+        ) -> LifecycleExecutionFuture {
+            let LifecycleJournalRecord::Command { command, .. } = current.record() else {
+                return Box::pin(async {
+                    Err(LifecycleExecutionError::Handler(anyhow::anyhow!(
+                        "completed Delete receipt reached executor"
+                    )))
+                });
+            };
+            let command = match command.decode_api() {
+                Ok(command) => command,
+                Err(error) => return Box::pin(async move { Err(error.into()) }),
+            };
+            let blocked = command.cat_id == self.blocked_cat_id;
+            if blocked {
+                self.blocked_started.notify_one();
+            }
+            self.executed_cats
+                .lock()
+                .expect("executed Cat mutex")
+                .push(command.cat_id.clone());
+            let release_blocked = Arc::clone(&self.release_blocked);
+            Box::pin(async move {
+                if blocked {
+                    release_blocked.notified().await;
+                }
+                let result = ExactCommandResult::from_api(&terminal_response(&command))?;
+                if matches!(&command.command, LifecycleCommand::Stop(_)) {
+                    let (fenced, token) = journal.record_stop_fence(
+                        &current,
+                        ExecutionStep {
+                            name: id("runner_test_strong_stop"),
+                            recovery_payload: ExactBytes::new(b"runtime-stopped".to_vec()),
+                        },
+                        ExactBytes::new(b"runner-test-stop-fence".to_vec()),
+                    )?;
+                    journal
+                        .complete_after_stop(&fenced, &token, result)
+                        .map_err(Into::into)
+                } else {
+                    journal.complete(&current, result).map_err(Into::into)
+                }
+            })
+        }
+    }
+
     async fn open_runner(
         directory: &TempDir,
         transport: Arc<FakeTransport>,
@@ -1917,13 +2080,8 @@ mod tests {
         transport.retry_one_commit();
         let executor = ReadyExecutor::new();
         let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
-        let runner = open_runner(
-            &directory,
-            Arc::clone(&transport),
-            executor.clone(),
-            shutdown_rx,
-        )
-        .await;
+        let runner =
+            open_runner(&directory, transport.clone(), executor.clone(), shutdown_rx).await;
         let task = tokio::spawn(runner.run());
 
         tokio::time::timeout(Duration::from_secs(2), transport.settled.notified())
@@ -1992,6 +2150,133 @@ mod tests {
             .expect("runner task joined")
             .expect("runner shutdown succeeded");
         assert_eq!(executor.executions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn noncooperative_cat_is_fenced_without_occupying_a_sibling_lane() {
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let blocked = command_for(
+            "operation_runner_blocked",
+            "cat_runner_blocked",
+            "creation_runner_blocked",
+        );
+        let healthy_predecessor = command_for(
+            "operation_runner_healthy_sibling_ready",
+            "cat_runner_healthy_sibling",
+            "creation_runner_healthy_sibling",
+        );
+        let healthy_ready = ready_response(&healthy_predecessor);
+        let healthy = stop_command_for(
+            "operation_runner_healthy_sibling",
+            &healthy_predecessor,
+            &healthy_ready,
+        );
+        let transport = FakeTransport::new(None);
+        let executor = OneCatBlockingExecutor::new(blocked.cat_id.clone());
+        let (_shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut runner = open_runner(
+            &directory,
+            Arc::clone(&transport),
+            executor.clone(),
+            shutdown_rx,
+        )
+        .await;
+
+        // The Stop has a real locally durable RuntimeReady predecessor. It is
+        // written after startup enumeration so only the Stop worker is under
+        // test; Control has already accepted the predecessor result.
+        let healthy_journal = FileLifecycleCommandJournal::open(
+            &directory.path().join(LIFECYCLE_JOURNAL_DIRECTORY_NAME),
+            &healthy.cat_id,
+        )
+        .expect("open healthy sibling journal");
+        let healthy_current = match healthy_journal
+            .admit_api(&healthy_predecessor, GenesisLocalInventory::ConfirmedEmpty)
+            .expect("admit healthy RuntimeReady predecessor")
+        {
+            AdmitCommandOutcome::Accepted(current) => current,
+            outcome => panic!("unexpected predecessor admission: {outcome:?}"),
+        };
+        healthy_journal
+            .complete(
+                &healthy_current,
+                ExactCommandResult::from_api(&healthy_ready)
+                    .expect("canonical healthy RuntimeReady result"),
+            )
+            .expect("persist healthy RuntimeReady predecessor");
+        drop(healthy_journal);
+
+        assert!(runner
+            .dispatch_batch(vec![blocked.clone(), healthy.clone()])
+            .expect("dispatch independent Cat workers"));
+        assert!(
+            runner.workers.contains_key(&healthy.cat_id),
+            "healthy Stop was not admitted: {:?}",
+            runner.blocked.get(&healthy.cat_id)
+        );
+        tokio::time::timeout(Duration::from_secs(1), executor.blocked_started.notified())
+            .await
+            .expect("blocked Cat entered its provider call");
+        if tokio::time::timeout(Duration::from_secs(1), transport.settled.notified())
+            .await
+            .is_err()
+        {
+            runner.reap_finished().await;
+            panic!(
+                "healthy sibling did not settle while the first Cat remained blocked: {:?}",
+                runner.blocked.get(&healthy.cat_id)
+            );
+        }
+        runner.reap_finished().await;
+        assert!(runner.workers.contains_key(&blocked.cat_id));
+        assert!(!runner.workers.contains_key(&healthy.cat_id));
+
+        let mut successor = blocked.clone();
+        successor.operation_id = id("operation_runner_blocked_successor");
+        successor.request_fingerprint = digest(42);
+        assert!(
+            !runner
+                .dispatch_batch(vec![successor])
+                .expect("same-Cat successor remains fenced"),
+            "an owned noncooperative Cat must retain its sole local effect lane"
+        );
+        assert!(runner.workers.contains_key(&blocked.cat_id));
+        assert!(!runner.blocked.contains_key(&healthy.cat_id));
+
+        let mut shutdown_join = Box::pin(runner.finish_shutdown());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), shutdown_join.as_mut())
+                .await
+                .is_err(),
+            "shutdown released the Host while an accepted physical effect was still owned"
+        );
+        executor.release_blocked.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), shutdown_join)
+            .await
+            .expect("shutdown joined the released Cat worker")
+            .expect("all Cat workers joined cleanly");
+
+        let executed = executor.executed_cats.lock().expect("executed Cat mutex");
+        assert!(executed.contains(&blocked.cat_id));
+        assert!(executed.contains(&healthy.cat_id));
+        assert_eq!(
+            executed.len(),
+            2,
+            "same-Cat successor never reached execute"
+        );
+        let commits = transport.commit_bodies.lock().expect("commit body mutex");
+        let healthy_commit = commits
+            .iter()
+            .map(|body| {
+                decode_lifecycle_result_commit_request(body)
+                    .expect("executor committed canonical terminal bytes")
+            })
+            .find(|commit| commit.response.cat_id == healthy.cat_id)
+            .expect("healthy Stop settled while sibling Start was blocked");
+        assert!(matches!(
+            healthy_commit.response.result,
+            NodeResult::Killed(_)
+        ));
     }
 
     #[tokio::test]
@@ -2206,6 +2491,139 @@ mod tests {
                 .expect("executed Cat mutex")
                 .as_slice(),
             [healthy.cat_id]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_bad_startup_cat_does_not_block_one_hundred_siblings_or_cat_101() {
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let healthy = (1..=100)
+            .map(|number| {
+                command_for(
+                    &format!("operation_runner_{number:03}"),
+                    &format!("cat_runner_{number:03}"),
+                    &format!("creation_runner_{number:03}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mismatched = command_for(
+            "operation_runner_bad",
+            "cat_runner_bad",
+            "creation_runner_bad",
+        );
+        for command in &healthy {
+            let journal = FileLifecycleCommandJournal::open(
+                &directory.path().join(LIFECYCLE_JOURNAL_DIRECTORY_NAME),
+                &command.cat_id,
+            )
+            .expect("open lifecycle journal");
+            let accepted = match journal
+                .admit_api(command, GenesisLocalInventory::ConfirmedEmpty)
+                .expect("admit startup command")
+            {
+                AdmitCommandOutcome::Accepted(accepted) => accepted,
+                other => panic!("healthy Running fixture was not admitted: {other:?}"),
+            };
+            journal
+                .complete(
+                    &accepted,
+                    ExactCommandResult::from_api(&ready_response(command))
+                        .expect("construct exact RuntimeReady result"),
+                )
+                .expect("persist healthy Running terminal");
+        }
+        let mismatched_journal = FileLifecycleCommandJournal::open(
+            &directory.path().join(LIFECYCLE_JOURNAL_DIRECTORY_NAME),
+            &mismatched.cat_id,
+        )
+        .expect("open mismatched lifecycle journal");
+        assert!(matches!(
+            mismatched_journal
+                .admit_api(&mismatched, GenesisLocalInventory::ConfirmedEmpty)
+                .expect("admit mismatched startup command"),
+            AdmitCommandOutcome::Accepted(_)
+        ));
+
+        let transport = FakeTransport::new(None);
+        let executor = StartupBindingExecutor::new(
+            mismatched.cat_id.clone(),
+            healthy
+                .iter()
+                .map(|command| command.cat_id.clone())
+                .chain(std::iter::once(mismatched.cat_id.clone())),
+        );
+        let (_shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+        let registry = LifecycleAdmissionRegistry::new_uninitialized();
+        let cache = StartupInventoryCache::new();
+        let mut runner = LifecycleCommandRunner::open(
+            StateDirectory::unanchored(directory.path().to_path_buf()),
+            session(),
+            transport.clone(),
+            executor.clone(),
+            Arc::clone(&registry),
+            Arc::clone(&cache),
+            shutdown_rx,
+        )
+        .await
+        .expect("open lifecycle runner");
+
+        assert_eq!(runner.pending_recovery.len(), 100);
+        assert!(runner.blocked_cats().contains_key(&mismatched.cat_id));
+        let joined = cache.take_joined().expect("take joined startup telemetry");
+        let bad_telemetry = joined
+            .cats
+            .iter()
+            .find(|cat| cat.cat_id == mismatched.cat_id)
+            .expect("quarantined Cat remains observable");
+        assert!(bad_telemetry.observed_conditions.iter().any(|condition| {
+            condition.kind == cats_api::runtime_inventory::ObservedRuntimeConditionKind::Quarantined
+        }));
+        assert!(matches!(
+            registry.lookup(&mismatched.cat_id),
+            Err(LifecycleAdmissionRegistryError::CatBlocked { .. })
+        ));
+        runner
+            .start_pending_recovery()
+            .expect("start every healthy Running terminal repost");
+        runner
+            .finish_shutdown()
+            .await
+            .expect("join every healthy Running terminal repost");
+        assert_eq!(executor.terminal_recoveries.load(Ordering::SeqCst), 100);
+        assert!(executor
+            .executed_cats
+            .lock()
+            .expect("executed Cat mutex")
+            .is_empty());
+
+        let newcomer = command_for(
+            "operation_runner_101",
+            "cat_runner_101",
+            "creation_runner_101",
+        );
+        assert!(runner
+            .dispatch_batch(vec![newcomer.clone()])
+            .expect("new Cat obtains an independent effect worker"));
+        runner
+            .finish_shutdown()
+            .await
+            .expect("new Cat settles independently");
+
+        let executed = executor
+            .executed_cats
+            .lock()
+            .expect("executed Cat mutex")
+            .clone();
+        assert_eq!(executed, vec![newcomer.cat_id]);
+        assert!(!executed.contains(&mismatched.cat_id));
+        assert_eq!(
+            transport
+                .commit_bodies
+                .lock()
+                .expect("commit body mutex")
+                .len(),
+            101,
+            "100 Running terminals and Cat 101 settle independently"
         );
     }
 

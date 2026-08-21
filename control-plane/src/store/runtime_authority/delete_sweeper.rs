@@ -1114,8 +1114,10 @@ mod tests {
         RuntimeInventoryReport,
     };
     use cats_api::runtime_lifecycle::{
-        DeleteSpec, ExecutionAbsenceProof, LifecycleOperation, LifecycleOperationState,
-        LifecyclePredecessor, RequestedVolumeDisposition,
+        CompletedVolumeDisposition, DeleteSpec, DeletedResult, ExecutionAbsenceProof,
+        LifecycleCommandResponse, LifecycleOperation, LifecycleOperationState,
+        LifecyclePredecessor, LifecycleResultCommitRequest, LifecycleTerminalResult, NodeResult,
+        RequestedVolumeDisposition, VolumeTerminalReceipt,
     };
     use cats_api::runtime_lifecycle_volume::LifecycleVolumeStrongStopEvidence;
     use cats_api::runtime_reconciliation::{
@@ -1133,9 +1135,12 @@ mod tests {
     };
     use cats_storage::{BlobError, BlobListPage, QualifiedDeleteListPage};
 
-    use super::super::lifecycle_commands::LifecycleCommandAdmission;
+    use super::super::lifecycle_commands::{
+        LifecycleCommandAdmission, LifecycleResultCommitOutcome,
+    };
     use super::super::lifecycle_commands_tests::{
-        genesis_start, seed_cat, session_binding, settle_genesis_runtime_ready, workspace_id,
+        genesis_start, register_node_with_credential_digest, seed_cat, session_binding,
+        settle_genesis_runtime_ready_in_session, workspace_id,
     };
     use super::super::lifecycle_volume_transitions::{
         LifecycleVolumeTransition, LifecycleVolumeTransitionApplied,
@@ -1227,6 +1232,7 @@ mod tests {
         command: DeleteCommandVolumeSet,
         root_durability: CommandVolumeDurabilityProof,
         strong_stop: LifecycleVolumeStrongStopEvidence,
+        root_normal_release: Option<(VolumeTerminalReceipt, Sha256Digest)>,
     }
 
     fn prepare_lifecycle_delete(
@@ -1251,7 +1257,26 @@ mod tests {
             store.admit_lifecycle_command(&workspace, &start).unwrap(),
             LifecycleCommandAdmission::Admitted(_)
         ));
-        let running = settle_genesis_runtime_ready(store, &node, &start, &config);
+        let suffix_bytes = suffix.as_bytes();
+        assert!(
+            suffix_bytes.len() < 32,
+            "Delete test suffix must fit in its deterministic credential digest"
+        );
+        let mut credential_digest = [0_u8; 32];
+        credential_digest[0] = suffix_bytes.len() as u8;
+        credential_digest[1..=suffix_bytes.len()].copy_from_slice(suffix_bytes);
+        let (authenticated, session) = register_node_with_credential_digest(
+            store,
+            &node,
+            Sha256Digest::from_bytes(credential_digest),
+        );
+        let running = settle_genesis_runtime_ready_in_session(
+            store,
+            &authenticated,
+            &session,
+            &start,
+            &config,
+        );
         let delete_id = id(&format!("delete-sweeper-{suffix}"));
         let operation = same_node_delete(
             &running.running_head,
@@ -1383,11 +1408,12 @@ mod tests {
             command,
             root_durability,
             strong_stop,
+            root_normal_release: None,
         }
     }
 
     fn seed_lifecycle_normal_delete(store: &Store, suffix: &str) -> PreparedLifecycleDelete {
-        let prepared = prepare_lifecycle_delete(store, suffix, false);
+        let mut prepared = prepare_lifecycle_delete(store, suffix, false);
         let request = LifecycleVolumeTransitionRequest {
             session: session_binding(&prepared.session),
             transition: LifecycleVolumeTransition::DeleteNormal {
@@ -1401,14 +1427,106 @@ mod tests {
                 strong_stop: Box::new(prepared.strong_stop.clone()),
             },
         };
-        assert!(matches!(
-            store
-                .apply_lifecycle_volume_transition(&prepared.authenticated, &request)
-                .unwrap(),
-            LifecycleVolumeTransitionOutcome::Applied(applied)
-                if matches!(*applied, LifecycleVolumeTransitionApplied::DeleteNormallyDeleting { .. })
+        let outcome = store
+            .apply_lifecycle_volume_transition(&prepared.authenticated, &request)
+            .unwrap();
+        let LifecycleVolumeTransitionOutcome::Applied(applied) = outcome else {
+            panic!("normal lifecycle Root delete was rejected: {outcome:?}")
+        };
+        let LifecycleVolumeTransitionApplied::DeleteNormallyDeleting { dispositions } = *applied
+        else {
+            panic!("normal lifecycle Root delete returned the wrong outcome")
+        };
+        let [super::super::lifecycle_volume_transitions::StoredVolumeDisposition::NormallyReleased(
+            released,
+        )] = dispositions.as_slice()
+        else {
+            panic!("normal lifecycle Root delete did not release exactly its Root")
+        };
+        let proof = &released.receipt.durability;
+        prepared.root_normal_release = Some((
+            VolumeTerminalReceipt {
+                volume_id: proof.volume.volume_id.clone(),
+                disk_id: proof.volume.disk_id.clone(),
+                disk_role: proof.volume.disk_role,
+                attachment_id: proof.volume.attachment_id.clone(),
+                attachment_epoch: proof.volume.attachment_epoch,
+                local_durable_generation: proof.local_durable_generation,
+                remote_durable_generation: proof.remote_durable_generation,
+                authority_receipt_digest: Some(released.receipt_digest.clone()),
+            },
+            released.receipt_digest.clone(),
         ));
         prepared
+    }
+
+    async fn sweep_and_settle_normal_delete(
+        store: Arc<Store>,
+        prepared: &PreparedLifecycleDelete,
+    ) -> LifecycleResultCommitRequest {
+        let sweeper = DeleteSweeper::new(store.clone(), Arc::new(MemoryBlob::default()));
+        let pass = sweeper
+            .run_once(
+                DeleteSweepBudget::new(1, 1).unwrap(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pass.completions_committed, 1);
+
+        let discovered = store
+            .apply_lifecycle_volume_transition(
+                &prepared.authenticated,
+                &LifecycleVolumeTransitionRequest {
+                    session: session_binding(&prepared.session),
+                    transition: LifecycleVolumeTransition::DiscoverDeleteCompletion {
+                        command: prepared.command.clone(),
+                    },
+                },
+            )
+            .unwrap();
+        let LifecycleVolumeTransitionOutcome::Applied(discovered) = discovered else {
+            panic!("completed Delete was not discoverable")
+        };
+        let LifecycleVolumeTransitionApplied::DeleteCompleted {
+            receipt: completion,
+            receipt_digest: completion_digest,
+        } = *discovered
+        else {
+            panic!("Delete discovery returned the wrong transition kind")
+        };
+        assert_eq!(completion.command, prepared.command);
+        let (released_root, _) = prepared
+            .root_normal_release
+            .as_ref()
+            .expect("normal Delete retained its exact release projection");
+        let response = LifecycleCommandResponse::new(
+            &prepared.operation,
+            NodeResult::Deleted(Box::new(DeletedResult {
+                execution_absence: prepared.strong_stop.execution_absence.clone(),
+                volume_dispositions: vec![CompletedVolumeDisposition::RootNormallyDeleted {
+                    volume: Box::new(released_root.clone()),
+                    delete_completion_receipt_digest: completion_digest,
+                }],
+                destructive_cleanup_absent_digest: digest(230),
+            })),
+        )
+        .expect("construct the real Node Deleted result");
+        let commit = LifecycleResultCommitRequest::new(&prepared.session, response)
+            .expect("construct exact Deleted settlement");
+        assert!(matches!(
+            store
+                .commit_lifecycle_result(&prepared.authenticated, &commit)
+                .unwrap(),
+            LifecycleResultCommitOutcome::Stored { ref operation, .. }
+                if matches!(
+                    &operation.state,
+                    LifecycleOperationState::Terminal { terminal, .. }
+                        if matches!(terminal.as_ref(), LifecycleTerminalResult::NodeResult { response }
+                            if matches!(&response.result, NodeResult::Deleted(_)))
+                )
+        ));
+        commit
     }
 
     fn seed_lifecycle_disposable_delete(
@@ -1932,14 +2050,53 @@ mod tests {
                 },
             )
             .unwrap();
+        let LifecycleVolumeTransitionOutcome::Applied(discovered) = discovered else {
+            panic!("completed Delete was not discoverable")
+        };
+        let LifecycleVolumeTransitionApplied::DeleteCompleted {
+            receipt: completion,
+            receipt_digest: completion_digest,
+        } = *discovered
+        else {
+            panic!("Delete discovery returned the wrong transition kind")
+        };
+        assert_eq!(completion.command, prepared.command);
+        let (released_root, _) = prepared
+            .root_normal_release
+            .as_ref()
+            .expect("normal Delete retained its exact release projection");
+        let response = LifecycleCommandResponse::new(
+            &prepared.operation,
+            NodeResult::Deleted(Box::new(DeletedResult {
+                execution_absence: prepared.strong_stop.execution_absence.clone(),
+                volume_dispositions: vec![CompletedVolumeDisposition::RootNormallyDeleted {
+                    volume: Box::new(released_root.clone()),
+                    delete_completion_receipt_digest: completion_digest,
+                }],
+                destructive_cleanup_absent_digest: digest(230),
+            })),
+        )
+        .expect("construct the real Node Deleted result");
+        let commit = LifecycleResultCommitRequest::new(&prepared.session, response)
+            .expect("construct exact Deleted settlement");
+        let stored = store
+            .commit_lifecycle_result(&prepared.authenticated, &commit)
+            .unwrap();
         assert!(matches!(
-            discovered,
-            LifecycleVolumeTransitionOutcome::Applied(applied)
+            stored,
+            LifecycleResultCommitOutcome::Stored { ref operation, .. }
                 if matches!(
-                    *applied,
-                    LifecycleVolumeTransitionApplied::DeleteCompleted { ref receipt, .. }
-                        if receipt.command == prepared.command
+                    &operation.state,
+                    LifecycleOperationState::Terminal { terminal, .. }
+                        if matches!(terminal.as_ref(), LifecycleTerminalResult::NodeResult { response }
+                            if matches!(&response.result, NodeResult::Deleted(_)))
                 )
+        ));
+        assert!(matches!(
+            store
+                .commit_lifecycle_result(&prepared.authenticated, &commit)
+                .unwrap(),
+            LifecycleResultCommitOutcome::ExactReplay { .. }
         ));
         store
             .authority_transaction(|transaction| {
@@ -1953,9 +2110,88 @@ mod tests {
                     &prepared.command.root_disposition.root.disk_id
                 )?
                 .is_none());
+                let active: i64 = transaction
+                    .query_one(
+                        "SELECT count(*) FROM cat_records
+                          WHERE cat_id=$1 AND deleted_at IS NULL",
+                        &[&prepared.operation.cat_id.as_str()],
+                    )?
+                    .try_get(0)?;
+                let history: i64 = transaction
+                    .query_one(
+                        "SELECT count(*) FROM cat_records WHERE cat_id=$1",
+                        &[&prepared.operation.cat_id.as_str()],
+                    )?
+                    .try_get(0)?;
+                assert_eq!(active, 0, "Deleted Cat left active membership");
+                assert_eq!(history, 1, "Deleted Cat immutable history was lost");
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeated_deleted_settlement_releases_every_active_assignment_projection() {
+        let store = Arc::new(
+            Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap(),
+        );
+
+        for round in 1_i64..=3 {
+            let prepared =
+                seed_lifecycle_normal_delete(&store, &format!("repeated-retirement-{round}"));
+            let commit = sweep_and_settle_normal_delete(store.clone(), &prepared).await;
+            assert!(matches!(
+                store
+                    .commit_lifecycle_result(&prepared.authenticated, &commit)
+                    .unwrap(),
+                LifecycleResultCommitOutcome::ExactReplay { .. }
+            ));
+
+            store
+                .authority_transaction(|transaction| {
+                    let active = transaction.query_one(
+                        "SELECT count(*) AS assigned,
+                                COALESCE(sum(config.placement_vcpus), 0)::bigint AS vcpus,
+                                COALESCE(sum(config.placement_memory_bytes), 0)::bigint AS memory,
+                                count(config.placement_ipv4_slot) AS network_slots
+                           FROM cat_records cat
+                           JOIN cat_runtime_configs config
+                             ON config.workspace_id=cat.workspace_id
+                            AND config.cat_id=cat.cat_id
+                            AND config.config_id=cat.current_runtime_config_id
+                            AND config.canonical_config_sha256=cat.current_runtime_config_sha256
+                          WHERE cat.deleted_at IS NULL",
+                        &[],
+                    )?;
+                    assert_eq!(active.try_get::<_, i64>("assigned")?, 0);
+                    assert_eq!(active.try_get::<_, i64>("vcpus")?, 0);
+                    assert_eq!(active.try_get::<_, i64>("memory")?, 0);
+                    assert_eq!(active.try_get::<_, i64>("network_slots")?, 0);
+
+                    let history: i64 = transaction
+                        .query_one("SELECT count(*) FROM cat_records", &[])?
+                        .try_get(0)?;
+                    let deleted_results: i64 = transaction
+                        .query_one(
+                            "SELECT count(*) FROM runtime_operations
+                              WHERE state='terminal' AND terminal_result_kind='deleted'",
+                            &[],
+                        )?
+                        .try_get(0)?;
+                    let completion_receipts: i64 = transaction
+                        .query_one(
+                            "SELECT count(*) FROM lifecycle_volume_receipts
+                              WHERE receipt_kind='delete_completion'",
+                            &[],
+                        )?
+                        .try_get(0)?;
+                    assert_eq!(history, round);
+                    assert_eq!(deleted_results, round);
+                    assert_eq!(completion_receipts, round);
+                    Ok(())
+                })
+                .unwrap();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

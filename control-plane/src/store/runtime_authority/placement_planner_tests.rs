@@ -1,6 +1,7 @@
 //! PostgreSQL acceptance tests for clean-slate atomic lifecycle placement.
 
 use cats_api::agent_registration::AuthenticatedNodeCredential;
+use cats_api::error::ErrorCode;
 use cats_api::runtime_inventory::{
     full_inventory_digest, RuntimeInventoryBody, RuntimeInventoryReport,
 };
@@ -260,4 +261,123 @@ fn planner_rejects_a_network_identity_retained_in_config_history() {
             .unwrap(),
         CatCreatePlacementLoad::CandidateIdentityCollision
     );
+}
+
+#[test]
+fn malformed_sibling_config_does_not_block_placement_and_retains_its_capacity_claim() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let release = release();
+    let guest_digest = guest_config_digest(&release).unwrap();
+    let node = establish_node(
+        &store,
+        &release,
+        "malformed_sibling",
+        40,
+        RuntimeSchedulingState::Schedulable,
+        true,
+    );
+    let workspace =
+        super::lifecycle_commands_tests::workspace_id(&store, "planner-malformed-sibling");
+    let sibling_cat = id("cat_planner_malformed_sibling");
+    let creation = id("creation_planner_malformed_sibling");
+    let sibling_config =
+        super::lifecycle_commands_tests::seed_cat(&store, &workspace, &sibling_cat, &creation);
+    let start = super::lifecycle_commands_tests::genesis_start(
+        &workspace,
+        &node,
+        &sibling_cat,
+        &creation,
+        "operation_planner_malformed_sibling",
+        &sibling_config,
+    );
+    assert!(matches!(
+        store.admit_lifecycle_command(&workspace, &start).unwrap(),
+        super::lifecycle_commands::LifecycleCommandAdmission::Admitted(_)
+    ));
+    store
+        .authority_transaction(|transaction| {
+            transaction.batch_execute(
+                "ALTER TABLE cat_runtime_configs
+                     DISABLE TRIGGER cat_runtime_config_cannot_update",
+            )?;
+            transaction.execute(
+                "UPDATE cat_runtime_configs
+                    SET canonical_config_bytes=$1
+                  WHERE config_id=$2",
+                &[
+                    &&b"{not-canonical-json"[..],
+                    &sibling_config.config_id.as_str(),
+                ],
+            )?;
+            transaction.batch_execute(
+                "ALTER TABLE cat_runtime_configs
+                     ENABLE TRIGGER cat_runtime_config_cannot_update",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let mut over_capacity = request(&guest_digest, "net_malformed_sibling_over_capacity");
+    over_capacity.vcpus = 8;
+    assert_eq!(
+        store.plan_cat_create_placement(&over_capacity).unwrap(),
+        CatCreatePlacementLoad::Unavailable {
+            first_rejection: Some((node.clone(), PlacementCandidateRejection::InsufficientVcpus)),
+        }
+    );
+
+    let mut fits = request(&guest_digest, "net_malformed_sibling_fits");
+    fits.vcpus = 7;
+    let plan = match store.plan_cat_create_placement(&fits).unwrap() {
+        CatCreatePlacementLoad::Planned(plan) => *plan,
+        other => panic!("malformed sibling blocked an otherwise eligible Cat: {other:?}"),
+    };
+    assert_eq!(plan.target.node_identity.node_id, node);
+
+    // The bytes remain Cat-local, but a normalized pool mismatch makes shared
+    // Node network capacity unknowable and must fail the candidate closed.
+    // This preserves the old policy check without decoding the sibling body.
+    store
+        .authority_transaction(|transaction| {
+            transaction.batch_execute(
+                "ALTER TABLE cat_runtime_configs
+                     DISABLE TRIGGER cat_runtime_config_cannot_update",
+            )?;
+            transaction.execute(
+                "UPDATE cat_runtime_configs
+                    SET placement_ipv4_pool_base=0
+                  WHERE config_id=$1",
+                &[&sibling_config.config_id.as_str()],
+            )?;
+            transaction.batch_execute(
+                "ALTER TABLE cat_runtime_configs
+                     ENABLE TRIGGER cat_runtime_config_cannot_update",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let pool_error = store
+        .plan_cat_create_placement(&fits)
+        .expect_err("active sibling pool drift must close Node allocation");
+    assert_eq!(pool_error.code, ErrorCode::Internal);
+
+    // Exact Deleted settlement is exercised through the real Delete sweeper
+    // and lifecycle result commit. Here isolate the placement projection:
+    // once that authoritative transition sets deleted_at, neither the
+    // retained immutable config nor its malformed full bytes may consume
+    // active vCPU, memory, or IPv4-slot capacity.
+    store
+        .authority_transaction(|transaction| {
+            transaction.execute(
+                "UPDATE cat_records SET deleted_at=2 WHERE cat_id=$1",
+                &[&sibling_cat.as_str()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let released = match store.plan_cat_create_placement(&over_capacity).unwrap() {
+        CatCreatePlacementLoad::Planned(plan) => *plan,
+        other => panic!("Deleted sibling retained active placement capacity: {other:?}"),
+    };
+    assert_eq!(released.target.node_identity.node_id, node);
 }

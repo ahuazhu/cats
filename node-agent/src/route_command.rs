@@ -6,6 +6,7 @@
 //! it. A process/session loss closes every registry gate, so an old response
 //! cannot authorize a replacement AgentSession.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -201,15 +202,25 @@ pub enum RouteCommandRunnerError {
     },
 }
 
-/// One process-owned Route delivery lane. Commands are endpoint-ordered in a
-/// poll batch and each exact result is settled before the next poll.
+struct ActiveRouteWorker {
+    operation_id: cats_api::runtime_reconciliation::Id,
+    request_fingerprint: Sha256Digest,
+    task: tokio::task::JoinHandle<Result<(), RouteCommandRunnerError>>,
+}
+
+/// One process-owned Route delivery lane. Polling remains Node-scoped, but
+/// every Endpoint owns an independent result-settlement worker so one Cat's
+/// unavailable or corrupt Control row cannot serialize unrelated gates.
 pub struct RouteCommandRunner {
     session: AgentSession,
     transport: Arc<dyn RouteCommandTransport>,
     registry: Arc<LifecycleAdmissionRegistry>,
     verifier: Arc<RouteGrantV2Verifier>,
     request_sequence: u64,
+    blocked: BTreeMap<cats_api::runtime_reconciliation::Id, String>,
+    workers: BTreeMap<cats_api::runtime_reconciliation::Id, ActiveRouteWorker>,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    worker_shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 impl RouteCommandRunner {
@@ -225,18 +236,33 @@ impl RouteCommandRunner {
                 context: "registry AgentSession differs from Route runner",
             });
         }
+        let (worker_shutdown, _) = tokio::sync::watch::channel(false);
         Ok(Self {
             session,
             transport,
             registry,
             verifier,
             request_sequence: 1,
+            blocked: BTreeMap::new(),
+            workers: BTreeMap::new(),
             shutdown,
+            worker_shutdown,
         })
     }
 
     pub async fn run(mut self) -> Result<(), RouteCommandRunnerError> {
+        let run_result = self.run_loop().await;
+        let _ = self.worker_shutdown.send(true);
+        let shutdown_result = self.finish_shutdown().await;
+        match (run_result, shutdown_result) {
+            (Err(error), _) => Err(error),
+            (Ok(()), result) => result,
+        }
+    }
+
+    async fn run_loop(&mut self) -> Result<(), RouteCommandRunnerError> {
         loop {
+            self.reap_finished().await?;
             if *self.shutdown.borrow() {
                 return Ok(());
             }
@@ -280,18 +306,129 @@ impl RouteCommandRunner {
                 }
             };
             let idle = batch.commands.is_empty();
-            for command in batch.commands {
-                let response = execute_route_command(&self.registry, &command);
-                self.settle_exact(response).await?;
-            }
+            let made_progress = self.dispatch_batch(batch.commands)?;
             self.advance_sequence()?;
             // Control currently returns a bounded snapshot rather than a
             // held long-poll. Pace an empty lane so a healthy idle Node does
             // not spin a signed HTTP/PG transaction loop.
-            if idle {
+            if idle || !made_progress {
                 self.wait_or_shutdown().await;
             }
         }
+    }
+
+    fn dispatch_batch(
+        &mut self,
+        commands: Vec<RouteCommandEnvelope>,
+    ) -> Result<bool, RouteCommandRunnerError> {
+        let mut made_progress = false;
+        for command in commands {
+            let endpoint_id = command.binding.endpoint_id.clone();
+            if self.blocked.contains_key(&endpoint_id) {
+                continue;
+            }
+            if let Some(active) = self.workers.get(&endpoint_id) {
+                if active.operation_id == command.operation_id
+                    && active.request_fingerprint == command.request_fingerprint
+                {
+                    continue;
+                }
+                // Control repeats the exact successor after this Endpoint's
+                // current response settles. Never run two effects for one
+                // Endpoint merely because polling and settlement overlap.
+                continue;
+            }
+
+            let response = execute_route_command(&self.registry, &command);
+            let transport = Arc::clone(&self.transport);
+            let registry = Arc::clone(&self.registry);
+            let session = self.session.clone();
+            let shutdown = self.worker_shutdown.subscribe();
+            let task = tokio::spawn(async move {
+                settle_exact_response(registry, transport, session, response, shutdown).await
+            });
+            self.workers.insert(
+                endpoint_id,
+                ActiveRouteWorker {
+                    operation_id: command.operation_id,
+                    request_fingerprint: command.request_fingerprint,
+                    task,
+                },
+            );
+            made_progress = true;
+        }
+        Ok(made_progress)
+    }
+
+    async fn reap_finished(&mut self) -> Result<(), RouteCommandRunnerError> {
+        let finished = self
+            .workers
+            .iter()
+            .filter_map(|(endpoint_id, worker)| {
+                worker.task.is_finished().then_some(endpoint_id.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut global_error = None;
+        for endpoint_id in finished {
+            let worker = self
+                .workers
+                .remove(&endpoint_id)
+                .expect("finished Route worker remained present");
+            match worker.task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) if route_worker_error_is_node_global(&error) => {
+                    if global_error.is_none() {
+                        global_error = Some(error);
+                    }
+                }
+                Ok(Err(error)) => {
+                    tracing::error!(
+                        endpoint_id = %endpoint_id,
+                        %error,
+                        "blocking one failed Endpoint Route lane without stopping siblings"
+                    );
+                    self.blocked.insert(endpoint_id, error.to_string());
+                }
+                Err(error) => {
+                    tracing::error!(
+                        endpoint_id = %endpoint_id,
+                        %error,
+                        "blocking one panicked Endpoint Route lane without stopping siblings"
+                    );
+                    self.blocked.insert(endpoint_id, error.to_string());
+                }
+            }
+        }
+        global_error.map_or(Ok(()), Err)
+    }
+
+    async fn finish_shutdown(&mut self) -> Result<(), RouteCommandRunnerError> {
+        let mut first_global_error = None;
+        for (endpoint_id, worker) in std::mem::take(&mut self.workers) {
+            match worker.task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) if route_worker_error_is_node_global(&error) => {
+                    if first_global_error.is_none() {
+                        first_global_error = Some(error);
+                    }
+                }
+                Ok(Err(error)) => {
+                    tracing::error!(
+                        endpoint_id = %endpoint_id,
+                        %error,
+                        "one Endpoint Route lane failed while shutdown joined its siblings"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(
+                        endpoint_id = %endpoint_id,
+                        %error,
+                        "join Route settlement worker during shutdown"
+                    );
+                }
+            }
+        }
+        first_global_error.map_or(Ok(()), Err)
     }
 
     fn current_poll(&self) -> Result<RouteCommandPollRequest, RouteCommandRunnerError> {
@@ -323,59 +460,19 @@ impl RouteCommandRunner {
         })
     }
 
+    #[cfg(test)]
     async fn settle_exact(
         &mut self,
         response: RouteCommandResponse,
     ) -> Result<(), RouteCommandRunnerError> {
-        let commit =
-            RouteResultCommitRequest::new(&self.session, response.clone()).map_err(|_| {
-                RouteCommandRunnerError::InvalidContract {
-                    context: "construct exact Route result commit",
-                }
-            })?;
-        let exact = encode_route_result_commit_request(&commit).map_err(|_| {
-            RouteCommandRunnerError::InvalidContract {
-                context: "encode exact Route result commit",
-            }
-        })?;
-        loop {
-            match self.transport.commit(exact.clone()).await {
-                RouteTransportAttempt::Accepted(ack) if ack_matches(&ack, &commit) => return Ok(()),
-                RouteTransportAttempt::Rejected {
-                    error:
-                        RuntimeRouteError::StaleOperation { .. }
-                        | RuntimeRouteError::SupersededOperation { .. },
-                    ..
-                } => {
-                    // Control has durably advanced or invalidated this exact
-                    // Endpoint lane. Retrying can never make this response
-                    // current. Close an exact locally installed Serving
-                    // effect before forgetting the response; otherwise a
-                    // command invalidated between poll and commit could strand
-                    // a stale gate and block the next burned epoch forever.
-                    self.close_superseded_serving(&response)?;
-                    return Ok(());
-                }
-                RouteTransportAttempt::RouteUnavailable => {
-                    return Err(RouteCommandRunnerError::RouteUnavailable {
-                        path: ROUTE_RESULT_COMMIT_PATH,
-                    });
-                }
-                RouteTransportAttempt::Rejected { status, error } => {
-                    return Err(RouteCommandRunnerError::Rejected {
-                        path: ROUTE_RESULT_COMMIT_PATH,
-                        status,
-                        error,
-                    });
-                }
-                RouteTransportAttempt::Accepted(_) | RouteTransportAttempt::RetryExact(_) => {
-                    if *self.shutdown.borrow() {
-                        return Ok(());
-                    }
-                    self.wait_or_shutdown().await;
-                }
-            }
-        }
+        settle_exact_response(
+            Arc::clone(&self.registry),
+            Arc::clone(&self.transport),
+            self.session.clone(),
+            response,
+            self.shutdown.clone(),
+        )
+        .await
     }
 
     fn advance_sequence(&mut self) -> Result<(), RouteCommandRunnerError> {
@@ -384,20 +481,6 @@ impl RouteCommandRunner {
             .checked_add(1)
             .ok_or(RouteCommandRunnerError::SequenceExhausted)?;
         Sequence::new(self.request_sequence).ok_or(RouteCommandRunnerError::SequenceExhausted)?;
-        Ok(())
-    }
-
-    fn close_superseded_serving(
-        &self,
-        response: &RouteCommandResponse,
-    ) -> Result<(), RouteCommandRunnerError> {
-        if !matches!(response.result, RouteNodeResult::Serving(_)) {
-            return Ok(());
-        }
-        let binding = response.result.binding();
-        if let Some(cell) = self.registry.lookup(&binding.cat_id)? {
-            let _ = cell.emergency_close_route(&binding.endpoint_id, &response.operation_id)?;
-        }
         Ok(())
     }
 
@@ -411,6 +494,113 @@ impl RouteCommandRunner {
             }
         }
     }
+}
+
+async fn settle_exact_response(
+    registry: Arc<LifecycleAdmissionRegistry>,
+    transport: Arc<dyn RouteCommandTransport>,
+    session: AgentSession,
+    response: RouteCommandResponse,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), RouteCommandRunnerError> {
+    let commit = RouteResultCommitRequest::new(&session, response.clone()).map_err(|_| {
+        RouteCommandRunnerError::InvalidContract {
+            context: "construct exact Route result commit",
+        }
+    })?;
+    let exact = encode_route_result_commit_request(&commit).map_err(|_| {
+        RouteCommandRunnerError::InvalidContract {
+            context: "encode exact Route result commit",
+        }
+    })?;
+    loop {
+        match transport.commit(exact.clone()).await {
+            RouteTransportAttempt::Accepted(ack) if ack_matches(&ack, &commit) => return Ok(()),
+            RouteTransportAttempt::Rejected {
+                error:
+                    RuntimeRouteError::StaleOperation { .. }
+                    | RuntimeRouteError::SupersededOperation { .. },
+                ..
+            } => {
+                // Control has durably advanced or invalidated this exact
+                // Endpoint lane. Retrying can never make this response
+                // current. Close an exact locally installed Serving effect
+                // before forgetting the response; otherwise a command
+                // invalidated between poll and commit could strand a stale
+                // gate and block the next burned epoch forever.
+                close_superseded_serving(&registry, &response)?;
+                return Ok(());
+            }
+            RouteTransportAttempt::RouteUnavailable => {
+                return Err(RouteCommandRunnerError::RouteUnavailable {
+                    path: ROUTE_RESULT_COMMIT_PATH,
+                });
+            }
+            RouteTransportAttempt::Rejected { status, error } => {
+                // A definitive rejection means Control did not accept this
+                // exact terminal projection.  Keep the failure Endpoint-local,
+                // but never retain a Serving gate whose result has no matching
+                // Control authority. Closed/Rejected results have no local
+                // Serving effect, so the same exact close is a no-op for them.
+                close_superseded_serving(&registry, &response)?;
+                return Err(RouteCommandRunnerError::Rejected {
+                    path: ROUTE_RESULT_COMMIT_PATH,
+                    status,
+                    error,
+                });
+            }
+            RouteTransportAttempt::Accepted(_) | RouteTransportAttempt::RetryExact(_) => {
+                if *shutdown.borrow() {
+                    return Ok(());
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(RETRY_DELAY) => {}
+                    changed = shutdown.changed() => {
+                        if changed.is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn close_superseded_serving(
+    registry: &LifecycleAdmissionRegistry,
+    response: &RouteCommandResponse,
+) -> Result<(), RouteCommandRunnerError> {
+    if !matches!(response.result, RouteNodeResult::Serving(_)) {
+        return Ok(());
+    }
+    let binding = response.result.binding();
+    if let Some(cell) = registry.lookup(&binding.cat_id)? {
+        let _ = cell.emergency_close_route(&binding.endpoint_id, &response.operation_id)?;
+    }
+    Ok(())
+}
+
+fn route_worker_error_is_node_global(error: &RouteCommandRunnerError) -> bool {
+    matches!(
+        error,
+        RouteCommandRunnerError::RouteUnavailable { .. }
+            | RouteCommandRunnerError::Rejected {
+                error: RuntimeRouteError::AuthenticationFailed
+                    | RuntimeRouteError::WrongNode { .. },
+                ..
+            }
+            | RouteCommandRunnerError::Registry(
+                LifecycleAdmissionRegistryError::Unavailable
+                    | LifecycleAdmissionRegistryError::Uninitialized
+                    | LifecycleAdmissionRegistryError::InitializationConflict
+                    | LifecycleAdmissionRegistryError::InvalidStartupInventory { .. }
+                    | LifecycleAdmissionRegistryError::StaleAgentSession
+                    | LifecycleAdmissionRegistryError::UnattributedPhysicalArtifacts
+                    | LifecycleAdmissionRegistryError::InvalidAgentSessionSuccessor
+            )
+            | RouteCommandRunnerError::SequenceExhausted
+            | RouteCommandRunnerError::RingUnavailable
+    )
 }
 
 /// Execute one exact Endpoint command against the sole Host-global cell. The
@@ -715,6 +905,96 @@ mod tests {
     };
     use crate::route_grant_v2::RouteGrantV2KeyRing;
 
+    struct IsolatedCommitTransport {
+        blocked_endpoint_id: Id,
+        blocked_started: Arc<tokio::sync::Notify>,
+        release_blocked: Arc<tokio::sync::Notify>,
+        healthy_committed: Arc<tokio::sync::Notify>,
+    }
+
+    struct DefinitiveRejectTransport {
+        rejected_endpoint_id: Id,
+    }
+
+    struct AuthenticationRejectTransport;
+
+    impl RouteCommandTransport for DefinitiveRejectTransport {
+        fn poll(&self, _exact_body: Vec<u8>) -> RoutePollFuture {
+            Box::pin(async { panic!("direct dispatch test must not poll") })
+        }
+
+        fn commit(&self, exact_body: Vec<u8>) -> RouteCommitFuture {
+            let commit = cats_api::runtime_route::decode_route_result_commit_request(&exact_body)
+                .expect("runner emits one exact canonical commit");
+            if commit.response.endpoint_id == self.rejected_endpoint_id {
+                let operation_id = commit.response.operation_id;
+                return Box::pin(async move {
+                    RouteTransportAttempt::Rejected {
+                        status: 409,
+                        error: RuntimeRouteError::ConflictingTerminalResult { operation_id },
+                    }
+                });
+            }
+            let acknowledgement = RouteResultStoredAck {
+                version: ContractVersion::V1,
+                node_id: commit.session.node_id,
+                endpoint_id: commit.response.endpoint_id.clone(),
+                operation_id: commit.response.operation_id.clone(),
+                request_fingerprint: commit.response.request_fingerprint.clone(),
+                terminal_result_digest: commit.terminal_result_digest,
+            };
+            Box::pin(async move { RouteTransportAttempt::Accepted(acknowledgement) })
+        }
+    }
+
+    impl RouteCommandTransport for AuthenticationRejectTransport {
+        fn poll(&self, _exact_body: Vec<u8>) -> RoutePollFuture {
+            Box::pin(async { panic!("direct dispatch test must not poll") })
+        }
+
+        fn commit(&self, _exact_body: Vec<u8>) -> RouteCommitFuture {
+            Box::pin(async {
+                RouteTransportAttempt::Rejected {
+                    status: 401,
+                    error: RuntimeRouteError::AuthenticationFailed,
+                }
+            })
+        }
+    }
+
+    impl RouteCommandTransport for IsolatedCommitTransport {
+        fn poll(&self, _exact_body: Vec<u8>) -> RoutePollFuture {
+            Box::pin(async { panic!("direct dispatch test must not poll") })
+        }
+
+        fn commit(&self, exact_body: Vec<u8>) -> RouteCommitFuture {
+            let commit = cats_api::runtime_route::decode_route_result_commit_request(&exact_body)
+                .expect("runner emits one exact canonical commit");
+            let is_blocked = commit.response.endpoint_id == self.blocked_endpoint_id;
+            let release_blocked = Arc::clone(&self.release_blocked);
+            let healthy_committed = Arc::clone(&self.healthy_committed);
+            if is_blocked {
+                self.blocked_started.notify_one();
+            }
+            let acknowledgement = RouteResultStoredAck {
+                version: ContractVersion::V1,
+                node_id: commit.session.node_id,
+                endpoint_id: commit.response.endpoint_id.clone(),
+                operation_id: commit.response.operation_id.clone(),
+                request_fingerprint: commit.response.request_fingerprint.clone(),
+                terminal_result_digest: commit.terminal_result_digest,
+            };
+            Box::pin(async move {
+                if is_blocked {
+                    release_blocked.notified().await;
+                } else {
+                    healthy_committed.notify_one();
+                }
+                RouteTransportAttempt::Accepted(acknowledgement)
+            })
+        }
+    }
+
     struct RetryPollTransport {
         poll_bodies: Mutex<Vec<Vec<u8>>>,
         shutdown: tokio::sync::watch::Sender<bool>,
@@ -770,6 +1050,171 @@ mod tests {
         let bodies = transport.poll_bodies.lock().unwrap();
         assert_eq!(bodies.len(), 2);
         assert_eq!(bodies[0], bodies[1]);
+    }
+
+    #[tokio::test]
+    async fn blocked_endpoint_commit_does_not_block_a_sibling_endpoint() {
+        let session = session();
+        let admission_session = session_binding(&session);
+        let registry = LifecycleAdmissionRegistry::for_machine_test(admission_session.clone());
+        let (blocked_command, blocked_endpoint_id) =
+            enable_command(&registry, &admission_session, "blocked", 7);
+        let (healthy_command, healthy_endpoint_id) =
+            enable_command(&registry, &admission_session, "healthy", 11);
+        let blocked_started = Arc::new(tokio::sync::Notify::new());
+        let release_blocked = Arc::new(tokio::sync::Notify::new());
+        let healthy_committed = Arc::new(tokio::sync::Notify::new());
+        let transport = Arc::new(IsolatedCommitTransport {
+            blocked_endpoint_id: blocked_endpoint_id.clone(),
+            blocked_started: Arc::clone(&blocked_started),
+            release_blocked: Arc::clone(&release_blocked),
+            healthy_committed: Arc::clone(&healthy_committed),
+        });
+        let verifier = Arc::new(RouteGrantV2Verifier::new(
+            RouteGrantV2KeyRing::new(Epoch::new(1).unwrap(), Vec::new()).unwrap(),
+        ));
+        let (_shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut runner =
+            RouteCommandRunner::new(session, transport, registry, verifier, shutdown_rx).unwrap();
+
+        assert!(runner
+            .dispatch_batch(vec![blocked_command, healthy_command])
+            .unwrap());
+        tokio::time::timeout(Duration::from_secs(1), blocked_started.notified())
+            .await
+            .expect("blocked Endpoint reached its independent commit worker");
+        tokio::time::timeout(Duration::from_secs(1), healthy_committed.notified())
+            .await
+            .expect("healthy sibling committed while the first Endpoint remained blocked");
+
+        runner.reap_finished().await.unwrap();
+        assert!(runner.workers.contains_key(&blocked_endpoint_id));
+        assert!(!runner.workers.contains_key(&healthy_endpoint_id));
+
+        release_blocked.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), runner.finish_shutdown())
+            .await
+            .expect("blocked Endpoint worker joined after its commit was released")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn definitive_rejection_closes_only_that_endpoint_and_siblings_finish() {
+        let session = session();
+        let admission_session = session_binding(&session);
+        let registry = LifecycleAdmissionRegistry::for_machine_test(admission_session.clone());
+        let (failed_command, failed_endpoint) =
+            enable_command(&registry, &admission_session, "definitive-failure", 17);
+        let failed_cat = failed_command.binding.cat_id.clone();
+        let failed_operation = failed_command.operation_id.clone();
+        let (healthy_command, healthy_endpoint) =
+            enable_command(&registry, &admission_session, "definitive-healthy", 19);
+        let healthy_cat = healthy_command.binding.cat_id.clone();
+        let verifier = Arc::new(RouteGrantV2Verifier::new(
+            RouteGrantV2KeyRing::new(Epoch::new(1).unwrap(), Vec::new()).unwrap(),
+        ));
+        let (_shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+        let transport = Arc::new(DefinitiveRejectTransport {
+            rejected_endpoint_id: failed_endpoint.clone(),
+        });
+        let mut runner =
+            RouteCommandRunner::new(session, transport, registry, verifier, shutdown_rx).unwrap();
+
+        assert!(runner
+            .dispatch_batch(vec![failed_command, healthy_command])
+            .unwrap());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runner
+                .workers
+                .values()
+                .any(|worker| !worker.task.is_finished())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both Endpoint commits reached terminal outcomes");
+        runner
+            .reap_finished()
+            .await
+            .expect("one Endpoint-local failure does not fail the Node lane");
+        assert!(runner.blocked.contains_key(&failed_endpoint));
+        assert!(!runner.blocked.contains_key(&healthy_endpoint));
+        assert_eq!(
+            runner
+                .registry
+                .lookup(&failed_cat)
+                .unwrap()
+                .unwrap()
+                .current_serving_route(&failed_endpoint)
+                .unwrap(),
+            None,
+            "definitively rejected Serving result retained a local gate"
+        );
+        assert!(runner
+            .registry
+            .lookup(&healthy_cat)
+            .unwrap()
+            .unwrap()
+            .current_serving_route(&healthy_endpoint)
+            .unwrap()
+            .is_some());
+        assert!(runner.blocked[&failed_endpoint].contains(failed_operation.as_str()));
+        runner.finish_shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn node_authentication_rejection_stops_the_route_runner() {
+        let session = session();
+        let admission_session = session_binding(&session);
+        let registry = LifecycleAdmissionRegistry::for_machine_test(admission_session.clone());
+        let (command, endpoint_id) =
+            enable_command(&registry, &admission_session, "authentication-failure", 23);
+        let cat_id = command.binding.cat_id.clone();
+        let verifier = Arc::new(RouteGrantV2Verifier::new(
+            RouteGrantV2KeyRing::new(Epoch::new(1).unwrap(), Vec::new()).unwrap(),
+        ));
+        let (_shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut runner = RouteCommandRunner::new(
+            session,
+            Arc::new(AuthenticationRejectTransport),
+            registry,
+            verifier,
+            shutdown_rx,
+        )
+        .unwrap();
+
+        assert!(runner.dispatch_batch(vec![command]).unwrap());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runner
+                .workers
+                .values()
+                .any(|worker| !worker.task.is_finished())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Route commit reached the authentication rejection");
+        assert!(matches!(
+            runner.reap_finished().await,
+            Err(RouteCommandRunnerError::Rejected {
+                error: RuntimeRouteError::AuthenticationFailed,
+                ..
+            })
+        ));
+        assert!(runner.blocked.is_empty());
+        assert_eq!(
+            runner
+                .registry
+                .lookup(&cat_id)
+                .unwrap()
+                .unwrap()
+                .current_serving_route(&endpoint_id)
+                .unwrap(),
+            None,
+            "an unaccepted Serving result retained a local gate"
+        );
     }
 
     struct SupersededCommitTransport {
@@ -864,6 +1309,64 @@ mod tests {
 
         runner.settle_exact(response).await.unwrap();
         assert_eq!(cell.current_serving_route(&endpoint_id).unwrap(), None);
+    }
+
+    fn enable_command(
+        registry: &LifecycleAdmissionRegistry,
+        admission_session: &SessionBinding,
+        suffix: &str,
+        route_epoch: u64,
+    ) -> (RouteCommandEnvelope, Id) {
+        let source_operation_id = Id::new(format!("lifecycle_start_{suffix}")).unwrap();
+        let incarnation = RandomId128::new(format!("{route_epoch:02}").repeat(16)).unwrap();
+        let cat_id = Id::new(format!("cat_route_{suffix}")).unwrap();
+        let endpoint_id = Id::new(format!("endpoint_route_{suffix}")).unwrap();
+        let cell = LifecycleRouteAdmissionCell::new(
+            cat_id.clone(),
+            admission_session.clone(),
+            LifecycleRouteAdmission::RuntimeReady(LocalEffectiveRuntimeReady::new(
+                source_operation_id.clone(),
+                incarnation.clone(),
+                cats_api::runtime_reconciliation::Ipv4Address::new(format!(
+                    "10.0.0.{}",
+                    route_epoch + 1
+                ))
+                .unwrap(),
+            )),
+        );
+        registry.insert_cell_for_machine_test(cell).unwrap();
+        let command = RouteCommandEnvelope::new(
+            Id::new(format!("route_enable_{suffix}")).unwrap(),
+            RouteServingBinding {
+                workspace_id: Id::new("workspace_route_isolation").unwrap(),
+                endpoint_id: endpoint_id.clone(),
+                hostname: cats_api::runtime_reconciliation::Hostname::new(format!(
+                    "{suffix}.route-command.example.test"
+                ))
+                .unwrap(),
+                cat_id,
+                placement_identity: PlacementIdentity {
+                    node_id: admission_session.node_id.clone(),
+                    placement_epoch: Epoch::new(1).unwrap(),
+                },
+                effective_runtime_ready: WireEffectiveRuntimeReady {
+                    source_lifecycle_operation_id: source_operation_id,
+                    runtime_incarnation: incarnation,
+                    runtime_config_digest: Sha256Digest::from_bytes([route_epoch as u8; 32]),
+                    runtime_ready_receipt_digest: Sha256Digest::from_bytes(
+                        [route_epoch as u8 + 1; 32],
+                    ),
+                },
+                route_epoch: Epoch::new(route_epoch).unwrap(),
+                admission_session: admission_session.clone(),
+                protocol: cats_api::runtime_reconciliation::HttpProtocol::Http,
+                target_port: 8080,
+            },
+            RouteCommandPredecessor::Genesis,
+            RouteCommand::Enable,
+        )
+        .unwrap();
+        (command, endpoint_id)
     }
 
     fn session() -> AgentSession {

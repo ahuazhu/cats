@@ -32,6 +32,7 @@ use super::lifecycle_volume_transitions::{
     scope_to_wire, LifecycleVolumeTransition, LifecycleVolumeTransitionApplied,
     LifecycleVolumeTransitionOutcome, LifecycleVolumeTransitionRequest,
 };
+use super::placement_planner::runtime_config_placement_claims;
 use super::product::{
     CatRecord, DiskAdminState as ProductDiskAdminState, DiskRecord, DiskRole as ProductDiskRole,
 };
@@ -105,10 +106,10 @@ pub(super) fn runtime_config(cat_id: &Id) -> ImmutableRuntimeConfig {
         digest(3),
         RuntimeNetworkConfig::IsolatedIpv4 {
             network_id: id("network-lifecycle-test"),
-            guest_mac: MacAddress::new("02:ca:0a:00:00:02").unwrap(),
-            guest_ipv4: Ipv4Address::new("10.0.0.2").unwrap(),
+            guest_mac: MacAddress::new("02:ca:0a:f0:00:06").unwrap(),
+            guest_ipv4: Ipv4Address::new("10.240.0.6").unwrap(),
             prefix_length: 30,
-            gateway_ipv4: Ipv4Address::new("10.0.0.1").unwrap(),
+            gateway_ipv4: Ipv4Address::new("10.240.0.5").unwrap(),
         },
         vec![RuntimeVolumeConfig {
             volume_id: id(format!("volume-{cat_id}")),
@@ -162,6 +163,7 @@ pub(super) fn seed_cat(
             cat_id: cat_id.clone(),
         },
     };
+    let placement_claims = runtime_config_placement_claims(&config).unwrap();
     store
         .authority_transaction(|transaction| {
             let cat = CatRecord {
@@ -192,14 +194,24 @@ pub(super) fn seed_cat(
             transaction.execute(
                 "INSERT INTO cat_runtime_configs (
                     config_id, workspace_id, cat_id, canonical_config_bytes,
-                    canonical_config_sha256, created_at_unix_ms
-                 ) VALUES ($1,$2,$3,$4,$5,1)",
+                    canonical_config_sha256, placement_vcpus,
+                    placement_memory_bytes, placement_network_id,
+                    placement_ipv4_pool_base, placement_ipv4_slot, placement_disk_ids,
+                    placement_volume_ids, created_at_unix_ms
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1)",
                 &[
                     &config.config_id.as_str(),
                     &workspace_id.as_str(),
                     &cat_id.as_str(),
                     &config_bytes,
                     &config.config_digest.as_str(),
+                    &placement_claims.vcpus,
+                    &placement_claims.memory_bytes,
+                    &placement_claims.network_id.as_str(),
+                    &placement_claims.ipv4_pool_base,
+                    &placement_claims.isolated_ipv4_slot,
+                    &placement_claims.disk_ids,
+                    &placement_claims.volume_ids,
                 ],
             )?;
             insert_volume(transaction, &volume)?;
@@ -657,12 +669,22 @@ pub(super) fn settle_genesis_runtime_ready(
     config: &ImmutableRuntimeConfig,
 ) -> RunningLifecycleFixture {
     let (authenticated, session) = register_node(store, node_id);
+    settle_genesis_runtime_ready_in_session(store, &authenticated, &session, start, config)
+}
+
+pub(super) fn settle_genesis_runtime_ready_in_session(
+    store: &Store,
+    authenticated: &AuthenticatedNodeCredential,
+    session: &AgentSession,
+    start: &LifecycleCommandEnvelope,
+    config: &ImmutableRuntimeConfig,
+) -> RunningLifecycleFixture {
     let slot = &config.volumes[0];
     let attachment_id = id(format!("attachment-{}", start.cat_id));
     let (acquire, grant_digest) = acquire_genesis_start_volume(
         store,
-        &authenticated,
-        &session,
+        authenticated,
+        session,
         start,
         config,
         attachment_id.clone(),
@@ -679,7 +701,7 @@ pub(super) fn settle_genesis_runtime_ready(
         authority_receipt_digest: Some(grant_digest),
     };
     let commit = cats_api::runtime_lifecycle::LifecycleResultCommitRequest::new(
-        &session,
+        session,
         cats_api::runtime_lifecycle::LifecycleCommandResponse::new(
             start,
             NodeResult::RuntimeReady(Box::new(RuntimeReadyResult {
@@ -697,14 +719,14 @@ pub(super) fn settle_genesis_runtime_ready(
         operation: running_head,
         ..
     } = store
-        .commit_lifecycle_result(&authenticated, &commit)
+        .commit_lifecycle_result(authenticated, &commit)
         .unwrap()
     else {
         panic!("RuntimeReady did not settle")
     };
     RunningLifecycleFixture {
-        authenticated,
-        session,
+        authenticated: authenticated.clone(),
+        session: session.clone(),
         running_head,
         runtime_incarnation,
         volume_receipt,
@@ -818,6 +840,258 @@ fn poll_authenticates_current_session_and_renews_lease_without_observation() {
             LifecycleSessionRejection::WrongSession { .. }
         ))
     ));
+}
+
+#[test]
+fn corrupt_sibling_operation_does_not_block_healthy_cat_poll_or_settlement() {
+    let store = test_store();
+    let workspace = workspace_id(&store, "lifecycle-poll-corrupt-sibling");
+    let node = id("node-lifecycle-poll-corrupt-sibling");
+    let corrupt_cat = id("cat-a-lifecycle-poll-corrupt-sibling");
+    let healthy_cat = id("cat-b-lifecycle-poll-corrupt-sibling");
+    let corrupt_creation = id("creation-cat-a-lifecycle-poll-corrupt-sibling");
+    let healthy_creation = id("creation-cat-b-lifecycle-poll-corrupt-sibling");
+    let corrupt_config = seed_cat(&store, &workspace, &corrupt_cat, &corrupt_creation);
+    let healthy_config = seed_cat(&store, &workspace, &healthy_cat, &healthy_creation);
+    let corrupt_command = genesis_start(
+        &workspace,
+        &node,
+        &corrupt_cat,
+        &corrupt_creation,
+        "operation-a-lifecycle-poll-corrupt-sibling",
+        &corrupt_config,
+    );
+    let healthy_command = genesis_start(
+        &workspace,
+        &node,
+        &healthy_cat,
+        &healthy_creation,
+        "operation-b-lifecycle-poll-corrupt-sibling",
+        &healthy_config,
+    );
+    for command in [&corrupt_command, &healthy_command] {
+        assert!(matches!(
+            store.admit_lifecycle_command(&workspace, command).unwrap(),
+            LifecycleCommandAdmission::Admitted(_)
+        ));
+    }
+    seed_corrupt_poll_prefix(&store, &workspace, &node, 63);
+
+    let malformed_request = b"{}".to_vec();
+    store
+        .with(|client| {
+            client.batch_execute("ALTER TABLE runtime_operations DISABLE TRIGGER USER")?;
+            let update = client.execute(
+                "UPDATE runtime_operations
+                    SET canonical_request_bytes=$2
+                  WHERE operation_id=$1",
+                &[&corrupt_command.operation_id.as_str(), &malformed_request],
+            );
+            let enable = client.batch_execute("ALTER TABLE runtime_operations ENABLE TRIGGER USER");
+            update?;
+            enable?;
+            Ok(())
+        })
+        .unwrap();
+
+    let (authenticated, session) = register_node(&store, &node);
+    let poll = LifecycleCommandPollRequest {
+        version: ContractVersion::V1,
+        session: session_binding(&session),
+        request_sequence: Sequence::new(1).unwrap(),
+    };
+    let LifecycleCommandPollOutcome::Batch(batch) = store
+        .poll_lifecycle_commands(&authenticated, &poll)
+        .unwrap()
+    else {
+        panic!("current session poll rejected")
+    };
+    assert_eq!(batch.commands, vec![healthy_command.clone()]);
+
+    let slot = &healthy_config.volumes[0];
+    let attachment_id = id("attachment-b-lifecycle-poll-corrupt-sibling");
+    let (acquire, grant_digest) = acquire_genesis_start_volume(
+        &store,
+        &authenticated,
+        &session,
+        &healthy_command,
+        &healthy_config,
+        attachment_id.clone(),
+    );
+    let runtime_incarnation = random(91);
+    let response = cats_api::runtime_lifecycle::LifecycleCommandResponse::new(
+        &healthy_command,
+        NodeResult::RuntimeReady(Box::new(RuntimeReadyResult {
+            runtime_incarnation: runtime_incarnation.clone(),
+            runtime_config_digest: healthy_config.config_digest.clone(),
+            execution_receipt_digest: digest(92),
+            guest_ready_receipt_digest: digest(93),
+            volume_receipts: vec![VolumeTerminalReceipt {
+                volume_id: slot.volume_id.clone(),
+                disk_id: slot.disk_id.clone(),
+                disk_role: slot.disk_role,
+                attachment_id,
+                attachment_epoch: acquire.resulting_epoch,
+                local_durable_generation: acquire.resulting_head.generation,
+                remote_durable_generation: acquire.resulting_head.generation,
+                authority_receipt_digest: Some(grant_digest),
+            }],
+        })),
+    )
+    .unwrap();
+    let commit =
+        cats_api::runtime_lifecycle::LifecycleResultCommitRequest::new(&session, response).unwrap();
+    assert!(matches!(
+        store
+            .commit_lifecycle_result(&authenticated, &commit)
+            .unwrap(),
+        LifecycleResultCommitOutcome::Stored { .. }
+    ));
+
+    store
+        .with(|client| {
+            let corrupt = client.query_one(
+                "SELECT state, canonical_request_bytes
+                   FROM runtime_operations WHERE operation_id=$1",
+                &[&corrupt_command.operation_id.as_str()],
+            )?;
+            assert_eq!(corrupt.get::<_, String>(0), "unresolved");
+            assert_eq!(corrupt.get::<_, Vec<u8>>(1), malformed_request);
+            let healthy_state: String = client
+                .query_one(
+                    "SELECT state FROM runtime_operations WHERE operation_id=$1",
+                    &[&healthy_command.operation_id.as_str()],
+                )?
+                .get(0);
+            assert_eq!(healthy_state, "terminal");
+            let corrupt_projection = client.query_one(
+                "SELECT lifecycle_head_operation_id, stable_state,
+                        effective_runtime_ready_operation_id, runtime_incarnation
+                   FROM cat_records WHERE cat_id=$1",
+                &[&corrupt_cat.as_str()],
+            )?;
+            assert_eq!(corrupt_projection.get::<_, Option<String>>(0), None);
+            assert_eq!(corrupt_projection.get::<_, Option<String>>(1), None);
+            assert_eq!(corrupt_projection.get::<_, Option<String>>(2), None);
+            assert_eq!(corrupt_projection.get::<_, Option<String>>(3), None);
+            let healthy_projection = client.query_one(
+                "SELECT lifecycle_head_operation_id, stable_state,
+                        effective_runtime_ready_operation_id, runtime_incarnation
+                   FROM cat_records WHERE cat_id=$1",
+                &[&healthy_cat.as_str()],
+            )?;
+            assert_eq!(
+                healthy_projection.get::<_, Option<String>>(0).as_deref(),
+                Some(healthy_command.operation_id.as_str())
+            );
+            assert_eq!(
+                healthy_projection.get::<_, Option<String>>(1).as_deref(),
+                Some("running")
+            );
+            assert_eq!(
+                healthy_projection.get::<_, Option<String>>(2).as_deref(),
+                Some(healthy_command.operation_id.as_str())
+            );
+            assert_eq!(
+                healthy_projection.get::<_, Option<String>>(3).as_deref(),
+                Some(runtime_incarnation.as_str())
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn seed_corrupt_poll_prefix(store: &Store, workspace: &Id, node: &Id, count: usize) {
+    store
+        .authority_transaction(|transaction| {
+            for index in 0..count {
+                let suffix = format!("{index:03}");
+                let cat_id = format!("cat-a-{suffix}-lifecycle-poll-corrupt-prefix");
+                let cat_name = format!("test-a-{suffix}-lifecycle-poll-corrupt-prefix");
+                let creation_id = format!("creation-a-{suffix}-lifecycle-poll-corrupt-prefix");
+                let config_id = format!("config-a-{suffix}-lifecycle-poll-corrupt-prefix");
+                let operation_id = format!("operation-a-{suffix}-lifecycle-poll-corrupt-prefix");
+                let record = serde_json::json!({
+                    "cat_id": cat_id,
+                    "workspace_id": workspace.as_str(),
+                    "name": cat_name,
+                })
+                .to_string();
+                let config_digest = digest(210);
+                transaction.execute(
+                    "INSERT INTO cat_records (
+                        cat_id, record, workspace_id, name, cat_creation_id,
+                        lifecycle_head_operation_id, stable_state,
+                        effective_runtime_ready_operation_id, runtime_incarnation,
+                        current_runtime_config_id, current_runtime_config_sha256,
+                        created_at, deleted_at
+                     ) VALUES (
+                        $1,$2::TEXT::jsonb,$3,$4,$5,NULL,NULL,NULL,NULL,$6,$7,1,NULL
+                     )",
+                    &[
+                        &cat_id,
+                        &record,
+                        &workspace.as_str(),
+                        &cat_name,
+                        &creation_id,
+                        &config_id,
+                        &config_digest.as_str(),
+                    ],
+                )?;
+                transaction.execute(
+                    "INSERT INTO cat_runtime_configs (
+                        config_id, workspace_id, cat_id, canonical_config_bytes,
+                        canonical_config_sha256, placement_vcpus,
+                        placement_memory_bytes, placement_network_id,
+                        placement_ipv4_pool_base, placement_ipv4_slot, placement_disk_ids,
+                        placement_volume_ids, created_at_unix_ms
+                     ) VALUES (
+                        $1,$2,$3,$4,$5,1,536870912,$6,0,1,
+                        ARRAY[$7]::TEXT[],ARRAY[$8]::TEXT[],1
+                     )",
+                    &[
+                        &config_id,
+                        &workspace.as_str(),
+                        &cat_id,
+                        &&b"{}"[..],
+                        &config_digest.as_str(),
+                        &format!("network-a-{suffix}-lifecycle-poll-corrupt-prefix"),
+                        &format!("disk-a-{suffix}-lifecycle-poll-corrupt-prefix"),
+                        &format!("volume-a-{suffix}-lifecycle-poll-corrupt-prefix"),
+                    ],
+                )?;
+                transaction.execute(
+                    "INSERT INTO runtime_operations (
+                        operation_id, workspace_id, cat_id, node_id,
+                        placement_epoch, command_kind, canonical_request_bytes,
+                        canonical_request_sha256, runtime_config_id,
+                        runtime_config_sha256,
+                        expected_predecessor_operation_id, predecessor_kind,
+                        expected_predecessor_result_kind,
+                        expected_predecessor_result_sha256, state,
+                        terminal_source, terminal_result_kind,
+                        canonical_result_bytes, canonical_result_sha256,
+                        created_at_unix_ms, terminal_at_unix_ms
+                     ) VALUES (
+                        $1,$2,$3,$4,1,'start',$5,$6,$7,$8,
+                        NULL,'genesis',NULL,NULL,'unresolved',
+                        NULL,NULL,NULL,NULL,1,NULL
+                     )",
+                    &[
+                        &operation_id,
+                        &workspace.as_str(),
+                        &cat_id,
+                        &node.as_str(),
+                        &&b"{}"[..],
+                        &digest(211).as_str(),
+                        &config_id,
+                        &config_digest.as_str(),
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
 }
 
 #[test]

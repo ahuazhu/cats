@@ -43,6 +43,7 @@ use super::lifecycle_commands_tests::{
     register_node, register_node_with_credential_digest, runtime_config as base_runtime_config,
     seed_cat, test_store, workspace_id,
 };
+use super::placement_planner::runtime_config_placement_claims;
 use super::product::{
     CatRecord, DiskAdminState, DiskRecord, DiskRole, PersistentDiskInitialization,
 };
@@ -236,6 +237,7 @@ fn seed_terminal_cold_on_node(
             cat_id: cat.clone(),
         },
     };
+    let placement_claims = runtime_config_placement_claims(&config).unwrap();
     store
         .authority_transaction(|transaction| {
             let cat_record = CatRecord {
@@ -266,14 +268,24 @@ fn seed_terminal_cold_on_node(
             transaction.execute(
                 "INSERT INTO cat_runtime_configs (
                     config_id, workspace_id, cat_id, canonical_config_bytes,
-                    canonical_config_sha256, created_at_unix_ms
-                 ) VALUES ($1,$2,$3,$4,$5,1)",
+                    canonical_config_sha256, placement_vcpus,
+                    placement_memory_bytes, placement_network_id,
+                    placement_ipv4_pool_base, placement_ipv4_slot, placement_disk_ids,
+                    placement_volume_ids, created_at_unix_ms
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1)",
                 &[
                     &config.config_id.as_str(),
                     &workspace.as_str(),
                     &cat.as_str(),
                     &config_bytes,
                     &config.config_digest.as_str(),
+                    &placement_claims.vcpus,
+                    &placement_claims.memory_bytes,
+                    &placement_claims.network_id.as_str(),
+                    &placement_claims.ipv4_pool_base,
+                    &placement_claims.isolated_ipv4_slot,
+                    &placement_claims.disk_ids,
+                    &placement_claims.volume_ids,
                 ],
             )?;
             insert_volume(transaction, &volume)?;
@@ -1067,6 +1079,89 @@ fn missing_cold_unresolved_root_disk_name_and_non_cold_head_fail_closed_without_
         .unwrap();
     assert_status(&blocked, 412, PERSISTENT_DISK_BINDING_PRECONDITION_BODY);
     assert_eq!(count_rows(&store, "configs", &cold_cat), cold_before);
+}
+
+#[test]
+fn malformed_sibling_config_does_not_block_unrelated_attach_or_detach() {
+    let store = Arc::new(test_store());
+    let workspace = workspace_id(&store, "binding-malformed-sibling");
+    crate::testsupport::begin_production_qualification_for_product_test(&store, &workspace);
+
+    let malformed_cat = id("cat_binding_malformed_sibling");
+    let malformed_creation = id("creation_binding_malformed_sibling");
+    let malformed_config = seed_cat(&store, &workspace, &malformed_cat, &malformed_creation);
+    store
+        .with(|client| {
+            client.batch_execute(
+                "ALTER TABLE cat_runtime_configs
+                     DISABLE TRIGGER cat_runtime_config_cannot_update",
+            )?;
+            let update = client.execute(
+                "UPDATE cat_runtime_configs
+                    SET canonical_config_bytes=$1
+                  WHERE config_id=$2",
+                &[&&b"{}"[..], &malformed_config.config_id.as_str()],
+            );
+            let enable = client.batch_execute(
+                "ALTER TABLE cat_runtime_configs
+                     ENABLE TRIGGER cat_runtime_config_cannot_update",
+            );
+            assert_eq!(update?, 1);
+            enable
+        })
+        .unwrap();
+
+    let target_cat = id("cat_binding_healthy_sibling");
+    let (target_config, _) = seed_terminal_cold(&store, &workspace, &target_cat, 140);
+    let disk = seed_persistent_disk(
+        &store,
+        &workspace,
+        "disk_binding_healthy_sibling",
+        "disk_name_binding_healthy_sibling",
+        "volume_binding_healthy_sibling",
+        71,
+        171,
+    );
+    let service = service(Arc::clone(&store));
+    let runtime = runtime();
+    for (action, key) in [
+        (
+            PersistentDiskBindingAction::Attach,
+            "attach-with-bad-sibling",
+        ),
+        (
+            PersistentDiskBindingAction::Detach,
+            "detach-with-bad-sibling",
+        ),
+    ] {
+        let result = runtime
+            .block_on(service.mutate(binding_ingress(
+                &workspace,
+                &disk.disk_id,
+                &target_cat,
+                "/srv/healthy",
+                key,
+                action,
+            )))
+            .unwrap();
+        assert_eq!(result.http_status, 200);
+    }
+    assert_eq!(
+        current_config(&store, &target_cat).volumes,
+        target_config.volumes
+    );
+    let malformed_bytes: Vec<u8> = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT canonical_config_bytes FROM cat_runtime_configs
+                      WHERE config_id=$1",
+                    &[&malformed_config.config_id.as_str()],
+                )
+                .map(|row| row.get(0))
+        })
+        .unwrap();
+    assert_eq!(malformed_bytes, b"{}");
 }
 
 #[test]

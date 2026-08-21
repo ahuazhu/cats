@@ -170,8 +170,16 @@ fn seed_unresolved_operation(store: &Store, cat_id: &Id, node_id: &Id) {
             transaction.execute(
                 "INSERT INTO cat_runtime_configs (
                     config_id, workspace_id, cat_id, canonical_config_bytes,
-                    canonical_config_sha256, created_at_unix_ms
-                 ) VALUES ('config_inventory', $1, $2, $3, $4, 1)",
+                    canonical_config_sha256, placement_vcpus,
+                    placement_memory_bytes, placement_network_id,
+                    placement_ipv4_pool_base, placement_ipv4_slot, placement_disk_ids,
+                    placement_volume_ids, created_at_unix_ms
+                 ) VALUES (
+                    'config_inventory', $1, $2, $3, $4,
+                    1, 1024, 'network_inventory', 0, 1,
+                    ARRAY['disk_inventory']::TEXT[],
+                    ARRAY['volume_inventory']::TEXT[], 1
+                 )",
                 &[
                     &workspace_id,
                     &cat_id.as_str(),
@@ -318,19 +326,40 @@ fn accepted<T>(outcome: RuntimeInventoryOutcome<T>) -> T {
 }
 
 #[test]
-fn accepted_full_inventory_is_telemetry_only() {
+fn corrupt_operation_cannot_block_sibling_telemetry_or_session_renewal() {
     let fixture = fixture();
     let before = operation_snapshot(&fixture.store);
+    let lease_before: i64 = fixture
+        .store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT lease_deadline_unix_ms FROM current_agent_sessions
+                      WHERE node_id=$1",
+                    &[&fixture.identity.node_id.as_str()],
+                )
+                .map(|row| row.get(0))
+        })
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(2));
+    let sibling_cat_id = id("cat_inventory_sibling");
     let report = full_report(
         &fixture.session,
         1,
         1,
         10,
-        vec![observed_cat(
-            &fixture.identity.node_id,
-            &fixture.cat_id,
-            ObservedRuntimePhysicalState::Absent,
-        )],
+        vec![
+            observed_cat(
+                &fixture.identity.node_id,
+                &fixture.cat_id,
+                ObservedRuntimePhysicalState::Absent,
+            ),
+            observed_cat(
+                &fixture.identity.node_id,
+                &sibling_cat_id,
+                ObservedRuntimePhysicalState::StoppedRetained,
+            ),
+        ],
     );
 
     let acceptance = accepted(
@@ -377,6 +406,29 @@ fn accepted_full_inventory_is_telemetry_only() {
         .unwrap();
     assert_eq!(current.source_kind, RuntimeTelemetrySourceKind::Full);
     assert_eq!(current.telemetry.cat_id, fixture.cat_id);
+    assert_eq!(
+        fixture
+            .store
+            .load_current_cat_telemetry(&fixture.identity.node_id, &sibling_cat_id)
+            .unwrap()
+            .unwrap()
+            .telemetry
+            .cat_id,
+        sibling_cat_id
+    );
+    let lease_after: i64 = fixture
+        .store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT lease_deadline_unix_ms FROM current_agent_sessions
+                      WHERE node_id=$1",
+                    &[&fixture.identity.node_id.as_str()],
+                )
+                .map(|row| row.get(0))
+        })
+        .unwrap();
+    assert!(lease_after > lease_before);
 }
 
 #[test]
