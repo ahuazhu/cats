@@ -9151,6 +9151,29 @@ mod object_write_gateway_catalog_tests {
     }
 
     #[test]
+    fn existing_gateway_role_is_normalized_without_superuser_only_alter_options() {
+        let existing_role_alter = ROLE_INSTALLER
+            .split_once("ALTER ROLE cats_object_write_gateway")
+            .expect("role installer normalizes an existing role")
+            .1
+            .split_once(';')
+            .expect("existing-role ALTER terminates")
+            .0;
+        for privileged_option in ["NOSUPERUSER", "NOREPLICATION", "NOBYPASSRLS"] {
+            assert!(
+                !existing_role_alter.contains(privileged_option),
+                "RDS rejects privileged ALTER option {privileged_option}"
+            );
+        }
+        for catalog_flag in ["rolsuper", "rolreplication", "rolbypassrls"] {
+            assert!(
+                ROLE_INSTALLER.contains(catalog_flag),
+                "existing role does not fail closed on {catalog_flag}"
+            );
+        }
+    }
+
+    #[test]
     fn every_physical_dial_checks_identity_prosrc_and_ambient_privileges() {
         for required in [
             "current_user::TEXT, session_user::TEXT, current_schema()::TEXT",
