@@ -258,23 +258,6 @@ resource "kubernetes_secret_v1" "runtime" {
   data = local.runtime_secret_data
 }
 
-# Separate from runtime credentials so the signing key is mounted as a file
-# only in cats-controld. The future v2 Gateway receives no private signing key.
-# The matching public half lets every replica prove the pair before Ready.
-resource "kubernetes_secret_v1" "route_grant_signing" {
-  metadata {
-    name      = "cats-route-grant-signing"
-    namespace = kubernetes_namespace_v1.cats.metadata[0].name
-    labels    = local.labels
-  }
-
-  type = "Opaque"
-  data = {
-    "private.pem" = var.route_grant_private_key_pem
-    "public.pem"  = var.route_grant_public_key_pem
-  }
-}
-
 # Public deployment-provisioner trust is a rollout-pinned artifact, not a
 # credential. A subPath bind mount gives the process one root-owned regular
 # 0644 file instead of Kubernetes' symlink-based projected-volume entry; the
@@ -352,7 +335,6 @@ resource "kubernetes_deployment_v1" "control_plane" {
         })
         annotations = {
           "cats.run/runtime-secret-sha256"                   = sha256(jsonencode(local.runtime_secret_data))
-          "cats.run/route-grant-key-sha256"                  = sha256("${var.route_grant_private_key_pem}\n${var.route_grant_public_key_pem}")
           "cats.run/route-v2-control-artifact-secret"        = terraform_data.route_v2_control_artifact.output.secret_name
           "cats.run/route-v2-control-artifact-secret-sha256" = terraform_data.route_v2_control_artifact.output.secret_sha256
           "cats.run/route-v2-control-signer-revision"        = tostring(terraform_data.route_v2_control_artifact.output.signer_revision)
@@ -481,28 +463,8 @@ resource "kubernetes_deployment_v1" "control_plane" {
           ]
 
           env {
-            name  = "CATS_AUTO_WARM_AFTER_SECONDS"
-            value = tostring(var.auto_warm_after_seconds)
-          }
-
-          env {
-            name  = "CATS_AUTO_COLD_AFTER_SECONDS"
-            value = tostring(var.auto_cold_after_seconds)
-          }
-
-          env {
             name  = "CATS_OCI_DEPLOY_SYNC_WAIT_MS"
             value = tostring(var.oci_deploy_sync_wait_ms)
-          }
-
-          env {
-            name  = "CATS_ROUTE_GRANT_PRIVATE_KEY_FILE"
-            value = "/etc/cats/route-grant/private.pem"
-          }
-
-          env {
-            name  = "CATS_ROUTE_GRANT_PUBLIC_KEY_FILE"
-            value = "/etc/cats/route-grant/public.pem"
           }
 
           # All PostgreSQL clients verify RDS TLS with this CA. Their DSNs are
@@ -604,12 +566,6 @@ resource "kubernetes_deployment_v1" "control_plane" {
           }
 
           volume_mount {
-            name       = "route-grant-signing"
-            mount_path = "/etc/cats/route-grant"
-            read_only  = true
-          }
-
-          volume_mount {
             name       = "route-v2-control-artifacts"
             mount_path = "/etc/cats/route-v2"
             read_only  = true
@@ -643,14 +599,6 @@ resource "kubernetes_deployment_v1" "control_plane" {
 
           secret {
             secret_name = kubernetes_secret_v1.runtime.metadata[0].name
-          }
-        }
-
-        volume {
-          name = "route-grant-signing"
-
-          secret {
-            secret_name = kubernetes_secret_v1.route_grant_signing.metadata[0].name
           }
         }
 

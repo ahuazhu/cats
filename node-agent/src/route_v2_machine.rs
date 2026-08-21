@@ -14,9 +14,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Context as _;
 use bytes::Bytes;
 use cats_api::gateway_workload_identity::canonical_gateway_leaf_spki_sha256;
+#[cfg(test)]
+use cats_api::route_grant_v2::RouteAdmissionV2Reason;
 use cats_api::route_grant_v2::{
     decode_route_tunnel_v2_request, encode_route_admission_v2_failure,
-    encode_route_grant_v2_public_key_ring, RouteAdmissionV2Failure, RouteAdmissionV2Reason,
+    encode_route_grant_v2_public_key_ring, RouteAdmissionV2Failure,
     ROUTE_TUNNEL_V2_CONNECT_DEADLINE_MILLIS, ROUTE_TUNNEL_V2_METHOD, ROUTE_TUNNEL_V2_PATH,
     ROUTE_TUNNEL_V2_REQUEST_MAX_WIRE_BYTES, ROUTE_TUNNEL_V2_UPGRADE, ROUTE_V2_JSON_CONTENT_TYPE,
 };
@@ -44,12 +46,12 @@ use tokio::sync::{mpsc, watch, OwnedSemaphorePermit};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 
+use crate::admission_registry::LifecycleAdmissionRegistry;
 use crate::route_grant_v2::{
     AdmittedRouteV2, AuthenticatedGatewayPrincipal, RouteAdmissionV2RequestBinding,
     RouteGrantV2KeyRing, RouteGrantV2Verifier,
 };
 use crate::route_signing_rotation::{RouteGrantV2RingInstallContext, RouteGrantV2RingInstaller};
-use crate::runtime::reconciliation::AdmissionCellRegistry;
 
 const TLS_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
 const REQUEST_HEADER_DEADLINE: Duration = Duration::from_secs(5);
@@ -73,7 +75,7 @@ pub struct RouteV2MachineConfig {
     tls: Arc<ServerConfig>,
     verifier: Arc<RouteGrantV2Verifier>,
     ring_install_serialized: Arc<Mutex<()>>,
-    delivery: Option<RouteV2RingDeliveryConfig>,
+    delivery: RouteV2RingDeliveryConfig,
 }
 
 #[derive(Clone)]
@@ -113,14 +115,17 @@ impl RouteV2MachineConfig {
             tls,
             verifier: Arc::new(RouteGrantV2Verifier::new(ring)),
             ring_install_serialized: Arc::new(Mutex::new(())),
-            delivery: Some(RouteV2RingDeliveryConfig {
+            delivery: RouteV2RingDeliveryConfig {
                 rotation_origin: validate_rotation_origin(rotation_origin)?,
+                // The frozen server-auth bundle validates both the Control
+                // rotation endpoint and reviewed Node server identities. The
+                // Gateway-client CA is only the inbound mTLS client verifier.
                 control_server_roots: route_rotation_control_roots(
-                    artifacts.gateway_client_ca_bundle_pem(),
+                    artifacts.node_server_ca_bundle_pem(),
                 )?,
                 trust,
                 expected_release_commit_sha,
-            }),
+            },
         })
     }
 
@@ -132,16 +137,18 @@ impl RouteV2MachineConfig {
     /// used by this listener and by full-inventory ACK observation.
     pub(crate) fn ring_installer(
         &self,
-        admission_registry: Arc<AdmissionCellRegistry>,
+        admission_registry: Arc<LifecycleAdmissionRegistry>,
     ) -> RouteGrantV2RingInstaller {
         if self
             .verifier
             .current_ring()
             .map_or(true, |ring| ring.loaded_kids().is_empty())
         {
-            admission_registry.latch_emergency_route_disable();
+            let _ = admission_registry.emergency_close_all_routes();
         }
-        let emergency_close = Arc::new(move || admission_registry.latch_emergency_route_disable());
+        let emergency_close = Arc::new(move || {
+            let _ = admission_registry.emergency_close_all_routes();
+        });
         RouteGrantV2RingInstaller::for_production(
             Arc::clone(&self.verifier),
             Arc::clone(&self.ring_install_serialized),
@@ -150,13 +157,14 @@ impl RouteV2MachineConfig {
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test(
+    fn for_test(
         listen: String,
         local_node_id: Id,
         client_ca_bundle_pem: &[u8],
         server_certificate_pem: &[u8],
         server_private_key_pem: &[u8],
         verifier: Arc<RouteGrantV2Verifier>,
+        delivery: RouteV2RingDeliveryConfig,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             listen,
@@ -168,7 +176,7 @@ impl RouteV2MachineConfig {
             )?,
             verifier,
             ring_install_serialized: Arc::new(Mutex::new(())),
-            delivery: None,
+            delivery,
         })
     }
 }
@@ -265,7 +273,7 @@ pub(crate) struct RouteV2MachineListener {
 impl RouteV2MachineListener {
     pub(crate) async fn spawn(
         config: RouteV2MachineConfig,
-        registry: Arc<AdmissionCellRegistry>,
+        registry: Arc<LifecycleAdmissionRegistry>,
     ) -> anyhow::Result<Self> {
         let ring_installer = Arc::new(config.ring_installer(Arc::clone(&registry)));
         let listener = TcpListener::bind(&config.listen)
@@ -274,7 +282,7 @@ impl RouteV2MachineListener {
         let addr = listener.local_addr()?;
         let (stop, shutdown) = watch::channel(false);
         let delivery_shutdown = stop.subscribe();
-        let delivery = config.delivery.clone();
+        let delivery = config.delivery;
         let delivery_verifier = Arc::clone(&config.verifier);
         let delivery_installer = Arc::clone(&ring_installer);
         let delivery_registry = Arc::clone(&registry);
@@ -285,31 +293,29 @@ impl RouteV2MachineListener {
         ));
         let run_service = Arc::clone(&service);
         let task = tokio::spawn(run_listener(listener, config.tls, run_service, shutdown));
-        let delivery_task = delivery.map(|delivery| {
-            tokio::spawn(async move {
-                let result = run_ring_delivery(
-                    delivery,
-                    delivery_verifier,
-                    delivery_installer,
-                    delivery_shutdown,
-                )
-                .await;
-                if let Err(error) = &result {
-                    tracing::error!(
-                        %error,
-                        "Route v2 ring delivery stopped; latching route admission closed"
-                    );
-                    delivery_registry.latch_emergency_route_disable();
-                }
-                result
-            })
+        let delivery_task = tokio::spawn(async move {
+            let result = run_ring_delivery(
+                delivery,
+                delivery_verifier,
+                delivery_installer,
+                delivery_shutdown,
+            )
+            .await;
+            if let Err(error) = &result {
+                tracing::error!(
+                    %error,
+                    "Route v2 ring delivery stopped; latching route admission closed"
+                );
+                let _ = delivery_registry.emergency_close_all_routes();
+            }
+            result
         });
         Ok(Self {
             addr,
             service,
             stop,
             task: Some(task),
-            delivery_task,
+            delivery_task: Some(delivery_task),
         })
     }
 
@@ -323,44 +329,83 @@ impl RouteV2MachineListener {
     }
 
     pub(crate) async fn wait(&mut self) -> anyhow::Result<()> {
-        let task = self
+        enum First {
+            Listener(Result<anyhow::Result<()>, tokio::task::JoinError>),
+            Delivery(Result<anyhow::Result<()>, tokio::task::JoinError>),
+        }
+
+        let listener = self
             .task
             .as_mut()
             .context("Node Route v2 listener already joined")?;
-        let joined = task.await;
-        self.task.take();
-        self.stop.send_replace(true);
-        let delivery = join_optional_task(&mut self.delivery_task, "Route v2 delivery task").await;
-        joined.context("Node Route v2 listener task panicked")??;
-        delivery
+        let delivery = self
+            .delivery_task
+            .as_mut()
+            .context("Route v2 delivery task already joined")?;
+        let first = tokio::select! {
+            result = listener => First::Listener(result),
+            result = delivery => First::Delivery(result),
+        };
+
+        // Either owned task ending is a process-component event. In
+        // particular, a terminal ring-delivery failure has already latched
+        // every AdmissionCell gate Closed; do not leave the listener and the
+        // Route command ACK loop alive in a permanently inconsistent state.
+        self.begin_shutdown();
+        match first {
+            First::Listener(joined) => {
+                self.task.take();
+                let listener = joined
+                    .context("Node Route v2 listener task panicked")
+                    .and_then(|result| result);
+                let delivery =
+                    join_owned_task(&mut self.delivery_task, "Route v2 delivery task").await;
+                listener.and(delivery)
+            }
+            First::Delivery(joined) => {
+                self.delivery_task.take();
+                let delivery = joined
+                    .context("Route v2 delivery task panicked")
+                    .and_then(|result| result);
+                let listener = match self.task.take() {
+                    Some(task) => task
+                        .await
+                        .context("Node Route v2 listener task panicked")
+                        .and_then(|result| result),
+                    None => Err(anyhow::anyhow!("Node Route v2 listener already joined")),
+                };
+                delivery.and(listener)
+            }
+        }
     }
 
     pub(crate) async fn shutdown(&mut self) -> anyhow::Result<()> {
         self.begin_shutdown();
-        let mut task = self.task.take();
-        let mut delivery_task = self.delivery_task.take();
+        let mut task = self
+            .task
+            .take()
+            .context("Node Route v2 listener already joined")?;
+        let mut delivery_task = self
+            .delivery_task
+            .take()
+            .context("Route v2 delivery task already joined")?;
         match tokio::time::timeout(SHUTDOWN_DEADLINE, async {
-            if let Some(task) = task.as_mut() {
-                task.await
-                    .context("Node Route v2 listener task panicked")??;
-            }
-            if let Some(task) = delivery_task.as_mut() {
-                task.await.context("Route v2 delivery task panicked")??;
-            }
+            (&mut task)
+                .await
+                .context("Node Route v2 listener task panicked")??;
+            (&mut delivery_task)
+                .await
+                .context("Route v2 delivery task panicked")??;
             anyhow::Ok(())
         })
         .await
         {
             Ok(joined) => joined,
             Err(_) => {
-                if let Some(task) = task {
-                    task.abort();
-                    let _ = task.await;
-                }
-                if let Some(task) = delivery_task {
-                    task.abort();
-                    let _ = task.await;
-                }
+                task.abort();
+                let _ = task.await;
+                delivery_task.abort();
+                let _ = delivery_task.await;
                 anyhow::bail!("Node Route v2 listener exceeded its shutdown deadline");
             }
         }
@@ -379,13 +424,13 @@ impl Drop for RouteV2MachineListener {
     }
 }
 
-async fn join_optional_task(
+async fn join_owned_task(
     task: &mut Option<JoinHandle<anyhow::Result<()>>>,
     name: &str,
 ) -> anyhow::Result<()> {
-    let Some(task_ref) = task.as_mut() else {
-        return Ok(());
-    };
+    let task_ref = task
+        .as_mut()
+        .with_context(|| format!("{name} already joined"))?;
     let result = task_ref.await.with_context(|| format!("{name} panicked"))?;
     task.take();
     result
@@ -665,7 +710,7 @@ async fn read_bounded_delivery_body(
 struct RouteV2MachineService {
     local_node_id: Id,
     verifier: Arc<RouteGrantV2Verifier>,
-    registry: Arc<AdmissionCellRegistry>,
+    registry: Arc<LifecycleAdmissionRegistry>,
     accepting: AtomicBool,
     permits: Arc<tokio::sync::Semaphore>,
     tunnel_sender: mpsc::Sender<TunnelJob>,
@@ -676,7 +721,7 @@ impl RouteV2MachineService {
     fn new(
         local_node_id: Id,
         verifier: Arc<RouteGrantV2Verifier>,
-        registry: Arc<AdmissionCellRegistry>,
+        registry: Arc<LifecycleAdmissionRegistry>,
     ) -> Self {
         let (tunnel_sender, tunnel_receiver) = mpsc::channel(TUNNEL_LIMIT);
         Self {
@@ -967,27 +1012,10 @@ fn verify_and_admit_route(
     opaque_grant: &str,
     now: u64,
 ) -> Result<AdmittedRouteV2, RouteAdmissionV2Failure> {
-    let Some(publication) = service
-        .registry
-        .begin_route_admission_publication()
-        .ok()
-        .flatten()
-    else {
-        return Err(RouteAdmissionV2Failure::pre_admission(
-            RouteAdmissionV2Reason::RuntimeNotReady,
-        )
-        .expect("RuntimeNotReady is pre-admission"));
-    };
     let verified = service
         .verifier
         .verify_request(principal, opaque_grant, binding, now)?;
-    let Some(cell) = publication.cell(verified.cat_id()) else {
-        return Err(RouteAdmissionV2Failure::pre_admission(
-            RouteAdmissionV2Reason::RuntimeNotReady,
-        )
-        .expect("RuntimeNotReady is pre-admission"));
-    };
-    verified.admit(&cell)
+    verified.admit_from_registry(&service.registry)
 }
 
 fn valid_tunnel_head(request: &Request<Incoming>) -> bool {
@@ -1244,28 +1272,37 @@ fn leaf_ed25519_spki_sha256(certificate_der: &[u8]) -> anyhow::Result<Sha256Dige
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
     use cats_api::route_grant_v2::{
         decode_route_admission_v2_failure, encode_route_tunnel_v2_request, RouteGrantV2Claims,
         RouteGrantV2ProtectedHeader, RouteGrantV2PublicKey, RouteGrantV2SigningInput,
         RouteTunnelV2Request, ROUTE_GRANT_V2_AUDIENCE, ROUTE_GRANT_V2_ISSUER,
         ROUTE_GRANT_V2_VERSION,
     };
+    use cats_api::route_signing_operator::RouteV2RotationOperatorCredential;
     use cats_api::runtime_reconciliation::{
-        AssignedKind, AssignedPlacement, CheckpointRouteGate, Epoch, Hostname, Ipv4Address,
-        LifecycleAdmission, RandomId128, Revision, RouteGateBinding, RouteGateState,
+        Base64UrlNoPad, ContractVersion, Epoch, Hostname, Ipv4Address, NodeBootId, RandomId128,
+        RouteGateBinding, SessionBinding,
     };
     use hyper::client::conn::http1 as client_http1;
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
     use rustls::pki_types::ServerName;
     use rustls::ClientConfig;
-    use tempfile::TempDir;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio_rustls::TlsConnector;
 
-    use crate::runtime::reconciliation::{
-        AdmissionCell, AdmissionGatePort as _, AdmissionSnapshot,
+    use crate::admission::{
+        DisableRoute, EffectiveRuntimeReady, EnableRoute, LifecycleRouteAdmission,
+        LifecycleRouteAdmissionCell,
     };
+
+    #[derive(Clone, Copy)]
+    enum TestGate {
+        Serving,
+        Closed,
+    }
 
     const CA_CERTIFICATE: &[u8] =
         include_bytes!("../../control-plane/tests/fixtures/gateway_machine_ca_certificate.pem");
@@ -1318,6 +1355,94 @@ mod tests {
     fn gateway_digest() -> Sha256Digest {
         let certificate = CertificateDer::from_pem_slice(CLIENT_CERTIFICATE).unwrap();
         leaf_ed25519_spki_sha256(certificate.as_ref()).unwrap()
+    }
+
+    fn test_delivery_config(rotation_origin: &str) -> RouteV2RingDeliveryConfig {
+        let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let operator = Ed25519KeyPair::from_pkcs8(document.as_ref()).unwrap();
+        let mut spki = ED25519_SPKI_PREFIX.to_vec();
+        spki.extend_from_slice(operator.public_key().as_ref());
+        let public = RouteGrantV2PublicKey::from_spki_der(&spki).unwrap();
+        let release_commit_sha = "a".repeat(40);
+        let trust = RouteV2RotationOperatorTrust {
+            version: ContractVersion::V1,
+            authority_id: Id::new("route_rotation_operator_test").unwrap(),
+            route_deployment_id: Id::new("route_deployment_test").unwrap(),
+            release_commit_sha: release_commit_sha.clone(),
+            threshold: 1,
+            credentials: vec![RouteV2RotationOperatorCredential {
+                credential_id: Id::new("route_rotation_credential_test").unwrap(),
+                public_key_spki: Base64UrlNoPad::new(URL_SAFE_NO_PAD.encode(&spki)).unwrap(),
+                public_key_spki_sha256: Sha256Digest::new(format!(
+                    "sha256:{}",
+                    public.kid().as_str()
+                ))
+                .unwrap(),
+            }],
+        };
+        trust.validate().unwrap();
+        RouteV2RingDeliveryConfig {
+            rotation_origin: validate_rotation_origin(rotation_origin).unwrap(),
+            control_server_roots: route_rotation_control_roots(CA_CERTIFICATE).unwrap(),
+            trust,
+            expected_release_commit_sha: release_commit_sha,
+        }
+    }
+
+    async fn test_delivery_harness() -> (RouteV2RingDeliveryConfig, JoinHandle<anyhow::Result<()>>)
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let certificates = strict_certificates(SERVER_CERTIFICATE, "test rotation server").unwrap();
+        let private_key = PrivatePkcs8KeyDer::from_pem_slice(SERVER_PRIVATE_KEY).unwrap();
+        let mut tls = ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certificates, PrivateKeyDer::Pkcs8(private_key))
+            .unwrap();
+        tls.alpn_protocols = vec![HTTP_11_ALPN.to_vec()];
+        let acceptor = TlsAcceptor::from(Arc::new(tls));
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.context("accept test delivery")?;
+            let stream = acceptor
+                .accept(stream)
+                .await
+                .context("accept test delivery TLS")?;
+            http1::Builder::new()
+                .serve_connection(
+                    TokioIo::new(stream),
+                    service_fn(|request: Request<Incoming>| async move {
+                        assert_eq!(request.method(), Method::GET);
+                        assert_eq!(request.uri().path(), ROUTE_V2_RING_SUCCESSOR_PATH);
+                        assert!(request.uri().query().is_some());
+                        assert_eq!(
+                            request.headers().get(header::ACCEPT),
+                            Some(&HeaderValue::from_static(
+                                ROUTE_V2_ROTATION_OPERATOR_JSON_CONTENT_TYPE
+                            ))
+                        );
+                        assert!(!request.headers().contains_key(header::AUTHORIZATION));
+                        Ok::<_, std::convert::Infallible>(
+                            Response::builder()
+                                .status(StatusCode::NO_CONTENT)
+                                .header(header::CACHE_CONTROL, "no-store")
+                                .header(header::CONTENT_LENGTH, "0")
+                                .header(header::CONNECTION, "close")
+                                .body(Full::new(Bytes::new()))
+                                .unwrap(),
+                        )
+                    }),
+                )
+                .await
+                .context("serve one real test delivery request")?;
+            Ok(())
+        });
+        (
+            test_delivery_config(&format!("https://127.0.0.1:{}/", address.port())),
+            task,
+        )
     }
 
     #[test]
@@ -1378,52 +1503,101 @@ mod tests {
         input.finish(&signature).unwrap()
     }
 
-    fn cell(claims: &RouteGrantV2Claims, gate: RouteGateState) -> Arc<AdmissionCell> {
+    fn test_session() -> SessionBinding {
+        SessionBinding {
+            node_id: Id::new("node-a").unwrap(),
+            node_boot_id: NodeBootId::new("ab".repeat(16)).unwrap(),
+            agent_instance_id: RandomId128::new("22".repeat(16)).unwrap(),
+            agent_session_epoch: Epoch::new(1).unwrap(),
+        }
+    }
+
+    fn route_binding(claims: &RouteGrantV2Claims) -> RouteGateBinding {
+        RouteGateBinding {
+            workspace_id: claims.workspace_id.clone(),
+            endpoint_id: claims.endpoint_id.clone(),
+            hostname: claims.hostname.clone(),
+            cat_id: claims.cat_id.clone(),
+            node_id: claims.node_id.clone(),
+            runtime_incarnation: claims.runtime_incarnation.clone(),
+            route_epoch: claims.route_epoch,
+            protocol: claims.protocol,
+            target_port: claims.target_port,
+        }
+    }
+
+    fn route_operation_id(prefix: &str, endpoint_id: &Id) -> Id {
+        Id::new(format!("{prefix}_{}", endpoint_id.as_str())).unwrap()
+    }
+
+    fn cell(claims: &RouteGrantV2Claims, gate: TestGate) -> Arc<LifecycleRouteAdmissionCell> {
         cell_with_guest_target(claims, gate, true)
     }
 
     fn cell_with_guest_target(
         claims: &RouteGrantV2Claims,
-        gate: RouteGateState,
+        gate: TestGate,
         has_guest_target: bool,
-    ) -> Arc<AdmissionCell> {
-        let snapshot = AdmissionSnapshot::new(
-            Revision::new(11).unwrap(),
-            Sha256Digest::from_bytes([0x11; 32]),
-            AssignedPlacement {
-                kind: AssignedKind::Assigned,
-                node_id: claims.node_id.clone(),
-                placement_epoch: Epoch::new(3).unwrap(),
-            },
-            Some(claims.runtime_incarnation.clone()),
-            LifecycleAdmission::Open,
-            vec![CheckpointRouteGate {
-                binding: RouteGateBinding {
-                    workspace_id: claims.workspace_id.clone(),
-                    endpoint_id: claims.endpoint_id.clone(),
-                    hostname: claims.hostname.clone(),
-                    cat_id: claims.cat_id.clone(),
-                    node_id: claims.node_id.clone(),
-                    runtime_incarnation: claims.runtime_incarnation.clone(),
-                    route_epoch: claims.route_epoch,
-                    protocol: claims.protocol,
-                    target_port: claims.target_port,
-                },
-                gate,
-            }],
-        );
-        let snapshot = if has_guest_target {
-            snapshot.with_guest_ipv4(Ipv4Address::new("127.0.0.1").unwrap())
+    ) -> Arc<LifecycleRouteAdmissionCell> {
+        let source = Id::new("start_test").unwrap();
+        let session = test_session();
+        let cell = if has_guest_target {
+            LifecycleRouteAdmissionCell::new(
+                claims.cat_id.clone(),
+                session.clone(),
+                LifecycleRouteAdmission::RuntimeReady(EffectiveRuntimeReady::new(
+                    source.clone(),
+                    claims.runtime_incarnation.clone(),
+                    Ipv4Address::new("127.0.0.1").unwrap(),
+                )),
+            )
         } else {
-            snapshot
+            LifecycleRouteAdmissionCell::new_fail_closed(
+                claims.cat_id.clone(),
+                session.clone(),
+                source.clone(),
+            )
         };
-        AdmissionCell::new(snapshot).unwrap()
+        if has_guest_target {
+            cell.enable_route(&EnableRoute::new(
+                route_operation_id("enable", &claims.endpoint_id),
+                source,
+                session,
+                route_binding(claims),
+            ))
+            .unwrap();
+            if matches!(gate, TestGate::Closed) {
+                cell.emergency_close_routes().unwrap();
+            }
+        }
+        cell
+    }
+
+    fn active_guards(cell: &LifecycleRouteAdmissionCell, endpoint_id: &Id) -> u32 {
+        cell.active_guard_counts()
+            .unwrap()
+            .endpoint_guards
+            .into_iter()
+            .find_map(|(current, count)| (current == *endpoint_id).then_some(count))
+            .unwrap_or(0)
+    }
+
+    fn close_endpoint(cell: &LifecycleRouteAdmissionCell, claims: &RouteGrantV2Claims) {
+        cell.disable_route(&DisableRoute::new(
+            route_operation_id("disable", &claims.endpoint_id),
+            Id::new("start_test").unwrap(),
+            test_session(),
+            route_operation_id("enable", &claims.endpoint_id),
+            route_binding(claims),
+        ))
+        .unwrap();
     }
 
     async fn listener(
         keys: &TestKeys,
-        registry: Arc<AdmissionCellRegistry>,
+        registry: Arc<LifecycleAdmissionRegistry>,
     ) -> RouteV2MachineListener {
+        let (delivery, delivery_server) = test_delivery_harness().await;
         let ring =
             RouteGrantV2KeyRing::new(Epoch::new(1).unwrap(), vec![keys.public.clone()]).unwrap();
         let config = RouteV2MachineConfig::for_test(
@@ -1433,11 +1607,58 @@ mod tests {
             SERVER_CERTIFICATE,
             SERVER_PRIVATE_KEY,
             Arc::new(RouteGrantV2Verifier::new(ring)),
+            delivery,
         )
         .unwrap();
-        RouteV2MachineListener::spawn(config, registry)
+        let machine = RouteV2MachineListener::spawn(config, registry)
             .await
-            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), delivery_server)
+            .await
+            .expect("mandatory delivery did not reach the real HTTPS harness")
+            .expect("test delivery server task panicked")
+            .expect("test delivery server failed");
+        assert!(machine
+            .delivery_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished()));
+        machine
+    }
+
+    #[tokio::test]
+    async fn terminal_ring_delivery_failure_stops_the_owned_listener() {
+        let keys = keys();
+        let registry = LifecycleAdmissionRegistry::for_machine_test(test_session());
+        let mut listener = listener(&keys, registry).await;
+        listener
+            .delivery_task
+            .as_ref()
+            .expect("mandatory delivery task")
+            .abort();
+
+        let error = tokio::time::timeout(Duration::from_secs(2), listener.wait())
+            .await
+            .expect("delivery failure must wake the component owner")
+            .expect_err("delivery failure must stop Route composition");
+        assert!(
+            format!("{error:#}").contains("Route v2 delivery task panicked"),
+            "unexpected error: {error:#}"
+        );
+        assert!(listener.task.is_none());
+        assert!(listener.delivery_task.is_none());
+    }
+
+    #[tokio::test]
+    async fn listener_shutdown_joins_the_mandatory_delivery_task() {
+        let keys = keys();
+        let registry = LifecycleAdmissionRegistry::for_machine_test(test_session());
+        let mut listener = listener(&keys, registry).await;
+        assert!(listener.delivery_task.is_some());
+
+        listener.shutdown().await.unwrap();
+
+        assert!(listener.task.is_none());
+        assert!(listener.delivery_task.is_none());
     }
 
     #[test]
@@ -1452,10 +1673,10 @@ mod tests {
             SERVER_CERTIFICATE,
             SERVER_PRIVATE_KEY,
             Arc::new(RouteGrantV2Verifier::new(ring)),
+            test_delivery_config("https://127.0.0.1:9/"),
         )
         .unwrap();
-        let registry_root = tempfile::tempdir().unwrap();
-        let registry = AdmissionCellRegistry::new(registry_root.path().join("checkpoints"));
+        let registry = LifecycleAdmissionRegistry::for_machine_test(test_session());
         let first = config.ring_installer(Arc::clone(&registry));
         let second = config.ring_installer(registry);
         assert!(first.shares_process_lock_with(&second));
@@ -1473,15 +1694,20 @@ mod tests {
             SERVER_CERTIFICATE,
             SERVER_PRIVATE_KEY,
             verifier,
+            test_delivery_config("https://127.0.0.1:9/"),
         )
         .unwrap();
-        let registry_root = tempfile::tempdir().unwrap();
-        let registry = AdmissionCellRegistry::new(registry_root.path().join("checkpoints"));
+        let claims = claims("cat_empty_ring", "ep_empty_ring", 9);
+        let active = cell(&claims, TestGate::Serving);
+        let registry = LifecycleAdmissionRegistry::for_machine_test(test_session());
+        registry
+            .insert_cell_for_machine_test(Arc::clone(&active))
+            .unwrap();
 
         let _installer = config.ring_installer(Arc::clone(&registry));
 
-        assert!(registry
-            .begin_route_admission_publication()
+        assert!(active
+            .current_serving_route(&claims.endpoint_id)
             .unwrap()
             .is_none());
     }
@@ -1491,11 +1717,10 @@ mod tests {
         let keys = keys();
         let claims = claims("cat_publication", "ep_publication", 9);
         let token = sign(&keys, &claims);
-        let active = cell(&claims, RouteGateState::Active);
-        let temp = TempDir::new().unwrap();
-        let registry = AdmissionCellRegistry::new(temp.path().join("checkpoints"));
+        let active = cell(&claims, TestGate::Serving);
+        let registry = LifecycleAdmissionRegistry::for_machine_test(test_session());
         registry
-            .insert_cell_for_machine_test(claims.cat_id.clone(), Arc::clone(&active))
+            .insert_cell_for_machine_test(Arc::clone(&active))
             .unwrap();
         let verifier = Arc::new(RouteGrantV2Verifier::new(
             RouteGrantV2KeyRing::new(Epoch::new(1).unwrap(), vec![keys.public.clone()]).unwrap(),
@@ -1513,21 +1738,21 @@ mod tests {
 
         let mut admitted =
             verify_and_admit_route(&service, &principal, &binding, &token, claims.nbf).unwrap();
-        assert_eq!(active.active_guards(&claims.endpoint_id), Some(1));
+        assert_eq!(active_guards(&active, &claims.endpoint_id), 1);
 
         // The synchronous helper no longer owns the registry barrier here,
         // so emergency close can linearize before any Guest-network await and
         // cancel the already-acquired Endpoint guard.
-        registry.latch_emergency_route_disable();
+        registry.emergency_close_all_routes().unwrap();
         tokio::time::timeout(cats_test_support::poll_bound(), admitted.cancelled())
             .await
             .expect("emergency close cancels the admitted guard");
         drop(admitted);
-        assert_eq!(active.active_guards(&claims.endpoint_id), Some(0));
+        assert_eq!(active_guards(&active, &claims.endpoint_id), 0);
 
         let failure =
             verify_and_admit_route(&service, &principal, &binding, &token, claims.nbf).unwrap_err();
-        assert_eq!(failure.reason, RouteAdmissionV2Reason::RuntimeNotReady);
+        assert_eq!(failure.reason, RouteAdmissionV2Reason::GateClosed);
         assert!(!failure.guard_acquired);
     }
 
@@ -1641,11 +1866,10 @@ mod tests {
         });
         let keys = keys();
         let claims = claims("cat_success", "ep_success", target_port);
-        let active = cell(&claims, RouteGateState::Active);
-        let temp = TempDir::new().unwrap();
-        let registry = AdmissionCellRegistry::new(temp.path().join("checkpoints"));
+        let active = cell(&claims, TestGate::Serving);
+        let registry = LifecycleAdmissionRegistry::for_machine_test(test_session());
         registry
-            .insert_cell_for_machine_test(claims.cat_id.clone(), Arc::clone(&active))
+            .insert_cell_for_machine_test(Arc::clone(&active))
             .unwrap();
         let mut listener = listener(&keys, registry).await;
         let exchange = exchange(
@@ -1662,7 +1886,7 @@ mod tests {
                 panic!("unexpected rejection {status}: {body:?}")
             }
         };
-        assert_eq!(active.active_guards(&claims.endpoint_id), Some(1));
+        assert_eq!(active_guards(&active, &claims.endpoint_id), 1);
         tunnel.write_all(b"ping").await.unwrap();
         let mut pong = [0_u8; 4];
         tunnel.read_exact(&mut pong).await.unwrap();
@@ -1675,7 +1899,7 @@ mod tests {
             Err(error) => error.kind() == std::io::ErrorKind::UnexpectedEof,
             Ok(_) => false,
         });
-        assert_eq!(active.active_guards(&claims.endpoint_id), Some(0));
+        assert_eq!(active_guards(&active, &claims.endpoint_id), 0);
         guest_task.await.unwrap();
     }
 
@@ -1699,42 +1923,19 @@ mod tests {
             let mut tail = [0_u8; 1];
             assert_eq!(stream.read(&mut tail).await.unwrap(), 0);
         });
-        let routes = [&claims_a, &claims_b]
-            .into_iter()
-            .map(|claims| CheckpointRouteGate {
-                binding: RouteGateBinding {
-                    workspace_id: claims.workspace_id.clone(),
-                    endpoint_id: claims.endpoint_id.clone(),
-                    hostname: claims.hostname.clone(),
-                    cat_id: claims.cat_id.clone(),
-                    node_id: claims.node_id.clone(),
-                    runtime_incarnation: claims.runtime_incarnation.clone(),
-                    route_epoch: claims.route_epoch,
-                    protocol: claims.protocol,
-                    target_port: claims.target_port,
-                },
-                gate: RouteGateState::Active,
-            })
-            .collect();
-        let snapshot = AdmissionSnapshot::new(
-            Revision::new(11).unwrap(),
-            Sha256Digest::from_bytes([0x11; 32]),
-            AssignedPlacement {
-                kind: AssignedKind::Assigned,
-                node_id: claims_a.node_id.clone(),
-                placement_epoch: Epoch::new(3).unwrap(),
-            },
-            Some(claims_a.runtime_incarnation.clone()),
-            LifecycleAdmission::Open,
-            routes,
-        )
-        .with_guest_ipv4(Ipv4Address::new("127.0.0.1").unwrap());
-        let active = AdmissionCell::new(snapshot).unwrap();
+        let active = cell(&claims_a, TestGate::Serving);
+        active
+            .enable_route(&EnableRoute::new(
+                route_operation_id("enable", &claims_b.endpoint_id),
+                Id::new("start_test").unwrap(),
+                test_session(),
+                route_binding(&claims_b),
+            ))
+            .unwrap();
         let keys = keys();
-        let temp = TempDir::new().unwrap();
-        let registry = AdmissionCellRegistry::new(temp.path().join("checkpoints"));
+        let registry = LifecycleAdmissionRegistry::for_machine_test(test_session());
         registry
-            .insert_cell_for_machine_test(claims_a.cat_id.clone(), Arc::clone(&active))
+            .insert_cell_for_machine_test(Arc::clone(&active))
             .unwrap();
         let mut listener = listener(&keys, registry).await;
         let mut tunnel_a = match exchange(
@@ -1761,25 +1962,10 @@ mod tests {
             Exchange::Upgraded(tunnel) => tunnel,
             Exchange::Rejected(status, _) => panic!("B was rejected with {status}"),
         };
-        assert_eq!(active.active_guards(&claims_a.endpoint_id), Some(1));
-        assert_eq!(active.active_guards(&claims_b.endpoint_id), Some(1));
+        assert_eq!(active_guards(&active, &claims_a.endpoint_id), 1);
+        assert_eq!(active_guards(&active, &claims_b.endpoint_id), 1);
 
-        let expected = active.snapshot();
-        let mut closed_routes = expected.endpoints().to_vec();
-        closed_routes[0].gate = RouteGateState::Closed;
-        let closed_a = AdmissionSnapshot::new(
-            expected.applied_desired_revision(),
-            expected.spec_digest().clone(),
-            expected.placement().clone(),
-            expected.runtime_incarnation().cloned(),
-            expected.lifecycle_admission(),
-            closed_routes,
-        )
-        .with_guest_ipv4(expected.guest_ipv4().cloned().unwrap());
-        active
-            .port()
-            .close_gate(&expected, &closed_a, &claims_a.endpoint_id)
-            .unwrap();
+        close_endpoint(&active, &claims_a);
 
         let mut tail = [0_u8; 1];
         let a_closed =
@@ -1787,8 +1973,8 @@ mod tests {
                 .await
                 .expect("A tunnel must be cancelled");
         assert!(matches!(a_closed, Ok(0) | Err(_)));
-        assert_eq!(active.active_guards(&claims_a.endpoint_id), Some(0));
-        assert_eq!(active.active_guards(&claims_b.endpoint_id), Some(1));
+        assert_eq!(active_guards(&active, &claims_a.endpoint_id), 0);
+        assert_eq!(active_guards(&active, &claims_b.endpoint_id), 1);
         tunnel_b.write_all(b"ping").await.unwrap();
         let mut pong = [0_u8; 4];
         tunnel_b.read_exact(&mut pong).await.unwrap();
@@ -1814,22 +2000,21 @@ mod tests {
     #[tokio::test]
     async fn identity_binding_time_node_gate_and_missing_runtime_reject_before_guest_io() {
         let keys = keys();
-        let temp = TempDir::new().unwrap();
-        let registry = AdmissionCellRegistry::new(temp.path().join("checkpoints"));
+        let registry = LifecycleAdmissionRegistry::for_machine_test(test_session());
         let active_claims = claims("cat_active", "ep_active", 9);
-        let active = cell(&active_claims, RouteGateState::Active);
+        let active = cell(&active_claims, TestGate::Serving);
         registry
-            .insert_cell_for_machine_test(active_claims.cat_id.clone(), Arc::clone(&active))
+            .insert_cell_for_machine_test(Arc::clone(&active))
             .unwrap();
         let closed_claims = claims("cat_closed", "ep_closed", 9);
-        let closed = cell(&closed_claims, RouteGateState::Closed);
+        let closed = cell(&closed_claims, TestGate::Closed);
         registry
-            .insert_cell_for_machine_test(closed_claims.cat_id.clone(), Arc::clone(&closed))
+            .insert_cell_for_machine_test(Arc::clone(&closed))
             .unwrap();
         let targetless_claims = claims("cat_targetless", "ep_targetless", 9);
-        let targetless = cell_with_guest_target(&targetless_claims, RouteGateState::Active, false);
+        let targetless = cell_with_guest_target(&targetless_claims, TestGate::Serving, false);
         registry
-            .insert_cell_for_machine_test(targetless_claims.cat_id.clone(), Arc::clone(&targetless))
+            .insert_cell_for_machine_test(Arc::clone(&targetless))
             .unwrap();
         let mut listener = listener(&keys, registry).await;
 
@@ -1896,6 +2081,22 @@ mod tests {
         );
         assert_eq!(failure.reason, RouteAdmissionV2Reason::Expired);
 
+        let mut not_yet_valid = active_claims.clone();
+        not_yet_valid.iat = now() + 30;
+        not_yet_valid.nbf = not_yet_valid.iat;
+        not_yet_valid.exp = not_yet_valid.iat + 120;
+        let (_, failure) = rejection(
+            exchange(
+                listener.addr(),
+                &frame(&not_yet_valid, sign(&keys, &not_yet_valid)),
+                CLIENT_CERTIFICATE,
+                CLIENT_PRIVATE_KEY,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(failure.reason, RouteAdmissionV2Reason::NotYetValid);
+
         let (_, failure) = rejection(
             exchange(
                 listener.addr(),
@@ -1932,11 +2133,11 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(failure.reason, RouteAdmissionV2Reason::RuntimeNotReady);
-        assert_eq!(active.active_guards(&active_claims.endpoint_id), Some(0));
-        assert_eq!(closed.active_guards(&closed_claims.endpoint_id), Some(0));
+        assert_eq!(active_guards(&active, &active_claims.endpoint_id), 0);
+        assert_eq!(active_guards(&closed, &closed_claims.endpoint_id), 0);
         assert_eq!(
-            targetless.active_guards(&targetless_claims.endpoint_id),
-            Some(0)
+            active_guards(&targetless, &targetless_claims.endpoint_id),
+            0
         );
 
         assert!(exchange(
@@ -1976,14 +2177,12 @@ mod tests {
         let trusted = keys();
         let untrusted = keys();
         let claims = claims("cat_probe", "ep_probe", target_port);
-        let active = cell(&claims, RouteGateState::Active);
-        let present_root = TempDir::new().unwrap();
-        let present_registry = AdmissionCellRegistry::new(present_root.path().join("checkpoints"));
+        let active = cell(&claims, TestGate::Serving);
+        let present_registry = LifecycleAdmissionRegistry::for_machine_test(test_session());
         present_registry
-            .insert_cell_for_machine_test(claims.cat_id.clone(), Arc::clone(&active))
+            .insert_cell_for_machine_test(Arc::clone(&active))
             .unwrap();
-        let absent_root = TempDir::new().unwrap();
-        let absent_registry = AdmissionCellRegistry::new(absent_root.path().join("checkpoints"));
+        let absent_registry = LifecycleAdmissionRegistry::for_machine_test(test_session());
         let mut present_listener = listener(&trusted, present_registry).await;
         let mut absent_listener = listener(&trusted, absent_registry).await;
 
@@ -2017,7 +2216,7 @@ mod tests {
             assert_eq!(present.0, StatusCode::CONFLICT);
             assert_eq!(present.1.reason, expected_reason);
             assert!(!present.1.guard_acquired);
-            assert_eq!(active.active_guards(&claims.endpoint_id), Some(0));
+            assert_eq!(active_guards(&active, &claims.endpoint_id), 0);
         }
 
         let (_, valid_absent) = rejection(
@@ -2040,7 +2239,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(active.active_guards(&claims.endpoint_id), Some(0));
+        assert_eq!(active_guards(&active, &claims.endpoint_id), 0);
 
         present_listener.shutdown().await.unwrap();
         absent_listener.shutdown().await.unwrap();
@@ -2053,11 +2252,10 @@ mod tests {
         drop(unused);
         let keys = keys();
         let claims = claims("cat_refused", "ep_refused", target_port);
-        let active = cell(&claims, RouteGateState::Active);
-        let temp = TempDir::new().unwrap();
-        let registry = AdmissionCellRegistry::new(temp.path().join("checkpoints"));
+        let active = cell(&claims, TestGate::Serving);
+        let registry = LifecycleAdmissionRegistry::for_machine_test(test_session());
         registry
-            .insert_cell_for_machine_test(claims.cat_id.clone(), Arc::clone(&active))
+            .insert_cell_for_machine_test(Arc::clone(&active))
             .unwrap();
         let mut listener = listener(&keys, registry).await;
         let (status, failure) = rejection(
@@ -2073,7 +2271,7 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(failure.guard_acquired);
         assert_eq!(failure.reason, RouteAdmissionV2Reason::UpstreamUnavailable);
-        assert_eq!(active.active_guards(&claims.endpoint_id), Some(0));
+        assert_eq!(active_guards(&active, &claims.endpoint_id), 0);
         listener.shutdown().await.unwrap();
     }
 }

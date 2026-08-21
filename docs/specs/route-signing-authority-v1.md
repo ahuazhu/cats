@@ -5,7 +5,7 @@
   ADR尚未授予production caller/transport触发该Store transition的权限，因此production invocation保持关闭
 - 决策：[ADR-0044](../decisions/0044-independent-route-v2-signing-authority.md)
 - Grant 与 admission：[Route Grant v2](route-grant-v2.md)
-- Node observation：[Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)
+- Node inventory telemetry：[Runtime Inventory and Telemetry v1](runtime-inventory-observation-v1.md)
 
 本文只冻结 Route v2 private signer、public-key ring、rotation/revocation、部署 artifact，以及 Runtime
 scanner 对 fixed installed ring 的 exact observation。它不定义其他 physical inventory source、Gateway

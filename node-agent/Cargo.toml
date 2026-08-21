@@ -16,9 +16,7 @@ proposed-node-residue-reclamation = [
 
 [dependencies]
 cats-api = { workspace = true }
-cats-block-client = { workspace = true }
 cats-blockd = { workspace = true }
-cats-metering = { workspace = true }
 cats-storage = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -28,14 +26,10 @@ sha2 = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
-rusqlite = { workspace = true }
 uuid = { workspace = true }
 libc = { workspace = true }
 tracing = { workspace = true }
-futures-util = { workspace = true }
-tokio-tungstenite = { workspace = true }
 base64 = { workspace = true }
-jsonwebtoken = { workspace = true }
 bytes = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
@@ -61,20 +55,12 @@ postgres = { workspace = true }
 # already builds both crates, so this adds no new workspace dependency.
 cats-host-fence-aws = { workspace = true }
 aws-config = { workspace = true }
-cats-network = { workspace = true, features = ["test-support"] }
-# The stub control planes in `tests/control_plane_connection.rs` and
-# `tests/heartbeat_independence.rs` need a real `MetadataStore` for
-# `ServerConfig`; this is the workspace's SQLite adapter.
-cats-metadata-store-sqlite = { workspace = true }
 cats-object-store-file = { workspace = true }
 tempfile = { workspace = true }
 hex = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-cats-metadata-store-postgres = { workspace = true }
-cats-object-store-aws-s3 = { workspace = true }
 cats-blockd = { workspace = true, features = ["test-vhost-user-frontend"] }
-vhost = { workspace = true, features = ["vhost-user-frontend"] }
 
 [lints]
 workspace = true

@@ -3,7 +3,7 @@
 //! The machine listener supplies an unforgeable in-process Gateway transport
 //! proof. This module first verifies the complete signed request binding and
 //! returns a non-wire-constructible claims/time proof. Only that proof's Cat
-//! identity may select the live [`AdmissionCell`], where admission and guard
+//! identity may select the live [`LifecycleRouteAdmissionCell`], where admission and guard
 //! acquisition are then atomic.
 
 use std::collections::BTreeMap;
@@ -11,15 +11,16 @@ use std::sync::{Arc, RwLock};
 
 use cats_api::route_grant_v2::{
     RouteAdmissionV2Failure, RouteAdmissionV2Reason, RouteGrantV2Compact, RouteGrantV2Error,
-    RouteGrantV2PublicKey, RouteGrantV2PublicKeyRingArtifact, MAX_ROUTE_GRANT_V2_RING_KEYS,
-    ROUTE_GRANT_V2_VERSION,
+    RouteGrantV2PublicKey, RouteGrantV2PublicKeyRingArtifact, RouteGrantV2TimeVerdict,
+    MAX_ROUTE_GRANT_V2_RING_KEYS, ROUTE_GRANT_V2_VERSION,
 };
 use cats_api::runtime_reconciliation::{
     key_ring_digest, Epoch, Hostname, HttpProtocol, Id, Ipv4Address, KeyId, Sha256Digest,
 };
 use thiserror::Error;
 
-use crate::runtime::reconciliation::{AdmissionCell, RouteAdmissionGuard};
+use crate::admission::{LifecycleRouteAdmissionCell, RouteInterlockError, RouteUseGuard};
+use crate::admission_registry::{LifecycleAdmissionRegistry, LifecycleAdmissionRegistryError};
 
 #[derive(Clone)]
 pub struct RouteGrantV2KeyRing {
@@ -170,7 +171,7 @@ pub struct RouteAdmissionV2RequestBinding {
     pub protocol: HttpProtocol,
 }
 
-/// Signed claims and time evidence for one exact machine request.
+/// Signed claims for one exact machine request whose time window was verified.
 ///
 /// All fields are private so neither the tunnel frame nor another crate can
 /// manufacture the proof used for registry selection or admission. The only
@@ -178,7 +179,6 @@ pub struct RouteAdmissionV2RequestBinding {
 #[derive(Debug)]
 pub(crate) struct VerifiedRouteV2Request {
     claims: cats_api::route_grant_v2::RouteGrantV2Claims,
-    time_verdict: cats_api::route_grant_v2::RouteGrantV2TimeVerdict,
 }
 
 impl VerifiedRouteV2Request {
@@ -190,23 +190,49 @@ impl VerifiedRouteV2Request {
     /// acquires its Endpoint guard. No I/O is performed in this operation.
     pub(crate) fn admit(
         self,
-        admission_cell: &Arc<AdmissionCell>,
+        admission_cell: &Arc<LifecycleRouteAdmissionCell>,
     ) -> Result<AdmittedRouteV2, RouteAdmissionV2Failure> {
+        let binding = cats_api::runtime_reconciliation::RouteGateBinding {
+            workspace_id: self.claims.workspace_id.clone(),
+            endpoint_id: self.claims.endpoint_id.clone(),
+            hostname: self.claims.hostname.clone(),
+            cat_id: self.claims.cat_id.clone(),
+            node_id: self.claims.node_id.clone(),
+            runtime_incarnation: self.claims.runtime_incarnation.clone(),
+            route_epoch: self.claims.route_epoch,
+            protocol: self.claims.protocol,
+            target_port: self.claims.target_port,
+        };
         let (guard, guest_ipv4) = admission_cell
-            .acquire_verified_route(&self.claims, self.time_verdict)
-            .map_err(pre_admission)?;
+            .acquire_route(&binding)
+            .map_err(|error| pre_admission(map_interlock_error(error)))?;
         Ok(AdmittedRouteV2 {
             claims: self.claims,
             guard,
             guest_ipv4,
         })
     }
+
+    /// Select the sole Host-global Cat cell only after signature and binding
+    /// verification have succeeded. Missing, blocked and uninitialized Cats
+    /// deliberately share one pre-admission result so an invalid/valid Grant
+    /// cannot turn the machine endpoint into a local-inventory oracle.
+    pub(crate) fn admit_from_registry(
+        self,
+        registry: &LifecycleAdmissionRegistry,
+    ) -> Result<AdmittedRouteV2, RouteAdmissionV2Failure> {
+        let cell = registry
+            .lookup(self.cat_id())
+            .map_err(|error| pre_admission(map_registry_error(error)))?
+            .ok_or_else(|| pre_admission(RouteAdmissionV2Reason::RuntimeNotReady))?;
+        self.admit(&cell)
+    }
 }
 
 #[derive(Debug)]
 pub struct AdmittedRouteV2 {
     claims: cats_api::route_grant_v2::RouteGrantV2Claims,
-    guard: RouteAdmissionGuard,
+    guard: RouteUseGuard,
     guest_ipv4: Ipv4Address,
 }
 
@@ -215,7 +241,7 @@ impl AdmittedRouteV2 {
         &self.claims
     }
 
-    pub fn guard(&self) -> &RouteAdmissionGuard {
+    pub fn guard(&self) -> &RouteUseGuard {
         &self.guard
     }
 
@@ -231,7 +257,7 @@ impl AdmittedRouteV2 {
         self,
     ) -> (
         cats_api::route_grant_v2::RouteGrantV2Claims,
-        RouteAdmissionGuard,
+        RouteUseGuard,
         Ipv4Address,
     ) {
         (self.claims, self.guard, self.guest_ipv4)
@@ -357,9 +383,6 @@ impl RouteGrantV2Verifier {
         if claims.gateway_public_key_spki_sha256 != principal.public_key_spki_sha256 {
             return Err(pre_admission(RouteAdmissionV2Reason::BindingMismatch));
         }
-        let time_verdict = claims
-            .time_verdict(now_unix_seconds)
-            .map_err(|_| pre_admission(RouteAdmissionV2Reason::InvalidClaims))?;
         if claims.node_id != request.local_node_id
             || claims.cat_id != request.cat_id
             || claims.endpoint_id != request.endpoint_id
@@ -368,10 +391,19 @@ impl RouteGrantV2Verifier {
         {
             return Err(pre_admission(RouteAdmissionV2Reason::BindingMismatch));
         }
-        Ok(VerifiedRouteV2Request {
-            claims,
-            time_verdict,
-        })
+        match claims
+            .time_verdict(now_unix_seconds)
+            .map_err(|_| pre_admission(RouteAdmissionV2Reason::InvalidClaims))?
+        {
+            RouteGrantV2TimeVerdict::Valid => {}
+            RouteGrantV2TimeVerdict::NotYetValid => {
+                return Err(pre_admission(RouteAdmissionV2Reason::NotYetValid));
+            }
+            RouteGrantV2TimeVerdict::Expired => {
+                return Err(pre_admission(RouteAdmissionV2Reason::Expired));
+            }
+        }
+        Ok(VerifiedRouteV2Request { claims })
     }
 
     #[cfg(test)]
@@ -381,10 +413,10 @@ impl RouteGrantV2Verifier {
         opaque_grant: &str,
         request: &RouteAdmissionV2RequestBinding,
         now_unix_seconds: u64,
-        admission_cell: &Arc<AdmissionCell>,
+        admission_cell: &Arc<LifecycleRouteAdmissionCell>,
     ) -> Result<AdmittedRouteV2, RouteAdmissionV2Failure> {
-        self.verify_request(principal, opaque_grant, request, now_unix_seconds)?
-            .admit(admission_cell)
+        let verified = self.verify_request(principal, opaque_grant, request, now_unix_seconds)?;
+        verified.admit(admission_cell)
     }
 }
 
@@ -407,6 +439,49 @@ fn map_verification_error(error: RouteGrantV2Error) -> RouteAdmissionV2Reason {
     }
 }
 
+fn map_interlock_error(error: RouteInterlockError) -> RouteAdmissionV2Reason {
+    match error {
+        RouteInterlockError::StaleLifecycleSource
+        | RouteInterlockError::StaleLifecycleClose
+        | RouteInterlockError::StaleRuntimeReadySuccessor => {
+            RouteAdmissionV2Reason::RuntimeNotReady
+        }
+        RouteInterlockError::RouteNotServing
+        | RouteInterlockError::StaleRouteOperation
+        | RouteInterlockError::RouteEpochNotAdvanced
+        | RouteInterlockError::EndpointAlreadyServing
+        | RouteInterlockError::ActiveRouteGuards => RouteAdmissionV2Reason::GateClosed,
+        RouteInterlockError::WrongCat
+        | RouteInterlockError::WrongNode
+        | RouteInterlockError::WrongRuntimeIncarnation
+        | RouteInterlockError::StaleAgentSession
+        | RouteInterlockError::InvalidAgentSessionSuccessor
+        | RouteInterlockError::RouteOperationConflict => RouteAdmissionV2Reason::BindingMismatch,
+        RouteInterlockError::Unavailable | RouteInterlockError::CounterExhausted => {
+            RouteAdmissionV2Reason::UpstreamUnavailable
+        }
+    }
+}
+
+fn map_registry_error(error: LifecycleAdmissionRegistryError) -> RouteAdmissionV2Reason {
+    match error {
+        LifecycleAdmissionRegistryError::Unavailable => RouteAdmissionV2Reason::UpstreamUnavailable,
+        LifecycleAdmissionRegistryError::Uninitialized
+        | LifecycleAdmissionRegistryError::InitializationConflict
+        | LifecycleAdmissionRegistryError::InvalidStartupInventory { .. }
+        | LifecycleAdmissionRegistryError::CatBlocked { .. }
+        | LifecycleAdmissionRegistryError::CellAuthorityConflict { .. }
+        | LifecycleAdmissionRegistryError::InvalidInitialTargetCommand
+        | LifecycleAdmissionRegistryError::MissingSameNodeAdmissionCell { .. }
+        | LifecycleAdmissionRegistryError::StaleAgentSession
+        | LifecycleAdmissionRegistryError::RuntimeReadyRecoveryAuthorityMismatch
+        | LifecycleAdmissionRegistryError::UnattributedPhysicalArtifacts
+        | LifecycleAdmissionRegistryError::InvalidAgentSessionSuccessor
+        | LifecycleAdmissionRegistryError::CellInterlock { .. }
+        | LifecycleAdmissionRegistryError::Journal(_) => RouteAdmissionV2Reason::RuntimeNotReady,
+    }
+}
+
 fn pre_admission(reason: RouteAdmissionV2Reason) -> RouteAdmissionV2Failure {
     RouteAdmissionV2Failure {
         version: ROUTE_GRANT_V2_VERSION,
@@ -424,16 +499,13 @@ mod tests {
         RouteGrantV2SigningInput, ROUTE_GRANT_V2_AUDIENCE, ROUTE_GRANT_V2_ISSUER,
     };
     use cats_api::runtime_reconciliation::{
-        AssignedKind, AssignedPlacement, CheckpointRouteGate, Ipv4Address, LifecycleAdmission,
-        RandomId128, Revision, RouteGateBinding, RouteGateState,
+        NodeBootId, RandomId128, RouteGateBinding, SessionBinding,
     };
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
     use super::*;
-    use crate::runtime::reconciliation::{
-        AdmissionGatePort, AdmissionSnapshot, GatePortError, IdleCloseResult,
-    };
+    use crate::admission::{EffectiveRuntimeReady, EnableRoute, LifecycleRouteAdmission};
 
     const ED25519_SPKI_PREFIX: [u8; 12] = [
         0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
@@ -509,56 +581,48 @@ mod tests {
         }
     }
 
-    fn snapshot(
-        claims: &RouteGrantV2Claims,
-        gate: RouteGateState,
-        lifecycle: LifecycleAdmission,
-    ) -> AdmissionSnapshot {
-        snapshot_many(std::slice::from_ref(claims), gate, lifecycle)
+    fn session(node_id: &Id) -> SessionBinding {
+        SessionBinding {
+            node_id: node_id.clone(),
+            node_boot_id: NodeBootId::new("ab".repeat(16)).unwrap(),
+            agent_instance_id: RandomId128::new("22".repeat(16)).unwrap(),
+            agent_session_epoch: Epoch::new(1).unwrap(),
+        }
     }
 
-    fn snapshot_many(
-        claims: &[RouteGrantV2Claims],
-        gate: RouteGateState,
-        lifecycle: LifecycleAdmission,
-    ) -> AdmissionSnapshot {
-        let first = claims.first().unwrap();
-        with_guest_target(AdmissionSnapshot::new(
-            Revision::new(11).unwrap(),
-            Sha256Digest::from_bytes([0x11; 32]),
-            AssignedPlacement {
-                kind: AssignedKind::Assigned,
-                node_id: first.node_id.clone(),
-                placement_epoch: Epoch::new(3).unwrap(),
-            },
-            Some(first.runtime_incarnation.clone()),
-            lifecycle,
-            claims
-                .iter()
-                .map(|claims| CheckpointRouteGate {
-                    binding: RouteGateBinding {
-                        workspace_id: claims.workspace_id.clone(),
-                        endpoint_id: claims.endpoint_id.clone(),
-                        hostname: claims.hostname.clone(),
-                        cat_id: claims.cat_id.clone(),
-                        node_id: claims.node_id.clone(),
-                        runtime_incarnation: claims.runtime_incarnation.clone(),
-                        route_epoch: claims.route_epoch,
-                        protocol: claims.protocol,
-                        target_port: claims.target_port,
-                    },
-                    gate,
-                })
-                .collect(),
-        ))
-    }
-
-    fn with_guest_target(snapshot: AdmissionSnapshot) -> AdmissionSnapshot {
-        with_guest_target_at(snapshot, "10.240.0.6")
-    }
-
-    fn with_guest_target_at(snapshot: AdmissionSnapshot, address: &str) -> AdmissionSnapshot {
-        snapshot.with_guest_ipv4(Ipv4Address::new(address).unwrap())
+    fn cell(claims: &RouteGrantV2Claims, serving: bool) -> Arc<LifecycleRouteAdmissionCell> {
+        let source = Id::new("start_01").unwrap();
+        let agent_session = session(&claims.node_id);
+        let ready = EffectiveRuntimeReady::new(
+            source.clone(),
+            claims.runtime_incarnation.clone(),
+            Ipv4Address::new("10.240.0.6").unwrap(),
+        );
+        let cell = LifecycleRouteAdmissionCell::new(
+            claims.cat_id.clone(),
+            agent_session.clone(),
+            LifecycleRouteAdmission::RuntimeReady(ready),
+        );
+        if serving {
+            cell.enable_route(&EnableRoute::new(
+                Id::new("enable_01").unwrap(),
+                source,
+                agent_session,
+                RouteGateBinding {
+                    workspace_id: claims.workspace_id.clone(),
+                    endpoint_id: claims.endpoint_id.clone(),
+                    hostname: claims.hostname.clone(),
+                    cat_id: claims.cat_id.clone(),
+                    node_id: claims.node_id.clone(),
+                    runtime_incarnation: claims.runtime_incarnation.clone(),
+                    route_epoch: claims.route_epoch,
+                    protocol: claims.protocol,
+                    target_port: claims.target_port,
+                },
+            ))
+            .unwrap();
+        }
+        cell
     }
 
     fn reason(error: RouteAdmissionV2Failure) -> RouteAdmissionV2Reason {
@@ -574,12 +638,7 @@ mod tests {
             RouteGrantV2KeyRing::new(Epoch::new(1).unwrap(), vec![old_public.clone()]).unwrap(),
         );
         let claims = claims();
-        let cell = AdmissionCell::new(snapshot(
-            &claims,
-            RouteGateState::Active,
-            LifecycleAdmission::Open,
-        ))
-        .unwrap();
+        let cell = cell(&claims, true);
         let principal = AuthenticatedGatewayPrincipal::for_test();
         let old = sign(&old_private, &old_public, &claims);
         let new = sign(&new_private, &new_public, &claims);
@@ -652,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn binding_and_gate_precede_expiry_and_backend_work() {
+    fn signature_and_binding_precede_time_which_precedes_gate_and_backend_work() {
         let (public, private) = generated_key();
         let (_, wrong_private) = generated_key();
         let verifier = RouteGrantV2Verifier::new(
@@ -665,12 +724,7 @@ mod tests {
 
         let mut wrong_target_claims = claims.clone();
         wrong_target_claims.target_port = 8081;
-        let wrong_target_cell = AdmissionCell::new(snapshot(
-            &wrong_target_claims,
-            RouteGateState::Active,
-            LifecycleAdmission::Open,
-        ))
-        .unwrap();
+        let wrong_target_cell = cell(&wrong_target_claims, true);
         assert_eq!(
             reason(
                 verifier
@@ -683,15 +737,10 @@ mod tests {
                     )
                     .unwrap_err()
             ),
-            RouteAdmissionV2Reason::BindingMismatch
+            RouteAdmissionV2Reason::Expired
         );
 
-        let closed = AdmissionCell::new(snapshot(
-            &claims,
-            RouteGateState::Closed,
-            LifecycleAdmission::Open,
-        ))
-        .unwrap();
+        let closed = cell(&claims, false);
         assert_eq!(
             reason(
                 verifier
@@ -704,15 +753,10 @@ mod tests {
                     )
                     .unwrap_err()
             ),
-            RouteAdmissionV2Reason::GateClosed
+            RouteAdmissionV2Reason::Expired
         );
 
-        let active = AdmissionCell::new(snapshot(
-            &claims,
-            RouteGateState::Active,
-            LifecycleAdmission::Open,
-        ))
-        .unwrap();
+        let active = cell(&claims, true);
         assert_eq!(
             reason(
                 verifier
@@ -749,12 +793,7 @@ mod tests {
         );
         let mut wrong_cat_claims = claims.clone();
         wrong_cat_claims.cat_id = Id::new("cat_02").unwrap();
-        let wrong_cat_cell = AdmissionCell::new(snapshot(
-            &wrong_cat_claims,
-            RouteGateState::Active,
-            LifecycleAdmission::Open,
-        ))
-        .unwrap();
+        let wrong_cat_cell = cell(&wrong_cat_claims, true);
         assert_eq!(
             reason(
                 verifier
@@ -774,6 +813,19 @@ mod tests {
             &principal,
             &token,
             &request(&claims),
+            claims.nbf - 100,
+            &active,
+        );
+        assert_eq!(
+            reason(result.unwrap_err()),
+            RouteAdmissionV2Reason::NotYetValid
+        );
+        assert!(active.active_guard_counts().unwrap().is_drained());
+
+        let result = verifier.verify_and_admit(
+            &principal,
+            &token,
+            &request(&claims),
             claims.exp + 100,
             &active,
         );
@@ -782,577 +834,6 @@ mod tests {
         }
         assert_eq!(reason(result.unwrap_err()), RouteAdmissionV2Reason::Expired);
         assert!(!backend_called.load(Ordering::SeqCst));
-        assert_eq!(active.active_guards(&claims.endpoint_id), Some(0));
-
-        let mut incoherent = snapshot(&claims, RouteGateState::Active, LifecycleAdmission::Open);
-        let wrong_placement = AssignedPlacement {
-            kind: AssignedKind::Assigned,
-            node_id: Id::new("node-b").unwrap(),
-            placement_epoch: Epoch::new(3).unwrap(),
-        };
-        incoherent = with_guest_target(AdmissionSnapshot::new(
-            incoherent.applied_desired_revision(),
-            incoherent.spec_digest().clone(),
-            wrong_placement,
-            incoherent.runtime_incarnation().cloned(),
-            incoherent.lifecycle_admission(),
-            incoherent.endpoints().to_vec(),
-        ));
-        assert!(matches!(
-            AdmissionCell::new(incoherent),
-            Err(crate::runtime::reconciliation::AdmissionCellBuildError::WrongPlacement { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn guard_releases_on_drop_panic_and_task_cancellation() {
-        let (public, private) = generated_key();
-        let verifier = RouteGrantV2Verifier::new(
-            RouteGrantV2KeyRing::new(Epoch::new(1).unwrap(), vec![public.clone()]).unwrap(),
-        );
-        let principal = AuthenticatedGatewayPrincipal::for_test();
-        let claims = claims();
-        let token = sign(&private, &public, &claims);
-        let cell = AdmissionCell::new(snapshot(
-            &claims,
-            RouteGateState::Active,
-            LifecycleAdmission::Open,
-        ))
-        .unwrap();
-
-        let admitted = verifier
-            .verify_and_admit(&principal, &token, &request(&claims), claims.nbf, &cell)
-            .unwrap();
-        assert_eq!(cell.active_guards(&claims.endpoint_id), Some(1));
-        drop(admitted);
-        assert_eq!(cell.active_guards(&claims.endpoint_id), Some(0));
-
-        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _admitted = verifier
-                .verify_and_admit(&principal, &token, &request(&claims), claims.nbf, &cell)
-                .unwrap();
-            panic!("simulated proxy panic");
-        }));
-        assert!(panic_result.is_err());
-        assert_eq!(cell.active_guards(&claims.endpoint_id), Some(0));
-
-        let admitted = verifier
-            .verify_and_admit(&principal, &token, &request(&claims), claims.nbf, &cell)
-            .unwrap();
-        let task = tokio::spawn(async move {
-            let _admitted = admitted;
-            std::future::pending::<()>().await;
-        });
-        tokio::task::yield_now().await;
-        assert_eq!(cell.active_guards(&claims.endpoint_id), Some(1));
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        assert_eq!(cell.active_guards(&claims.endpoint_id), Some(0));
-    }
-
-    #[test]
-    fn require_idle_busy_is_non_mutating_then_closes_at_zero_guards() {
-        let (public, private) = generated_key();
-        let verifier = RouteGrantV2Verifier::new(
-            RouteGrantV2KeyRing::new(Epoch::new(1).unwrap(), vec![public.clone()]).unwrap(),
-        );
-        let principal = AuthenticatedGatewayPrincipal::for_test();
-        let claims = claims();
-        let token = sign(&private, &public, &claims);
-        let cell = AdmissionCell::new(snapshot(
-            &claims,
-            RouteGateState::Active,
-            LifecycleAdmission::Open,
-        ))
-        .unwrap();
-        let route_guard = verifier
-            .verify_and_admit(&principal, &token, &request(&claims), claims.nbf, &cell)
-            .unwrap();
-        let platform_guard = cell.try_acquire_platform().unwrap();
-        let expected = cell.snapshot();
-        let mut closed_routes = expected.endpoints().to_vec();
-        for route in &mut closed_routes {
-            route.gate = RouteGateState::Closed;
-        }
-        let replacement = with_guest_target(AdmissionSnapshot::new(
-            Revision::new(12).unwrap(),
-            Sha256Digest::from_bytes([0x12; 32]),
-            expected.placement().clone(),
-            expected.runtime_incarnation().cloned(),
-            LifecycleAdmission::Closed,
-            closed_routes,
-        ));
-        let mut port = cell.port();
-        assert_eq!(
-            port.try_close_all_if_idle(&expected, &replacement).unwrap(),
-            IdleCloseResult::Busy {
-                platform_guards: 1,
-                endpoint_guards: vec![cats_api::runtime_reconciliation::EndpointGuardCount {
-                    endpoint_id: claims.endpoint_id.clone(),
-                    active_guards: 1,
-                }],
-            }
-        );
-        assert_eq!(cell.snapshot(), expected);
-        drop(route_guard);
-        drop(platform_guard);
-        assert_eq!(
-            port.try_close_all_if_idle(&expected, &replacement).unwrap(),
-            IdleCloseResult::Closed
-        );
-        assert_eq!(cell.snapshot(), replacement);
-        assert_eq!(
-            reason(
-                verifier
-                    .verify_and_admit(&principal, &token, &request(&claims), claims.nbf, &cell,)
-                    .unwrap_err()
-            ),
-            RouteAdmissionV2Reason::GateClosed
-        );
-    }
-
-    #[test]
-    fn close_and_admission_share_one_linearization_point() {
-        let (public, private) = generated_key();
-        let verifier = RouteGrantV2Verifier::new(
-            RouteGrantV2KeyRing::new(Epoch::new(1).unwrap(), vec![public.clone()]).unwrap(),
-        );
-        let principal = AuthenticatedGatewayPrincipal::for_test();
-        let claims = claims();
-        let mut claims_b = claims.clone();
-        claims_b.endpoint_id = Id::new("ep_02").unwrap();
-        claims_b.hostname = Hostname::new("other.cats.run").unwrap();
-        claims_b.route_epoch = Epoch::new(9).unwrap();
-        claims_b.target_port = 8081;
-        let token = sign(&private, &public, &claims);
-        let token_b = sign(&private, &public, &claims_b);
-        let cell = AdmissionCell::new(snapshot_many(
-            &[claims.clone(), claims_b.clone()],
-            RouteGateState::Active,
-            LifecycleAdmission::Open,
-        ))
-        .unwrap();
-        let admitted = verifier
-            .verify_and_admit(&principal, &token, &request(&claims), claims.nbf, &cell)
-            .unwrap();
-        let expected = cell.snapshot();
-        let stale_expected = with_guest_target(AdmissionSnapshot::new(
-            Revision::new(10).unwrap(),
-            Sha256Digest::from_bytes([0x10; 32]),
-            expected.placement().clone(),
-            expected.runtime_incarnation().cloned(),
-            expected.lifecycle_admission(),
-            expected.endpoints().to_vec(),
-        ));
-        let mut stale_routes = stale_expected.endpoints().to_vec();
-        stale_routes[0].gate = RouteGateState::Closed;
-        let stale_replacement = with_guest_target(AdmissionSnapshot::new(
-            stale_expected.applied_desired_revision(),
-            stale_expected.spec_digest().clone(),
-            stale_expected.placement().clone(),
-            stale_expected.runtime_incarnation().cloned(),
-            stale_expected.lifecycle_admission(),
-            stale_routes,
-        ));
-        let mut port = cell.port();
-        assert_eq!(
-            port.close_gate(&stale_expected, &stale_replacement, &claims.endpoint_id),
-            Err(crate::runtime::reconciliation::GatePortError::StateMismatch)
-        );
-        assert_eq!(cell.snapshot(), expected);
-        let mut routes = expected.endpoints().to_vec();
-        routes[0].gate = RouteGateState::Closed;
-        let replacement = with_guest_target(AdmissionSnapshot::new(
-            expected.applied_desired_revision(),
-            expected.spec_digest().clone(),
-            expected.placement().clone(),
-            expected.runtime_incarnation().cloned(),
-            expected.lifecycle_admission(),
-            routes,
-        ));
-        port.close_gate(&expected, &replacement, &claims.endpoint_id)
-            .unwrap();
-        assert_eq!(cell.active_guards(&claims.endpoint_id), Some(1));
-        assert_eq!(
-            reason(
-                verifier
-                    .verify_and_admit(&principal, &token, &request(&claims), claims.nbf, &cell,)
-                    .unwrap_err()
-            ),
-            RouteAdmissionV2Reason::GateClosed
-        );
-        let admitted_b = verifier
-            .verify_and_admit(
-                &principal,
-                &token_b,
-                &request(&claims_b),
-                claims_b.nbf,
-                &cell,
-            )
-            .unwrap();
-        assert_eq!(cell.active_guards(&claims_b.endpoint_id), Some(1));
-        drop(admitted);
-        drop(admitted_b);
-        assert_eq!(cell.active_guards(&claims.endpoint_id), Some(0));
-        assert_eq!(cell.active_guards(&claims_b.endpoint_id), Some(0));
-    }
-
-    #[test]
-    fn same_incarnation_transitions_reject_guest_ipv4_only_drift() {
-        #[derive(Debug, Clone, Copy)]
-        enum Transition {
-            Open,
-            Install,
-            Close,
-            Remove,
-            CloseAll,
-            TryClose,
-            TryCloseBusy,
-        }
-
-        let a = claims();
-        let mut b = a.clone();
-        b.endpoint_id = Id::new("ep_02").unwrap();
-        b.hostname = Hostname::new("other.cats.run").unwrap();
-        b.route_epoch = Epoch::new(9).unwrap();
-        b.target_port = 8081;
-
-        for transition in [
-            Transition::Open,
-            Transition::Install,
-            Transition::Close,
-            Transition::Remove,
-            Transition::CloseAll,
-            Transition::TryClose,
-            Transition::TryCloseBusy,
-        ] {
-            let (expected, replacement, endpoint_id) = match transition {
-                Transition::Open => {
-                    let expected = with_guest_target(AdmissionSnapshot::new(
-                        Revision::new(11).unwrap(),
-                        Sha256Digest::from_bytes([0x11; 32]),
-                        AssignedPlacement {
-                            kind: AssignedKind::Assigned,
-                            node_id: a.node_id.clone(),
-                            placement_epoch: Epoch::new(3).unwrap(),
-                        },
-                        Some(a.runtime_incarnation.clone()),
-                        LifecycleAdmission::Closed,
-                        Vec::new(),
-                    ));
-                    let replacement = with_guest_target_at(
-                        AdmissionSnapshot::new(
-                            expected.applied_desired_revision(),
-                            expected.spec_digest().clone(),
-                            expected.placement().clone(),
-                            expected.runtime_incarnation().cloned(),
-                            LifecycleAdmission::Open,
-                            Vec::new(),
-                        ),
-                        "10.240.0.10",
-                    );
-                    (expected, replacement, a.endpoint_id.clone())
-                }
-                Transition::Install => {
-                    let expected = snapshot_many(
-                        std::slice::from_ref(&b),
-                        RouteGateState::Active,
-                        LifecycleAdmission::Open,
-                    );
-                    let replacement = with_guest_target_at(
-                        AdmissionSnapshot::new(
-                            expected.applied_desired_revision(),
-                            expected.spec_digest().clone(),
-                            expected.placement().clone(),
-                            expected.runtime_incarnation().cloned(),
-                            expected.lifecycle_admission(),
-                            snapshot_many(
-                                &[a.clone(), b.clone()],
-                                RouteGateState::Active,
-                                LifecycleAdmission::Open,
-                            )
-                            .endpoints()
-                            .to_vec(),
-                        ),
-                        "10.240.0.10",
-                    );
-                    (expected, replacement, a.endpoint_id.clone())
-                }
-                Transition::Close => {
-                    let expected = snapshot_many(
-                        &[a.clone(), b.clone()],
-                        RouteGateState::Active,
-                        LifecycleAdmission::Open,
-                    );
-                    let mut routes = expected.endpoints().to_vec();
-                    routes[0].gate = RouteGateState::Closed;
-                    let replacement = with_guest_target_at(
-                        AdmissionSnapshot::new(
-                            expected.applied_desired_revision(),
-                            expected.spec_digest().clone(),
-                            expected.placement().clone(),
-                            expected.runtime_incarnation().cloned(),
-                            expected.lifecycle_admission(),
-                            routes,
-                        ),
-                        "10.240.0.10",
-                    );
-                    (expected, replacement, a.endpoint_id.clone())
-                }
-                Transition::Remove => {
-                    let mut expected = snapshot_many(
-                        &[a.clone(), b.clone()],
-                        RouteGateState::Active,
-                        LifecycleAdmission::Open,
-                    );
-                    let mut expected_routes = expected.endpoints().to_vec();
-                    expected_routes[0].gate = RouteGateState::Closed;
-                    expected = with_guest_target(AdmissionSnapshot::new(
-                        expected.applied_desired_revision(),
-                        expected.spec_digest().clone(),
-                        expected.placement().clone(),
-                        expected.runtime_incarnation().cloned(),
-                        expected.lifecycle_admission(),
-                        expected_routes,
-                    ));
-                    let replacement = with_guest_target_at(
-                        AdmissionSnapshot::new(
-                            expected.applied_desired_revision(),
-                            expected.spec_digest().clone(),
-                            expected.placement().clone(),
-                            expected.runtime_incarnation().cloned(),
-                            expected.lifecycle_admission(),
-                            vec![expected.endpoints()[1].clone()],
-                        ),
-                        "10.240.0.10",
-                    );
-                    (expected, replacement, a.endpoint_id.clone())
-                }
-                Transition::CloseAll | Transition::TryClose | Transition::TryCloseBusy => {
-                    let expected = snapshot_many(
-                        &[a.clone(), b.clone()],
-                        RouteGateState::Active,
-                        LifecycleAdmission::Open,
-                    );
-                    let mut routes = expected.endpoints().to_vec();
-                    for route in &mut routes {
-                        route.gate = RouteGateState::Closed;
-                    }
-                    let replacement = with_guest_target_at(
-                        AdmissionSnapshot::new(
-                            Revision::new(12).unwrap(),
-                            Sha256Digest::from_bytes([0x12; 32]),
-                            expected.placement().clone(),
-                            expected.runtime_incarnation().cloned(),
-                            LifecycleAdmission::Closed,
-                            routes,
-                        ),
-                        "10.240.0.10",
-                    );
-                    (expected, replacement, a.endpoint_id.clone())
-                }
-            };
-            let cell = AdmissionCell::new(expected.clone()).unwrap();
-            let busy_guard = matches!(transition, Transition::TryCloseBusy)
-                .then(|| cell.try_acquire_platform().unwrap());
-            let mut port = cell.port();
-            let result = match transition {
-                Transition::Open => port.open_lifecycle(&expected, &replacement),
-                Transition::Install => port.install_gate(&expected, &replacement, &endpoint_id),
-                Transition::Close => port.close_gate(&expected, &replacement, &endpoint_id),
-                Transition::Remove => {
-                    port.remove_closed_gate(&expected, &replacement, &endpoint_id)
-                }
-                Transition::CloseAll => port.close_all(&expected, &replacement),
-                Transition::TryClose | Transition::TryCloseBusy => port
-                    .try_close_all_if_idle(&expected, &replacement)
-                    .map(|_| ()),
-            };
-            assert_eq!(
-                result,
-                Err(GatePortError::Unavailable),
-                "{transition:?} accepted an IP-only target change"
-            );
-            assert_eq!(cell.snapshot(), expected, "{transition:?} mutated the cell");
-            drop(busy_guard);
-        }
-    }
-
-    #[test]
-    fn closing_endpoint_a_cannot_retarget_active_endpoint_b() {
-        let (public, private) = generated_key();
-        let verifier = RouteGrantV2Verifier::new(
-            RouteGrantV2KeyRing::new(Epoch::new(1).unwrap(), vec![public.clone()]).unwrap(),
-        );
-        let principal = AuthenticatedGatewayPrincipal::for_test();
-        let a = claims();
-        let mut b = a.clone();
-        b.endpoint_id = Id::new("ep_02").unwrap();
-        b.hostname = Hostname::new("other.cats.run").unwrap();
-        b.route_epoch = Epoch::new(9).unwrap();
-        b.target_port = 8081;
-        let expected = snapshot_many(
-            &[a.clone(), b.clone()],
-            RouteGateState::Active,
-            LifecycleAdmission::Open,
-        );
-        let cell = AdmissionCell::new(expected.clone()).unwrap();
-        let mut routes = expected.endpoints().to_vec();
-        routes[0].gate = RouteGateState::Closed;
-        let retargeted = with_guest_target_at(
-            AdmissionSnapshot::new(
-                expected.applied_desired_revision(),
-                expected.spec_digest().clone(),
-                expected.placement().clone(),
-                expected.runtime_incarnation().cloned(),
-                expected.lifecycle_admission(),
-                routes.clone(),
-            ),
-            "10.240.0.10",
-        );
-        let mut port = cell.port();
-        assert_eq!(
-            port.close_gate(&expected, &retargeted, &a.endpoint_id),
-            Err(GatePortError::Unavailable)
-        );
-        assert_eq!(cell.snapshot(), expected);
-
-        let closed = with_guest_target(AdmissionSnapshot::new(
-            expected.applied_desired_revision(),
-            expected.spec_digest().clone(),
-            expected.placement().clone(),
-            expected.runtime_incarnation().cloned(),
-            expected.lifecycle_admission(),
-            routes,
-        ));
-        port.close_gate(&expected, &closed, &a.endpoint_id).unwrap();
-        let admitted_b = verifier
-            .verify_and_admit(
-                &principal,
-                &sign(&private, &public, &b),
-                &request(&b),
-                b.nbf,
-                &cell,
-            )
-            .unwrap();
-        assert_eq!(
-            admitted_b.guest_ipv4(),
-            &Ipv4Address::new("10.240.0.6").unwrap()
-        );
-        assert_eq!(cell.active_guards(&b.endpoint_id), Some(1));
-        drop(admitted_b);
-    }
-
-    #[test]
-    fn higher_epoch_install_and_remove_preserve_unrelated_endpoint_guard() {
-        let (public, private) = generated_key();
-        let verifier = RouteGrantV2Verifier::new(
-            RouteGrantV2KeyRing::new(Epoch::new(1).unwrap(), vec![public.clone()]).unwrap(),
-        );
-        let principal = AuthenticatedGatewayPrincipal::for_test();
-        let old_a = claims();
-        let mut b = old_a.clone();
-        b.endpoint_id = Id::new("ep_02").unwrap();
-        b.hostname = Hostname::new("other.cats.run").unwrap();
-        b.route_epoch = Epoch::new(4).unwrap();
-        b.target_port = 8081;
-        let mut initial = snapshot_many(
-            &[old_a.clone(), b.clone()],
-            RouteGateState::Active,
-            LifecycleAdmission::Open,
-        );
-        let mut initial_routes = initial.endpoints().to_vec();
-        initial_routes[0].gate = RouteGateState::Closed;
-        initial = with_guest_target(AdmissionSnapshot::new(
-            initial.applied_desired_revision(),
-            initial.spec_digest().clone(),
-            initial.placement().clone(),
-            initial.runtime_incarnation().cloned(),
-            initial.lifecycle_admission(),
-            initial_routes,
-        ));
-        let cell = AdmissionCell::new(initial.clone()).unwrap();
-        let b_guard = verifier
-            .verify_and_admit(
-                &principal,
-                &sign(&private, &public, &b),
-                &request(&b),
-                b.nbf,
-                &cell,
-            )
-            .unwrap();
-
-        let mut new_a = old_a.clone();
-        new_a.route_epoch = Epoch::new(8).unwrap();
-        new_a.target_port = 8082;
-        let mut installed_routes = initial.endpoints().to_vec();
-        installed_routes[0] = snapshot(&new_a, RouteGateState::Active, LifecycleAdmission::Open)
-            .endpoints()[0]
-            .clone();
-        let installed = with_guest_target(AdmissionSnapshot::new(
-            Revision::new(12).unwrap(),
-            Sha256Digest::from_bytes([0x12; 32]),
-            initial.placement().clone(),
-            initial.runtime_incarnation().cloned(),
-            initial.lifecycle_admission(),
-            installed_routes,
-        ));
-        let mut port = cell.port();
-        port.install_gate(&initial, &installed, &old_a.endpoint_id)
-            .unwrap();
-        assert_eq!(cell.active_guards(&b.endpoint_id), Some(1));
-        assert_eq!(
-            reason(
-                verifier
-                    .verify_and_admit(
-                        &principal,
-                        &sign(&private, &public, &old_a),
-                        &request(&old_a),
-                        old_a.nbf,
-                        &cell,
-                    )
-                    .unwrap_err()
-            ),
-            RouteAdmissionV2Reason::BindingMismatch
-        );
-        drop(
-            verifier
-                .verify_and_admit(
-                    &principal,
-                    &sign(&private, &public, &new_a),
-                    &request(&new_a),
-                    new_a.nbf,
-                    &cell,
-                )
-                .unwrap(),
-        );
-
-        let mut closed_routes = installed.endpoints().to_vec();
-        closed_routes[0].gate = RouteGateState::Closed;
-        let closed = with_guest_target(AdmissionSnapshot::new(
-            installed.applied_desired_revision(),
-            installed.spec_digest().clone(),
-            installed.placement().clone(),
-            installed.runtime_incarnation().cloned(),
-            installed.lifecycle_admission(),
-            closed_routes,
-        ));
-        port.close_gate(&installed, &closed, &new_a.endpoint_id)
-            .unwrap();
-        let absent = with_guest_target(AdmissionSnapshot::new(
-            closed.applied_desired_revision(),
-            closed.spec_digest().clone(),
-            closed.placement().clone(),
-            closed.runtime_incarnation().cloned(),
-            closed.lifecycle_admission(),
-            vec![closed.endpoints()[1].clone()],
-        ));
-        port.remove_closed_gate(&closed, &absent, &new_a.endpoint_id)
-            .unwrap();
-        assert_eq!(cell.active_guards(&new_a.endpoint_id), None);
-        assert_eq!(cell.active_guards(&b.endpoint_id), Some(1));
-        assert_eq!(cell.snapshot(), absent);
-        drop(b_guard);
-        assert_eq!(cell.active_guards(&b.endpoint_id), Some(0));
+        assert!(active.active_guard_counts().unwrap().is_drained());
     }
 }

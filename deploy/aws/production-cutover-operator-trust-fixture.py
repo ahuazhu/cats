@@ -89,7 +89,22 @@ def release_barrier(
     process: subprocess.Popen[bytes], barrier_write: int, fifo: Path
 ) -> None:
     try:
-        os.write(barrier_write, b"x")
+        try:
+            os.write(barrier_write, b"x")
+        except BrokenPipeError:
+            # Seeing the temporary file only proves that publication entered
+            # its descriptor-pinned sequence. A parent or lock ABA may be
+            # detected by one of the subsequent pre-barrier revalidations, in
+            # which case the safe publisher exits before reading this pipe.
+            # Accept only that completed fail-closed outcome; a live process
+            # that dropped its barrier reader is a fixture contract failure.
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired as error:
+                raise AssertionError(
+                    "publisher dropped the barrier reader without exiting"
+                ) from error
+            return
     finally:
         os.close(barrier_write)
 

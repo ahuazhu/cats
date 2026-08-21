@@ -25,9 +25,9 @@ use cats_api::runtime_reconciliation::{
     RuntimeProvisionerCredential, RuntimeProvisionerExpectedPrevious,
     RuntimeProvisionerTrustBundle, RuntimeSchedulingState, Sha256Digest,
 };
-use cats_control_plane::controller::AutoTierPolicy;
-use cats_control_plane::server::{spawn, Config, Handle};
+use cats_control_plane::server::{Config, Handle};
 use cats_control_plane::store::DsnSource;
+use cats_control_plane::testsupport::spawn_control_plane_for_test as spawn;
 use cats_metering::SqliteUsageStore;
 use reqwest::{Method, RequestBuilder, StatusCode};
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
@@ -135,8 +135,6 @@ impl Context {
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: usage,
-            #[cfg(debug_assertions)]
-            retired_storage_meta_for_tests: None,
             image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
             auth_token: SERVICE_TOKEN.into(),
             guest_runtime_profile_receipt:
@@ -144,14 +142,10 @@ impl Context {
             runtime_provisioner_trust_bundle: trust_bundle,
             production_cutover_operator_trust_bundle:
                 cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
-            route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
             admin_token: ADMIN_TOKEN.into(),
             workos: None,
             stripe: None,
             billing_enforcement_enabled: false,
-            node_lease_timeout_ms: 30_000,
-            reconcile_interval_ms: 60_000,
-            auto_tier_policy: AutoTierPolicy::default(),
             oci_deploy_sync_wait_ms: 5_000,
         })
         .await

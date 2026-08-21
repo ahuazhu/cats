@@ -51,8 +51,6 @@ module "cats_kubernetes" {
   route_v2_control_artifact_secret_sha256       = var.route_v2_control_artifact_secret_sha256
   route_v2_gateway_artifact_secret_name         = var.route_v2_gateway_artifact_secret_name
   runtime_secret_data                           = var.runtime_secret_data
-  route_grant_private_key_pem                   = var.route_grant_private_key_pem
-  route_grant_public_key_pem                    = var.route_grant_public_key_pem
   runtime_provisioner_trust_bundle_json         = var.runtime_provisioner_trust_bundle_json
   production_cutover_operator_trust_bundle_json = var.production_cutover_operator_trust_bundle_json
   storage_postgres_url                          = var.storage_postgres_url
@@ -82,8 +80,6 @@ module "cats_kubernetes" {
   credential_refresher_image      = var.credential_refresher_image
   credential_refresher_mode       = var.credential_refresher_mode
   database_master_user_secret_arn = var.database_master_user_secret_arn
-  auto_warm_after_seconds         = var.auto_warm_after_seconds
-  auto_cold_after_seconds         = var.auto_cold_after_seconds
   acm_certificate_arn             = var.acm_certificate_arn
   public_subnet_ids               = var.public_subnet_ids
   control_plane_hosts             = var.control_plane_hosts

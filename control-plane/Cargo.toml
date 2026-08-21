@@ -42,12 +42,9 @@ workos = { workspace = true }
 jsonwebtoken = { workspace = true }
 ring = { workspace = true }
 futures-util = { workspace = true }
-tokio-tungstenite = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-cats-blockd = { workspace = true }
-cats-metadata-store-sqlite = { workspace = true }
 cats-test-support = { workspace = true }
 base64 = { workspace = true }
 loom = { workspace = true }

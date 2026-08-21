@@ -13,6 +13,14 @@ Suspended 与 Warm 不能合并。两者都保护 Host-local State；Cold 启动
 
 ## 当前 Release 边界
 
-Signed Runtime Cutover 暴露 Cat Create 与 Read Projection，但不提供用户 Lifecycle Mutation。Per-Cat Reconciler 是唯一 Physical-effect Executor，`DesiredRuntimeSpec` 是唯一 Lifecycle Intent。浏览器或 CLI 不能制造 Transition、抢占 Attachment，也不能因缺少 Local Evidence 猜测 Cold。
+Signed Runtime Cutover 暴露六个精确、幂等的产品 Action：Create、Run、Suspend、Warm、
+Cold 与 Destroy。PostgreSQL 对每个 Cat 最多接受一个未解决 Operation；assigned Node
+上的 signed command runner 是唯一 Physical-effect Executor，并返回该命令的精确终态。
+Inventory 只报告事实，不能结算 Operation。浏览器或 CLI 不能制造 Transition、抢占
+Attachment，也不能因缺少 Local Evidence 猜测 Cold。
 
-Checkpoint/Inventory Evidence 缺失或损坏时，Reconcile 必须 Block 或 Quarantine。非计划 Cross-Node Recovery 还要求可信 Host-fence 与精确 Volume Takeover Authority。
+产品没有 Stop Action 或 Killed State。Node 可以在实现某个 Action 时生成私有的
+execution-stopped evidence，但产品 Operation 与稳定状态都不会返回它；Cold 要求每个 retained Volume
+已经远端持久化并完成 release。Command Journal 或 Inventory Evidence 缺失、损坏时，
+执行必须 Block 或 Quarantine。非计划 Cross-Node Recovery 还要求可信 Host-fence 与精确
+Volume Takeover Authority。

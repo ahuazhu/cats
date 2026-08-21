@@ -133,3 +133,24 @@ pub struct UpdateWorkspaceRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateWorkspaceTokenRequest {
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceToken {
+    pub id: String,
+    pub workspace_id: String,
+    pub label: String,
+    pub created_at_unix: i64,
+}
+
+/// Returned only once when a workspace token is created. Cats stores only
+/// the SHA-256 digest of `token`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatedWorkspaceToken {
+    pub access_token: WorkspaceToken,
+    pub token: String,
+}

@@ -5,11 +5,13 @@ Cats 在一个不可变 Workspace 边界内提供持久 Linux microVM Resource�
 Signed Runtime Cutover 有意只暴露窄产品 Surface：
 
 - Create、List 与 Inspect Cat。
+- 通过精确、幂等的 Action Run、Suspend、Warm、Cold 或 Destroy 一只 Cat。
 - Create、List 与 Inspect PersistentDisk。
+- 在精确 Cat 处于终态 Cold 时 Attach 或 Detach 一个 PersistentDisk。
 - 按 ID Inspect 一个精确的已接受 Operation。
 - 使用 Guest-local Runtime API 与独立 Identity/Billing Surface。
 
-Cat Lifecycle、Guest Command、Deployment、Endpoint 与 Delete Mutation 不可用。PersistentDisk Attachment、Snapshot、容量变更与 Delete Mutation 同样不可用。控制台和 CLI 会 fail closed，不探测 Legacy Route。
+Guest Command、Deployment、Endpoint、PersistentDisk Snapshot、容量变更与删除仍不可用。控制台和 CLI 会 fail closed，不探测 Legacy Route。
 
 ## 选择阅读路径
 
@@ -17,4 +19,4 @@ Cat Lifecycle、Guest Command、Deployment、Endpoint 与 Delete Mutation 不可
 
 ## 产品模型
 
-一只 Cat 拥有一个 RootDisk。PersistentDisk 是独立 RWO Resource，Release 容量不可变。Desired Runtime State 与 Signed Volume Authority——而不是浏览器或 CLI——协调 Lifecycle 与 Writer Epoch。
+一只 Cat 拥有一个 RootDisk。PersistentDisk 是独立 RWO Resource，Release 容量不可变。不可变 Runtime Config、Signed Atomic Lifecycle Command 与 Signed Volume Authority——而不是浏览器或 CLI——协调 Lifecycle 与 Writer Epoch。

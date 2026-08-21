@@ -1,328 +1,213 @@
 # Operations and HA
 
-- 状态：Target operations contract；终态模块尚未全部实现
-- 架构：[Architecture](architecture.md)
-- Runtime：[Runtime Reconciliation v1](specs/runtime-reconciliation-v1.md)
-- Agent transport：[Agent Registration and Internal Transport v1](specs/agent-registration-transport-v1.md)
-- Runtime internal spine：[Runtime Inventory and Observation Spine v1](specs/runtime-inventory-observation-v1.md)
+- 状态：运维合同；atomic lifecycle内部软件组成与六动作product adapter已落地，private
+  `Start/Stop/Delete/Killed`不进入product projection；Route resolve使用`run_required`并拒绝旧
+  `wake_required`；clean-slate release gate、
+  外部HostFence与真实production qualification均未宣称完成
+- 决策：[ADR-0031](decisions/0031-control-store-on-postgresql.md)、
+  [ADR-0032](decisions/0032-control-plane-multi-replica-and-postgresql-leadership.md)、
+  [ADR-0038](decisions/0038-production-account-qualification-cell-boundary.md)、
+  [ADR-0056](decisions/0056-atomic-per-cat-runtime-lifecycle.md)、
+  [ADR-0057](decisions/0057-product-lifecycle-actions-and-internal-execution-evidence.md)
+- Runtime：[Atomic Runtime Lifecycle v1](specs/atomic-runtime-lifecycle-v1.md)
+- Host/Agent/inventory foundation：[Runtime Reconciliation v1](specs/runtime-reconciliation-v1.md)、
+  [Runtime Inventory and Telemetry v1](specs/runtime-inventory-observation-v1.md)
 - Route：[Route Grant v2](specs/route-grant-v2.md)
+- Volume：[Volume Authority](specs/volume-authority.md)
 
-本文只定义终态运行边界和验收入口。它不引入新的 authority、工作流、共享 route cache或
-qualification 基础设施。
+本文定义运行拓扑、故障域、PostgreSQL/Controller边界、Host fence、监控、qualification与首次clean-slate
+部署。旧Desired/reconcile/Observation-settled Operation不是目标运维路径；Observation只做telemetry。
 
 ## 1. 终态拓扑
 
-- 两个以上 Gateway replica 分布在独立 failure domain，经公网负载均衡接收应用流量。每个 replica
-  只有有界本地 Route Grant cache。
-- 两个以上 stateless Control Plane/API/Controller replica 分布在独立 failure domain。所有可恢复
-  工作来自 PostgreSQL current desired/Operation/AgentSession/observation；内存队列和 leader身份都
-  不是authority。重复controller靠相同transaction/CAS合同收敛。
-- Multi-AZ PostgreSQL保存Control/Metadata authority；对象存储保存immutable durable data；两者都
-  不在Running HTTP热路径。同步数据库client只运行在有界blocking executor。
-- 每台Host只有一个持锁Node Agent。每个Cat的VMM、blockd和Guest运行在独立systemd scope；Agent
-  restart先以admission Closed重建current desired、checkpoint和complete inventory。
-- Route private key来自专用secret channel；Node只持versioned public ring，Gateway只搬运Grant。
-- 终态route状态只有PostgreSQL binding、per-replica cache和Node gate；旧mirror及其他协调authority
-  在首次启动前退出。
+- **Control Plane API**：至少两个stateless replica，共享PostgreSQL；不持有correctness-critical内存queue。
+- **Controller/Route Controller**：可与API co-deploy；lifecycle intent只写PG。Node签名poll本Node已admit的
+  unresolved exact command并签名commit result；Route按Endpoint独立派生Enable/Disable。LISTEN/NOTIFY只降latency。
+- **Gateway**：至少两个replica；无共享route mirror，只有bounded per-replica Grant cache。
+- **Node Agent**：每Host一个executor，固定state path kernel lock + provisioned NodeIdentity + current
+  AgentSession；每Cat一个command journal/worker与shared AdmissionCell。
+- **PostgreSQL**：Cat/runtime config/Operation/result、Endpoint/Serving、Node/session/fence、Volume Authority、
+  product/API idempotency与usage projection的唯一事务域。
+- **Object Store**：immutable Chunk/Map/Delta/Base/Snapshot objects；不决定current root/writer。
 
-这套拓扑提供control-plane和Gateway副本冗余，但不把单个Running Cat复制到多Host。Host丢失后的
-恢复是经过fence、以远端durable root `R`进行的Cold recovery，不是live failover；Suspended/Warm
-仍是Host-bound优化。
+Route private key只在independent signer/secret boundary；Node只持versioned public ring，Gateway只搬运opaque
+Grant。Guest没有S3、MetadataStore、Control或WorkOS credential。
+
+已经Running的数据面不依赖Controller heartbeat继续执行。Node/Host loss恢复是external fence后从remote `R`
+启动的新runtime，不是live failover；Suspended/Warm是Host-bound optimization，不是HA replica。
 
 ## 2. 故障合同
 
-| 故障 | 保证 | 明确不保证 |
+| 故障 | 继续 | 停止/降级 |
 |---|---|---|
-| 单个Control Plane replica退出 | 其他副本继续API/resolve；level-triggered controller从PG重扫 | 恢复该进程内存queue |
-| Control Plane全断 | Running VMM/blockd及已有stream继续；预热该hostname的Gateway replica可在Grant expiry前接新流 | mutation、wake、续签或cold Gateway admission |
-| PostgreSQL暂时不可用 | Running compute和已有stream继续；有本地额度时Relaxed可推进local `L` | Strict FLUSH、authority transfer、lifecycle成功或新route签发 |
-| Object Store暂时不可用 | 已缓存读和允许的Relaxed local commit有界继续 | cache miss、Strict durability、Warm/Cold转换 |
-| 单个Gateway退出 | 其他replica在Control Plane健康时自行resolve | 复制丢失replica的local cache；CP全断时cold-cache HA |
-| Node Agent退出 | systemd重启Agent；目标形态下VMM/blockd scopes继续；重建完成前gate Closed | 代理中的stream不断线或重建期新admission |
-| Node网络分区 | 保留源placement和writer，不在别处猜测启动 | heartbeat timeout自动takeover |
-| Host永久丢失 | provider隔离Host，再逐卷CAS writer epoch后从remote `R` Cold恢复 | Relaxed `R < L` 的local tail；必须报告`DataLossPossible` |
-| Gateway -> Guest应用失败 | 释放guard并返回UpstreamUnavailable | route refresh或当前request replay |
-| Signer/key异常 | 停止签发；缺active key的Node Closed/cordoned | unsigned、旧wire或single-key fallback |
+| 单个API/Controller退出 | 其他replica从PG Operation继续；exact retry安全 | 该进程内未提交response丢失 |
+| Control Plane全断 | 已Running compute与existing stream；warm Gateway cache在Grant expiry前可新admit | 新mutation、command settlement、Grant续签、cold Gateway cache |
+| PostgreSQL暂不可用 | Running compute；Relaxed可在local quota内推进L | command admission/result commit、Strict metadata CAS、route resolve |
+| Object Store暂不可用 | cache-hit read、允许的Relaxed local commit | cache miss、Strict commit、warm/cold/Persistent destroy convergence |
+| Node Agent crash/replacement | Host lock/session/inventory下resume exact command；systemd scope维持或StopFence保护 | proxy stream可能断；AdmissionCell默认Closed，old Serving失效 |
+| Node network partition | source保持；不自动启动另一writer | heartbeat timeout只suspicion，unresolved lane保持 |
+| Host永久丢失 | trusted HostFenceEvent终结exact op为HostLost，逐卷takeover后从R恢复 | Relaxed local tail可能丢失；报告DataLossPossible |
+| Gateway退出 | 其他Gateway在Control健康时resolve | CP全断时cold replica不能接新流 |
 
-所有timeout、队列、retry和drain都有硬界。超界的正常结果是backpressure、Unavailable或Blocked，
-不是继续堆积、猜测成功或绕过authority。
+所有timeout、queue、retry、grace drain与data convergence都有硬界。超界结果是typed backpressure、
+Unavailable、unknown或NeedsIntervention；绝不自动变成fence、Cold、execution-stopped proof、release、discard或成功。
 
-## 3. PostgreSQL 与controller边界
+## 3. PostgreSQL、Controller与command lane
 
-每个进程必须显式配置并在启动时校验：connection pool上限、blocking worker数、排队上限、pool
-acquire deadline、connect/query/lock/transaction timeout、单批rows/bytes和controller scan page。
-同步driver不得占用Tokio worker；blocking queue满时立即backpressure。
+同步PostgreSQL driver只在bounded blocking executor/connection pool运行；不得占用async worker。每类request有
+独立queue/running/deadline指标和容量预算。runtime command、volume transition、product mutation与telemetry
+不能共享一个可被长query饥饿的single mutex/worker。
 
-其中A20新sequence observation是AgentSession的唯一续期点，不能只靠HTTP semaphore与其他
-mutation分流。每个Control Plane replica必须按
-[Inventory Spine §2](specs/runtime-inventory-observation-v1.md#2-http-与-authentication-envelope)为完整observation
-Store调用保留一个独立blocking worker、一个等待位和一个PostgreSQL connection；这些资源计入
-replica/database/proxy硬上限，并在计算ordinary pool容量前先扣除一席；启动/readiness必须
-实际打开它，断线重连仍只用该保留席。它不借给volume transition、Desired read、product mutation或
-controller。排队、SQL和
-retry共享HTTP的10秒absolute deadline，取消和shutdown必须rollback/close并join，不允许请求已返回
-后再detached commit。ordinary Store饱和可以使A22返回Unavailable，但不得阻塞这个保留lane。
+每Cat最多一个unresolved lifecycle Operation由Cat row lock + database constraint共同保证。accept transaction
+验证current terminal chain head、typed predecessor、canonical request/fingerprint与legal successor；存在unresolved
+时在Operation insert、使命令可被poll前拒绝。external network I/O不在DB transaction内。
 
-事务规则只有三条：
+Node response只有在authenticated identity、Operation/fingerprint/placement与terminal result digest完全匹配时，
+才和Cat product projection同一commit settlement。一个Controller收到response但commit失败，lane仍unresolved；
+Node可向任何replica重poll/repost same Operation。Observation/capacity/read model不参与settlement。
 
-1. mutation、Endpoint revision、signer snapshot、AgentSession和result settlement各使用文档规定的
-   固定lock order和一个bounded transaction；不在transaction内做网络、VMM、object-store或fsync。
-2. 只对serialization/deadlock/明确transient连接错误做有限次数、带jitter的retry；每次从fresh
-   snapshot重放整个transaction，不能只重放最后一条write。外部副作用只能通过idempotency key、
-   revision/incarnation/epoch的窄CAS重试。
-3. controller只分页扫描current state，按稳定key排序，每轮有work/time budget；notify只负责提前
-   唤醒。没有无界in-memory backlog，也不靠历史command重建意图。
+production runtime transport只允许Node→Control两条current-AgentSession signed POST：command poll只返回已在
+PG commit、仍unresolved且目标为该Node的canonical command；result commit把exact response/digest与product
+projection同事务保存并返回exact ACK。poll不admit/claim/renew Operation，Node不能创造intent；重复poll
+join/resume本地journal，result或ACK丢失只repost同一result。没有Control→Node lifecycle client或legacy
+`agent_url`旁路。
 
-只有能与业务rows在唯一Control PostgreSQL事务原子提交的Workspace product mutation使用以下result；
-它先完成调用者认证、当前Workspace membership和route permission检查，再取得
-`(authenticated workspace, canonical route, Idempotency-Key)`的transaction-scoped reservation。
-全局锁DAG是`API key -> CatNameLock -> NodeIdentity（写old/new assigned current Desired任一字段或消费current Node
-evidence时）-> current credential lineage（A19 auth适用时）-> AgentSession -> observation receive/cursor（适用时）-> HostFenceEvent ->
-authorization -> VolumeRecord -> Disk/Desired -> DiskSnapshotRecord`，不涉及的节点直接跳过，同类多行按稳定ID排序。fingerprint唯一使用
-[Volume Authority §3.3](specs/volume-authority.md#33-workspace-product-api-idempotency)的domain-separated、
-u64-BE length-framed workspace/route/raw path-query/If-Match/raw body bytes；不允许route-local JSON或参数
-归一化。相同fingerprint只读status/content-type/exact response bytes，即使目标资源后来已删除也不先查询它；
-不同fingerprint在资源锁前
-失败。只有result miss才检查当前资源ownership并取得domain locks；跨Workspace miss回滚reservation，
-零持久副作用。首次业务变化与成功/确定性失败result同一commit且不落持久Pending。V1已提交result
-不随resource或Operation删除而GC。request超过route body cap、非identity Content-Encoding和非法
-If-Match在reservation前拒绝；transport/commit结果不明本身不写失败result，最终事务只允许业务+result
-全有或全无，重试按key判定。
+全局锁DAG的共同前缀是：
 
-每条covered route必须在自己的canonical合同中枚举result-miss后可持久化的确定性业务失败，并由public
-API层在进入Control Store前提供对应的exact status/content-type/body。Store只选择已冻结的envelope，不能把
-PostgreSQL constraint name、provider error或内部validator error临时映射成HTTP bytes。未枚举的identity碰撞、
-stored-state corruption、serialization/连接错误全部回滚且不写失败result。Cat create当前唯一这种失败是
-`(workspace_id, name)`已存在：零业务row变化并原子保存调用方提供的`409 application/json` response。
+```text
+ApiIdempotencyResult key / product name lock (where applicable)
+  -> NodeIdentity
+  -> current credential lineage
+  -> AgentSession
+  -> lifecycle Operation + Cat chain head
+  -> HostFenceEvent
+  -> per-volume AuthorizationRecord
+  -> VolumeRecord
+  -> Disk / CatRuntimeConfig / Endpoint
+  -> DiskSnapshotRecord
+```
 
-需要在result miss后准备placement或其他当前状态bundle的route可以先做一次不查resource的只读result fast
-lookup：hit直接重放；miss不保留reservation/Pending，准备完成后的业务事务必须再次按相同key取得reservation并
-重读result。两次读取之间的竞态以事务内结果为准，届时丢弃candidate bundle。该优化不新增authority，也不能
-把resource/capacity检查放到fast hit之前。
+事务跳过不相关节点，同类多row按stable ID排序；不得先锁Volume/Operation后反向取NodeIdentity/session。
+ordinary normal acquire只锁其exact Volume domain row，但signed runtime transport在进入domain前必须闭合current
+Node/session/Operation。API idempotency result与covered product mutation同commit；hit只replay saved status/
+content-type/body，不从resource当前存在性重建结果。
 
-`CatNameLock(workspace_id,name)`只是不落row的PostgreSQL transaction advisory coordination：Cat create
-在API key之后取得它；持锁查询到existing Cat后按既有Volume→Cat→Disk→Desired→Endpoint/lookup→Operation
-锁序闭合existing graph，合法时只保存fixed 409且不锁candidate plan/NodeIdentity；name free的202分支才先锁
-并重验candidate NodeIdentity、A23 policy/admission/capacity/network probe，再取得任何candidate
-Volume/Cat/Disk锁。
-数据库unique constraint仍保留，但不能依赖一个已abort的unique violation事务再补写409 result。
+Node command内部effect journal不是第二Control workflow。first effect前fsync accepted/effect token，return前fsync
+terminal result；response unknown只repoll/repost exact identity。successor accepted后poll中晚到old command返回
+SupersededOperation，历史API replay仍从PG返回original terminal result。
 
-router build/startup gate枚举全部mutation：每条恰好归入上述PG result或已有domain协议；Account/WorkOS、
-Billing/Stripe、fleet/admin、Node/internal、webhook与external-first route不使用本row，不伪造system
-workspace或双重幂等。covered route还要求恰好一个1..=512 printable-ASCII key、唯一media type和
-identity/no Content-Encoding；错误envelope在reservation前拒绝。需要精确重放的语义必须由保存的status/
-content-type/body表达，不能依赖未保存的ETag、Location等header。
+## 4. Host fence与HostLost
 
-数据库慢或pool饱和时，readiness、队列拒绝和延迟指标必须先于全局超时告警；Running数据面不因
-controller retry而停止。
+heartbeat timeout、lease expiry、route TTL、AgentSession replacement和Controller cancel都不是fence。Host recovery
+顺序固定：
 
-## 4. Host fence
+1. provider/BMC adapter对immutable Host/boot/session/fence-attempt执行外部隔离；
+2. 保存并验证trusted `HostFenceEvent {state: Active}`；network suspicion或power API request本身不够；
+3. 在一个PG transaction锁exact Cat unresolved Operation与event，把它terminalize为
+   `HostLost {host_fence_event_id, interrupted_operation_id}`；不制造Cold或execution-stopped proof；
+4. 为target placement创建HostFenceRecovery EnsureRunning execution，typed predecessor绑定HostLost digest、old Node identity、
+   event与完整per-volume takeover authorization IDs；
+5. 每卷在event -> authorization -> VolumeRecord锁序下CAS owner/epoch并写immutable consumed receipt；
+6. target只从remote `R`启动，old epoch/route/session永久fail closed。
 
-heartbeat缺失、AgentSession过期、EC2状态查询或Gateway不可达都只是suspicion。它们不能单独授权
-新placement、writer epoch或route publication。
+HostLost是normal command result rule的唯一external exception。HostLost wire与per-volume takeover
+primitives已组成，但current Control仍明确拒绝`HostFenceRecovery` admission。production
+HostFence producer、exact successor composition与physical qualification是同一独立上线门；
+在它们完成前unreachable unresolved lane宁可保持blocked，也不能用timeout解锁。
 
-自动恢复使用一个窄provider/BMC fence adapter：
+Root destroy的HostFence authorization arm只绑定event、interrupted Operation与HostLost digest，不伪造
+strong-stop/absence。可达Node disposable Root arm才绑定current AgentSession、strong-stop result/proof与complete
+inventory。两者都还须绑定destroy Operation/fingerprint、Node/Cat/placement、Root attachment/epoch/head、
+`discard_with_cat`和Persistent completion；Persistent任何`R < L`都使destroy NeedsIntervention。
 
-1. Control Plane把source placement标记Blocked，停止新Grant，并创建绑定
-   `provider + immutable_host_id + node_id + expected_node_boot_id + expected_agent_session_epoch +
-   fence_attempt_id`的attempt。
-2. adapter执行并重新读取权威power/network isolation结果，产生不可变receipt。PostgreSQL只在
-   identities仍精确匹配且receipt证明旧Host不能serving或访问writer authority时，CAS建立Active
-   `HostFenceEvent`。receipt本身不创建placement，也不是逐卷writer permission。
-3. Control Plane先把当前Pending Operation置为`Failed(HostLost)`，再在一个事务中创建新完整
-   Desired/Operation、placement、全部新attachments与每卷`VolumeTakeoverAuthorization`；Desired
-   逐卷引用授权，授权把目标`authorized_node_id`不可变写入payload。任何一项无法建立就保持Blocked，
-   不留下旁路placement。
-4. replacement只从remote durable`R` Cold启动。每卷首次消费必须按
-   `HostFenceEvent -> authorization -> VolumeRecord`锁序，在同一PostgreSQL事务确认event仍Active、
-   完成epoch CAS并写不可变`AuthorizationConsumedReceipt`；不存在另一种writer-proof fallback。
-   全部volume、runtime和新route epochs Ready后才serving。旧Grant/gate/writer全部fail closed。
+## 5. Route与Agent replacement
 
-HostFenceEvent来源的disposable Root删除在上述锁序后继续锁Control rows；同一事务写Consumed receipt，
-把VolumeRecord和Control Disk改为同一Deleting。对象sweep只能在该提交后执行。普通begin-delete也在
-一个PostgreSQL事务同时改变两边；显式Disk delete API在该事务持久化exact 202 result且不创建Operation，
-Root继续由现有Cat Operation驱动：direct Root Disk DELETE与live Cold拒绝，`R == L` normal begin必须绑定
-同一delete ID；stable Cold fast path同一PG commit写Deleted/Operation/begin/API result，deferred path只在
-current Deleted observation证明exact release、Unowned和`R == L`后begin。`R < L`仍只走authorization。
-Active HostFenceEvent下任何仍Owned Root都可authorization，包括最后`R == L`或L未知；release和derive
-取得同一VolumeRecord锁后fresh重验，不能提交`Unowned + authorization`。
-begin与normal acquire锁同一VolumeRecord，只能一方提交。
-Deleting rows就是level-triggered工作：sweeper只分页扫描
-current rows，不持久job/claim；它幂等delete并从prefix起点re-list到empty，再以一个事务重验exact
-Disk/Volume/delete/head/epoch/last-transition和zero snapshots，写completion receipt并删除两row。失败保持
-Deleting，多实例只有一个compare/CAS可提交；object store与PG之间没有两阶段事务或第二authority。用于
-completion的BlobStore LIST必须对已完成PUT/DELETE线性可见；normal stop先join upload workers，HostFence
-adapter必须在返回/提交event前以provider cutoff阻止新PUT，并等待已经接受的PUT成功可见或永久失败。
-不能完成barrier时保持Deleting；empty之后仍能落地late PUT的adapter/路径不得提交receipt。
+每Cat lifecycle lane与每Endpoint Route lane只在shared AdmissionCell线性化。接受leaving-Running Operation的
+Cat-row transaction同时停止new signing/Enable generation；Node accepted后的first local effect关闭lifecycle与
+全部Endpoint gate。
 
-旧Host即使恢复供电也持续隔离。没有可验证external fence的平台保持Blocked等待人工处置。
+Serving receipt/installed binding绑定effective RuntimeReady source、runtime incarnation、route epoch与exact
+`admission_session_epoch`。Agent replacement后memory cell默认Closed，old Serving自动失效；Route Controller
+burn epoch后fresh Enable。Grant不增加session claim。
 
-## 5. 运行监控
+SuspendDeclined(Busy)成为new lifecycle head，但只有cell-never-closed proof可保留original
+effective_runtime_ready；Signer比较head projection而非`Serving.source == head op`。actual/ambiguous close、Agent
+replacement或incarnation change都burn epoch。
 
-指标使用有界label；resource identity进入structured log/evidence，不进入高基数metric label。禁止
-采集Grant、signature、private key、Cookie、Authorization或响应body。
+需要停止旧执行的产品动作在bounded guard drain后可internal strong stop Guest/VMM并drop connection；active
+stream不是无限execution lease。该proof嵌入原动作result，不创建产品Stop/Killed head；RequireIdle Busy仍是
+non-destructive例外。
 
-必须覆盖：
+## 6. 运行监控
 
-- Control Plane：PG pool/queue saturation、acquire/query/lock timeout、transaction retry、observation renewal-critical
-  lane的active/queued/reject/deadline/cancel/join、ordinary-lane saturation时的renewal progress、scan lag、
-  desired-to-observation lag、stale observation拒签、AgentSession conflict、API fingerprint conflict/result replay、
-  signer active kid；
-- Gateway：每replica LRU size/bytes/eviction、hit/miss/expiry、negative/backoff、in-flight keys、
-  singleflight waiters/reject、resolve latency/error、typed pre-admission reason、UpstreamUnavailable；
-- Node：Host lock/session、按
-  [Inventory Spine §7](specs/runtime-inventory-observation-v1.md#7-planner--signer-的同-snapshot读取)计算的
-  inventory attestation/per-Cat observation freshness、checkpoint rebuild、gate Active/Closed、active guards、
-  close/drain time、Blocked reason、runtime incarnation、ring version/digest/loaded kids；
-- Storage/lifecycle：逐卷owner/epoch、`R/L` gap、Strict FLUSH、object-store error、Cold fallback、
-  `DataLossPossible`、orphan/quarantine、Deleting row age、sweeper scan/delete/re-list-empty failure和completion
-  CAS contention；
-- HA：replica/failure-domain count、public probe、fence attempt age/result、replacement phase。
+至少监控：
 
-告警阈值必须来自部署容量和经验证基线，不能把单次实验数字写成SLA。每个page指向一个按
-`observe -> stop unsafe progress -> collect bounded evidence -> recover -> verify postcondition`编排的
-runbook；禁止以“重启看看”跳过fence或durability proof。
+- Control：PG pool/queue/running/deadline、transaction retry/serialization、per-Cat unresolved age、signed poll
+  空/重复/拒绝、result repost/ACK unknown、commit conflict、LifecycleOperationInProgress、HostLost transition；
+- Node：Host lock/session conflict、command phase/age/replay、StopFence、complete inventory/attestation freshness、
+  missing/corrupt journal、artifact classification/GC、scope resurrection、effect ambiguity；
+- Route：effective RuntimeReady/Serving mismatch、admission session mismatch、route epoch burn、Active/Closed gates、
+  guards/drain/force stop、Grant cache/resolve/ring ACK；
+- Storage：owner/epoch、R/L gap、Strict FLUSH latency/error、pending pack quota、normal release、takeover/disposable
+  authorization、Persistent destroy blockers、Snapshot live roots与sweeper progress；
+- Fleet：heartbeat suspicion、provider fence attempt/event、old Host return、capacity/cordon、RDS/Object Store health；
+- Usage：spool backlog、counter gap/reset、projection/rating lag。
 
-## 6. 分层qualification
+RuntimeInventoryReport staleness/rejection是telemetry incident，不得改变command terminal result。Full
+inventory attestation与Partial subset分别监控；Partial不能刷新complete scan freshness。
 
-不再创建测试环境。终态复用三个已有入口，并按从便宜到昂贵的顺序运行：
+## 7. 分层qualification
 
-1. **Workspace/model**：在开发worktree运行`./scripts/quality.sh fast`；覆盖JWT fixed vectors、
-   AdmissionCell/close race、RequireIdle one-shot、Gateway LRU/singleflight/backoff和PostgreSQL双session
-   transaction tests。FakeVmm integration注入慢DB、响应丢失、restart/cancel和HTTP/WS transport歧义。
-   [Volume Authority §14](specs/volume-authority.md#14-最小验收矩阵)是同一上线门，必须覆盖acquire/
-   release模糊响应、旧lineage、API fingerprint fixed vectors与raw-byte差异、mutation分类/key/envelope gate、
-   Root create/Operation/result全有或全无、PersistentDisk create/201原子提交、Disk/Volume和Root/Cat唯一性、
-   exact Disk role/init、AgentSession replacement/observation advance与Initialized CAS双session竞争、snapshot create/result原子提交及lost response、
-   create→delete→旧create replay不复活、跨Workspace零副作用、`DiskSnapshotRecord`/GC、显式snapshot
-   delete与`SnapshotInUse`、同盘restore只前进一次、Disk delete 202/Deleting/404/replay、普通begin-delete
-   与并发attach/acquire竞争、Root Cold fast全有或全无、Deleted cleanup/release后只凭current observation
-   normal begin、direct/live-Cold/旧revision拒绝、release/auth derive双提交顺序、R==L后release前Host loss、
-   双sweeper/adapter contract positive PUT/
-   strong prefix-empty/provider fence paused accepted PUT barrier/completion CAS、receipt后再次empty，
-   以及disposable Root两边Deleting的每个crash点；用真实PG pause双向覆盖
-   Desired INSERT/full observation的`NodeIdentity -> credential lineage -> AgentSession -> receive/cursor`锁序；饱和A22/
-   ordinary Store时保留observation lane仍续期，并在queue/running/commit三个取消点证明无
-   detached late mutation。Control-signed authorization evidence read还必须覆盖consume commit丢response后的
-   direct/合法current successor、sweep删row后的exact completion，以及错projection/重复receipt/跨volume
-   direct authorization的fail-closed；验证A19 proof、current provisioned identity/exact active credential lineage/session、immutable
-   `authorized_node_id` isolation、combined cap/deadline/cancel，并以negative probe证明Node没有相关表的raw
-   SQL credential或权限。
-2. **独立native x86_64 Linux build host**：使用现有
-   [qualification build host](../deploy/aws/terraform/qualification/build-host/README.md)；controller发布
-   exact 40-hex commit后，在Host运行：
+每一层使用exact clean commit与可重复oracle：
 
-   ```sh
-   cats-checkout-exact-sha "$EXACT_40_HEX_COMMIT" "$MANIFEST_SHA256" "$BUNDLE_SHA256"
-   cats-run-build "$EXACT_40_HEX_COMMIT" "$MANIFEST_SHA256" "$BUNDLE_SHA256" \
-     --with-postgres -- ./scripts/quality.sh full
-   ```
+1. **Pure/domain**：ADR-0057六动作product projection与旧名absence、action-specific ExecutionStopped evidence、
+   command successor table、fingerprint/digest vectors、one-unresolved DB constraint、Volume owner/epoch state
+   machine、authorization sum type、Route binding compare。
+2. **PostgreSQL integration**：多replica admission race、response-received/result-commit crash、HostLost transaction、
+   lock DAG、API replay、Cat create全有或全无、Persistent initialization signed command CAS、Snapshot/delete。
+3. **Node local Linux**：real systemd scopes/cgroups、Host lock/double Agent、journal fsync crash points、StopFence/
+   force stop/resurrection、complete inventory、per-Cat GC、kernel-NBD与vhost-user-blk。
+4. **Runtime integration**：Cloud Hypervisor/Guest readiness、四态、Warm snapshot、R/L convergence、exact release、
+   destroy Persistent-first/Root discard、Route race/active HTTP/WebSocket。
+5. **Two-Node/failure**：normal Cold handoff、Agent/Control/PG response loss、network partition、external HostFence/
+   per-volume takeover、old Host return。
+6. **Production cell**：real RDS/Object Store/KMS/secret/mTLS/Gateway/provisioner artifacts、monitoring/rollback/open
+   evidence，exact immutable build receipt。
 
-   该入口原生覆盖Linux-only build/tests和PostgreSQL。`cats-run-build`只冻结Host本地output并写
-   immutable receipt；需要append-only evidence时，另以
-   `cats-publish-content-addressed evidence <file>`发布指定日志。不要在这里运行Docker版
-   `quality.sh linux`，也不要另建build host。
-3. **批准的隔离metal/KVM Host**：Host必须先证明安装exact artifact、cordoned、`cats=0/orphans=0`
-   且使用隔离qualification Workspace；没有合格Host时本层明确Blocked，不能把生产worker或历史
-   evidence当作当前gate。满足前置后按[metal runbook](../deploy/metal/README.md)运行真实Cloud
-   Hypervisor基线，再用下节同一个oracle分别设置`kernel-nbd`和`vhost-user`，覆盖真实HTTP/WS、
-   Agent restart、gate rebuild、Endpoint rebind、RequireIdle active-stream race、key overlap、Control
-   Plane/Gateway interruption和cleanup。provider adapter还必须跑两卷HostFenceEvent→逐卷CAS→旧
-   writer拒绝→quarantine矩阵，包含错tuple、takeover后release、HostFence disposable
-   event/auth/volume/control原子提交和delete完成receipt。
-4. **生产拓扑smoke**：前三层全绿后，才运行已有
-   [control-plane HA workflow](../.github/workflows/verify-control-plane-ha.yml)的diagnose/disrupt模式，
-   保存public probe和Pod/EndpointSlice evidence。该workflow目前只证明Control Plane副本切换；它不
-   替代Route、Node、storage或Host-fence oracle。
-
-## 7. 缺少的evidence脚本
-
-现有机器入口足够；缺的是仓库内确定性执行器。实现阶段新增一个
-`deploy/metal/runtime-cutover-e2e.sh`，但不让它provision、apply Terraform或创建长期service。脚本
-合同必须包括：
-
-- 必填exact commit、block path、run id和绝对output directory；启动时记录Host/Guest kernel、
-  binary/config SHA-256、schema version和**非secret**key fingerprints；不接受branch/tag或dirty binary；
-- 用同一scenario和oracle运行两种block path；每个case有稳定id、deadline、预期postcondition和
-  cleanup，失败后继续收集有界diagnostic但最终非零退出；
-- 覆盖§6列出的route/lifecycle/restart/outage矩阵，并校验过程中没有request replay、guard leak、
-  dual writer、gate resurrection或secret泄漏；
-- 输出`manifest.json`、`scenario-results.jsonl`、有界component journal摘要、最终inventory、退出码和
-  `SHA256SUMS`。每个artifact写临时文件后原子rename；超限时保留first/latest及truncation marker，
-  不能静默截断；
-- 不采集token/private key/用户header/raw response body。构建receipt、scenario manifest和exact
-  commit互相引用，随后进入现有append-only evidence发布边界。
-
-确定性逻辑、故障注入、oracle和artifact生成必须是可审查的repo script；skill若存在，只说明何时
-调用脚本和如何review evidence，不能复制脚本逻辑或代替执行证据。
+`./scripts/quality.sh full`是handoff门；Node/Linux-only change还要configured native x86_64 build host的full gate。
+本机迭代可用`./scripts/quality.sh linux`，但不能替代final native receipt。已知与改动无关的门禁flakiness需记录
+provenance并隔离，不在同一失败上无限重试。
 
 ## 8. 首次终态部署
 
-本节是 clean-slate cutover 顺序的唯一权威；各模块规格只声明自己的前置条件。
+atomic lifecycle只允许一次one-version clean-slate vertical cutover：
 
-1. 先在代码、schema和IaC中删除旧入口，形成只含终态合同的exact clean commit；由独立native
-   Linux build host验证完整workspace并保存build receipt。真实KVM场景还必须在满足第6节前置的
-   隔离metal Host验证同一artifact；没有合格Host时该上线门保持Blocked。
-2. 进入维护窗口，关闭公网 ingress 和 mutation。drain 可达 runtime；对不可达 Host 执行外部
-   fence，并正向证明旧 Gateway、Controller、Node Agent、VMM 和 blockd 已停止或被隔离。
-3. 在任何终态组件启动前，核对待部署artifact与步骤1的receipt完全一致，并证明其schema/IaC不含
-   NodeJob、heartbeat overwrite、旧Route parser/mirror、旧IAM/Terraform inputs或transitional
-   writes。创建与旧边界不重叠的fresh Control/Usage schema、ChunkStore bucket/prefix、Kinesis stream、
-   DynamoDB checkpoint table与Object-Locked usage archive；旧边界完整保留，不导入fresh系统。
-   随后为fresh边界轮换service、per-Node、database、object-store与route-signing credentials。此步不
-   重建或修改artifact，也不复用仍能授权旧writer的credential。
-4. 在fresh Control schema安装终态DDL（含A23 Node/provisioner credential all-history lineage），安装并验证
-   A23 deployment provisioner Ed25519 revision-1/null-previous trust bundle，在打开admin listener前CAS持久
-   revision receipt与active/retired tombstone，
-   再启动同一个exact release
-   的Control Plane；central IaC通过single signed node-authority route原子provision
-   `NodeIdentity`/per-Node credential binding与revision-1 cordoned `NodePlacementPolicy`。不得direct SQL或
-   使用Node/static admin bearer补row。
-5. Node 以所有 gate Closed 注册新 `AgentSession`，提交 complete empty inventory attestation 和
-   key-ring ACK；随后启动 Gateway。
-6. 在cordoned且mutation Closed状态运行第6节全部qualification和故障oracle。fresh Kubernetes rollout
-   必须以至少两个fully available Control replica、matching Running/Ready Pods、`cats.run/ingress=disabled`及零
-   public Ingress/IngressClass组成；`maintenance_mode=false`只启动fresh Control，独立且default-false的
-   `enable_public_ingress`仍保持false，不能用Terraform资源存在性虚构route/mutation Closed证明。全绿后生成绑定exact release、
-   fresh targets、唯一reset ID、qualification manifest与全部旧writer stopped-or-isolated证明的post-green evidence。
-   evidence在首次destructive start时必须不晚于当前时间且age不超过900秒；其中`old_writers`只是closed declaration，
-   不能代替E13 retained、可解析的systemd/process-tree正向停止或外部隔离receipt。E13已有
-   [Proposed候选格式](specs/old-host-positive-stop-v1.md)，但尚未accepted、不是`HostFenceEvent`且未接入reset authority；
-   E9 signed final usage epoch/barrier receipt与跨组件Closed-admission proof也尚未accepted。本版reset binary对三项分别机械
-   Blocked且在任何AWS/PostgreSQL调用前拒绝production execute；随机digest或operator字符串不能绕过。
-7. post-green后才执行旧namespace的exact destructive retirement。仓库内的
-   [`production-clean-slate-reset.py`](../deploy/aws/production-clean-slate-reset.py)是其中Control/Usage/ChunkStore
-   边界的两阶段执行器：reviewed `plan`与省略`--execute`的`apply`均只读；只有exact plan SHA、reset ID和
-   `--execute`同时存在才先发布immutable `reset-started` receipt，再删除明确命名的旧ChunkStore prefix、旧
-   Kinesis stream、旧DynamoDB checkpoint table及两个旧dedicated `cats_*` schema。旧immutable usage archive、
-   Terraform state、实验和审计evidence保留；`public`或任意shared PostgreSQL schema永不作为删除目标，旧schema-1
-   数据若仍在`public`则留待另一个closed table/dependency retirement。工具同时重验fresh namespace仍green且
-   old/fresh全部不重叠；STS caller account必须等于explicit 12-digit target account，且同一个值作为每次S3
-   read/list/delete/abort的expected bucket owner。不能把fresh空schema、旧schema缺表或retention等待当成零引用proof。完整合同见
-   [production clean-slate reset](../deploy/aws/production-clean-slate-reset.md)。其他旧Cat/Disk/Snapshot/Operation、
-   route/cache、Node runtime state和credential必须由各自批准的exact retirement继续处理，不能扩大本工具范围。
-   receipt以canonical JSON为唯一authority，SHA sidecar只从exact JSON no-replace补齐；sidecar无JSON或digest漂移fail closed。
-   `reset-started`后若进程或effect响应丢失，只能以同一plan/reset/release commit/artifact SHA256/targets/evidence digest重进：逐stage验证
-   canonical receipt/SHA与predecessor链，对缺receipt的stage先做authoritative live discovery，只执行尚未完成的effect；
-   已absent的exact stream/table/schema与空prefix只结算receipt，complete replay零mutation。receipt gap/drift、live
-   postcondition矛盾或另一plan/evidence一律fail closed。
-8. 独立验证final reset receipt及所有剩余old-retirement evidence后，才开放route/mutation admission、uncordon并
-   创建全新产品资源。已retire credential、ID、SPKI、schema、prefix、stream或checkpoint name不得复用。
+1. 离线构建exact Controller/Node/Gateway/Volume/provisioner bundle；验证schema/wire/version、migration absence、
+   credential inventory与全部qualification receipts。
+2. 进入维护窗口，关闭公网ingress与mutation；可达runtime用atomic target之外的现有安全runbook drain，
+   不可达Host必须完成external fence或明确阻断cutover，不能由timeout猜隔离。
+3. 停止所有旧Controller/Node/Gateway/signer/write path，确认不会再写旧schema、route mirror或volume authority。
+4. rotate/revoke旧service/Node/route credentials；删除旧Desired read、reconcile、Observation settlement、NodeJob、
+   heartbeat overwrite、legacy Route parser/mirror和兼容IAM input。
+5. 删除开发product/runtime state，创建唯一empty atomic schema 17。没有Desired/Operation/checkpoint/runtime/
+   route migration、translator、dual write/read、fallback或mixed-version window。
+6. provision immutable NodeIdentity/state-path/credential与cordoned NodePlacementPolicy；Node先取得Host lock、fresh
+   AgentSession、complete inventory，所有AdmissionCell/gate Closed。
+7. 启动PostgreSQL/control authority，再启动Node/Route signer ring；全部compatible version、inventory attestation、
+   public key ring与machine mTLS ACK后才启动Gateway/API mutation。
+8. 在exact deployed SHA上执行smoke + Linux/runtime/route/storage crash oracle；保存immutable build/deploy/test
+   receipt。任何old parser/credential、schema drift、unknown checkpoint或qualification failure保持Closed。
+9. 只有all-green receipt与operator review后才打开mutation和public ingress。
 
-在步骤7的`reset-started`发布前可以取消destructive retirement并完整保留旧namespace；若决定放弃fresh release，
-必须先停止其writer并走另一个reviewed rollback，任何时候都不能让old/fresh writer重叠。`reset-started`发布后只允许
-forward-fix同一终态版本。fresh目标schema/protocol version是启动前置事实，运行期只有这一套authority。
+production reset/open的更细artifact流程继续由
+[production clean-slate reset](../deploy/aws/production-clean-slate-reset.md)及accepted production qualification
+ADRs维护；它们不得重新引入legacy lifecycle authority。
 
-后续同一终态协议内的普通 release 可以逐副本/逐空 Node 部署，但必须保持 schema 兼容范围、
-key overlap、Node drain 和不可变 artifact digest；provisioner key rotation必须以单调revision和exact previous-set
-CAS先所有replica overlap、再切signer、最后用下一revision移除old，已retire ID/SPKI跨release不得重用；
-stale/same-revision不同set的replica必须fail startup，不能按本地缺席隐式retire。该路径不能用于首次 cutover。
+## 9. 明确不宣称
 
-步骤3–6还必须遵守
-[Agent Registration and Internal Transport v1](specs/agent-registration-transport-v1.md)和
-[Runtime Composition Artifacts v1](specs/runtime-composition-artifacts-v1.md)，policy/auth/planner另外遵守
-[Runtime Placement Policy v1](specs/runtime-placement-policy-v1.md)：provisioner安装并封闭验证唯一的
-local `NodeIdentity` artifact；Control/Node artifact extract出的manifest和
-`guest-runtime-profile.v1.json`逐byte一致；Node/Metal Control systemd及AWS Control Kubernetes container都
-显式传入installed exact receipt path；每Node Ed25519 key只在该Host以root-only文件存在。缺失identity、
-manifest或receipt，Host临时重建Guest kernel，或回退shared bearer都必须在启动/注册前fail closed。
+- atomic lifecycle内部软件组成与current product adapter不表示clean-slate release gate、
+  automatic HostFence、real RDS failover或production Route qualification已通过。
+- heartbeat timeout、last Observation、audit record和“目录不存在”都不是fence/result/delete authority。
+- Warm/Suspended不是跨Host HA副本；Relaxed Host loss可能丢失`R-L` local tail。
+- test machine/prototype样本不自动成为production SLA；报告必须保留environment、sample count、boundary与oracle。
+- privilege separation、cross-Node Guest overlay与automatic cloud/BMC Host fencing仍是独立后续边界。

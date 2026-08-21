@@ -3,30 +3,39 @@
 use std::sync::{mpsc, Arc, Barrier};
 use std::time::Duration;
 
-use cats_api::error::ErrorCode;
+use cats_api::agent_registration::AuthenticatedNodeCredential;
+use cats_api::route_grant_v2::{
+    decode_route_grant_v2_public_key_ring, decode_route_grant_v2_signer_reference,
+    RouteGrantV2PublicKeyRingArtifact, RouteGrantV2SignerSelection,
+};
 use cats_api::runtime_reconciliation::{
-    canonical_ed25519_spki_sha256, guest_config_digest, runtime_provisioner_active_set_digest,
-    AllocatableMemoryBytes, AllocatableVcpus, AsciiText, Base64UrlNoPad, ContractVersion,
-    CredentialBinding, Epoch, FleetPolicyPrincipal, GuestIpv4Pool, GuestIpv4PoolKind,
-    GuestRuntimeProfileReceipt, Id, Ipv4Address, NodeIdentity, NodeIdentityState,
-    NodePlacementPolicy, NodeTransportTarget, PublicKeyCredentialBinding, RandomId128,
-    RuntimeNodeAuthorityApply, RuntimeNodeAuthorityMutation, RuntimeNodeAuthorityOutcome,
-    RuntimeNodeAuthorityStoredOutcome, RuntimePlacementBlockFrontend, RuntimePlacementCapabilities,
-    RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport, RuntimePlacementVmm,
-    RuntimeProvisionerActiveSet, RuntimeProvisionerCredential, RuntimeProvisionerExpectedPrevious,
-    RuntimeProvisionerTrustBundle, RuntimeSchedulingState, Sha256Digest,
+    canonical_ed25519_spki_sha256, encode_agent_session, guest_config_digest,
+    runtime_provisioner_active_set_digest, AgentRegistrationAttempt, AllocatableMemoryBytes,
+    AllocatableVcpus, AsciiText, Base64UrlNoPad, ContractVersion, CredentialBinding, Epoch,
+    FleetPolicyPrincipal, GuestIpv4Pool, GuestIpv4PoolKind, GuestRuntimeProfileReceipt, Id,
+    Ipv4Address, NodeBootId, NodeIdentity, NodeIdentityState, NodePlacementPolicy,
+    NodeTransportTarget, PublicKeyCredentialBinding, RandomId128, RuntimeNodeAuthorityApply,
+    RuntimeNodeAuthorityMutation, RuntimeNodeAuthorityOutcome, RuntimeNodeAuthorityStoredOutcome,
+    RuntimePlacementBlockFrontend, RuntimePlacementCapabilities, RuntimePlacementGuestNetwork,
+    RuntimePlacementGuestTransport, RuntimePlacementVmm, RuntimeProvisionerActiveSet,
+    RuntimeProvisionerCredential, RuntimeProvisionerExpectedPrevious,
+    RuntimeProvisionerTrustBundle, RuntimeSchedulingState, Sequence, SessionBinding, Sha256Digest,
+    UnixMillis,
 };
+use cats_api::runtime_route::{RouteCommandPollRequest, RouteNodeRingAck};
 
-use super::host_fence_recovery_batch_tests::active_host_recovery_fixture;
 use super::placement_policy::RuntimeNodeAuthorityApplyStoreOutcome;
-use super::route_signing_authority_tests::install_initial_signer_for_test;
-use super::runtime_spine_tests::{
-    accept_ring_admission_for_test, refresh_assigned_admission_for_test,
-};
+use super::route_operations::RouteCommandPollOutcome;
+use crate::route_grant_v2::InstalledRouteGrantV2SigningAuthority;
+use crate::store::agent_sessions::{AgentRegistrationOutcome, AgentSessionRegistrationPolicy};
 use crate::store::{AuthorityRequestContext, Store};
 
 const SPKI_A: &str = "MCowBQYDK2VwAyEA11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
 const SPKI_B: &str = "MCowBQYDK2VwAyEAPUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw";
+const ROUTE_RING: &[u8] = br#"{"version":1,"ring_version":1,"expected_previous":null,"keys":[{"kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","public_key_spki":"MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To"}]}"#;
+const ROUTE_SIGNER: &[u8] = br#"{"version":1,"deployment_id":"route_deployment_a","signer_revision":1,"expected_previous":null,"signer":{"state":"active","active_kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","secret_reference_id":"route_secret_a"},"public_key_ring_version":1,"public_key_ring_digest":"sha256:7c7e324d7be6c6ee71735c900ce1041de63af7cc08fb39b6800853f966e81e34"}"#;
+const ROUTE_PRIVATE_KEY: &[u8] =
+    include_bytes!("../../../../tests/fixtures/route_grant_v2_private_ed25519.pem");
 
 fn id(value: &str) -> Id {
     Id::new(value).unwrap()
@@ -48,6 +57,83 @@ fn guest_release() -> GuestRuntimeProfileReceipt {
         kernel_cmdline: AsciiText::new("console=hvc0 root=/dev/vda").unwrap(),
         guest_agent_protocol_version: ContractVersion::V1,
     }
+}
+
+pub(super) fn install_initial_signer_for_test(store: &Store) -> RouteGrantV2PublicKeyRingArtifact {
+    let reference = decode_route_grant_v2_signer_reference(ROUTE_SIGNER).unwrap();
+    let ring = decode_route_grant_v2_public_key_ring(ROUTE_RING).unwrap();
+    let private_key = match &reference.signer {
+        RouteGrantV2SignerSelection::Active { .. } => Some(ROUTE_PRIVATE_KEY),
+        RouteGrantV2SignerSelection::Disabled => None,
+    };
+    let installed = InstalledRouteGrantV2SigningAuthority::from_authority_artifacts(
+        &reference,
+        ROUTE_SIGNER,
+        &ring,
+        private_key,
+        120,
+    )
+    .unwrap();
+    store
+        .install_route_grant_v2_signer_authority(&installed)
+        .unwrap();
+    ring
+}
+
+fn register_and_ack_current_ring(
+    store: &Store,
+    ring: &RouteGrantV2PublicKeyRingArtifact,
+) -> cats_api::runtime_reconciliation::AgentSession {
+    let identity = identity();
+    let authenticated = AuthenticatedNodeCredential::new(
+        identity.credential_id.clone(),
+        identity.credential_binding.clone(),
+    );
+    let attempt = AgentRegistrationAttempt {
+        version: ContractVersion::V1,
+        node_id: identity.node_id.clone(),
+        immutable_host_id: identity.immutable_host_id.clone(),
+        node_boot_id: NodeBootId::new("11111111111111111111111111111111").unwrap(),
+        agent_instance_id: random(40),
+        registration_attempt_id: random(41),
+        guest_config_digest: guest_config_digest(&guest_release()).unwrap(),
+        expected_agent_session_epoch: None,
+    };
+    let session = match store
+        .register_agent_session(
+            &authenticated,
+            &attempt,
+            &AgentSessionRegistrationPolicy::from_release_receipt(&guest_release()).unwrap(),
+        )
+        .unwrap()
+    {
+        AgentRegistrationOutcome::Registered(session) => session,
+        AgentRegistrationOutcome::Rejected(rejection) => {
+            panic!("test AgentSession was rejected: {rejection:?}")
+        }
+    };
+    let binding = SessionBinding {
+        node_id: session.node_id.clone(),
+        node_boot_id: session.node_boot_id.clone(),
+        agent_instance_id: session.agent_instance_id.clone(),
+        agent_session_epoch: session.agent_session_epoch,
+    };
+    let acknowledgement = RouteNodeRingAck::new(
+        binding,
+        random(42),
+        Sequence::new(1).unwrap(),
+        ring.ring_version,
+        ring.keys.iter().map(|entry| entry.kid.clone()).collect(),
+    )
+    .unwrap();
+    let poll =
+        RouteCommandPollRequest::new(&session, Sequence::new(1).unwrap(), Some(acknowledgement))
+            .unwrap();
+    assert!(matches!(
+        store.poll_route_commands(&authenticated, &poll).unwrap(),
+        RouteCommandPollOutcome::Batch(_)
+    ));
+    session
 }
 
 fn credential(name: &str, spki: &str) -> RuntimeProvisionerCredential {
@@ -146,35 +232,6 @@ fn provision(apply_id: u128) -> RuntimeNodeAuthorityApply {
             placement_policy: Box::new(policy(1, RuntimeSchedulingState::Cordoned, 16 << 30)),
         },
     }
-}
-
-fn provision_on_host(
-    apply_id: u128,
-    node_id: &str,
-    immutable_host_id: &str,
-    provider_scope: cats_api::runtime_reconciliation::ProviderScope,
-) -> RuntimeNodeAuthorityApply {
-    let mut apply = provision(apply_id);
-    apply.node_id = id(node_id);
-    let RuntimeNodeAuthorityMutation::Provision {
-        node_identity,
-        placement_policy,
-    } = &mut apply.mutation
-    else {
-        unreachable!();
-    };
-    node_identity.node_id = id(node_id);
-    node_identity.provider_scope = provider_scope;
-    node_identity.immutable_host_id = id(immutable_host_id);
-    node_identity.credential_id = Id::new(format!("credential-{node_id}")).unwrap();
-    node_identity.credential_binding = CredentialBinding::PublicKey {
-        public_key_spki_sha256: digest(u8::try_from(apply_id).unwrap()),
-    };
-    node_identity.state_path_id = Id::new(format!("state-path-{node_id}")).unwrap();
-    placement_policy.node_id = id(node_id);
-    placement_policy.node_transport_target =
-        NodeTransportTarget::new(format!("https://{node_id}.internal:7301")).unwrap();
-    apply
 }
 
 fn update(
@@ -409,8 +466,7 @@ fn apply_replay_preconditions_policy_and_credential_lineage_are_atomic() {
         ),
         RuntimeNodeAuthorityStoredOutcome::AuthorityPreconditionFailed
     );
-    let admission = refresh_assigned_admission_for_test(&store, &identity(), &guest_release(), 41);
-    let admission = accept_ring_admission_for_test(&store, &admission, &current_ring, 2, 2);
+    let session = register_and_ack_current_ring(&store, &current_ring);
     let enable = update(2, 1, RuntimeSchedulingState::Schedulable, 16 << 30);
     assert_applied(
         store.apply_runtime_node_authority(&actor, &enable).unwrap(),
@@ -492,18 +548,52 @@ fn apply_replay_preconditions_policy_and_credential_lineage_are_atomic() {
         RuntimeNodeAuthorityStoredOutcome::AuthorityPreconditionFailed
     );
 
+    // Rotation requires the current session to be quiescent, not physically
+    // erased. Runtime inventory and Route ring rows retain exact foreign keys
+    // to the session, so deleting it is no longer a legal clean-slate state.
+    let mut expired_session = session.clone();
+    expired_session.lease_deadline_unix_ms = UnixMillis::new(0).unwrap();
+    let expired_record =
+        String::from_utf8(encode_agent_session(&expired_session).unwrap()).unwrap();
     store
         .with(|client| {
-            client
-                .execute(
-                    "DELETE FROM current_agent_sessions
+            let mut transaction = client.transaction()?;
+            // Waiting for the fixed one-minute production lease would make
+            // this characterization slow. Seed the same coherent state by
+            // changing both copies of the first result in one isolated test
+            // transaction; USER triggers are restored before commit, while
+            // all exact-binding foreign keys remain enabled throughout.
+            transaction
+                .batch_execute("ALTER TABLE agent_registration_attempts DISABLE TRIGGER USER")?;
+            assert_eq!(
+                transaction.execute(
+                    "UPDATE agent_registration_attempts
+                        SET session_record=$3::TEXT::jsonb, lease_deadline_unix_ms=0
+                      WHERE node_id=$1 AND registration_attempt_id=$2",
+                    &[
+                        &session.node_id.as_str(),
+                        &session.registration_attempt_id.as_str(),
+                        &expired_record,
+                    ],
+                )?,
+                1
+            );
+            assert_eq!(
+                transaction.execute(
+                    "UPDATE current_agent_sessions
+                        SET record=$3::TEXT::jsonb, lease_deadline_unix_ms=0
                       WHERE node_id=$1 AND agent_session_epoch=$2",
                     &[
-                        &admission.agent_session.node_id.as_str(),
-                        &i64::try_from(admission.agent_session.agent_session_epoch.get()).unwrap(),
+                        &session.node_id.as_str(),
+                        &i64::try_from(session.agent_session_epoch.get()).unwrap(),
+                        &expired_record,
                     ],
-                )
-                .map(|changed| assert_eq!(changed, 1))
+                )?,
+                1
+            );
+            transaction
+                .batch_execute("ALTER TABLE agent_registration_attempts ENABLE TRIGGER USER")?;
+            transaction.commit()
         })
         .unwrap();
 
@@ -1155,80 +1245,4 @@ fn concurrent_host_state_reuse_has_one_applied_winner_and_one_durable_rejection(
         Ok(())
     })
     .unwrap();
-}
-
-#[test]
-fn active_recovery_seals_fresh_provision_on_the_same_physical_host_only() {
-    let fixture = active_host_recovery_fixture("host-recovery-provision-barrier");
-    let store = &fixture.fixture.store;
-    let provisioner = credential("host_recovery_provisioner", SPKI_A);
-    store
-        .install_runtime_provisioner_trust_bundle(&trust(1, vec![provisioner.clone()], None))
-        .unwrap();
-    let actor = principal(&provisioner);
-    let source_scope = fixture.fixture.old_identity.provider_scope.clone();
-    let source_host = fixture
-        .fixture
-        .old_identity
-        .immutable_host_id
-        .as_str()
-        .to_owned();
-
-    // This is a fresh Node ID and a fresh state path, so a Node-scoped or
-    // Host/state-path-scoped barrier cannot catch it.  The physical Host
-    // recovery barrier must reject it before any apply or authority row is
-    // written.
-    let same_host = provision_on_host(
-        80,
-        "node-recovery-bypass",
-        &source_host,
-        source_scope.clone(),
-    );
-    let error = store
-        .apply_runtime_node_authority(&actor, &same_host)
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::Conflict);
-    store
-        .with(|client| {
-            for (table, column) in [
-                ("node_identities", "node_id"),
-                ("runtime_node_placement_policies", "node_id"),
-                ("runtime_node_credential_lineage", "node_id"),
-            ] {
-                let count = client
-                    .query_one(
-                        &format!("SELECT count(*) FROM {table} WHERE {column}=$1"),
-                        &[&same_host.node_id.as_str()],
-                    )?
-                    .get::<_, i64>(0);
-                assert_eq!(count, 0, "{table} changed for rejected same-Host provision");
-            }
-            assert_eq!(
-                client
-                    .query_one(
-                        "SELECT count(*) FROM runtime_node_authority_apply_records
-                          WHERE apply_id=$1",
-                        &[&same_host.apply_id.as_str()],
-                    )?
-                    .get::<_, i64>(0),
-                0
-            );
-            Ok(())
-        })
-        .unwrap();
-
-    // The scope key is exact: recovery of one immutable Host must not stop
-    // normal provisioning on another Host in the same provider scope.
-    let other_host = provision_on_host(
-        81,
-        "node-other-physical-host",
-        "host-other-physical-host",
-        source_scope,
-    );
-    assert_applied(
-        store
-            .apply_runtime_node_authority(&actor, &other_host)
-            .unwrap(),
-        RuntimeNodeAuthorityOutcome::Provisioned,
-    );
 }

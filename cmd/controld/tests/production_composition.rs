@@ -2,19 +2,30 @@ use std::path::Path;
 
 #[test]
 fn official_control_daemon_selects_only_production_router_compositions() {
-    let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source_path = manifest_dir.join("src/main.rs");
     let source = std::fs::read_to_string(&source_path)
         .unwrap_or_else(|error| panic!("read {}: {error}", source_path.display()));
+    let server_path = manifest_dir.join("../../control-plane/src/server.rs");
+    let server = std::fs::read_to_string(&server_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", server_path.display()));
 
-    for production_composition in [
-        "cats_control_plane::server::spawn(server_config)",
-        "cats_control_plane::server::spawn_with_gateway_machine(server_config, machine)",
-    ] {
-        assert!(
-            source.contains(production_composition),
-            "the official control daemon lost production composition {production_composition:?}"
-        );
-    }
+    assert!(
+        source.contains(
+            "cats_control_plane::server::spawn_with_gateway_machine(server_config, gateway_machine)"
+        ),
+        "the official daemon must always compose the fixed Route v2 machine authority"
+    );
+    assert!(!source.contains("cats_control_plane::server::spawn(server_config)"));
+    assert!(!source.contains("route_v2_machine_listen: Option"));
+    assert!(!source.contains("route_v2_rotation_listen: Option"));
+    assert!(!server.contains("pub async fn spawn(cfg: Config)"));
+    assert!(!server.contains("Option<GatewayMachineConfig>"));
+    assert!(source.contains("load_installed_gateway_machine_artifacts("));
+    assert!(source.contains("load_installed_route_grant_v2_signer("));
+    assert!(source.contains("load_installed_route_v2_rotation_operator_trust("));
+    assert!(server.contains("GatewayMachineListener::spawn("));
+    assert!(server.contains("RouteRotationMachineListener::spawn("));
 
     for retired_test_composition in [
         "spawn_for_retired_product_tests",
@@ -73,70 +84,6 @@ fn official_control_daemon_has_no_legacy_volume_authority() {
 }
 
 #[test]
-fn release_surface_cannot_compose_the_debug_retired_authority() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace = manifest_dir.join("../..");
-    let server = std::fs::read_to_string(workspace.join("control-plane/src/server.rs"))
-        .expect("read control-plane server");
-    let controller = std::fs::read_to_string(workspace.join("control-plane/src/controller.rs"))
-        .expect("read control-plane controller");
-    let router = std::fs::read_to_string(workspace.join("control-plane/src/api/mod.rs"))
-        .expect("read control-plane router");
-    let docker = std::fs::read_to_string(workspace.join("deploy/aws/Dockerfile.control-plane"))
-        .expect("read official control-plane image build");
-
-    for debug_only_surface in [
-        "#[cfg(debug_assertions)]\n    pub retired_storage_meta_for_tests:",
-        "#[cfg(debug_assertions)]\n    pub(crate) retired_product_authority_for_tests:",
-        "#[cfg(debug_assertions)]\npub async fn spawn_for_retired_product_tests",
-    ] {
-        assert!(
-            server.contains(debug_only_surface),
-            "retired server surface lost its release-excluding cfg: {debug_only_surface:?}"
-        );
-    }
-    assert!(
-        controller.contains(
-            "#[cfg(debug_assertions)]\n    retired_storage_meta_for_tests: Option<Arc<dyn MetadataStore>>"
-        ),
-        "release Controller regained the retired storage authority field"
-    );
-    assert!(
-        router.contains(
-            "#[cfg(not(debug_assertions))]\n    let retired_product_authority = Router::<AppState>::new();"
-        ),
-        "release router no longer statically omits retired product routes"
-    );
-    assert!(
-        docker.contains("cargo build --locked --release")
-            && docker.contains("-p cats-control-plane-daemon"),
-        "official control-plane image must compile the release-only authority surface"
-    );
-}
-
-#[test]
-fn release_runtime_volume_authority_includes_the_feature_gated_residue_route() {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let router = std::fs::read_to_string(workspace.join("control-plane/src/api/mod.rs"))
-        .expect("read control-plane router");
-    let release_start = router
-        .find("#[cfg(not(debug_assertions))]\n    let runtime_volume_authority = {")
-        .expect("find release runtime volume authority composition");
-    let release_end = router[release_start..]
-        .find("#[cfg(debug_assertions)]\n    let runtime_operation_read")
-        .map(|offset| release_start + offset)
-        .expect("find end of release runtime volume authority composition");
-    let release = &router[release_start..release_end];
-
-    assert!(
-        release.contains(
-            "#[cfg(feature = \"proposed-node-residue-reclamation\")]\n        let router = router.route(\n            \"/v1/internal/runtime/residue-authority\",\n            post(runtime_volume_transitions::residue_authority)\n                .fallback(runtime_volume_transitions::residue_authority),\n        );"
-        ),
-        "release router must install residue authority only when its implementation feature is compiled"
-    );
-}
-
-#[test]
 fn release_product_router_cli_console_and_docs_share_one_cutover_surface() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let router = std::fs::read_to_string(workspace.join("control-plane/src/api/mod.rs"))
@@ -153,15 +100,24 @@ fn release_product_router_cli_console_and_docs_share_one_cutover_surface() {
         ".route(\"/v1/workspaces/{workspace}/disks\", disk_collection_route)",
         ".route(\"/v1/workspaces/{workspace}/cats/{cat}\", cat_item_route)",
         ".route(\"/v1/workspaces/{workspace}/disks/{disk}\", disk_item_route)",
+        "\"/v1/workspaces/{workspace}/cats/{cat}/actions/run\"",
+        "\"/v1/workspaces/{workspace}/cats/{cat}/actions/suspend\"",
+        "\"/v1/workspaces/{workspace}/cats/{cat}/actions/warm\"",
+        "\"/v1/workspaces/{workspace}/cats/{cat}/actions/cold\"",
+        "\"/v1/workspaces/{workspace}/cats/{cat}/actions/destroy\"",
         "get(runtime_operations::get_runtime_operation)",
     ] {
         assert!(router.contains(route), "release router lost {route:?}");
     }
     assert!(
-        cli.contains("#[command(hide = true)]\n    Delete {")
+        cli.contains("Run { cat_id: String }")
+            && cli.contains("Suspend { cat_id: String }")
+            && cli.contains("Warm { cat_id: String }")
+            && cli.contains("Cold { cat_id: String }")
+            && cli.contains("Destroy { cat_id: String }")
             && cli.contains("PersistentDiskCreateV1Request")
             && cli.contains("CatCreateV2Request"),
-        "shipped CLI no longer hides Disk delete or shares the closed create DTOs"
+        "shipped CLI lost the six-action product surface or the closed create DTOs"
     );
 
     for retired in [
@@ -198,6 +154,11 @@ fn release_product_router_cli_console_and_docs_share_one_cutover_surface() {
             "POST /v1/workspaces/{workspace_id}/disks",
             "GET  /v1/workspaces/{workspace_id}/disks",
             "GET /v1/workspaces/{workspace_id}/operations/{operation_id}",
+            "/actions/run",
+            "/actions/suspend",
+            "/actions/warm",
+            "/actions/cold",
+            "/actions/destroy",
         ] {
             assert!(api.contains(current), "{locale} API docs lost {current:?}");
         }
@@ -214,6 +175,11 @@ fn release_product_router_cli_console_and_docs_share_one_cutover_surface() {
         }
         for current in [
             "cats create NAME --boot-image-digest",
+            "cats run CAT_ID",
+            "cats suspend CAT_ID",
+            "cats warm CAT_ID",
+            "cats cold CAT_ID",
+            "cats destroy CAT_ID",
             "cats disk create NAME --size SIZE",
             "cats operation get OPERATION_ID",
         ] {
@@ -229,7 +195,9 @@ fn release_product_router_cli_console_and_docs_share_one_cutover_surface() {
             "cats unmount",
             "cats expose",
             "cats start",
-            "cats destroy",
+            "cats stop",
+            "cats delete",
+            "cats resume",
         ] {
             assert!(
                 !cli_reference.contains(retired),

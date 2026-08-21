@@ -15,6 +15,38 @@ fn read_workspace_file(path: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+#[cfg(unix)]
+fn install_fake_cgroup2_findmnt(directory: &Path) -> std::ffi::OsString {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let findmnt = directory.join("findmnt");
+    std::fs::write(
+        &findmnt,
+        r#"#!/bin/sh
+output=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --output ]; then
+    shift
+    output=${1-}
+  fi
+  shift
+done
+case "$output" in
+  TARGET) printf '%s\n' "$CATS_CGROUP_MOUNT" ;;
+  FSTYPE) printf '%s\n' cgroup2 ;;
+  *) exit 2 ;;
+esac
+"#,
+    )
+    .expect("write fake cgroup2 findmnt");
+    std::fs::set_permissions(&findmnt, std::fs::Permissions::from_mode(0o755))
+        .expect("make fake cgroup2 findmnt executable");
+    let mut path = directory.as_os_str().to_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    path
+}
+
 #[test]
 fn production_deployment_selects_each_control_plane_image_target() {
     let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
@@ -58,6 +90,26 @@ fn deployment_units_take_the_pinned_guest_cmdline_only_from_the_shared_receipt()
             "--guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json"
         ));
         assert!(text.contains("--vmm-launcher-bin /opt/cats/bin/cats-vmm-launcher"));
+        for exact in [
+            "--route-v2-machine-listen 0.0.0.0:7444",
+            "--route-v2-rotation-origin",
+            "--runtime-systemctl-bin /usr/bin/systemctl",
+            "--runtime-systemd-run-bin /usr/bin/systemd-run",
+            "--runtime-cgroup-root /sys/fs/cgroup",
+            "--runtime-proc-root /proc",
+            "--runtime-network-class-root /sys/class/net",
+            "--runtime-sys-block-root /sys/block",
+            "--runtime-device-root /dev",
+            "--runtime-blockd-socket-root /run/cats/blockd-v1",
+            "--runtime-vmm-socket-root /run/cats/vmm-v1",
+            "--runtime-inventory-scan-timeout-ms 5000",
+            "--runtime-effect-step-timeout-ms 30000",
+        ] {
+            assert!(
+                text.contains(exact),
+                "{unit} lost atomic lifecycle installed coordinate {exact:?}"
+            );
+        }
         let recovery = text
             .find("ExecStartPre=/opt/cats/bin/install-guest-runtime-release startup-recover")
             .expect("service restart recovery gate");
@@ -69,6 +121,21 @@ fn deployment_units_take_the_pinned_guest_cmdline_only_from_the_shared_receipt()
             "{unit} must recover or block before Node exec"
         );
         assert!(!text.contains("--ch-cmdline"));
+        assert!(!text.contains("--guest-agent-bin"));
+        assert!(!text.contains("--metering-cgroup-root"));
+    }
+    for environment in [
+        "deploy/metal/cats.env.example",
+        "deploy/aws/metal/worker.env.example",
+    ] {
+        let text = read_workspace_file(environment);
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("CATS_ROUTE_V2_ROTATION_ORIGIN=https://"))
+                .count(),
+            1,
+            "{environment} must provide exactly one mandatory HTTPS Route v2 rotation origin"
+        );
     }
 }
 
@@ -116,13 +183,14 @@ fn node_agent_killmode_is_explicit_without_owning_per_cat_services() {
     );
 
     let process_owner =
-        read_workspace_file("node-agent/src/runtime/reconciliation/systemd_root_provision.rs");
+        read_workspace_file("node-agent/src/lifecycle_command/installed/start_platform.rs");
     for exact in [
-        "const SYSTEM_SLICE: &str = \"system.slice\";",
-        "const ROOT_PROVISION_KILL_MODE: &str = \"control-group\";",
-        ".arg(format!(\"--slice={SYSTEM_SLICE}\"))",
-        ".arg(format!(\"--property=KillMode={ROOT_PROVISION_KILL_MODE}\"))",
-        ".arg(format!(\"--property=Restart={ROOT_PROVISION_RESTART}\"))",
+        "fn submit_atomic_vmm_service(",
+        "let slice = cat_execution_slice_id(cat_id);",
+        ".arg(format!(\"--slice={slice}\"))",
+        ".arg(format!(\"--property=Slice={slice}\"))",
+        ".arg(\"--property=KillMode=control-group\")",
+        ".arg(\"--property=Restart=no\")",
     ] {
         assert!(
             process_owner.contains(exact),
@@ -148,13 +216,18 @@ fn node_agent_killmode_is_explicit_without_owning_per_cat_services() {
 }
 
 #[test]
-fn linux_gate_names_the_serving_pending_pack_restart_adoption_case() {
-    const TEST_NAME: &str = "postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart";
+fn linux_gate_names_the_current_privileged_network_boundary_cases() {
     let gate = read_workspace_file("scripts/linux-gate.sh");
-    assert!(
-        gate.contains(TEST_NAME),
-        "quality.sh linux does not name the serving/pending-pack restart characterization"
-    );
+    for test_name in [
+        "real_linux_pending_tap_rejects_name_replacement_at_every_configuration_boundary",
+        "real_linux_scoped_tap_is_published_and_exact_in_a_private_network_namespace",
+    ] {
+        assert!(
+            gate.contains(test_name),
+            "quality.sh linux does not name privileged Node test {test_name}"
+        );
+    }
+    assert!(!gate.contains("runtime_cutover::cross_component_e2e"));
 }
 
 #[test]
@@ -495,6 +568,164 @@ fn metal_acceptance_drives_real_mount_propagation_and_postgresql() {
 }
 
 #[test]
+fn clean_release_excludes_the_retired_runtime_checkpoint_e3_artifacts() {
+    let cargo = read_workspace_file("cmd/noded/Cargo.toml");
+    let dockerfile = read_workspace_file("deploy/aws/Dockerfile.worker-artifact");
+    let installer = read_workspace_file("deploy/aws/metal/install-worker.sh");
+    let deployment =
+        read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
+    let verifier = read_workspace_file("deploy/aws/tools/verify-manual-release.py");
+    let release_builder = read_workspace_file("deploy/aws/tools/build-manual-release.sh");
+
+    // Calibrate every release-membership surface against the active daemon
+    // before relying on absence of the retired probe.
+    for (surface, source) in [
+        ("Cargo bins", &cargo),
+        ("worker artifact", &dockerfile),
+        ("source installer", &installer),
+        ("Terraform installer and receipt", &deployment),
+        ("manual release membership", &verifier),
+    ] {
+        assert!(
+            source.contains("cats-noded"),
+            "clean-release absence probe is not calibrated for {surface}"
+        );
+        assert!(
+            !source.contains("cats-runtime-e3-probe") && !source.contains("runtime_e3_probe.rs"),
+            "{surface} still publishes the retired RuntimeCheckpoint E3 probe"
+        );
+    }
+    assert_eq!(
+        verifier.matches("    \"cats-noded\",").count(),
+        2,
+        "active daemon must remain in the closed static and executable worker sets"
+    );
+    assert!(
+        !release_builder.contains("runtime-cutover-e2e-catalog.v1.json"),
+        "manual release manifest still binds the retired checked-in E3 catalog"
+    );
+
+    for retired_path in [
+        "cmd/noded/src/runtime_e3_probe.rs",
+        "cmd/noded/tests/runtime_cutover_e2e_contracts.rs",
+        "deploy/metal/runtime-cutover-e2e.sh",
+        "deploy/metal/runtime-cutover-v2-scenarios.sh",
+        "deploy/metal/runtime-cutover-e2e-catalog.v1.json",
+        "deploy/metal/tests/runtime-cutover-e2e-scenario-fixture.sh",
+    ] {
+        assert!(
+            !workspace_root().join(retired_path).exists(),
+            "retired RuntimeCheckpoint E3 release path still exists: {retired_path}"
+        );
+    }
+}
+
+#[test]
+fn clean_release_has_no_retired_runtime_checkpoint_or_volume_transition_codec() {
+    fn collect_production_rust_sources(directory: &Path, sources: &mut Vec<(PathBuf, String)>) {
+        let mut entries = std::fs::read_dir(directory)
+            .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|error| panic!("enumerate {}: {error}", directory.display()));
+        entries.sort_by_key(std::fs::DirEntry::path);
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_production_rust_sources(&path, sources);
+            } else if path.extension().and_then(std::ffi::OsStr::to_str) == Some("rs") {
+                let source = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+                let production = source
+                    .split_once("\n#[cfg(test)]")
+                    .map_or(source.as_str(), |(prefix, _)| prefix)
+                    .to_owned();
+                sources.push((path, production));
+            }
+        }
+    }
+
+    let root = workspace_root();
+    let mut sources = Vec::new();
+    for relative in [
+        "api/src",
+        "blockd/src",
+        "cmd/blockd/src",
+        "cmd/noded/src",
+        "node-agent/src/lifecycle_command",
+        "node-agent/src/runtime_inventory",
+    ] {
+        collect_production_rust_sources(&root.join(relative), &mut sources);
+    }
+
+    let active_decoder = ["decode", "lifecycle", "command", "envelope"].join("_");
+    assert!(
+        sources
+            .iter()
+            .any(|(_, source)| source.contains(&active_decoder)),
+        "production-code scan did not find the active lifecycle decoder positive control"
+    );
+    assert!(
+        sources
+            .iter()
+            .any(|(_, source)| source.contains("decode_lifecycle_volume_transition_request")),
+        "production-code scan did not find the active lifecycle-volume decoder positive control"
+    );
+
+    let retired_decoder = ["decode", "runtime", "checkpoint"].join("_");
+    let retired_encoder = ["encode", "runtime", "checkpoint"].join("_");
+    let retired_type_declaration = ["pub struct Runtime", "Checkpoint"].concat();
+    let retired_contract_arm = ["ContractName::Runtime", "Checkpoint"].concat();
+    let offenders = sources
+        .iter()
+        .filter(|(_, source)| {
+            source.contains(&retired_decoder)
+                || source.contains(&retired_encoder)
+                || source.contains(&retired_type_declaration)
+                || source.contains(&retired_contract_arm)
+        })
+        .map(|(path, _)| {
+            path.strip_prefix(&root)
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        offenders.is_empty(),
+        "retired RuntimeCheckpoint codec/type remains in production sources: {offenders:?}"
+    );
+
+    let retired_transition_symbols = [
+        "decode_runtime_volume_transition",
+        "encode_runtime_volume_transition",
+        "pub struct RuntimeVolumeTransition",
+        "pub enum RuntimeVolumeTransition",
+        "ContractName::RuntimeVolumeTransition",
+        "RUNTIME_VOLUME_TRANSITION_PATH",
+        "RUNTIME_VOLUME_TRANSITION_EVIDENCE_PATH",
+    ];
+    let transition_offenders = sources
+        .iter()
+        .filter(|(_, source)| {
+            retired_transition_symbols
+                .iter()
+                .any(|symbol| source.contains(symbol))
+        })
+        .map(|(path, _)| {
+            path.strip_prefix(&root)
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        transition_offenders.is_empty(),
+        "retired Desired/revision volume-transition parser remains in production sources: \
+         {transition_offenders:?}"
+    );
+}
+
+#[test]
 fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
     let dockerignore = read_workspace_file(".dockerignore");
     for required in [
@@ -555,7 +786,6 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
         "manual verifier fixture must not restate the worker member sets"
     );
     for binary in [
-        "cats-runtime-e3-probe",
         "cats-e3-guest-workload",
         "cats-usage-schema-v16-verifier",
         "cats-usage-terminal-receipt-verifier",
@@ -647,15 +877,15 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
         .find("route_v2_install_state=\"$(cats_classify_route_v2_node_r1")
         .map(|offset| deployment_lock + offset)
         .expect("worker deployment classifies exact Route v2 state under the lock");
-    let locked_metering = deployment[exact_classification..]
-        .find("metering_root=\"$(cats_worker_metering_root cats-worker)\"")
+    let locked_cgroup = deployment[exact_classification..]
+        .find("cgroup_v2_root=\"$(cats_worker_cgroup_v2_root)\"")
         .map(|offset| exact_classification + offset)
-        .expect("worker deployment recomputes its metering cgroup under the lock");
-    let locked_idle_guard = deployment[locked_metering..]
+        .expect("worker deployment recomputes its cgroup-v2 root under the lock");
+    let locked_idle_guard = deployment[locked_cgroup..]
         .find(
-            "\"$stage_path/require-idle-worker.sh\" \"$metering_root\" \"${var.install_root}/bin\"",
+            "\"$cgroup_v2_root\" \"${var.install_root}/bin\" \"${var.install_root}/bin/cloud-hypervisor\"",
         )
-        .map(|offset| locked_metering + offset)
+        .map(|offset| locked_cgroup + offset)
         .expect("worker deployment rechecks physical idle under the lock");
     let stop = deployment[locked_idle_guard..]
         .find("cats_gate_node_service cats-worker")
@@ -672,7 +902,7 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
         .find("cats_begin_candidate_lifetime cats-worker \"$release_installer\"")
         .expect("post-mutation worker start authorization and watchdog");
     let idle_guard =
-        "\"$stage_path/require-idle-worker.sh\" \"$metering_root\" \"${var.install_root}/bin\"";
+        "\"$cgroup_v2_root\" \"${var.install_root}/bin\" \"${var.install_root}/bin/cloud-hypervisor\"";
     assert_eq!(
         deployment.matches(idle_guard).count(),
         1,
@@ -685,8 +915,8 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
     assert!(
         release_verify < deployment_lock
             && deployment_lock < exact_classification
-            && exact_classification < locked_metering
-            && locked_metering < locked_idle_guard
+            && exact_classification < locked_cgroup
+            && locked_cgroup < locked_idle_guard
             && locked_idle_guard < stop
             && stop < prepare
             && prepare < first_install
@@ -1944,49 +2174,130 @@ fn overlapping_guest_release_transactions_serialize_journal_active_and_commit() 
 
 #[cfg(unix)]
 #[test]
-fn worker_release_refuses_active_cat_cgroups() {
+fn worker_release_calibrates_cgroup_probe_and_refuses_cat_slice_residue() {
+    use std::os::unix::fs::PermissionsExt as _;
+
     let temp = tempfile::tempdir().expect("temporary cgroup fixture");
-    let metering_root = temp.path().join("metering");
-    let active_cat = metering_root.join("metal-1/cat-active");
-    std::fs::create_dir_all(&active_cat).expect("create cgroup fixture");
-    let cgroup_procs = active_cat.join("cgroup.procs");
-    std::fs::write(&cgroup_procs, "").expect("write empty cgroup");
+    let cgroup_root = temp.path().join("cgroup");
+    std::fs::create_dir(&cgroup_root).expect("create cgroup fixture");
+    let cgroup_root = std::fs::canonicalize(cgroup_root).expect("canonical cgroup fixture");
+    std::fs::write(cgroup_root.join("cgroup.controllers"), "cpu memory\n")
+        .expect("write cgroup-v2 positive control");
 
     // An isolated bin root keeps the process-table scan away from whatever
     // the developer machine happens to run.
     let bin_root = temp.path().join("bin");
     std::fs::create_dir_all(&bin_root).expect("create bin fixture");
+    let fake_tools = temp.path().join("fake-tools");
+    std::fs::create_dir(&fake_tools).expect("create fake tool directory");
+    let tool_path = install_fake_cgroup2_findmnt(&fake_tools);
 
     let guard = workspace_root().join("deploy/aws/metal/require-idle-worker.sh");
     let idle = std::process::Command::new(&guard)
-        .arg(&metering_root)
+        .arg(&cgroup_root)
         .arg(&bin_root)
+        .env("PATH", &tool_path)
+        .env("CATS_CGROUP_MOUNT", &cgroup_root)
         .output()
         .expect("run idle worker guard");
     assert!(
         idle.status.success(),
-        "empty metering cgroups must be releasable: {}",
+        "a calibrated cgroup-v2 root with no Cat slice must be releasable: {}",
         String::from_utf8_lossy(&idle.stderr)
     );
 
-    std::fs::write(&cgroup_procs, "1818070\n").expect("write active cgroup");
-    let active = std::process::Command::new(&guard)
-        .arg(&metering_root)
+    let delegated = cgroup_root.join("delegated");
+    std::fs::create_dir(&delegated).expect("create delegated cgroup subtree");
+    std::fs::write(delegated.join("cgroup.controllers"), "cpu memory\n")
+        .expect("write delegated cgroup marker");
+    let subtree = std::process::Command::new(&guard)
+        .arg(&delegated)
         .arg(&bin_root)
+        .env("PATH", &tool_path)
+        .env("CATS_CGROUP_MOUNT", &cgroup_root)
         .output()
-        .expect("run active worker guard");
-    assert!(!active.status.success(), "active Cat must block release");
-    let stderr = String::from_utf8_lossy(&active.stderr);
+        .expect("run delegated-subtree guard");
+    assert!(!subtree.status.success());
+    assert!(String::from_utf8_lossy(&subtree.stderr).contains("not the exact cgroup2 mount root"));
+
+    let linked_root = temp.path().join("linked-cgroup-root");
+    std::os::unix::fs::symlink(&cgroup_root, &linked_root).expect("link cgroup fixture");
+    let symlinked = std::process::Command::new(&guard)
+        .arg(&linked_root)
+        .arg(&bin_root)
+        .env("PATH", &tool_path)
+        .env("CATS_CGROUP_MOUNT", &cgroup_root)
+        .output()
+        .expect("run symlinked-root guard");
+    assert!(!symlinked.status.success());
+    assert!(String::from_utf8_lossy(&symlinked.stderr).contains("not an ordinary directory"));
+
+    let canonical = cgroup_root
+        .join("cats-cat-1111111111111111111111111111111111111111111111111111111111111111.slice");
+    std::fs::create_dir(&canonical).expect("create canonical Cat slice");
+    let residue = std::process::Command::new(&guard)
+        .arg(&cgroup_root)
+        .arg(&bin_root)
+        .env("PATH", &tool_path)
+        .env("CATS_CGROUP_MOUNT", &cgroup_root)
+        .output()
+        .expect("run Cat-slice residue guard");
+    assert!(!residue.status.success(), "a Cat slice must block release");
+    let stderr = String::from_utf8_lossy(&residue.stderr);
     assert!(
-        stderr.contains("active Cat processes: 1818070")
-            && stderr.contains("state=cordoned cats=0"),
-        "guard must name the active PID and recovery contract: {stderr}"
+        stderr.contains("atomic Cat execution slices:")
+            && stderr.contains("state=cordoned cats=0 orphans=0"),
+        "guard must name the retained slice and recovery contract: {stderr}"
     );
+
+    std::fs::remove_dir(&canonical).expect("remove canonical Cat slice");
+    let malformed = cgroup_root.join("cats-cat-not-a-canonical-digest.slice");
+    std::fs::create_dir(&malformed).expect("create malformed Cat slice");
+    let malformed_result = std::process::Command::new(&guard)
+        .arg(&cgroup_root)
+        .arg(&bin_root)
+        .env("PATH", &tool_path)
+        .env("CATS_CGROUP_MOUNT", &cgroup_root)
+        .output()
+        .expect("run malformed Cat-slice guard");
+    assert!(!malformed_result.status.success());
+    assert!(String::from_utf8_lossy(&malformed_result.stderr)
+        .contains("malformed reserved Cat-slice entry"));
+    std::fs::remove_dir(&malformed).expect("remove malformed Cat slice");
+
+    // Calibrate the negative: a probe which exits successfully but observes
+    // nothing must not turn an unknown hierarchy into an idle answer.
+    let fake_find = fake_tools.join("find");
+    std::fs::write(&fake_find, "#!/bin/sh\nexit 0\n").expect("write empty find probe");
+    std::fs::set_permissions(&fake_find, std::fs::Permissions::from_mode(0o755))
+        .expect("make fake find executable");
+    let uncalibrated = std::process::Command::new(&guard)
+        .arg(&cgroup_root)
+        .arg(&bin_root)
+        .env("PATH", &tool_path)
+        .env("CATS_CGROUP_MOUNT", &cgroup_root)
+        .output()
+        .expect("run uncalibrated empty probe");
+    assert!(!uncalibrated.status.success());
+    assert!(String::from_utf8_lossy(&uncalibrated.stderr)
+        .contains("enumeration calibration did not observe cgroup.controllers"));
+
+    std::fs::remove_file(cgroup_root.join("cgroup.controllers")).expect("remove cgroup-v2 marker");
+    let wrong_hierarchy = std::process::Command::new(&guard)
+        .arg(&cgroup_root)
+        .arg(&bin_root)
+        .env("PATH", &tool_path)
+        .env("CATS_CGROUP_MOUNT", &cgroup_root)
+        .output()
+        .expect("run non-cgroup-v2 guard");
+    assert!(!wrong_hierarchy.status.success());
+    assert!(String::from_utf8_lossy(&wrong_hierarchy.stderr)
+        .contains("not a readable cgroup-v2 hierarchy"));
 }
 
 #[cfg(unix)]
 #[test]
-fn worker_release_refuses_live_runtime_binaries_outside_metering_cgroups() {
+fn worker_release_refuses_live_runtime_binaries_outside_cat_slices() {
     use std::os::unix::fs::PermissionsExt as _;
 
     struct RuntimeChildren(Vec<std::process::Child>);
@@ -2051,13 +2362,17 @@ fn worker_release_refuses_live_runtime_binaries_outside_metering_cgroups() {
     }
 
     let temp = tempfile::tempdir().expect("temporary runtime fixture");
-    let metering_root = temp.path().join("metering");
-    std::fs::create_dir_all(&metering_root).expect("create empty metering fixture");
+    let cgroup_root = temp.path().join("cgroup");
+    std::fs::create_dir(&cgroup_root).expect("create empty cgroup fixture");
+    let cgroup_root = std::fs::canonicalize(cgroup_root).expect("canonical cgroup fixture");
+    std::fs::write(cgroup_root.join("cgroup.controllers"), "cpu memory\n")
+        .expect("write cgroup-v2 positive control");
     let bin_root = temp.path().join("bin");
     std::fs::create_dir_all(&bin_root).expect("create bin fixture");
+    let command_path = install_fake_cgroup2_findmnt(&bin_root);
 
-    // cats-blockd and the short-lived launcher may be outside the metering
-    // cgroup, while the VMM's name is longer than Linux comm. The guard must
+    // cats-blockd and the short-lived launcher may survive outside a Cat
+    // slice, while the VMM's name is longer than Linux comm. The guard must
     // catch all of them by their full argv[0] path (issue #98).
     let blockd_bin = bin_root.join("cats-blockd");
     let launcher_bin = bin_root.join("cats-vmm-launcher");
@@ -2096,14 +2411,16 @@ fn worker_release_refuses_live_runtime_binaries_outside_metering_cgroups() {
 
     let guard = workspace_root().join("deploy/aws/metal/require-idle-worker.sh");
     let refused = std::process::Command::new(&guard)
-        .arg(&metering_root)
+        .arg(&cgroup_root)
         .arg(&bin_root)
+        .env("PATH", &command_path)
+        .env("CATS_CGROUP_MOUNT", &cgroup_root)
         .output()
         .expect("run guard against live runtime binaries");
 
     assert!(
         !refused.status.success(),
-        "a live runtime binary must block the release even with empty metering cgroups"
+        "a live runtime binary must block the release even with no Cat slices"
     );
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(
@@ -2114,9 +2431,9 @@ fn worker_release_refuses_live_runtime_binaries_outside_metering_cgroups() {
         "guard must name all runtime pids and the journal hazard: {stderr}"
     );
 
-    for (installer_path, service, expected_guard_count) in [
-        ("deploy/aws/metal/install-worker.sh", "cats-worker", 1),
-        ("deploy/metal/install.sh", "cats-noded", 2),
+    for (installer_path, expected_guard_count) in [
+        ("deploy/aws/metal/install-worker.sh", 1),
+        ("deploy/metal/install.sh", 2),
     ] {
         let installer = read_workspace_file(installer_path);
         let first_guard = installer
@@ -2125,15 +2442,13 @@ fn worker_release_refuses_live_runtime_binaries_outside_metering_cgroups() {
         let lock = installer
             .find("cats_acquire_worker_deployment_lock")
             .unwrap_or_else(|| panic!("{installer_path} lost its deployment lock"));
-        let locked_metering = installer[lock..]
-            .find(&format!(
-                "metering_root=$(cats_worker_metering_root {service})"
-            ))
+        let locked_cgroup = installer[lock..]
+            .find("cgroup_v2_root=$(cats_worker_cgroup_v2_root)")
             .map(|offset| lock + offset)
-            .unwrap_or_else(|| panic!("{installer_path} lost its locked metering recomputation"));
-        let locked_guard = installer[locked_metering..]
+            .unwrap_or_else(|| panic!("{installer_path} lost its locked cgroup-v2 recomputation"));
+        let locked_guard = installer[locked_cgroup..]
             .find("require-idle-worker.sh\"")
-            .map(|offset| locked_metering + offset)
+            .map(|offset| locked_cgroup + offset)
             .unwrap_or_else(|| panic!("{installer_path} lost its locked physical idle guard"));
         let stop = installer[locked_guard..]
             .find("cats_gate_node_service")
@@ -2156,8 +2471,8 @@ fn worker_release_refuses_live_runtime_binaries_outside_metering_cgroups() {
             );
         }
         assert!(
-            lock < locked_metering
-                && locked_metering < locked_guard
+            lock < locked_cgroup
+                && locked_cgroup < locked_guard
                 && locked_guard < stop,
             "{installer_path} must re-prove physical idle under the lock immediately before stopping"
         );
@@ -2172,9 +2487,6 @@ fn worker_release_refuses_live_runtime_binaries_outside_metering_cgroups() {
     .expect("write fake systemctl");
     std::fs::set_permissions(&fake_systemctl, std::fs::Permissions::from_mode(0o755))
         .expect("make fake systemctl executable");
-    let mut command_path = bin_root.as_os_str().to_os_string();
-    command_path.push(":");
-    command_path.push(std::env::var_os("PATH").unwrap_or_default());
     let guarded_stop = std::process::Command::new("/bin/sh")
         .args([
             "-c",
@@ -2182,9 +2494,10 @@ fn worker_release_refuses_live_runtime_binaries_outside_metering_cgroups() {
             "sh",
         ])
         .arg(&guard)
-        .arg(&metering_root)
+        .arg(&cgroup_root)
         .arg(&bin_root)
-        .env("PATH", command_path)
+        .env("PATH", &command_path)
+        .env("CATS_CGROUP_MOUNT", &cgroup_root)
         .env("CATS_STOP_MARKER", &stop_marker)
         .output()
         .expect("run the manual-install pre-stop sequence");
@@ -2197,8 +2510,10 @@ fn worker_release_refuses_live_runtime_binaries_outside_metering_cgroups() {
     drop(children);
 
     let idle = std::process::Command::new(&guard)
-        .arg(&metering_root)
+        .arg(&cgroup_root)
         .arg(&bin_root)
+        .env("PATH", &command_path)
+        .env("CATS_CGROUP_MOUNT", &cgroup_root)
         .output()
         .expect("run guard after the runtime binaries exited");
     assert!(
@@ -2256,16 +2571,12 @@ fn deployment_rechecks_physical_idle_after_waiting_for_the_host_lock() {
     std::os::unix::fs::symlink("/bin/sleep", &vmm).unwrap();
 
     let cgroup_root = fixture.path().join("cgroup");
-    std::fs::create_dir_all(cgroup_root.join("system.slice/cats-worker.service/metering")).unwrap();
+    std::fs::create_dir(&cgroup_root).unwrap();
+    let cgroup_root = std::fs::canonicalize(cgroup_root).unwrap();
+    std::fs::write(cgroup_root.join("cgroup.controllers"), "cpu memory\n").unwrap();
     let fake_bin = fixture.path().join("fake-bin");
     std::fs::create_dir(&fake_bin).unwrap();
-    let findmnt = fake_bin.join("findmnt");
-    std::fs::write(
-        &findmnt,
-        "#!/bin/sh\nprintf '%s\\n' \"$CATS_CGROUP_ROOT\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&findmnt, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let command_path = install_fake_cgroup2_findmnt(&fake_bin);
     let systemctl = fake_bin.join("systemctl");
     std::fs::write(
         &systemctl,
@@ -2273,10 +2584,6 @@ fn deployment_rechecks_physical_idle_after_waiting_for_the_host_lock() {
     )
     .unwrap();
     std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let mut command_path = fake_bin.as_os_str().to_os_string();
-    command_path.push(":");
-    command_path.push(std::env::var_os("PATH").unwrap_or_default());
-
     let a_locked = fixture.path().join("a-locked");
     let b_early = fixture.path().join("b-early-idle");
     let runtime_ready = fixture.path().join("a-runtime-ready");
@@ -2339,12 +2646,12 @@ while [[ ! -e "$9" ]]; do sleep 0.01; done
                 r#"set -euo pipefail
 trap ': > "$5"' EXIT
 . "$1"
-metering_root=$(cats_worker_metering_root cats-worker)
-"$2" "$metering_root" "$3"
+cgroup_v2_root=$(cats_worker_cgroup_v2_root)
+"$2" "$cgroup_v2_root" "$3"
 : > "$4"
 cats_acquire_worker_deployment_lock
-metering_root=$(cats_worker_metering_root cats-worker)
-"$2" "$metering_root" "$3"
+cgroup_v2_root=$(cats_worker_cgroup_v2_root)
+"$2" "$cgroup_v2_root" "$3"
 systemctl stop cats-worker
 "#,
                 "bash",
@@ -2355,7 +2662,7 @@ systemctl stop cats-worker
             .arg(&b_early)
             .arg(&b_done)
             .env("PATH", &command_path)
-            .env("CATS_CGROUP_ROOT", &cgroup_root)
+            .env("CATS_CGROUP_MOUNT", &cgroup_root)
             .env("CATS_STOP_MARKER", &stop_marker)
             .stderr(b_stderr_file)
             .spawn()

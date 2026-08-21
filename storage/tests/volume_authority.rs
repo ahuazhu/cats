@@ -1,5 +1,14 @@
 use cats_api::object_write_gateway::ObjectWriteCredentialReference;
+use cats_api::runtime_lifecycle::{
+    DiskRole, PlacementIdentity, RuntimeVolumeConfig, RuntimeVolumeGuestBinding,
+};
+use cats_api::runtime_lifecycle_volume::{
+    LifecycleCommandStartVolumeGrantReceipt, LifecycleRenewLeaseRequest, LifecycleRenewLeaseResult,
+    LifecycleServingAcquire, LifecycleStartVolumeGrantAuthority, LifecycleVolumeCommandScope,
+};
+use cats_api::runtime_reconciliation::WireU64;
 use cats_storage::authority::*;
+use cats_storage::lifecycle_volume::command_start_volume_grant_receipt_digest_from_closed_receipt;
 
 const MAX_INTEGER: u64 = i64::MAX as u64;
 
@@ -78,7 +87,6 @@ fn acquire_request(transition: u128) -> NormalAcquireRequest {
         transition_id: random_id(transition),
         attachment_id: id("attachment-old"),
         expected_unowned_epoch: fence_epoch(7),
-        desired_revision: revision(11),
         placement_epoch: epoch(3),
         lease_duration_ms: 5_000,
     }
@@ -91,39 +99,67 @@ fn acquired_volume() -> VolumeRecord {
 }
 
 fn authorized_serving_attachment() -> (AuthorizedServingAttachment, VolumeRecord) {
-    let record = acquired_volume();
-    let LastVolumeTransition::NormalAcquire { request, result } =
-        record.last_transition.clone().unwrap()
+    let transition_source = VolumeTransitionSource::Lifecycle {
+        operation_id: id("operation-start-1"),
+        request_fingerprint: Sha256Digest::from_bytes([17; 32]),
+    };
+    let request = acquire_request(1);
+    let (record, _) = normal_acquire_with_source(
+        &unowned_volume(),
+        &transition_source,
+        &request,
+        time(10_000),
+    )
+    .unwrap();
+    let LastVolumeTransition::NormalAcquire {
+        source,
+        request,
+        result,
+    } = record.last_transition.clone().unwrap()
     else {
         unreachable!("fixture is a normal acquire")
     };
-    (
-        AuthorizedServingAttachment {
-            identity: AttachmentLineageIdentity {
-                volume_id: record.volume_id.clone(),
-                attachment_id: result.attachment_id.clone(),
-                attachment_epoch: result.resulting_epoch,
-                acquire_origin: AcquireOrigin::Normal {
-                    transition_id: result.transition_id.clone(),
-                },
+    let grant = LifecycleCommandStartVolumeGrantReceipt {
+        scope: LifecycleVolumeCommandScope {
+            operation_id: id("operation-start-1"),
+            request_fingerprint: Sha256Digest::from_bytes([17; 32]),
+            cat_id: id("cat-1"),
+            node_id: id("node-1"),
+            placement_identity: PlacementIdentity {
                 node_id: id("node-1"),
                 placement_epoch: request.placement_epoch,
             },
-            object_write_credential: Some(object_write_credential(1)),
+        },
+        grant_sequence: WireU64::new(0).unwrap(),
+        volume: RuntimeVolumeConfig {
+            volume_id: record.volume_id.clone(),
+            disk_id: id("disk-root"),
+            disk_role: DiskRole::Root,
             size_bytes: record.size_bytes,
             durability: record.durability,
-            head: record.head.clone(),
-            lease_expires_at: record.lease_expires_at.unwrap(),
-            acquire: AuthorizedServingAcquire::Normal { request, result },
+            guest_device_serial: id("root-boot"),
+            guest_device_slot: 0,
+            guest_binding: RuntimeVolumeGuestBinding::RootBoot,
         },
-        record,
+        authority: LifecycleStartVolumeGrantAuthority::NormalAcquire { request, result },
+    };
+    let digest = command_start_volume_grant_receipt_digest_from_closed_receipt(&grant).unwrap();
+    let attachment = authorized_serving_attachment_from_start_volume_grant(
+        &grant,
+        &digest,
+        Some(object_write_credential(1)),
     )
+    .unwrap();
+    assert_eq!(attachment.transition_source, source);
+    (attachment, record)
 }
 
 #[cfg(feature = "proposed-node-residue-reclamation")]
 fn residue_lineage(local: u64, remote: u64) -> ResidueDataDirectoryLineage {
     let acquired = acquired_volume();
-    let Some(LastVolumeTransition::NormalAcquire { request, result }) = acquired.last_transition
+    let Some(LastVolumeTransition::NormalAcquire {
+        request, result, ..
+    }) = acquired.last_transition
     else {
         unreachable!("fixture is a normal acquire")
     };
@@ -207,6 +243,144 @@ fn authorized_serving_input_binds_identity_receipt_and_exact_authority_record() 
     );
 }
 
+#[test]
+fn authorized_serving_renewal_retains_original_acquire_and_binds_current_grant() {
+    let (initial, initial_record) = authorized_serving_attachment();
+    let initial_grant = initial.current_lease.grant.as_ref();
+    let AuthorizedServingAcquire::Normal {
+        request: acquire_request,
+        result: acquire_result,
+    } = &initial.acquire
+    else {
+        unreachable!()
+    };
+    // The latest lease was renewed while the Root was still blank. Root
+    // provisioning may then advance that exact owner/epoch before blockd is
+    // launched, so the serving carrier is allowed to project the later head
+    // without rewriting the immutable renewal result.
+    let renewed_head = head(4);
+    let renew_result = LifecycleRenewLeaseResult {
+        volume_id: initial.identity.volume_id.clone(),
+        attachment_id: initial.identity.attachment_id.clone(),
+        epoch: initial.identity.attachment_epoch,
+        resulting_head: renewed_head.clone(),
+        lease_expires_at: time(20_000),
+    };
+    let renew_grant = LifecycleCommandStartVolumeGrantReceipt {
+        scope: initial_grant.scope.clone(),
+        grant_sequence: WireU64::new(1).unwrap(),
+        volume: initial_grant.volume.clone(),
+        authority: LifecycleStartVolumeGrantAuthority::RenewSameNode {
+            expected_source: initial.transition_source.clone(),
+            serving_acquire: Box::new(LifecycleServingAcquire::Normal {
+                request: acquire_request.clone(),
+                result: acquire_result.clone(),
+            }),
+            request: LifecycleRenewLeaseRequest {
+                volume_id: initial.identity.volume_id.clone(),
+                attachment_id: initial.identity.attachment_id.clone(),
+                expected_epoch: initial.identity.attachment_epoch,
+                lease_duration_ms: WireU64::new(5_000).unwrap(),
+            },
+            result: renew_result.clone(),
+        },
+    };
+    let renew_digest =
+        command_start_volume_grant_receipt_digest_from_closed_receipt(&renew_grant).unwrap();
+    let mut renewed = authorized_serving_attachment_from_start_volume_grant(
+        &renew_grant,
+        &renew_digest,
+        initial.object_write_credential.clone(),
+    )
+    .unwrap();
+    renewed.head = head(5);
+
+    assert_eq!(renewed.acquire, initial.acquire);
+    assert_eq!(renewed.initial_head(), &head(4));
+    assert_eq!(renewed.head, head(5));
+    assert_eq!(renewed.lease_expires_at, time(20_000));
+    assert_eq!(renewed.lease_duration_ms(), 5_000);
+    let AuthorizedServingAcquire::Normal {
+        result: retained_original,
+        ..
+    } = &renewed.acquire
+    else {
+        unreachable!()
+    };
+    assert_eq!(retained_original.lease_expires_at, time(15_000));
+
+    let mut renewed_record = initial_record.clone();
+    renewed_record.head = renewed.head.clone();
+    renewed_record.lease_expires_at = Some(renewed.lease_expires_at);
+    validate_authorized_serving_attachment(&renewed).unwrap();
+    validate_authorized_serving_record(&renewed_record, &renewed, Some(renewed.lease_expires_at))
+        .unwrap();
+
+    let mut changed_original = renewed.clone();
+    let AuthorizedServingAcquire::Normal { result, .. } = &mut changed_original.acquire else {
+        unreachable!()
+    };
+    result.lease_expires_at = time(20_000);
+    assert_eq!(
+        validate_authorized_serving_attachment(&changed_original),
+        Err(AuthorityError::BackendUnknown)
+    );
+
+    let mut changed_digest = renewed.clone();
+    changed_digest.current_lease.grant_receipt_digest = Sha256Digest::from_bytes([99; 32]);
+    assert_eq!(
+        validate_authorized_serving_attachment(&changed_digest),
+        Err(AuthorityError::BackendUnknown)
+    );
+
+    let mut changed_sequence = renewed.clone();
+    changed_sequence.current_lease.grant.grant_sequence = WireU64::new(0).unwrap();
+    assert_eq!(
+        validate_authorized_serving_attachment(&changed_sequence),
+        Err(AuthorityError::BackendUnknown)
+    );
+
+    let mut changed_result = renewed.clone();
+    let LifecycleStartVolumeGrantAuthority::RenewSameNode { result, .. } =
+        &mut changed_result.current_lease.grant.authority
+    else {
+        unreachable!()
+    };
+    result.resulting_head = head(6);
+    assert_eq!(
+        validate_authorized_serving_attachment(&changed_result),
+        Err(AuthorityError::BackendUnknown)
+    );
+
+    let mut divergent_same_generation = renewed.clone();
+    divergent_same_generation.head = renewed_head.clone();
+    divergent_same_generation.head.root_hash = Some(Sha256Digest::from_bytes([0x5a; 32]));
+    assert_eq!(
+        validate_authorized_serving_attachment(&divergent_same_generation),
+        Err(AuthorityError::BackendUnknown)
+    );
+
+    let mut rolled_back = renewed.clone();
+    rolled_back.head = head(3);
+    assert_eq!(
+        validate_authorized_serving_attachment(&rolled_back),
+        Err(AuthorityError::BackendUnknown)
+    );
+
+    let mut stale_record = renewed_record.clone();
+    stale_record.head = renewed_head;
+    assert_eq!(
+        validate_authorized_serving_record(&stale_record, &renewed, None),
+        Err(AuthorityError::BackendUnknown)
+    );
+
+    renewed_record.lease_expires_at = Some(time(19_999));
+    assert_eq!(
+        validate_authorized_serving_record(&renewed_record, &renewed, None),
+        Err(AuthorityError::BackendUnknown)
+    );
+}
+
 fn host_fence_event(state: HostFenceEventState) -> HostFenceEvent {
     HostFenceEvent {
         event_id: id("fence-event-1"),
@@ -222,18 +396,42 @@ fn host_fence_event(state: HostFenceEventState) -> HostFenceEvent {
     }
 }
 
+fn host_fence_basis(event: &HostFenceEvent) -> DisposableDeleteIsolationBasis {
+    DisposableDeleteIsolationBasis::HostFenceEvent {
+        event_id: event.event_id.clone(),
+        interrupted_operation_id: id("operation-interrupted-1"),
+        host_lost_result_digest: Sha256Digest::from_bytes([14; 32]),
+    }
+}
+
+fn lifecycle_strong_stop_basis() -> DisposableDeleteIsolationBasis {
+    DisposableDeleteIsolationBasis::LifecycleStrongStop {
+        node_id: id("node-old"),
+        agent_session_epoch: epoch(8),
+        strong_stop_operation_id: id("operation-delete-1"),
+        strong_stop_receipt_digest: Sha256Digest::from_bytes([15; 32]),
+        execution_absence_proof_digest: Sha256Digest::from_bytes([16; 32]),
+        inventory_attestation_digest: Sha256Digest::from_bytes([17; 32]),
+    }
+}
+
 fn takeover_authorization(volume: &VolumeRecord) -> AuthorizationRecord {
     AuthorizationRecord {
         authorization: VolumeAuthorization::Takeover(VolumeTakeoverAuthorization {
             authorization_id: id("takeover-auth-1"),
+            operation_id: id("operation-takeover-1"),
+            request_fingerprint: Sha256Digest::from_bytes([12; 32]),
             authorized_node_id: id("node-new"),
             host_fence_event_id: id("fence-event-1"),
+            interrupted_operation_id: id("operation-interrupted-1"),
+            host_lost_result_digest: Sha256Digest::from_bytes([14; 32]),
+            disk_id: id("disk-1"),
             volume_id: volume.volume_id.clone(),
+            cat_id: id("cat-1"),
             expected_attachment_id: volume.lease_owner.clone().unwrap(),
             expected_epoch: volume.lease_epoch,
             expected_head: volume.head.clone(),
             new_attachment_id: id("attachment-new"),
-            desired_revision: revision(12),
             new_placement_epoch: epoch(4),
             lease_duration_ms: 6_000,
             not_after: time(30_000),
@@ -275,67 +473,34 @@ fn authorized_takeover_attachment() -> (AuthorizedServingAttachment, VolumeRecor
                 node_id: authorization.authorized_node_id.clone(),
                 placement_epoch: authorization.new_placement_epoch,
             },
+            transition_source: VolumeTransitionSource::Lifecycle {
+                operation_id: authorization.operation_id.clone(),
+                request_fingerprint: authorization.request_fingerprint.clone(),
+            },
             object_write_credential: Some(object_write_credential(2)),
             size_bytes: record.size_bytes,
             durability: record.durability,
             head: record.head.clone(),
             lease_expires_at: result.lease_expires_at,
             acquire: AuthorizedServingAcquire::Takeover {
-                authorization,
+                authorization: Box::new(authorization),
                 receipt,
             },
+            current_lease: authorized_serving_attachment().0.current_lease,
         },
         record,
     )
 }
 
 #[test]
-fn authorized_takeover_binds_consumed_thick_proof_and_current_marker() {
+fn authorized_takeover_requires_a_real_command_start_grant() {
     let (attachment, record) = authorized_takeover_attachment();
-    validate_authorized_serving_attachment(&attachment).unwrap();
-    validate_authorized_serving_record(&record, &attachment, Some(time(26_000))).unwrap();
-    assert_eq!(attachment.lease_duration_ms(), 6_000);
-    assert_eq!(attachment.initial_head(), &head(4));
     assert_eq!(
-        attachment.checkpoint_acquire_request(),
-        VolumeAcquireRequest::Takeover {
-            authorization_id: id("takeover-auth-1")
-        }
-    );
-
-    let mut advanced_attachment = attachment.clone();
-    advanced_attachment.head = head(5);
-    let mut advanced_record = record.clone();
-    advanced_record.head = head(5);
-    validate_authorized_serving_attachment(&advanced_attachment).unwrap();
-    validate_authorized_serving_record(&advanced_record, &advanced_attachment, Some(time(26_000)))
-        .unwrap();
-
-    let mut wrong_consumed_at = attachment.clone();
-    let AuthorizedServingAcquire::Takeover { receipt, .. } = &mut wrong_consumed_at.acquire else {
-        unreachable!()
-    };
-    receipt.consumed_at = time(20_001);
-    assert_eq!(
-        validate_authorized_serving_attachment(&wrong_consumed_at),
+        validate_authorized_serving_attachment(&attachment),
         Err(AuthorityError::BackendUnknown)
     );
-
-    let mut wrong_marker = record.clone();
-    wrong_marker.last_transition = Some(LastVolumeTransition::Takeover {
-        authorization_id: id("normal-looking-same-text"),
-    });
     assert_eq!(
-        validate_authorized_serving_record(&wrong_marker, &attachment, None),
-        Err(AuthorityError::BackendUnknown)
-    );
-
-    let mut crossed_variant = attachment;
-    crossed_variant.identity.acquire_origin = AcquireOrigin::Normal {
-        transition_id: random_id(1),
-    };
-    assert_eq!(
-        validate_authorized_serving_attachment(&crossed_variant),
+        validate_authorized_serving_record(&record, &attachment, None),
         Err(AuthorityError::BackendUnknown)
     );
 }
@@ -345,23 +510,26 @@ fn disposable_authorization(
     basis: DisposableDeleteIsolationBasis,
 ) -> AuthorizationRecord {
     let authorized_node_id = match &basis {
-        DisposableDeleteIsolationBasis::RuntimeStopped { node_id, .. } => node_id.clone(),
+        DisposableDeleteIsolationBasis::LifecycleStrongStop { node_id, .. } => node_id.clone(),
         DisposableDeleteIsolationBasis::HostFenceEvent { .. } => id("node-old"),
     };
     AuthorizationRecord {
         authorization: VolumeAuthorization::DisposableRootDelete(
             DisposableRootDeleteAuthorization {
                 authorization_id: id("delete-auth-1"),
+                operation_id: id("operation-delete-1"),
+                request_fingerprint: Sha256Digest::from_bytes([13; 32]),
                 authorized_node_id,
                 delete_id: id("delete-1"),
                 disk_id: id("disk-1"),
                 volume_id: volume.volume_id.clone(),
                 cat_id: id("cat-1"),
-                desired_revision: revision(13),
                 placement_epoch: epoch(3),
                 expected_attachment_id: volume.lease_owner.clone().unwrap(),
                 expected_epoch: volume.lease_epoch,
                 expected_head: volume.head.clone(),
+                disposition: DisposableRootDisposition::DiscardWithCat,
+                persistent_dispositions_digest: Sha256Digest::from_bytes([18; 32]),
                 isolation_basis: basis,
                 not_after: time(30_000),
             },
@@ -524,12 +692,7 @@ fn acquired_and_takeover_rows_fail_closed_on_zero_expiry_or_epoch() {
 fn disposable_deleting_epoch_zero_fails_before_completion() {
     let owned = acquired_volume();
     let event = host_fence_event(HostFenceEventState::Active);
-    let authorization = disposable_authorization(
-        &owned,
-        DisposableDeleteIsolationBasis::HostFenceEvent {
-            event_id: event.event_id.clone(),
-        },
-    );
+    let authorization = disposable_authorization(&owned, host_fence_basis(&event));
     let (mut deleting, consumed, _) = consume_disposable_root_delete(
         &owned,
         Some(&event),
@@ -584,10 +747,6 @@ fn normal_acquire_same_id_with_any_payload_change_is_stale() {
         },
         NormalAcquireRequest {
             expected_unowned_epoch: fence_epoch(6),
-            ..request.clone()
-        },
-        NormalAcquireRequest {
-            desired_revision: revision(12),
             ..request.clone()
         },
         NormalAcquireRequest {
@@ -725,7 +884,9 @@ fn takeover_consumes_one_server_side_authorization() {
     assert_eq!(result.lease_expires_at, time(26_000));
     assert!(matches!(
         taken_over.last_transition,
-        Some(LastVolumeTransition::Takeover { authorization_id })
+        Some(LastVolumeTransition::Takeover {
+            authorization_id, ..
+        })
             if authorization_id == id("takeover-auth-1")
     ));
     assert!(matches!(consumed.state, AuthorizationState::Consumed(_)));
@@ -779,18 +940,17 @@ fn consumed_takeover_replays_exact_authorization() {
 fn unconsumed_takeover_rejects_expiry_and_wrong_binding() {
     let owned = acquired_volume();
     let authorization = takeover_authorization(&owned);
-    for (event, now) in [(host_fence_event(HostFenceEventState::Active), 30_001)] {
-        assert_eq!(
-            consume_takeover(
-                &owned,
-                &event,
-                &authorization,
-                &id("takeover-auth-1"),
-                time(now),
-            ),
-            Err(AuthorityError::InvalidAuthorization)
-        );
-    }
+    let event = host_fence_event(HostFenceEventState::Active);
+    assert_eq!(
+        consume_takeover(
+            &owned,
+            &event,
+            &authorization,
+            &id("takeover-auth-1"),
+            time(30_001),
+        ),
+        Err(AuthorityError::InvalidAuthorization)
+    );
 
     let mut wrong_event = host_fence_event(HostFenceEventState::Active);
     wrong_event.event_id = id("fence-event-other");
@@ -894,12 +1054,7 @@ fn authorization_receipt_payload_mismatch_is_backend_unknown() {
 fn disposable_delete_moves_owned_directly_to_deleting() {
     let owned = acquired_volume();
     let event = host_fence_event(HostFenceEventState::Active);
-    let authorization = disposable_authorization(
-        &owned,
-        DisposableDeleteIsolationBasis::HostFenceEvent {
-            event_id: event.event_id.clone(),
-        },
-    );
+    let authorization = disposable_authorization(&owned, host_fence_basis(&event));
     let (deleting, consumed, receipt) = consume_disposable_root_delete(
         &owned,
         Some(&event),
@@ -931,17 +1086,9 @@ fn disposable_delete_moves_owned_directly_to_deleting() {
 }
 
 #[test]
-fn disposable_runtime_stopped_and_host_fence_bases_cannot_be_confused() {
+fn disposable_strong_stop_and_host_fence_bases_cannot_be_confused() {
     let owned = acquired_volume();
-    let stopped = disposable_authorization(
-        &owned,
-        DisposableDeleteIsolationBasis::RuntimeStopped {
-            node_id: id("node-old"),
-            agent_session_epoch: epoch(8),
-            runtime_incarnation: random_id(5),
-            observation_id: random_id(6),
-        },
-    );
+    let stopped = disposable_authorization(&owned, lifecycle_strong_stop_basis());
     assert!(consume_disposable_root_delete(
         &owned,
         None,
@@ -960,6 +1107,31 @@ fn disposable_runtime_stopped_and_host_fence_bases_cannot_be_confused() {
         ),
         Err(AuthorityError::InvalidAuthorization)
     );
+
+    let mut mismatched = stopped.clone();
+    let VolumeAuthorization::DisposableRootDelete(authorization) = &mut mismatched.authorization
+    else {
+        unreachable!()
+    };
+    let DisposableDeleteIsolationBasis::LifecycleStrongStop {
+        strong_stop_operation_id,
+        ..
+    } = &mut authorization.isolation_basis
+    else {
+        unreachable!()
+    };
+    *strong_stop_operation_id = id("operation-other");
+    assert_eq!(
+        consume_disposable_root_delete(
+            &owned,
+            None,
+            &mismatched,
+            &id("delete-auth-1"),
+            time(20_000),
+        ),
+        Err(AuthorityError::BackendUnknown)
+    );
+    assert!(matches!(stopped.state, AuthorizationState::Unconsumed));
 }
 
 #[test]
@@ -1069,12 +1241,7 @@ fn table_outside_transitions_fail_closed() {
         ),
         Err(AuthorityError::InvalidAuthorization)
     );
-    let disposable = disposable_authorization(
-        &owned,
-        DisposableDeleteIsolationBasis::HostFenceEvent {
-            event_id: event.event_id.clone(),
-        },
-    );
+    let disposable = disposable_authorization(&owned, host_fence_basis(&event));
     assert_eq!(
         consume_disposable_root_delete(
             &unowned,
@@ -1121,12 +1288,7 @@ fn delete_completion_receipts_are_closed_and_replayable() {
 fn disposable_completion_reconnects_to_the_unique_consumed_receipt() {
     let owned = acquired_volume();
     let event = host_fence_event(HostFenceEventState::Active);
-    let authorization = disposable_authorization(
-        &owned,
-        DisposableDeleteIsolationBasis::HostFenceEvent {
-            event_id: event.event_id.clone(),
-        },
-    );
+    let authorization = disposable_authorization(&owned, host_fence_basis(&event));
     let (deleting, consumed, direct) = consume_disposable_root_delete(
         &owned,
         Some(&event),
@@ -1168,7 +1330,7 @@ fn residue_reclaim_accepts_only_exact_direct_ordinary_release() {
     let lineage = residue_lineage(4, 4);
     let expected = RuntimeResidueAuthorityOutcome::Reclaimable {
         proof: Box::new(ResidueReclaimProof::OrdinaryRelease {
-            current_volume: released.clone(),
+            current_volume: Box::new(released.clone()),
         }),
     };
     assert_eq!(
@@ -1244,12 +1406,7 @@ fn residue_reclaim_accepts_exact_normal_delete_completion_only_at_r_equals_l() {
 fn residue_reclaim_accepts_exact_disposable_root_consumed_completion() {
     let owned = acquired_volume();
     let event = host_fence_event(HostFenceEventState::Active);
-    let authorization = disposable_authorization(
-        &owned,
-        DisposableDeleteIsolationBasis::HostFenceEvent {
-            event_id: event.event_id.clone(),
-        },
-    );
+    let authorization = disposable_authorization(&owned, host_fence_basis(&event));
     let (deleting, consumed, _) = consume_disposable_root_delete(
         &owned,
         Some(&event),
@@ -1364,12 +1521,7 @@ fn every_epoch_changing_transition_fails_at_maximum_epoch() {
         ),
         Err(AuthorityError::EpochExhausted)
     );
-    let disposable = disposable_authorization(
-        &owned,
-        DisposableDeleteIsolationBasis::HostFenceEvent {
-            event_id: event.event_id.clone(),
-        },
-    );
+    let disposable = disposable_authorization(&owned, host_fence_basis(&event));
     assert_eq!(
         consume_disposable_root_delete(
             &owned,
@@ -1472,7 +1624,9 @@ fn volume_projection_is_derived_from_the_validated_authority_record() {
     assert_eq!(projection.lease_owner.as_deref(), Some("attachment-old"));
     assert_eq!(projection.lease_epoch, owned.lease_epoch);
     assert_eq!(projection.last_transition_kind, Some("normal_acquire"));
-    assert_eq!(projection.transition_desired_revision, Some(revision(11)));
+    assert_eq!(projection.transition_source_kind, Some("independent"));
+    assert_eq!(projection.transition_operation_id, None);
+    assert_eq!(projection.transition_request_fingerprint, None);
     assert_eq!(projection.transition_placement_epoch, Some(epoch(3)));
     assert_eq!(projection.transition_lease_duration_ms, Some(5_000));
 }
@@ -1616,12 +1770,7 @@ fn evidence_bundle_requires_the_exact_direct_successor_authorization() {
 fn evidence_bundle_closes_disposable_delete_completion_and_rejects_split_state() {
     let owned = acquired_volume();
     let event = host_fence_event(HostFenceEventState::Active);
-    let authorization = disposable_authorization(
-        &owned,
-        DisposableDeleteIsolationBasis::HostFenceEvent {
-            event_id: event.event_id.clone(),
-        },
-    );
+    let authorization = disposable_authorization(&owned, host_fence_basis(&event));
     let (deleting, consumed, _) = consume_disposable_root_delete(
         &owned,
         Some(&event),

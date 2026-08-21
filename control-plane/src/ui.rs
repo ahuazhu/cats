@@ -991,7 +991,6 @@ mod tests {
     use axum::extract::OriginalUri;
     use cats_api::runtime_reconciliation::{
         RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY, RUNTIME_INTERNAL_ROUTE_NOT_FOUND_ROBOTS,
-        RUNTIME_VOLUME_TRANSITION_PATH,
     };
 
     use super::{
@@ -1001,8 +1000,10 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_unmatched_route_fallback_has_the_shared_exact_shape() {
-        let response =
-            not_found(OriginalUri(RUNTIME_VOLUME_TRANSITION_PATH.parse().unwrap())).await;
+        let response = not_found(OriginalUri(
+            "/v1/internal/runtime/volume-transitions".parse().unwrap(),
+        ))
+        .await;
         assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
         assert_eq!(
             response
@@ -1032,6 +1033,60 @@ mod tests {
             .as_ref(),
             RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY
         );
+    }
+
+    #[test]
+    fn shipped_product_docs_use_only_the_six_lifecycle_actions() {
+        let api = DOCS
+            .iter()
+            .find(|page| page.slug == "api-reference")
+            .expect("API reference is shipped");
+        let cli = DOCS
+            .iter()
+            .find(|page| page.slug == "cli-reference")
+            .expect("CLI reference is shipped");
+        let lifecycle = DOCS
+            .iter()
+            .find(|page| page.slug == "cats-lifecycle")
+            .expect("lifecycle reference is shipped");
+
+        for body in [api.body_en, api.body_zh] {
+            for required in [
+                "/actions/run",
+                "/actions/suspend",
+                "/actions/warm",
+                "/actions/cold",
+                "/actions/destroy",
+            ] {
+                assert!(body.contains(required), "API docs lost {required}");
+            }
+            for retired in ["/actions/start", "/actions/stop", "/actions/delete"] {
+                assert!(!body.contains(retired), "API docs regained {retired}");
+            }
+        }
+        for body in [cli.body_en, cli.body_zh] {
+            for required in [
+                "cats run CAT_ID",
+                "cats suspend CAT_ID",
+                "cats warm CAT_ID",
+                "cats cold CAT_ID",
+                "cats destroy CAT_ID",
+            ] {
+                assert!(body.contains(required), "CLI docs lost {required}");
+            }
+            for retired in [
+                "cats start CAT_ID",
+                "cats stop CAT_ID",
+                "cats delete CAT_ID",
+            ] {
+                assert!(!body.contains(retired), "CLI docs regained {retired}");
+            }
+        }
+        for body in [lifecycle.body_en, lifecycle.body_zh] {
+            assert!(body.contains("Create"));
+            assert!(body.contains("Run"));
+            assert!(body.contains("Destroy"));
+        }
     }
 
     fn quoted_keys(source: &str, prefix: &str) -> BTreeSet<String> {

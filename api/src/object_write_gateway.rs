@@ -49,7 +49,7 @@ pub const OBJECT_WRITE_QUALIFICATION_SEALED_REQUEST_MAX_BYTES: usize = 32 * 1024
 pub const OBJECT_WRITE_QUALIFICATION_UNPROVEN_RECEIPT_MAX_BYTES: usize = 48 * 1024;
 pub const OBJECT_WRITE_QUALIFICATION_AMBIGUITY_RECEIPT_MAX_BYTES: usize = 48 * 1024;
 pub const OBJECT_WRITE_GATEWAY_RECEIPT_MAX_BYTES: usize = 64 * 1024;
-pub const OBJECT_WRITE_QUALIFICATION_CONTROL_SCHEMA_VERSION: u64 = 16;
+pub const OBJECT_WRITE_QUALIFICATION_CONTROL_SCHEMA_VERSION: u64 = 17;
 pub const OBJECT_WRITE_CREDENTIAL_DIRECTORY_BASENAME: &str = "object-write-credentials";
 pub const OBJECT_WRITE_PRIVATE_KEY_FILE_SUFFIX: &str = ".pk8";
 pub const OBJECT_WRITE_PREPARED_REGISTRATION_FILE_SUFFIX: &str = ".prepared.v1.json";
@@ -1800,7 +1800,8 @@ mod tests {
             deployment_id: id("deployment-a"),
             release_id: id("release-a"),
             source_commit_sha: "a".repeat(40),
-            control_schema_version: WireU64::new(16).unwrap(),
+            control_schema_version: WireU64::new(OBJECT_WRITE_QUALIFICATION_CONTROL_SCHEMA_VERSION)
+                .unwrap(),
             qualification_catalog_sha256: Sha256Digest::from_bytes([7; 32]),
             admission_binding_sha256: Sha256Digest::from_bytes([9; 32]),
             admission_revision: Epoch::new(3).unwrap(),

@@ -373,7 +373,7 @@ pub enum RouteResolveV2RejectionCode {
     InvalidRequest,
     NotFound,
     Gone,
-    WakeRequired,
+    RunRequired,
     Pending,
     Unavailable,
     Internal,
@@ -1325,6 +1325,19 @@ mod tests {
         assert_eq!(
             encode_route_resolve_v2_rejection(&rejection).unwrap(),
             br#"{"version":2,"code":"pending"}"#
+        );
+        let run_required = RouteResolveV2Rejection::new(RouteResolveV2RejectionCode::RunRequired);
+        let run_required_bytes = encode_route_resolve_v2_rejection(&run_required).unwrap();
+        assert_eq!(
+            run_required_bytes,
+            br#"{"version":2,"code":"run_required"}"#
+        );
+        assert_eq!(
+            decode_route_resolve_v2_rejection(&run_required_bytes).unwrap(),
+            run_required
+        );
+        assert!(
+            decode_route_resolve_v2_rejection(br#"{"version":2,"code":"wake_required"}"#).is_err()
         );
         let expired =
             RouteAdmissionV2Failure::pre_admission(RouteAdmissionV2Reason::Expired).unwrap();

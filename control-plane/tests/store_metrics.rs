@@ -7,12 +7,12 @@
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
-use cats_api::resources::DiskDurability;
-use cats_control_plane::controller::AutoTierPolicy;
-use cats_control_plane::server::{spawn, spawn_singleton_task, Config, Handle};
+use cats_api::runtime_reconciliation::Id;
+use cats_control_plane::server::{spawn_singleton_task, Config, Handle};
 use cats_control_plane::store::{
     DsnSource, OciDeploymentClaim, SingletonRole, Store, CONTROL_STORE_BLOCKING_WORKERS,
 };
+use cats_control_plane::testsupport::spawn_control_plane_for_test as spawn;
 use cats_metering::SqliteUsageStore;
 
 const SERVICE_TOKEN: &str = "store-metrics-service-token";
@@ -36,8 +36,6 @@ impl MetricsContext {
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: usage,
-            #[cfg(debug_assertions)]
-            retired_storage_meta_for_tests: None,
             image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
             auth_token: SERVICE_TOKEN.to_string(),
             guest_runtime_profile_receipt:
@@ -46,15 +44,11 @@ impl MetricsContext {
                 cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
             production_cutover_operator_trust_bundle:
                 cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
-            route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
             admin_token: ADMIN_TOKEN.to_string(),
             workos: None,
             stripe: None,
             billing_enforcement_enabled: false,
-            node_lease_timeout_ms: 30_000,
-            reconcile_interval_ms: 60_000,
             oci_deploy_sync_wait_ms: 5_000,
-            auto_tier_policy: AutoTierPolicy::default(),
         };
         let control_plane = spawn(config).await.unwrap();
         Self {
@@ -79,7 +73,6 @@ struct Sample {
     latency_sum: f64,
     singleton_connections: u64,
     oci_connections: u64,
-    database_snapshot_available: u64,
 }
 
 fn prometheus_number(body: &str, selector: &str) -> f64 {
@@ -118,9 +111,6 @@ async fn sample(context: &MetricsContext) -> Sample {
         ),
         singleton_connections: integer("cats_control_store_connections{kind=\"singleton\"}"),
         oci_connections: integer("cats_control_store_connections{kind=\"oci\"}"),
-        database_snapshot_available: integer(
-            "cats_control_plane_metrics_database_snapshot_available",
-        ),
     }
 }
 
@@ -154,7 +144,7 @@ async fn saturation_and_connection_lifetimes_report_explicit_deltas() {
     let database_lock = std::thread::spawn(move || {
         let mut client = postgres::Client::connect(&dsn, postgres::NoTls).unwrap();
         client
-            .batch_execute("BEGIN; LOCK TABLE cats IN ACCESS EXCLUSIVE MODE")
+            .batch_execute("BEGIN; LOCK TABLE accounts IN ACCESS EXCLUSIVE MODE")
             .unwrap();
         let _ = locked_tx.send(());
         release_rx.recv().unwrap();
@@ -164,7 +154,11 @@ async fn saturation_and_connection_lifetimes_report_explicit_deltas() {
 
     let mut blocked = tokio::task::JoinSet::new();
     for store in load_stores {
-        blocked.spawn(async move { store.execute(|store| store.list_all_cats()).await });
+        blocked.spawn(async move {
+            store
+                .execute(|store| store.list_all_workspace_views())
+                .await
+        });
     }
 
     // A regression that routes authentication through the DB lane parks it
@@ -208,8 +202,6 @@ async fn saturation_and_connection_lifetimes_report_explicit_deltas() {
         delta(during.admission, before.admission, "admission")
             > CONTROL_STORE_BLOCKING_WORKERS as u64
     );
-    assert_eq!(during.database_snapshot_available, 0);
-
     release_tx.send(()).unwrap();
     while let Some(result) = blocked.join_next().await {
         result.unwrap().unwrap();
@@ -273,46 +265,13 @@ async fn saturation_and_connection_lifetimes_report_explicit_deltas() {
     .await
     .expect("singleton connection count must increase by at least one");
 
-    let workspace = context
-        .control_plane
-        .state
-        .store
-        .execute(|store| {
-            let view = store
-                .list_all_workspace_views()?
-                .into_iter()
-                .find(|workspace| workspace.is_default)
-                .expect("bootstrap workspace exists");
-            store.workspace_by_id(&view.id)
-        })
-        .await
-        .unwrap();
-    let (cat, _, _) = context
-        .control_plane
-        .state
-        .store
-        .execute(move |store| {
-            store.create_cat(
-                &workspace,
-                "metrics-connection-lifetime",
-                "test",
-                1,
-                256,
-                1 << 20,
-                true,
-                None,
-                None,
-                DiskDurability::Strict,
-            )
-        })
-        .await
-        .unwrap();
+    let cat_id = Id::new("cat_metrics_connection_lifetime").unwrap();
     let claim = context
         .control_plane
         .state
         .store
         .execute(move |store| {
-            store.claim_oci_deployment(&cat, "metrics", &format!("sha256:{}", "a".repeat(64)))
+            store.claim_oci_deployment(&cat_id, "metrics", &format!("sha256:{}", "a".repeat(64)))
         })
         .await
         .unwrap();

@@ -26,8 +26,8 @@ use cats_api::runtime_reconciliation::{
     SessionBinding, Sha256Digest, WireU64,
 };
 use cats_storage::authority::{
-    FenceEpoch, Generation, NormalAcquireRequest, RemoteHead, Revision, VolumeAdminState,
-    VolumeDurability, VolumeRecord,
+    FenceEpoch, Generation, NormalAcquireRequest, RemoteHead, VolumeAdminState, VolumeDurability,
+    VolumeRecord,
 };
 use cats_storage::object_write_authority::{
     empty_terminal_prefix_sha256, ObjectWriteAuthority, ObjectWriteAuthorityState,
@@ -718,7 +718,6 @@ fn gateway_registration_succeeds_only_once_the_writer_authority_exists() {
                 transition_id: random(14),
                 attachment_id: id(ATTACHMENT_ID),
                 expected_unowned_epoch: FenceEpoch::new(0).unwrap(),
-                desired_revision: Revision::new(1).unwrap(),
                 placement_epoch: Epoch::new(1).unwrap(),
                 lease_duration_ms: 600_000,
             },

@@ -1643,14 +1643,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let usage = Arc::new(SqliteUsageStore::open(&dir.path().join("usage.db")).unwrap());
         let dsn = crate::testsupport::isolated_control_store_url();
-        let server = crate::server::spawn(crate::server::Config {
+        let server = crate::testsupport::spawn_control_plane_for_test(crate::server::Config {
             listen: "127.0.0.1:0".into(),
             control_store_dsn: crate::store::DsnSource::Literal(dsn.clone()),
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: usage,
-            #[cfg(debug_assertions)]
-            retired_storage_meta_for_tests: None,
             image_blob: crate::testsupport::unavailable_image_blob(),
             auth_token: "runtime-node-authority-unit-service-token".into(),
             guest_runtime_profile_receipt: crate::testsupport::test_guest_runtime_profile_receipt(),
@@ -1658,14 +1656,10 @@ mod tests {
                 crate::testsupport::test_runtime_provisioner_trust_bundle(),
             production_cutover_operator_trust_bundle:
                 crate::testsupport::test_production_cutover_operator_trust_bundle(),
-            route_grant_signer: crate::testsupport::route_grant_signer(),
             admin_token: "runtime-node-authority-unit-admin-token".into(),
             workos: None,
             stripe: None,
             billing_enforcement_enabled: false,
-            node_lease_timeout_ms: 30_000,
-            reconcile_interval_ms: 60_000,
-            auto_tier_policy: crate::controller::AutoTierPolicy::default(),
             oci_deploy_sync_wait_ms: 5_000,
         })
         .await

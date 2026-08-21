@@ -324,15 +324,6 @@ pub(super) struct Execution<T> {
     result: oneshot::Receiver<Outcome<T>>,
 }
 
-impl<T> Execution<T> {
-    /// Leave an admitted job in the queue when its result is intentionally
-    /// unobserved. This is reserved for cancellation cleanup whose whole
-    /// purpose is to outlive the future being dropped.
-    pub(super) fn detach(mut self) {
-        self.id = None;
-    }
-}
-
 impl<T> Future for Execution<T> {
     type Output = Result<T, ExecutionError>;
 

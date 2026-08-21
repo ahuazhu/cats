@@ -9,6 +9,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::ErrorBody;
+use crate::runtime_reconciliation::{ContractVersion, Id};
+
 /// Basic credentials used for one registry pull.
 ///
 /// `password` may be a short-lived registry token. This type intentionally
@@ -70,6 +73,31 @@ pub struct OciDeployment {
     pub manifest_digest: String,
     pub service: String,
     pub active: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OciDeploymentAttemptState {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+/// Pollable result for one OCI deployment attempt.
+///
+/// This authority is intentionally independent from Cat lifecycle Operations:
+/// an OCI pull/activate never carries a lifecycle generation or settles a Cat
+/// command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OciDeploymentAttempt {
+    pub version: ContractVersion,
+    pub attempt_id: Id,
+    pub state: OciDeploymentAttemptState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment: Option<OciDeployment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorBody>,
 }
 
 /// The digest a caller pinned in `image`, without the `@`.

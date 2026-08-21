@@ -116,7 +116,7 @@ class FakeLocalRunner:
         if argv[0].endswith("/require-idle-worker.sh"):
             if command != (
                 "/opt/cats/bin/require-idle-worker.sh",
-                "/sys/fs/cgroup/cats/metering",
+                "/sys/fs/cgroup",
                 "/opt/cats/bin",
             ):
                 raise AssertionError("executor changed the exact idle/runtime preflight")
@@ -407,8 +407,8 @@ def local_host(*, all_components: bool = True) -> dict[str, Any]:
         "expected_machine_id_sha256": MACHINE,
         "host_id": "old-local",
         "idle_preflight": {
+            "cgroup_v2_root": "/sys/fs/cgroup",
             "helper_path": "/opt/cats/bin/require-idle-worker.sh",
-            "metering_cgroup_root": "/sys/fs/cgroup/cats/metering",
             "runtime_bin_root": "/opt/cats/bin",
         },
         "method": "local_systemd",
@@ -484,6 +484,22 @@ def expect_refusal(tool: Any, callback: Any, contains: str) -> None:
 
 
 def run_local_matrix(tool: Any, root: Path) -> tuple[Path, Path, dict[str, Any]]:
+    legacy_case = root / "local-legacy-cgroup-field"
+    legacy_case.mkdir(mode=0o700)
+    legacy_host = local_host()
+    legacy_preflight = legacy_host["idle_preflight"]
+    legacy_preflight["metering_cgroup_root"] = legacy_preflight.pop("cgroup_v2_root")
+    legacy_inventory = legacy_case / "inventory.json"
+    legacy_inventory.write_bytes(
+        tool.canonical_bytes(inventory([legacy_host], "positive-local-legacy-field"))
+    )
+    legacy_inventory.chmod(0o600)
+    expect_refusal(
+        tool,
+        lambda: tool.load_inventory(legacy_inventory),
+        "non-canonical field set",
+    )
+
     case = root / "local"
     case.mkdir(mode=0o700)
     inv_path = case / "inventory.json"

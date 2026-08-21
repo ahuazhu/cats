@@ -10,10 +10,10 @@ pub mod blob;
 pub mod delete;
 pub mod host_fence;
 pub mod image_manifest;
+pub mod lifecycle_volume;
 pub mod metadata;
 pub mod object_write_authority;
 pub mod trusted_host_fence;
-pub mod trusted_host_recovery;
 
 pub use adapter::{
     open_blob_store, open_metadata_store, AdapterConfig, AdapterError, AdapterSelection,

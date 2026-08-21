@@ -1,9 +1,13 @@
 # ADR-0025：Destroy 可丢弃待删除 RootDisk，PersistentDisk 仍强制 drain
 
-- 状态：Accepted
+- 状态：Accepted；Deleted Desired/stop Observation authorization input已由
+  [ADR-0056](0056-atomic-per-cat-runtime-lifecycle.md)取代，default Root discard产品语义保留
 - 日期：2026-08-03
 - 细化：[ADR-0042](0042-volume-authority-and-disk-lifecycle.md)、
   [Volume Authority](../specs/volume-authority.md#11-delete)
+
+> Atomic Delete仍只允许default Root放弃local tail，并且全部Persistent必须先`R == L`/release/detach。
+> exact authorization绑定Operation/fingerprint与closed strong-Stop或HostFence sum arm，不再消费Observation。
 
 ## 背景
 

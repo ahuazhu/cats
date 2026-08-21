@@ -8,8 +8,71 @@
 use serde::{Deserialize, Serialize};
 
 use crate::chunk::MAX_VOLUME_BYTES;
-use crate::resources::{Disk, DiskDurability, DiskKind, DiskState};
-use crate::runtime_reconciliation::{HostPath, Id, Revision, UnixMillis};
+use crate::runtime_reconciliation::{AsciiText, HostPath, Id, Sha256Digest, UnixMillis};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskKind {
+    Root,
+    Persistent,
+}
+
+/// What a guest fsync acknowledgment promises for this disk (ADR-0021).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskDurability {
+    /// fsync returns only once the data is durable in the object store; an
+    /// acknowledged write survives losing the host outright.
+    #[default]
+    Strict,
+    /// fsync returns after a local commit; data reaches the object store
+    /// asynchronously and an unclean host loss may lose recent writes.
+    Relaxed,
+}
+
+impl DiskDurability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Relaxed => "relaxed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "strict" => Some(Self::Strict),
+            "relaxed" => Some(Self::Relaxed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskState {
+    Creating,
+    Available,
+    Bound,
+    Deleting,
+    Deleted,
+}
+
+/// Public PersistentDisk product projection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Disk {
+    pub id: String,
+    pub workspace_id: String,
+    pub name: String,
+    pub kind: DiskKind,
+    pub size_bytes: u64,
+    pub state: DiskState,
+    #[serde(default)]
+    pub durability: DiskDurability,
+    pub volume_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_cat_id: Option<String>,
+    pub created_at_unix: i64,
+}
 
 pub const PERSISTENT_DISK_NAME_CONFLICT_BODY: &[u8] =
     br#"{"code":"already_exists","message":"disk name already exists"}"#;
@@ -17,6 +80,8 @@ pub const PERSISTENT_DISK_BINDING_CONFLICT_BODY: &[u8] =
     br#"{"code":"conflict","message":"disk binding does not match the requested Cat and mount path"}"#;
 pub const PERSISTENT_DISK_BINDING_PRECONDITION_BODY: &[u8] =
     br#"{"code":"failed_precondition","message":"disk binding requires an exact settled Cold Cat and unowned PersistentDisk"}"#;
+pub const PERSISTENT_DISK_BINDING_NOT_FOUND_BODY: &[u8] =
+    br#"{"code":"not_found","message":"Cat or PersistentDisk not found"}"#;
 
 /// Exact logical binding named by both clean-slate PersistentDisk actions.
 ///
@@ -38,6 +103,9 @@ impl PersistentDiskBindingV2Request {
         if self.mount_path.as_str() == "/" {
             return Err(PersistentDiskBindingV2Error::GuestRoot);
         }
+        if AsciiText::new(self.mount_path.as_str().to_owned()).is_none() {
+            return Err(PersistentDiskBindingV2Error::MountPath);
+        }
         Ok(())
     }
 }
@@ -48,23 +116,35 @@ pub enum PersistentDiskBindingV2Error {
     CatId,
     #[error("PersistentDisk mount_path cannot replace the Guest root filesystem")]
     GuestRoot,
+    #[error("PersistentDisk mount_path must be 1..=512 printable ASCII bytes")]
+    MountPath,
 }
 
-/// Exact terminal acceptance returned by both PersistentDisk binding actions.
-/// The Operation settles only after the successor complete Desired membership
-/// is observed as stable Cold; acceptance is not mount-readiness evidence.
+/// Exact committed current-config identity returned by both binding actions.
+///
+/// Binding is a synchronous product transaction while the Cat is terminal
+/// Cold. It does not create a lifecycle Operation and is not mount-readiness
+/// evidence; a later Start freezes this exact immutable config in its command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PersistentDiskBindingV2AcceptedResponse {
-    pub desired_revision: Revision,
-    pub operation_id: Id,
+pub struct PersistentDiskBindingV2CommittedResponse {
+    pub cat_id: Id,
+    pub disk_id: Id,
+    pub runtime_config_id: Id,
+    pub runtime_config_digest: Sha256Digest,
 }
 
-pub fn decode_persistent_disk_binding_v2_accepted_response(
+pub fn encode_persistent_disk_binding_v2_committed_response(
+    response: &PersistentDiskBindingV2CommittedResponse,
+) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(response)
+}
+
+pub fn decode_persistent_disk_binding_v2_committed_response(
     body: &[u8],
-) -> Result<PersistentDiskBindingV2AcceptedResponse, serde_json::Error> {
+) -> Result<PersistentDiskBindingV2CommittedResponse, serde_json::Error> {
     let mut decoder = serde_json::Deserializer::from_slice(body);
-    let response = PersistentDiskBindingV2AcceptedResponse::deserialize(&mut decoder)?;
+    let response = PersistentDiskBindingV2CommittedResponse::deserialize(&mut decoder)?;
     decoder.end()?;
     Ok(response)
 }
@@ -208,21 +288,33 @@ mod tests {
             root.validate(),
             Err(PersistentDiskBindingV2Error::GuestRoot)
         );
+
+        let non_ascii: PersistentDiskBindingV2Request =
+            serde_json::from_slice(br#"{"cat_id":"cat_01","mount_path":"/srv/\u6570\u636e"}"#)
+                .unwrap();
+        assert_eq!(
+            non_ascii.validate(),
+            Err(PersistentDiskBindingV2Error::MountPath)
+        );
     }
 
     #[test]
-    fn binding_accepted_response_is_flat_strict_and_canonical() {
-        let wire = br#"{"desired_revision":7,"operation_id":"op_01"}"#;
-        let accepted = decode_persistent_disk_binding_v2_accepted_response(wire).unwrap();
-        assert_eq!(accepted.desired_revision.get(), 7);
-        assert_eq!(accepted.operation_id, id("op_01"));
-        assert_eq!(serde_json::to_vec(&accepted).unwrap(), wire);
-        assert!(decode_persistent_disk_binding_v2_accepted_response(
-            br#"{"desired_revision":7,"operation_id":"op_01","settled":true}"#,
+    fn binding_committed_response_is_flat_strict_and_byte_stable() {
+        let wire = br#"{"cat_id":"cat_01","disk_id":"disk_01","runtime_config_id":"cfg_02","runtime_config_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111"}"#;
+        let committed = decode_persistent_disk_binding_v2_committed_response(wire).unwrap();
+        assert_eq!(committed.cat_id, id("cat_01"));
+        assert_eq!(committed.disk_id, id("disk_01"));
+        assert_eq!(committed.runtime_config_id, id("cfg_02"));
+        assert_eq!(
+            encode_persistent_disk_binding_v2_committed_response(&committed).unwrap(),
+            wire
+        );
+        assert!(decode_persistent_disk_binding_v2_committed_response(
+            br#"{"cat_id":"cat_01","disk_id":"disk_01","runtime_config_id":"cfg_02","runtime_config_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","settled":true}"#,
         )
         .is_err());
-        assert!(decode_persistent_disk_binding_v2_accepted_response(
-            br#"{"desired_revision":0,"operation_id":"op_01"}"#,
+        assert!(decode_persistent_disk_binding_v2_committed_response(
+            br#"{"cat_id":"cat_01","disk_id":"disk_01","runtime_config_id":"cfg_02"}"#,
         )
         .is_err());
     }

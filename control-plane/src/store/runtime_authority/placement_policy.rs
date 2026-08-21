@@ -22,12 +22,8 @@ use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::gateway_identity::lock_route_v2_machine_authority_shared;
-use super::host_fence_recovery_batch::{
-    require_host_recovery_unblocked_in, require_product_mutation_unblocked_in,
-};
 use super::object_write::open_object_write_authority_in;
 use super::pg_codec::PgBigInt;
-use super::product_rows::load_assigned_desired_for_update;
 use super::route_signing_authority::node_acks_current_published_ring_in;
 use super::rows::database_now;
 use crate::store::agent_sessions::{
@@ -672,13 +668,6 @@ fn apply_runtime_node_authority_in(
             "NodeIdentity and placement policy presence diverged",
         ));
     }
-    if identity.is_some() {
-        // The clean-slate catalog permits only one Provisioned NodeIdentity
-        // per physical Host. Existing identities therefore use the exact
-        // Node barrier; only the missing-row Provision path needs the
-        // Host-global guard below.
-        require_product_mutation_unblocked_in(transaction, &apply.node_id)?;
-    }
     let committed_at = database_now(transaction)?;
     let stored_outcome = match &apply.mutation {
         RuntimeNodeAuthorityMutation::Provision {
@@ -855,10 +844,23 @@ fn lock_and_check_fresh_host_state(
     // one-Provisioned-identity invariant. Existing Node mutations never take
     // it after their identity row, so querying the current Host row below
     // cannot form a row/advisory lock inversion with Retire.
-    require_host_recovery_unblocked_in(
-        transaction,
-        &identity.provider_scope,
-        &identity.immutable_host_id,
+    // HostLost/#263 is intentionally not a production mutation path in the
+    // atomic release.  Keep the immutable-Host missing-row barrier without
+    // consulting the superseded Desired recovery-batch catalog.
+    transaction.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended(
+            current_schema() || ':host-identity-lineage:' ||
+            jsonb_build_array(
+                $1::TEXT,$2::TEXT,$3::TEXT,$4::TEXT,$5::TEXT
+            )::TEXT,
+            0::BIGINT))",
+        &[
+            &identity.provider_scope.provider.as_str(),
+            &identity.provider_scope.partition.as_str(),
+            &identity.provider_scope.account_id.as_str(),
+            &identity.provider_scope.region.as_str(),
+            &identity.immutable_host_id.as_str(),
+        ],
     )?;
     let provisioned = transaction.query(
         "SELECT node_id FROM node_identities
@@ -938,7 +940,7 @@ fn valid_policy_update(
     if static_changed
         && (current.scheduling_state != RuntimeSchedulingState::Cordoned
             || next.scheduling_state != RuntimeSchedulingState::Cordoned
-            || !load_assigned_desired_for_update(transaction, &current.node_id)?.is_empty())
+            || node_has_active_runtime_bindings_for_update(transaction, &current.node_id)?)
     {
         return Ok(false);
     }
@@ -960,11 +962,38 @@ fn rotation_or_retire_quiescent(
     node_id: &Id,
     db_now: UnixMillis,
 ) -> AuthorityTxResult<bool> {
-    if !load_assigned_desired_for_update(transaction, node_id)?.is_empty() {
+    if node_has_active_runtime_bindings_for_update(transaction, node_id)? {
         return Ok(false);
     }
     Ok(load_current_session_for_update(transaction, node_id)?
         .is_none_or(|session| session.lease_deadline_unix_ms <= db_now))
+}
+
+/// Lock and detect the atomic lifecycle bindings which still depend on one
+/// Node.  A successful Cold is location-independent, while every unresolved
+/// command and every other current terminal head still owns a Node-local
+/// execution, journal, snapshot, tail, or recovery boundary.
+fn node_has_active_runtime_bindings_for_update(
+    transaction: &mut Transaction<'_>,
+    node_id: &Id,
+) -> AuthorityTxResult<bool> {
+    let rows = transaction.query(
+        "SELECT o.operation_id
+           FROM runtime_operations o
+           JOIN cat_records c ON c.cat_id=o.cat_id
+          WHERE o.node_id=$1
+            AND c.deleted_at IS NULL
+            AND (
+                o.state='unresolved' OR
+                (c.lifecycle_head_operation_id=o.operation_id
+                    AND c.stable_state IS DISTINCT FROM 'cold')
+            )
+          ORDER BY o.operation_id COLLATE \"C\"
+          LIMIT 1
+          FOR UPDATE OF o, c",
+        &[&node_id.as_str()],
+    )?;
+    Ok(!rows.is_empty())
 }
 
 fn lock_and_check_fresh_node_credential(
@@ -1101,15 +1130,6 @@ pub(crate) fn corrupt_policy_on_store_for_test(store: &Store) -> Result<()> {
             )
             .map(|_| ())
     })
-}
-
-#[cfg(test)]
-pub(super) fn update_policy_for_test(
-    transaction: &mut Transaction<'_>,
-    current: &NodePlacementPolicy,
-    next: &NodePlacementPolicy,
-) -> AuthorityTxResult<()> {
-    update_policy(transaction, current, next)
 }
 
 fn update_policy(

@@ -243,8 +243,8 @@ fn qualification_product_inventory_in(
         counts.persistent_disk_count,
         counts.disk_snapshot_count,
         counts.endpoint_count,
-        counts.hostname_desired_lookup_count,
-        counts.pending_runtime_operation_count,
+        counts.hostname_endpoint_lookup_count,
+        counts.unresolved_lifecycle_operation_count,
     ]
     .into_iter()
     .try_fold(0_u64, |total, count| total.checked_add(count.get()))
@@ -1045,7 +1045,8 @@ mod tests {
             deployment_id: Id::new("deployment_a").unwrap(),
             release_id: Id::new("release_a").unwrap(),
             source_commit_sha: "a".repeat(40),
-            control_schema_version: WireU64::new(16).unwrap(),
+            control_schema_version: WireU64::new(PRODUCTION_MUTATION_ADMISSION_SCHEMA_VERSION)
+                .unwrap(),
             source_manifest_sha256: digest('0'),
             source_bundle_sha256: digest('1'),
             release_manifest_sha256: digest('2'),
@@ -1075,7 +1076,8 @@ mod tests {
             deployment_id: Id::new("deployment_a").unwrap(),
             release_id: Id::new("release_a").unwrap(),
             source_commit_sha: "a".repeat(40),
-            control_schema_version: WireU64::new(16).unwrap(),
+            control_schema_version: WireU64::new(PRODUCTION_MUTATION_ADMISSION_SCHEMA_VERSION)
+                .unwrap(),
             source_manifest_sha256: digest('0'),
             source_bundle_sha256: digest('1'),
             build_receipt_sha256: digest('2'),

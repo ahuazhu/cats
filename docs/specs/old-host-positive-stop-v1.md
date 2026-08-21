@@ -70,8 +70,8 @@ LocalHostExpectation {
   expected_machine_id_sha256: "sha256:" + 64 lowercase hex,
   expected_boot_id: lowercase UUID,
   idle_preflight: {
+    cgroup_v2_root: canonical absolute cgroup2 mount root,
     helper_path: canonical absolute require-idle-worker path,
-    metering_cgroup_root: canonical absolute path,
     runtime_bin_root: canonical absolute path
   },
   components: [LocalComponentExpectation] // 按component排序且不重复
@@ -98,6 +98,13 @@ LocalComponentExpectation =
     ]
   }
 ```
+
+`cgroup_v2_root` 是 exact cgroup2 mount point，不是任意 delegation subtree。local mutation 前
+`require-idle-worker` 必须重新解析所有 path component、拒绝 symlink/non-canonical path，并用
+mount table 证明该 exact path 是 `cgroup2` mount root；无法读取或不一致都 fail closed。它只在该
+root 的直接子项中枚举 canonical `cats-cat-<64 lowercase hex>.slice`。probe 必须先观察
+`cgroup.controllers` 和已知 positive namespace matcher；已知 canonical Cat slice 必须拒绝，只有
+同一校准 probe 证明 slice 集为空且 managed runtime process 也为空时才能通过。
 
 每个 local Host 至少有一个 `systemd_stop` unit。VMM/blockd 只能使用 exact absence，不能声明为可由本
 程序 stop 的 unit。无论 inventory 是否把 VMM/blockd pair 归到该 Host，local preflight 总是检查上述三个

@@ -3,11 +3,13 @@
 <p>The signed runtime cutover deliberately exposes a narrow product surface:</p>
 <ul>
   <li>Create, list, and inspect Cats.</li>
+  <li>Run, Suspend, Warm, Cold, or Destroy one Cat through its exact idempotent lifecycle action.</li>
   <li>Create, list, and inspect PersistentDisks.</li>
+  <li>Attach or detach one PersistentDisk while its exact Cat is terminal Cold.</li>
   <li>Inspect one exact accepted Operation by ID.</li>
   <li>Use the Guest-local Runtime API and the independent identity/billing surfaces.</li>
 </ul>
-<p>Cat lifecycle, Guest command, deployment, Endpoint, and delete mutations are unavailable. PersistentDisk attachment, snapshot, capacity change, and delete mutations are also unavailable. The console and CLI fail closed instead of probing legacy routes.</p>
+<p>Guest command, Endpoint mutation, PersistentDisk snapshot, capacity change, and PersistentDisk deletion remain unavailable. The console and CLI fail closed instead of probing legacy routes.</p>
 <h2 id="choose-a-path">Choose a path</h2>
 <div class="doc-grid">
   <a class="doc-card" href="/docs/getting-started/"><strong>Get started</strong><span>Create and inspect a Cat with the current console or CLI.</span></a>
@@ -21,4 +23,4 @@
   <a class="doc-card" href="/docs/operations-troubleshooting/"><strong>Operations and troubleshooting</strong><span>Recover exact create identity and collect evidence.</span></a>
 </div>
 <h2 id="product-model">Product model</h2>
-<p>A Cat owns one RootDisk. A PersistentDisk is an independent RWO resource whose release capacity is immutable. Desired runtime state and signed Volume Authority—not a browser or CLI—coordinate lifecycle and writer epochs.</p>
+<p>A Cat owns one RootDisk. A PersistentDisk is an independent RWO resource whose release capacity is immutable. An immutable runtime config, one signed atomic lifecycle command, and signed Volume Authority—not a browser or CLI—coordinate lifecycle and writer epochs.</p>

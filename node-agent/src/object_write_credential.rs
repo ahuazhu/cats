@@ -21,15 +21,8 @@
 //!   while one already exists, so a retry re-registers the *same* public key
 //!   rather than minting a second live credential for the same epoch.
 //!
-//! Deliberately not wired into the attachment lifecycle yet: this module owns
-//! the credential, not the decision to create or retire one.
-
-// Scoped to this module for exactly as long as the attachment lifecycle has not
-// called into it. Every item below is exercised by this module's tests; drop
-// this attribute in the change that makes the reconciler establish, load and
-// retire these credentials, so an item that is genuinely unreachable then still
-// gets reported.
-#![allow(dead_code)]
+//! Atomic Start owns the decision to establish the credential; this module
+//! retains the key, registration transport and crash-safe local state machine.
 
 use std::ffi::{CStr, CString};
 use std::fs::{DirBuilder, File, OpenOptions};
@@ -120,6 +113,11 @@ impl LoadedObjectWriteCredential {
 
     /// The only credential material allowed in a descriptor or checkpoint.
     pub(crate) fn credential(&self) -> &ObjectWriteCredentialReference {
+        debug_assert_eq!(
+            self.signer().public_key_spki_sha256(),
+            self.artifact.registration.credential.public_key_spki_sha256,
+            "loaded object-write signer must match its registered credential"
+        );
         &self.artifact.registration.credential
     }
 
@@ -940,7 +938,7 @@ impl ObjectWriteCredentialStore {
                     "open object-write credential file",
                     path,
                     source,
-                ))
+                ));
             }
         };
         verify_private_file(&file, path)?;
@@ -1208,7 +1206,7 @@ impl ObjectWriteCredentialRegistrar for ObjectWriteCredentialHttpRegistrar {
         let response = match response {
             Ok(response) => response,
             Err(error) if error.is_timeout() => {
-                return Err(ObjectWriteCredentialRegistrationFailure::Timeout)
+                return Err(ObjectWriteCredentialRegistrationFailure::Timeout);
             }
             Err(_) => return Err(ObjectWriteCredentialRegistrationFailure::Connection),
         };
@@ -1332,7 +1330,7 @@ impl ObjectWriteWriterAuthorityResolver for ObjectWriteWriterAuthorityHttpReader
         let response = match response {
             Ok(response) => response,
             Err(error) if error.is_timeout() => {
-                return Err(ObjectWriteWriterAuthorityReadFailure::Timeout)
+                return Err(ObjectWriteWriterAuthorityReadFailure::Timeout);
             }
             Err(_) => return Err(ObjectWriteWriterAuthorityReadFailure::Connection),
         };
@@ -1358,6 +1356,7 @@ impl ObjectWriteWriterAuthorityResolver for ObjectWriteWriterAuthorityHttpReader
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TransportMode {
     ProductionHttps,
+    #[cfg(test)]
     LoopbackTest,
 }
 
@@ -1379,6 +1378,7 @@ fn validate_origin(
             url.scheme() == "https",
             "production {subject} origin must use HTTPS"
         ),
+        #[cfg(test)]
         TransportMode::LoopbackTest => anyhow::ensure!(
             url.scheme() == "http"
                 && url
@@ -1680,7 +1680,7 @@ impl ObjectWriteCredentialUnavailable {
 /// The Node's authority to mint and destroy the attachment-scoped object-write
 /// credential one serving grant needs before it may publish.
 ///
-/// The reconciler holds this instead of an [`ObjectWriteCredentialStore`] so a
+/// The reconciler holds this instead of an `ObjectWriteCredentialStore` so a
 /// grant path never learns the state-directory layout, the A19 Node signer or
 /// the registration transport, and so the private half of a credential cannot
 /// escape this module: `establish` returns only the public reference a
@@ -1715,130 +1715,6 @@ pub trait ObjectWriteCredentialPort: std::fmt::Debug + Send + Sync {
     fn gateway_origin(&self) -> &str;
 }
 
-/// A recording [`ObjectWriteCredentialPort`] for the reconciler's own tests.
-///
-/// It is deliberately not a stub of the production port: it performs no I/O and
-/// exists only so a reconciliation test can observe *which* attachment epoch
-/// was credentialed or retired, and inject the two failures the grant paths
-/// must fail closed on.
-#[cfg(test)]
-#[derive(Debug, Default)]
-pub(crate) struct RecordingObjectWriteCredentials {
-    establish_fails: bool,
-    retire_fails: bool,
-    established: std::sync::Mutex<Vec<(Id, Id, FenceEpoch)>>,
-    retired: std::sync::Mutex<Vec<(Id, Id, FenceEpoch)>>,
-}
-
-#[cfg(test)]
-impl RecordingObjectWriteCredentials {
-    pub(crate) fn failing_establish() -> Self {
-        Self {
-            establish_fails: true,
-            ..Self::default()
-        }
-    }
-
-    pub(crate) fn failing_retire() -> Self {
-        Self {
-            retire_fails: true,
-            ..Self::default()
-        }
-    }
-
-    pub(crate) fn established(&self) -> Vec<(Id, Id, FenceEpoch)> {
-        self.established.lock().unwrap().clone()
-    }
-
-    pub(crate) fn retired(&self) -> Vec<(Id, Id, FenceEpoch)> {
-        self.retired.lock().unwrap().clone()
-    }
-
-    /// The public reference this port hands back for one scope. It is derived
-    /// exactly the way the production port derives it, so a test asserting the
-    /// bound value is asserting the real binding rule.
-    pub(crate) fn expected_credential(
-        session: &SessionBinding,
-        volume_id: &Id,
-        attachment_id: &Id,
-        attachment_epoch: FenceEpoch,
-    ) -> ObjectWriteCredentialReference {
-        ObjectWriteCredentialReference {
-            credential_id: object_write_credential_id(
-                session,
-                volume_id,
-                attachment_id,
-                attachment_epoch,
-            ),
-            public_key_spki_sha256: cats_api::runtime_reconciliation::Sha256Digest::from_bytes(
-                [7; 32],
-            ),
-        }
-    }
-}
-
-#[cfg(test)]
-impl ObjectWriteCredentialPort for RecordingObjectWriteCredentials {
-    fn establish(
-        &self,
-        session: &SessionBinding,
-        volume_id: &Id,
-        attachment_id: &Id,
-        attachment_epoch: FenceEpoch,
-        _deadline: Instant,
-    ) -> Result<ObjectWriteCredentialReference, ObjectWriteCredentialUnavailable> {
-        if self.establish_fails {
-            return Err(ObjectWriteCredentialUnavailable::new(
-                volume_id,
-                attachment_id,
-                attachment_epoch,
-                &ObjectWriteCredentialError::Rejected("injected".to_owned()),
-            ));
-        }
-        self.established.lock().unwrap().push((
-            volume_id.clone(),
-            attachment_id.clone(),
-            attachment_epoch,
-        ));
-        Ok(Self::expected_credential(
-            session,
-            volume_id,
-            attachment_id,
-            attachment_epoch,
-        ))
-    }
-
-    fn retire(
-        &self,
-        volume_id: &Id,
-        attachment_id: &Id,
-        attachment_epoch: FenceEpoch,
-    ) -> Result<(), ObjectWriteCredentialUnavailable> {
-        if self.retire_fails {
-            return Err(ObjectWriteCredentialUnavailable::new(
-                volume_id,
-                attachment_id,
-                attachment_epoch,
-                &ObjectWriteCredentialError::Rejected("injected".to_owned()),
-            ));
-        }
-        self.retired.lock().unwrap().push((
-            volume_id.clone(),
-            attachment_id.clone(),
-            attachment_epoch,
-        ));
-        Ok(())
-    }
-
-    fn credential_directory(&self) -> PathBuf {
-        PathBuf::from("/var/lib/cats/node/test").join(OBJECT_WRITE_CREDENTIAL_DIRECTORY_BASENAME)
-    }
-
-    fn gateway_origin(&self) -> &str {
-        "https://gateway.invalid"
-    }
-}
-
 /// Production [`ObjectWriteCredentialPort`]: one Node state directory, the
 /// installed A19 Node signer, the Control writer-authority read and the
 /// ObjectWrite Gateway registration route.
@@ -1871,6 +1747,23 @@ impl std::fmt::Debug for NodeObjectWriteCredentials {
 }
 
 impl NodeObjectWriteCredentials {
+    /// Compose the production credential owner from the exact retained Agent
+    /// registration used by lifecycle, inventory and Route.  Keeping this
+    /// constructor in `node-agent` prevents the external `noded` crate from
+    /// gaining access to the A19 private signer merely to wire Start.
+    pub fn for_agent_registration(
+        gateway_origin: &str,
+        control_plane_origin: &str,
+        registration: &crate::agent_registration::AgentRegistrationConfig,
+    ) -> anyhow::Result<Self> {
+        Self::for_production(
+            registration.runtime_state_directory().path().to_path_buf(),
+            gateway_origin,
+            control_plane_origin,
+            registration.runtime_request_signer(),
+        )
+    }
+
     /// Composes the production path. `gateway_origin` and `control_plane_origin`
     /// must both be bare HTTPS origins; they are validated here so a
     /// misconfigured Node fails at startup rather than at its first grant.
@@ -1957,13 +1850,13 @@ impl NodeObjectWriteCredentials {
                 writer_authority_id,
             } => writer_authority_id.clone(),
             ObjectWriteWriterAuthorityStateV1::Absent => {
-                return Err(ObjectWriteCredentialError::WriterAuthorityAbsent)
+                return Err(ObjectWriteCredentialError::WriterAuthorityAbsent);
             }
             ObjectWriteWriterAuthorityStateV1::CutoffPending { .. }
             | ObjectWriteWriterAuthorityStateV1::CutoffComplete { .. } => {
                 return Err(ObjectWriteCredentialError::WriterAuthorityClosed {
                     state: state.state_name(),
-                })
+                });
             }
         };
         *resolved = Some((session.clone(), writer_authority_id.clone()));
@@ -2140,7 +2033,7 @@ mod tests {
             match registered.get(&key) {
                 Some(existing) if *existing == registration => {}
                 Some(_) => {
-                    return Err(ObjectWriteCredentialRegistrationFailure::Closed { status: 409 })
+                    return Err(ObjectWriteCredentialRegistrationFailure::Closed { status: 409 });
                 }
                 None => {
                     registered.insert(key, registration.clone());

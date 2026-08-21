@@ -93,4 +93,4 @@ Guest或稳定Running，因此只是真实Linux systemd physical prefix，不是
 详细验收分别以[Runtime Reconciliation §14](specs/runtime-reconciliation-v1.md#14-最小验收矩阵)、
 [Volume Authority §14](specs/volume-authority.md#14-最小验收矩阵)、
 [Route Grant §11](specs/route-grant-v2.md#11-verification)和
-[Operations/HA §6](operations-ha.md#6-分层qualification)为准，不在本记录复制滚动状态。
+[Operations/HA §7](operations-ha.md#7-分层qualification)为准，不在本记录复制滚动状态。

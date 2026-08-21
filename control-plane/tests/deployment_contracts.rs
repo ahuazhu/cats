@@ -174,7 +174,7 @@ fn production_cutover_native_full_log_is_frozen_before_exact_job_publication() {
         .map(|(section, _)| section)
         .expect("Stage A phase 0 release qualification section");
     let final_gates = runbook
-        .split_once("## 8. Recheck final full, Linux and metal gates")
+        .split_once("## 8. Recheck final full and Linux gates")
         .and_then(|(_, remainder)| remainder.split_once("## Stage B"))
         .map(|(section, _)| section)
         .expect("Stage A final gates section");
@@ -585,6 +585,7 @@ fn old_host_positive_stop_contract_passes_calibrated_offline_fixture() {
     let producer = read_workspace_file("deploy/aws/old-host-positive-stop.py");
     for required in [
         "cats.old-host-positive-stop-inventory.v1",
+        "cgroup_v2_root",
         "\"--no-ask-password\", \"stop\"",
         "modify-network-interface-attribute",
         "host_fence_event\": \"not_established",
@@ -594,9 +595,12 @@ fn old_host_positive_stop_contract_passes_calibrated_offline_fixture() {
         assert!(producer.contains(required), "producer lost {required:?}");
     }
     assert!(!producer.contains("shell=True"));
+    assert!(!producer.contains("metering_cgroup_root"));
 
     let specification = read_workspace_file("docs/specs/old-host-positive-stop-v1.md");
     assert!(specification.contains("Status: **Proposed**"));
+    assert!(specification.contains("cgroup_v2_root: canonical absolute cgroup2 mount root"));
+    assert!(!specification.contains("metering_cgroup_root"));
     assert!(specification.contains("不是 ADR-0040 的 `HostFenceEvent`"));
     assert!(specification.contains("不能解除"));
 
@@ -612,67 +616,79 @@ fn old_host_positive_stop_contract_passes_calibrated_offline_fixture() {
 }
 
 #[test]
-fn legacy_route_grant_private_key_is_control_only_until_c1_removes_v1() {
+fn clean_route_v2_deployment_contains_no_v1_route_grant_credential() {
     let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
-    let control = kubernetes
-        .split_once("resource \"kubernetes_deployment_v1\" \"control_plane\"")
-        .and_then(|(_, rest)| rest.split_once("resource \"kubernetes_pod_disruption_budget_v1\""))
-        .map(|(section, _)| section)
-        .expect("control-plane Deployment section");
-    for fragment in [
-        "kubernetes_secret_v1.route_grant_signing",
-        "CATS_ROUTE_GRANT_PRIVATE_KEY_FILE",
-        "/etc/cats/route-grant/private.pem",
-    ] {
-        assert!(
-            control.contains(fragment) || kubernetes.contains(fragment),
-            "control-plane Route Grant delivery lost {fragment:?}"
-        );
-    }
-    for fragment in [
-        "CATS_ROUTE_GRANT_PUBLIC_KEY_FILE",
-        "/etc/cats/route-grant/public.pem",
-        "\"public.pem\"  = var.route_grant_public_key_pem",
-    ] {
-        assert!(
-            control.contains(fragment) || kubernetes.contains(fragment),
-            "control-plane startup pair verification lost {fragment:?}"
-        );
-    }
-
-    let worker =
-        read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
-    assert!(!worker.contains("route_grant_public_key_pem"));
-    assert!(!worker.contains("/etc/cats/route-grant-public.pem"));
-    for unit in [
+    let kubernetes_variables =
+        read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/variables.tf");
+    let application =
+        read_workspace_file("deploy/aws/terraform/stacks/production-application/main.tf");
+    let application_variables =
+        read_workspace_file("deploy/aws/terraform/stacks/production-application/variables.tf");
+    let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
+    let controld = read_workspace_file("cmd/controld/src/main.rs");
+    let control_lib = read_workspace_file("control-plane/src/lib.rs");
+    let control_server = read_workspace_file("control-plane/src/server.rs");
+    let api_lib = read_workspace_file("api/src/lib.rs");
+    let metal_install = read_workspace_file("deploy/metal/install.sh");
+    let mut surfaces = vec![
+        kubernetes.as_str(),
+        kubernetes_variables.as_str(),
+        application.as_str(),
+        application_variables.as_str(),
+        workflow.as_str(),
+        controld.as_str(),
+        control_lib.as_str(),
+        control_server.as_str(),
+        api_lib.as_str(),
+        metal_install.as_str(),
+    ];
+    let units = [
+        "deploy/metal/systemd/cats-controld.service",
         "deploy/aws/metal/cats-worker.service",
         "deploy/metal/systemd/cats-noded.service",
+    ]
+    .map(read_workspace_file);
+    surfaces.extend(units.iter().map(String::as_str));
+    for forbidden in [
+        "RouteGrantSigner",
+        "pub mod route_grant;",
+        "route_grant_signing",
+        "route_grant_private_key_pem",
+        "route_grant_public_key_pem",
+        "ROUTE_GRANT_PRIVATE_KEY_PEM_B64",
+        "CATS_ROUTE_GRANT_PRIVATE_KEY_FILE",
+        "CATS_ROUTE_GRANT_PUBLIC_KEY_FILE",
+        "CATS_ROUTE_GRANT_TTL_SECONDS",
+        "route-grant-private.pem",
+        "route-grant-public.pem",
+        "--route-grant-private-key-file",
+        "--route-grant-public-key-file",
     ] {
-        assert!(!read_workspace_file(unit).contains("--route-grant-public-key-file"));
+        assert!(
+            surfaces.iter().all(|surface| !surface.contains(forbidden)),
+            "clean Route v2 deployment retained V1 credential surface {forbidden:?}"
+        );
     }
-
-    let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
-    assert!(workflow.contains(
-        "ROUTE_GRANT_PRIVATE_KEY_PEM_B64: ${{ secrets.ROUTE_GRANT_PRIVATE_KEY_PEM_B64 }}"
-    ));
-    assert!(workflow.contains("route-grant-private.pem"));
-    assert!(workflow.contains("openssl pkey"));
-    assert!(workflow.contains("^ED25519 Private-Key:"));
-    assert!(workflow.contains("-pubout"));
-    assert!(!workflow.contains("route-grant-public.sha256"));
-    assert!(workflow.contains(
-        "--rawfile route_grant_private_key_pem \"$RUNNER_TEMP/route-grant-private.pem\""
-    ));
-    assert!(workflow.contains("route_grant_private_key_pem: $route_grant_private_key_pem"));
-    assert!(workflow
-        .contains("--rawfile route_grant_public_key_pem \"$RUNNER_TEMP/route-grant-public.pem\""));
-    assert!(workflow.contains("route_grant_public_key_pem: $route_grant_public_key_pem"));
-
-    let dev = read_workspace_file("scripts/dev.sh");
-    assert!(dev.contains("signed Agent-registration cutover"));
-    assert!(dev.contains("provisioner-owned /etc/cats/identity"));
-    assert!(!dev.contains("--node-id"));
-    assert!(!dev.contains("--state-dir"));
+    assert!(kubernetes.contains("route-v2-control-artifacts"));
+    assert!(kubernetes.contains("--route-v2-machine-listen"));
+    assert!(kubernetes.contains("--route-v2-rotation-listen"));
+    assert!(units[0].contains("--route-v2-machine-listen"));
+    assert!(units[0].contains("--route-v2-rotation-listen"));
+    for required_control_artifact in [
+        "gateway-workload-authority.v1.json",
+        "gateway-client-ca-bundle.pem",
+        "control-machine-server-certificate.pem",
+        "control-machine-server-private-key.pem",
+        "signer.v1.json",
+        "public-key-ring.v1.json",
+        "rotation-operator-trust.v1.json",
+        "signer-private-key.pem",
+    ] {
+        assert!(
+            metal_install.contains(required_control_artifact),
+            "direct-metal startup does not require Route v2 control artifact {required_control_artifact:?}"
+        );
+    }
 }
 
 #[test]
@@ -795,7 +811,8 @@ fn route_v2_deployment_wires_closed_artifact_sets_without_private_bytes_in_terra
     let direct_unit = read_workspace_file("deploy/metal/systemd/cats-noded.service");
     assert!(direct_unit.contains("UnsetEnvironment=CATS_ROUTE_V2_MACHINE_LISTEN"));
     assert!(!direct_unit.contains("Environment=CATS_ROUTE_V2_MACHINE_LISTEN="));
-    assert!(!direct_unit.contains("--route-v2-machine-listen"));
+    assert!(direct_unit.contains("--route-v2-machine-listen 0.0.0.0:7444"));
+    assert!(direct_unit.contains("--route-v2-rotation-origin ${CATS_ROUTE_V2_ROTATION_ORIGIN}"));
     assert!(!direct_unit.contains("--route-grant-public-key-file"));
 }
 
@@ -1217,9 +1234,14 @@ fn production_fresh_schema_and_chunkstore_prefix_are_single_reviewed_inputs() {
     assert!(renderer.contains("options=-csearch_path%3D${CATS_POSTGRES_SCHEMA}"));
     let worker_unit = read_workspace_file("deploy/aws/metal/cats-worker.service");
     assert!(worker_unit.contains("url-file=/run/cats/postgres-url"));
-    let root_provision =
-        read_workspace_file("node-agent/src/runtime/reconciliation/systemd_root_provision.rs");
-    assert!(root_provision.contains("url-file=/run/cats/postgres-url"));
+    let noded = read_workspace_file("cmd/noded/src/main.rs");
+    assert!(noded.contains("AdapterConfig::from_cli(args.metadata_store_options)"));
+    assert!(noded.contains("metadata_store,"));
+    let start_platform =
+        read_workspace_file("node-agent/src/lifecycle_command/installed/start_platform.rs");
+    assert!(start_platform.contains("config.blockd.metadata_store.config.to_cli()"));
+    assert!(start_platform.contains("\"--metadata-store-option\""));
+    assert!(start_platform.contains("&blockd.metadata_store_options"));
     let verifier = read_workspace_file("deploy/aws/tools/verify-manual-release.py");
     assert!(verifier.contains("\"cats-worker.service\""));
 }
@@ -1548,9 +1570,22 @@ fn linux_quality_gate_uses_capability_owned_cancellation_safe_cleanup() {
 #[test]
 fn linux_quality_gate_pins_one_private_systemd_e2e_to_an_immutable_image() {
     let linux_gate = read_workspace_file("scripts/linux-gate.sh");
+    let blockd_manifest = read_workspace_file("blockd/Cargo.toml");
+    let node_manifest = read_workspace_file("node-agent/Cargo.toml");
     let (_, systemd_gate) = linux_gate
         .split_once("# ProvisionRootImage restart inventory must query a real system manager.")
         .expect("focused systemd gate boundary");
+
+    assert!(
+        blockd_manifest.contains("test-vhost-user-frontend = [\"vhost/vhost-user-frontend\"]"),
+        "the cross-crate Linux frontend must enable the dependency feature it compiles"
+    );
+    assert!(
+        node_manifest.contains(
+            "cats-blockd = { workspace = true, features = [\"test-vhost-user-frontend\"] }"
+        ),
+        "the Node Linux E2E must opt into the closed blockd frontend harness"
+    );
 
     for required in [
         "LINUX_SYSTEMD_IIDFILE=\"$LINUX_CAPTURE_DIR/systemd-image.iid\"",
@@ -1573,11 +1608,12 @@ fn linux_quality_gate_pins_one_private_systemd_e2e_to_an_immutable_image() {
         "cat /proc/1/cgroup",
         "0::/init.scope",
         "systemctl is-system-running --quiet",
-        "-- --ignored --exact --list",
-        "listed_test_count=$((listed_test_count + 1))",
-        "listed_test_count\" -ne 1",
-        "listed_test_mismatch\" == true",
-        "focused Linux Runtime E2E test inventory was not the exact known positive",
+        "node-privileged.expected",
+        "ch::tests::real_linux_",
+        "real_linux_pending_tap_rejects_name_replacement_at_every_configuration_boundary",
+        "real_linux_scoped_tap_is_published_and_exact_in_a_private_network_namespace",
+        "LC_ALL=C sort -o \"$observed_node_privileged_inventory\"",
+        "privileged Node test inventory was not the exact known positive",
         "timeout --signal=TERM --kill-after=30s 20m",
         "install -D -m 0755 \"$source_binary\" \"$target_binary\"",
         "cmp -s \"$source_binary\" \"$target_binary\"",
@@ -1623,21 +1659,21 @@ fn linux_quality_gate_pins_one_private_systemd_e2e_to_an_immutable_image() {
     );
     assert!(
         focused_command.contains(
-            "exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-blockd-daemon --test root_provision_control --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" -- --ignored --test-threads=1 --nocapture"
+            "exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-blockd-daemon --test root_provision_control --locked --no-fail-fast --target-dir \"$LINUX_TARGET_DIRECTORY\" -- --ignored --test-threads=1 --nocapture"
         ),
         "the installed-namespace blockd tests must run only in the privileged gate"
     );
     assert!(
         focused_command.contains(
-            "docker_cli capture 12600 exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-node-agent --lib --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart -- --ignored --exact --list"
+            "docker_cli capture 12600 exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-node-agent --lib --all-features --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" ch::tests::real_linux_ -- --ignored --list"
         ),
-        "the focused test inventory must bound both Docker and its in-container Cargo process"
+        "the privileged Node inventory must bound both Docker and its in-container Cargo process"
     );
     assert!(
         focused_command.contains(
-            "exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-node-agent --lib --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart -- --ignored --exact --nocapture"
+            "exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-node-agent --lib --all-features --locked --no-fail-fast --target-dir \"$LINUX_TARGET_DIRECTORY\" ch::tests::real_linux_ -- --ignored --test-threads=1 --nocapture"
         ),
-        "the privileged gate must run only the exact ignored Node E2E"
+        "the privileged gate must run only the calibrated ignored Node inventory"
     );
     assert!(
         !systemd_gate.contains("--workspace"),
@@ -1942,6 +1978,14 @@ case "${1:-} ${2:-}" in
       trap '' TERM
       while :; do sleep 0.2; done
     fi
+    if [[ "$mode" == workspace-stage-failure && "$name" == cats-linux-workspace-gate-* ]]; then
+      printf '%s\n' '==> Linux quality stage failures: tests(exit=1)' >&2
+      exit 1
+    fi
+    if [[ "$mode" == workspace-build-failure && "$name" == cats-linux-workspace-gate-* ]]; then
+      printf '%s\n' '==> Linux quality stage failures: build(exit=101)' >&2
+      exit 2
+    fi
     ;;
   "exec "*)
     case "$*" in
@@ -1963,14 +2007,15 @@ case "${1:-} ${2:-}" in
       *" cargo test -p cats-blockd-daemon --test root_provision_control "*" -- --ignored --test-threads=1 --nocapture")
         : >"$state/root-control-tests-ran"
         ;;
-      *" timeout --signal=TERM --kill-after=30s 20m cargo test "*" -- --ignored --exact --list")
+      *" timeout --signal=TERM --kill-after=30s 20m cargo test "*" -- --ignored --list")
         : >"$state/focused-systemd-test-list-ran"
         if [[ "$mode" == timeout-systemd-test-list ]]; then
           exit 124
         fi
         if [[ "$mode" != zero-systemd-test ]]; then
           printf '%s\n' \
-            'runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart: test'
+            'ch::tests::real_linux_pending_tap_rejects_name_replacement_at_every_configuration_boundary: test' \
+            'ch::tests::real_linux_scoped_tap_is_published_and_exact_in_a_private_network_namespace: test'
         fi
         ;;
       *" timeout --signal=TERM --kill-after=30s 20m cargo test "*)
@@ -2339,8 +2384,8 @@ fn linux_quality_gate_rejects_an_empty_privileged_root_control_inventory() {
         "the privileged root-control tests ran after their inventory probe returned zero"
     );
     assert!(
-        !state.join("focused-systemd-test-ran").exists(),
-        "the Runtime E2E ran after the earlier root-control inventory failed"
+        state.join("focused-systemd-test-ran").exists(),
+        "an independent Node privileged group was skipped after root-control inventory failed"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -2358,6 +2403,69 @@ fn linux_quality_gate_rejects_an_empty_privileged_root_control_inventory() {
         assert!(
             !state.join(&resource).exists(),
             "intended resource remained after empty root-control inventory: {resource}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_quality_gate_collects_privileged_failures_after_a_workspace_stage_failure() {
+    let fixture = tempfile::tempdir().expect("Linux gate collected workspace failure fixture");
+    let fake_bin = fixture.path().join("bin");
+    let state = fixture.path().join("state");
+    std::fs::create_dir_all(&state).expect("create fake Docker state");
+    install_linux_gate_fake_cli(&fake_bin);
+
+    let output = linux_gate_command(&fake_bin, &state, "workspace-stage-failure")
+        .output()
+        .expect("run Linux gate collected workspace failure regression");
+    assert!(
+        !output.status.success(),
+        "a collected workspace failure incorrectly passed the Linux gate"
+    );
+    for marker in [
+        "blockd-installed",
+        "root-control-test-list-ran",
+        "root-control-tests-ran",
+        "focused-systemd-test-list-ran",
+        "focused-systemd-test-ran",
+    ] {
+        assert!(
+            state.join(marker).exists(),
+            "workspace failure skipped independent privileged evidence {marker}"
+        );
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Linux quality stage failures: tests(exit=1)"));
+    assert!(stderr.contains("Linux quality stage failed: workspace (exit 1)"));
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_quality_gate_never_uses_artifacts_after_the_current_workspace_build_failed() {
+    let fixture = tempfile::tempdir().expect("Linux gate failed-build fixture");
+    let fake_bin = fixture.path().join("bin");
+    let state = fixture.path().join("state");
+    std::fs::create_dir_all(&state).expect("create fake Docker state");
+    install_linux_gate_fake_cli(&fake_bin);
+
+    let output = linux_gate_command(&fake_bin, &state, "workspace-build-failure")
+        .output()
+        .expect("run Linux gate failed-build regression");
+    assert!(
+        !output.status.success(),
+        "a failed current-source build incorrectly passed the Linux gate"
+    );
+    for marker in [
+        "blockd-installed",
+        "root-control-test-list-ran",
+        "root-control-tests-ran",
+        "focused-systemd-test-list-ran",
+        "focused-systemd-test-ran",
+    ] {
+        assert!(
+            !state.join(marker).exists(),
+            "failed current-source build exposed stale privileged artifact {marker}"
         );
     }
 }
@@ -2388,8 +2496,7 @@ fn linux_quality_gate_rejects_an_empty_focused_systemd_test_filter() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr
-            .contains("focused Linux Runtime E2E test inventory was not the exact known positive"),
+        stderr.contains("privileged Node test inventory was not the exact known positive"),
         "the empty exact test filter was not diagnosed:\n{stderr}"
     );
     for resource in [
@@ -2449,10 +2556,10 @@ fn linux_quality_gate_cleans_exact_resources_when_focused_test_inventory_times_o
     }
     let trace = std::fs::read_to_string(state.join("trace")).expect("fake Docker trace");
     let bounded_list = format!(
-        "exec cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN} timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-node-agent --lib --locked"
+        "exec cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN} timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-node-agent --lib --all-features --locked"
     );
     assert!(
-        trace.contains(&bounded_list) && trace.contains("-- --ignored --exact --list"),
+        trace.contains(&bounded_list) && trace.contains("-- --ignored --list"),
         "the timeout regression did not preserve the in-container Cargo deadline:\n{trace}"
     );
     let systemd_id = format!("owned-cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}-id");
@@ -2773,7 +2880,45 @@ printf 'args=%s\n' "$*" >> "$CATS_QUALITY_CAPTURE"
         .find_map(|line| line.strip_prefix("path="))
         .expect("PATH capture");
     assert!(path.split(':').any(|entry| entry == "/usr/sbin"));
-    assert!(captured.contains("args=test --workspace --locked -- --test-threads=4\n"));
+    assert!(
+        captured.contains("args=test --workspace --locked --no-fail-fast -- --test-threads=4\n")
+    );
+}
+
+#[test]
+fn quality_gates_collect_all_independent_stage_failures() {
+    let quality = read_workspace_file("scripts/quality.sh");
+    let linux = read_workspace_file("scripts/linux-gate.sh");
+
+    assert!(quality.contains("run_collected_gates \\\n"));
+    for stage in [
+        "fmt run_fmt",
+        "skills run_skills",
+        "release-images run_release_images",
+        "dependencies run_deps",
+        "check run_check",
+        "build run_build",
+        "clippy run_clippy",
+        "tests run_test",
+        "rustdoc run_doc",
+    ] {
+        assert!(
+            quality.contains(stage),
+            "full gate lost collected stage {stage}"
+        );
+    }
+    assert!(quality.contains("QUALITY_FAILURES+=("));
+    assert!(quality.contains("quality stage failures"));
+    assert!(quality.contains("cargo test --workspace --locked --no-fail-fast"));
+
+    assert!(linux.contains("run_linux_stage check cargo check"));
+    assert!(linux.contains("--locked --keep-going --target-dir"));
+    assert!(linux.contains("run_linux_stage tests cargo test"));
+    assert!(linux.contains("--locked --no-fail-fast --target-dir"));
+    assert!(linux.contains("Linux quality stage failures:"));
+    assert!(linux.contains("collect_gate_failure workspace"));
+    assert!(linux.contains("collect_gate_failure root-control-inventory"));
+    assert!(linux.contains("collect_gate_failure node-privileged-inventory"));
 }
 
 #[test]
@@ -4119,7 +4264,6 @@ fn manual_release_builder_verifies_all_final_artifacts_and_writes_one_receipt() 
         "--input-file \"old_host_positive_stop=$source_root/deploy/aws/old-host-positive-stop.py\"",
         "--input-file \"production_mutation_admission_operator=$source_root/deploy/aws/production-mutation-admission.py\"",
         "--input-file \"production_cutover_proof_set=$source_root/deploy/aws/production_cutover_proof_set.py\"",
-        "--input-file \"qualification_catalog=$source_root/deploy/metal/runtime-cutover-e2e-catalog.v1.json\"",
         "--input-file \"route_v2_control_rollout_operator=$source_root/deploy/aws/terraform/qualification/tools/apply_route_v2_control_rollout_plan.py\"",
         "--input-file \"route_v2_control_rollout_plan_validator=$source_root/deploy/aws/terraform/qualification/tools/validate_route_v2_control_rollout_plan.py\"",
         "--input-file \"route_v2_control_rollout_receipt_signer=$worker_root/cats\"",
@@ -4410,13 +4554,13 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
         .find("route_v2_install_state=\"$(cats_classify_route_v2_node_r1")
         .map(|offset| deployment_lock + offset)
         .expect("exact Route v2 classification under the Host lock");
-    let locked_metering = terraform[exact_classification..]
-        .find("metering_root=\"$(cats_worker_metering_root cats-worker)\"")
+    let locked_cgroup = terraform[exact_classification..]
+        .find("cgroup_v2_root=\"$(cats_worker_cgroup_v2_root)\"")
         .map(|offset| exact_classification + offset)
-        .expect("metering cgroup recomputation under the Host lock");
-    let locked_idle_guard = terraform[locked_metering..]
+        .expect("cgroup-v2 root recomputation under the Host lock");
+    let locked_idle_guard = terraform[locked_cgroup..]
         .find("require-idle-worker.sh\"")
-        .map(|offset| locked_metering + offset)
+        .map(|offset| locked_cgroup + offset)
         .expect("physical idle recheck under the Host lock");
     let stop = terraform[locked_idle_guard..]
         .find("cats_gate_node_service cats-worker")
@@ -4453,10 +4597,10 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
     );
     assert!(
         route_v2_validate < deployment_lock
-            && deployment_lock < locked_metering
+            && deployment_lock < locked_cgroup
             && deployment_lock < exact_classification
-            && exact_classification < locked_metering
-            && locked_metering < locked_idle_guard
+            && exact_classification < locked_cgroup
+            && locked_cgroup < locked_idle_guard
             && locked_idle_guard < stop
             && stop < prepare
             && prepare < first_install

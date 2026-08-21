@@ -1,51 +1,37 @@
 //! Closed row codecs for covered product mutations.
 
-use std::collections::BTreeMap;
-
 use cats_api::production_mutation_admission::ProductionQualificationProductInventoryCounts;
-use cats_api::runtime_reconciliation::{
-    decode_desired_runtime_spec, decode_operation, encode_desired_runtime_spec, encode_operation,
-    DesiredRuntimeSpec, Epoch, Generation, Hostname, Id, Operation, OperationPhase,
-    OperationTerminal, Revision, RuntimeTarget, Sha256Digest, UnixMillis, WireU64,
+use cats_api::runtime_lifecycle_volume::{
+    encode_persistent_initialization_commit_receipt,
+    persistent_initialization_commit_receipt_digest,
 };
+use cats_api::runtime_reconciliation::{Generation, Id, Sha256Digest, UnixMillis, WireU64};
 use cats_storage::authority::{remote_head_is_valid, AuthorityError, VolumeDurability};
 use postgres::{Row, Transaction};
 use serde::{de::DeserializeOwned, Serialize};
 
 use super::pg_codec::{PgBigInt, SizeBytes};
 use super::product::{
-    ApiIdempotencyRequest, ApiIdempotencyResult, CatRecord, DesiredMutationRowCapability,
-    DiskAdminState, DiskRecord, DiskRole, DiskSnapshotRecord, EndpointRecord, ExactContentType,
-    HostnameDesiredLookup, PersistentDiskInitialization, RuntimeOperationRead,
+    ApiIdempotencyRequest, ApiIdempotencyResult, CatRecord, DiskAdminState, DiskRecord, DiskRole,
+    DiskSnapshotRecord, ExactContentType, PersistentDiskInitialization,
 };
 use crate::store::transaction::{AuthorityTransactionError, AuthorityTxResult};
 use crate::store::{internal, Result, Store};
 
 pub(super) const CAT_COLUMNS: &str =
     "cat_id, record::text AS record_json, workspace_id, name, created_at";
-pub(super) const ENDPOINT_COLUMNS: &str = "
-    endpoint_id, record::text AS record_json, workspace_id, cat_id, name,
-    created_at";
 pub(super) const DISK_COLUMNS: &str = "
     disk_id, record::text AS record_json, workspace_id, name, volume_id,
     size_bytes, durability, created_at, admin_state, delete_id, role_kind,
     root_cat_id, initialization_kind, initialization_token, filesystem_uuid,
     expected_blank_generation, expected_blank_root_hash,
     expected_blank_root_object_id, initialized_generation,
-    initialized_root_hash, initialized_root_object_id, initialized_at";
+    initialized_root_hash, initialized_root_object_id, initialized_at,
+    initialization_commit_receipt_bytes,
+    initialization_commit_receipt_digest";
 const DISK_SNAPSHOT_COLUMNS: &str = "
     snapshot_id, record::text AS record_json, disk_id, volume_id, size_bytes,
     head_generation, head_root_hash, head_root_object_id, created_at";
-pub(super) const DESIRED_COLUMNS: &str = "
-    cat_id, record::text AS record_json, workspace_id, desired_revision,
-    spec_digest, target, node_id, placement_epoch";
-const HOSTNAME_LOOKUP_COLUMNS: &str = "
-    hostname, record::text AS record_json, workspace_id, cat_id, endpoint_id,
-    desired_revision";
-const OPERATION_COLUMNS: &str = "
-    operation_id, record::text AS record_json, workspace_id, cat_id,
-    desired_revision, desired_spec_digest, node_id, placement_epoch, target,
-    phase, terminal_kind, created_at, updated_at";
 const API_RESULT_COLUMNS: &str = "
     authenticated_workspace_id, canonical_route, idempotency_key,
     request_fingerprint, http_status, content_type, response_body, created_at";
@@ -79,68 +65,6 @@ impl CatProjection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct EndpointProjection {
-    endpoint_id: String,
-    workspace_id: String,
-    cat_id: String,
-    name: String,
-    created_at: UnixMillis,
-}
-
-impl EndpointProjection {
-    fn from_record(record: &EndpointRecord) -> Self {
-        Self {
-            endpoint_id: record.endpoint_id.to_string(),
-            workspace_id: record.workspace_id.to_string(),
-            cat_id: record.cat_id.to_string(),
-            name: record.name.to_string(),
-            created_at: record.created_at,
-        }
-    }
-
-    fn from_row(row: &Row) -> AuthorityTxResult<Self> {
-        Ok(Self {
-            endpoint_id: row.try_get("endpoint_id")?,
-            workspace_id: row.try_get("workspace_id")?,
-            cat_id: row.try_get("cat_id")?,
-            name: row.try_get("name")?,
-            created_at: from_pg(row.try_get("created_at")?)?,
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HostnameLookupProjection {
-    hostname: String,
-    workspace_id: String,
-    cat_id: String,
-    endpoint_id: String,
-    desired_revision: Revision,
-}
-
-impl HostnameLookupProjection {
-    fn from_record(record: &HostnameDesiredLookup) -> Self {
-        Self {
-            hostname: record.hostname.to_string(),
-            workspace_id: record.workspace_id.to_string(),
-            cat_id: record.cat_id.to_string(),
-            endpoint_id: record.endpoint_id.to_string(),
-            desired_revision: record.desired_revision,
-        }
-    }
-
-    fn from_row(row: &Row) -> AuthorityTxResult<Self> {
-        Ok(Self {
-            hostname: row.try_get("hostname")?,
-            workspace_id: row.try_get("workspace_id")?,
-            cat_id: row.try_get("cat_id")?,
-            endpoint_id: row.try_get("endpoint_id")?,
-            desired_revision: from_pg(row.try_get("desired_revision")?)?,
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct DiskProjection {
     disk_id: String,
     workspace_id: String,
@@ -163,6 +87,8 @@ struct DiskProjection {
     initialized_root_hash: Option<String>,
     initialized_root_object_id: Option<String>,
     initialized_at: Option<UnixMillis>,
+    initialization_commit_receipt_bytes: Option<Vec<u8>>,
+    initialization_commit_receipt_digest: Option<String>,
 }
 
 impl DiskProjection {
@@ -185,10 +111,12 @@ impl DiskProjection {
             expected_blank_head,
             initialized_head,
             initialized_at,
+            initialization_commit,
         ) = match &record.role {
             DiskRole::Root { cat_id } => (
                 "root",
                 Some(cat_id.to_string()),
+                None,
                 None,
                 None,
                 None,
@@ -210,6 +138,7 @@ impl DiskProjection {
                     Some(expected_blank_head),
                     None,
                     None,
+                    None,
                 ),
                 PersistentDiskInitialization::Initialized {
                     initialization_token,
@@ -217,6 +146,7 @@ impl DiskProjection {
                     expected_blank_head,
                     initialized_head,
                     initialized_at,
+                    commit,
                 } => (
                     "persistent",
                     None,
@@ -226,9 +156,21 @@ impl DiskProjection {
                     Some(expected_blank_head),
                     Some(initialized_head),
                     Some(*initialized_at),
+                    Some(commit.as_ref()),
                 ),
             },
         };
+        let (initialization_commit_receipt_bytes, initialization_commit_receipt_digest) =
+            match initialization_commit {
+                Some(commit) => (
+                    Some(
+                        encode_persistent_initialization_commit_receipt(&commit.receipt)
+                            .map_err(corrupt)?,
+                    ),
+                    Some(commit.receipt_digest.to_string()),
+                ),
+                None => (None, None),
+            };
         Ok(Self {
             disk_id: record.disk_id.to_string(),
             workspace_id: record.workspace_id.to_string(),
@@ -255,6 +197,8 @@ impl DiskProjection {
             initialized_root_object_id: initialized_head
                 .and_then(|head| head.root_object_id.as_ref().map(ToString::to_string)),
             initialized_at,
+            initialization_commit_receipt_bytes,
+            initialization_commit_receipt_digest,
         })
     }
 
@@ -286,6 +230,10 @@ impl DiskProjection {
             initialized_root_hash: row.try_get("initialized_root_hash")?,
             initialized_root_object_id: row.try_get("initialized_root_object_id")?,
             initialized_at: optional_from_pg(row.try_get("initialized_at")?)?,
+            initialization_commit_receipt_bytes: row
+                .try_get("initialization_commit_receipt_bytes")?,
+            initialization_commit_receipt_digest: row
+                .try_get("initialization_commit_receipt_digest")?,
         })
     }
 }
@@ -331,149 +279,11 @@ impl DiskSnapshotProjection {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DesiredProjection {
-    cat_id: String,
-    workspace_id: String,
-    desired_revision: Revision,
-    spec_digest: String,
-    target: String,
-    node_id: String,
-    placement_epoch: Epoch,
-}
-
-impl DesiredProjection {
-    fn from_record(record: &DesiredRuntimeSpec) -> AuthorityTxResult<Self> {
-        encode_desired_runtime_spec(record).map_err(corrupt)?;
-        Ok(Self {
-            cat_id: record.cat_id.to_string(),
-            workspace_id: record.workspace_id.to_string(),
-            desired_revision: record.desired_revision,
-            spec_digest: record.spec_digest.to_string(),
-            target: target_text(record.target).to_owned(),
-            node_id: record.placement.node_id.to_string(),
-            placement_epoch: record.placement.placement_epoch,
-        })
-    }
-
-    fn from_row(row: &Row) -> AuthorityTxResult<Self> {
-        Ok(Self {
-            cat_id: row.try_get("cat_id")?,
-            workspace_id: row.try_get("workspace_id")?,
-            desired_revision: from_pg(row.try_get("desired_revision")?)?,
-            spec_digest: parse_digest(row.try_get("spec_digest")?)?.to_string(),
-            target: closed_text(
-                row.try_get("target")?,
-                &["running", "suspended", "warm", "cold", "deleted"],
-            )?
-            .to_owned(),
-            node_id: row.try_get("node_id")?,
-            placement_epoch: from_pg(row.try_get("placement_epoch")?)?,
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct OperationProjection {
-    operation_id: String,
-    workspace_id: String,
-    cat_id: String,
-    desired_revision: Revision,
-    desired_spec_digest: String,
-    node_id: String,
-    placement_epoch: Epoch,
-    target: String,
-    phase: String,
-    terminal_kind: Option<String>,
-    created_at: UnixMillis,
-    updated_at: UnixMillis,
-}
-
-impl OperationProjection {
-    fn from_record(record: &Operation) -> AuthorityTxResult<Self> {
-        encode_operation(record).map_err(corrupt)?;
-        Ok(Self {
-            operation_id: record.operation_id.to_string(),
-            workspace_id: record.workspace_id.to_string(),
-            cat_id: record.cat_id.to_string(),
-            desired_revision: record.desired_revision,
-            desired_spec_digest: record.desired_spec_digest.to_string(),
-            node_id: record.placement.node_id.to_string(),
-            placement_epoch: record.placement.placement_epoch,
-            target: target_text(record.target).to_owned(),
-            phase: phase_text(record.phase).to_owned(),
-            terminal_kind: terminal_text(record.terminal.as_ref()).map(str::to_owned),
-            created_at: record.created_at_unix_ms,
-            updated_at: record.updated_at_unix_ms,
-        })
-    }
-
-    fn from_row(row: &Row) -> AuthorityTxResult<Self> {
-        Ok(Self {
-            operation_id: row.try_get("operation_id")?,
-            workspace_id: row.try_get("workspace_id")?,
-            cat_id: row.try_get("cat_id")?,
-            desired_revision: from_pg(row.try_get("desired_revision")?)?,
-            desired_spec_digest: parse_digest(row.try_get("desired_spec_digest")?)?.to_string(),
-            node_id: row.try_get("node_id")?,
-            placement_epoch: from_pg(row.try_get("placement_epoch")?)?,
-            target: closed_text(
-                row.try_get("target")?,
-                &["running", "suspended", "warm", "cold", "deleted"],
-            )?
-            .to_owned(),
-            phase: closed_text(
-                row.try_get("phase")?,
-                &["pending", "succeeded", "failed", "superseded"],
-            )?
-            .to_owned(),
-            terminal_kind: row
-                .try_get::<_, Option<String>>("terminal_kind")?
-                .map(|value| closed_text(value, &["succeeded", "failed", "superseded"]))
-                .transpose()?
-                .map(str::to_owned),
-            created_at: from_pg(row.try_get("created_at")?)?,
-            updated_at: from_pg(row.try_get("updated_at")?)?,
-        })
-    }
-}
-
-pub(super) fn insert_cat(
-    transaction: &mut Transaction<'_>,
-    record: &CatRecord,
-) -> AuthorityTxResult<()> {
-    let projection = CatProjection::from_record(record);
-    let json = encode_json(record)?;
-    let created_at = projection.created_at.to_pg().map_err(corrupt)?;
-    exactly_one(transaction.execute(
-        "INSERT INTO cat_records (cat_id, record, workspace_id, name, created_at)
-         VALUES ($1, $2::TEXT::jsonb, $3, $4, $5)",
-        &[
-            &projection.cat_id,
-            &json,
-            &projection.workspace_id,
-            &projection.name,
-            &created_at,
-        ],
-    )?)
-}
-
 pub(super) fn load_cat_by_id_for_update(
     transaction: &mut Transaction<'_>,
     cat_id: &Id,
 ) -> AuthorityTxResult<Option<CatRecord>> {
     let sql = format!("SELECT {CAT_COLUMNS} FROM cat_records WHERE cat_id=$1 FOR UPDATE");
-    transaction
-        .query_opt(&sql, &[&cat_id.as_str()])?
-        .map(|row| decode_cat(&row))
-        .transpose()
-}
-
-pub(super) fn load_cat_by_id_unlocked(
-    transaction: &mut Transaction<'_>,
-    cat_id: &Id,
-) -> AuthorityTxResult<Option<CatRecord>> {
-    let sql = format!("SELECT {CAT_COLUMNS} FROM cat_records WHERE cat_id=$1");
     transaction
         .query_opt(&sql, &[&cat_id.as_str()])?
         .map(|row| decode_cat(&row))
@@ -492,91 +302,10 @@ pub(super) fn load_cat_by_name_unlocked(
         .transpose()
 }
 
-pub(super) fn load_root_disk_by_cat_unlocked(
-    transaction: &mut Transaction<'_>,
-    cat_id: &Id,
-) -> AuthorityTxResult<Option<DiskRecord>> {
-    let sql = format!(
-        "SELECT {DISK_COLUMNS} FROM disk_records
-          WHERE role_kind='root' AND root_cat_id=$1"
-    );
-    transaction
-        .query_opt(&sql, &[&cat_id.as_str()])?
-        .map(|row| decode_disk(&row))
-        .transpose()
-}
-
 pub(super) fn decode_cat(row: &Row) -> AuthorityTxResult<CatRecord> {
     let stored = CatProjection::from_row(row)?;
     let record: CatRecord = decode_json(row.try_get("record_json")?)?;
     if stored != CatProjection::from_record(&record) {
-        return Err(corrupt(()));
-    }
-    Ok(record)
-}
-
-pub(super) fn insert_endpoint(
-    transaction: &mut Transaction<'_>,
-    record: &EndpointRecord,
-) -> AuthorityTxResult<()> {
-    let projection = EndpointProjection::from_record(record);
-    let json = encode_json(record)?;
-    let created_at = projection.created_at.to_pg().map_err(corrupt)?;
-    exactly_one(transaction.execute(
-        "INSERT INTO endpoint_records (
-            endpoint_id, record, workspace_id, cat_id, name, created_at
-         ) VALUES ($1, $2::TEXT::jsonb, $3, $4, $5, $6)",
-        &[
-            &projection.endpoint_id,
-            &json,
-            &projection.workspace_id,
-            &projection.cat_id,
-            &projection.name,
-            &created_at,
-        ],
-    )?)
-}
-
-pub(super) fn load_endpoint_by_id_for_update(
-    transaction: &mut Transaction<'_>,
-    endpoint_id: &Id,
-) -> AuthorityTxResult<Option<EndpointRecord>> {
-    let sql =
-        format!("SELECT {ENDPOINT_COLUMNS} FROM endpoint_records WHERE endpoint_id=$1 FOR UPDATE");
-    transaction
-        .query_opt(&sql, &[&endpoint_id.as_str()])?
-        .map(|row| decode_endpoint(&row))
-        .transpose()
-}
-
-pub(super) fn load_endpoint_by_id_unlocked(
-    transaction: &mut Transaction<'_>,
-    endpoint_id: &Id,
-) -> AuthorityTxResult<Option<EndpointRecord>> {
-    let sql = format!("SELECT {ENDPOINT_COLUMNS} FROM endpoint_records WHERE endpoint_id=$1");
-    transaction
-        .query_opt(&sql, &[&endpoint_id.as_str()])?
-        .map(|row| decode_endpoint(&row))
-        .transpose()
-}
-
-pub(super) fn load_endpoint_by_cat_name_unlocked(
-    transaction: &mut Transaction<'_>,
-    cat_id: &Id,
-    name: &Id,
-) -> AuthorityTxResult<Option<EndpointRecord>> {
-    let sql =
-        format!("SELECT {ENDPOINT_COLUMNS} FROM endpoint_records WHERE cat_id=$1 AND name=$2");
-    transaction
-        .query_opt(&sql, &[&cat_id.as_str(), &name.as_str()])?
-        .map(|row| decode_endpoint(&row))
-        .transpose()
-}
-
-pub(super) fn decode_endpoint(row: &Row) -> AuthorityTxResult<EndpointRecord> {
-    let stored = EndpointProjection::from_row(row)?;
-    let record: EndpointRecord = decode_json(row.try_get("record_json")?)?;
-    if stored != EndpointProjection::from_record(&record) {
         return Err(corrupt(()));
     }
     Ok(record)
@@ -601,10 +330,13 @@ pub(super) fn insert_disk(
             filesystem_uuid, expected_blank_generation,
             expected_blank_root_hash, expected_blank_root_object_id,
             initialized_generation, initialized_root_hash,
-            initialized_root_object_id, initialized_at
+            initialized_root_object_id, initialized_at,
+            initialization_commit_receipt_bytes,
+            initialization_commit_receipt_digest
          ) VALUES (
             $1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-            $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
+            $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
+            $23, $24
          )",
         &[
             &projection.disk_id,
@@ -629,6 +361,8 @@ pub(super) fn insert_disk(
             &projection.initialized_root_hash,
             &projection.initialized_root_object_id,
             &initialized_at,
+            &projection.initialization_commit_receipt_bytes,
+            &projection.initialization_commit_receipt_digest,
         ],
     )?)
 }
@@ -705,7 +439,9 @@ pub(super) fn update_disk(
             filesystem_uuid=$15, expected_blank_generation=$16,
             expected_blank_root_hash=$17, expected_blank_root_object_id=$18,
             initialized_generation=$19, initialized_root_hash=$20,
-            initialized_root_object_id=$21, initialized_at=$22
+            initialized_root_object_id=$21, initialized_at=$22,
+            initialization_commit_receipt_bytes=$23,
+            initialization_commit_receipt_digest=$24
           WHERE disk_id=$1",
         &[
             &projection.disk_id,
@@ -730,23 +466,11 @@ pub(super) fn update_disk(
             &projection.initialized_root_hash,
             &projection.initialized_root_object_id,
             &initialized_at,
+            &projection.initialization_commit_receipt_bytes,
+            &projection.initialization_commit_receipt_digest,
         ],
     )?;
     exactly_one(changed)
-}
-
-pub(super) fn load_disk_by_name_for_update(
-    transaction: &mut Transaction<'_>,
-    workspace_id: &Id,
-    name: &Id,
-) -> AuthorityTxResult<Option<DiskRecord>> {
-    let sql = format!(
-        "SELECT {DISK_COLUMNS} FROM disk_records WHERE workspace_id=$1 AND name=$2 FOR UPDATE"
-    );
-    transaction
-        .query_opt(&sql, &[&workspace_id.as_str(), &name.as_str()])?
-        .map(|row| decode_disk(&row))
-        .transpose()
 }
 
 /// Bounded exact lookup used before the Volume -> Disk lock suffix for a
@@ -948,564 +672,6 @@ fn decode_disk_snapshot(row: &Row) -> AuthorityTxResult<DiskSnapshotRecord> {
     Ok(record)
 }
 
-pub(super) fn insert_desired(
-    transaction: &mut Transaction<'_>,
-    record: &DesiredRuntimeSpec,
-) -> AuthorityTxResult<()> {
-    let projection = DesiredProjection::from_record(record)?;
-    let json = String::from_utf8(encode_desired_runtime_spec(record).map_err(corrupt)?)
-        .map_err(corrupt)?;
-    let revision = projection.desired_revision.to_pg().map_err(corrupt)?;
-    let placement_epoch = projection.placement_epoch.to_pg().map_err(corrupt)?;
-    exactly_one(transaction.execute(
-        "INSERT INTO desired_runtime_specs (
-            cat_id, record, workspace_id, desired_revision, spec_digest,
-            target, node_id, placement_epoch
-         ) VALUES ($1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8)",
-        &[
-            &projection.cat_id,
-            &json,
-            &projection.workspace_id,
-            &revision,
-            &projection.spec_digest,
-            &projection.target,
-            &projection.node_id,
-            &placement_epoch,
-        ],
-    )?)
-}
-
-#[allow(
-    dead_code,
-    reason = "A1 row CAS is consumed when A2/G4 production Desired routes are composed"
-)]
-pub(super) fn replace_desired(
-    transaction: &mut Transaction<'_>,
-    _capability: &DesiredMutationRowCapability,
-    expected: &DesiredRuntimeSpec,
-    record: &DesiredRuntimeSpec,
-) -> AuthorityTxResult<bool> {
-    let expected_projection = DesiredProjection::from_record(expected)?;
-    let projection = DesiredProjection::from_record(record)?;
-    let json = String::from_utf8(encode_desired_runtime_spec(record).map_err(corrupt)?)
-        .map_err(corrupt)?;
-    let desired_revision = projection.desired_revision.to_pg().map_err(corrupt)?;
-    let placement_epoch = projection.placement_epoch.to_pg().map_err(corrupt)?;
-    let expected_revision = expected_projection
-        .desired_revision
-        .to_pg()
-        .map_err(corrupt)?;
-    let expected_placement_epoch = expected_projection
-        .placement_epoch
-        .to_pg()
-        .map_err(corrupt)?;
-    let changed = transaction.execute(
-        "UPDATE desired_runtime_specs SET
-            record=$2::TEXT::jsonb, workspace_id=$3, desired_revision=$4,
-            spec_digest=$5, target=$6, node_id=$7, placement_epoch=$8
-          WHERE cat_id=$1
-            AND workspace_id=$9
-            AND desired_revision=$10
-            AND spec_digest=$11
-            AND node_id=$12
-            AND placement_epoch=$13",
-        &[
-            &projection.cat_id,
-            &json,
-            &projection.workspace_id,
-            &desired_revision,
-            &projection.spec_digest,
-            &projection.target,
-            &projection.node_id,
-            &placement_epoch,
-            &expected_projection.workspace_id,
-            &expected_revision,
-            &expected_projection.spec_digest,
-            &expected_projection.node_id,
-            &expected_placement_epoch,
-        ],
-    )?;
-    if changed > 1 {
-        return Err(corrupt(
-            "Desired CAS update affected more than one current row",
-        ));
-    }
-    Ok(changed == 1)
-}
-
-pub(super) fn load_desired_for_update(
-    transaction: &mut Transaction<'_>,
-    cat_id: &Id,
-) -> AuthorityTxResult<Option<DesiredRuntimeSpec>> {
-    let sql =
-        format!("SELECT {DESIRED_COLUMNS} FROM desired_runtime_specs WHERE cat_id=$1 FOR UPDATE");
-    transaction
-        .query_opt(&sql, &[&cat_id.as_str()])?
-        .map(|row| decode_desired(&row))
-        .transpose()
-}
-
-pub(super) fn load_desired_unlocked(
-    transaction: &mut Transaction<'_>,
-    cat_id: &Id,
-) -> AuthorityTxResult<Option<DesiredRuntimeSpec>> {
-    let sql = format!("SELECT {DESIRED_COLUMNS} FROM desired_runtime_specs WHERE cat_id=$1");
-    transaction
-        .query_opt(&sql, &[&cat_id.as_str()])?
-        .map(|row| decode_desired(&row))
-        .transpose()
-}
-
-/// Resolves the sole current Desired that names a Disk. The Disk/Volume row
-/// lock is the serialization barrier for attach/detach callers; this lookup
-/// deliberately does not manufacture a second binding table.
-pub(super) fn load_desired_by_disk_unlocked(
-    transaction: &mut Transaction<'_>,
-    disk_id: &Id,
-) -> AuthorityTxResult<Option<DesiredRuntimeSpec>> {
-    let sql = format!(
-        "SELECT {DESIRED_COLUMNS} FROM desired_runtime_specs
-          WHERE record->'volumes' @>
-                jsonb_build_array(jsonb_build_object('disk_id', $1::text))
-          ORDER BY cat_id COLLATE \"C\" LIMIT 2"
-    );
-    let rows = transaction.query(&sql, &[&disk_id.as_str()])?;
-    if rows.len() > 1 {
-        return Err(corrupt(()));
-    }
-    let desired = rows.first().map(decode_desired).transpose()?;
-    if desired.as_ref().is_some_and(|desired| {
-        desired
-            .volumes
-            .iter()
-            .filter(|intent| intent.disk_id == *disk_id)
-            .count()
-            != 1
-    }) {
-        return Err(corrupt(()));
-    }
-    Ok(desired)
-}
-
-/// Candidate collision probe for the two identities that are globally unique
-/// in one Node's complete Desired set. Callers hold both namespaced advisory
-/// candidate locks before invoking this read.
-pub(super) fn persistent_intent_identity_exists_unlocked(
-    transaction: &mut Transaction<'_>,
-    volume_intent_id: &Id,
-    attachment_id: &Id,
-) -> AuthorityTxResult<bool> {
-    transaction
-        .query_one(
-            "SELECT
-                EXISTS (
-                    SELECT 1 FROM desired_runtime_specs
-                     WHERE record->'volumes' @> jsonb_build_array(
-                         jsonb_build_object('volume_intent_id', $1::text)
-                     )
-                ) OR EXISTS (
-                    SELECT 1 FROM desired_runtime_specs
-                     WHERE record->'volumes' @> jsonb_build_array(
-                         jsonb_build_object('attachment_id', $2::text)
-                     )
-                ) AS present",
-            &[&volume_intent_id.as_str(), &attachment_id.as_str()],
-        )
-        .map(|row| row.get("present"))
-        .map_err(Into::into)
-}
-
-/// Looks up the globally unique Guest network identity without introducing a
-/// second scheduler/lease table. Callers use one repeatable-read planner
-/// snapshot or hold the matching candidate advisory lock in a mutation.
-pub(super) fn load_desired_by_network_id_unlocked(
-    transaction: &mut Transaction<'_>,
-    network_id: &Id,
-) -> AuthorityTxResult<Option<DesiredRuntimeSpec>> {
-    let sql = format!(
-        "SELECT {DESIRED_COLUMNS} FROM desired_runtime_specs
-          WHERE record->'runtime'->'network_config'->>'network_id'=$1
-          ORDER BY cat_id COLLATE \"C\" LIMIT 2"
-    );
-    let rows = transaction.query(&sql, &[&network_id.as_str()])?;
-    if rows.len() > 1 {
-        return Err(corrupt(()));
-    }
-    let desired = rows.first().map(decode_desired).transpose()?;
-    if desired
-        .as_ref()
-        .is_some_and(|desired| desired.runtime.network_config.network_id != *network_id)
-    {
-        return Err(corrupt(()));
-    }
-    Ok(desired)
-}
-
-pub(super) fn decode_desired(row: &Row) -> AuthorityTxResult<DesiredRuntimeSpec> {
-    let stored = DesiredProjection::from_row(row)?;
-    let json: String = row.try_get("record_json")?;
-    let record = decode_desired_runtime_spec(json.as_bytes()).map_err(corrupt)?;
-    if stored != DesiredProjection::from_record(&record)? {
-        return Err(corrupt(()));
-    }
-    Ok(record)
-}
-
-pub(super) fn load_assigned_desired_for_update(
-    transaction: &mut Transaction<'_>,
-    node_id: &Id,
-) -> AuthorityTxResult<Vec<DesiredRuntimeSpec>> {
-    let sql = format!(
-        "SELECT {DESIRED_COLUMNS} FROM desired_runtime_specs
-          WHERE node_id=$1 OR record->'placement'->>'node_id'=$1
-          ORDER BY cat_id COLLATE \"C\" FOR UPDATE"
-    );
-    transaction
-        .query(&sql, &[&node_id.as_str()])?
-        .iter()
-        .map(decode_desired)
-        .collect()
-}
-
-#[allow(dead_code, reason = "used by the gated C3 batch authority")]
-pub(super) fn load_assigned_desired_for_update_bounded(
-    transaction: &mut Transaction<'_>,
-    node_id: &Id,
-    limit: usize,
-) -> AuthorityTxResult<Vec<DesiredRuntimeSpec>> {
-    let limit = i64::try_from(limit).map_err(corrupt)?;
-    let sql = format!(
-        "SELECT {DESIRED_COLUMNS} FROM desired_runtime_specs
-          WHERE node_id=$1 OR record->'placement'->>'node_id'=$1
-          ORDER BY cat_id COLLATE \"C\" LIMIT $2 FOR UPDATE"
-    );
-    transaction
-        .query(&sql, &[&node_id.as_str(), &limit])?
-        .iter()
-        .map(decode_desired)
-        .collect()
-}
-
-pub(super) fn load_assigned_desired_unlocked(
-    transaction: &mut Transaction<'_>,
-    node_id: &Id,
-    limit: usize,
-) -> AuthorityTxResult<Vec<DesiredRuntimeSpec>> {
-    let limit = i64::try_from(limit).map_err(corrupt)?;
-    let sql = format!(
-        "SELECT {DESIRED_COLUMNS} FROM desired_runtime_specs
-          WHERE node_id=$1 OR record->'placement'->>'node_id'=$1
-          ORDER BY cat_id COLLATE \"C\" LIMIT $2"
-    );
-    transaction
-        .query(&sql, &[&node_id.as_str(), &limit])?
-        .iter()
-        .map(decode_desired)
-        .collect()
-}
-
-pub(super) fn insert_hostname_lookup(
-    transaction: &mut Transaction<'_>,
-    record: &HostnameDesiredLookup,
-) -> AuthorityTxResult<()> {
-    let projection = HostnameLookupProjection::from_record(record);
-    let json = encode_json(record)?;
-    let desired_revision = projection.desired_revision.to_pg().map_err(corrupt)?;
-    exactly_one(transaction.execute(
-        "INSERT INTO hostname_desired_lookups (
-            hostname, record, workspace_id, cat_id, endpoint_id,
-            desired_revision
-         ) VALUES ($1, $2::TEXT::jsonb, $3, $4, $5, $6)",
-        &[
-            &projection.hostname,
-            &json,
-            &projection.workspace_id,
-            &projection.cat_id,
-            &projection.endpoint_id,
-            &desired_revision,
-        ],
-    )?)
-}
-
-pub(super) fn load_hostname_lookup_for_update(
-    transaction: &mut Transaction<'_>,
-    hostname: &Hostname,
-) -> AuthorityTxResult<Option<HostnameDesiredLookup>> {
-    let sql = format!(
-        "SELECT {HOSTNAME_LOOKUP_COLUMNS} FROM hostname_desired_lookups
-          WHERE hostname=$1 FOR UPDATE"
-    );
-    transaction
-        .query_opt(&sql, &[&hostname.as_str()])?
-        .map(|row| decode_hostname_lookup(&row))
-        .transpose()
-}
-
-pub(super) fn load_hostname_lookup_unlocked(
-    transaction: &mut Transaction<'_>,
-    hostname: &Hostname,
-) -> AuthorityTxResult<Option<HostnameDesiredLookup>> {
-    let sql =
-        format!("SELECT {HOSTNAME_LOOKUP_COLUMNS} FROM hostname_desired_lookups WHERE hostname=$1");
-    transaction
-        .query_opt(&sql, &[&hostname.as_str()])?
-        .map(|row| decode_hostname_lookup(&row))
-        .transpose()
-}
-
-pub(super) fn load_hostname_lookups_by_cat_unlocked(
-    transaction: &mut Transaction<'_>,
-    cat_id: &Id,
-) -> AuthorityTxResult<Vec<HostnameDesiredLookup>> {
-    let sql = format!(
-        "SELECT {HOSTNAME_LOOKUP_COLUMNS} FROM hostname_desired_lookups
-          WHERE cat_id=$1 ORDER BY endpoint_id"
-    );
-    transaction
-        .query(&sql, &[&cat_id.as_str()])?
-        .iter()
-        .map(decode_hostname_lookup)
-        .collect()
-}
-
-#[allow(
-    dead_code,
-    reason = "A1 row CAS is consumed when A2/G4 production Desired routes are composed"
-)]
-pub(super) fn delete_hostname_lookups_by_cat(
-    transaction: &mut Transaction<'_>,
-    _capability: &DesiredMutationRowCapability,
-    cat_id: &Id,
-) -> AuthorityTxResult<u64> {
-    transaction
-        .execute(
-            "DELETE FROM hostname_desired_lookups WHERE cat_id=$1",
-            &[&cat_id.as_str()],
-        )
-        .map_err(AuthorityTransactionError::from)
-}
-
-fn decode_hostname_lookup(row: &Row) -> AuthorityTxResult<HostnameDesiredLookup> {
-    let stored = HostnameLookupProjection::from_row(row)?;
-    let record: HostnameDesiredLookup = decode_json(row.try_get("record_json")?)?;
-    if stored != HostnameLookupProjection::from_record(&record) {
-        return Err(corrupt(()));
-    }
-    Ok(record)
-}
-
-pub(super) fn insert_operation(
-    transaction: &mut Transaction<'_>,
-    record: &Operation,
-) -> AuthorityTxResult<()> {
-    let projection = OperationProjection::from_record(record)?;
-    let json = String::from_utf8(encode_operation(record).map_err(corrupt)?).map_err(corrupt)?;
-    let revision = projection.desired_revision.to_pg().map_err(corrupt)?;
-    let placement_epoch = projection.placement_epoch.to_pg().map_err(corrupt)?;
-    let created_at = projection.created_at.to_pg().map_err(corrupt)?;
-    let updated_at = projection.updated_at.to_pg().map_err(corrupt)?;
-    exactly_one(transaction.execute(
-        "INSERT INTO runtime_operations (
-            operation_id, record, workspace_id, cat_id, desired_revision,
-            desired_spec_digest, node_id, placement_epoch, target, phase,
-            terminal_kind, created_at, updated_at
-         ) VALUES (
-            $1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-            $12, $13
-         )",
-        &[
-            &projection.operation_id,
-            &json,
-            &projection.workspace_id,
-            &projection.cat_id,
-            &revision,
-            &projection.desired_spec_digest,
-            &projection.node_id,
-            &placement_epoch,
-            &projection.target,
-            &projection.phase,
-            &projection.terminal_kind,
-            &created_at,
-            &updated_at,
-        ],
-    )?)
-}
-
-pub(super) fn load_operation_for_update(
-    transaction: &mut Transaction<'_>,
-    operation_id: &Id,
-) -> AuthorityTxResult<Option<Operation>> {
-    let sql = format!(
-        "SELECT {OPERATION_COLUMNS} FROM runtime_operations WHERE operation_id=$1 FOR UPDATE"
-    );
-    transaction
-        .query_opt(&sql, &[&operation_id.as_str()])?
-        .map(|row| decode_operation_row(&row))
-        .transpose()
-}
-
-pub(super) fn load_operation_unlocked(
-    transaction: &mut Transaction<'_>,
-    operation_id: &Id,
-) -> AuthorityTxResult<Option<Operation>> {
-    let sql = format!("SELECT {OPERATION_COLUMNS} FROM runtime_operations WHERE operation_id=$1");
-    transaction
-        .query_opt(&sql, &[&operation_id.as_str()])?
-        .map(|row| decode_operation_row(&row))
-        .transpose()
-}
-
-pub(super) fn load_operation_by_workspace_unlocked(
-    store: &Store,
-    workspace_id: &Id,
-    operation_id: &Id,
-) -> Result<RuntimeOperationRead> {
-    let sql = operation_by_workspace_candidates_sql();
-    let rows = store
-        .with(|client| client.query(&sql, &[&workspace_id.as_str(), &operation_id.as_str()]))?;
-    if rows.len() > 1 {
-        return Ok(RuntimeOperationRead::Corrupt);
-    }
-    let Some(row) = rows.first() else {
-        return Ok(RuntimeOperationRead::NotFound);
-    };
-    let Ok(operation) = decode_operation_row(row) else {
-        return Ok(RuntimeOperationRead::Corrupt);
-    };
-    if operation.workspace_id != *workspace_id || operation.operation_id != *operation_id {
-        return Ok(RuntimeOperationRead::Corrupt);
-    }
-    Ok(RuntimeOperationRead::Found(Box::new(operation)))
-}
-
-/// Find every bounded row that can claim the workspace-qualified Operation
-/// key through either its scalar or canonical JSON projection. The four
-/// branches are deliberately disjoint: each has its own exact two-key index
-/// and reads at most two rows, so duplicate corruption cannot turn this API
-/// into an unbounded scan.
-pub(super) fn operation_by_workspace_candidates_sql() -> String {
-    format!(
-        "(SELECT {OPERATION_COLUMNS} FROM runtime_operations
-           WHERE workspace_id COLLATE \"C\"=$1 AND operation_id COLLATE \"C\"=$2
-           LIMIT 2)
-         UNION ALL
-         (SELECT {OPERATION_COLUMNS} FROM runtime_operations
-           WHERE workspace_id COLLATE \"C\"=$1
-             AND (record->>'operation_id') COLLATE \"C\"=$2
-             AND operation_id COLLATE \"C\"<>$2
-             AND operation_id COLLATE \"C\" IS DISTINCT FROM
-                 (record->>'operation_id') COLLATE \"C\"
-           LIMIT 2)
-         UNION ALL
-         (SELECT {OPERATION_COLUMNS} FROM runtime_operations
-           WHERE (record->>'workspace_id') COLLATE \"C\"=$1
-             AND operation_id COLLATE \"C\"=$2
-             AND workspace_id COLLATE \"C\"<>$1
-             AND workspace_id COLLATE \"C\" IS DISTINCT FROM
-                 (record->>'workspace_id') COLLATE \"C\"
-           LIMIT 2)
-         UNION ALL
-         (SELECT {OPERATION_COLUMNS} FROM runtime_operations
-           WHERE (record->>'workspace_id') COLLATE \"C\"=$1
-             AND (record->>'operation_id') COLLATE \"C\"=$2
-             AND workspace_id COLLATE \"C\"<>$1
-             AND operation_id COLLATE \"C\"<>$2
-             AND workspace_id COLLATE \"C\" IS DISTINCT FROM
-                 (record->>'workspace_id') COLLATE \"C\"
-             AND operation_id COLLATE \"C\" IS DISTINCT FROM
-                 (record->>'operation_id') COLLATE \"C\"
-           LIMIT 2)"
-    )
-}
-
-pub(super) fn load_operation_by_cat_revision_unlocked(
-    transaction: &mut Transaction<'_>,
-    cat_id: &Id,
-    revision: Revision,
-) -> AuthorityTxResult<Option<Operation>> {
-    let sql = format!(
-        "SELECT {OPERATION_COLUMNS} FROM runtime_operations
-          WHERE cat_id=$1 AND desired_revision=$2"
-    );
-    let revision = revision.to_pg().map_err(corrupt)?;
-    transaction
-        .query_opt(&sql, &[&cat_id.as_str(), &revision])?
-        .map(|row| decode_operation_row(&row))
-        .transpose()
-}
-
-#[allow(
-    dead_code,
-    reason = "A1 row CAS is consumed when A2/G4 production Desired routes are composed"
-)]
-pub(super) fn load_operation_by_cat_revision_for_update(
-    transaction: &mut Transaction<'_>,
-    _capability: &DesiredMutationRowCapability,
-    cat_id: &Id,
-    revision: Revision,
-) -> AuthorityTxResult<Option<Operation>> {
-    let sql = format!(
-        "SELECT {OPERATION_COLUMNS} FROM runtime_operations
-          WHERE cat_id=$1 AND desired_revision=$2 FOR UPDATE"
-    );
-    let revision = revision.to_pg().map_err(corrupt)?;
-    transaction
-        .query_opt(&sql, &[&cat_id.as_str(), &revision])?
-        .map(|row| decode_operation_row(&row))
-        .transpose()
-}
-
-pub(super) fn load_pending_operation_by_cat_for_update(
-    transaction: &mut Transaction<'_>,
-    cat_id: &Id,
-) -> AuthorityTxResult<Option<Operation>> {
-    let sql = format!(
-        "SELECT {OPERATION_COLUMNS} FROM runtime_operations
-          WHERE cat_id=$1 AND phase='pending' FOR UPDATE"
-    );
-    transaction
-        .query_opt(&sql, &[&cat_id.as_str()])?
-        .map(|row| decode_operation_row(&row))
-        .transpose()
-}
-
-pub(super) fn update_operation(
-    transaction: &mut Transaction<'_>,
-    record: &Operation,
-) -> AuthorityTxResult<()> {
-    let projection = OperationProjection::from_record(record)?;
-    let json = String::from_utf8(encode_operation(record).map_err(corrupt)?).map_err(corrupt)?;
-    let updated_at = projection.updated_at.to_pg().map_err(corrupt)?;
-    let changed = transaction.execute(
-        "UPDATE runtime_operations SET
-            record=$2::TEXT::jsonb, phase=$3, terminal_kind=$4, updated_at=$5
-          WHERE operation_id=$1",
-        &[
-            &projection.operation_id,
-            &json,
-            &projection.phase,
-            &projection.terminal_kind,
-            &updated_at,
-        ],
-    )?;
-    if changed != 1 {
-        return Err(corrupt(
-            "runtime Operation update affected an unexpected row count",
-        ));
-    }
-    Ok(())
-}
-
-fn decode_operation_row(row: &Row) -> AuthorityTxResult<Operation> {
-    let stored = OperationProjection::from_row(row)?;
-    let json: String = row.try_get("record_json")?;
-    let record = decode_operation(json.as_bytes()).map_err(corrupt)?;
-    if stored != OperationProjection::from_record(&record)? {
-        return Err(corrupt(()));
-    }
-    Ok(record)
-}
-
 /// Decode the complete clean-slate product graph and return the exact current
 /// projection for one qualification Workspace.  This deliberately has no
 /// pagination or client-side list composition: one repeatable-read caller
@@ -1514,204 +680,51 @@ pub(super) fn qualification_product_inventory_counts(
     transaction: &mut Transaction<'_>,
     workspace_id: &Id,
 ) -> AuthorityTxResult<ProductionQualificationProductInventoryCounts> {
-    let cat_sql = format!("SELECT {CAT_COLUMNS} FROM cat_records ORDER BY cat_id COLLATE \"C\"");
-    let cats = transaction
-        .query(&cat_sql, &[])?
-        .iter()
-        .map(decode_cat)
-        .collect::<AuthorityTxResult<Vec<_>>>()?;
-    let cats = cats
-        .into_iter()
-        .filter(|record| record.workspace_id == *workspace_id)
-        .map(|record| (record.cat_id.to_string(), record))
-        .collect::<BTreeMap<_, _>>();
-
-    let desired_sql = format!(
-        "SELECT {DESIRED_COLUMNS} FROM desired_runtime_specs ORDER BY cat_id COLLATE \"C\""
-    );
-    let desired = transaction
-        .query(&desired_sql, &[])?
-        .iter()
-        .map(decode_desired)
-        .collect::<AuthorityTxResult<Vec<_>>>()?;
-    let desired = desired
-        .into_iter()
-        .filter(|record| record.workspace_id == *workspace_id)
-        .map(|record| (record.cat_id.to_string(), record))
-        .collect::<BTreeMap<_, _>>();
-    if cats.keys().ne(desired.keys()) {
-        return Err(corrupt(
-            "qualification product inventory found a Cat/Desired projection gap",
-        ));
-    }
-    let current_cat_count = desired
-        .values()
-        .filter(|record| record.target != RuntimeTarget::Deleted)
-        .count();
-    let deleted_cat_tombstone_count = desired.len().saturating_sub(current_cat_count);
-
-    let disk_sql =
-        format!("SELECT {DISK_COLUMNS} FROM disk_records ORDER BY disk_id COLLATE \"C\"");
-    let disks = transaction
-        .query(&disk_sql, &[])?
-        .iter()
-        .map(decode_disk)
-        .collect::<AuthorityTxResult<Vec<_>>>()?;
-    let disks = disks
-        .into_iter()
-        .filter(|record| record.workspace_id == *workspace_id)
-        .map(|record| (record.disk_id.to_string(), record))
-        .collect::<BTreeMap<_, _>>();
-    let mut root_disk_count = 0_usize;
-    let mut persistent_disk_count = 0_usize;
-    for disk in disks.values() {
-        match &disk.role {
-            DiskRole::Root { cat_id } => {
-                if !cats.contains_key(cat_id.as_str()) {
-                    return Err(corrupt(
-                        "qualification product inventory found an orphan RootDisk",
-                    ));
-                }
-                root_disk_count += 1;
-            }
-            DiskRole::Persistent { .. } => persistent_disk_count += 1,
-        }
-    }
-
-    let snapshot_sql = format!(
-        "SELECT {DISK_SNAPSHOT_COLUMNS} FROM disk_snapshot_records
-          ORDER BY snapshot_id COLLATE \"C\""
-    );
-    let snapshots = transaction
-        .query(&snapshot_sql, &[])?
-        .iter()
-        .map(decode_disk_snapshot)
-        .collect::<AuthorityTxResult<Vec<_>>>()?;
-    let mut disk_snapshot_count = 0_usize;
-    for snapshot in snapshots {
-        let Some(disk) = disks.get(snapshot.disk_id.as_str()) else {
-            continue;
-        };
-        if snapshot.volume_id != disk.volume_id || snapshot.size_bytes != disk.size_bytes {
-            return Err(corrupt(
-                "qualification product inventory found a rebound DiskSnapshot",
-            ));
-        }
-        disk_snapshot_count += 1;
-    }
-
-    let endpoint_sql = format!(
-        "SELECT {ENDPOINT_COLUMNS} FROM endpoint_records ORDER BY endpoint_id COLLATE \"C\""
-    );
-    let endpoints = transaction
-        .query(&endpoint_sql, &[])?
-        .iter()
-        .map(decode_endpoint)
-        .collect::<AuthorityTxResult<Vec<_>>>()?;
-    let endpoints = endpoints
-        .into_iter()
-        .filter(|record| record.workspace_id == *workspace_id)
-        .map(|record| (record.endpoint_id.to_string(), record))
-        .collect::<BTreeMap<_, _>>();
-    if endpoints
-        .values()
-        .any(|endpoint| !cats.contains_key(endpoint.cat_id.as_str()))
-    {
-        return Err(corrupt(
-            "qualification product inventory found an orphan Endpoint",
-        ));
-    }
-
-    let hostname_sql = format!(
-        "SELECT {HOSTNAME_LOOKUP_COLUMNS} FROM hostname_desired_lookups
-          ORDER BY hostname COLLATE \"C\""
-    );
-    let hostname_lookups = transaction
-        .query(&hostname_sql, &[])?
-        .iter()
-        .map(decode_hostname_lookup)
-        .collect::<AuthorityTxResult<Vec<_>>>()?;
-    let hostname_lookups = hostname_lookups
-        .into_iter()
-        .filter(|record| record.workspace_id == *workspace_id)
-        .collect::<Vec<_>>();
-    for lookup in &hostname_lookups {
-        let Some(endpoint) = endpoints.get(lookup.endpoint_id.as_str()) else {
-            return Err(corrupt(
-                "qualification product inventory found an orphan hostname lookup",
-            ));
-        };
-        let Some(current) = desired.get(lookup.cat_id.as_str()) else {
-            return Err(corrupt(
-                "qualification product inventory found a hostname without Desired",
-            ));
-        };
-        if endpoint.cat_id != lookup.cat_id || current.desired_revision != lookup.desired_revision {
-            return Err(corrupt(
-                "qualification product inventory found a rebound hostname lookup",
-            ));
-        }
-    }
-
-    let operation_sql = format!(
-        "SELECT {OPERATION_COLUMNS} FROM runtime_operations
-          ORDER BY operation_id COLLATE \"C\""
-    );
-    let operations = transaction
-        .query(&operation_sql, &[])?
-        .iter()
-        .map(decode_operation_row)
-        .collect::<AuthorityTxResult<Vec<_>>>()?;
-    let operations = operations
-        .into_iter()
-        .filter(|record| record.workspace_id == *workspace_id)
-        .collect::<Vec<_>>();
-    let mut pending_runtime_operation_count = 0_usize;
-    let mut terminal_runtime_operation_history_count = 0_usize;
-    for operation in &operations {
-        let Some(current) = desired.get(operation.cat_id.as_str()) else {
-            return Err(corrupt(
-                "qualification product inventory found an orphan Runtime Operation",
-            ));
-        };
-        if operation.phase == OperationPhase::Pending {
-            if operation.desired_revision != current.desired_revision
-                || operation.desired_spec_digest != current.spec_digest
-            {
-                return Err(corrupt(
-                    "qualification product inventory found a stale pending Runtime Operation",
-                ));
-            }
-            pending_runtime_operation_count += 1;
-        } else {
-            terminal_runtime_operation_history_count += 1;
-        }
-    }
-
-    let api_idempotency_receipt_count = transaction
-        .query_one(
-            "SELECT count(*) FROM api_idempotency_results
-              WHERE authenticated_workspace_id=$1",
-            &[&workspace_id.as_str()],
-        )?
-        .try_get::<_, i64>(0)?;
-    let api_idempotency_receipt_count =
-        usize::try_from(api_idempotency_receipt_count).map_err(corrupt)?;
-
+    let row = transaction.query_one(
+        "SELECT
+            (SELECT count(*) FROM cat_records
+              WHERE workspace_id=$1 AND deleted_at IS NULL) AS current_cats,
+            (SELECT count(*) FROM cat_records
+              WHERE workspace_id=$1 AND deleted_at IS NOT NULL) AS deleted_cats,
+            (SELECT count(*) FROM disk_records
+              WHERE workspace_id=$1 AND role_kind='root') AS root_disks,
+            (SELECT count(*) FROM disk_records
+              WHERE workspace_id=$1 AND role_kind='persistent') AS persistent_disks,
+            (SELECT count(*) FROM disk_snapshot_records snapshot
+              JOIN disk_records disk ON disk.disk_id=snapshot.disk_id
+             WHERE disk.workspace_id=$1) AS disk_snapshots,
+            (SELECT count(*) FROM endpoint_records
+              WHERE workspace_id=$1) AS endpoints,
+            (SELECT count(*) FROM hostname_endpoint_lookups
+              WHERE workspace_id=$1) AS hostname_endpoints,
+            (SELECT count(*) FROM runtime_operations
+              WHERE workspace_id=$1 AND state='unresolved') AS unresolved_operations,
+            (SELECT count(*) FROM runtime_operations
+              WHERE workspace_id=$1 AND state='terminal') AS terminal_operations,
+            (SELECT count(*) FROM api_idempotency_results
+              WHERE authenticated_workspace_id=$1) AS idempotency_receipts",
+        &[&workspace_id.as_str()],
+    )?;
     Ok(ProductionQualificationProductInventoryCounts {
-        current_cat_count: wire_count(current_cat_count)?,
-        root_disk_count: wire_count(root_disk_count)?,
-        persistent_disk_count: wire_count(persistent_disk_count)?,
-        disk_snapshot_count: wire_count(disk_snapshot_count)?,
-        endpoint_count: wire_count(endpoints.len())?,
-        hostname_desired_lookup_count: wire_count(hostname_lookups.len())?,
-        pending_runtime_operation_count: wire_count(pending_runtime_operation_count)?,
-        deleted_cat_tombstone_count: wire_count(deleted_cat_tombstone_count)?,
-        terminal_runtime_operation_history_count: wire_count(
-            terminal_runtime_operation_history_count,
+        current_cat_count: wire_i64_count(row.try_get("current_cats")?)?,
+        root_disk_count: wire_i64_count(row.try_get("root_disks")?)?,
+        persistent_disk_count: wire_i64_count(row.try_get("persistent_disks")?)?,
+        disk_snapshot_count: wire_i64_count(row.try_get("disk_snapshots")?)?,
+        endpoint_count: wire_i64_count(row.try_get("endpoints")?)?,
+        hostname_endpoint_lookup_count: wire_i64_count(row.try_get("hostname_endpoints")?)?,
+        unresolved_lifecycle_operation_count: wire_i64_count(
+            row.try_get("unresolved_operations")?,
         )?,
-        api_idempotency_receipt_count: wire_count(api_idempotency_receipt_count)?,
+        deleted_cat_tombstone_count: wire_i64_count(row.try_get("deleted_cats")?)?,
+        terminal_lifecycle_operation_history_count: wire_i64_count(
+            row.try_get("terminal_operations")?,
+        )?,
+        api_idempotency_receipt_count: wire_i64_count(row.try_get("idempotency_receipts")?)?,
     })
+}
+
+fn wire_i64_count(value: i64) -> AuthorityTxResult<WireU64> {
+    wire_count(usize::try_from(value).map_err(corrupt)?)
 }
 
 fn wire_count(value: usize) -> AuthorityTxResult<WireU64> {
@@ -1850,12 +863,27 @@ fn validate_disk(record: &DiskRecord) -> AuthorityTxResult<()> {
             PersistentDiskInitialization::Initialized {
                 expected_blank_head,
                 initialized_head,
-                ..
+                initialization_token,
+                filesystem_uuid,
+                initialized_at,
+                commit,
             } => {
                 if expected_blank_head.generation.get() != 0
                     || !remote_head_is_valid(expected_blank_head)
                     || initialized_head.generation.get() == 0
                     || !remote_head_is_valid(initialized_head)
+                    || commit.receipt.initialized_at != *initialized_at
+                    || commit.receipt.request.initialization_token != *initialization_token
+                    || commit.receipt.request.filesystem_uuid != *filesystem_uuid
+                    || commit.receipt.request.expected_blank_head != *expected_blank_head
+                    || commit.receipt.request.initialized_head != *initialized_head
+                    || commit.receipt.request.binding.volume.disk_id != record.disk_id
+                    || commit.receipt.request.binding.volume.volume_id != record.volume_id
+                    || commit.receipt.request.binding.volume.size_bytes != record.size_bytes
+                    || commit.receipt.request.binding.volume.durability != record.durability
+                    || persistent_initialization_commit_receipt_digest(&commit.receipt)
+                        .map_err(corrupt)?
+                        != commit.receipt_digest
                 {
                     return Err(corrupt(()));
                 }
@@ -1878,33 +906,6 @@ fn validate_api_result(result: &ApiIdempotencyResult) -> AuthorityTxResult<()> {
         return Err(corrupt(()));
     }
     Ok(())
-}
-
-fn target_text(target: RuntimeTarget) -> &'static str {
-    match target {
-        RuntimeTarget::Running => "running",
-        RuntimeTarget::Suspended => "suspended",
-        RuntimeTarget::Warm => "warm",
-        RuntimeTarget::Cold => "cold",
-        RuntimeTarget::Deleted => "deleted",
-    }
-}
-
-fn phase_text(phase: OperationPhase) -> &'static str {
-    match phase {
-        OperationPhase::Pending => "pending",
-        OperationPhase::Succeeded => "succeeded",
-        OperationPhase::Failed => "failed",
-        OperationPhase::Superseded => "superseded",
-    }
-}
-
-fn terminal_text(terminal: Option<&OperationTerminal>) -> Option<&'static str> {
-    terminal.map(|terminal| match terminal {
-        OperationTerminal::Succeeded { .. } => "succeeded",
-        OperationTerminal::Failed { .. } => "failed",
-        OperationTerminal::Superseded { .. } => "superseded",
-    })
 }
 
 fn parse_digest(value: String) -> AuthorityTxResult<Sha256Digest> {

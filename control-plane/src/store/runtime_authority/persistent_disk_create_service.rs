@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use cats_api::error::{ApiError, ErrorCode};
 use cats_api::persistent_disk::{
-    encode_persistent_disk_name_conflict_response, PersistentDiskCreateV1Error,
+    encode_persistent_disk_name_conflict_response, DiskDurability, PersistentDiskCreateV1Error,
     PersistentDiskCreateV1Request,
 };
 use cats_api::runtime_reconciliation::{AsciiText, Id, RandomId128};
@@ -458,8 +458,8 @@ fn build_covered_request(
     let disk_id = prefixed_id("disk_", &identities.disk)?;
     let volume_id = prefixed_id("vol_", &identities.volume)?;
     let durability = match ingress.request.durability {
-        cats_api::resources::DiskDurability::Strict => VolumeDurability::Strict,
-        cats_api::resources::DiskDurability::Relaxed => VolumeDurability::Relaxed,
+        DiskDurability::Strict => VolumeDurability::Strict,
+        DiskDurability::Relaxed => VolumeDurability::Relaxed,
     };
     Ok(CoveredPersistentDiskCreateRequest {
         idempotency: ingress.idempotency.clone(),

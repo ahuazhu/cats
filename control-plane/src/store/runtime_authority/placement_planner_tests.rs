@@ -1,30 +1,31 @@
-//! Real PostgreSQL acceptance tests for the A23 first-fit planner.
+//! PostgreSQL acceptance tests for clean-slate atomic lifecycle placement.
 
-use cats_api::error::ErrorCode;
+use cats_api::agent_registration::AuthenticatedNodeCredential;
+use cats_api::runtime_inventory::{
+    full_inventory_digest, RuntimeInventoryBody, RuntimeInventoryReport,
+};
+use cats_api::runtime_lifecycle::RuntimeNetworkConfig;
 use cats_api::runtime_reconciliation::{
-    guest_config_digest, spec_digest, AllocatableMemoryBytes, AllocatableVcpus, AsciiText,
-    AssignedKind, AssignedPlacement, ContractVersion, CredentialBinding, DesiredRuntimeSpec,
-    Durability, Epoch, GuestIpv4Pool, GuestIpv4PoolKind, GuestRuntimeProfileReceipt, Id,
-    Ipv4Address, IsolatedIpv4Kind, MacAddress, NetworkConfig, NodeIdentity, NodeIdentityState,
-    NodePlacementPolicy, NodeTransportTarget, Revision, RuntimeConfig,
+    guest_config_digest, AgentRegistrationAttempt, AllocatableMemoryBytes, AllocatableVcpus,
+    AsciiText, ContractVersion, CredentialBinding, Durability, Epoch, GuestIpv4Pool,
+    GuestIpv4PoolKind, GuestRuntimeProfileReceipt, Id, Ipv4Address, NodeBootId, NodeIdentity,
+    NodeIdentityState, NodePlacementPolicy, NodeTransportTarget, ProviderScope, RandomId128,
     RuntimePlacementBlockFrontend, RuntimePlacementCapabilities, RuntimePlacementGuestNetwork,
-    RuntimePlacementGuestTransport, RuntimePlacementVmm, RuntimeSchedulingState, RuntimeTarget,
-    RuntimeTransition, Sha256Digest,
+    RuntimePlacementGuestTransport, RuntimePlacementVmm, RuntimeSchedulingState, Sequence,
+    SessionBinding, Sha256Digest, UnixMillis,
 };
 
 use super::cat_create_service::CatCreatePlanRequest;
 use super::placement_planner::{CatCreatePlacementLoad, PlacementCandidateRejection};
-use super::product::CatRecord;
-use super::product_rows::{insert_cat, insert_desired};
-use super::rows::database_now;
-use crate::store::Store;
+use super::runtime_spine::RuntimeInventoryOutcome;
+use crate::store::{AgentRegistrationOutcome, AgentSessionRegistrationPolicy, Store};
 
-fn id(value: &str) -> Id {
-    Id::new(value).unwrap()
+fn id(value: impl Into<String>) -> Id {
+    Id::new(value.into()).unwrap()
 }
 
-fn digest(byte: u8) -> Sha256Digest {
-    Sha256Digest::from_bytes([byte; 32])
+fn digest(value: u8) -> Sha256Digest {
+    Sha256Digest::from_bytes([value; 32])
 }
 
 fn release() -> GuestRuntimeProfileReceipt {
@@ -39,18 +40,16 @@ fn release() -> GuestRuntimeProfileReceipt {
 
 fn policy(
     node_id: &Id,
-    revision: u64,
     state: RuntimeSchedulingState,
-    memory_bytes: u64,
     guest_digest: &Sha256Digest,
 ) -> NodePlacementPolicy {
     NodePlacementPolicy {
         version: ContractVersion::V1,
         node_id: node_id.clone(),
-        policy_revision: Epoch::new(revision).unwrap(),
+        policy_revision: Epoch::new(1).unwrap(),
         scheduling_state: state,
         allocatable_vcpus: AllocatableVcpus::new(8).unwrap(),
-        allocatable_memory_bytes: AllocatableMemoryBytes::new(memory_bytes).unwrap(),
+        allocatable_memory_bytes: AllocatableMemoryBytes::new(16 << 30).unwrap(),
         capabilities: RuntimePlacementCapabilities {
             vmm: RuntimePlacementVmm::CloudHypervisor,
             block_frontend: RuntimePlacementBlockFrontend::KernelNbd,
@@ -69,7 +68,7 @@ fn policy(
     }
 }
 
-fn request(guest_digest: &Sha256Digest) -> CatCreatePlanRequest {
+fn request(guest_digest: &Sha256Digest, network_id: &str) -> CatCreatePlanRequest {
     CatCreatePlanRequest {
         cat_id: id("cat_77777777777777777777777777777777"),
         vcpus: 2,
@@ -78,415 +77,187 @@ fn request(guest_digest: &Sha256Digest) -> CatCreatePlanRequest {
         durability: Durability::Strict,
         boot_image_digest: digest(3),
         guest_config_digest: guest_digest.clone(),
-        network_id: id("net_77777777777777777777777777777777"),
+        network_id: id(network_id),
     }
 }
 
-fn desired(
-    workspace_id: &Id,
-    node_id: &Id,
-    guest_digest: &Sha256Digest,
+fn establish_node(
+    store: &Store,
+    release: &GuestRuntimeProfileReceipt,
     suffix: &str,
-    guest_ipv4: &str,
-    gateway_ipv4: &str,
-    guest_mac: &str,
-) -> DesiredRuntimeSpec {
-    let mut desired = DesiredRuntimeSpec {
+    identity_byte: u8,
+    scheduling_state: RuntimeSchedulingState,
+    submit_full_inventory: bool,
+) -> Id {
+    let node_id = id(format!("node_{suffix}"));
+    let identity = NodeIdentity {
         version: ContractVersion::V1,
-        workspace_id: workspace_id.clone(),
-        cat_id: id(&format!("cat_{suffix}")),
-        desired_revision: Revision::new(1).unwrap(),
-        target: RuntimeTarget::Running,
-        placement: AssignedPlacement {
-            kind: AssignedKind::Assigned,
-            node_id: node_id.clone(),
-            placement_epoch: Epoch::new(1).unwrap(),
+        node_id: node_id.clone(),
+        provider_scope: ProviderScope {
+            provider: id("test_provider"),
+            partition: id("test_partition"),
+            account_id: id("test_account"),
+            region: id("test_region"),
         },
-        runtime: RuntimeConfig {
-            vcpus: 1,
-            memory_bytes: 512 << 20,
-            boot_image_digest: digest(3),
-            guest_config_digest: guest_digest.clone(),
-            network_config: NetworkConfig {
-                kind: IsolatedIpv4Kind::IsolatedIpv4,
-                network_id: id("net_reused_identity"),
-                guest_mac: MacAddress::new(guest_mac).unwrap(),
-                guest_ipv4: Ipv4Address::new(guest_ipv4).unwrap(),
-                prefix_length: 30,
-                gateway_ipv4: Ipv4Address::new(gateway_ipv4).unwrap(),
-            },
+        immutable_host_id: id(format!("host_{suffix}")),
+        credential_id: id(format!("credential_{suffix}")),
+        credential_binding: CredentialBinding::PublicKey {
+            public_key_spki_sha256: digest(identity_byte),
         },
-        volumes: Vec::new(),
-        endpoints: Vec::new(),
-        transition: RuntimeTransition::CancelAndDrain,
-        spec_digest: digest(0),
+        state_path_id: id(format!("state_path_{suffix}")),
+        state: NodeIdentityState::Provisioned,
     };
-    desired.spec_digest = spec_digest(&desired).unwrap();
-    desired
-}
-
-#[test]
-fn planner_scans_keyset_in_c_order_and_selects_first_eligible_node() {
-    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
-    let release = release();
-    let guest_digest = guest_config_digest(&release).unwrap();
-    let a = super::runtime_spine_tests::establish_empty_admission_for(&store, &release, "a", 1);
-    let b = super::runtime_spine_tests::establish_empty_admission_for(&store, &release, "b", 2);
-    let policy_a = policy(
-        &a.node_identity.node_id,
-        1,
-        RuntimeSchedulingState::Cordoned,
-        16 << 30,
-        &guest_digest,
+    let authenticated = AuthenticatedNodeCredential::new(
+        identity.credential_id.clone(),
+        identity.credential_binding.clone(),
     );
-    let policy_b = policy(
-        &b.node_identity.node_id,
-        1,
-        RuntimeSchedulingState::Schedulable,
-        16 << 30,
-        &guest_digest,
-    );
+    let registration_policy =
+        AgentSessionRegistrationPolicy::from_release_receipt(release).unwrap();
+    store.provision_node_identity(&identity).unwrap();
+    let random = |offset: u8| {
+        RandomId128::new(format!("{:02x}", identity_byte.wrapping_add(offset)).repeat(16)).unwrap()
+    };
+    let attempt = AgentRegistrationAttempt {
+        version: ContractVersion::V1,
+        node_id: node_id.clone(),
+        immutable_host_id: identity.immutable_host_id.clone(),
+        node_boot_id: NodeBootId::new(format!("{:02x}", identity_byte).repeat(16)).unwrap(),
+        agent_instance_id: random(1),
+        registration_attempt_id: random(2),
+        guest_config_digest: guest_config_digest(release).unwrap(),
+        expected_agent_session_epoch: None,
+    };
+    let session = match store
+        .register_agent_session(&authenticated, &attempt, &registration_policy)
+        .unwrap()
+    {
+        AgentRegistrationOutcome::Registered(session) => session,
+        AgentRegistrationOutcome::Rejected(rejection) => {
+            panic!("AgentSession registration rejected: {rejection:?}")
+        }
+    };
+    let placement_policy = policy(&node_id, scheduling_state, &session.guest_config_digest);
     store
         .authority_transaction(|transaction| {
-            super::placement_policy::insert_policy_for_test(transaction, &policy_a)?;
-            super::placement_policy::insert_policy_for_test(transaction, &policy_b)
+            super::placement_policy::insert_policy_for_test(transaction, &placement_policy)
         })
         .unwrap();
 
+    if submit_full_inventory {
+        let mut report = RuntimeInventoryReport {
+            version: ContractVersion::V1,
+            session: SessionBinding {
+                node_id: session.node_id.clone(),
+                node_boot_id: session.node_boot_id.clone(),
+                agent_instance_id: session.agent_instance_id.clone(),
+                agent_session_epoch: session.agent_session_epoch,
+            },
+            report_id: random(3),
+            sequence: Sequence::new(1).unwrap(),
+            collected_at_unix_ms: UnixMillis::new(1).unwrap(),
+            inventory: RuntimeInventoryBody::Full {
+                inventory_epoch: Epoch::new(1).unwrap(),
+                scan_id: random(4),
+                inventory_digest: digest(0),
+                cats: Vec::new(),
+                unattributed_artifacts: Vec::new(),
+            },
+        };
+        let computed = full_inventory_digest(&report).unwrap();
+        let RuntimeInventoryBody::Full {
+            inventory_digest, ..
+        } = &mut report.inventory
+        else {
+            unreachable!()
+        };
+        *inventory_digest = computed;
+        assert!(matches!(
+            store
+                .runtime_accept_inventory(&authenticated, &report)
+                .unwrap(),
+            RuntimeInventoryOutcome::Accepted(_)
+        ));
+    }
+    node_id
+}
+
+#[test]
+fn planner_scans_in_c_order_and_selects_the_first_fresh_eligible_node() {
+    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    let release = release();
+    let guest_digest = guest_config_digest(&release).unwrap();
+    establish_node(
+        &store,
+        &release,
+        "a",
+        10,
+        RuntimeSchedulingState::Cordoned,
+        true,
+    );
+    let selected = establish_node(
+        &store,
+        &release,
+        "b",
+        20,
+        RuntimeSchedulingState::Schedulable,
+        true,
+    );
+
     let plan = match store
-        .plan_cat_create_placement(&request(&guest_digest))
+        .plan_cat_create_placement(&request(&guest_digest, "net_planner_first_fit"))
         .unwrap()
     {
         CatCreatePlacementLoad::Planned(plan) => *plan,
-        other => panic!("planner did not find node_b: {other:?}"),
+        other => panic!("planner did not find the eligible Node: {other:?}"),
     };
-    assert_eq!(plan.target.policy, policy_b);
-    assert_eq!(
-        plan.target.admission.node_identity.node_id.as_str(),
-        "node_b"
-    );
-    assert!(plan.target.active_host_fence_event.is_none());
-    assert_eq!(
-        plan.mutation.network_config.network_id.as_str(),
-        "net_77777777777777777777777777777777"
-    );
+    assert_eq!(plan.target.node_identity.node_id, selected);
+    let RuntimeNetworkConfig::IsolatedIpv4 { network_id, .. } = &plan.mutation.network_config;
+    assert_eq!(network_id.as_str(), "net_planner_first_fit");
 }
 
 #[test]
-fn planner_returns_bounded_ordinary_rejections_without_writing() {
+fn planner_requires_a_fresh_session_bound_full_inventory() {
     let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
     let release = release();
     let guest_digest = guest_config_digest(&release).unwrap();
-    let admission = super::runtime_spine_tests::establish_empty_admission(&store, &release);
-    let cordoned = policy(
-        &admission.node_identity.node_id,
-        1,
-        RuntimeSchedulingState::Cordoned,
-        16 << 30,
-        &guest_digest,
-    );
-    store
-        .authority_transaction(|transaction| {
-            super::placement_policy::insert_policy_for_test(transaction, &cordoned)
-        })
-        .unwrap();
-
-    let unavailable = store
-        .plan_cat_create_placement(&request(&guest_digest))
-        .unwrap();
-    assert_eq!(
-        unavailable,
-        CatCreatePlacementLoad::Unavailable {
-            first_rejection: Some((
-                admission.node_identity.node_id.clone(),
-                PlacementCandidateRejection::PolicyCordoned,
-            )),
-        }
-    );
-
-    let tiny = policy(
-        &admission.node_identity.node_id,
-        2,
+    let node = establish_node(
+        &store,
+        &release,
+        "missing_inventory",
+        30,
         RuntimeSchedulingState::Schedulable,
-        1 << 30,
-        &guest_digest,
+        false,
     );
-    store
-        .authority_transaction(|transaction| {
-            super::placement_policy::update_policy_for_test(transaction, &cordoned, &tiny)
-        })
-        .unwrap();
-    let unavailable = store
-        .plan_cat_create_placement(&request(&guest_digest))
-        .unwrap();
-    assert_eq!(
-        unavailable,
-        CatCreatePlacementLoad::Unavailable {
-            first_rejection: Some((
-                admission.node_identity.node_id,
-                PlacementCandidateRejection::InsufficientMemory,
-            )),
-        }
-    );
-    let result_rows: i64 = store
-        .with(|client| {
-            client
-                .query_one("SELECT count(*) FROM api_idempotency_results", &[])
-                .map(|row| row.get(0))
-        })
-        .unwrap();
-    assert_eq!(result_rows, 0);
-}
-
-#[test]
-fn stored_assigned_corruption_is_fatal_before_missing_admission_can_skip_the_node() {
-    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
-    let release = release();
-    let guest_digest = guest_config_digest(&release).unwrap();
-    let admission = super::runtime_spine_tests::establish_empty_admission(&store, &release);
-    let initial_policy = policy(
-        &admission.node_identity.node_id,
-        1,
-        RuntimeSchedulingState::Schedulable,
-        16 << 30,
-        &guest_digest,
-    );
-    let workspace = super::product_tests::bootstrap_workspace(&store, "planner-corrupt");
-    let desired_a = desired(
-        &workspace,
-        &admission.node_identity.node_id,
-        &guest_digest,
-        "duplicate_network_a",
-        "10.240.0.6",
-        "10.240.0.5",
-        "02:ca:0a:f0:00:06",
-    );
-    let desired_b = desired(
-        &workspace,
-        &admission.node_identity.node_id,
-        &guest_digest,
-        "duplicate_network_b",
-        "10.240.0.10",
-        "10.240.0.9",
-        "02:ca:0a:f0:00:0a",
-    );
-    store
-        .authority_transaction(|transaction| {
-            let now = database_now(transaction)?;
-            for (name, desired) in [("duplicate-a", &desired_a), ("duplicate-b", &desired_b)] {
-                insert_cat(
-                    transaction,
-                    &CatRecord {
-                        cat_id: desired.cat_id.clone(),
-                        workspace_id: workspace.clone(),
-                        name: id(name),
-                        created_at: now,
-                    },
-                )?;
-                insert_desired(transaction, desired)?;
-            }
-            super::placement_policy::insert_policy_for_test(transaction, &initial_policy)?;
-            transaction.execute(
-                "DELETE FROM current_agent_sessions WHERE node_id=$1",
-                &[&admission.node_identity.node_id.as_str()],
-            )?;
-            Ok(())
-        })
-        .unwrap();
-
-    let error = store
-        .plan_cat_create_placement(&request(&guest_digest))
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::Internal);
-}
-
-#[test]
-fn canonical_assignment_cannot_be_hidden_by_node_projection_drift() {
-    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
-    let release = release();
-    let guest_digest = guest_config_digest(&release).unwrap();
-    let admission = super::runtime_spine_tests::establish_empty_admission(&store, &release);
-    let current_policy = policy(
-        &admission.node_identity.node_id,
-        1,
-        RuntimeSchedulingState::Schedulable,
-        16 << 30,
-        &guest_digest,
-    );
-    let workspace = super::product_tests::bootstrap_workspace(&store, "planner-hidden-desired");
-    let hidden = desired(
-        &workspace,
-        &admission.node_identity.node_id,
-        &guest_digest,
-        "hidden_assignment",
-        "10.240.0.6",
-        "10.240.0.5",
-        "02:ca:0a:f0:00:06",
-    );
-    store
-        .authority_transaction(|transaction| {
-            let now = database_now(transaction)?;
-            insert_cat(
-                transaction,
-                &CatRecord {
-                    cat_id: hidden.cat_id.clone(),
-                    workspace_id: workspace.clone(),
-                    name: id("hidden-assignment"),
-                    created_at: now,
-                },
-            )?;
-            insert_desired(transaction, &hidden)?;
-            super::placement_policy::insert_policy_for_test(transaction, &current_policy)
-        })
-        .unwrap();
-    store
-        .with(|client| {
-            client.execute(
-                "UPDATE desired_runtime_specs SET node_id='node_z' WHERE cat_id=$1",
-                &[&hidden.cat_id.as_str()],
-            )
-        })
-        .unwrap();
-
-    let error = store
-        .plan_cat_create_placement(&request(&guest_digest))
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::Internal);
-}
-
-#[test]
-fn global_network_identity_collision_is_detected_before_first_fit() {
-    let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
-    let release = release();
-    let guest_digest = guest_config_digest(&release).unwrap();
-    let admission_a =
-        super::runtime_spine_tests::establish_empty_admission_for(&store, &release, "a", 1);
-    let admission_b =
-        super::runtime_spine_tests::establish_empty_admission_for(&store, &release, "b", 2);
-    let policy_a = policy(
-        &admission_a.node_identity.node_id,
-        1,
-        RuntimeSchedulingState::Schedulable,
-        16 << 30,
-        &guest_digest,
-    );
-    let policy_b = policy(
-        &admission_b.node_identity.node_id,
-        1,
-        RuntimeSchedulingState::Schedulable,
-        16 << 30,
-        &guest_digest,
-    );
-    let workspace = super::product_tests::bootstrap_workspace(&store, "planner-global-network");
-    let mut occupied = desired(
-        &workspace,
-        &admission_b.node_identity.node_id,
-        &guest_digest,
-        "occupied_on_larger_node",
-        "10.240.0.6",
-        "10.240.0.5",
-        "02:ca:0a:f0:00:06",
-    );
-    occupied.runtime.network_config.network_id = request(&guest_digest).network_id;
-    occupied.spec_digest = spec_digest(&occupied).unwrap();
-    store
-        .authority_transaction(|transaction| {
-            let now = database_now(transaction)?;
-            insert_cat(
-                transaction,
-                &CatRecord {
-                    cat_id: occupied.cat_id.clone(),
-                    workspace_id: workspace.clone(),
-                    name: id("occupied-on-node-b"),
-                    created_at: now,
-                },
-            )?;
-            insert_desired(transaction, &occupied)?;
-            super::placement_policy::insert_policy_for_test(transaction, &policy_a)?;
-            super::placement_policy::insert_policy_for_test(transaction, &policy_b)
-        })
-        .unwrap();
 
     assert_eq!(
         store
-            .plan_cat_create_placement(&request(&guest_digest))
+            .plan_cat_create_placement(&request(&guest_digest, "net_missing_inventory"))
             .unwrap(),
-        CatCreatePlacementLoad::CandidateIdentityCollision
+        CatCreatePlacementLoad::Unavailable {
+            first_rejection: Some((
+                node,
+                PlacementCandidateRejection::MissingOrStaleFullInventory,
+            )),
+        }
     );
-    let counts = super::product_tests::counts(&store);
-    assert_eq!(counts, [1, 0, 0, 1, 0, 0, 0, 0]);
 }
 
 #[test]
-fn first_fit_stops_before_a_larger_corrupt_identity_in_the_same_page() {
+fn planner_rejects_a_network_identity_retained_in_config_history() {
     let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
-    let release = release();
-    let guest_digest = guest_config_digest(&release).unwrap();
-    let admission =
-        super::runtime_spine_tests::establish_empty_admission_for(&store, &release, "a", 1);
-    let initial_policy = policy(
-        &admission.node_identity.node_id,
-        1,
-        RuntimeSchedulingState::Schedulable,
-        16 << 30,
-        &guest_digest,
+    let workspace = super::lifecycle_commands_tests::workspace_id(&store, "planner-network");
+    let cat = id("cat_planner_network_history");
+    let creation = id("creation_planner_network_history");
+    let config = super::lifecycle_commands_tests::seed_cat(&store, &workspace, &cat, &creation);
+    let RuntimeNetworkConfig::IsolatedIpv4 { network_id, .. } = &config.network_config;
+
+    assert_eq!(
+        store
+            .plan_cat_create_placement(&request(
+                &config.guest_runtime_profile_digest,
+                network_id.as_str(),
+            ))
+            .unwrap(),
+        CatCreatePlacementLoad::CandidateIdentityCollision
     );
-    store
-        .authority_transaction(|transaction| {
-            super::placement_policy::insert_policy_for_test(transaction, &initial_policy)
-        })
-        .unwrap();
-
-    for index in 0_u8..64 {
-        let identity = NodeIdentity {
-            version: ContractVersion::V1,
-            node_id: id(&format!("node_b{index:03}")),
-            provider_scope: cats_api::runtime_reconciliation::ProviderScope {
-                provider: id("test_provider"),
-                partition: id("test_partition"),
-                account_id: id("test_account"),
-                region: id("test_region"),
-            },
-            immutable_host_id: id(&format!("host_b{index:03}")),
-            credential_id: id(&format!("credential_b{index:03}")),
-            credential_binding: CredentialBinding::PublicKey {
-                public_key_spki_sha256: digest(index.saturating_add(100)),
-            },
-            state_path_id: id(&format!("state_path_b{index:03}")),
-            state: NodeIdentityState::Provisioned,
-        };
-        store.provision_node_identity(&identity).unwrap();
-    }
-    store
-        .with(|client| {
-            client.execute(
-                "UPDATE node_identities
-                    SET record=jsonb_set(record, '{immutable_host_id}', '\"corrupt_host\"')
-                  WHERE node_id='node_b000'",
-                &[],
-            )
-        })
-        .unwrap();
-
-    let plan = store
-        .plan_cat_create_placement(&request(&guest_digest))
-        .unwrap();
-    assert!(matches!(plan, CatCreatePlacementLoad::Planned(_)));
-
-    let cordoned = policy(
-        &admission.node_identity.node_id,
-        2,
-        RuntimeSchedulingState::Cordoned,
-        16 << 30,
-        &guest_digest,
-    );
-    store
-        .authority_transaction(|transaction| {
-            super::placement_policy::update_policy_for_test(transaction, &initial_policy, &cordoned)
-        })
-        .unwrap();
-    let error = store
-        .plan_cat_create_placement(&request(&guest_digest))
-        .unwrap_err();
-    assert_eq!(error.code, cats_api::error::ErrorCode::Internal);
 }

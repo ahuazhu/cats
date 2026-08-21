@@ -208,12 +208,15 @@ fn ensure_schema(client: &mut Client) -> Result<()> {
     // Integration tests link the ordinary library, so the isolated-schema
     // helper carries an exact custom GUC instead of relying on cfg(test).
     // SET LOCAL restores the production 5s/2s session limits at transaction
-    // end, and no other marker value changes production behavior.
+    // end, and no other marker value changes production behavior. Four
+    // workspace test threads can queue behind the intentionally global DDL
+    // lock while a concurrent Linux gate loads the host, so the test-only
+    // budget covers the complete bounded queue rather than one schema install.
     if isolated_test_bootstrap {
         transaction
             .batch_execute(
-                "SET LOCAL statement_timeout = '30s'; \
-                 SET LOCAL lock_timeout = '30s'",
+                "SET LOCAL statement_timeout = '120s'; \
+                 SET LOCAL lock_timeout = '120s'",
             )
             .map_err(internal)?;
     }
@@ -289,11 +292,45 @@ fn relation_exists(transaction: &mut postgres::Transaction<'_>, relation: &str) 
         .map_err(internal)
 }
 
+fn column_exists(
+    transaction: &mut postgres::Transaction<'_>,
+    relation: &str,
+    column: &str,
+) -> Result<bool> {
+    transaction
+        .query_one(
+            "SELECT EXISTS (
+                SELECT 1
+                  FROM information_schema.columns
+                 WHERE table_schema=current_schema()
+                   AND table_name=$1
+                   AND column_name=$2
+             )",
+            &[&relation, &column],
+        )
+        .map(|row| row.get(0))
+        .map_err(internal)
+}
+
 fn verify_current_schema(transaction: &mut postgres::Transaction<'_>) -> Result<()> {
     for table in CONTROL_TABLES {
         if !relation_exists(transaction, table)? {
             return Err(ApiError::failed_precondition(format!(
                 "control-plane schema version {SCHEMA_VERSION} is partial: missing table {table}; recreate it"
+            )));
+        }
+    }
+    for table in FORBIDDEN_LEGACY_CONTROL_TABLES {
+        if relation_exists(transaction, table)? {
+            return Err(ApiError::failed_precondition(format!(
+                "control-plane schema version {SCHEMA_VERSION} still contains legacy authority table {table}; recreate it"
+            )));
+        }
+    }
+    for (table, column) in FORBIDDEN_LEGACY_CONTROL_COLUMNS {
+        if column_exists(transaction, table, column)? {
+            return Err(ApiError::failed_precondition(format!(
+                "control-plane schema version {SCHEMA_VERSION} still contains legacy authority column {table}.{column}; recreate it"
             )));
         }
     }
@@ -1141,7 +1178,13 @@ fn verify_authority_catalog(transaction: &mut postgres::Transaction<'_>) -> Resu
                             WHERE attribute.attrelid=i.indrelid
                               AND attribute.attname='volume_id'
                        )
-                       AND i.indcollation[1]=0 AND i.indcollation[2]=0
+                       AND i.indcollation[1]=(
+                           SELECT attribute.attcollation
+                             FROM pg_attribute attribute
+                            WHERE attribute.attrelid=i.indrelid
+                              AND attribute.attname=$4
+                       )
+                       AND i.indcollation[2]=0
                        AND i.indcollation[3]='pg_catalog.\"C\"'::regcollation
                        AND pg_get_indexdef(i.indexrelid, 1, FALSE)=$3
                        AND pg_get_indexdef(i.indexrelid, 2, FALSE)=$4
@@ -1370,13 +1413,12 @@ fn partial_catalog_object(name: &str) -> ApiError {
     ))
 }
 
-/// The Control Store owns the full release stamp. Its authority tables share
-/// the one compatibility number consumed by the target data-plane adapter.
+/// The Control Store owns the exact clean-slate release stamp. Version 17 has
+/// no migration or compatibility reader/writer for an earlier authority shape.
 pub(super) const SCHEMA_VERSION: i64 = AUTHORITY_RELEASE_SCHEMA_VERSION;
 
 const CONTROL_TABLES: &[&str] = &[
     "control_schema_version",
-    "route_grant_rollout_state",
     "accounts",
     "workspaces",
     "account_membership_shadow",
@@ -1385,17 +1427,7 @@ const CONTROL_TABLES: &[&str] = &[
     "signup_grant_eligibility",
     "account_invitations",
     "workos_event_receipts",
-    "cats",
-    "disks",
-    "mount_bindings",
-    "nodes",
-    "operations",
-    "idempotency",
     "oci_deployments",
-    "endpoints",
-    "routes",
-    "cat_work_sources",
-    "cat_work_leases",
     "volume_records",
     "host_fence_events",
     "volume_authorizations",
@@ -1404,22 +1436,22 @@ const CONTROL_TABLES: &[&str] = &[
     "endpoint_records",
     "disk_records",
     "disk_snapshot_records",
-    "desired_runtime_specs",
-    "hostname_desired_lookups",
+    "cat_runtime_configs",
+    "hostname_endpoint_lookups",
     "runtime_operations",
+    "lifecycle_volume_receipts",
     "host_fence_provider_queue_v1",
-    "trusted_host_fence_recovery_attempts_v1",
-    "trusted_host_fence_recovery_attempt_cats_v1",
     "api_idempotency_results",
     "production_mutation_admission_commands",
     "production_mutation_admission",
     "node_identities",
+    "route_operations",
     "agent_registration_attempts",
     "current_agent_sessions",
-    "runtime_desired_read_states",
-    "runtime_observation_receive_states",
-    "runtime_admission_inventory_states",
-    "runtime_current_cat_observations",
+    "route_node_ring_acks",
+    "runtime_inventory_receive_states",
+    "runtime_full_inventory_attestations",
+    "runtime_current_cat_telemetry",
     "runtime_node_placement_policies",
     "runtime_node_authority_apply_records",
     "runtime_node_credential_lineage",
@@ -1445,6 +1477,41 @@ const CONTROL_TABLES: &[&str] = &[
     "route_v2_public_ring_deliveries",
 ];
 
+// Version 17 is an empty-database cutover, not an additive migration. A
+// manually stamped database that still exposes any former product or Desired
+// authority must fail closed instead of letting old and atomic writers coexist.
+const FORBIDDEN_LEGACY_CONTROL_TABLES: &[&str] = &[
+    "route_grant_rollout_state",
+    "cats",
+    "disks",
+    "mount_bindings",
+    "nodes",
+    "operations",
+    "idempotency",
+    "endpoints",
+    "routes",
+    "cat_work_sources",
+    "cat_work_leases",
+    "desired_runtime_specs",
+    "hostname_desired_lookups",
+    "runtime_desired_read_states",
+    "runtime_observation_receive_states",
+    "runtime_current_cat_observations",
+    "runtime_admission_inventory_states",
+    "trusted_host_fence_recovery_attempts_v1",
+    "trusted_host_fence_recovery_attempt_cats_v1",
+];
+
+const FORBIDDEN_LEGACY_CONTROL_COLUMNS: &[(&str, &str)] = &[
+    ("oci_deployments", "operation_id"),
+    ("volume_records", "transition_desired_revision"),
+    ("volume_authorizations", "desired_revision"),
+    ("runtime_full_inventory_attestations", "full_observation"),
+    ("runtime_full_inventory_attestations", "observation_id"),
+    ("runtime_full_inventory_attestations", "heartbeat_sequence"),
+    ("runtime_full_inventory_attestations", "assigned_snapshot"),
+];
+
 type RequiredDeferredForeignKey = (
     &'static str,
     &'static str,
@@ -1456,6 +1523,236 @@ type RequiredDeferredForeignKey = (
 );
 
 pub(super) const REQUIRED_CHECK_CONSTRAINTS: &[(&str, &str, &str)] = &[
+    (
+        "disk_records",
+        "disk_records_initialization_commit_receipt_bytes_check",
+        "CHECK (((initialization_commit_receipt_bytes IS NULL) OR ((octet_length(initialization_commit_receipt_bytes) >= 1) AND (octet_length(initialization_commit_receipt_bytes) <= 2097152))))",
+    ),
+    (
+        "disk_records",
+        "disk_records_initialization_commit_receipt_digest_check",
+        "CHECK (((initialization_commit_receipt_digest IS NULL) OR (initialization_commit_receipt_digest ~ '^sha256:[0-9a-f]{64}$'::text)))",
+    ),
+    (
+        "volume_authorizations",
+        "volume_authorizations_lifecycle_request_fingerprint_check",
+        "CHECK (((lifecycle_request_fingerprint IS NULL) OR (lifecycle_request_fingerprint ~ '^sha256:[0-9a-f]{64}$'::text)))",
+    ),
+    (
+        "volume_authorizations",
+        "volume_authorizations_persistent_dispositions_digest_check",
+        "CHECK (((persistent_dispositions_digest IS NULL) OR (persistent_dispositions_digest ~ '^sha256:[0-9a-f]{64}$'::text)))",
+    ),
+    (
+        "volume_authorizations",
+        "volume_authorizations_strong_stop_receipt_digest_check",
+        "CHECK (((strong_stop_receipt_digest IS NULL) OR (strong_stop_receipt_digest ~ '^sha256:[0-9a-f]{64}$'::text)))",
+    ),
+    (
+        "volume_authorizations",
+        "volume_authorizations_execution_absence_proof_digest_check",
+        "CHECK (((execution_absence_proof_digest IS NULL) OR (execution_absence_proof_digest ~ '^sha256:[0-9a-f]{64}$'::text)))",
+    ),
+    (
+        "volume_authorizations",
+        "volume_authorizations_inventory_attestation_digest_check",
+        "CHECK (((inventory_attestation_digest IS NULL) OR (inventory_attestation_digest ~ '^sha256:[0-9a-f]{64}$'::text)))",
+    ),
+    (
+        "volume_authorizations",
+        "volume_authorizations_host_lost_result_digest_check",
+        "CHECK (((host_lost_result_digest IS NULL) OR (host_lost_result_digest ~ '^sha256:[0-9a-f]{64}$'::text)))",
+    ),
+    (
+        "volume_authorizations",
+        "volume_authorizations_kind_shape_check",
+        "CHECK ((((kind = 'takeover'::text) AND (host_fence_event_id IS NOT NULL) AND (lease_duration_ms IS NOT NULL) AND (lease_duration_ms > 0) AND (lifecycle_operation_id IS NOT NULL) AND (lifecycle_request_fingerprint IS NOT NULL) AND (delete_id IS NULL) AND (disk_id IS NOT NULL) AND (cat_id IS NOT NULL) AND (expected_attachment_id IS NOT NULL) AND (expected_attachment_epoch IS NOT NULL) AND (expected_attachment_epoch > 0) AND (disposition IS NULL) AND (persistent_dispositions_digest IS NULL) AND (isolation_basis_kind IS NULL) AND (strong_stop_receipt_digest IS NULL) AND (strong_stop_agent_session_epoch IS NULL) AND (execution_absence_proof_digest IS NULL) AND (inventory_attestation_digest IS NULL) AND (interrupted_operation_id IS NOT NULL) AND (host_lost_result_digest IS NOT NULL)) OR ((kind = 'disposable_root_delete'::text) AND (lease_duration_ms IS NULL) AND (lifecycle_operation_id IS NOT NULL) AND (lifecycle_request_fingerprint IS NOT NULL) AND (delete_id IS NOT NULL) AND (disk_id IS NOT NULL) AND (cat_id IS NOT NULL) AND (expected_attachment_id IS NOT NULL) AND (expected_attachment_epoch IS NOT NULL) AND (expected_attachment_epoch > 0) AND (disposition = 'discard_with_cat'::text) AND (persistent_dispositions_digest IS NOT NULL) AND (((isolation_basis_kind = 'lifecycle_strong_stop'::text) AND (host_fence_event_id IS NULL) AND (strong_stop_receipt_digest IS NOT NULL) AND (strong_stop_agent_session_epoch IS NOT NULL) AND (strong_stop_agent_session_epoch > 0) AND (execution_absence_proof_digest IS NOT NULL) AND (inventory_attestation_digest IS NOT NULL) AND (interrupted_operation_id IS NULL) AND (host_lost_result_digest IS NULL)) OR ((isolation_basis_kind = 'host_fence_event'::text) AND (host_fence_event_id IS NOT NULL) AND (strong_stop_receipt_digest IS NULL) AND (strong_stop_agent_session_epoch IS NULL) AND (execution_absence_proof_digest IS NULL) AND (inventory_attestation_digest IS NULL) AND (interrupted_operation_id IS NOT NULL) AND (host_lost_result_digest IS NOT NULL))))))",
+    ),
+    (
+        "cat_records",
+        "cat_records_stable_state_check",
+        "CHECK ((stable_state = ANY (ARRAY['running'::text, 'suspended'::text, 'warm'::text, 'cold'::text])))",
+    ),
+    (
+        "cat_records",
+        "cat_records_runtime_incarnation_check",
+        "CHECK ((runtime_incarnation ~ '^[0-9a-f]{32}$'::text))",
+    ),
+    (
+        "cat_records",
+        "cat_records_runtime_config_digest_check",
+        "CHECK ((current_runtime_config_sha256 ~ '^sha256:[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "cat_records",
+        "cat_records_deleted_at_check",
+        "CHECK ((deleted_at >= created_at))",
+    ),
+    (
+        "cat_records",
+        "cat_records_runtime_ready_shape_check",
+        "CHECK (((((stable_state = 'running'::text) AND (effective_runtime_ready_operation_id IS NOT NULL) AND (runtime_incarnation IS NOT NULL)) OR ((stable_state = 'suspended'::text) AND (effective_runtime_ready_operation_id IS NULL) AND (runtime_incarnation IS NOT NULL)) OR ((stable_state = ANY (ARRAY['warm'::text, 'cold'::text])) AND (effective_runtime_ready_operation_id IS NULL) AND (runtime_incarnation IS NULL)) OR ((stable_state IS NULL) AND (effective_runtime_ready_operation_id IS NULL) AND (runtime_incarnation IS NULL))) IS TRUE))",
+    ),
+    (
+        "cat_records",
+        "cat_records_deleted_shape_check",
+        "CHECK (((deleted_at IS NULL) OR ((stable_state IS NULL) AND (effective_runtime_ready_operation_id IS NULL) AND (runtime_incarnation IS NULL))))",
+    ),
+    (
+        "cat_runtime_configs",
+        "cat_runtime_configs_bytes_check",
+        "CHECK (((octet_length(canonical_config_bytes) >= 1) AND (octet_length(canonical_config_bytes) <= 1048576)))",
+    ),
+    (
+        "cat_runtime_configs",
+        "cat_runtime_configs_digest_check",
+        "CHECK ((canonical_config_sha256 ~ '^sha256:[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "cat_runtime_configs",
+        "cat_runtime_configs_created_at_check",
+        "CHECK ((created_at_unix_ms >= 0))",
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_placement_epoch_check",
+        "CHECK ((placement_epoch > 0))",
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_command_kind_check",
+        "CHECK ((command_kind = ANY (ARRAY['start'::text, 'suspend'::text, 'warm'::text, 'cold'::text, 'stop'::text, 'delete'::text])))",
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_request_bytes_check",
+        "CHECK (((octet_length(canonical_request_bytes) >= 1) AND (octet_length(canonical_request_bytes) <= 1048576)))",
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_request_digest_check",
+        "CHECK ((canonical_request_sha256 ~ '^sha256:[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_runtime_config_digest_check",
+        "CHECK ((runtime_config_sha256 ~ '^sha256:[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_predecessor_kind_check",
+        "CHECK ((predecessor_kind = ANY (ARRAY['genesis'::text, 'same_node'::text, 'cross_node_cold_handoff'::text, 'host_fence_recovery'::text])))",
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_predecessor_digest_check",
+        "CHECK ((expected_predecessor_result_sha256 ~ '^sha256:[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_state_check",
+        "CHECK ((state = ANY (ARRAY['unresolved'::text, 'terminal'::text])))",
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_terminal_source_check",
+        "CHECK ((terminal_source = ANY (ARRAY['node_result'::text, 'host_lost'::text])))",
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_terminal_result_kind_check",
+        "CHECK ((terminal_result_kind = ANY (ARRAY['runtime_ready'::text, 'start_failed'::text, 'suspended'::text, 'suspend_declined'::text, 'suspend_failed'::text, 'warm'::text, 'warm_failed'::text, 'cold'::text, 'killed'::text, 'deleted'::text, 'needs_intervention'::text, 'host_lost'::text])))",
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_result_bytes_check",
+        "CHECK (((canonical_result_bytes IS NULL) OR ((octet_length(canonical_result_bytes) >= 1) AND (octet_length(canonical_result_bytes) <= 1048576))))",
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_result_digest_check",
+        "CHECK ((canonical_result_sha256 ~ '^sha256:[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_created_at_check",
+        "CHECK ((created_at_unix_ms >= 0))",
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_terminal_at_check",
+        "CHECK ((terminal_at_unix_ms >= created_at_unix_ms))",
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_predecessor_shape_check",
+        "CHECK ((((predecessor_kind = 'genesis'::text) AND (expected_predecessor_operation_id IS NULL) AND (expected_predecessor_result_kind IS NULL) AND (expected_predecessor_result_sha256 IS NULL)) OR ((predecessor_kind <> 'genesis'::text) AND (expected_predecessor_operation_id IS NOT NULL) AND (expected_predecessor_result_kind IS NOT NULL) AND (expected_predecessor_result_sha256 IS NOT NULL))))",
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_typed_predecessor_check",
+        "CHECK ((((predecessor_kind <> 'cross_node_cold_handoff'::text) OR (expected_predecessor_result_kind = 'cold'::text)) AND ((predecessor_kind <> 'host_fence_recovery'::text) OR (expected_predecessor_result_kind = 'host_lost'::text))))",
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_terminal_shape_check",
+        "CHECK ((((state = 'unresolved'::text) AND (terminal_source IS NULL) AND (terminal_result_kind IS NULL) AND (canonical_result_bytes IS NULL) AND (canonical_result_sha256 IS NULL) AND (terminal_at_unix_ms IS NULL)) OR ((state = 'terminal'::text) AND (terminal_source IS NOT NULL) AND (terminal_result_kind IS NOT NULL) AND (canonical_result_bytes IS NOT NULL) AND (canonical_result_sha256 IS NOT NULL) AND (terminal_at_unix_ms IS NOT NULL))))",
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_terminal_source_shape_check",
+        "CHECK ((((terminal_source IS NULL) AND (terminal_result_kind IS NULL)) OR ((terminal_source = 'host_lost'::text) AND (terminal_result_kind = 'host_lost'::text)) OR ((terminal_source = 'node_result'::text) AND (terminal_result_kind <> 'host_lost'::text))))",
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_command_result_check",
+        "CHECK (((terminal_source IS DISTINCT FROM 'node_result'::text) OR ((command_kind = 'start'::text) AND (terminal_result_kind = ANY (ARRAY['runtime_ready'::text, 'start_failed'::text]))) OR ((command_kind = 'suspend'::text) AND (terminal_result_kind = ANY (ARRAY['suspended'::text, 'suspend_declined'::text, 'suspend_failed'::text]))) OR ((command_kind = 'warm'::text) AND (terminal_result_kind = ANY (ARRAY['warm'::text, 'warm_failed'::text, 'needs_intervention'::text]))) OR ((command_kind = 'cold'::text) AND (terminal_result_kind = ANY (ARRAY['cold'::text, 'needs_intervention'::text]))) OR ((command_kind = 'stop'::text) AND (terminal_result_kind = 'killed'::text)) OR ((command_kind = 'delete'::text) AND (terminal_result_kind = ANY (ARRAY['deleted'::text, 'needs_intervention'::text])))))",
+    ),
+    (
+        "lifecycle_volume_receipts",
+        "lifecycle_volume_receipts_bytes_check",
+        "CHECK (((octet_length(canonical_receipt_bytes) >= 1) AND (octet_length(canonical_receipt_bytes) <= 1048576)))",
+    ),
+    (
+        "lifecycle_volume_receipts",
+        "lifecycle_volume_receipts_command_shape_check",
+        "CHECK ((((source_command_kind = 'start'::text) AND (receipt_kind = 'start_grant'::text) AND (delete_id IS NULL)) OR ((source_command_kind = 'cold'::text) AND (receipt_kind = ANY (ARRAY['normal_release'::text, 'already_unowned'::text])) AND (receipt_sequence = 0) AND (delete_id IS NULL)) OR ((source_command_kind = 'delete'::text) AND (receipt_sequence = 0) AND (delete_id IS NOT NULL))))",
+    ),
+    (
+        "lifecycle_volume_receipts",
+        "lifecycle_volume_receipts_sequence_check",
+        "CHECK ((receipt_sequence >= 0))",
+    ),
+    (
+        "endpoint_records",
+        "endpoint_records_binding_shape_check",
+        "CHECK ((((binding_state = 'bound'::text) AND (hostname IS NOT NULL) AND (protocol = 'http'::text) AND ((target_port >= 1) AND (target_port <= 65535))) OR ((binding_state = 'unbound'::text) AND (hostname IS NULL) AND (protocol IS NULL) AND (target_port IS NULL) AND (effective_serving_operation_id IS NULL))))",
+    ),
+    (
+        "route_operations",
+        "route_operations_predecessor_shape_check",
+        "CHECK ((((expected_predecessor_operation_id IS NULL) AND (expected_predecessor_result_kind IS NULL) AND (expected_predecessor_result_sha256 IS NULL)) OR ((expected_predecessor_operation_id IS NOT NULL) AND (expected_predecessor_result_kind IS NOT NULL) AND (expected_predecessor_result_sha256 IS NOT NULL))))",
+    ),
+    (
+        "route_operations",
+        "route_operations_terminal_shape_check",
+        "CHECK ((((state = 'unresolved'::text) AND (terminal_source IS NULL) AND (terminal_result_kind IS NULL) AND (canonical_result_bytes IS NULL) AND (canonical_result_sha256 IS NULL) AND (terminal_at_unix_ms IS NULL)) OR ((state = 'terminal'::text) AND (terminal_source IS NOT NULL) AND (terminal_result_kind IS NOT NULL) AND (canonical_result_bytes IS NOT NULL) AND (canonical_result_sha256 IS NOT NULL) AND (terminal_at_unix_ms IS NOT NULL))))",
+    ),
+    (
+        "route_operations",
+        "route_operations_command_result_check",
+        "CHECK (((terminal_source IS NULL) OR ((terminal_source = 'control_invalidation'::text) AND (terminal_result_kind = 'invalidated'::text)) OR ((terminal_source = 'node_result'::text) AND (operation_kind = 'enable'::text) AND (terminal_result_kind = ANY (ARRAY['serving'::text, 'rejected'::text]))) OR ((terminal_source = 'node_result'::text) AND (operation_kind = 'disable'::text) AND (terminal_result_kind = ANY (ARRAY['closed'::text, 'rejected'::text])))))",
+    ),
+    (
+        "route_node_ring_acks",
+        "route_node_ring_acks_bytes_check",
+        "CHECK (((octet_length(canonical_ack_bytes) >= 1) AND (octet_length(canonical_ack_bytes) <= 1048576)))",
+    ),
+    (
+        "route_node_ring_acks",
+        "route_node_ring_acks_loaded_kids_check",
+        "CHECK ((jsonb_typeof(loaded_kids) = 'array'::text))",
+    ),
     (
         "route_v2_rotation_operator_authority",
         "route_v2_rotation_operator_singleton_ck",
@@ -1961,6 +2258,11 @@ pub(super) const REQUIRED_CHECK_CONSTRAINTS: &[(&str, &str, &str)] = &[
         "volume_records_owner_binding_check",
         "CHECK (((owner_binding IS NULL) OR (owner_binding = jsonb_build_object('volume_id', volume_id, 'owner_node_id', owner_node_id, 'attachment_id', lease_owner, 'attachment_epoch', lease_epoch))))",
     ),
+    (
+        "volume_records",
+        "volume_records_transition_shape_check",
+        "CHECK (((((last_transition_kind IS NULL) AND (last_transition_id IS NULL) AND (transition_source_kind IS NULL) AND (transition_operation_id IS NULL) AND (transition_request_fingerprint IS NULL) AND (transition_placement_epoch IS NULL) AND (transition_lease_duration_ms IS NULL)) OR ((last_transition_kind = 'normal_acquire'::text) AND (last_transition_id IS NOT NULL) AND (transition_source_kind IS NOT NULL) AND (transition_placement_epoch > 0) AND (transition_lease_duration_ms > 0) AND (((transition_source_kind = 'independent'::text) AND (transition_operation_id IS NULL) AND (transition_request_fingerprint IS NULL)) OR ((transition_source_kind = 'lifecycle'::text) AND (transition_operation_id IS NOT NULL) AND (transition_request_fingerprint IS NOT NULL)))) OR ((last_transition_kind = ANY (ARRAY['release'::text, 'takeover'::text, 'begin_delete'::text, 'begin_disposable_delete'::text])) AND (last_transition_id IS NOT NULL) AND (transition_source_kind IS NOT NULL) AND (transition_placement_epoch IS NULL) AND (transition_lease_duration_ms IS NULL) AND (((transition_source_kind = 'independent'::text) AND (transition_operation_id IS NULL) AND (transition_request_fingerprint IS NULL)) OR ((transition_source_kind = 'lifecycle'::text) AND (transition_operation_id IS NOT NULL) AND (transition_request_fingerprint IS NOT NULL))))) IS TRUE))",
+    ),
 ];
 
 const REQUIRED_PRIMARY_KEYS: &[(&str, &str, &str)] = &[
@@ -1985,14 +2287,35 @@ const REQUIRED_PRIMARY_KEYS: &[(&str, &str, &str)] = &[
         "deployment_id,ring_version",
     ),
     (
-        "trusted_host_fence_recovery_attempts_v1",
-        "trusted_host_fence_recovery_attempts_v1_pkey",
-        "fence_attempt_id",
+        "cat_runtime_configs",
+        "cat_runtime_configs_pkey",
+        "config_id",
     ),
     (
-        "trusted_host_fence_recovery_attempt_cats_v1",
-        "trusted_host_fence_recovery_attempt_cats_v1_pkey",
-        "fence_attempt_id,ordinal",
+        "hostname_endpoint_lookups",
+        "hostname_endpoint_lookups_pkey",
+        "hostname",
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_pkey",
+        "operation_id",
+    ),
+    (
+        "lifecycle_volume_receipts",
+        "lifecycle_volume_receipts_pkey",
+        "operation_id,volume_id,receipt_kind,receipt_sequence",
+    ),
+    ("route_operations", "route_operations_pkey", "operation_id"),
+    (
+        "route_node_ring_acks",
+        "route_node_ring_acks_pkey",
+        "node_id",
+    ),
+    (
+        "runtime_full_inventory_attestations",
+        "runtime_full_inventory_attestations_pkey",
+        "node_id",
     ),
     (
         "host_fence_provider_queue_v1",
@@ -2059,6 +2382,41 @@ const REQUIRED_PRIMARY_KEYS: &[(&str, &str, &str)] = &[
 
 pub(super) const REQUIRED_FOREIGN_KEYS: &[(&str, &str, &str)] = &[
     (
+        "volume_records",
+        "volume_records_lifecycle_transition_operation_fkey",
+        "FOREIGN KEY (transition_operation_id, transition_request_fingerprint) REFERENCES runtime_operations(operation_id, canonical_request_sha256) ON UPDATE RESTRICT ON DELETE RESTRICT",
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_workspace_cat_fkey",
+        "FOREIGN KEY (workspace_id, cat_id) REFERENCES cat_records(workspace_id, cat_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_exact_runtime_config_fkey",
+        "FOREIGN KEY (workspace_id, cat_id, runtime_config_id, runtime_config_sha256) REFERENCES cat_runtime_configs(workspace_id, cat_id, config_id, canonical_config_sha256) ON UPDATE RESTRICT ON DELETE RESTRICT",
+    ),
+    (
+        "lifecycle_volume_receipts",
+        "lifecycle_volume_receipts_exact_operation_fkey",
+        "FOREIGN KEY (operation_id, request_fingerprint, workspace_id, cat_id, node_id, placement_epoch, runtime_config_id, runtime_config_sha256, source_command_kind) REFERENCES runtime_operations(operation_id, canonical_request_sha256, workspace_id, cat_id, node_id, placement_epoch, runtime_config_id, runtime_config_sha256, command_kind) ON UPDATE RESTRICT ON DELETE RESTRICT",
+    ),
+    (
+        "route_operations",
+        "route_operations_endpoint_fkey",
+        "FOREIGN KEY (workspace_id, cat_id, endpoint_id) REFERENCES endpoint_records(workspace_id, cat_id, endpoint_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
+    ),
+    (
+        "route_operations",
+        "route_operations_source_lifecycle_fkey",
+        "FOREIGN KEY (cat_id, source_lifecycle_operation_id) REFERENCES runtime_operations(cat_id, operation_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
+    ),
+    (
+        "route_operations",
+        "route_operations_node_fkey",
+        "FOREIGN KEY (node_id) REFERENCES node_identities(node_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
+    ),
+    (
         "route_v2_rotation_operator_credentials",
         "route_v2_rotation_operator_credential_authority_fkey",
         "FOREIGN KEY (authority_id) REFERENCES route_v2_rotation_operator_authority(authority_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
@@ -2086,6 +2444,78 @@ pub(super) const REQUIRED_FOREIGN_KEYS: &[(&str, &str, &str)] = &[
 ];
 
 const REQUIRED_DEFERRED_FOREIGN_KEYS: &[RequiredDeferredForeignKey] = &[
+    (
+        "cat_runtime_configs",
+        "cat_runtime_configs_workspace_cat_fkey",
+        "cat_records",
+        "workspace_id,cat_id",
+        "workspace_id,cat_id",
+        "r",
+        "r",
+    ),
+    (
+        "cat_records",
+        "cat_records_current_runtime_config_fkey",
+        "cat_runtime_configs",
+        "workspace_id,cat_id,current_runtime_config_id,current_runtime_config_sha256",
+        "workspace_id,cat_id,config_id,canonical_config_sha256",
+        "r",
+        "r",
+    ),
+    (
+        "hostname_endpoint_lookups",
+        "hostname_endpoint_lookup_endpoint_fkey",
+        "endpoint_records",
+        "workspace_id,cat_id,endpoint_id,hostname",
+        "workspace_id,cat_id,endpoint_id,hostname",
+        "a",
+        "a",
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_exact_predecessor_fkey",
+        "runtime_operations",
+        "cat_id,expected_predecessor_operation_id,expected_predecessor_result_kind,expected_predecessor_result_sha256",
+        "cat_id,operation_id,terminal_result_kind,canonical_result_sha256",
+        "a",
+        "a",
+    ),
+    (
+        "route_operations",
+        "route_operations_exact_predecessor_fkey",
+        "route_operations",
+        "endpoint_id,expected_predecessor_operation_id,expected_predecessor_result_kind,expected_predecessor_result_sha256",
+        "endpoint_id,operation_id,terminal_result_kind,canonical_result_sha256",
+        "a",
+        "a",
+    ),
+    (
+        "endpoint_records",
+        "endpoint_records_route_head_operation_fkey",
+        "route_operations",
+        "workspace_id,cat_id,endpoint_id,route_head_operation_id",
+        "workspace_id,cat_id,endpoint_id,operation_id",
+        "r",
+        "r",
+    ),
+    (
+        "endpoint_records",
+        "endpoint_records_effective_serving_operation_fkey",
+        "route_operations",
+        "workspace_id,cat_id,endpoint_id,effective_serving_operation_id",
+        "workspace_id,cat_id,endpoint_id,operation_id",
+        "r",
+        "r",
+    ),
+    (
+        "route_node_ring_acks",
+        "route_node_ring_acks_exact_session_fkey",
+        "current_agent_sessions",
+        "node_id,node_boot_id,agent_instance_id,admission_session_epoch",
+        "node_id,node_boot_id,agent_instance_id,agent_session_epoch",
+        "r",
+        "r",
+    ),
     (
         "production_mutation_admission",
         "production_mutation_admission_exact_command_fkey",
@@ -2372,21 +2802,135 @@ const REQUIRED_UNIQUE_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
         Some("(state = 'open'::text)"),
     ),
     (
-        "trusted_host_fence_recovery_attempts_v1",
-        "host_recovery_attempt_apply_id_key",
-        "apply_id",
+        "cat_records",
+        "cat_records_cat_creation_id_key",
+        "cat_creation_id",
         None,
     ),
     (
-        "trusted_host_fence_recovery_attempts_v1",
-        "host_recovery_one_active_source_session",
-        "provider,host_partition,host_account_id,host_region,immutable_host_id,node_id,expected_node_boot_id,expected_agent_session_epoch",
-        Some("(state = ANY (ARRAY['provider_pending'::text, 'provider_terminal'::text, 'blocked'::text]))"),
+        "cat_records",
+        "cat_records_lifecycle_head_operation_key",
+        "lifecycle_head_operation_id",
+        Some("(lifecycle_head_operation_id IS NOT NULL)"),
     ),
     (
-        "trusted_host_fence_recovery_attempt_cats_v1",
-        "host_recovery_cat_attempt_cat_key",
-        "fence_attempt_id,cat_id",
+        "cat_records",
+        "cat_records_effective_runtime_ready_operation_key",
+        "effective_runtime_ready_operation_id",
+        Some("(effective_runtime_ready_operation_id IS NOT NULL)"),
+    ),
+    (
+        "cat_runtime_configs",
+        "cat_runtime_configs_exact_key",
+        "workspace_id,cat_id,config_id,canonical_config_sha256",
+        None,
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_cat_operation_key",
+        "cat_id,operation_id",
+        None,
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_predecessor_result_key",
+        "cat_id,operation_id,terminal_result_kind,canonical_result_sha256",
+        None,
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_receipt_scope_key",
+        "operation_id,canonical_request_sha256,workspace_id,cat_id,node_id,placement_epoch,runtime_config_id,runtime_config_sha256,command_kind",
+        None,
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_request_scope_key",
+        "operation_id,canonical_request_sha256",
+        None,
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_one_unresolved_per_cat",
+        "cat_id",
+        Some("(state = 'unresolved'::text)"),
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_one_genesis_per_cat",
+        "cat_id",
+        Some("(expected_predecessor_operation_id IS NULL)"),
+    ),
+    (
+        "runtime_operations",
+        "runtime_operations_one_successor_per_predecessor",
+        "cat_id,expected_predecessor_operation_id",
+        Some("(expected_predecessor_operation_id IS NOT NULL)"),
+    ),
+    (
+        "lifecycle_volume_receipts",
+        "lifecycle_volume_receipts_operation_disk_unique",
+        "operation_id,disk_id,receipt_kind,receipt_sequence",
+        None,
+    ),
+    (
+        "endpoint_records",
+        "endpoint_records_route_head_operation_key",
+        "route_head_operation_id",
+        Some("(route_head_operation_id IS NOT NULL)"),
+    ),
+    (
+        "endpoint_records",
+        "endpoint_records_effective_serving_operation_key",
+        "effective_serving_operation_id",
+        Some("(effective_serving_operation_id IS NOT NULL)"),
+    ),
+    (
+        "route_operations",
+        "route_operations_endpoint_operation_key",
+        "endpoint_id,operation_id",
+        None,
+    ),
+    (
+        "route_operations",
+        "route_operations_predecessor_result_key",
+        "endpoint_id,operation_id,terminal_result_kind,canonical_result_sha256",
+        None,
+    ),
+    (
+        "route_operations",
+        "route_operations_one_unresolved_per_endpoint",
+        "endpoint_id",
+        Some("(state = 'unresolved'::text)"),
+    ),
+    (
+        "route_operations",
+        "route_operations_one_genesis_per_endpoint",
+        "endpoint_id",
+        Some("(expected_predecessor_operation_id IS NULL)"),
+    ),
+    (
+        "route_operations",
+        "route_operations_one_successor_per_predecessor",
+        "endpoint_id,expected_predecessor_operation_id",
+        Some("(expected_predecessor_operation_id IS NOT NULL)"),
+    ),
+    (
+        "current_agent_sessions",
+        "current_agent_sessions_exact_binding_key",
+        "node_id,node_boot_id,agent_instance_id,agent_session_epoch",
+        None,
+    ),
+    (
+        "route_node_ring_acks",
+        "route_node_ring_acks_session_sequence_key",
+        "node_id,admission_session_epoch,ack_sequence",
+        None,
+    ),
+    (
+        "route_node_ring_acks",
+        "route_node_ring_acks_session_ack_id_key",
+        "node_id,admission_session_epoch,ack_id",
         None,
     ),
     (
@@ -2602,14 +3146,6 @@ const REQUIRED_EXPRESSION_INDEXES: &[RequiredExpressionIndex] = &[
         None,
     ),
     (
-        "desired_runtime_specs",
-        "desired_runtime_specs_record_volumes",
-        "gin",
-        "jsonb_path_ops",
-        "(record -> 'volumes'::text)",
-        None,
-    ),
-    (
         "delete_completion_receipts",
         "delete_completion_receipts_record_delete",
         "btree",
@@ -2675,38 +3211,12 @@ const REQUIRED_EXPRESSION_INDEXES: &[RequiredExpressionIndex] = &[
     ),
 ];
 
-const REQUIRED_RUNTIME_OPERATION_LOOKUP_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[
-    (
-        "runtime_operations_lookup_scalar_scalar",
-        "workspace_id",
-        "operation_id",
-        None,
-    ),
-    (
-        "runtime_operations_lookup_scalar_record",
-        "workspace_id",
-        "((record ->> 'operation_id'::text))",
-        Some(
-            "((operation_id COLLATE \"C\") IS DISTINCT FROM ((record ->> 'operation_id'::text) COLLATE \"C\"))",
-        ),
-    ),
-    (
-        "runtime_operations_lookup_record_scalar",
-        "((record ->> 'workspace_id'::text))",
-        "operation_id",
-        Some(
-            "((workspace_id COLLATE \"C\") IS DISTINCT FROM ((record ->> 'workspace_id'::text) COLLATE \"C\"))",
-        ),
-    ),
-    (
-        "runtime_operations_lookup_record_record",
-        "((record ->> 'workspace_id'::text))",
-        "((record ->> 'operation_id'::text))",
-        Some(
-            "(((workspace_id COLLATE \"C\") IS DISTINCT FROM ((record ->> 'workspace_id'::text) COLLATE \"C\")) AND ((operation_id COLLATE \"C\") IS DISTINCT FROM ((record ->> 'operation_id'::text) COLLATE \"C\")))",
-        ),
-    ),
-];
+const REQUIRED_RUNTIME_OPERATION_LOOKUP_INDEXES: &[(&str, &str, &str, Option<&str>)] = &[(
+    "runtime_operations_workspace_lookup",
+    "workspace_id",
+    "operation_id",
+    None,
+)];
 
 type RequiredProductReadLookupIndex = (
     &'static str,
@@ -2801,7 +3311,7 @@ const REQUIRED_ORDERED_PARTIAL_INDEXES: &[RequiredOrderedPartialIndex] = &[(
     "volume_authorizations",
     "volume_authorizations_disposable_scope",
     "volume_id",
-    "desired_revision",
+    "lifecycle_operation_id",
     "placement_epoch",
     "authorization_id",
     "(kind = 'disposable_root_delete'::text)",
@@ -3068,33 +3578,114 @@ const REQUIRED_IMMUTABILITY_TRIGGERS: &[(&str, &str, &str, i16, &str)] = &[
         "f9f88a4724e414eb226d429fdfb1dca313868b2ea5a9d69d467f63a85696d8aa",
     ),
     (
-        "trusted_host_fence_recovery_attempts_v1",
-        "host_recovery_attempt_transition_v1",
-        "control_host_recovery_attempt_transition_v1",
+        "runtime_operations",
+        "runtime_operation_transition_is_forward_only",
+        "control_runtime_operation_transition_guard",
         BEFORE_ROW_UPDATE,
-        "3dce8a351119f6f0c6dffd4567e7d4787f815507ce1a840ceae46de4e06f16b0",
+        "fc00b66725065b4fc6a527a4982bc0108785cec0ac5f1668d1673aadc733c8b3",
     ),
     (
-        "trusted_host_fence_recovery_attempts_v1",
-        "host_recovery_attempt_cannot_delete_v1",
-        "control_host_recovery_attempt_cannot_delete_v1",
+        "runtime_operations",
+        "runtime_operation_cannot_delete",
+        "control_runtime_operation_cannot_delete",
         BEFORE_ROW_DELETE,
-        "6a545210255656923f6d1ea198a49c1a95b0ac62173f7b7978b0f081f64ec247",
+        "68ea71ec0b39c400451864589c88683ca6ba80a579b86f76f4e41810e5e26d5d",
     ),
     (
-        "trusted_host_fence_recovery_attempt_cats_v1",
-        "host_recovery_cat_is_immutable_v1",
-        "control_host_recovery_cat_is_immutable_v1",
-        BEFORE_ROW_UPDATE_DELETE,
-        "0f8cd357d7a37b46f006f92d1a147d12f023767630cb3d1462054d35019c9584",
+        "cat_records",
+        "cat_record_identity_is_immutable",
+        "control_cat_record_identity_guard",
+        BEFORE_ROW_UPDATE,
+        "64400971bfff2fc539de2e0588a277498a64c0d8c3c3ee2cedaf8533994f7079",
+    ),
+    (
+        "cat_records",
+        "cat_record_cannot_delete",
+        "control_cat_record_cannot_delete",
+        BEFORE_ROW_DELETE,
+        "9d2b2b4b4e98d5a50531d17a2dc70d6884c2082806fe0afcb746e435f3924d86",
+    ),
+    (
+        "cat_runtime_configs",
+        "cat_runtime_config_cannot_update",
+        "control_cat_runtime_config_is_immutable",
+        BEFORE_ROW_UPDATE,
+        "e1b1cb5cf748c57734477d4c98f51932c488cf9142ebaa982fdc96721ef2d992",
+    ),
+    (
+        "cat_runtime_configs",
+        "cat_runtime_config_cannot_delete",
+        "control_cat_runtime_config_is_immutable",
+        BEFORE_ROW_DELETE,
+        "e1b1cb5cf748c57734477d4c98f51932c488cf9142ebaa982fdc96721ef2d992",
+    ),
+    (
+        "lifecycle_volume_receipts",
+        "lifecycle_volume_receipt_cannot_update",
+        "control_lifecycle_volume_receipt_is_immutable",
+        BEFORE_ROW_UPDATE,
+        "165ed66d83baa7d13ee78747798ab6257f3cb46adfe094c461cb449d3fda4897",
+    ),
+    (
+        "lifecycle_volume_receipts",
+        "lifecycle_volume_receipt_cannot_delete",
+        "control_lifecycle_volume_receipt_is_immutable",
+        BEFORE_ROW_DELETE,
+        "165ed66d83baa7d13ee78747798ab6257f3cb46adfe094c461cb449d3fda4897",
+    ),
+    (
+        "endpoint_records",
+        "endpoint_record_transition_is_forward_only",
+        "control_endpoint_record_transition_guard",
+        BEFORE_ROW_UPDATE,
+        "3699f12957510bf43e8288421ad81b3dab84770ef450bd22f846986a7c06bccd",
+    ),
+    (
+        "endpoint_records",
+        "endpoint_record_cannot_delete",
+        "control_endpoint_record_cannot_delete",
+        BEFORE_ROW_DELETE,
+        "f00d56f121c90d16475177f52897d957b34674bdb886d5c5bc989855e03d2aff",
+    ),
+    (
+        "route_operations",
+        "route_operation_transition_is_forward_only",
+        "control_route_operation_transition_guard",
+        BEFORE_ROW_UPDATE,
+        "ef530d845e69aa356bb6b04783b559bc6b54590ea6ee4c5aa3db68083aa9b360",
+    ),
+    (
+        "route_operations",
+        "route_operation_cannot_delete",
+        "control_route_operation_cannot_delete",
+        BEFORE_ROW_DELETE,
+        "00896b3e808767ba3109b67715f8a6f61c2d94908249c49d2d544ee7abbb2af6",
+    ),
+    (
+        "route_node_ring_acks",
+        "route_node_ring_ack_transition_is_forward_only",
+        "control_route_node_ring_ack_transition_guard",
+        BEFORE_ROW_UPDATE,
+        "5cd74190ddd7fb8ae82dbf0f46c0b394b414d9259da05243bf3c51c9455de484",
+    ),
+    (
+        "route_node_ring_acks",
+        "route_node_ring_ack_cannot_delete",
+        "control_route_node_ring_ack_cannot_delete",
+        BEFORE_ROW_DELETE,
+        "ffe9feb77c44c36ef51b7707f4ecc765e963acf6c23a088ffadfd9e72761ca11",
     ),
 ];
 
 const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
+    "SELECT id, cat_id, app, image_digest, attempt_id, phase,
+            manifest_digest, service, active, error_json, created_at, updated_at
+       FROM oci_deployments WHERE FALSE",
     "SELECT volume_id, record, size_bytes, durability, admin_state, delete_id,
             head_generation, head_root_hash, head_root_object_id, lease_owner,
             lease_epoch, lease_expires_at, last_transition_kind,
-            last_transition_id, transition_desired_revision,
+            last_transition_id, transition_source_kind,
+            transition_operation_id, transition_request_fingerprint,
             transition_placement_epoch, transition_lease_duration_ms,
             owner_binding, owner_node_id
        FROM volume_records WHERE FALSE",
@@ -3106,7 +3697,14 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
        FROM host_fence_events WHERE FALSE",
     "SELECT authorization_id, record, kind, authorized_node_id,
             host_fence_event_id, volume_id,
-            state, desired_revision, placement_epoch, lease_duration_ms,
+            state, placement_epoch, lease_duration_ms,
+            lifecycle_operation_id, lifecycle_request_fingerprint,
+            delete_id, disk_id, cat_id, expected_attachment_id,
+            expected_attachment_epoch, disposition,
+            persistent_dispositions_digest, isolation_basis_kind,
+            strong_stop_receipt_digest, strong_stop_agent_session_epoch,
+            execution_absence_proof_digest, inventory_attestation_digest,
+            interrupted_operation_id, host_lost_result_digest,
             expected_head_generation, expected_head_root_hash,
             expected_head_root_object_id,
             not_after, consumed_at
@@ -3115,9 +3713,16 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             prior_attachment_id, deleting_epoch, head_generation,
             head_root_hash, head_root_object_id, completed_at
        FROM delete_completion_receipts WHERE FALSE",
-    "SELECT cat_id, record, workspace_id, name, created_at
+    "SELECT cat_id, record, workspace_id, name, cat_creation_id,
+            lifecycle_head_operation_id, stable_state,
+            effective_runtime_ready_operation_id, runtime_incarnation,
+            current_runtime_config_id, current_runtime_config_sha256,
+            created_at, deleted_at
        FROM cat_records WHERE FALSE",
-    "SELECT endpoint_id, record, workspace_id, cat_id, name, created_at
+    "SELECT endpoint_id, record, workspace_id, cat_id, name,
+            binding_state, hostname, protocol, target_port, route_epoch,
+            route_head_operation_id, effective_serving_operation_id,
+            created_at, updated_at_unix_ms
        FROM endpoint_records WHERE FALSE",
     "SELECT disk_id, record, workspace_id, name, volume_id, size_bytes,
             durability, created_at, admin_state, delete_id, role_kind,
@@ -3125,21 +3730,34 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             filesystem_uuid, expected_blank_generation,
             expected_blank_root_hash, expected_blank_root_object_id,
             initialized_generation, initialized_root_hash,
-            initialized_root_object_id, initialized_at
+            initialized_root_object_id, initialized_at,
+            initialization_commit_receipt_bytes,
+            initialization_commit_receipt_digest
        FROM disk_records WHERE FALSE",
     "SELECT snapshot_id, record, disk_id, volume_id, size_bytes,
             head_generation, head_root_hash, head_root_object_id, created_at
        FROM disk_snapshot_records WHERE FALSE",
-    "SELECT cat_id, record, workspace_id, desired_revision, spec_digest,
-            target, node_id, placement_epoch
-       FROM desired_runtime_specs WHERE FALSE",
-    "SELECT hostname, record, workspace_id, cat_id, endpoint_id,
-            desired_revision
-       FROM hostname_desired_lookups WHERE FALSE",
-    "SELECT operation_id, record, workspace_id, cat_id, desired_revision,
-            desired_spec_digest, node_id, placement_epoch, target, phase,
-            terminal_kind, created_at, updated_at
+    "SELECT config_id, workspace_id, cat_id, canonical_config_bytes,
+            canonical_config_sha256, created_at_unix_ms
+       FROM cat_runtime_configs WHERE FALSE",
+    "SELECT hostname, workspace_id, cat_id, endpoint_id
+       FROM hostname_endpoint_lookups WHERE FALSE",
+    "SELECT operation_id, workspace_id, cat_id, node_id, placement_epoch,
+            command_kind, canonical_request_bytes, canonical_request_sha256,
+            runtime_config_id, runtime_config_sha256,
+            expected_predecessor_operation_id, predecessor_kind,
+            expected_predecessor_result_kind,
+            expected_predecessor_result_sha256, state, terminal_source,
+            terminal_result_kind, canonical_result_bytes,
+            canonical_result_sha256, created_at_unix_ms,
+            terminal_at_unix_ms
        FROM runtime_operations WHERE FALSE",
+    "SELECT operation_id, request_fingerprint, workspace_id, cat_id,
+            node_id, placement_epoch, runtime_config_id,
+            runtime_config_sha256, source_command_kind, delete_id,
+            disk_id, volume_id, disk_role, receipt_kind, receipt_sequence,
+            canonical_receipt_bytes, receipt_digest, created_at_unix_ms
+       FROM lifecycle_volume_receipts WHERE FALSE",
     "SELECT fence_attempt_id, request_bytes, request_sha256,
             provider, host_partition, host_account_id, host_region,
             immutable_host_id, node_id, expected_node_boot_id,
@@ -3152,24 +3770,6 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             renewed_to_unix_ms, evidence_bytes, evidence_sha256,
             enqueued_at_unix_ms, completed_at_unix_ms
        FROM host_fence_provider_queue_v1 WHERE FALSE",
-    "SELECT fence_attempt_id, apply_id, attempt_bytes, attempt_sha256,
-            provider, host_partition, host_account_id, host_region,
-            immutable_host_id, node_id, expected_node_boot_id,
-            agent_instance_id, expected_agent_session_epoch,
-            physical_snapshot_state, inventory_epoch, inventory_digest, inventory_read_position,
-            full_observation_id, full_observation_bytes,
-            full_observation_sha256, full_observation_length,
-            assigned_snapshot_bytes, assigned_snapshot_sha256,
-            assigned_snapshot_length, assigned_set_sha256, assigned_cat_count,
-            state, provider_evidence_bytes, provider_evidence_sha256,
-            provider_completed_at_unix_ms, outcome_bytes, outcome_sha256,
-            enqueued_at_unix_ms, outcome_completed_at_unix_ms
-       FROM trusted_host_fence_recovery_attempts_v1 WHERE FALSE",
-    "SELECT fence_attempt_id, ordinal, cat_id, cat_snapshot_bytes,
-            cat_snapshot_sha256, workspace_id, expected_desired_revision,
-            expected_desired_spec_digest, expected_old_operation_id,
-            volume_count, volume_set_sha256
-       FROM trusted_host_fence_recovery_attempt_cats_v1 WHERE FALSE",
     "SELECT authenticated_workspace_id, canonical_route, idempotency_key,
             request_fingerprint, http_status, content_type, response_body,
             created_at
@@ -3229,6 +3829,18 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             credential_provider, credential_principal,
             credential_lineage_state, state_path_id, state
        FROM node_identities WHERE FALSE",
+    "SELECT operation_id, workspace_id, cat_id, endpoint_id,
+            operation_kind, canonical_request_bytes,
+            canonical_request_sha256, expected_predecessor_operation_id,
+            expected_predecessor_result_kind,
+            expected_predecessor_result_sha256, hostname, protocol,
+            target_port, route_epoch, source_lifecycle_operation_id,
+            runtime_incarnation, node_id, placement_epoch, node_boot_id,
+            agent_instance_id, admission_session_epoch, state,
+            terminal_source, terminal_result_kind, canonical_result_bytes,
+            canonical_result_sha256, created_at_unix_ms,
+            terminal_at_unix_ms
+       FROM route_operations WHERE FALSE",
     "SELECT node_id, registration_attempt_id, attempt_record,
             immutable_host_id, node_boot_id, agent_instance_id,
             guest_config_digest, expected_agent_session_epoch,
@@ -3238,26 +3850,25 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             agent_instance_id, agent_session_epoch, registration_attempt_id,
             guest_config_digest, lease_deadline_unix_ms
        FROM current_agent_sessions WHERE FALSE",
-    "SELECT node_id, response, node_boot_id, agent_instance_id,
-            agent_session_epoch, last_request_sequence,
-            read_position_high_water, issued_at_unix_ms,
-            expires_at_unix_ms, consumed_observation_id,
-            consumed_heartbeat_sequence
-       FROM runtime_desired_read_states WHERE FALSE",
-    "SELECT node_id, observation, acceptance, node_boot_id,
-            agent_instance_id, agent_session_epoch, heartbeat_sequence,
-            observation_id, accepted_at_unix_ms
-       FROM runtime_observation_receive_states WHERE FALSE",
-    "SELECT node_id, attestation, full_observation, assigned_snapshot,
+    "SELECT node_id, canonical_ack_bytes, canonical_ack_sha256, ack_id,
+            ack_sequence, node_boot_id, agent_instance_id,
+            admission_session_epoch, ring_version, key_ring_digest,
+            loaded_kids, accepted_at_unix_ms
+       FROM route_node_ring_acks WHERE FALSE",
+    "SELECT node_id, report, acceptance, node_boot_id,
+            agent_instance_id, agent_session_epoch, report_sequence,
+            report_id, accepted_at_unix_ms
+       FROM runtime_inventory_receive_states WHERE FALSE",
+    "SELECT node_id, attestation, full_report,
             node_boot_id, agent_instance_id, agent_session_epoch,
-            inventory_epoch, inventory_digest, inventory_read_position,
-            accepted_at_unix_ms
-       FROM runtime_admission_inventory_states WHERE FALSE",
-    "SELECT node_id, cat_id, runtime_record, node_boot_id,
+            inventory_epoch, scan_id, inventory_digest, source_report_id,
+            source_sequence, accepted_at_unix_ms
+       FROM runtime_full_inventory_attestations WHERE FALSE",
+    "SELECT node_id, cat_id, telemetry_record, node_boot_id,
             agent_instance_id, agent_session_epoch, inventory_epoch,
-            source_observation_id, heartbeat_sequence, accepted_at_unix_ms,
+            source_report_id, report_sequence, accepted_at_unix_ms,
             source_kind
-       FROM runtime_current_cat_observations WHERE FALSE",
+       FROM runtime_current_cat_telemetry WHERE FALSE",
     "SELECT node_id, record, policy_revision, scheduling_state,
             allocatable_vcpus, allocatable_memory_bytes,
             guest_config_digest, block_frontend, guest_ipv4_network_address,
@@ -4194,13 +4805,6 @@ CREATE TABLE IF NOT EXISTS control_schema_version (
     singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
     version BIGINT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS route_grant_rollout_state (
-    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
-    legacy_admission_open BOOLEAN NOT NULL
-);
-INSERT INTO route_grant_rollout_state (singleton, legacy_admission_open)
-VALUES (TRUE, TRUE)
-ON CONFLICT (singleton) DO NOTHING;
 CREATE TABLE IF NOT EXISTS accounts (
     id TEXT PRIMARY KEY,
     slug TEXT NOT NULL UNIQUE,
@@ -4273,78 +4877,6 @@ CREATE TABLE IF NOT EXISTS workos_event_receipts (
     event_name TEXT NOT NULL,
     processed_at BIGINT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS cats (
-    id TEXT PRIMARY KEY,
-    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
-    name TEXT NOT NULL,
-    image TEXT NOT NULL,
-    cpus BIGINT NOT NULL,
-    memory_mib BIGINT NOT NULL,
-    root_disk_id TEXT NOT NULL,
-    desired_state TEXT NOT NULL,
-    observed_state TEXT NOT NULL,
-    generation BIGINT NOT NULL,
-    auto_suspend BOOLEAN NOT NULL DEFAULT TRUE,
-    work_version BIGINT NOT NULL DEFAULT 0,
-    observed_state_since_ms BIGINT NOT NULL,
-    node_id TEXT,
-    created_at BIGINT NOT NULL,
-    expires_at_unix BIGINT,
-    UNIQUE (workspace_id, name)
-);
-CREATE TABLE IF NOT EXISTS disks (
-    id TEXT PRIMARY KEY,
-    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
-    name TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    size_bytes BIGINT NOT NULL,
-    state TEXT NOT NULL,
-    volume_id TEXT NOT NULL,
-    created_at BIGINT NOT NULL,
-    durability TEXT NOT NULL DEFAULT 'strict',
-    UNIQUE (workspace_id, name)
-);
-CREATE TABLE IF NOT EXISTS mount_bindings (
-    id TEXT PRIMARY KEY,
-    disk_id TEXT NOT NULL UNIQUE,
-    cat_id TEXT NOT NULL,
-    mount_path TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS nodes (
-    id TEXT PRIMARY KEY,
-    agent_url TEXT NOT NULL,
-    gateway_url TEXT NOT NULL,
-    state TEXT NOT NULL,
-    cpus BIGINT NOT NULL,
-    memory_mib BIGINT NOT NULL,
-    last_heartbeat_ms BIGINT NOT NULL,
-    telemetry_json TEXT,
-    scheduling_disabled BOOLEAN NOT NULL DEFAULT FALSE,
-    reported_cats_json TEXT,
-    route_grant_public_key_sha256 TEXT
-);
-ALTER TABLE nodes
-    ADD COLUMN IF NOT EXISTS route_grant_public_key_sha256 TEXT;
-CREATE TABLE IF NOT EXISTS operations (
-    id TEXT PRIMARY KEY,
-    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
-    kind TEXT NOT NULL,
-    resource_id TEXT NOT NULL,
-    resource_generation BIGINT NOT NULL,
-    phase TEXT NOT NULL,
-    error_json TEXT,
-    created_at BIGINT NOT NULL,
-    updated_at BIGINT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS operations_active_resource_generation
-ON operations(resource_id, resource_generation)
-WHERE phase IN ('pending','running');
-CREATE TABLE IF NOT EXISTS idempotency (
-    key TEXT NOT NULL,
-    route TEXT NOT NULL,
-    operation_id TEXT NOT NULL,
-    PRIMARY KEY (key, route)
-);
 -- One row per (cat, app, pinned digest): the deployment's identity, so a
 -- retried request finds the first attempt instead of starting a second one.
 -- The UNIQUE constraint is the idempotency mechanism; handler code only reads
@@ -4363,7 +4895,7 @@ CREATE TABLE IF NOT EXISTS oci_deployments (
     cat_id TEXT NOT NULL,
     app TEXT NOT NULL,
     image_digest TEXT NOT NULL,
-    operation_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
     phase TEXT NOT NULL
         CHECK (phase IN ('running','succeeded','failed','superseded')),
     manifest_digest TEXT,
@@ -4381,44 +4913,6 @@ CREATE TABLE IF NOT EXISTS oci_deployments (
 -- reading what is deployed.
 CREATE UNIQUE INDEX IF NOT EXISTS oci_deployments_one_current_per_app
     ON oci_deployments (cat_id, app) WHERE phase='succeeded';
-CREATE TABLE IF NOT EXISTS endpoints (
-    id TEXT PRIMARY KEY,
-    cat_id TEXT NOT NULL,
-    name TEXT NOT NULL,
-    hostname TEXT NOT NULL UNIQUE,
-    target_port BIGINT NOT NULL,
-    protocol TEXT NOT NULL,
-    wake_policy TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS routes (
-    hostname TEXT PRIMARY KEY,
-    cat_id TEXT NOT NULL,
-    node_id TEXT,
-    gateway_url TEXT,
-    target_port BIGINT NOT NULL,
-    epoch BIGINT NOT NULL,
-    state TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS cat_work_sources (
-    cat_id TEXT PRIMARY KEY,
-    node_id TEXT NOT NULL,
-    generation BIGINT NOT NULL,
-    source_epoch TEXT NOT NULL,
-    lease_sequence BIGINT NOT NULL,
-    seen_at_ms BIGINT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS cat_work_leases (
-    id TEXT PRIMARY KEY,
-    cat_id TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    owner_id TEXT NOT NULL,
-    label TEXT NOT NULL,
-    expires_at_ms BIGINT NOT NULL,
-    source_epoch TEXT,
-    UNIQUE (cat_id, kind, owner_id)
-);
-CREATE INDEX IF NOT EXISTS cat_work_leases_live
-ON cat_work_leases(cat_id, expires_at_ms);
 CREATE TABLE IF NOT EXISTS volume_records (
     volume_id TEXT PRIMARY KEY,
     record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
@@ -4439,7 +4933,13 @@ CREATE TABLE IF NOT EXISTS volume_records (
         )
     ),
     last_transition_id TEXT,
-    transition_desired_revision BIGINT,
+    transition_source_kind TEXT CHECK (
+        transition_source_kind IN ('independent', 'lifecycle')
+    ),
+    transition_operation_id TEXT,
+    transition_request_fingerprint TEXT CHECK (
+        transition_request_fingerprint ~ '^sha256:[0-9a-f]{64}$'
+    ),
     transition_placement_epoch BIGINT,
     transition_lease_duration_ms BIGINT,
     owner_binding JSONB,
@@ -4468,22 +4968,40 @@ CREATE TABLE IF NOT EXISTS volume_records (
         (head_generation = 0 AND head_root_hash IS NULL AND head_root_object_id IS NULL) OR
         (head_generation > 0 AND head_root_hash IS NOT NULL AND head_root_object_id IS NOT NULL)
     ),
-    CHECK (
+    CONSTRAINT volume_records_transition_shape_check CHECK ((
         (last_transition_kind IS NULL AND last_transition_id IS NULL
-            AND transition_desired_revision IS NULL
+            AND transition_source_kind IS NULL
+            AND transition_operation_id IS NULL
+            AND transition_request_fingerprint IS NULL
             AND transition_placement_epoch IS NULL
             AND transition_lease_duration_ms IS NULL) OR
         (last_transition_kind = 'normal_acquire' AND last_transition_id IS NOT NULL
-            AND transition_desired_revision > 0
+            AND transition_source_kind IS NOT NULL
             AND transition_placement_epoch > 0
-            AND transition_lease_duration_ms > 0) OR
+            AND transition_lease_duration_ms > 0
+            AND (
+                (transition_source_kind = 'independent'
+                    AND transition_operation_id IS NULL
+                    AND transition_request_fingerprint IS NULL) OR
+                (transition_source_kind = 'lifecycle'
+                    AND transition_operation_id IS NOT NULL
+                    AND transition_request_fingerprint IS NOT NULL)
+            )) OR
         (last_transition_kind IN (
                 'release', 'takeover', 'begin_delete', 'begin_disposable_delete'
             ) AND last_transition_id IS NOT NULL
-            AND transition_desired_revision IS NULL
+            AND transition_source_kind IS NOT NULL
             AND transition_placement_epoch IS NULL
-            AND transition_lease_duration_ms IS NULL)
-    )
+            AND transition_lease_duration_ms IS NULL
+            AND (
+                (transition_source_kind = 'independent'
+                    AND transition_operation_id IS NULL
+                    AND transition_request_fingerprint IS NULL) OR
+                (transition_source_kind = 'lifecycle'
+                    AND transition_operation_id IS NOT NULL
+                    AND transition_request_fingerprint IS NOT NULL)
+            ))
+    ) IS TRUE)
 );
 CREATE INDEX IF NOT EXISTS volume_records_owner_node
 ON volume_records(owner_node_id, volume_id COLLATE \"C\")
@@ -4555,6 +5073,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS runtime_one_terminal_host_fence_event_v1
         immutable_host_id, node_id, expected_node_boot_id,
         expected_agent_session_epoch
     ) WHERE state = 'terminal_v1';
+-- `runtime_operations` is declared after the product/authority rows it uses,
+-- so this Delete-Operation back-reference deliberately has no reverse FK.
+-- The sole writer must lock and validate the current unresolved Delete row,
+-- Cat chain head, canonical request fingerprint and proof tuple in the same
+-- transaction which inserts this immutable authorization.
 CREATE TABLE IF NOT EXISTS volume_authorizations (
     authorization_id TEXT PRIMARY KEY,
     record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
@@ -4563,17 +5086,104 @@ CREATE TABLE IF NOT EXISTS volume_authorizations (
     host_fence_event_id TEXT REFERENCES host_fence_events(event_id),
     volume_id TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('unconsumed', 'consumed')),
-    desired_revision BIGINT NOT NULL CHECK (desired_revision > 0),
+    -- Both arms bind exact lifecycle lineage. HostFenceRecovery is not yet a
+    -- production writer, but its persisted shape is already clean-slate: an
+    -- external fence plus the interrupted Operation's HostLost result grants
+    -- one target placement/volume/head takeover, never a Desired revision.
     placement_epoch BIGINT NOT NULL CHECK (placement_epoch > 0),
     lease_duration_ms BIGINT,
+    lifecycle_operation_id TEXT,
+    lifecycle_request_fingerprint TEXT,
+    delete_id TEXT,
+    disk_id TEXT,
+    cat_id TEXT,
+    expected_attachment_id TEXT,
+    expected_attachment_epoch BIGINT,
+    disposition TEXT,
+    persistent_dispositions_digest TEXT,
+    isolation_basis_kind TEXT,
+    strong_stop_receipt_digest TEXT,
+    strong_stop_agent_session_epoch BIGINT,
+    execution_absence_proof_digest TEXT,
+    inventory_attestation_digest TEXT,
+    interrupted_operation_id TEXT,
+    host_lost_result_digest TEXT,
     expected_head_generation BIGINT NOT NULL CHECK (expected_head_generation >= 0),
     expected_head_root_hash TEXT,
     expected_head_root_object_id TEXT,
     not_after BIGINT NOT NULL CHECK (not_after >= 0),
     consumed_at BIGINT,
-    CHECK (
-        (kind = 'takeover' AND host_fence_event_id IS NOT NULL AND lease_duration_ms > 0) OR
-        (kind = 'disposable_root_delete' AND lease_duration_ms IS NULL)
+    CONSTRAINT volume_authorizations_lifecycle_request_fingerprint_check
+        CHECK (lifecycle_request_fingerprint IS NULL OR
+            lifecycle_request_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
+    CONSTRAINT volume_authorizations_persistent_dispositions_digest_check
+        CHECK (persistent_dispositions_digest IS NULL OR
+            persistent_dispositions_digest ~ '^sha256:[0-9a-f]{64}$'),
+    CONSTRAINT volume_authorizations_strong_stop_receipt_digest_check
+        CHECK (strong_stop_receipt_digest IS NULL OR
+            strong_stop_receipt_digest ~ '^sha256:[0-9a-f]{64}$'),
+    CONSTRAINT volume_authorizations_execution_absence_proof_digest_check
+        CHECK (execution_absence_proof_digest IS NULL OR
+            execution_absence_proof_digest ~ '^sha256:[0-9a-f]{64}$'),
+    CONSTRAINT volume_authorizations_inventory_attestation_digest_check
+        CHECK (inventory_attestation_digest IS NULL OR
+            inventory_attestation_digest ~ '^sha256:[0-9a-f]{64}$'),
+    CONSTRAINT volume_authorizations_host_lost_result_digest_check
+        CHECK (host_lost_result_digest IS NULL OR
+            host_lost_result_digest ~ '^sha256:[0-9a-f]{64}$'),
+    CONSTRAINT volume_authorizations_kind_shape_check CHECK (
+        (kind = 'takeover'
+            AND host_fence_event_id IS NOT NULL
+            AND lease_duration_ms IS NOT NULL
+            AND lease_duration_ms > 0
+            AND lifecycle_operation_id IS NOT NULL
+            AND lifecycle_request_fingerprint IS NOT NULL
+            AND delete_id IS NULL
+            AND disk_id IS NOT NULL
+            AND cat_id IS NOT NULL
+            AND expected_attachment_id IS NOT NULL
+            AND expected_attachment_epoch IS NOT NULL
+            AND expected_attachment_epoch > 0
+            AND disposition IS NULL
+            AND persistent_dispositions_digest IS NULL
+            AND isolation_basis_kind IS NULL
+            AND strong_stop_receipt_digest IS NULL
+            AND strong_stop_agent_session_epoch IS NULL
+            AND execution_absence_proof_digest IS NULL
+            AND inventory_attestation_digest IS NULL
+            AND interrupted_operation_id IS NOT NULL
+            AND host_lost_result_digest IS NOT NULL) OR
+        (kind = 'disposable_root_delete'
+            AND lease_duration_ms IS NULL
+            AND lifecycle_operation_id IS NOT NULL
+            AND lifecycle_request_fingerprint IS NOT NULL
+            AND delete_id IS NOT NULL
+            AND disk_id IS NOT NULL
+            AND cat_id IS NOT NULL
+            AND expected_attachment_id IS NOT NULL
+            AND expected_attachment_epoch IS NOT NULL
+            AND expected_attachment_epoch > 0
+            AND disposition = 'discard_with_cat'
+            AND persistent_dispositions_digest IS NOT NULL
+            AND (
+                (isolation_basis_kind = 'lifecycle_strong_stop'
+                    AND host_fence_event_id IS NULL
+                    AND strong_stop_receipt_digest IS NOT NULL
+                    AND strong_stop_agent_session_epoch IS NOT NULL
+                    AND strong_stop_agent_session_epoch > 0
+                    AND execution_absence_proof_digest IS NOT NULL
+                    AND inventory_attestation_digest IS NOT NULL
+                    AND interrupted_operation_id IS NULL
+                    AND host_lost_result_digest IS NULL) OR
+                (isolation_basis_kind = 'host_fence_event'
+                    AND host_fence_event_id IS NOT NULL
+                    AND strong_stop_receipt_digest IS NULL
+                    AND strong_stop_agent_session_epoch IS NULL
+                    AND execution_absence_proof_digest IS NULL
+                    AND inventory_attestation_digest IS NULL
+                    AND interrupted_operation_id IS NOT NULL
+                    AND host_lost_result_digest IS NOT NULL)
+            ))
     ),
     CHECK (
         (expected_head_generation = 0
@@ -4591,7 +5201,8 @@ CREATE INDEX IF NOT EXISTS volume_authorizations_volume
 ON volume_authorizations(volume_id);
 CREATE INDEX IF NOT EXISTS volume_authorizations_disposable_scope
 ON volume_authorizations(
-    volume_id, desired_revision, placement_epoch, authorization_id COLLATE \"C\"
+    volume_id, lifecycle_operation_id, placement_epoch,
+    authorization_id COLLATE \"C\"
 ) WHERE kind='disposable_root_delete';
 CREATE INDEX IF NOT EXISTS volume_authorizations_record_authorization
 ON volume_authorizations USING GIN ((record->'authorization') jsonb_path_ops);
@@ -4636,10 +5247,58 @@ CREATE TABLE IF NOT EXISTS cat_records (
     record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
     name TEXT NOT NULL,
+    cat_creation_id TEXT NOT NULL,
+    lifecycle_head_operation_id TEXT,
+    stable_state TEXT
+        CONSTRAINT cat_records_stable_state_check
+        CHECK (stable_state IN ('running', 'suspended', 'warm', 'cold')),
+    effective_runtime_ready_operation_id TEXT,
+    runtime_incarnation TEXT
+        CONSTRAINT cat_records_runtime_incarnation_check
+        CHECK (runtime_incarnation ~ '^[0-9a-f]{32}$'),
+    current_runtime_config_id TEXT NOT NULL,
+    current_runtime_config_sha256 TEXT NOT NULL
+        CONSTRAINT cat_records_runtime_config_digest_check
+        CHECK (current_runtime_config_sha256 ~ '^sha256:[0-9a-f]{64}$'),
     created_at BIGINT NOT NULL CHECK (created_at >= 0),
+    deleted_at BIGINT
+        CONSTRAINT cat_records_deleted_at_check
+        CHECK (deleted_at >= created_at),
+    CONSTRAINT cat_records_cat_creation_id_key UNIQUE (cat_creation_id),
     UNIQUE (workspace_id, name),
-    UNIQUE (workspace_id, cat_id)
+    UNIQUE (workspace_id, cat_id),
+    CONSTRAINT cat_records_runtime_ready_shape_check CHECK ((
+        (stable_state = 'running'
+            AND effective_runtime_ready_operation_id IS NOT NULL
+            AND runtime_incarnation IS NOT NULL) OR
+        (stable_state = 'suspended'
+            AND effective_runtime_ready_operation_id IS NULL
+            AND runtime_incarnation IS NOT NULL) OR
+        (stable_state IN ('warm', 'cold')
+            AND effective_runtime_ready_operation_id IS NULL
+            AND runtime_incarnation IS NULL) OR
+        (stable_state IS NULL
+            AND effective_runtime_ready_operation_id IS NULL
+            AND runtime_incarnation IS NULL)
+    ) IS TRUE),
+    CONSTRAINT cat_records_deleted_shape_check CHECK (
+        deleted_at IS NULL OR
+        (stable_state IS NULL
+            AND effective_runtime_ready_operation_id IS NULL
+            AND runtime_incarnation IS NULL)
+    )
 );
+-- These are the Cat-row transaction's current-chain projections. They do not
+-- carry reverse foreign keys to runtime_operations: the fresh-schema create
+-- order would form a Cat/Operation cycle, and an unresolved Operation is
+-- deliberately not the terminal lifecycle head. The Store must update them
+-- with exact Operation settlement in the same Cat-row transaction.
+CREATE UNIQUE INDEX IF NOT EXISTS cat_records_lifecycle_head_operation_key
+ON cat_records(lifecycle_head_operation_id)
+WHERE lifecycle_head_operation_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS cat_records_effective_runtime_ready_operation_key
+ON cat_records(effective_runtime_ready_operation_id)
+WHERE effective_runtime_ready_operation_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS cat_records_lookup_scalar_scalar
 ON cat_records(workspace_id COLLATE \"C\", cat_id COLLATE \"C\");
 CREATE INDEX IF NOT EXISTS cat_records_lookup_scalar_record
@@ -4658,12 +5317,118 @@ CREATE TABLE IF NOT EXISTS endpoint_records (
     workspace_id TEXT NOT NULL,
     cat_id TEXT NOT NULL,
     name TEXT NOT NULL,
+    binding_state TEXT NOT NULL
+        CONSTRAINT endpoint_records_binding_state_check
+        CHECK (binding_state IN ('bound', 'unbound')),
+    hostname TEXT,
+    protocol TEXT,
+    target_port INTEGER,
+    route_epoch BIGINT NOT NULL
+        CONSTRAINT endpoint_records_route_epoch_check
+        CHECK (route_epoch > 0),
+    route_head_operation_id TEXT,
+    effective_serving_operation_id TEXT,
     created_at BIGINT NOT NULL CHECK (created_at >= 0),
+    updated_at_unix_ms BIGINT NOT NULL
+        CONSTRAINT endpoint_records_updated_at_check
+        CHECK (updated_at_unix_ms >= created_at),
     UNIQUE (cat_id, name),
     UNIQUE (workspace_id, cat_id, endpoint_id),
+    UNIQUE (hostname),
+    UNIQUE (workspace_id, cat_id, endpoint_id, hostname),
     FOREIGN KEY (workspace_id, cat_id)
-        REFERENCES cat_records(workspace_id, cat_id)
+        REFERENCES cat_records(workspace_id, cat_id),
+    CONSTRAINT endpoint_records_binding_shape_check CHECK (
+        (binding_state = 'bound'
+            AND hostname IS NOT NULL
+            AND protocol = 'http'
+            AND target_port BETWEEN 1 AND 65535) OR
+        (binding_state = 'unbound'
+            AND hostname IS NULL
+            AND protocol IS NULL
+            AND target_port IS NULL
+            AND effective_serving_operation_id IS NULL)
+    )
 );
+CREATE UNIQUE INDEX IF NOT EXISTS endpoint_records_route_head_operation_key
+ON endpoint_records(route_head_operation_id)
+WHERE route_head_operation_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS endpoint_records_effective_serving_operation_key
+ON endpoint_records(effective_serving_operation_id)
+WHERE effective_serving_operation_id IS NOT NULL;
+CREATE OR REPLACE FUNCTION control_endpoint_record_transition_guard()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF (OLD.endpoint_id, OLD.record, OLD.workspace_id, OLD.cat_id,
+        OLD.name, OLD.created_at)
+       IS DISTINCT FROM
+       (NEW.endpoint_id, NEW.record, NEW.workspace_id, NEW.cat_id,
+        NEW.name, NEW.created_at)
+       OR NEW.route_epoch < OLD.route_epoch
+       OR NEW.route_epoch > OLD.route_epoch + 1
+       OR NEW.updated_at_unix_ms < OLD.updated_at_unix_ms
+    THEN
+        RAISE EXCEPTION 'invalid Endpoint identity or route lineage transition';
+    END IF;
+    IF (OLD.binding_state, OLD.hostname, OLD.protocol, OLD.target_port)
+       IS DISTINCT FROM
+       (NEW.binding_state, NEW.hostname, NEW.protocol, NEW.target_port)
+       AND (NEW.route_epoch <> OLD.route_epoch + 1
+            OR NEW.route_head_operation_id IS DISTINCT FROM
+                OLD.route_head_operation_id
+            OR NEW.effective_serving_operation_id IS NOT NULL)
+    THEN
+        RAISE EXCEPTION 'Endpoint binding changes must burn one epoch, retain the history head and close Serving';
+    END IF;
+    IF NEW.route_epoch = OLD.route_epoch + 1
+       AND NEW.effective_serving_operation_id IS NOT NULL
+    THEN
+        RAISE EXCEPTION 'an epoch burn must close effective Serving';
+    END IF;
+    IF NEW.route_head_operation_id IS NOT NULL
+       AND NOT EXISTS (
+            SELECT 1 FROM route_operations r
+             WHERE r.operation_id=NEW.route_head_operation_id
+               AND r.workspace_id=NEW.workspace_id
+               AND r.cat_id=NEW.cat_id
+               AND r.endpoint_id=NEW.endpoint_id
+               AND r.state='terminal'
+       )
+    THEN
+        RAISE EXCEPTION 'Endpoint route head must name an exact terminal Route Operation';
+    END IF;
+    IF NEW.effective_serving_operation_id IS NOT NULL
+       AND NOT EXISTS (
+            SELECT 1 FROM route_operations r
+             WHERE r.operation_id=NEW.effective_serving_operation_id
+               AND r.workspace_id=NEW.workspace_id
+               AND r.cat_id=NEW.cat_id
+               AND r.endpoint_id=NEW.endpoint_id
+               AND r.state='terminal'
+               AND r.terminal_result_kind='serving'
+               AND r.hostname=NEW.hostname
+               AND r.protocol=NEW.protocol
+               AND r.target_port=NEW.target_port
+               AND r.route_epoch=NEW.route_epoch
+       )
+    THEN
+        RAISE EXCEPTION 'effective Serving pointer is not exact for the current Endpoint binding';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE OR REPLACE FUNCTION control_endpoint_record_cannot_delete()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'Endpoint identity is retained as an unbound route lineage';
+END;
+$$;
+CREATE TRIGGER endpoint_record_transition_is_forward_only
+BEFORE UPDATE ON endpoint_records FOR EACH ROW
+EXECUTE FUNCTION control_endpoint_record_transition_guard();
+CREATE TRIGGER endpoint_record_cannot_delete
+BEFORE DELETE ON endpoint_records FOR EACH ROW
+EXECUTE FUNCTION control_endpoint_record_cannot_delete();
 CREATE TABLE IF NOT EXISTS disk_records (
     disk_id TEXT PRIMARY KEY,
     record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
@@ -4687,6 +5452,14 @@ CREATE TABLE IF NOT EXISTS disk_records (
     initialized_root_hash TEXT,
     initialized_root_object_id TEXT,
     initialized_at BIGINT,
+    initialization_commit_receipt_bytes BYTEA
+        CONSTRAINT disk_records_initialization_commit_receipt_bytes_check
+        CHECK (initialization_commit_receipt_bytes IS NULL OR
+               octet_length(initialization_commit_receipt_bytes) BETWEEN 1 AND 2097152),
+    initialization_commit_receipt_digest TEXT
+        CONSTRAINT disk_records_initialization_commit_receipt_digest_check
+        CHECK (initialization_commit_receipt_digest IS NULL OR
+               initialization_commit_receipt_digest ~ '^sha256:[0-9a-f]{64}$'),
     UNIQUE (workspace_id, name),
     FOREIGN KEY (workspace_id, root_cat_id)
         REFERENCES cat_records(workspace_id, cat_id),
@@ -4707,7 +5480,9 @@ CREATE TABLE IF NOT EXISTS disk_records (
             AND initialized_generation IS NULL
             AND initialized_root_hash IS NULL
             AND initialized_root_object_id IS NULL
-            AND initialized_at IS NULL) OR
+            AND initialized_at IS NULL
+            AND initialization_commit_receipt_bytes IS NULL
+            AND initialization_commit_receipt_digest IS NULL) OR
         (role_kind = 'persistent'
             AND root_cat_id IS NULL
             AND initialization_kind = 'uninitialized'
@@ -4719,7 +5494,9 @@ CREATE TABLE IF NOT EXISTS disk_records (
             AND initialized_generation IS NULL
             AND initialized_root_hash IS NULL
             AND initialized_root_object_id IS NULL
-            AND initialized_at IS NULL) OR
+            AND initialized_at IS NULL
+            AND initialization_commit_receipt_bytes IS NULL
+            AND initialization_commit_receipt_digest IS NULL) OR
         (role_kind = 'persistent'
             AND root_cat_id IS NULL
             AND initialization_kind = 'initialized'
@@ -4731,7 +5508,9 @@ CREATE TABLE IF NOT EXISTS disk_records (
             AND initialized_generation > 0
             AND initialized_root_hash IS NOT NULL
             AND initialized_root_object_id IS NOT NULL
-            AND initialized_at >= 0)
+            AND initialized_at >= 0
+            AND initialization_commit_receipt_bytes IS NOT NULL
+            AND initialization_commit_receipt_digest IS NOT NULL)
     ) IS TRUE)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS disk_records_one_root_per_cat
@@ -4779,79 +5558,400 @@ CREATE INDEX IF NOT EXISTS disk_snapshot_records_record_disk
 ON disk_snapshot_records((record->>'disk_id'), snapshot_id);
 CREATE INDEX IF NOT EXISTS disk_snapshot_records_record_volume
 ON disk_snapshot_records((record->>'volume_id'), snapshot_id);
-CREATE TABLE IF NOT EXISTS desired_runtime_specs (
-    cat_id TEXT PRIMARY KEY,
-    record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
+CREATE TABLE IF NOT EXISTS cat_runtime_configs (
+    config_id TEXT
+        CONSTRAINT cat_runtime_configs_pkey PRIMARY KEY,
     workspace_id TEXT NOT NULL,
-    desired_revision BIGINT NOT NULL CHECK (desired_revision > 0),
-    spec_digest TEXT NOT NULL CHECK (spec_digest ~ '^sha256:[0-9a-f]{64}$'),
-    target TEXT NOT NULL CHECK (target IN ('running', 'suspended', 'warm', 'cold', 'deleted')),
-    node_id TEXT NOT NULL,
-    placement_epoch BIGINT NOT NULL CHECK (placement_epoch > 0),
-    UNIQUE (workspace_id, cat_id, desired_revision),
-    FOREIGN KEY (workspace_id, cat_id)
+    cat_id TEXT NOT NULL,
+    canonical_config_bytes BYTEA NOT NULL
+        CONSTRAINT cat_runtime_configs_bytes_check
+        CHECK (octet_length(canonical_config_bytes) BETWEEN 1 AND 1048576),
+    canonical_config_sha256 TEXT NOT NULL
+        CONSTRAINT cat_runtime_configs_digest_check
+        CHECK (canonical_config_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    created_at_unix_ms BIGINT NOT NULL
+        CONSTRAINT cat_runtime_configs_created_at_check
+        CHECK (created_at_unix_ms >= 0),
+    CONSTRAINT cat_runtime_configs_exact_key UNIQUE (
+        workspace_id, cat_id, config_id, canonical_config_sha256
+    ),
+    CONSTRAINT cat_runtime_configs_workspace_cat_fkey
+        FOREIGN KEY (workspace_id, cat_id)
         REFERENCES cat_records(workspace_id, cat_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+        DEFERRABLE INITIALLY DEFERRED
 );
-CREATE INDEX IF NOT EXISTS desired_runtime_specs_record_volumes
-ON desired_runtime_specs USING gin ((record->'volumes') jsonb_path_ops);
-CREATE TABLE IF NOT EXISTS hostname_desired_lookups (
+ALTER TABLE cat_records
+    ADD CONSTRAINT cat_records_current_runtime_config_fkey
+    FOREIGN KEY (
+        workspace_id, cat_id,
+        current_runtime_config_id, current_runtime_config_sha256
+    ) REFERENCES cat_runtime_configs (
+        workspace_id, cat_id, config_id, canonical_config_sha256
+    ) ON UPDATE RESTRICT ON DELETE RESTRICT
+    DEFERRABLE INITIALLY DEFERRED;
+CREATE INDEX IF NOT EXISTS cat_runtime_configs_cat_history
+ON cat_runtime_configs(workspace_id, cat_id, created_at_unix_ms, config_id);
+CREATE OR REPLACE FUNCTION control_cat_runtime_config_is_immutable()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'runtime configs are append-only immutable product history';
+END;
+$$;
+CREATE TRIGGER cat_runtime_config_cannot_update
+BEFORE UPDATE ON cat_runtime_configs FOR EACH ROW
+EXECUTE FUNCTION control_cat_runtime_config_is_immutable();
+CREATE TRIGGER cat_runtime_config_cannot_delete
+BEFORE DELETE ON cat_runtime_configs FOR EACH ROW
+EXECUTE FUNCTION control_cat_runtime_config_is_immutable();
+CREATE TABLE IF NOT EXISTS hostname_endpoint_lookups (
     hostname TEXT PRIMARY KEY,
-    record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
     workspace_id TEXT NOT NULL,
     cat_id TEXT NOT NULL,
     endpoint_id TEXT NOT NULL UNIQUE,
-    desired_revision BIGINT NOT NULL CHECK (desired_revision > 0),
-    FOREIGN KEY (workspace_id, cat_id, endpoint_id)
-        REFERENCES endpoint_records(workspace_id, cat_id, endpoint_id)
-        DEFERRABLE INITIALLY DEFERRED,
-    FOREIGN KEY (workspace_id, cat_id, desired_revision)
-        REFERENCES desired_runtime_specs(workspace_id, cat_id, desired_revision)
+    CONSTRAINT hostname_endpoint_lookup_endpoint_fkey
+        FOREIGN KEY (workspace_id, cat_id, endpoint_id, hostname)
+        REFERENCES endpoint_records(workspace_id, cat_id, endpoint_id, hostname)
         DEFERRABLE INITIALLY DEFERRED
 );
 CREATE TABLE IF NOT EXISTS runtime_operations (
-    operation_id TEXT PRIMARY KEY,
-    record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
+    operation_id TEXT
+        CONSTRAINT runtime_operations_pkey PRIMARY KEY,
     workspace_id TEXT NOT NULL,
     cat_id TEXT NOT NULL,
-    desired_revision BIGINT NOT NULL CHECK (desired_revision > 0),
-    desired_spec_digest TEXT NOT NULL CHECK (desired_spec_digest ~ '^sha256:[0-9a-f]{64}$'),
     node_id TEXT NOT NULL,
-    placement_epoch BIGINT NOT NULL CHECK (placement_epoch > 0),
-    target TEXT NOT NULL CHECK (target IN ('running', 'suspended', 'warm', 'cold', 'deleted')),
-    phase TEXT NOT NULL CHECK (phase IN ('pending', 'succeeded', 'failed', 'superseded')),
-    terminal_kind TEXT CHECK (terminal_kind IN ('succeeded', 'failed', 'superseded')),
-    created_at BIGINT NOT NULL CHECK (created_at >= 0),
-    updated_at BIGINT NOT NULL CHECK (updated_at >= created_at),
-    UNIQUE (cat_id, desired_revision),
-    FOREIGN KEY (workspace_id, cat_id)
-        REFERENCES cat_records(workspace_id, cat_id),
-    CHECK ((
-        (phase = 'pending' AND terminal_kind IS NULL) OR
-        (phase <> 'pending' AND terminal_kind = phase)
-    ) IS TRUE)
+    placement_epoch BIGINT NOT NULL
+        CONSTRAINT runtime_operations_placement_epoch_check
+        CHECK (placement_epoch > 0),
+    command_kind TEXT NOT NULL
+        CONSTRAINT runtime_operations_command_kind_check
+        CHECK (command_kind IN (
+            'start', 'suspend', 'warm', 'cold', 'stop', 'delete'
+        )),
+    canonical_request_bytes BYTEA NOT NULL
+        CONSTRAINT runtime_operations_request_bytes_check
+        CHECK (octet_length(canonical_request_bytes) BETWEEN 1 AND 1048576),
+    canonical_request_sha256 TEXT NOT NULL
+        CONSTRAINT runtime_operations_request_digest_check
+        CHECK (canonical_request_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    runtime_config_id TEXT NOT NULL,
+    runtime_config_sha256 TEXT NOT NULL
+        CONSTRAINT runtime_operations_runtime_config_digest_check
+        CHECK (runtime_config_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    expected_predecessor_operation_id TEXT,
+    predecessor_kind TEXT NOT NULL
+        CONSTRAINT runtime_operations_predecessor_kind_check
+        CHECK (predecessor_kind IN (
+            'genesis', 'same_node', 'cross_node_cold_handoff',
+            'host_fence_recovery'
+        )),
+    expected_predecessor_result_kind TEXT,
+    expected_predecessor_result_sha256 TEXT
+        CONSTRAINT runtime_operations_predecessor_digest_check
+        CHECK (expected_predecessor_result_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    state TEXT NOT NULL
+        CONSTRAINT runtime_operations_state_check
+        CHECK (state IN ('unresolved', 'terminal')),
+    terminal_source TEXT
+        CONSTRAINT runtime_operations_terminal_source_check
+        CHECK (terminal_source IN ('node_result', 'host_lost')),
+    terminal_result_kind TEXT
+        CONSTRAINT runtime_operations_terminal_result_kind_check
+        CHECK (terminal_result_kind IN (
+            'runtime_ready', 'start_failed',
+            'suspended', 'suspend_declined', 'suspend_failed',
+            'warm', 'warm_failed', 'cold', 'killed', 'deleted',
+            'needs_intervention', 'host_lost'
+        )),
+    canonical_result_bytes BYTEA
+        CONSTRAINT runtime_operations_result_bytes_check
+        CHECK (canonical_result_bytes IS NULL OR
+               octet_length(canonical_result_bytes) BETWEEN 1 AND 1048576),
+    canonical_result_sha256 TEXT
+        CONSTRAINT runtime_operations_result_digest_check
+        CHECK (canonical_result_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    created_at_unix_ms BIGINT NOT NULL
+        CONSTRAINT runtime_operations_created_at_check
+        CHECK (created_at_unix_ms >= 0),
+    terminal_at_unix_ms BIGINT
+        CONSTRAINT runtime_operations_terminal_at_check
+        CHECK (terminal_at_unix_ms >= created_at_unix_ms),
+    CONSTRAINT runtime_operations_workspace_cat_fkey
+        FOREIGN KEY (workspace_id, cat_id)
+        REFERENCES cat_records(workspace_id, cat_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT runtime_operations_exact_runtime_config_fkey
+        FOREIGN KEY (
+            workspace_id, cat_id, runtime_config_id, runtime_config_sha256
+        ) REFERENCES cat_runtime_configs (
+            workspace_id, cat_id, config_id, canonical_config_sha256
+        ) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT runtime_operations_cat_operation_key
+        UNIQUE (cat_id, operation_id),
+    CONSTRAINT runtime_operations_predecessor_result_key
+        UNIQUE (
+            cat_id, operation_id, terminal_result_kind,
+            canonical_result_sha256
+        ),
+    CONSTRAINT runtime_operations_receipt_scope_key UNIQUE (
+        operation_id, canonical_request_sha256, workspace_id, cat_id,
+        node_id, placement_epoch, runtime_config_id, runtime_config_sha256,
+        command_kind
+    ),
+    CONSTRAINT runtime_operations_request_scope_key UNIQUE (
+        operation_id, canonical_request_sha256
+    ),
+    CONSTRAINT runtime_operations_exact_predecessor_fkey
+        FOREIGN KEY (
+            cat_id, expected_predecessor_operation_id,
+            expected_predecessor_result_kind,
+            expected_predecessor_result_sha256
+        ) REFERENCES runtime_operations (
+            cat_id, operation_id, terminal_result_kind,
+            canonical_result_sha256
+        ) DEFERRABLE INITIALLY DEFERRED,
+    CONSTRAINT runtime_operations_predecessor_shape_check CHECK (
+        (predecessor_kind = 'genesis'
+            AND expected_predecessor_operation_id IS NULL
+            AND expected_predecessor_result_kind IS NULL
+            AND expected_predecessor_result_sha256 IS NULL) OR
+        (predecessor_kind <> 'genesis'
+            AND expected_predecessor_operation_id IS NOT NULL
+            AND expected_predecessor_result_kind IS NOT NULL
+            AND expected_predecessor_result_sha256 IS NOT NULL)
+    ),
+    CONSTRAINT runtime_operations_typed_predecessor_check CHECK (
+        (predecessor_kind <> 'cross_node_cold_handoff'
+            OR expected_predecessor_result_kind = 'cold')
+        AND (predecessor_kind <> 'host_fence_recovery'
+            OR expected_predecessor_result_kind = 'host_lost')
+    ),
+    CONSTRAINT runtime_operations_terminal_shape_check CHECK (
+        (state = 'unresolved'
+            AND terminal_source IS NULL
+            AND terminal_result_kind IS NULL
+            AND canonical_result_bytes IS NULL
+            AND canonical_result_sha256 IS NULL
+            AND terminal_at_unix_ms IS NULL) OR
+        (state = 'terminal'
+            AND terminal_source IS NOT NULL
+            AND terminal_result_kind IS NOT NULL
+            AND canonical_result_bytes IS NOT NULL
+            AND canonical_result_sha256 IS NOT NULL
+            AND terminal_at_unix_ms IS NOT NULL)
+    ),
+    CONSTRAINT runtime_operations_terminal_source_shape_check CHECK (
+        (terminal_source IS NULL AND terminal_result_kind IS NULL) OR
+        (terminal_source = 'host_lost' AND terminal_result_kind = 'host_lost') OR
+        (terminal_source = 'node_result' AND terminal_result_kind <> 'host_lost')
+    ),
+    CONSTRAINT runtime_operations_command_result_check CHECK (
+        terminal_source IS DISTINCT FROM 'node_result' OR
+        (command_kind = 'start'
+            AND terminal_result_kind IN ('runtime_ready', 'start_failed')) OR
+        (command_kind = 'suspend'
+            AND terminal_result_kind IN (
+                'suspended', 'suspend_declined', 'suspend_failed'
+            )) OR
+        (command_kind = 'warm'
+            AND terminal_result_kind IN (
+                'warm', 'warm_failed', 'needs_intervention'
+            )) OR
+        (command_kind = 'cold'
+            AND terminal_result_kind IN (
+                'cold', 'needs_intervention'
+            )) OR
+        (command_kind = 'stop' AND terminal_result_kind = 'killed') OR
+        (command_kind = 'delete'
+            AND terminal_result_kind IN (
+                'deleted', 'needs_intervention'
+            ))
+    )
 );
-CREATE UNIQUE INDEX IF NOT EXISTS runtime_operations_one_pending_per_cat
-ON runtime_operations(cat_id) WHERE phase = 'pending';
-CREATE INDEX IF NOT EXISTS runtime_operations_lookup_scalar_scalar
+ALTER TABLE volume_records
+    ADD CONSTRAINT volume_records_lifecycle_transition_operation_fkey
+    FOREIGN KEY (transition_operation_id, transition_request_fingerprint)
+    REFERENCES runtime_operations(operation_id, canonical_request_sha256)
+    ON UPDATE RESTRICT ON DELETE RESTRICT;
+CREATE UNIQUE INDEX IF NOT EXISTS runtime_operations_one_unresolved_per_cat
+ON runtime_operations(cat_id) WHERE state = 'unresolved';
+CREATE UNIQUE INDEX IF NOT EXISTS runtime_operations_one_genesis_per_cat
+ON runtime_operations(cat_id)
+WHERE expected_predecessor_operation_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS runtime_operations_one_successor_per_predecessor
+ON runtime_operations(cat_id, expected_predecessor_operation_id)
+WHERE expected_predecessor_operation_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS runtime_operations_workspace_lookup
 ON runtime_operations(workspace_id COLLATE \"C\", operation_id COLLATE \"C\");
-CREATE INDEX IF NOT EXISTS runtime_operations_lookup_scalar_record
-ON runtime_operations(
-    workspace_id COLLATE \"C\", ((record->>'operation_id') COLLATE \"C\")
-) WHERE operation_id COLLATE \"C\" IS DISTINCT FROM
-    (record->>'operation_id') COLLATE \"C\";
-CREATE INDEX IF NOT EXISTS runtime_operations_lookup_record_scalar
-ON runtime_operations(
-    ((record->>'workspace_id') COLLATE \"C\"), operation_id COLLATE \"C\"
-) WHERE workspace_id COLLATE \"C\" IS DISTINCT FROM
-    (record->>'workspace_id') COLLATE \"C\";
-CREATE INDEX IF NOT EXISTS runtime_operations_lookup_record_record
-ON runtime_operations(
-    ((record->>'workspace_id') COLLATE \"C\"),
-    ((record->>'operation_id') COLLATE \"C\")
-) WHERE workspace_id COLLATE \"C\" IS DISTINCT FROM
-        (record->>'workspace_id') COLLATE \"C\"
-    AND operation_id COLLATE \"C\" IS DISTINCT FROM
-        (record->>'operation_id') COLLATE \"C\";
+CREATE OR REPLACE FUNCTION control_runtime_operation_transition_guard()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF (OLD.operation_id, OLD.workspace_id, OLD.cat_id, OLD.node_id,
+        OLD.placement_epoch, OLD.command_kind, OLD.canonical_request_bytes,
+        OLD.canonical_request_sha256, OLD.runtime_config_id,
+        OLD.runtime_config_sha256, OLD.expected_predecessor_operation_id,
+        OLD.predecessor_kind, OLD.expected_predecessor_result_kind,
+        OLD.expected_predecessor_result_sha256, OLD.created_at_unix_ms)
+       IS DISTINCT FROM
+       (NEW.operation_id, NEW.workspace_id, NEW.cat_id, NEW.node_id,
+        NEW.placement_epoch, NEW.command_kind, NEW.canonical_request_bytes,
+        NEW.canonical_request_sha256, NEW.runtime_config_id,
+        NEW.runtime_config_sha256, NEW.expected_predecessor_operation_id,
+        NEW.predecessor_kind, NEW.expected_predecessor_result_kind,
+        NEW.expected_predecessor_result_sha256, NEW.created_at_unix_ms)
+       OR OLD.state <> 'unresolved'
+       OR NEW.state <> 'terminal'
+    THEN
+        RAISE EXCEPTION 'invalid runtime lifecycle Operation transition';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE OR REPLACE FUNCTION control_runtime_operation_cannot_delete()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'runtime lifecycle Operations cannot be deleted';
+END;
+$$;
+CREATE TRIGGER runtime_operation_transition_is_forward_only
+BEFORE UPDATE ON runtime_operations FOR EACH ROW
+EXECUTE FUNCTION control_runtime_operation_transition_guard();
+CREATE TRIGGER runtime_operation_cannot_delete
+BEFORE DELETE ON runtime_operations FOR EACH ROW
+EXECUTE FUNCTION control_runtime_operation_cannot_delete();
+CREATE TABLE IF NOT EXISTS lifecycle_volume_receipts (
+    operation_id TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL
+        CONSTRAINT lifecycle_volume_receipts_request_digest_check
+        CHECK (request_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
+    workspace_id TEXT NOT NULL,
+    cat_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    placement_epoch BIGINT NOT NULL
+        CONSTRAINT lifecycle_volume_receipts_placement_epoch_check
+        CHECK (placement_epoch > 0),
+    runtime_config_id TEXT NOT NULL,
+    runtime_config_sha256 TEXT NOT NULL
+        CONSTRAINT lifecycle_volume_receipts_runtime_config_digest_check
+        CHECK (runtime_config_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    source_command_kind TEXT NOT NULL
+        CONSTRAINT lifecycle_volume_receipts_command_kind_check
+        CHECK (source_command_kind IN ('start', 'cold', 'delete')),
+    delete_id TEXT,
+    disk_id TEXT NOT NULL,
+    volume_id TEXT NOT NULL,
+    disk_role TEXT NOT NULL
+        CONSTRAINT lifecycle_volume_receipts_disk_role_check
+        CHECK (disk_role IN ('root', 'persistent')),
+    receipt_kind TEXT NOT NULL
+        CONSTRAINT lifecycle_volume_receipts_kind_check
+        CHECK (receipt_kind IN (
+            'start_grant', 'normal_release', 'already_unowned',
+            'disposable_consumed', 'delete_completion'
+        )),
+    receipt_sequence BIGINT NOT NULL
+        CONSTRAINT lifecycle_volume_receipts_sequence_check
+        CHECK (receipt_sequence >= 0),
+    canonical_receipt_bytes BYTEA NOT NULL
+        CONSTRAINT lifecycle_volume_receipts_bytes_check
+        CHECK (octet_length(canonical_receipt_bytes) BETWEEN 1 AND 1048576),
+    receipt_digest TEXT NOT NULL
+        CONSTRAINT lifecycle_volume_receipts_digest_check
+        CHECK (receipt_digest ~ '^sha256:[0-9a-f]{64}$'),
+    created_at_unix_ms BIGINT NOT NULL
+        CONSTRAINT lifecycle_volume_receipts_created_at_check
+        CHECK (created_at_unix_ms >= 0),
+    CONSTRAINT lifecycle_volume_receipts_pkey
+        PRIMARY KEY (operation_id, volume_id, receipt_kind, receipt_sequence),
+    CONSTRAINT lifecycle_volume_receipts_exact_operation_fkey
+        FOREIGN KEY (
+            operation_id, request_fingerprint, workspace_id, cat_id,
+            node_id, placement_epoch, runtime_config_id, runtime_config_sha256,
+            source_command_kind
+        ) REFERENCES runtime_operations (
+            operation_id, canonical_request_sha256, workspace_id, cat_id,
+            node_id, placement_epoch, runtime_config_id, runtime_config_sha256,
+            command_kind
+        ) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT lifecycle_volume_receipts_operation_disk_unique
+        UNIQUE (operation_id, disk_id, receipt_kind, receipt_sequence),
+    CONSTRAINT lifecycle_volume_receipts_command_shape_check CHECK (
+        (source_command_kind = 'start'
+            AND receipt_kind = 'start_grant'
+            AND delete_id IS NULL) OR
+        (source_command_kind = 'cold'
+            AND receipt_kind IN ('normal_release', 'already_unowned')
+            AND receipt_sequence = 0
+            AND delete_id IS NULL) OR
+        (source_command_kind = 'delete'
+            AND receipt_sequence = 0
+            AND delete_id IS NOT NULL)
+    )
+);
+CREATE INDEX IF NOT EXISTS lifecycle_volume_receipts_stable_lookup
+ON lifecycle_volume_receipts(operation_id, receipt_kind, receipt_sequence, volume_id);
+CREATE INDEX IF NOT EXISTS lifecycle_volume_receipts_delete_lookup
+ON lifecycle_volume_receipts(volume_id, delete_id, receipt_kind, operation_id);
+CREATE OR REPLACE FUNCTION control_lifecycle_volume_receipt_is_immutable()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'lifecycle volume receipts are immutable command evidence';
+END;
+$$;
+CREATE TRIGGER lifecycle_volume_receipt_cannot_update
+BEFORE UPDATE ON lifecycle_volume_receipts FOR EACH ROW
+EXECUTE FUNCTION control_lifecycle_volume_receipt_is_immutable();
+CREATE TRIGGER lifecycle_volume_receipt_cannot_delete
+BEFORE DELETE ON lifecycle_volume_receipts FOR EACH ROW
+EXECUTE FUNCTION control_lifecycle_volume_receipt_is_immutable();
+CREATE OR REPLACE FUNCTION control_cat_record_identity_guard()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF (OLD.cat_id, OLD.record, OLD.workspace_id, OLD.name,
+        OLD.cat_creation_id, OLD.created_at)
+       IS DISTINCT FROM
+       (NEW.cat_id, NEW.record, NEW.workspace_id, NEW.name,
+        NEW.cat_creation_id, NEW.created_at)
+       OR (OLD.deleted_at IS NOT NULL AND
+           (OLD.lifecycle_head_operation_id, OLD.stable_state,
+            OLD.effective_runtime_ready_operation_id,
+            OLD.runtime_incarnation, OLD.current_runtime_config_id,
+            OLD.current_runtime_config_sha256, OLD.deleted_at)
+           IS DISTINCT FROM
+           (NEW.lifecycle_head_operation_id, NEW.stable_state,
+            NEW.effective_runtime_ready_operation_id,
+            NEW.runtime_incarnation, NEW.current_runtime_config_id,
+            NEW.current_runtime_config_sha256, NEW.deleted_at))
+    THEN
+        RAISE EXCEPTION 'Cat identity and creation authority are immutable';
+    END IF;
+    IF (OLD.current_runtime_config_id, OLD.current_runtime_config_sha256)
+       IS DISTINCT FROM
+       (NEW.current_runtime_config_id, NEW.current_runtime_config_sha256)
+       AND (OLD.stable_state IS DISTINCT FROM 'cold'
+            OR NEW.stable_state IS DISTINCT FROM 'cold'
+            OR EXISTS (
+                SELECT 1 FROM runtime_operations
+                 WHERE cat_id=OLD.cat_id AND state='unresolved'
+            ))
+    THEN
+        RAISE EXCEPTION 'runtime config may advance only from terminal Cold with no unresolved Operation';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE OR REPLACE FUNCTION control_cat_record_cannot_delete()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'Cat lifecycle membership is retired by tombstone, not deletion';
+END;
+$$;
+CREATE TRIGGER cat_record_identity_is_immutable
+BEFORE UPDATE ON cat_records FOR EACH ROW
+EXECUTE FUNCTION control_cat_record_identity_guard();
+CREATE TRIGGER cat_record_cannot_delete
+BEFORE DELETE ON cat_records FOR EACH ROW
+EXECUTE FUNCTION control_cat_record_cannot_delete();
 CREATE TABLE IF NOT EXISTS api_idempotency_results (
     authenticated_workspace_id TEXT NOT NULL REFERENCES workspaces(id),
     canonical_route TEXT NOT NULL CHECK (
@@ -4943,7 +6043,7 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission_commands (
         CHECK (source_commit_sha ~ '^[0-9a-f]{40}$'),
     control_schema_version BIGINT NOT NULL
         CONSTRAINT production_mutation_admission_commands_schema_ck
-        CHECK (control_schema_version = 16),
+        CHECK (control_schema_version = 17),
     source_manifest_sha256 TEXT NOT NULL
         CONSTRAINT production_mutation_admission_commands_source_manifest_ck
         CHECK (source_manifest_sha256 ~ '^sha256:[0-9a-f]{64}$'),
@@ -5135,7 +6235,7 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission (
         CHECK (source_commit_sha ~ '^[0-9a-f]{40}$'),
     control_schema_version BIGINT NULL
         CONSTRAINT production_mutation_admission_schema_ck
-        CHECK (control_schema_version = 16),
+        CHECK (control_schema_version = 17),
     source_manifest_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_source_manifest_ck
         CHECK (source_manifest_sha256 ~ '^sha256:[0-9a-f]{64}$'),
@@ -5392,6 +6492,204 @@ CREATE UNIQUE INDEX IF NOT EXISTS node_identity_one_provisioned_per_host
         host_provider, host_partition, host_account_id, host_region,
         immutable_host_id
     ) WHERE state = 'provisioned';
+CREATE TABLE IF NOT EXISTS route_operations (
+    operation_id TEXT
+        CONSTRAINT route_operations_pkey PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    cat_id TEXT NOT NULL,
+    endpoint_id TEXT NOT NULL,
+    operation_kind TEXT NOT NULL
+        CONSTRAINT route_operations_kind_check
+        CHECK (operation_kind IN ('enable', 'disable')),
+    canonical_request_bytes BYTEA NOT NULL
+        CONSTRAINT route_operations_request_bytes_check
+        CHECK (octet_length(canonical_request_bytes) BETWEEN 1 AND 1048576),
+    canonical_request_sha256 TEXT NOT NULL
+        CONSTRAINT route_operations_request_digest_check
+        CHECK (canonical_request_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    expected_predecessor_operation_id TEXT,
+    expected_predecessor_result_kind TEXT,
+    expected_predecessor_result_sha256 TEXT
+        CONSTRAINT route_operations_predecessor_digest_check
+        CHECK (expected_predecessor_result_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    hostname TEXT NOT NULL,
+    protocol TEXT NOT NULL
+        CONSTRAINT route_operations_protocol_check
+        CHECK (protocol = 'http'),
+    target_port INTEGER NOT NULL
+        CONSTRAINT route_operations_target_port_check
+        CHECK (target_port BETWEEN 1 AND 65535),
+    route_epoch BIGINT NOT NULL
+        CONSTRAINT route_operations_route_epoch_check
+        CHECK (route_epoch > 0),
+    source_lifecycle_operation_id TEXT NOT NULL,
+    runtime_incarnation TEXT NOT NULL
+        CONSTRAINT route_operations_runtime_incarnation_check
+        CHECK (runtime_incarnation ~ '^[0-9a-f]{32}$'),
+    node_id TEXT NOT NULL,
+    placement_epoch BIGINT NOT NULL
+        CONSTRAINT route_operations_placement_epoch_check
+        CHECK (placement_epoch > 0),
+    node_boot_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL
+        CONSTRAINT route_operations_agent_instance_check
+        CHECK (agent_instance_id ~ '^[0-9a-f]{32}$'),
+    admission_session_epoch BIGINT NOT NULL
+        CONSTRAINT route_operations_session_epoch_check
+        CHECK (admission_session_epoch > 0),
+    state TEXT NOT NULL
+        CONSTRAINT route_operations_state_check
+        CHECK (state IN ('unresolved', 'terminal')),
+    terminal_source TEXT
+        CONSTRAINT route_operations_terminal_source_check
+        CHECK (terminal_source IN ('node_result', 'control_invalidation')),
+    terminal_result_kind TEXT
+        CONSTRAINT route_operations_terminal_result_kind_check
+        CHECK (terminal_result_kind IN (
+            'serving', 'closed', 'rejected', 'invalidated'
+        )),
+    canonical_result_bytes BYTEA
+        CONSTRAINT route_operations_result_bytes_check
+        CHECK (canonical_result_bytes IS NULL OR
+               octet_length(canonical_result_bytes) BETWEEN 1 AND 1048576),
+    canonical_result_sha256 TEXT
+        CONSTRAINT route_operations_result_digest_check
+        CHECK (canonical_result_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    created_at_unix_ms BIGINT NOT NULL
+        CONSTRAINT route_operations_created_at_check
+        CHECK (created_at_unix_ms >= 0),
+    terminal_at_unix_ms BIGINT
+        CONSTRAINT route_operations_terminal_at_check
+        CHECK (terminal_at_unix_ms >= created_at_unix_ms),
+    CONSTRAINT route_operations_endpoint_fkey
+        FOREIGN KEY (workspace_id, cat_id, endpoint_id)
+        REFERENCES endpoint_records(workspace_id, cat_id, endpoint_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT route_operations_source_lifecycle_fkey
+        FOREIGN KEY (cat_id, source_lifecycle_operation_id)
+        REFERENCES runtime_operations(cat_id, operation_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT route_operations_node_fkey
+        FOREIGN KEY (node_id) REFERENCES node_identities(node_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    CONSTRAINT route_operations_endpoint_operation_key
+        UNIQUE (endpoint_id, operation_id),
+    CONSTRAINT route_operations_exact_endpoint_operation_key
+        UNIQUE (workspace_id, cat_id, endpoint_id, operation_id),
+    CONSTRAINT route_operations_predecessor_result_key
+        UNIQUE (
+            endpoint_id, operation_id, terminal_result_kind,
+            canonical_result_sha256
+        ),
+    CONSTRAINT route_operations_exact_predecessor_fkey
+        FOREIGN KEY (
+            endpoint_id, expected_predecessor_operation_id,
+            expected_predecessor_result_kind,
+            expected_predecessor_result_sha256
+        ) REFERENCES route_operations (
+            endpoint_id, operation_id, terminal_result_kind,
+            canonical_result_sha256
+        ) DEFERRABLE INITIALLY DEFERRED,
+    CONSTRAINT route_operations_predecessor_shape_check CHECK (
+        (expected_predecessor_operation_id IS NULL
+            AND expected_predecessor_result_kind IS NULL
+            AND expected_predecessor_result_sha256 IS NULL) OR
+        (expected_predecessor_operation_id IS NOT NULL
+            AND expected_predecessor_result_kind IS NOT NULL
+            AND expected_predecessor_result_sha256 IS NOT NULL)
+    ),
+    CONSTRAINT route_operations_terminal_shape_check CHECK (
+        (state = 'unresolved'
+            AND terminal_source IS NULL
+            AND terminal_result_kind IS NULL
+            AND canonical_result_bytes IS NULL
+            AND canonical_result_sha256 IS NULL
+            AND terminal_at_unix_ms IS NULL) OR
+        (state = 'terminal'
+            AND terminal_source IS NOT NULL
+            AND terminal_result_kind IS NOT NULL
+            AND canonical_result_bytes IS NOT NULL
+            AND canonical_result_sha256 IS NOT NULL
+            AND terminal_at_unix_ms IS NOT NULL)
+    ),
+    CONSTRAINT route_operations_command_result_check CHECK (
+        terminal_source IS NULL OR
+        (terminal_source = 'control_invalidation'
+            AND terminal_result_kind = 'invalidated') OR
+        (terminal_source = 'node_result'
+            AND operation_kind = 'enable'
+            AND terminal_result_kind IN ('serving', 'rejected')) OR
+        (terminal_source = 'node_result'
+            AND operation_kind = 'disable'
+            AND terminal_result_kind IN ('closed', 'rejected'))
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS route_operations_one_unresolved_per_endpoint
+ON route_operations(endpoint_id) WHERE state='unresolved';
+CREATE UNIQUE INDEX IF NOT EXISTS route_operations_one_genesis_per_endpoint
+ON route_operations(endpoint_id)
+WHERE expected_predecessor_operation_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS route_operations_one_successor_per_predecessor
+ON route_operations(endpoint_id, expected_predecessor_operation_id)
+WHERE expected_predecessor_operation_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS route_operations_workspace_lookup
+ON route_operations(workspace_id, operation_id);
+CREATE INDEX IF NOT EXISTS route_operations_endpoint_history
+ON route_operations(endpoint_id, created_at_unix_ms, operation_id);
+ALTER TABLE endpoint_records
+    ADD CONSTRAINT endpoint_records_route_head_operation_fkey
+    FOREIGN KEY (workspace_id, cat_id, endpoint_id, route_head_operation_id)
+    REFERENCES route_operations(workspace_id, cat_id, endpoint_id, operation_id)
+    ON UPDATE RESTRICT ON DELETE RESTRICT
+    DEFERRABLE INITIALLY DEFERRED;
+ALTER TABLE endpoint_records
+    ADD CONSTRAINT endpoint_records_effective_serving_operation_fkey
+    FOREIGN KEY (workspace_id, cat_id, endpoint_id, effective_serving_operation_id)
+    REFERENCES route_operations(workspace_id, cat_id, endpoint_id, operation_id)
+    ON UPDATE RESTRICT ON DELETE RESTRICT
+    DEFERRABLE INITIALLY DEFERRED;
+CREATE OR REPLACE FUNCTION control_route_operation_transition_guard()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF (OLD.operation_id, OLD.workspace_id, OLD.cat_id, OLD.endpoint_id,
+        OLD.operation_kind, OLD.canonical_request_bytes,
+        OLD.canonical_request_sha256, OLD.expected_predecessor_operation_id,
+        OLD.expected_predecessor_result_kind,
+        OLD.expected_predecessor_result_sha256, OLD.hostname, OLD.protocol,
+        OLD.target_port, OLD.route_epoch, OLD.source_lifecycle_operation_id,
+        OLD.runtime_incarnation, OLD.node_id, OLD.placement_epoch,
+        OLD.node_boot_id, OLD.agent_instance_id, OLD.admission_session_epoch,
+        OLD.created_at_unix_ms)
+       IS DISTINCT FROM
+       (NEW.operation_id, NEW.workspace_id, NEW.cat_id, NEW.endpoint_id,
+        NEW.operation_kind, NEW.canonical_request_bytes,
+        NEW.canonical_request_sha256, NEW.expected_predecessor_operation_id,
+        NEW.expected_predecessor_result_kind,
+        NEW.expected_predecessor_result_sha256, NEW.hostname, NEW.protocol,
+        NEW.target_port, NEW.route_epoch, NEW.source_lifecycle_operation_id,
+        NEW.runtime_incarnation, NEW.node_id, NEW.placement_epoch,
+        NEW.node_boot_id, NEW.agent_instance_id, NEW.admission_session_epoch,
+        NEW.created_at_unix_ms)
+       OR OLD.state <> 'unresolved'
+       OR NEW.state <> 'terminal'
+    THEN
+        RAISE EXCEPTION 'invalid Route Operation transition';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE OR REPLACE FUNCTION control_route_operation_cannot_delete()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'Route Operations are immutable history';
+END;
+$$;
+CREATE TRIGGER route_operation_transition_is_forward_only
+BEFORE UPDATE ON route_operations FOR EACH ROW
+EXECUTE FUNCTION control_route_operation_transition_guard();
+CREATE TRIGGER route_operation_cannot_delete
+BEFORE DELETE ON route_operations FOR EACH ROW
+EXECUTE FUNCTION control_route_operation_cannot_delete();
 CREATE TABLE IF NOT EXISTS runtime_node_credential_lineage (
     credential_id TEXT PRIMARY KEY,
     node_id TEXT NOT NULL REFERENCES node_identities(node_id)
@@ -6412,274 +7710,6 @@ EXECUTE FUNCTION control_host_fence_provider_queue_transition_guard();
 CREATE TRIGGER host_fence_provider_queue_cannot_delete
 BEFORE DELETE ON host_fence_provider_queue_v1 FOR EACH ROW
 EXECUTE FUNCTION control_host_fence_provider_queue_cannot_delete();
-CREATE TABLE IF NOT EXISTS trusted_host_fence_recovery_attempts_v1 (
-    fence_attempt_id TEXT
-        CONSTRAINT trusted_host_fence_recovery_attempts_v1_pkey PRIMARY KEY,
-    apply_id TEXT NOT NULL
-        CONSTRAINT host_recovery_attempt_apply_id_check
-        CHECK (apply_id ~ '^[0-9a-f]{32}$'),
-    attempt_bytes BYTEA NOT NULL
-        CONSTRAINT host_recovery_attempt_bytes_check
-        CHECK (octet_length(attempt_bytes) BETWEEN 2 AND 33554432),
-    attempt_sha256 TEXT NOT NULL
-        CONSTRAINT host_recovery_attempt_digest_check
-        CHECK (attempt_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    provider TEXT NOT NULL,
-    host_partition TEXT NOT NULL,
-    host_account_id TEXT NOT NULL,
-    host_region TEXT NOT NULL,
-    immutable_host_id TEXT NOT NULL,
-    node_id TEXT NOT NULL
-        CONSTRAINT host_recovery_attempt_node_id_fkey
-        REFERENCES node_identities(node_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
-    expected_node_boot_id TEXT NOT NULL
-        CONSTRAINT host_recovery_attempt_boot_id_check
-        CHECK (expected_node_boot_id ~ '^[0-9a-f]{32}$'),
-    agent_instance_id TEXT NOT NULL
-        CONSTRAINT host_recovery_attempt_agent_id_check
-        CHECK (agent_instance_id ~ '^[0-9a-f]{32}$'),
-    expected_agent_session_epoch BIGINT NOT NULL
-        CONSTRAINT host_recovery_attempt_session_epoch_check
-        CHECK (expected_agent_session_epoch > 0),
-    physical_snapshot_state TEXT NOT NULL
-        CONSTRAINT host_recovery_attempt_physical_state_check
-        CHECK (physical_snapshot_state IN ('accepted_full', 'unavailable')),
-    inventory_epoch BIGINT
-        CONSTRAINT host_recovery_attempt_inventory_epoch_check
-        CHECK (inventory_epoch > 0),
-    inventory_digest TEXT
-        CONSTRAINT host_recovery_attempt_inventory_digest_check
-        CHECK (inventory_digest ~ '^sha256:[0-9a-f]{64}$'),
-    inventory_read_position BIGINT
-        CONSTRAINT host_recovery_attempt_inventory_position_check
-        CHECK (inventory_read_position > 0),
-    full_observation_id TEXT
-        CONSTRAINT host_recovery_attempt_observation_id_check
-        CHECK (full_observation_id ~ '^[0-9a-f]{32}$'),
-    full_observation_bytes BYTEA
-        CONSTRAINT host_recovery_attempt_observation_bytes_check
-        CHECK (full_observation_bytes IS NULL OR
-               octet_length(full_observation_bytes) BETWEEN 2 AND 8388608),
-    full_observation_sha256 TEXT
-        CONSTRAINT host_recovery_attempt_observation_digest_check
-        CHECK (full_observation_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    full_observation_length BIGINT
-        CONSTRAINT host_recovery_attempt_observation_length_check
-        CHECK (full_observation_length BETWEEN 2 AND 8388608),
-    assigned_snapshot_bytes BYTEA
-        CONSTRAINT host_recovery_attempt_snapshot_bytes_check
-        CHECK (assigned_snapshot_bytes IS NULL OR
-               octet_length(assigned_snapshot_bytes) BETWEEN 2 AND 16777216),
-    assigned_snapshot_sha256 TEXT
-        CONSTRAINT host_recovery_attempt_snapshot_digest_check
-        CHECK (assigned_snapshot_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    assigned_snapshot_length BIGINT
-        CONSTRAINT host_recovery_attempt_snapshot_length_check
-        CHECK (assigned_snapshot_length BETWEEN 2 AND 16777216),
-    assigned_set_sha256 TEXT NOT NULL
-        CONSTRAINT host_recovery_attempt_assigned_digest_check
-        CHECK (assigned_set_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    assigned_cat_count BIGINT NOT NULL
-        CONSTRAINT host_recovery_attempt_cat_count_check
-        CHECK (assigned_cat_count BETWEEN 1 AND 1024),
-    state TEXT NOT NULL
-        CONSTRAINT host_recovery_attempt_state_check
-        CHECK (state IN (
-            'provider_pending', 'provider_terminal', 'blocked', 'committed'
-        )),
-    provider_evidence_bytes BYTEA
-        CONSTRAINT host_recovery_attempt_evidence_bytes_check
-        CHECK (provider_evidence_bytes IS NULL OR
-               octet_length(provider_evidence_bytes) BETWEEN 2 AND 4194304),
-    provider_evidence_sha256 TEXT
-        CONSTRAINT host_recovery_attempt_evidence_digest_check
-        CHECK (provider_evidence_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    provider_completed_at_unix_ms BIGINT
-        CONSTRAINT host_recovery_attempt_provider_time_check
-        CHECK (provider_completed_at_unix_ms >= 0),
-    outcome_bytes BYTEA
-        CONSTRAINT host_recovery_attempt_outcome_bytes_check
-        CHECK (outcome_bytes IS NULL OR
-               octet_length(outcome_bytes) BETWEEN 2 AND 67108864),
-    outcome_sha256 TEXT
-        CONSTRAINT host_recovery_attempt_outcome_digest_check
-        CHECK (outcome_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    enqueued_at_unix_ms BIGINT NOT NULL
-        CONSTRAINT host_recovery_attempt_enqueued_time_check
-        CHECK (enqueued_at_unix_ms >= 0),
-    outcome_completed_at_unix_ms BIGINT
-        CONSTRAINT host_recovery_attempt_outcome_time_check
-        CHECK (outcome_completed_at_unix_ms >= provider_completed_at_unix_ms),
-    CONSTRAINT host_recovery_attempt_provider_queue_fkey
-        FOREIGN KEY (fence_attempt_id)
-        REFERENCES host_fence_provider_queue_v1(fence_attempt_id)
-        ON UPDATE RESTRICT ON DELETE RESTRICT,
-    CONSTRAINT host_recovery_attempt_physical_shape_check CHECK (
-        (physical_snapshot_state = 'accepted_full'
-            AND inventory_epoch IS NOT NULL AND inventory_digest IS NOT NULL
-            AND inventory_read_position IS NOT NULL
-            AND full_observation_id IS NOT NULL
-            AND full_observation_bytes IS NOT NULL
-            AND full_observation_sha256 IS NOT NULL
-            AND full_observation_length IS NOT NULL
-            AND octet_length(full_observation_bytes) = full_observation_length
-            AND assigned_snapshot_bytes IS NOT NULL
-            AND assigned_snapshot_sha256 IS NOT NULL
-            AND assigned_snapshot_length IS NOT NULL
-            AND octet_length(assigned_snapshot_bytes) = assigned_snapshot_length) OR
-        (physical_snapshot_state = 'unavailable'
-            AND inventory_epoch IS NULL AND inventory_digest IS NULL
-            AND inventory_read_position IS NULL
-            AND full_observation_id IS NULL
-            AND full_observation_bytes IS NULL
-            AND full_observation_sha256 IS NULL
-            AND full_observation_length IS NULL
-            AND assigned_snapshot_bytes IS NULL
-            AND assigned_snapshot_sha256 IS NULL
-            AND assigned_snapshot_length IS NULL)
-    ),
-    CONSTRAINT host_recovery_attempt_state_shape_check CHECK (
-        (state = 'provider_pending' AND provider_evidence_bytes IS NULL
-            AND provider_evidence_sha256 IS NULL
-            AND provider_completed_at_unix_ms IS NULL
-            AND outcome_bytes IS NULL AND outcome_sha256 IS NULL
-            AND outcome_completed_at_unix_ms IS NULL) OR
-        (state = 'provider_terminal' AND provider_evidence_bytes IS NOT NULL
-            AND provider_evidence_sha256 IS NOT NULL
-            AND provider_completed_at_unix_ms IS NOT NULL
-            AND outcome_bytes IS NULL AND outcome_sha256 IS NULL
-            AND outcome_completed_at_unix_ms IS NULL) OR
-        (state IN ('blocked', 'committed')
-            AND provider_evidence_bytes IS NOT NULL
-            AND provider_evidence_sha256 IS NOT NULL
-            AND provider_completed_at_unix_ms IS NOT NULL
-            AND outcome_bytes IS NOT NULL AND outcome_sha256 IS NOT NULL
-            AND outcome_completed_at_unix_ms IS NOT NULL)
-    ),
-    CONSTRAINT host_recovery_attempt_apply_id_key UNIQUE (apply_id)
-);
-CREATE UNIQUE INDEX IF NOT EXISTS host_recovery_one_active_source_session
-    ON trusted_host_fence_recovery_attempts_v1(
-        provider, host_partition, host_account_id, host_region,
-        immutable_host_id, node_id, expected_node_boot_id,
-        expected_agent_session_epoch
-    ) WHERE state IN ('provider_pending', 'provider_terminal', 'blocked');
-CREATE INDEX IF NOT EXISTS host_recovery_active_node_barrier
-    ON trusted_host_fence_recovery_attempts_v1(
-        node_id, state, fence_attempt_id COLLATE \"C\"
-    ) WHERE state IN ('provider_pending', 'provider_terminal', 'blocked');
-CREATE TABLE IF NOT EXISTS trusted_host_fence_recovery_attempt_cats_v1 (
-    fence_attempt_id TEXT NOT NULL,
-    ordinal BIGINT NOT NULL
-        CONSTRAINT host_recovery_cat_ordinal_check
-        CHECK (ordinal BETWEEN 0 AND 1023),
-    cat_id TEXT NOT NULL
-        CONSTRAINT host_recovery_cat_id_fkey
-        REFERENCES cat_records(cat_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
-    cat_snapshot_bytes BYTEA NOT NULL
-        CONSTRAINT host_recovery_cat_snapshot_bytes_check
-        CHECK (octet_length(cat_snapshot_bytes) BETWEEN 2 AND 33554432),
-    cat_snapshot_sha256 TEXT NOT NULL
-        CONSTRAINT host_recovery_cat_snapshot_digest_check
-        CHECK (cat_snapshot_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    workspace_id TEXT NOT NULL,
-    expected_desired_revision BIGINT NOT NULL
-        CONSTRAINT host_recovery_cat_desired_revision_check
-        CHECK (expected_desired_revision > 0),
-    expected_desired_spec_digest TEXT NOT NULL
-        CONSTRAINT host_recovery_cat_desired_digest_check
-        CHECK (expected_desired_spec_digest ~ '^sha256:[0-9a-f]{64}$'),
-    expected_old_operation_id TEXT NOT NULL
-        CONSTRAINT host_recovery_cat_old_operation_fkey
-        REFERENCES runtime_operations(operation_id)
-        ON UPDATE RESTRICT ON DELETE RESTRICT,
-    volume_count BIGINT NOT NULL
-        CONSTRAINT host_recovery_cat_volume_count_check
-        CHECK (volume_count BETWEEN 1 AND 64),
-    volume_set_sha256 TEXT NOT NULL
-        CONSTRAINT host_recovery_cat_volume_digest_check
-        CHECK (volume_set_sha256 ~ '^sha256:[0-9a-f]{64}$'),
-    CONSTRAINT trusted_host_fence_recovery_attempt_cats_v1_pkey
-        PRIMARY KEY (fence_attempt_id, ordinal),
-    CONSTRAINT host_recovery_cat_attempt_fkey
-        FOREIGN KEY (fence_attempt_id)
-        REFERENCES trusted_host_fence_recovery_attempts_v1(fence_attempt_id)
-        ON UPDATE RESTRICT ON DELETE RESTRICT,
-    CONSTRAINT host_recovery_cat_attempt_cat_key
-        UNIQUE (fence_attempt_id, cat_id)
-);
-CREATE OR REPLACE FUNCTION control_host_recovery_attempt_transition_v1()
-RETURNS trigger LANGUAGE plpgsql AS $$
-BEGIN
-    IF (OLD.fence_attempt_id, OLD.apply_id, OLD.attempt_bytes, OLD.attempt_sha256,
-        OLD.provider, OLD.host_partition, OLD.host_account_id, OLD.host_region,
-        OLD.immutable_host_id, OLD.node_id, OLD.expected_node_boot_id,
-        OLD.agent_instance_id, OLD.expected_agent_session_epoch,
-        OLD.physical_snapshot_state, OLD.inventory_epoch, OLD.inventory_digest,
-        OLD.inventory_read_position, OLD.full_observation_id,
-        OLD.full_observation_bytes, OLD.full_observation_sha256,
-        OLD.full_observation_length, OLD.assigned_snapshot_bytes,
-        OLD.assigned_snapshot_sha256, OLD.assigned_snapshot_length,
-        OLD.assigned_set_sha256,
-        OLD.assigned_cat_count, OLD.enqueued_at_unix_ms)
-       IS DISTINCT FROM
-       (NEW.fence_attempt_id, NEW.apply_id, NEW.attempt_bytes, NEW.attempt_sha256,
-        NEW.provider, NEW.host_partition, NEW.host_account_id, NEW.host_region,
-        NEW.immutable_host_id, NEW.node_id, NEW.expected_node_boot_id,
-        NEW.agent_instance_id, NEW.expected_agent_session_epoch,
-        NEW.physical_snapshot_state, NEW.inventory_epoch, NEW.inventory_digest,
-        NEW.inventory_read_position, NEW.full_observation_id,
-        NEW.full_observation_bytes, NEW.full_observation_sha256,
-        NEW.full_observation_length, NEW.assigned_snapshot_bytes,
-        NEW.assigned_snapshot_sha256, NEW.assigned_snapshot_length,
-        NEW.assigned_set_sha256,
-        NEW.assigned_cat_count, NEW.enqueued_at_unix_ms)
-       OR NOT (
-            (OLD.state = 'provider_pending' AND NEW.state = 'provider_terminal'
-                AND OLD.provider_evidence_bytes IS NULL
-                AND OLD.provider_evidence_sha256 IS NULL
-                AND OLD.provider_completed_at_unix_ms IS NULL
-                AND OLD.outcome_bytes IS NULL AND OLD.outcome_sha256 IS NULL
-                AND OLD.outcome_completed_at_unix_ms IS NULL)
-            OR (OLD.state = 'provider_terminal'
-                AND NEW.state IN ('blocked', 'committed')
-                AND (OLD.provider_evidence_bytes,
-                     OLD.provider_evidence_sha256,
-                     OLD.provider_completed_at_unix_ms)
-                    IS NOT DISTINCT FROM
-                    (NEW.provider_evidence_bytes,
-                     NEW.provider_evidence_sha256,
-                     NEW.provider_completed_at_unix_ms)
-                AND OLD.outcome_bytes IS NULL AND OLD.outcome_sha256 IS NULL
-                AND OLD.outcome_completed_at_unix_ms IS NULL)
-       )
-    THEN
-        RAISE EXCEPTION 'invalid trusted Host recovery attempt transition';
-    END IF;
-    RETURN NEW;
-END;
-$$;
-CREATE OR REPLACE FUNCTION control_host_recovery_attempt_cannot_delete_v1()
-RETURNS trigger LANGUAGE plpgsql AS $$
-BEGIN
-    RAISE EXCEPTION 'trusted Host recovery attempts cannot be deleted';
-END;
-$$;
-CREATE OR REPLACE FUNCTION control_host_recovery_cat_is_immutable_v1()
-RETURNS trigger LANGUAGE plpgsql AS $$
-BEGIN
-    RAISE EXCEPTION 'trusted Host recovery assigned snapshots are immutable';
-END;
-$$;
-CREATE TRIGGER host_recovery_attempt_transition_v1
-BEFORE UPDATE ON trusted_host_fence_recovery_attempts_v1 FOR EACH ROW
-EXECUTE FUNCTION control_host_recovery_attempt_transition_v1();
-CREATE TRIGGER host_recovery_attempt_cannot_delete_v1
-BEFORE DELETE ON trusted_host_fence_recovery_attempts_v1 FOR EACH ROW
-EXECUTE FUNCTION control_host_recovery_attempt_cannot_delete_v1();
-CREATE TRIGGER host_recovery_cat_is_immutable_v1
-BEFORE UPDATE OR DELETE ON trusted_host_fence_recovery_attempt_cats_v1 FOR EACH ROW
-EXECUTE FUNCTION control_host_recovery_cat_is_immutable_v1();
 CREATE TABLE IF NOT EXISTS runtime_node_placement_policies (
     node_id TEXT PRIMARY KEY REFERENCES node_identities(node_id)
         ON UPDATE RESTRICT ON DELETE RESTRICT,
@@ -7332,59 +8362,131 @@ CREATE TABLE IF NOT EXISTS current_agent_sessions (
     guest_config_digest TEXT NOT NULL
         CHECK (guest_config_digest ~ '^sha256:[0-9a-f]{64}$'),
     lease_deadline_unix_ms BIGINT NOT NULL CHECK (lease_deadline_unix_ms >= 0),
+    CONSTRAINT current_agent_sessions_exact_binding_key
+        UNIQUE (
+            node_id, node_boot_id, agent_instance_id,
+            agent_session_epoch
+        ),
     FOREIGN KEY (node_id, registration_attempt_id, agent_session_epoch)
         REFERENCES agent_registration_attempts(
             node_id, registration_attempt_id, agent_session_epoch
         )
 );
-CREATE TABLE IF NOT EXISTS runtime_desired_read_states (
-    node_id TEXT PRIMARY KEY REFERENCES node_identities(node_id),
-    response JSONB NOT NULL CHECK (jsonb_typeof(response) = 'object'),
+CREATE TABLE IF NOT EXISTS route_node_ring_acks (
+    node_id TEXT
+        CONSTRAINT route_node_ring_acks_pkey PRIMARY KEY
+        REFERENCES node_identities(node_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    canonical_ack_bytes BYTEA NOT NULL
+        CONSTRAINT route_node_ring_acks_bytes_check
+        CHECK (octet_length(canonical_ack_bytes) BETWEEN 1 AND 1048576),
+    canonical_ack_sha256 TEXT NOT NULL
+        CONSTRAINT route_node_ring_acks_ack_digest_check
+        CHECK (canonical_ack_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    ack_id TEXT NOT NULL,
+    ack_sequence BIGINT NOT NULL
+        CONSTRAINT route_node_ring_acks_sequence_check
+        CHECK (ack_sequence > 0),
     node_boot_id TEXT NOT NULL,
-    agent_instance_id TEXT NOT NULL,
-    agent_session_epoch BIGINT NOT NULL CHECK (agent_session_epoch > 0),
-    last_request_sequence BIGINT NOT NULL CHECK (last_request_sequence > 0),
-    read_position_high_water BIGINT NOT NULL CHECK (read_position_high_water > 0),
-    issued_at_unix_ms BIGINT NOT NULL CHECK (issued_at_unix_ms >= 0),
-    expires_at_unix_ms BIGINT NOT NULL CHECK (expires_at_unix_ms > issued_at_unix_ms),
-    consumed_observation_id TEXT,
-    consumed_heartbeat_sequence BIGINT CHECK (consumed_heartbeat_sequence > 0),
-    CHECK ((consumed_observation_id IS NULL) = (consumed_heartbeat_sequence IS NULL))
+    agent_instance_id TEXT NOT NULL
+        CONSTRAINT route_node_ring_acks_agent_instance_check
+        CHECK (agent_instance_id ~ '^[0-9a-f]{32}$'),
+    admission_session_epoch BIGINT NOT NULL
+        CONSTRAINT route_node_ring_acks_session_epoch_check
+        CHECK (admission_session_epoch > 0),
+    ring_version BIGINT NOT NULL
+        CONSTRAINT route_node_ring_acks_ring_version_check
+        CHECK (ring_version > 0),
+    key_ring_digest TEXT NOT NULL
+        CONSTRAINT route_node_ring_acks_ring_digest_check
+        CHECK (key_ring_digest ~ '^sha256:[0-9a-f]{64}$'),
+    loaded_kids JSONB NOT NULL
+        CONSTRAINT route_node_ring_acks_loaded_kids_check
+        CHECK (jsonb_typeof(loaded_kids) = 'array'),
+    accepted_at_unix_ms BIGINT NOT NULL
+        CONSTRAINT route_node_ring_acks_accepted_at_check
+        CHECK (accepted_at_unix_ms >= 0),
+    CONSTRAINT route_node_ring_acks_session_sequence_key
+        UNIQUE (node_id, admission_session_epoch, ack_sequence),
+    CONSTRAINT route_node_ring_acks_session_ack_id_key
+        UNIQUE (node_id, admission_session_epoch, ack_id),
+    CONSTRAINT route_node_ring_acks_exact_session_fkey
+        FOREIGN KEY (
+            node_id, node_boot_id, agent_instance_id,
+            admission_session_epoch
+        ) REFERENCES current_agent_sessions (
+            node_id, node_boot_id, agent_instance_id,
+            agent_session_epoch
+        ) ON UPDATE RESTRICT ON DELETE RESTRICT
+        DEFERRABLE INITIALLY DEFERRED
 );
-CREATE TABLE IF NOT EXISTS runtime_observation_receive_states (
+CREATE OR REPLACE FUNCTION control_route_node_ring_ack_transition_guard()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.node_id IS DISTINCT FROM OLD.node_id
+       OR NEW.admission_session_epoch < OLD.admission_session_epoch
+       OR (NEW.admission_session_epoch = OLD.admission_session_epoch
+           AND NEW.ack_sequence < OLD.ack_sequence)
+       OR (NEW.admission_session_epoch = OLD.admission_session_epoch
+           AND NEW.ack_sequence = OLD.ack_sequence
+           AND NEW IS DISTINCT FROM OLD)
+    THEN
+        RAISE EXCEPTION 'invalid Route public-ring acknowledgement transition';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE OR REPLACE FUNCTION control_route_node_ring_ack_cannot_delete()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'Route public-ring acknowledgement cannot be deleted';
+END;
+$$;
+CREATE TRIGGER route_node_ring_ack_transition_is_forward_only
+BEFORE UPDATE ON route_node_ring_acks FOR EACH ROW
+EXECUTE FUNCTION control_route_node_ring_ack_transition_guard();
+CREATE TRIGGER route_node_ring_ack_cannot_delete
+BEFORE DELETE ON route_node_ring_acks FOR EACH ROW
+EXECUTE FUNCTION control_route_node_ring_ack_cannot_delete();
+CREATE TABLE IF NOT EXISTS runtime_inventory_receive_states (
     node_id TEXT PRIMARY KEY REFERENCES node_identities(node_id),
-    observation JSONB NOT NULL CHECK (jsonb_typeof(observation) = 'object'),
+    report JSONB NOT NULL CHECK (jsonb_typeof(report) = 'object'),
     acceptance JSONB NOT NULL CHECK (jsonb_typeof(acceptance) = 'object'),
     node_boot_id TEXT NOT NULL,
     agent_instance_id TEXT NOT NULL,
     agent_session_epoch BIGINT NOT NULL CHECK (agent_session_epoch > 0),
-    heartbeat_sequence BIGINT NOT NULL CHECK (heartbeat_sequence > 0),
-    observation_id TEXT NOT NULL,
+    report_sequence BIGINT NOT NULL CHECK (report_sequence > 0),
+    report_id TEXT NOT NULL,
     accepted_at_unix_ms BIGINT NOT NULL CHECK (accepted_at_unix_ms >= 0)
 );
-CREATE TABLE IF NOT EXISTS runtime_admission_inventory_states (
-    node_id TEXT PRIMARY KEY REFERENCES node_identities(node_id),
+-- This is session-bound full-inventory telemetry. It contains no assigned Cat
+-- membership and grants no command, admission, settlement, or cleanup power.
+CREATE TABLE IF NOT EXISTS runtime_full_inventory_attestations (
+    node_id TEXT
+        CONSTRAINT runtime_full_inventory_attestations_pkey PRIMARY KEY
+        REFERENCES node_identities(node_id),
     attestation JSONB NOT NULL CHECK (jsonb_typeof(attestation) = 'object'),
-    full_observation JSONB NOT NULL CHECK (jsonb_typeof(full_observation) = 'object'),
-    assigned_snapshot JSONB NOT NULL CHECK (jsonb_typeof(assigned_snapshot) = 'object'),
+    full_report JSONB NOT NULL CHECK (jsonb_typeof(full_report) = 'object'),
     node_boot_id TEXT NOT NULL,
     agent_instance_id TEXT NOT NULL,
     agent_session_epoch BIGINT NOT NULL CHECK (agent_session_epoch > 0),
     inventory_epoch BIGINT NOT NULL CHECK (inventory_epoch > 0),
+    scan_id TEXT NOT NULL,
     inventory_digest TEXT NOT NULL CHECK (inventory_digest ~ '^sha256:[0-9a-f]{64}$'),
-    inventory_read_position BIGINT NOT NULL CHECK (inventory_read_position > 0),
+    source_report_id TEXT NOT NULL,
+    source_sequence BIGINT NOT NULL CHECK (source_sequence > 0),
     accepted_at_unix_ms BIGINT NOT NULL CHECK (accepted_at_unix_ms >= 0)
 );
-CREATE TABLE IF NOT EXISTS runtime_current_cat_observations (
+CREATE TABLE IF NOT EXISTS runtime_current_cat_telemetry (
     node_id TEXT NOT NULL REFERENCES node_identities(node_id),
     cat_id TEXT NOT NULL,
-    runtime_record JSONB NOT NULL CHECK (jsonb_typeof(runtime_record) = 'object'),
+    telemetry_record JSONB NOT NULL CHECK (jsonb_typeof(telemetry_record) = 'object'),
     node_boot_id TEXT NOT NULL,
     agent_instance_id TEXT NOT NULL,
     agent_session_epoch BIGINT NOT NULL CHECK (agent_session_epoch > 0),
     inventory_epoch BIGINT NOT NULL CHECK (inventory_epoch > 0),
-    source_observation_id TEXT NOT NULL,
-    heartbeat_sequence BIGINT NOT NULL CHECK (heartbeat_sequence > 0),
+    source_report_id TEXT NOT NULL,
+    report_sequence BIGINT NOT NULL CHECK (report_sequence > 0),
     accepted_at_unix_ms BIGINT NOT NULL CHECK (accepted_at_unix_ms >= 0),
     source_kind TEXT NOT NULL CHECK (source_kind IN ('full', 'partial')),
     PRIMARY KEY (node_id, cat_id)
@@ -7803,38 +8905,6 @@ CREATE TRIGGER production_mutation_admission_successor
 CREATE TRIGGER production_mutation_admission_cannot_delete
     BEFORE DELETE ON production_mutation_admission
     FOR EACH ROW EXECUTE FUNCTION control_production_mutation_admission_cannot_delete();
--- Workspace ownership is immutable, enforced in the database exactly as the
--- SQLite triggers did. Raised as an ordinary exception; the store maps it to
--- a conflict.
-CREATE OR REPLACE FUNCTION control_workspace_owner_is_immutable() RETURNS trigger AS $$
-BEGIN
-    IF NEW.workspace_id IS DISTINCT FROM OLD.workspace_id THEN
-        RAISE EXCEPTION '% workspace owner is immutable', TG_TABLE_NAME;
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_trigger t
-         JOIN pg_class c ON c.oid = t.tgrelid
-         JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE t.tgname = 'cats_workspace_owner_is_immutable'
-          AND n.nspname = current_schema()
-    ) THEN
-        CREATE TRIGGER cats_workspace_owner_is_immutable
-            BEFORE UPDATE OF workspace_id ON cats
-            FOR EACH ROW EXECUTE FUNCTION control_workspace_owner_is_immutable();
-        CREATE TRIGGER disks_workspace_owner_is_immutable
-            BEFORE UPDATE OF workspace_id ON disks
-            FOR EACH ROW EXECUTE FUNCTION control_workspace_owner_is_immutable();
-        CREATE TRIGGER operations_workspace_owner_is_immutable
-            BEFORE UPDATE OF workspace_id ON operations
-            FOR EACH ROW EXECUTE FUNCTION control_workspace_owner_is_immutable();
-    END IF;
-END;
-$$;
 ";
 
 #[cfg(test)]
@@ -8076,6 +9146,110 @@ mod object_write_gateway_catalog_tests {
         ] {
             assert!(SCHEMA.contains(&format!("OLD.{column}")));
             assert!(SCHEMA.contains(&format!("NEW.{column}")));
+        }
+    }
+}
+
+#[cfg(test)]
+mod atomic_lifecycle_schema_tests {
+    use super::{
+        CONTROL_TABLES, FORBIDDEN_LEGACY_CONTROL_COLUMNS, FORBIDDEN_LEGACY_CONTROL_TABLES,
+        REQUIRED_CHECK_CONSTRAINTS, REQUIRED_FOREIGN_KEYS, REQUIRED_UNIQUE_INDEXES, SCHEMA,
+        SCHEMA_VERSION,
+    };
+
+    #[test]
+    fn v17_manifest_has_no_parallel_v1_or_desired_authority() {
+        assert_eq!(SCHEMA_VERSION, 17);
+        for table in FORBIDDEN_LEGACY_CONTROL_TABLES {
+            assert!(!CONTROL_TABLES.contains(table));
+            assert!(
+                !SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {table} ")),
+                "legacy authority table {table} returned to the clean schema"
+            );
+        }
+        for (table, column) in FORBIDDEN_LEGACY_CONTROL_COLUMNS {
+            let marker = format!("CREATE TABLE IF NOT EXISTS {table} (");
+            let table_ddl = SCHEMA
+                .split_once(&marker)
+                .unwrap_or_else(|| panic!("authoritative table {table} is absent from SCHEMA"))
+                .1
+                .split_once("\n);")
+                .unwrap_or_else(|| panic!("authoritative table {table} has no DDL terminator"))
+                .0;
+            assert!(
+                !table_ddl
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(&format!("{column} "))),
+                "legacy authority projection {table}.{column} returned to the clean schema"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_ready_and_volume_transition_sum_types_are_catalog_bound() {
+        assert!(REQUIRED_CHECK_CONSTRAINTS
+            .iter()
+            .any(|(table, constraint, definition)| {
+                *table == "cat_records"
+                    && *constraint == "cat_records_runtime_ready_shape_check"
+                    && definition.contains("stable_state = 'suspended'")
+                    && definition.contains("effective_runtime_ready_operation_id IS NULL")
+                    && definition.contains("runtime_incarnation IS NOT NULL")
+            }));
+        assert!(REQUIRED_CHECK_CONSTRAINTS
+            .iter()
+            .any(|(table, constraint, definition)| {
+                *table == "volume_records"
+                    && *constraint == "volume_records_transition_shape_check"
+                    && definition.contains("transition_source_kind = 'independent'")
+                    && definition.contains("transition_source_kind = 'lifecycle'")
+                    && definition.contains("transition_operation_id IS NOT NULL")
+                    && definition.contains("transition_request_fingerprint IS NOT NULL")
+            }));
+        assert!(REQUIRED_FOREIGN_KEYS
+            .iter()
+            .any(|(table, constraint, definition)| {
+                *table == "volume_records"
+                    && *constraint == "volume_records_lifecycle_transition_operation_fkey"
+                    && definition.contains(
+                        "REFERENCES runtime_operations(operation_id, canonical_request_sha256)",
+                    )
+            }));
+        assert!(REQUIRED_UNIQUE_INDEXES
+            .iter()
+            .any(|(table, constraint, columns, predicate)| {
+                *table == "runtime_operations"
+                    && *constraint == "runtime_operations_request_scope_key"
+                    && *columns == "operation_id,canonical_request_sha256"
+                    && predicate.is_none()
+            }));
+    }
+
+    #[test]
+    fn terminal_result_catalog_rejects_removed_failure_variants() {
+        for removed in ["cold_failed", "delete_failed"] {
+            assert!(
+                !SCHEMA.contains(removed),
+                "removed terminal result {removed} returned to the fresh schema"
+            );
+            assert!(
+                REQUIRED_CHECK_CONSTRAINTS
+                    .iter()
+                    .all(|(_, _, definition)| !definition.contains(removed)),
+                "removed terminal result {removed} returned to catalog validation"
+            );
+        }
+        let terminal_set = REQUIRED_CHECK_CONSTRAINTS
+            .iter()
+            .find(|(table, constraint, _)| {
+                *table == "runtime_operations"
+                    && *constraint == "runtime_operations_terminal_result_kind_check"
+            })
+            .map(|(_, _, definition)| *definition)
+            .expect("runtime terminal closed set is catalog-bound");
+        for retained in ["'cold'::text", "'killed'::text", "'deleted'::text"] {
+            assert!(terminal_set.contains(retained));
         }
     }
 }

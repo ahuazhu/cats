@@ -30,6 +30,7 @@ def exercise(source: Path, *, production: bool, root: Path) -> list[str]:
         "\n".join(
             [
                 "CATS_ROUTE_V2_MACHINE_LISTEN=127.0.0.1:6553",
+                "CATS_ROUTE_V2_ROTATION_ORIGIN=https://rotation.fixture.invalid",
                 "CATS_CONTROL_PLANE_URL=http://127.0.0.1:7300",
                 "CATS_S3_BUCKET=fixture-bucket",
                 "CATS_AWS_REGION=us-east-1",
@@ -105,13 +106,20 @@ def main() -> int:
         production = exercise(arguments.production_unit.resolve(), production=True, root=root)
         direct = exercise(arguments.direct_unit.resolve(), production=False, root=root)
 
-    flag = "--route-v2-machine-listen"
-    assert production.count(flag) == 1
-    position = production.index(flag)
-    assert production[position + 1] == "0.0.0.0:7444"
-    assert "127.0.0.1:6553" not in production
-    assert flag not in direct
-    assert "127.0.0.1:6553" not in direct
+    listener_flag = "--route-v2-machine-listen"
+    rotation_flag = "--route-v2-rotation-origin"
+    for label, arguments in [("production", production), ("direct", direct)]:
+        assert arguments.count(listener_flag) == 1, label
+        listener_position = arguments.index(listener_flag)
+        assert arguments[listener_position + 1] == "0.0.0.0:7444", label
+        assert "127.0.0.1:6553" not in arguments, label
+
+        assert arguments.count(rotation_flag) == 1, label
+        rotation_position = arguments.index(rotation_flag)
+        assert (
+            arguments[rotation_position + 1]
+            == "https://rotation.fixture.invalid"
+        ), label
     print("systemd Route v2 effective argv fixture: PASS")
     return 0
 

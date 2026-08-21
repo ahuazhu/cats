@@ -519,7 +519,7 @@ def validate_inventory(value: dict[str, Any]) -> list[dict[str, Any]]:
             local_identities.add(local_identity)
             preflight = require_keys(
                 host["idle_preflight"],
-                {"helper_path", "metering_cgroup_root", "runtime_bin_root"},
+                {"cgroup_v2_root", "helper_path", "runtime_bin_root"},
                 f"{context} idle_preflight",
             )
             helper = _validate_absolute_path(preflight["helper_path"], "idle helper path")
@@ -529,7 +529,7 @@ def validate_inventory(value: dict[str, Any]) -> list[dict[str, Any]]:
             ):
                 raise PositiveStopError(f"{context} does not name require-idle-worker")
             _validate_absolute_path(
-                preflight["metering_cgroup_root"], "metering cgroup root"
+                preflight["cgroup_v2_root"], "cgroup-v2 mount root"
             )
             runtime_root = _validate_absolute_path(
                 preflight["runtime_bin_root"], "runtime binary root"
@@ -1402,7 +1402,7 @@ def execute_local_stop(
         result = runner.run(
             [
                 preflight["helper_path"],
-                preflight["metering_cgroup_root"],
+                preflight["cgroup_v2_root"],
                 preflight["runtime_bin_root"],
             ],
             timeout=deadline.command_timeout("idle/runtime preflight"),
@@ -1449,7 +1449,7 @@ def execute_local_stop(
         second_preflight = runner.run(
             [
                 preflight["helper_path"],
-                preflight["metering_cgroup_root"],
+                preflight["cgroup_v2_root"],
                 preflight["runtime_bin_root"],
             ],
             timeout=deadline.command_timeout("final idle/runtime preflight"),

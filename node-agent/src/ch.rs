@@ -42,7 +42,10 @@ use cats_api::runtime_reconciliation::{
     GUEST_DEVICE_SERIAL_MAX_BYTES_V1,
 };
 
-use crate::runtime_spine::{RuntimeDesiredEffectContext, RuntimePhysicalReadContext};
+use crate::physical_read::{
+    PhysicalEffectContext as RuntimePhysicalEffectContext,
+    PhysicalReadContext as RuntimePhysicalReadContext,
+};
 
 /// Guest-agent vsock port (must match the guest image's init script).
 pub const GUEST_VSOCK_PORT: u32 = 5000;
@@ -235,7 +238,7 @@ pub(crate) trait PendingTap: Send {
         &mut self,
         ip_bin: &Path,
         network: &ChNetwork,
-        effect_context: &RuntimeDesiredEffectContext,
+        effect_context: &dyn RuntimePhysicalEffectContext,
     ) -> Result<()>;
 
     fn publish(self: Box<Self>) -> Result<()>;
@@ -283,9 +286,9 @@ impl PendingTap for LinuxPendingTap {
         &mut self,
         _ip_bin: &Path,
         network: &ChNetwork,
-        effect_context: &RuntimeDesiredEffectContext,
+        effect_context: &dyn RuntimePhysicalEffectContext,
     ) -> Result<()> {
-        let context = IpCommandContext::Desired(effect_context);
+        let context = IpCommandContext::Effect(effect_context);
         self.configure_with_boundary_hook(network, &context, |_| Ok(()))
     }
 
@@ -821,7 +824,7 @@ impl TapCreatePort for PlatformTapCreatePort {
 }
 
 enum IpCommandContext<'a> {
-    Desired(&'a RuntimeDesiredEffectContext),
+    Effect(&'a dyn RuntimePhysicalEffectContext),
     Physical(&'a dyn RuntimePhysicalReadContext),
     Standalone { deadline: Instant },
 }
@@ -829,7 +832,7 @@ enum IpCommandContext<'a> {
 impl IpCommandContext<'_> {
     fn deadline(&self) -> Instant {
         match self {
-            Self::Desired(context) => context.deadline(),
+            Self::Effect(context) => context.deadline(),
             Self::Physical(context) => context.deadline(),
             Self::Standalone { deadline } => *deadline,
         }
@@ -837,7 +840,7 @@ impl IpCommandContext<'_> {
 
     fn check_active(&self) -> Result<()> {
         match self {
-            Self::Desired(context) => context.check_active(),
+            Self::Effect(context) => context.check_active(),
             Self::Physical(context) => context.check_active(),
             Self::Standalone { deadline } => {
                 anyhow::ensure!(
@@ -1009,7 +1012,7 @@ fn ip_status(context: &IpCommandContext<'_>, ip_bin: &Path, args: &[&str]) -> Re
 
 /// Produce the complete Host-physical tuple without touching Host state.
 /// The caller must durably checkpoint the return value before calling
-/// [`prepare_network`]. A checkpoint replay must reuse this exact value.
+/// `prepare_network`. A checkpoint replay must reuse this exact value.
 pub fn plan_network(desired: &NetworkConfig) -> Result<ChNetwork> {
     plan_network_with_random(desired, || {
         RandomId128::new(uuid::Uuid::new_v4().simple().to_string())
@@ -1095,22 +1098,6 @@ impl Ipv4Cidr {
     }
 }
 
-pub(crate) fn network_configs_overlap(left: &NetworkConfig, right: &NetworkConfig) -> Result<bool> {
-    validate_desired_network(left)?;
-    validate_desired_network(right)?;
-    let left = Ipv4Cidr::parse(&format!(
-        "{}/{}",
-        left.gateway_ipv4.as_str(),
-        left.prefix_length
-    ))?;
-    let right = Ipv4Cidr::parse(&format!(
-        "{}/{}",
-        right.gateway_ipv4.as_str(),
-        right.prefix_length
-    ))?;
-    Ok(left.overlaps(right))
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HostIpv4Address {
     interface: String,
@@ -1190,35 +1177,6 @@ struct IpJsonAddress {
 }
 
 impl HostNetworkSnapshot {
-    #[cfg(test)]
-    pub(crate) fn empty_for_test() -> Self {
-        Self {
-            links: BTreeMap::new(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn exact_for_test(identity: &RuntimeNetworkIdentity) -> Result<Self> {
-        let expected = ChNetwork {
-            tap: identity.tap_name.as_str().to_owned(),
-            ownership_token: identity.ownership_token.clone(),
-            config: identity.network_config.clone(),
-        };
-        validate_network_plan(&expected)?;
-        Ok(Self {
-            links: BTreeMap::from([(
-                expected.tap.clone(),
-                HostNetworkLinkSnapshot {
-                    ifindex: 17,
-                    is_tap: true,
-                    is_up: true,
-                    alias: Some(network_alias(&expected)),
-                    ipv4: vec![Ipv4Cidr::parse(&host_cidr(&expected))?],
-                },
-            )]),
-        })
-    }
-
     fn managed_networks(
         &self,
     ) -> Result<BTreeMap<String, (cats_api::runtime_reconciliation::Id, RandomId128, Ipv4Cidr)>>
@@ -1260,6 +1218,7 @@ impl HostNetworkSnapshot {
     /// durable network reservation. A reservation may legitimately be absent
     /// before its later create effect, but a physical managed TAP without a
     /// checkpoint must never be treated as harmless Host background state.
+    #[cfg(test)]
     pub(crate) fn ensure_managed_networks_are_reserved<'a>(
         &self,
         reserved: impl IntoIterator<Item = &'a RuntimeNetworkIdentity>,
@@ -1341,39 +1300,6 @@ impl HostNetworkSnapshot {
             });
         }
         Ok(residue)
-    }
-
-    /// Close every durable reservation against the complete Host IPv4 set.
-    /// Its own exact TAP/address is the sole allowed overlap; an absent
-    /// reservation therefore conflicts with any physical owner of its range.
-    pub(crate) fn ensure_reserved_network_ranges<'a>(
-        &self,
-        reserved: impl IntoIterator<Item = &'a RuntimeNetworkIdentity>,
-    ) -> Result<()> {
-        let reserved = reserved.into_iter().collect::<Vec<_>>();
-        for identity in &reserved {
-            let expected = ChNetwork {
-                tap: identity.tap_name.as_str().to_owned(),
-                ownership_token: identity.ownership_token.clone(),
-                config: identity.network_config.clone(),
-            };
-            validate_network_plan(&expected)?;
-            let desired = Ipv4Cidr::parse(&host_cidr(&expected))?;
-            for (name, link) in &self.links {
-                for address in &link.ipv4 {
-                    if name == &expected.tap && address == &desired {
-                        continue;
-                    }
-                    anyhow::ensure!(
-                        !address.overlaps(desired),
-                        "durable Host network range {} overlaps {} on {name}",
-                        desired.display(),
-                        address.display()
-                    );
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Prove that a fresh random reservation does not reuse a Host link,
@@ -1748,10 +1674,10 @@ fn ensure_host_cidr_available(
 /// Create or adopt only the exact tuple that the caller already checkpointed.
 /// An existing same-token tap is completed idempotently; a same-name tap with
 /// any other token or address is rejected without mutation.
-pub fn prepare_network(
+pub(crate) fn prepare_network(
     cfg: &ChConfig,
     network: &ChNetwork,
-    effect_context: &RuntimeDesiredEffectContext,
+    effect_context: &dyn RuntimePhysicalEffectContext,
 ) -> Result<()> {
     prepare_network_with_tap_port(cfg, network, effect_context, &PlatformTapCreatePort)
 }
@@ -1759,13 +1685,13 @@ pub fn prepare_network(
 pub(crate) fn prepare_network_with_tap_port(
     cfg: &ChConfig,
     network: &ChNetwork,
-    effect_context: &RuntimeDesiredEffectContext,
+    effect_context: &dyn RuntimePhysicalEffectContext,
     tap_create: &dyn TapCreatePort,
 ) -> Result<()> {
     validate_network_plan(network)?;
     let host_cidr = host_cidr(network);
     let desired_cidr = Ipv4Cidr::parse(&host_cidr).context("parse checkpointed Host IPv4 CIDR")?;
-    let context = IpCommandContext::Desired(effect_context);
+    let context = IpCommandContext::Effect(effect_context);
 
     if exact_network_exists(&cfg.ip_bin, network, &context)? {
         let addresses = run_ip_command(
@@ -1820,6 +1746,7 @@ pub(crate) fn prepare_network_with_tap_port(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum NetworkCreateAttempt {
     Published,
     DefinitelyNotPublished,
@@ -1831,17 +1758,18 @@ pub(crate) enum NetworkCreateAttempt {
 /// the sole name claim, and every pre-publication path drops the clone fd.
 /// Once creation is attempted, the closed outcome deliberately contains no
 /// retry instruction; the reconciler must Refresh and obtain a new scan.
+#[cfg(test)]
 pub(crate) fn create_network_from_sealed_absence_with_tap_port(
     ip_bin: &Path,
     network: &ChNetwork,
-    effect_context: &RuntimeDesiredEffectContext,
+    effect_context: &dyn RuntimePhysicalEffectContext,
     tap_create: &dyn TapCreatePort,
 ) -> Result<NetworkCreateAttempt> {
     anyhow::ensure!(ip_bin.is_absolute(), "Host ip binary must be absolute");
     validate_network_plan(network)?;
     let host_cidr = host_cidr(network);
     let desired_cidr = Ipv4Cidr::parse(&host_cidr).context("parse checkpointed Host IPv4 CIDR")?;
-    let context = IpCommandContext::Desired(effect_context);
+    let context = IpCommandContext::Effect(effect_context);
     ensure_host_cidr_available(ip_bin, desired_cidr, None, &context)?;
     context.check_active()?;
 
@@ -1876,21 +1804,6 @@ pub fn remove_network(cfg: &ChConfig, network: &ChNetwork) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn remove_network_bounded(
-    ip_bin: &Path,
-    network: &ChNetwork,
-    effect_context: &RuntimeDesiredEffectContext,
-) -> Result<()> {
-    anyhow::ensure!(ip_bin.is_absolute(), "Host ip binary must be absolute");
-    validate_network_plan(network)?;
-    let context = IpCommandContext::Desired(effect_context);
-    if exact_network_exists(ip_bin, network, &context)? {
-        context.check_active()?;
-        ip_status(&context, ip_bin, &["link", "delete", "dev", &network.tap])?;
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // CH API socket: minimal HTTP/1.1 over a unix stream.
 // ---------------------------------------------------------------------------
@@ -1921,9 +1834,25 @@ fn ch_api_until(
     deadline: Instant,
     check_active: &dyn Fn() -> Result<()>,
 ) -> Result<(u16, String)> {
+    ch_api_until_with_peer(sock, method, path, body, deadline, check_active, None)
+}
+
+fn ch_api_until_with_peer(
+    sock: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    deadline: Instant,
+    check_active: &dyn Fn() -> Result<()>,
+    expected_peer_pid: Option<u32>,
+) -> Result<(u16, String)> {
     check_active_until(deadline, check_active)?;
     let mut stream = connect_unix_until(sock, deadline, check_active)
         .with_context(|| format!("connect CH api socket {}", sock.display()))?;
+    if let Some(expected_peer_pid) = expected_peer_pid {
+        ensure_unix_peer_pid(&stream, expected_peer_pid)
+            .context("CH API peer is not the exact installed VMM")?;
+    }
     let body = body.unwrap_or("");
     let req = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -1981,6 +1910,41 @@ fn ch_api_until(
     let payload = String::from_utf8(response[header_end..message_end].to_vec())
         .context("CH api response body is not UTF-8")?;
     Ok((status, payload))
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_unix_peer_pid(stream: &UnixStream, expected_pid: u32) -> Result<()> {
+    let mut credentials = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut length = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>())
+        .context("CH API peer credential length overflow")?;
+    // SAFETY: both output pointers name initialized writable objects, and
+    // `stream` retains its live descriptor for the duration of getsockopt.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            std::ptr::addr_of_mut!(credentials).cast(),
+            std::ptr::addr_of_mut!(length),
+        )
+    };
+    anyhow::ensure!(
+        result == 0
+            && usize::try_from(length).ok() == Some(std::mem::size_of::<libc::ucred>())
+            && credentials.pid > 0
+            && u32::try_from(credentials.pid).ok() == Some(expected_pid),
+        "CH API Unix peer PID differs from the installed VMM"
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_unix_peer_pid(_stream: &UnixStream, _expected_pid: u32) -> Result<()> {
+    bail!("exact CH API peer credentials require Linux")
 }
 
 fn connect_unix_until(
@@ -3002,19 +2966,175 @@ pub fn pause(api_sock: &Path) -> Result<()> {
     ch_api_ok(api_sock, "PUT", "/api/v1/vm.pause", None)
 }
 
-pub(crate) fn pause_bounded(api_sock: &Path, context: &RuntimeDesiredEffectContext) -> Result<()> {
-    let (status, payload) = ch_api_until(
+/// Exact Cloud Hypervisor state returned only by a fresh `vm.info` read from
+/// the Unix peer whose PID is the installed VMM identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExactVmState {
+    Executing,
+    Paused,
+}
+
+/// Closed classification for one bounded CH mutation. `Ambiguous` is never a
+/// success oracle; callers retain their journaled step or select its typed
+/// fail-closed terminal path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExactVmEffectOutcome {
+    Exact,
+    DefiniteFailure,
+    Ambiguous,
+}
+
+fn exact_vm_state_from_payload(payload: &str) -> Result<ExactVmState> {
+    let value: serde_json::Value =
+        serde_json::from_str(payload).context("decode exact CH vm.info JSON")?;
+    let object = value
+        .as_object()
+        .context("CH vm.info is not a JSON object")?;
+    match object.get("state").and_then(serde_json::Value::as_str) {
+        Some("Running") => Ok(ExactVmState::Executing),
+        Some("Paused") => Ok(ExactVmState::Paused),
+        _ => bail!("CH vm.info returned an unsupported VM state"),
+    }
+}
+
+/// Read the current VM state under one absolute deadline and bind the API
+/// connection to the exact installed VMM PID. This function never converts a
+/// missing socket, malformed response, wrong peer, or unknown state into an
+/// absence proof.
+pub(crate) fn inspect_exact_vm_state_until(
+    api_sock: &Path,
+    expected_vmm_pid: u32,
+    deadline: Instant,
+) -> Result<ExactVmState> {
+    anyhow::ensure!(expected_vmm_pid > 0, "exact VMM PID is zero");
+    let (status, payload) = ch_api_until_with_peer(
+        api_sock,
+        "GET",
+        "/api/v1/vm.info",
+        None,
+        deadline,
+        &|| Ok(()),
+        Some(expected_vmm_pid),
+    )?;
+    anyhow::ensure!(
+        (200..300).contains(&status),
+        "CH GET /api/v1/vm.info returned {status}"
+    );
+    exact_vm_state_from_payload(&payload)
+}
+
+/// Inspect-or-pause the exact installed VMM. A successful PUT is followed by
+/// a separate fresh `vm.info`; a lost response is also followed by that same
+/// postcondition read when the frozen deadline still permits it.
+pub(crate) fn pause_exact_vmm_until(
+    api_sock: &Path,
+    expected_vmm_pid: u32,
+    deadline: Instant,
+) -> Result<ExactVmEffectOutcome> {
+    match inspect_exact_vm_state_until(api_sock, expected_vmm_pid, deadline) {
+        Ok(ExactVmState::Paused) => return Ok(ExactVmEffectOutcome::Exact),
+        Ok(ExactVmState::Executing) => {}
+        Err(_) => return Ok(ExactVmEffectOutcome::Ambiguous),
+    }
+    let submitted = ch_api_until_with_peer(
         api_sock,
         "PUT",
         "/api/v1/vm.pause",
         None,
-        context.deadline(),
-        &|| context.check_active(),
-    )?;
-    if !(200..300).contains(&status) {
-        bail!("CH PUT /api/v1/vm.pause -> {status}: {payload}");
+        deadline,
+        &|| Ok(()),
+        Some(expected_vmm_pid),
+    );
+    let response_was_definite_failure = matches!(
+        &submitted,
+        Ok((status, _)) if !(200..300).contains(status)
+    );
+    match inspect_exact_vm_state_until(api_sock, expected_vmm_pid, deadline) {
+        Ok(ExactVmState::Paused) => Ok(ExactVmEffectOutcome::Exact),
+        Ok(ExactVmState::Executing) if response_was_definite_failure => {
+            Ok(ExactVmEffectOutcome::DefiniteFailure)
+        }
+        Ok(ExactVmState::Executing) | Err(_) => Ok(ExactVmEffectOutcome::Ambiguous),
     }
-    Ok(())
+}
+
+/// Inspect-or-resume the exact installed VMM. A successful PUT is followed by
+/// a separate fresh `vm.info`; a lost response is also followed by that same
+/// postcondition read when the frozen deadline still permits it.
+pub(crate) fn resume_exact_vmm_until(
+    api_sock: &Path,
+    expected_vmm_pid: u32,
+    deadline: Instant,
+) -> Result<ExactVmEffectOutcome> {
+    match inspect_exact_vm_state_until(api_sock, expected_vmm_pid, deadline) {
+        Ok(ExactVmState::Executing) => return Ok(ExactVmEffectOutcome::Exact),
+        Ok(ExactVmState::Paused) => {}
+        Err(_) => return Ok(ExactVmEffectOutcome::Ambiguous),
+    }
+    let submitted = ch_api_until_with_peer(
+        api_sock,
+        "PUT",
+        "/api/v1/vm.resume",
+        None,
+        deadline,
+        &|| Ok(()),
+        Some(expected_vmm_pid),
+    );
+    let response_was_definite_failure = matches!(
+        &submitted,
+        Ok((status, _)) if !(200..300).contains(status)
+    );
+    match inspect_exact_vm_state_until(api_sock, expected_vmm_pid, deadline) {
+        Ok(ExactVmState::Executing) => Ok(ExactVmEffectOutcome::Exact),
+        Ok(ExactVmState::Paused) if response_was_definite_failure => {
+            Ok(ExactVmEffectOutcome::DefiniteFailure)
+        }
+        Ok(ExactVmState::Paused) | Err(_) => Ok(ExactVmEffectOutcome::Ambiguous),
+    }
+}
+
+/// Submit one snapshot of an already-paused exact VMM under the same absolute
+/// deadline. Snapshot bytes are not a postcondition here: the installed Warm
+/// owner must fsync, hash, atomically publish, and reopen its own manifest
+/// before treating this exact response as durable completion.
+pub(crate) fn snapshot_exact_vmm_until(
+    api_sock: &Path,
+    expected_vmm_pid: u32,
+    destination: &Path,
+    deadline: Instant,
+) -> Result<ExactVmEffectOutcome> {
+    if !matches!(
+        inspect_exact_vm_state_until(api_sock, expected_vmm_pid, deadline),
+        Ok(ExactVmState::Paused)
+    ) {
+        return Ok(ExactVmEffectOutcome::Ambiguous);
+    }
+    let body = serde_json::json!({
+        "destination_url": format!("file://{}", destination.display())
+    })
+    .to_string();
+    let response = ch_api_until_with_peer(
+        api_sock,
+        "PUT",
+        "/api/v1/vm.snapshot",
+        Some(&body),
+        deadline,
+        &|| Ok(()),
+        Some(expected_vmm_pid),
+    );
+    let Ok((status, _)) = response else {
+        return Ok(ExactVmEffectOutcome::Ambiguous);
+    };
+    if !(200..300).contains(&status) {
+        // The provider response alone is not a snapshot absence proof. The
+        // installed owner keeps the same durable step and never deletes a
+        // possibly completed destination from this classification.
+        return Ok(ExactVmEffectOutcome::Ambiguous);
+    }
+    match inspect_exact_vm_state_until(api_sock, expected_vmm_pid, deadline) {
+        Ok(ExactVmState::Paused) => Ok(ExactVmEffectOutcome::Exact),
+        Ok(ExactVmState::Executing) | Err(_) => Ok(ExactVmEffectOutcome::Ambiguous),
+    }
 }
 
 pub fn resume(api_sock: &Path) -> Result<()> {
@@ -3055,7 +3175,7 @@ mod tests {
     struct MarkerTapCreatePort {
         link: PathBuf,
         behavior: FakePublishBehavior,
-        cancel_after_create: Option<RuntimeDesiredEffectContext>,
+        cancel_after_create: Option<TestPhysicalEffectContext>,
         events: Arc<Mutex<FakeTapEvents>>,
     }
 
@@ -3082,9 +3202,9 @@ mod tests {
             &mut self,
             ip_bin: &Path,
             network: &ChNetwork,
-            effect_context: &RuntimeDesiredEffectContext,
+            effect_context: &dyn RuntimePhysicalEffectContext,
         ) -> Result<()> {
-            let context = IpCommandContext::Desired(effect_context);
+            let context = IpCommandContext::Effect(effect_context);
             ip_status(
                 &context,
                 ip_bin,
@@ -3668,11 +3788,43 @@ mod tests {
             .is_err());
     }
 
-    fn desired_effect_context(path: &Path) -> RuntimeDesiredEffectContext {
-        RuntimeDesiredEffectContext::for_test(
-            crate::state_directory::StateDirectory::unanchored(path.to_path_buf()),
-            Instant::now() + Duration::from_secs(10),
-        )
+    #[derive(Clone)]
+    struct TestPhysicalEffectContext {
+        deadline: Instant,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    impl TestPhysicalEffectContext {
+        fn cancel_for_test(&self) {
+            self.cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl RuntimePhysicalReadContext for TestPhysicalEffectContext {
+        fn deadline(&self) -> Instant {
+            self.deadline
+        }
+
+        fn check_active(&self) -> Result<()> {
+            anyhow::ensure!(
+                !self.cancelled.load(Ordering::SeqCst),
+                "physical effect cancelled"
+            );
+            anyhow::ensure!(
+                Instant::now() < self.deadline,
+                "physical effect deadline expired"
+            );
+            Ok(())
+        }
+    }
+
+    impl RuntimePhysicalEffectContext for TestPhysicalEffectContext {}
+
+    fn physical_effect_context(_path: &Path) -> TestPhysicalEffectContext {
+        TestPhysicalEffectContext {
+            deadline: Instant::now() + Duration::from_secs(10),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     #[test]
@@ -3811,7 +3963,7 @@ exit 97\n",
 
         let mut cfg = probe_config(dir.path().join("nbd-client"), 8);
         cfg.ip_bin = fake_ip;
-        let context = desired_effect_context(dir.path());
+        let context = physical_effect_context(dir.path());
         let tap_create = MarkerTapCreatePort::new(link.clone());
         let tap_events = Arc::clone(&tap_create.events);
         prepare_network_with_tap_port(&cfg, &replayed, &context, &tap_create).unwrap();
@@ -3867,7 +4019,7 @@ exit 0\n",
         let mut cfg = probe_config(dir.path().join("nbd-client"), 8);
         cfg.ip_bin = fake_ip;
         let network = plan_network(&desired_network()).unwrap();
-        let context = desired_effect_context(dir.path());
+        let context = physical_effect_context(dir.path());
         let mut tap_create = MarkerTapCreatePort::new(link.clone());
         tap_create.cancel_after_create = Some(context.clone());
         let events = Arc::clone(&tap_create.events);
@@ -3930,7 +4082,7 @@ exit 0\n",
             .unwrap();
             std::fs::set_permissions(&fake_ip, std::fs::Permissions::from_mode(0o755)).unwrap();
             let network = plan_network(&desired_network()).unwrap();
-            let context = desired_effect_context(dir.path());
+            let context = physical_effect_context(dir.path());
             let mut tap_create = MarkerTapCreatePort::new(link.clone());
             tap_create.behavior = behavior;
             if cancel {
@@ -3984,7 +4136,7 @@ exit 0\n",
         );
 
         let state = tempfile::tempdir().unwrap();
-        let context = desired_effect_context(state.path());
+        let context = physical_effect_context(state.path());
         let network = plan_network(&desired_network()).unwrap();
         assert_eq!(
             create_network_from_sealed_absence_with_tap_port(
@@ -4031,7 +4183,7 @@ exit 0\n",
         );
 
         let state = tempfile::tempdir().unwrap();
-        let context = desired_effect_context(state.path());
+        let context = physical_effect_context(state.path());
         for (index, injection) in [
             LinuxTapConfigurationBoundary::Alias,
             LinuxTapConfigurationBoundary::Address,
@@ -4053,21 +4205,17 @@ exit 0\n",
             };
 
             let error = pending
-                .configure_with_boundary_hook(
-                    &network,
-                    &IpCommandContext::Desired(&context),
-                    |at| {
-                        if at == injection {
-                            ip_status(
-                                &ip_context,
-                                &ip,
-                                &["link", "set", "dev", &network.tap, "name", &detached_name],
-                            )?;
-                            replacement = Some(create_linux_pending_tap(&network.tap)?);
-                        }
-                        Ok(())
-                    },
-                )
+                .configure_with_boundary_hook(&network, &IpCommandContext::Effect(&context), |at| {
+                    if at == injection {
+                        ip_status(
+                            &ip_context,
+                            &ip,
+                            &["link", "set", "dev", &network.tap, "name", &detached_name],
+                        )?;
+                        replacement = Some(create_linux_pending_tap(&network.tap)?);
+                    }
+                    Ok(())
+                })
                 .expect_err("same-name replacement passed fd-bound configuration");
             assert!(
                 format!("{error:#}").contains("renamed")
@@ -4140,7 +4288,7 @@ exit 0\n",
         let mut cfg = probe_config(dir.path().join("nbd-client"), 8);
         cfg.ip_bin = fake_ip;
         let network = plan_network(&desired_network()).unwrap();
-        let context = desired_effect_context(dir.path());
+        let context = physical_effect_context(dir.path());
         let mut tap_create = MarkerTapCreatePort::new(link.clone());
         tap_create.behavior = FakePublishBehavior::PanicBeforePublish;
         let events = Arc::clone(&tap_create.events);
@@ -4353,6 +4501,127 @@ exit 0\n",
         assert_eq!(status, 200);
         assert_eq!(body, r#"{"ok":true}"#);
         release_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn exact_vm_state_parser_accepts_only_running_or_paused() {
+        assert_eq!(
+            exact_vm_state_from_payload(r#"{"state":"Running","config":{}}"#).unwrap(),
+            ExactVmState::Executing
+        );
+        assert_eq!(
+            exact_vm_state_from_payload(r#"{"state":"Paused"}"#).unwrap(),
+            ExactVmState::Paused
+        );
+        assert!(exact_vm_state_from_payload(r#"{"state":"Created"}"#).is_err());
+        assert!(exact_vm_state_from_payload(r#"{"state":1}"#).is_err());
+        assert!(exact_vm_state_from_payload("[]").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lost_pause_response_succeeds_only_from_fresh_exact_paused_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("ch-api-pause-recovery.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = std::thread::spawn(move || {
+            for (index, expected_path) in ["/api/v1/vm.info", "/api/v1/vm.pause", "/api/v1/vm.info"]
+                .into_iter()
+                .enumerate()
+            {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 2048];
+                let count = stream.read(&mut request).unwrap();
+                assert!(String::from_utf8_lossy(&request[..count]).contains(expected_path));
+                if index == 1 {
+                    // The pause may have completed even though its response
+                    // was lost. Only the third, separate vm.info settles it.
+                    continue;
+                }
+                let state = if index == 0 { "Running" } else { "Paused" };
+                let body = format!(r#"{{"state":"{state}"}}"#);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+
+        let result = pause_exact_vmm_until(
+            &sock,
+            std::process::id(),
+            Instant::now() + cats_test_support::poll_bound(),
+        )
+        .unwrap();
+        assert_eq!(result, ExactVmEffectOutcome::Exact);
+        server.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lost_resume_response_succeeds_only_from_fresh_exact_running_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("ch-api-resume-recovery.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = std::thread::spawn(move || {
+            for (index, expected_path) in
+                ["/api/v1/vm.info", "/api/v1/vm.resume", "/api/v1/vm.info"]
+                    .into_iter()
+                    .enumerate()
+            {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 2048];
+                let count = stream.read(&mut request).unwrap();
+                assert!(String::from_utf8_lossy(&request[..count]).contains(expected_path));
+                if index == 1 {
+                    // The resume may have completed even though its response
+                    // was lost. Only the third, separate vm.info settles it.
+                    continue;
+                }
+                let state = if index == 0 { "Paused" } else { "Running" };
+                let body = format!(r#"{{"state":"{state}"}}"#);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+
+        let result = resume_exact_vmm_until(
+            &sock,
+            std::process::id(),
+            Instant::now() + cats_test_support::poll_bound(),
+        )
+        .unwrap();
+        assert_eq!(result, ExactVmEffectOutcome::Exact);
+        server.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_vm_state_rejects_another_peer_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("ch-api-wrong-peer.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1];
+            let _ = stream.read(&mut request);
+        });
+        let wrong_pid = std::process::id().checked_add(1).unwrap();
+        assert!(inspect_exact_vm_state_until(
+            &sock,
+            wrong_pid,
+            Instant::now() + cats_test_support::poll_bound(),
+        )
+        .is_err());
         server.join().unwrap();
     }
 

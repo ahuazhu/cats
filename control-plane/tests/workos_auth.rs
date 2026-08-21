@@ -18,10 +18,9 @@ use cats_api::runtime_node_authority::{
     NODE_AUTHORITY_APPLY_ID_HEADER, RUNTIME_NODE_AUTHORITY_PATH,
 };
 use cats_control_plane::auth::{WorkOsConfig, WorkOsConfigParams};
-use cats_control_plane::server::{spawn_for_retired_product_tests as spawn, Config, Handle};
-use cats_metadata_store_sqlite::SqliteMetadataStore;
+use cats_control_plane::server::{Config, Handle};
+use cats_control_plane::testsupport::spawn_control_plane_for_test as spawn;
 use cats_metering::SqliteUsageStore;
-use cats_storage::MetadataStore;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use reqwest::header::{LOCATION, SET_COOKIE};
 use reqwest::{StatusCode, Url};
@@ -608,8 +607,6 @@ impl Ctx {
         })
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let storage_meta: Arc<dyn MetadataStore> =
-            Arc::new(SqliteMetadataStore::open(&dir.path().join("storage.db")).unwrap());
         let cp = spawn(Config {
             listen: "127.0.0.1:0".into(),
             control_store_dsn: cats_control_plane::store::DsnSource::Literal(
@@ -618,7 +615,6 @@ impl Ctx {
             control_store_ca_file: None,
             usage_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
             credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
-            retired_storage_meta_for_tests: Some(storage_meta),
             image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
             auth_token: "service-token".into(),
             guest_runtime_profile_receipt:
@@ -627,15 +623,11 @@ impl Ctx {
                 cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
             production_cutover_operator_trust_bundle:
                 cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
-            route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
             admin_token: "admin-token".into(),
             workos: Some(Arc::new(workos)),
             stripe: None,
             billing_enforcement_enabled: false,
-            node_lease_timeout_ms: 3_000,
-            reconcile_interval_ms: 200,
             oci_deploy_sync_wait_ms: 5_000,
-            auto_tier_policy: Default::default(),
         })
         .await
         .unwrap();
@@ -1078,7 +1070,7 @@ async fn workos_user_and_admin_sessions_enforce_their_scopes() {
     assert_eq!(other_account.status(), StatusCode::FORBIDDEN);
     let user_cannot_admin = ctx
         .http
-        .get(ctx.url("/v1/admin/monitoring"))
+        .get(ctx.url("/v1/admin/workspaces"))
         .header("Cookie", &user_cookie)
         .send()
         .await
@@ -1088,7 +1080,7 @@ async fn workos_user_and_admin_sessions_enforce_their_scopes() {
     let admin_cookie = ctx.login("admin", "admin-code").await;
     let fleet = ctx
         .http
-        .get(ctx.url("/v1/admin/monitoring"))
+        .get(ctx.url("/v1/admin/workspaces"))
         .header("Cookie", &admin_cookie)
         .send()
         .await

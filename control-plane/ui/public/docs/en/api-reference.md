@@ -2,13 +2,18 @@
 
 The external API is JSON over HTTP. Product resources are scoped by the immutable Workspace ID in `/v1/workspaces/{workspace_id}/…`; mutable slugs are not resource keys. Browser requests use the HttpOnly WorkOS session. CLI and automation requests use the corresponding WorkOS or Workspace credential.
 
-The two create collections require exact `Content-Type: application/json`, exactly one printable `Idempotency-Key`, a canonical Workspace path with no query, and the closed request body shown below. A retry after an ambiguous response must replay the same path, body, and key.
+The two create collections require exact `Content-Type: application/json`, exactly one printable `Idempotency-Key`, a canonical Workspace path with no query, and the closed request body shown below. Lifecycle actions instead require an empty body and no `Content-Type`. A retry after an ambiguous response must replay the same path, body, and key.
 
 ## Current Cat surface
 
     POST /v1/workspaces/{workspace_id}/cats
     GET  /v1/workspaces/{workspace_id}/cats
     GET  /v1/workspaces/{workspace_id}/cats/{cat_id}
+    POST /v1/workspaces/{workspace_id}/cats/{cat_id}/actions/run
+    POST /v1/workspaces/{workspace_id}/cats/{cat_id}/actions/suspend
+    POST /v1/workspaces/{workspace_id}/cats/{cat_id}/actions/warm
+    POST /v1/workspaces/{workspace_id}/cats/{cat_id}/actions/cold
+    POST /v1/workspaces/{workspace_id}/cats/{cat_id}/actions/destroy
 
     {
       "name": "dev",
@@ -19,15 +24,17 @@ The two create collections require exact `Content-Type: application/json`, exact
       "durability": "strict"
     }
 
-Create returns exact `202 application/json` with `{"cat_id":"…","operation_id":"…"}`. Collection reads accept only bounded `limit` and opaque `cursor` fields. Item reads accept immutable `cat_…` IDs only.
+Create returns exact `202 application/json` with `{"cat_id":"…","operation_id":"…"}`. Collection reads accept only bounded `limit` and opaque `cursor` fields. Item reads and lifecycle actions accept immutable `cat_…` IDs only.
 
-Lifecycle, exec, deployment, Endpoint, expiry, work-policy, and delete routes are not part of the release router during the signed runtime cutover. Clients must fail locally instead of probing those paths.
+Each lifecycle action takes exactly one `Idempotency-Key`, an empty body, and no `Content-Type`; success is exact `202 application/json` with `{"operation_id":"op_…"}`. An ambiguous response remains pending and must be replayed byte-for-byte. The retired `start`, `stop`, `delete`, and `resume` routes are not aliases. Exec, deployment, Endpoint, expiry, and work-policy mutations remain outside this release router.
 
 ## Current PersistentDisk surface
 
     POST /v1/workspaces/{workspace_id}/disks
     GET  /v1/workspaces/{workspace_id}/disks
     GET  /v1/workspaces/{workspace_id}/disks/{disk_id}
+    POST /v1/workspaces/{workspace_id}/disks/{disk_id}/actions/attach
+    POST /v1/workspaces/{workspace_id}/disks/{disk_id}/actions/detach
 
     {
       "durability": "strict",
@@ -35,13 +42,13 @@ Lifecycle, exec, deployment, Endpoint, expiry, work-policy, and delete routes ar
       "size_bytes": 21474836480
     }
 
-Create returns the exact created Disk projection with `201 application/json`. Capacity and durability are immutable in this release. Item reads require immutable `disk_…` IDs. Attachment, snapshot, capacity-change, and delete mutations are unavailable.
+Create returns the exact created Disk projection with `201 application/json`. Capacity and durability are immutable in this release. Item reads require immutable `disk_…` IDs. Attach and detach are synchronous, idempotent product transactions for a terminal Cold Cat; both use the closed body `{"cat_id":"cat_…","mount_path":"/absolute/guest/path"}`. Snapshot, capacity-change, and Disk delete mutations are unavailable.
 
 ## Operations
 
     GET /v1/workspaces/{workspace_id}/operations/{operation_id}
 
-Only exact Operation lookup is exposed. Authorization precedes lookup, and another Workspace's opaque ID is indistinguishable from an absent ID. No Operation collection or global Operation URL is available.
+Cat create and every lifecycle action return an Operation ID. Only exact Operation lookup is exposed. Its product projection contains only `create`, `run`, `suspend`, `warm`, `cold`, or `destroy` and `in_progress`, `succeeded`, or `failed`; Node execution commands and evidence are not returned. Authorization precedes lookup, and another Workspace's opaque ID is indistinguishable from an absent ID. No Operation collection or global Operation URL is available.
 
 ## Errors
 

@@ -1,9 +1,14 @@
 # Volume Authority 与磁盘生命周期
 
-- 状态：current-Desired Running attachment/ext4路径已实现；superseded publication、Snapshot/GC/Host-fence qualification仍显式开放
+- 状态：Implemented/Frozen internal Volume authority；command-scoped run-grant/Cold/destroy data semantics、
+  receipt ledger、Cold-only attach/detach与Persistent initialization vertical已实现；current release gate见
+  [Atomic Runtime Lifecycle v1 §11](atomic-runtime-lifecycle-v1.md#11-acceptance-matrix)，production
+  DiskSnapshot/GC与external Host-fence资格验证仍显式开放
 - 决策：[ADR-0042](../decisions/0042-volume-authority-and-disk-lifecycle.md)
-- 协调协议：[Runtime Reconciliation v1](runtime-reconciliation-v1.md)
-- Runtime transition transport：[Runtime Volume Transitions v1](runtime-volume-transitions-v1.md)
+- Product action/projection：
+  [ADR-0057](../decisions/0057-product-lifecycle-actions-and-internal-execution-evidence.md)
+- 协调协议：[Atomic Runtime Lifecycle v1](atomic-runtime-lifecycle-v1.md)
+- 保留的共享identity/inventory：[Runtime Reconciliation v1](runtime-reconciliation-v1.md)
 - 数据协议：[cats-blockd 协议](blockd-protocol.md)
 
 本文定义卷从创建、附着、格式化、快照、迁移到删除的完整合同。目标是让每个危险动作都由
@@ -13,6 +18,196 @@
 目录后启用本合同；实现不读取旧 pending pack，不转换旧 attachment，也不长期保留两套接口。
 完整、有序的操作以[Operations and HA §8](../operations-ha.md#8-首次终态部署)为唯一runbook。
 
+## 0. Atomic lifecycle composition
+
+[ADR-0056](../decisions/0056-atomic-per-cat-runtime-lifecycle.md)只替换谁发起/闭合runtime storage
+transitions，不替换本规格的MetadataStore state machine、owner/epoch CAS、RWO、L/R、authorization
+或receipt；ADR-0057只替换产品动作与投影。下表的`Start*`/`Delete*`若作为Rust type出现，指current
+Node-Control internal codec，不是product action；其内部命名仍受Atomic Runtime Lifecycle §11.0门约束。
+atomic release的直接组合只有下列authority：
+
+| 事实 | 唯一input/receipt |
+|---|---|
+| disk/placement intent | exact lifecycle Operation中的immutable `RuntimeVolumeConfig`、`StartVolumeAuthority`与placement |
+| Cold volume terminal | `ColdResult.volume_dispositions` 的`NormallyReleased | AlreadyUnowned` closed union |
+| normal cross-Node run | source `ColdResult` + 逐卷同variant的disposition receipt digest |
+| destroy disposition | internal teardown spec、same action `ExecutionStopped` evidence与closed Root/Persistent receipts |
+| product attach/detach | exact terminal Cold head与append-only immutable runtime config mutation；不创建lifecycle Operation |
+
+所有acquire/renew/release/takeover/delete mutation必须绑定current unresolved lifecycle Operation、canonical
+request/fingerprint、typed predecessor与Node current authenticated session；terminal storage receipts进入exact
+NodeResult。inventory/telemetry不结算Operation，也不重建`R == L`、release、stop或delete完成。
+
+Persistent initialization仍由create/run的内部EnsureRunning执行完成，但signed mutation绑定exact
+execution Operation/request、Guest UUID/device-flush evidence与current Volume/Disk/config；它不等待或消费
+Observation。cold/destroy/Snapshot等产品
+transaction消费PostgreSQL已存的exact terminal lifecycle result与Volume receipts，而不是Node物理事实的Control
+重演。
+
+`RuntimeVolumeConfig`只保存immutable product配置；acquire/adopt/takeover输入只来自同一StartSpec中与config
+volume有序1:1的`StartVolumeAuthority`，并被request fingerprint绑定。Genesis/Cold使用normal-unowned，
+Suspended/Warm same-Node使用same-node-owned；run failure后的exact retry按原run result中嵌入的retained
+receipt逐卷使用same-node-owned，没有retained receipt的卷必须使用normal-unowned；HostFenceRecovery使用takeover；不能从
+config或current Volume状态猜测variant。Root config只允许`root_boot`且不携带filesystem UUID/mount path；Persistent只允许
+`persistent_ext4 {filesystem_uuid,mount_path}`，role不匹配fail closed。
+
+### 0.1 Atomic command receipt digests
+
+Atomic lifecycle Volume transport只引用经下列closed shape验证并存入immutable ledger的
+command-scoped receipt/digest。Owned slot使用attachment-bearing target；已Unowned slot只使用
+identity，不伪造attachment：
+
+```text
+LifecycleVolumeCommandScope {
+  operation_id: Id,
+  request_fingerprint: Sha256Digest,
+  cat_id: Id,
+  node_id: Id,
+  placement_identity: { node_id: Id, placement_epoch: Epoch }
+}
+
+LifecycleVolumeTarget {
+  disk_id: Id,
+  disk_role: "root" | "persistent",
+  volume_id: Id,
+  attachment_id: Id,
+  attachment_epoch: FenceEpoch
+}
+
+LifecycleVolumeIdentity {
+  disk_id: Id,
+  disk_role: "root" | "persistent",
+  volume_id: Id
+}
+
+CommandVolumeDurabilityProof {
+  scope: LifecycleVolumeCommandScope,
+  volume: LifecycleVolumeTarget,
+  remote_head: RemoteHead,
+  local_durable_generation: Generation,
+  remote_durable_generation: Generation,
+  pending_pack_count: 0
+}
+
+CommandNormalReleaseReceipt {
+  durability: CommandVolumeDurabilityProof,
+  request: ReleaseRequest,
+  result: ReleaseResult
+}
+
+AlreadyUnownedProvenance =
+  { kind: "pristine" }
+| { kind: "normal_release",
+    receipt: CommandNormalReleaseReceipt,
+    receipt_digest: Sha256Digest }
+
+CommandAlreadyUnownedReceipt {
+  scope: LifecycleVolumeCommandScope,
+  volume: LifecycleVolumeIdentity,
+  expected_epoch: FenceEpoch,
+  expected_head: RemoteHead,
+  provenance: AlreadyUnownedProvenance
+}
+
+ColdCommandVolumeSet {
+  scope: LifecycleVolumeCommandScope,
+  volumes: [LifecycleVolumeIdentity]
+}
+
+DefaultRootDiscardDisposition {
+  root: LifecycleVolumeIdentity,
+  delete_id: Id
+}
+
+DeleteCommandVolumeSet {
+  scope: LifecycleVolumeCommandScope,
+  root_disposition: DefaultRootDiscardDisposition,
+  persistent_volumes: [LifecycleVolumeIdentity]
+}
+
+CommandDisposableAuthorizationConsumedReceipt {
+  command: DeleteCommandVolumeSet,
+  authorization_id: Id,
+  persistent_dispositions_digest: Sha256Digest,
+  receipt: BeginDisposableDeleteConsumedReceipt
+}
+
+CommandRootDeleteAuthorityReceipt =
+  { kind: "normal_release", receipt: CommandNormalReleaseReceipt }
+| { kind: "already_unowned", receipt: CommandAlreadyUnownedReceipt }
+| { kind: "disposable_authorization_consumed",
+    receipt: CommandDisposableAuthorizationConsumedReceipt }
+
+CommandDeleteCompletionReceipt {
+  command: DeleteCommandVolumeSet,
+  root_authority: CommandRootDeleteAuthorityReceipt,
+  completion: DeleteCompletionReceipt
+}
+```
+
+共同算法是`SHA-256(ASCII(domain) || 0x00 || CJ(input))`并编码为
+`sha256:<64 lowercase hex>`。下列input都是验证后的完整typed value，不删字段，也不对
+调用方传来的opaque JSON直接hash：
+
+| lifecycle引用 | domain separator | canonical input与hash前验证 |
+|---|---|---|
+| Start grant | `cats.volume-authority.command-start-volume-grant-receipt.v1` | 完整`LifecycleCommandStartVolumeGrantReceipt`；绑定Operation、grant sequence、runtime volume config、acquire/renew request/result与current owner lineage |
+| `command_normal_release_receipt_digest` | `cats.volume-authority.command-normal-release-receipt.v1` | 完整`CommandNormalReleaseReceipt`（含durability proof）；先与current released Volume及`last_transition.release`逐字段闭合 |
+| Cold already-Unowned | `cats.volume-authority.command-cold-already-unowned-receipt.v1` | 完整`CommandAlreadyUnownedReceipt`；绑定current Unowned epoch/head和`pristine | prior normal-release`来源 |
+| Delete already-Unowned | `cats.volume-authority.command-delete-already-unowned-receipt.v1` | 同一closed receipt shape，但使用与Cold分离的domain，不得跨命令重放 |
+| Persistent disposition set | `cats.volume-authority.persistent-delete-dispositions.v1` | 完整排序Persistent set中`normally_released | already_unowned`的role/disposition/digest投影 |
+| `command_disposable_authorization_consumed_receipt_digest` | `cats.volume-authority.command-disposable-authorization-consumed-receipt.v1` | 完整`CommandDisposableAuthorizationConsumedReceipt`；先闭合exact Delete command、Consumed parent `AuthorizationRecord`和current Deleting Volume |
+| `command_delete_completion_receipt_digest` | `cats.volume-authority.command-delete-completion-receipt.v1` | 完整`CommandDeleteCompletionReceipt`；要求current Volume absent并验证normal-release/already-Unowned/disposable prior Root authority的exact chain |
+
+当前storage integration fixed vectors（每个值只属于其对应typed fixture）为：
+
+| fixture | digest |
+|---|---|
+| Start initial grant | `sha256:8d13843f444482836c0c4c2e4f6bffb3b18b563384df14172ce753ff5e1d3114` |
+| normal release | `sha256:71681866927a00a0737b504e1ca4a03d1d8f366d6ccd5c0904da42fc79529d30` |
+| Cold already-Unowned | `sha256:a8c0ba6d0fc4740451eba234798e8966f62e3ea1c370ae37791a74ef43c4a734` |
+| Delete already-Unowned | `sha256:967b922e19b27ebf611a3bdb7c40df0e569fc8afda453a8e7499ce88bd077a3e` |
+| one-owned-Persistent disposition set | `sha256:4d9a7c1251a9dda993b9a8351d47e2e91bd87b46e5c5d48383acc2f02534daff` |
+| mixed pristine/owned Persistent disposition set | `sha256:daab4746a11e6b878354c179f6d181c888ee41c9b6fdfbf92c92ce9a10ed29ac` |
+| disposable authorization consumed | `sha256:7623e53b48a61f0751cdd9d5ad302646862f516ee4cb4a6e86f6975d2e7b9229` |
+| normal-Root delete completion | `sha256:32c759b4e3d3900061fad4d3dc1007c20c8d3adfaa912b29d1922223ed60b3e1` |
+| disposable-Root delete completion | `sha256:64f0b1aafd4b445d1879edc05e6de4a9f57b422f27e875f4177a8bf3cf8fb118` |
+
+实现测试必须从完整typed fixture重新CJ/hash，不得只比较硬编码digest。
+
+normal Root completion必须持久保存完整prior normal-release request/result；旧`DeleteCompletionReceipt.normal`
+没有这些字段，Volume row删除后不能据它重算authority receipt digest。digest helper只能在上述current-state/
+parent-chain验证成功后hash，不能对调用者提供的任意JSON签名。array沿用本规格的role与stable-ID顺序；scope中
+`node_id == placement_identity.node_id`，并与exact lifecycle Operation/request逐字段相同。
+
+normal release receipt中的durability proof是在Guest-facing I/O关闭后采样的exact final blockd事实；
+receipt不重复scope/volume，它们只由proof携带并与request/result逐字段闭合。`pending_pack_count == 0`、
+`local_durable_generation == remote_durable_generation == remote_head.generation`，`remote_head`逐字段等于
+`ReleaseResult.resulting_head`及current released Volume head。`ReleaseRequest/ReleaseResult`本身不含L/R，
+因此proof必须随receipt持久化并进入digest；Control从该同一proof投影Node result的L/R，禁止把一个合法
+authority digest与调用方另报的任意generation拼接。
+
+所有command-scoped receipt必须进入同一PostgreSQL authority域的immutable
+`lifecycle_volume_receipts` ledger。物理唯一键是
+`(operation_id, volume_id, receipt_kind, receipt_sequence)`，并以FK绑定exact Operation/fingerprint/config/
+placement；normal release在Owned→Unowned与
+`last_transition.release`同一事务写完整receipt/digest，disposable receipt在authorization consume与
+Owned→Deleting同一事务写，delete completion在prefix-empty验证、completion写入及Volume/Disk row删除的同一
+事务写。相同key只能逐byte重放原canonical receipt/digest；不同payload是stored corruption，不能覆盖或追加
+“更完整”版本。
+
+Control lifecycle settlement只从该ledger strict decode完整receipt，重验command scope、parent chain/current
+authority postcondition并重算domain digest，再与NodeResult引用比较。NodeResult不能携带一份替代ledger payload，
+Control也绝不从Node报告的L/R、legacy`last_transition`或`DeleteCompletionReceipt`补造command receipt。后两者
+仍是Volume state transition marker，但单独不足以承载final`R == L`proof；被terminal result/predecessor/
+authorization引用的ledger row不得提前GC。
+
+atomic lifecycle command涉及现有Cat时固定锁序为`current credential lineage/NodeIdentity -> AgentSession ->
+CatRecord -> exact current LifecycleOperation -> sorted VolumeRecord -> sorted DiskRecord -> immutable
+lifecycle-volume receipt ledger`；非signed内部事务跳过认证前缀。事务可以先无锁读取Operation scope来定位Cat，
+但该读取不授予任何权限；锁Cat后必须重新锁定并逐字段验证exact current unresolved Operation。settlement、
+Route和command-scoped Volume transition都不得先锁Operation或Volume再反向取得Cat，也不得持Cat锁反向认证session。
+
 ## 1. 权威和不变量
 
 每类事实只有一个权威：
@@ -20,10 +215,10 @@
 | 事实 | 权威 |
 |---|---|
 | Disk 是否存在、属于哪个 Workspace、是否可加入 Cat | Control Store |
-| 当前 DesiredRuntimeSpec 中的完整磁盘集合 | Control Store |
+| Cat的完整磁盘集合与immutable runtime配置 | Control Store `CatRuntimeConfig` |
 | Endpoint产品identity、所属Cat与管理名 | `EndpointRecord` |
-| Endpoint当前hostname/protocol/port/route epoch binding | current完整`DesiredRuntimeSpec` |
-| hostname到current Desired的定位 | `HostnameDesiredLookup`投影；不是binding authority |
+| Endpoint当前hostname/protocol/port/route epoch binding | current `EndpointBinding` |
+| hostname到current Endpoint的定位 | `HostnameEndpointLookup`投影；不是binding authority |
 | 当前 volume owner、fencing epoch、remote Root | MetadataStore |
 | DiskSnapshot产品资源与GC live-root | DiskSnapshotRecord |
 | 本规格覆盖的Workspace product mutation请求身份与不可变返回结果 | PostgreSQL `ApiIdempotencyResult` |
@@ -37,35 +232,35 @@ pure-domain/data-row fixture，不提供Control cross-row authority。首次消�
 通过唯一PG事务域的固定锁序完成。
 
 全局锁DAG是`ApiIdempotencyResult key reservation -> CatNameLock -> DiskNameLock -> NodeIdentity（写old/new assigned
-current Desired任一字段或消费current Node evidence时）-> current credential lineage（A19 auth适用时）
--> AgentSession -> observation receive/cursor rows（适用时）
--> HostFenceEvent -> AuthorizationRecord -> VolumeRecord -> Control Cat/Disk/Desired/Endpoint rows ->
+placement/config或消费current Node command时）-> current credential lineage（signed Node command适用时）
+-> AgentSession -> lifecycle Operation/current Cat chain head（适用时）
+-> HostFenceEvent -> AuthorizationRecord -> VolumeRecord -> Control Cat/Disk/config/Endpoint rows ->
 DiskSnapshotRecord`；事务跳过自己不涉及的节点，同类
 多行按稳定ID排序。§3.3覆盖的Workspace product mutation先取得由认证Workspace、canonical route和`Idempotency-Key`导出的
 PostgreSQL transaction-scoped reservation，再读结果；它不能先锁资源，也不落持久Pending。这样同一
 key即使携带不同资源也不会分别先锁不同Volume。normal acquire只锁`VolumeRecord`，因此它与snapshot
 mutation或begin-delete仍只能有一方先提交。production Runtime HTTP owner不能直接暴露该primitive；它必须先按
-[Runtime Volume Transitions v1](runtime-volume-transitions-v1.md)取得NodeIdentity、exact active credential lineage、
-current AgentSession和accepted inventory锁前缀，然后才进入本文的event/authorization/Volume后缀。HostFenceEvent来源的内部恢复没有API前缀；
+[Atomic Runtime Lifecycle v1](atomic-runtime-lifecycle-v1.md)取得NodeIdentity、exact active credential lineage、
+current AgentSession和exact lifecycle command锁前缀，然后才进入本文的event/authorization/Volume后缀。HostFenceEvent来源的内部恢复没有API前缀；
 改变event eligibility或创建placement时从NodeIdentity开始，只消费已有authorization且不再读Node时从event开始。
 `CatNameLock`和`DiskNameLock`都不是row或authority。只有会插入新Cat identity的create事务使用前者；
 Root Disk与PersistentDisk共享同一Workspace内的产品名称空间，因此两种create都在API key之后、任何Node/
 Volume/candidate identity锁之前取得后者。Cat create固定在API key之后
-取得它并先闭合名称分支：合法existing Cat按既有Volume→Cat→Disk→Desired→Endpoint/lookup→Operation锁序
-闭合existing graph后只写exact 409 result，不读取或锁定candidate plan/NodeIdentity；name free且将插入新Desired时，
+取得它并先闭合名称分支：合法existing Cat按既有Volume→Cat→Disk→config→Endpoint/lookup→Operation锁序
+闭合existing graph后只写exact 409 result，不读取或锁定candidate plan/NodeIdentity；name free且将插入新Cat/config时，
 才在任何candidate Volume/Cat/Disk row或candidate-ID lock之前锁定并重验candidate `NodeIdentity`。删除已有Cat由
 被锁定的existing Cat row与唯一索引
 线性化，不取得name lock，因此§1的Cat Destroy锁序没有反向边。
 
-Persistent initialization CAS没有API/event前缀，固定锁序是`current NodeIdentity -> current AgentSession row -> 该session的
-highest accepted-observation receive-state -> VolumeRecord -> DiskRecord -> current Desired -> immutable
-accepted observation payload`。session replacement和observation acceptance也必须先锁同一NodeIdentity，
-再锁AgentSession/receive-state，任何事务都不得先锁它们或Volume后反向取NodeIdentity；因此旧session检查与Initialized commit之间没有
+Persistent initialization CAS没有API/event前缀，固定锁序是`current NodeIdentity -> current AgentSession row ->
+current unresolved Start Operation/Cat chain head -> VolumeRecord -> DiskRecord -> current CatRuntimeConfig ->
+immutable signed Guest/device-flush evidence`。session replacement和command settlement也必须先锁同一NodeIdentity，
+再锁AgentSession/Operation，任何事务都不得先锁它们或Volume后反向取NodeIdentity；因此旧session检查与Initialized commit之间没有
 ABA窗口。
 
-covered Cat Destroy的Cold fast path使用`ApiIdempotencyResult key -> current NodeIdentity -> current AgentSession/highest
-accepted receive-state + immutable Cold observation -> VolumeRecord -> Disk/Cat/current Cold Desired及其
-Operation -> DiskSnapshotRecord`。它不保留前一revision/evidence的新历史authority；所有判断与下述Root
+covered Cat Destroy的Cold fast path使用`ApiIdempotencyResult key -> current NodeIdentity -> current AgentSession ->
+exact terminal Cold Operation/result + immutable release receipts -> VolumeRecord -> Disk/Cat/current config ->
+DiskSnapshotRecord`。它不保留前一command/evidence的新历史authority；所有判断与下述Root
 normal begin都在持锁的current rows上完成。
 
 必须始终满足：
@@ -75,8 +270,9 @@ normal begin都在持锁的current rows上完成。
 3. lease TTL 只表示 owner 多久没有续约，不授予其他 attachment 抢占权。
 4. `R <= L`。Strict FLUSH 在 `R` 前进后 ACK，Relaxed FLUSH 在 `L` 前进后 ACK。
 5. `R < L` 的 pack 绑定一个精确 attachment lineage，不能被新 attachment 采用。
-6. Cold、磁盘集合变更、DiskSnapshot、detach、计划迁移和删除保留盘前必须 `R == L`；唯一例外是
-   当前 Deleted Desired 明确放弃的 disposable Root，并且必须先消费 §11 的精确删除授权。
+6. Warm、Cold、磁盘集合变更、DiskSnapshot、detach、计划迁移和Delete中的每个PersistentDisk必须
+   `R == L`；唯一例外是current DeleteSpec明确放弃的default disposable Root，并且必须先消费 §11 的
+   exact authorization。Cold对Root也无例外。
 7. Volume admin 操作和普通 attach 不能并发越过彼此。
 8. 每条`DiskSnapshotRecord`命名的Root必须进入GC live set；不存在第二份物化记录。
 9. Snapshot API先验证调用者身份、当前Workspace membership和route permission，再reserve/read该
@@ -91,7 +287,8 @@ normal begin都在持锁的current rows上完成。
 - `transition_id: RandomId128`：只用于normal acquire和release；同一次重试必须复用，其他操作不得复用。
 - `authorization_id: Id`：takeover或disposable delete授权row的稳定主键。
 - `delete_id: Id`：一次Disk/Volume删除的稳定身份。
-- `desired_revision`、`placement_epoch`：来自 Runtime Reconciliation 合同。
+- `lifecycle_operation_id`、`placement_epoch`：来自 Atomic Runtime Lifecycle合同；authorization/request
+  必须绑定exact command identity/fingerprint。
 - `HostFenceEventId`：一次 Host 外部隔离事件的稳定 ID。
 
 本文复用[Runtime Reconciliation §1.1](runtime-reconciliation-v1.md#11-v1-wire-基础类型)的`Id`、
@@ -145,7 +342,17 @@ CatRecord {
   cat_id: Id,
   workspace_id: Id,
   name: Id,
+  cat_creation_id: Id,
+  lifecycle_head_operation_id: Id | null,
+  stable_state: "running" | "suspended" | "warm" | "cold" | null,
+  effective_runtime_ready_operation_id: Id | null,
+  runtime_incarnation: RandomId128 | null,
   created_at: UnixMillis
+}
+
+CatRuntimeConfig {
+  cat_id: Id,
+  config: AtomicLifecycle.ImmutableRuntimeConfig
 }
 
 EndpointRecord {
@@ -156,12 +363,19 @@ EndpointRecord {
   created_at: UnixMillis
 }
 
-HostnameDesiredLookup {
+EndpointBinding {
+  endpoint_id: Id,
+  hostname: Hostname,
+  protocol: "http",
+  target_port: integer 1..=65535,
+  route_epoch: Epoch
+}
+
+HostnameEndpointLookup {
   hostname: Hostname,
   workspace_id: Id,
   cat_id: Id,
-  endpoint_id: Id,
-  desired_revision: Revision
+  endpoint_id: Id
 }
 
 CatCreateRequest {
@@ -302,12 +516,12 @@ takeover在owner/epoch线性化点同时写入当前Node；release和两种begin
 旧binding的Node等于已锁HostFenceEvent的Node，host-fence disposable consume同理；runtime-stopped release/
 delete要求当前authenticated Node。binding/projection/Volume任一漂移都按stored corruption fail closed。
 
-schema v11提供两个partial ordered B-tree：projection arm
+clean-slate schema 17提供两个partial ordered B-tree：projection arm
 `(owner_node_id, volume_id COLLATE "C") WHERE owner_node_id IS NOT NULL`与canonical arm
 `((owner_binding->>'owner_node_id'), volume_id COLLATE "C") WHERE owner_binding IS NOT NULL`。Runtime
 inventory在一个read-only Repeatable Read事务中以两臂各自bounded查询并严格解码，最多返回`65536`
 条；第`65537`条、双向漂移、重复或backend不确定都拒绝，不能截断成complete。这个provider-neutral
-enumeration port还接收该次Desired read-position固定的完整volume candidate ID集合，并在同一事务中通过
+enumeration port还接收current `CatRuntimeConfig`集合固定的完整volume candidate ID集合，并在同一事务中通过
 `volume_records`主键把candidate行并入Node-owned两臂的去重结果；candidate缺失或总union越界由Node
 scanner拒绝，不能另开point-read事务拼出complete。该port只供signed Runtime scanner；blockd的
 `VolumeDataAuthority`仍只能读取自己的exact grant，
@@ -319,19 +533,19 @@ scanner拒绝，不能另开point-read事务拼出complete。该port只供signed
 本文的“head generation非倒退”固定表示：更小generation拒绝；相同generation时hash和object ID也必须
 逐字段相同；只有更大generation才进入对应的数据面CAS或closed successor验证。
 
-`CatRecord`只保存产品identity：四个字段创建后都不可修改，`(workspace_id, name)`唯一。它不复制
-`root_disk_id`、Desired/Observed state、generation、Node/placement、runtime shape或transition；这些事实分别
-只由`DiskRecord.role.root {cat_id}`、current完整`DesiredRuntimeSpec`、accepted observation和`Operation`
-回答。每个Cat恰好一个Root的交叉约束仍按下段锁定Disk/current Desired验证，不能向Cat row增加缓存字段作为
-第二个关系权威。Cat create的初始target也只由同事务的Desired/Operation携带，`CatRecord`不另存或选择target。
+`CatRecord`保存immutable product identity与Atomic Lifecycle定义的current chain/product projection；它不复制
+`root_disk_id`、volume generation、physical process或observation facts。Root关系只由
+`DiskRecord.role.root {cat_id}`回答；runtime shape/volume set只由`CatRuntimeConfig`回答；command/result只由
+exact lifecycle Operation回答。`stable_state/effective_runtime_ready/runtime_incarnation`是同一terminal
+settlement transaction写入的current投影，不是第二个command authority。每个Cat恰好一个Root的交叉约束按
+Disk/config锁定验证。
 
 `EndpointRecord`的五个字段创建后都不可修改，`endpoint_id`全局唯一、`(cat_id, name)`唯一；workspace/cat
 必须逐字段指向同一合法Cat。它只保存产品identity和管理名，不复制hostname、protocol、port、route epoch、
-placement或wake状态。`HostnameDesiredLookup.hostname`全局唯一，并且只定位
-`workspace_id/cat_id/endpoint_id/desired_revision`；signer必须在同一snapshot重读该revision的current完整
-Desired并逐字段闭合Endpoint binding，不能单独把lookup当作签发authority。创建或改变Endpoint的事务必须
-原子写完整Desired与对应lookup；任何提交仍包含该Endpoint的新current完整Desired revision的事务也必须把
-lookup推进到同一revision，移除Endpoint则在同一事务删除旧lookup。任一不等是store invariant failure并
+placement或wake状态。`HostnameEndpointLookup.hostname`全局唯一，并且只定位
+`workspace_id/cat_id/endpoint_id`；signer必须在同一snapshot重读current `EndpointBinding`、Serving receipt与
+effective RuntimeReady，不能单独把lookup当作签发authority。创建或改变Endpoint的事务必须原子写完整binding
+与对应lookup；移除Endpoint则在同一事务删除旧lookup。任一不等是store invariant failure并
 fail closed。
 
 `DiskRecord`的disk/workspace/name/volume identity、size、durability和created_at创建后不可修改，且
@@ -341,9 +555,9 @@ Root的`cat_id`不可修改；Persistent role唯一允许的变化是保留同�
 Uninitialized一次性变为Initialized。Root只保存`root {cat_id}`，没有假的NotApplicable initialization字段；
 Persistent只保存上述两态initialization。Available/Bound不是
 Disk row状态：Root的Cat必须与Disk属于同一Workspace，每个Cat恰好一个Root，且该Root只能出现在该Cat的
-current完整`DesiredRuntimeSpec`；Persistent绑定只从全部current完整Desired的VolumeIntent集合推导，任一
-PersistentDisk同时最多被一个current Desired引用。attach、detach、move和delete mutation都按全局锁序锁定
-同一Disk/Volume及涉及的current Desired rows；并发绑定只能一方提交，不能靠先读后写绕过RWO唯一性。
+current `CatRuntimeConfig`；Persistent绑定只从全部current config的RuntimeVolumeConfig集合推导，任一
+PersistentDisk同时最多被一个current config引用。attach、detach、move和delete mutation都按全局锁序锁定
+同一Disk/Volume及涉及的current config rows；并发绑定只能一方提交，不能靠先读后写绕过RWO唯一性。
 任一交叉约束破坏都是Control Store invariant failure并fail closed。产品删除完成后不保留
 `Deleted` Disk row；可观察的产品状态只有Active、Deleting和row不存在。
 
@@ -422,12 +636,13 @@ row/result/receipt全部不变，不能wrap、饱和或改用另一种操作继�
 pure domain函数只接受当前`VolumeRecord`，takeover/disposable路径再接受同一事务已锁定的
 `HostFenceEvent`（仅适用时）和`AuthorizationRecord`；它只判断这些row自身的精确字段、closed state转换、
 epoch checked-add、DB时间和typed replay，输出新的VolumeRecord/direct result或上面的closed error。它不读取
-Desired、Disk、Snapshot、Node observation或物理进程，也不接受`verified=true`、proof boolean、opaque
+CatRuntimeConfig、lifecycle Operation、Disk、Snapshot、Node inventory或物理进程，也不接受`verified=true`、proof boolean、opaque
 `VerifiedContext`之类可绕过检查的参数。
 
 唯一的PostgreSQL事务owner按§1固定锁序逐字段验证所有跨row前置，再调用pure domain函数并在同一commit写入
-它的结果及相关Control rows。Cold、`R == L`、blockd stopped、当前Desired/revision/placement、Disk kind/
-ownership/state、`DiskSnapshotRecord`为空、RuntimeStopped observation和provider fence事实都属于这一层；
+它的结果及相关Control rows。terminal atomic lifecycle result、`R == L`、blockd stopped、当前
+CatRuntimeConfig/revision/placement、Disk kind/ownership/state、`DiskSnapshotRecord`为空、exact
+strong-stop receipt或HostFenceEvent事实都属于这一层；
 每项必须从本事务锁定的权威row读取，不能先算成bool或由调用者声称。SQLite只可复用pure domain函数作为
 窄数据面/单row fixture；它不实现或模拟Control cross-row事务，也不形成第二个authority。
 
@@ -438,7 +653,8 @@ ownership/state、`DiskSnapshotRecord`为空、RuntimeStopped observation和prov
 ### 3.3 Workspace product API idempotency
 
 本节只覆盖同时满足两项的HTTP mutation：资源归属一个已认证Workspace；业务rows和最终result能在唯一
-Control PostgreSQL事务中原子commit。当前闭集是Cat/Desired、Endpoint、Disk和DiskSnapshot等
+Control PostgreSQL事务中原子commit。当前闭集是Cat/runtime config/lifecycle Operation、
+Endpoint、Disk和DiskSnapshot等
 Workspace-scoped product mutations。Account/WorkOS、Billing/Stripe、fleet/admin、Node/internal、webhook，
 以及先在外部系统产生副作用的route不使用本row；它们只复用各自已经存在的external ID、event ID、
 revision/attempt/authorization或provider idempotency协议，禁止伪造“system workspace”或再写一份
@@ -500,7 +716,8 @@ NormalAcquireRequest {
   transition_id: RandomId128,
   attachment_id: Id,
   expected_unowned_epoch: FenceEpoch,
-  desired_revision: Revision,
+  lifecycle_operation_id: Id,
+  lifecycle_request_fingerprint: Sha256Digest,
   placement_epoch: Epoch,
   lease_duration_ms: integer 1..=9223372036854775807
 }
@@ -527,10 +744,11 @@ NormalAcquireResult {
    `NormalAcquireResult`，不重读时钟或增加epoch；同ID异payload返回`StaleTransition`。若已被后续转换
    取代则按当前state/expected epoch拒绝，不恢复旧result。
 6. 任何其他 owner，即使expiry已过，也返回 `OtherWriter`。
-7. 同一 attachment 但不同 transition 也不隐式采用；reconciler 必须使用原 transition 或明确
+7. 同一 attachment 但不同 transition 也不隐式采用；atomic command必须使用原 transition 或明确
    quarantine。
 
-Node 在调用前把 request 写入 RuntimeCheckpoint。响应不明确时读取 VolumeRecord：只有
+Node在调用前把request写入当前Node-private command journal/installed physical manifest。响应
+不明确时读取VolumeRecord：只有
 `last_transition.kind="normal_acquire"`且其中完整request/result、当前owner和结果epoch逐字段匹配才算成功。
 
 ### 4.2 Renew
@@ -563,7 +781,9 @@ ReleaseRequest {
   volume_id: Id,
   transition_id: RandomId128,
   attachment_id: Id,
-  expected_epoch: FenceEpoch
+  expected_epoch: FenceEpoch,
+  lifecycle_operation_id: Id,
+  lifecycle_request_fingerprint: Sha256Digest
 }
 
 ReleaseResult {
@@ -583,7 +803,7 @@ pure domain转换只判断VolumeRecord为Active且owner/epoch逐字段等于requ
 
 ### 4.4 Protected takeover
 
-普通 reconcile 不存在 revoke。takeover 只接受逐卷授权：
+普通atomic command不存在revoke。takeover只接受HostFenceRecovery的逐卷授权：
 
 ```text
 VolumeTakeoverAuthorization {
@@ -592,10 +812,15 @@ VolumeTakeoverAuthorization {
   authorized_node_id: Id,
   host_fence_event_id: Id,
   volume_id: Id,
+  disk_id: Id,
+  cat_id: Id,
   expected_attachment_id: Id,
   expected_epoch: FenceEpoch,
   new_attachment_id: Id,
-  desired_revision: Revision,
+  interrupted_operation_id: Id,
+  host_lost_result_digest: Sha256Digest,
+  recovery_operation_id: Id,
+  recovery_request_fingerprint: Sha256Digest,
   new_placement_epoch: Epoch,
   lease_duration_ms: integer 1..=9223372036854775807,
   not_after: UnixMillis
@@ -603,7 +828,7 @@ VolumeTakeoverAuthorization {
 ```
 
 `authorized_node_id`在授权派生事务中逐字段复制目标new placement Node，随payload一次写定且
-不因Desired revision、placement或AgentSession后续变化而改写。Node只提交`authorization_id`，不提交
+不因lifecycle head、placement或AgentSession后续变化而改写。Node只提交`authorization_id`，不提交
 或签名上述payload。首次消费使用固定锁序
 `HostFenceEvent -> AuthorizationRecord -> VolumeRecord`，在一个PostgreSQL事务中读服务器端immutable
 authorization，同时验证event仍为Active、authorization仍为Unconsumed、本事务`db_now <= not_after`、
@@ -673,7 +898,7 @@ authorization、receipt或disposition闭环。
 并用`state=Active`、`isolation_state={kind:"isolated"}`及未改变的
 完整event tuple（`event_id`、provider、immutable host、node、expected boot/session、fence attempt和
 `observed_at`）做exact CAS。event创建、`isolated -> host_destroyed`、
-使用HostDestroyed proof的Runtime tombstone GC以及会创建Desired placement的授权派生都先按
+使用HostDestroyed proof的Runtime tombstone GC以及会创建CatRuntimeConfig placement的授权派生都先按
 node ID锁全部NodeIdentity，再锁event；只有不改event eligibility state、不再读NodeIdentity的授权
 首次消费保持`HostFenceEvent -> Authorization -> Volume`顺序。这些事务都持有event行锁到commit并重验
 各自要求的state、isolation variant和event tuple；竞争事务只能按锁取得顺序提交，后一方不得
@@ -690,77 +915,45 @@ HostFenceEvent/HostDestroyed receipt继续按现有Operation/审计引用保留�
 
 Node 是 lease transition 的执行者。顺序固定：
 
-1. 在 checkpoint 写 acquire/takeover request。
-2. 调用[Runtime Volume Transitions v1](runtime-volume-transitions-v1.md)的签名mutation route。normal acquire/release
-   的模糊结果可由`VolumeDataAuthority.load_volume(volume_id)`读取精确transition marker；
-   takeover/disposable authorization的模糊结果只使用同一规格冻结的Control签名evidence route，按§5.1
-   读取一份闭合snapshot。
-3. 把 `LeaseGrant` 原子写回 checkpoint。
+1. 在当前Node-private lifecycle journal/installed physical manifest写acquire/takeover request。
+2. 调用atomic lifecycle的signed
+   `POST /v1/internal/runtime/lifecycle-volume-transitions`；所有模糊结果都按§5.1重放同一exact
+   command-scoped request，由immutable receipt ledger/current marker返回原receipt。
+3. 把command-scoped EnsureRunning grant receipt原子写回该private recovery record。
 4. 创建 attachment 专属 data-dir identity。
 5. 启动 blockd，传入 volume、attachment、epoch 和既有的closed acquire origin。
 6. blockd 从 MetadataStore 验证精确 owner/epoch后开始 renew和服务。
 
 第3步的durable serving artifact不是薄grant的复制。它是closed
-`Normal {request,result} | Takeover {authorization,receipt}`：Takeover必须来自§5.1同一签名snapshot中的
-完整consumed authorization record，且首次expiry精确等于
+`Normal {request,result} | Takeover {authorization,receipt}`：Takeover必须来自§5.1同一command-scoped
+transition response中的完整consumed authorization record，且首次expiry精确等于
 `checked_add(receipt.consumed_at, authorization.lease_duration_ms)`。artifact与current Volume按
 origin/owner/epoch/marker/exact head闭合后才可创建data-dir或启动blockd。
 
 blockd 启动不得调用 acquire、takeover或增加 epoch。它只可以 renew、以精确 owner/epoch发布 Root，
-以及报告 status。Cold detach 时 Node 先 drain、停止 blockd，再执行 release。
+以及报告 status。会产生Cold terminal result的atomic command先drain、停止blockd，再执行release。
 
-### 5.1 Control-signed transition evidence read
+### 5.1 Signed command-scoped replay
 
-authorization的response-loss恢复不得扩展blockd的`VolumeDataAuthority`，也不得给Node任何Control
-PostgreSQL credential或表级`SELECT`。唯一边界是
-[Runtime Volume Transitions §3.1](runtime-volume-transitions-v1.md#31-control-signed-authorization-evidence-read)
-冻结的A19-signed Control internal POST：wire只接受current `SessionBinding`和`authorization_id`，成功只返回
-原exact `AuthorizationRecord`、由它派生的current `VolumeRecord | null`、唯一
-`DeleteCompletionReceipt | null`，以及由current marker/completion直接派生的最多一个
-`direct_successor_authorization`。
+atomic release不提供按任意`authorization_id`读取authorization历史的Node接口，也不返回
+`direct_successor_authorization`。pre-cutover Runtime Volume Transitions的A19 evidence-read spec、DTO、codec、
+constant与route parser已经物理删除；旧Desired/revision scope与任意ID read严格拒绝，历史只在Git中保留。
 
-Control先把proof绑定唯一provisioned `NodeIdentity`，锁后重验并持有exact active credential lineage share lock，
-再验证其current、未过期`AgentSession`并读取primary
-authorization；只有`authorization.authorized_node_id`等于该authenticated Node才可返回任何evidence。
-authorization不存在和存在但属于其他Node必须给出同一non-enumerating unavailable结果。retired identity在
-authorization lookup前按transport普通403拒绝。授权创建后的Desired revision、placement和session变化不会
-改写`authorized_node_id`，因此同一Node在session replacement后可用新的current `SessionBinding`恢复；Control
-不得为此读取或信任可能已supersede/GC的current Desired。Host-fence内部worker不借用或伪造这条Node route。
+Node唯一可调用的transition边界是current AgentSession签名的
+`POST /v1/internal/runtime/lifecycle-volume-transitions`。每次request精确绑定Operation、request
+fingerprint、Cat、Node、placement、command kind与排序volume targets；Node在发出请求前把同一scope和
+transition identity写入private journal。response丢失时只重放完全相同的request，不通过另一条read API
+查询或拼接结果。
 
-一个逻辑read-only、无domain write的PostgreSQL `REPEATABLE READ` transaction只读一次`db_now`，按
-`NodeIdentity FOR SHARE -> exact active credential lineage FOR SHARE -> current AgentSession`锁/读后返回一份
-不可拆分的snapshot；为取得前两把row lock，它不声明SQL `READ ONLY`。
-metadata adapter先strict decode并以共享projection validator验证primary，再只从其closed payload派生volume
-ID；caller不能提交volume ID、delete ID、receipt ID、successor authorization ID或预判bool。snapshot固定为：
+Control在同一transition事务中锁current session、unresolved Operation/Cat head和exact Volume domain rows。
+immutable receipt ledger与Volume current marker使同一transition重放返回原receipt bytes；identity或scope任一
+不同时fail closed。调用方不能提交结果bool、猜测successor、枚举authorization历史或取得Control SQL
+credential。takeover与disposable Root authorization同样只能在exact command scope中消费并返回closed
+receipt；模糊结果通过重放原command transition闭合。
 
-1. 该volume的current strict/projection-validated `VolumeRecord`，合法sweep已删row时为`null`；
-2. 只按派生volume ID查找的唯一strict/projection-validated `DeleteCompletionReceipt`，不存在时为`null`；
-   disposable primary还必须绑定同一delete ID，takeover则由closed normal/disposable receipt建立后继；
-3. current Volume `last_transition` authorization marker或
-   `DeleteCompletionReceipt.disposable_root.authorization_id`直接引用、且与primary不同的exact
-   `AuthorizationRecord`，否则为`null`。两个来源不能同时给出不同ID；不得按volume枚举授权历史、分页或
-   递归追链。这个单一direct record配合primary receipt、current epoch/head单调和现有closed successor规则
-   足以裁决；缺少它时保持Blocked，不能用无限查询消除false negative。
-
-四项必须来自同一snapshot，不能分开缓存或拼接。每个JSON/projection、authorization ID/variant/
-`authorized_node_id`、派生volume、current marker、receipt volume/delete/prior attachment/epoch/head和direct
-引用必须逐字段闭合；同一volume同时有current row和completion、多个completion、缺少direct row、跨volume/
-wrong variant引用或任何projection不等都是stored corruption，整份读取fail closed。primary授权与direct
-successor可以授权给不同Node；后者只因primary导出的current closed marker被一并返回，不能成为任意ID查询。
-
-success不含`consumed`、`transition_succeeded`、`rows_deleted`或其他bool，也不复制receipt/transition chain。
-Node必须用本规格validator和checkpoint完整step自行决定adopt、retry或Blocked。primary Unconsumed且current
-Volume为完整matching predecessor时只可重放原authorization ID；Consumed却无法闭合必须Blocked/
-Quarantined。`current_volume.last_transition=null`仍只能由§10.3 same-disk restore immutable API result闭合；
-evidence route不返回或镜像该product result，因此null marker本身不能证明consume成功。row已删除则只有逐字段
-匹配的`DeleteCompletionReceipt`可证明成功。
-
-PostgreSQL metadata adapter是当前Control内部implementation boundary。Node、blockd、VMM、Guest和provider
-adapter都没有authorization/completion表的raw SQL credential或权限；Control route也没有row write、result
-row、第二receipt ledger或blockd exposure。未来可把Control内部读取替换为另一个provider-neutral或签名read
-implementation，但必须原子保留相同认证、exact bundle、同snapshot、bounded wire/deadline和
-not-found/corruption/unavailable语义，并通过同一recovery/isolation oracles；不能退化为bool、审计list或让
-caller提供派生key。
+Node把返回的command-scoped receipt持久化到同一private recovery record后才可继续physical effect。缺少
+receipt、ledger/current marker不一致、session/Operation已变化或stored projection损坏都保持
+Blocked/Quarantined；audit log、inventory、目录存在性和旧A19 evidence route都不能替代。
 
 ## 6. 本地 attachment lineage
 
@@ -810,10 +1003,25 @@ clean-slate cutover 不解析缺少这些字段的旧 pack，也不接受旧裸`
 第一版终态不支持 hot attach、hot detach、resize 或 Running DiskSnapshot。volume 容量在创建时确定，
 之后不可变；Control Plane、MetadataStore 和 blockd 都不提供 resize API。
 
-- PersistentDisk 加入或离开 Cat 的磁盘集合，只能在 Cat 已稳定 Cold 时提交。
-- Cold -> Running 使用完整、排序且无重复的 VolumeIntent 集合一次启动。
+- PersistentDisk加入或离开Cat的磁盘集合，只能在Cat current head是exact terminal Cold、
+  没有unresolved Operation时提交。Cold head始终闭合自己冻结的历史config/result；同一
+  Cold window可append多个新config，current pointer只由每次mutation的source->target CAS推进，
+  不改写历史Cold Operation。
+- attach/detach是同步product mutation：它在同一事务重验Disk/Volume为Active + Unowned、
+  current membership全局唯一，插入append-only新`ImmutableRuntimeConfig`并CAS Cat pointer；
+  不创建lifecycle Operation、不调用Node、不读取inventory推断完成。
+- attach从Disk的一次性filesystem UUID与request mount path生成`persistent_ext4`，分配未占用
+  Guest slot/serial；detach必须逐字段命中同Cat/config/UUID/mount的exact binding。
+- Cold -> Running的run冻结已锁定的latest current config，不要求它等于历史Cold
+  command config。Control对旧Cold slots重验exact `NormallyReleased | AlreadyUnowned` receipts；
+  已detach的旧slot只留在source receipt set而不进入target authority，Cold后新attach的
+  Persistent slot必须是fresh locked `Active + Unowned`，以current exact epoch构造
+  `NormalUnowned`。Root不能用这个规则换或新增。
+- internal EnsureRunning spec最终使用latest config的完整、排序且无重复`RuntimeVolumeConfig`集合一次运行；
+  predecessor中的Cold disposition digests仍字节级绑定历史Cold result的完整slot set。
 - Running 中请求改变磁盘集合返回前置条件错误；调用方先将 Cat 变为 Cold。
-- RootDisk 始终随 Cat；PersistentDisk 可在不同 Cat 的 Cold 状态之间移动。
+- RootDisk始终随Cat；PersistentDisk要移到另一Cat，必须先在原Cat的Cold window完成
+  detach，再在目标Cat的Cold window完成attach；并发只有一方能commit。
 
 这条限制消除了 Guest 重新 mount、打开文件句柄、VMM hotplug 和 blockd drain 之间的竞态。未来若
 确有产品需要，hotplug 必须单独设计并验证，不能放宽本合同的 Cold 前置条件。
@@ -825,166 +1033,31 @@ clean-slate cutover 不解析缺少这些字段的旧 pack，也不接受旧裸`
 mutation path中的Disk引用遵守§3的immutable `disk_id`规则；create response可以展示name，但后续资源path
 不以name代替ID。
 
-**Public Cat create request到完整candidate。** 唯一route是
-`POST /v1/workspaces/{workspace}/cats`，canonical route template逐byte同该string。它的HTTP envelope固定为：
+#### Atomic Cat create
 
-- transfer framing移除后的完整raw body最多4096 bytes；恰好4096合法，读到第4097 byte即可停止并拒绝，
-  不得先分配或解析无界body；
-- 恰好一个`Content-Type` field，field-value逐byte等于`application/json`；`Content-Encoding`只能缺席或
-  恰好一个逐byte等于`identity`的field；
-- `If-Match`必须完全缺席，任一occurrence都在fingerprint/fast lookup前拒绝；因此§3.3 fingerprint的
-  `if_match_payload`恒为单byte `0x00`；
-- raw path bytes必须精确等于`/v1/workspaces/<path中canonical workspace_id>/cats`，不接受percent-encoded
-  等价写法；query component必须缺席，`?x=1`和结尾裸`?`都在fingerprint/fast lookup前拒绝；
-- 必须携带§3.3的exact `Idempotency-Key`。fingerprint保留server收到的raw path/query和raw body bytes，
-  不把JSON重编码后再hash。
+production Cat create只构造atomic lifecycle graph。HTTP idempotency、immutable image读取与placement
+planner分别沿用[§3.3](#33-workspace-product-api-idempotency)、
+[Immutable Image Manifest Read v1](immutable-image-manifest-read-v1.md)和
+[Runtime Placement Policy v1](runtime-placement-policy-v1.md)的唯一合同；这里不复制它们的rolling
+字段表。
 
-body必须是无BOM的UTF-8 JSON object，并按上面的`CatCreateRequest`闭合：六个字段全部必填，unknown字段、
-duplicate key、null、错误JSON kind和尾随非空白bytes都拒绝；integer沿用Runtime §1.1的canonical raw number
-token和范围。`name`进一步收窄为1..=30 ASCII bytes，只允许`[a-z0-9-]`且首尾必须是`[a-z0-9]`；不trim、
-不lowercase、不做Unicode或DNS归一化。六个字段都没有隐式default。旧create-time `image` alias、额外`disk`、
-`auto_suspend`、`expires_at`及其optional/null形态都不是本route字段；磁盘成员、自动休眠和过期策略是后续
-独立mutation/policy，不能偷偷进入首个Desired。
+一个成功的PostgreSQL commit全有或全无地写入：
 
-envelope/DTO、身份、当前Workspace membership和route permission通过后，按§3.3计算fingerprint并执行不查
-resource的fast lookup。exact hit逐byte重放且不得读取image、release receipt、placement或capacity；conflict
-也在这些读取前返回。只有fast miss才按以下唯一来源构造candidate：
+- `CatRecord/cat_creation_id`与append-only `ImmutableRuntimeConfig`；
+- generation-zero、Unowned、blank-head的唯一Root `DiskRecord/VolumeRecord`；
+- default bound Endpoint、hostname lookup、route epoch 1，且所有Node gate仍Closed；
+- `LifecyclePredecessor::Genesis`、`StartSource::Genesis`、Root `normal_unowned(epoch=0)` authority的
+  unresolved Start Operation；
+- exact `ApiIdempotencyResult`，其202 response绑定同一Cat/Operation identity。
 
-1. `boot_image_digest`直接寻址ADR-0017的
-   `images/<boot_image_digest去掉sha256:后的64位hex>/manifest.json`。service按
-   [Immutable Image Manifest Read v1](immutable-image-manifest-read-v1.md)通过与blockd共用的唯一
-   provider-neutral DTO/reader完整验证immutable manifest；不解析image
-   alias/tag，也不查询catalog。Root实际`size_bytes = ceil(root_size_bytes / CHUNK_SIZE) * CHUNK_SIZE`，其中
-   `CHUNK_SIZE=4194304`；结果必须不小于manifest `size_bytes`且不大于`MAX_VOLUME_BYTES=1099511627776`。
-   manifest缺失/暂不可读、非法或size不满足时不生成可提交candidate，不以fixture manifest继续。
-2. `guest_config_digest`只取Control Plane启动时已验证的唯一
-   [GuestRuntimeProfileReceipt](runtime-reconciliation-v1.md#2-可信-node-与-agentsession) digest；请求、image
-   manifest和builder都不能提供或重算另一个值。生产service构造器要求显式release receipt，不能使用测试
-   fixture digest、编译期示例常量或空值fallback。
-3. placement planner只从当前provisioned/schedulable Node的
-   [Inventory Spine §7.1](runtime-inventory-observation-v1.md#71-store-返回的完整-admission-facts)一次
-   same-snapshot loader返回的current未失效`AgentSession`、fresh full
-   `AdmissionInventoryAttestation`、产生它的完整full observation、逐字段相同的current assigned Desired
-   集合及现有Node/placement事实中选择；不能只返回三项摘录或`capacity_ok` boolean。session的
-   `guest_config_digest`必须等于
-   上一步active release digest。调用时service把本批candidate `network_id`交给planner；planner为本次
-   candidate返回一个`node_id`和完整合法`NetworkConfig`；service
-   用该node构造`AssignedPlacement {kind:"assigned", node_id:planner node_id, placement_epoch:1}`，
-   NetworkConfig的`network_id`逐字段
-   等于本批candidate network ID，地址/MAC满足Runtime §3。
-   具体Node排序、capacity估算、provisioner authority和地址选择算法只由
-   [Runtime Placement Policy v1](runtime-placement-policy-v1.md)冻结；planner结果只是可失效的
-   pre-transaction plan，不创建capacity reservation、network lease、scheduler row或第二authority。无可选Node/config时不创建
-   Desired/Operation。commit后Node/capacity/address事实变化由既有
-   `PlacementRejected(insufficient_vcpus|insufficient_memory|unsupported_block_path|unsupported_network|
-   unsupported_guest_capability)`
-   终结revision 1；任何重新选择都创建placement epoch更大的新系统revision，不能原地改candidate。
+canonical request、runtime config digest、placement、Root volume identity与normal-acquire transition在同一
+candidate中冻结；Endpoint不进入runtime config。candidate identity碰撞、placement/session/full-inventory
+重验失败或事务明确回滚均不留下业务row/result；commit response不明只查询/重放同一
+idempotency result，不重抽单个identity或创建replacement Operation。Node随后仅通过
+[Atomic Runtime Lifecycle v1 §4](atomic-runtime-lifecycle-v1.md#4-command-envelopepredecessor-与-admission)
+取得该Start并返回`RuntimeReady | StartFailed`；inventory不结算create。
 
-public API/service在调用Store前一次生成整批独立、非全零`RandomId128`，并固定编码为
-`cat_<random>`、`disk_<random>`、`vol_<random>`、`att_<random>`、`vint_<random>`、`op_<random>`、
-`ep_<random>`和`net_<random>`；normal acquire的`transition_id`使用另一裸`RandomId128`。这些分别是
-Cat、Root Disk、Volume、attachment、volume intent、Operation、default Endpoint和network identity。
-同一candidate或任何重试不得重抽其中单个ID；任一identity/hostname碰撞或candidate事务回滚都丢弃整批，
-下一次只使用全新整批。planner一旦返回NetworkConfig，该network ID/MAC/IPv4/prefix/gateway也作为一个
-不可拆分binding固定；要改变任一字段就丢弃整批并以新network ID重plan，不能在同ID下换地址。
-Endpoint opaque suffix精确取`endpoint_id`去掉`ep_`后的32位lowercase hex，default
-hostname固定为`<request.name>-<suffix>.cats.run`；name上限保证该DNS label最长恰好63 bytes。
-
-fast miss后的唯一构造顺序固定为：先完成上面的immutable manifest与active release receipt验证；再一次生成
-上述整批ID；随后以请求shape和本批`network_id`调用planner；只在exact NetworkConfig返回后构造并验证完整
-Desired、计算`spec_digest`及全部cross-row binding；然后用同批`cat_id/operation_id`编码exact 202并准备固定
-409 envelope；最后才调用Store。planner拒绝、candidate/encoder验证失败或已知事务回滚都丢弃整批，不能保留
-某个ID、NetworkConfig或已编码202供下一批复用；commit/result不明只按§3.3重放权威查询，不能盲目重建。
-
-由上述事实构造的唯一初始`DesiredRuntimeSpec`是：
-
-- `version=1`、请求path中的`workspace_id`、candidate `cat_id`、`desired_revision=1`、`target="running"`、
-  planner node上的`placement_epoch=1`、`transition={kind:"cancel_and_drain"}`；
-- runtime的`vcpus/memory_bytes/boot_image_digest`逐字段来自request，`guest_config_digest`来自active release
-  receipt，`network_config`逐字段来自planner；
-- `volumes`恰好一个Root intent：使用candidate intent/disk/volume/attachment ID和上面的rounded size，
-  `disk_kind="root"`、`access="read_write_once"`、request durability、
-  `guest_device={serial:"cats-root",slot:0}`、
-  `acquire={kind:"normal",transition_id:candidate transition_id,expected_unowned_epoch:0}`、
-  `disposition={kind:"retain"}`、`mount=null`；
-- `endpoints`恰好一个default binding：candidate `endpoint_id`、上述hostname、`route_epoch=1`、
-  `protocol="http"`、`target_port=8080`；产品管理名`web`不复制进Runtime `EndpointIntent`，
-  `wake_on_request`是ADR-0010固定行为而不是第二份可变binding；
-- 最后按Runtime §16对除`spec_digest`外的完整字段计算唯一`spec_digest`。builder不能从测试Desired、Store
-  default或旧Cat row复制任何缺失字段。
-
-同一candidate还包含`CatRecord`、Root `DiskRecord/VolumeRecord`、
-`EndpointRecord {endpoint_id, workspace_id, cat_id, name:"web", created_at:待注入}`、与上述hostname/Desired
-revision逐字段相同的`HostnameDesiredLookup`、绑定该Desired的Pending Operation及exact 202 envelope。
-Store接收的是这份完整candidate；它只验证closed schema、全部交叉绑定和digest，不接受public request、image
-alias、planner callback或任意default参数来补全它。
-
-**RootDisk随Cat create。** auth/membership/route permission通过后，API先做一次不查resource的只读result
-fast lookup；hit直接重放，miss只是一条可失效的优化提示，不创建reservation或Pending。只有fast miss才完成
-placement/capacity等当前状态准备，并由public API/service边界在进入Store前一次性生成全部candidate identity、形成包含
-完整Desired及所有非时间业务字段的已验证bundle，并用同一批candidate通过canonical response encoder编码成功response；candidate尚未提交时不对外
-可见且永不复用。result miss后的唯一PG事务首次持久化这些identity，并原子写入Cat、current完整
-Desired、default `EndpointRecord`及hostname lookup、绑定该revision的runtime Operation、
-`root {cat_id}` Disk、generation-zero且Unowned的Root Volume，以及包含原operation ID的exact
-`ApiIdempotencyResult`。Cat、Endpoint、Disk和Desired的Workspace/Cat identity逐字段相同，
-Desired恰好引用这一个Root Disk/Volume。全部rows/result同一commit或全部不存在；commit/response不明后
-同key只重放原status/body/operation ID，不生成第二个Cat、Endpoint、network、Disk、Volume、Desired或Operation。
-初始Volume精确为`admin_state=Active`、`lease_epoch=0`、owner/expiry/last_transition均为null、head精确为
-`{generation:0, root_hash:null, root_object_id:null}`。Desired中唯一Root intent使用normal acquire且
-`expected_unowned_epoch=0`；任何非零epoch、非blank head、已有owner/transition或takeover acquire都拒绝整个bundle。
-candidate集合一次性包含`cat_id`、Root `disk_id/volume_id`、`attachment_id`、`volume_intent_id`、normal-acquire
-`transition_id`、`operation_id`、`endpoint_id`、`network_id`以及完整Desired中出现的全部`Id/RandomId128`；
-Cat/Endpoint/Root/Volume全部非时间字段也在同一bundle内。Store逐字段验证Workspace、Root role、
-size/durability、Endpoint/hostname lookup、Desired volume/operation binding与spec digest，不接收
-`placement_ok`、`capacity_ok`或其他验证bool。placement/capacity结果允许在commit后变旧，
-按Runtime §3.3既有`PlacementRejected -> new revision`闭环处理，不新增capacity reservation authority。
-Root不携带Persistent initialization状态，也不创建第二个Disk Operation。事务只读取一次PostgreSQL DB now，
-并把同一毫秒值写入`CatRecord.created_at`、`EndpointRecord.created_at`、`DiskRecord.created_at`、
-Operation的created/updated time和
-`ApiIdempotencyResult.created_at`；重放不刷新任何时间。
-
-Cat create调用边界同时携带两个非持久、由public API层预先编码的exact HTTP envelope：成功response和
-`(workspace_id, name)`已存在时的`409 application/json` name-conflict response。Control Store只验证status、
-content type和body cap并在锁定事实后选择其一，不拼装、解析或重新序列化HTTP body。result miss下名称可用时，
-上述业务rows与成功result同一commit；名称已被另一个合法Cat占用时，零业务row变化并只把调用方提供的409
-response与同一次DB now原子写入`ApiIdempotencyResult`。因此该key以后始终重放原409，即使原Cat随后删除。
-成功response只使用同一bundle中的candidate identity和请求内已有字段，不包含`created_at`或其他必须等事务
-DB now/数据库生成值才能编码的字段；其operation ID必须逐字段等于待持久化Operation。result hit发生在任何
-candidate资源锁前，Store直接丢弃本次bundle/envelope并逐字节返回旧result。
-该事务必须重新取得key reservation并重新读取result；fast lookup与业务事务之间若另一请求先提交，仍以事务
-内hit为准。fast lookup不是第二authority，也不能让调用方跳过事务内重检。
-事务内result miss后立即取得`CatNameLock(workspace_id, name)`；V1 PostgreSQL实现固定执行
-`pg_advisory_xact_lock(hashtextextended(current_schema() || ':cat-name:' || $1 || ':' || $2,
-0::BIGINT))`，其中`$1=workspace_id`、`$2=name`。
-`Id`中的冒号或64-bit hash碰撞最多让不同名称额外串行，不会让相同tuple得到不同lock。持锁后读取并验证
-`CatRecord`：合法existing row按上述existing graph锁序闭合后选择409，并且不消费可失效的placement plan；absent先取得并
-闭合Root `DiskNameLock(workspace_id, disk_id)`，再按NodeIdentity（锁内按A23统一顺序重验完整policy/admission、无Active HostFenceEvent、
-post-mutation assigned count <= 1024、capacity与network probe）→Volume→Cat→Disk→Desired→EndpointRecord/
-hostname lookup→Operation锁/插入；corrupt row
-返回BackendUnknown。唯一约束只作invariant backstop，意外constraint error整体回滚，不能事后翻译成409。
-首次持久化的Operation固定为`phase=Pending, terminal=null`，其workspace/cat/revision/spec digest/placement/
-target从同一完整Desired和candidate operation ID构造；`created_at_unix_ms=updated_at_unix_ms`都由上述单次
-DB now注入。调用边界不携带一个带伪时间的“完整Operation row”，Store也不选择placement或重算spec。
-Root `DiskRecord.name`固定逐字节等于candidate `disk_id`，不从用户Cat name派生，也不增加第二种用户可观察
-name-conflict。若该server-generated disk ID/name意外碰撞既有Disk，则与其他candidate identity碰撞相同，
-整体回滚并用从未使用的新candidate bundle重试。
-`EndpointRecord.endpoint_id`、`(cat_id,"web")`和lookup hostname使用数据库unique约束作并发/invariant
-backstop；候选endpoint/hostname与不属于同一candidate的现有row碰撞时整体回滚并换全新bundle，不能改suffix、
-采用existing Endpoint或写Cat name 409。
-server生成的cat/endpoint/network/disk/volume/operation ID/name碰撞、stored row损坏和数据库/serialization失败不是name conflict，
-不得写409 result；事务回滚后按其既有infrastructure/invariant规则处理。
-因此旧plan形成后若另一个key已经合法占名，即使其间session replacement或assigned set变化，本请求仍按名称
-事实durable写入exact 409；反之name仍free时，任何admission变化都必须在零业务row/零result下回滚，不能用409掩盖。
-
-两个route response使用UTF-8、无BOM/空白/newline且按下列字段序编码；这是public API encoder fixed vector，
-不属于Runtime §16的wire或digest：
-
-| outcome | status/content-type | exact body bytes | bytes | SHA-256 |
-|---|---|---|---:|---|
-| accepted | `202 application/json` | `{"cat_id":"cat_01","operation_id":"op_01"}` | 42 | `9ff23d30170e1a81a16e5cdc847c79af292a48b2da3ce2764749320b8826bfda` |
-| name exists | `409 application/json` | `{"code":"already_exists","message":"cat name already exists"}` | 61 | `38f397c0f602012a22d578aec019b53c40b42e5e01611e1264be45fac3eb421e` |
-
-实际accepted body逐字节替换示例中的两个`Id`；name-conflict body恒定，不带动态name、request ID或时间。
+#### Retained PersistentDisk create
 
 **PersistentDisk独立create。** 它是同步资源事务，不走Runtime Operation。认证、当前membership/route permission和§3.3
 key reservation通过后，result miss的唯一PostgreSQL事务由server分配永不复用的`disk_id`、`volume_id`、
@@ -1006,50 +1079,44 @@ Volume或Disk再反向取得名称锁；与Cat Root create并发时，持同一�
 
 ### 8.2 Initialization CAS
 
-首次 Cold -> Running 在 route admission 打开前执行：
+首次Start一个尚未初始化的PersistentDisk时，Node必须在route admission仍Closed且业务mount尚未发生的
+边界内完成inspect -> format -> durable commit -> mount。Control不从inventory或“看见了ext4”推断
+Initialized。
 
-1. 取得精确 LeaseGrant，确认 MetadataStore head仍等于 blank predecessor。
-2. checkpoint 写 `FormatStarted(token, attachment, epoch, blank_head)` 并 fsync。
-3. Guest Agent按稳定virtio device identity probe。看到期望UUID就采用；确认全盘blank且没有部分
-   格式痕迹时，Node仍须在最终retained-launch authority barrier之后fresh重读VolumeRecord，只有完整
-   attachment/epoch未变且head逐字段仍等于blank predecessor，才按同一token执行
-   `mkfs.ext4 -U <filesystem_uuid>`；head前进、epoch/attachment替换、其他UUID或部分格式都零mkfs并
-   quarantine。
-4. RPC模糊或Agent crash后重新probe。期望UUID继续采用；仍严格blank可用同一token重试；任何
-   其他结果quarantine。`Initialized`之后永不进入mkfs路径。
-5. 磁盘尚未 mount，没有业务写入。Guest Agent执行设备 flush，Node要求 blockd drain到
-   `R == L`，并记录新的exact RemoteHead。Relaxed drain可以把head推进为同attachment/epoch的合法
-   successor；post-drain必须fresh验证完整owner/size/durability/admin/transition、lease单调且权威head
-   逐字段等于blockd返回的fully-drained status，不能要求它仍等于pre-drain sidecar head。
-6. `commit_initialized` step只能在Guest probe再次读到Desired的exact UUID、device flush完成且Node已观察
-   `R == L`后写入valid checkpoint；错UUID或模糊probe不能进入该step。step中的`new_remote_head`必须是
-   generation严格大于blank generation 0的合法非空`RemoteHead`。
-7. Control Store不接受调用方bool或新proof DTO，只复用已经由current AgentSession接受并完整保存的
-   `NodeObservation` row。它按§1的
-   `current NodeIdentity -> current AgentSession -> highest accepted-observation receive-state -> VolumeRecord -> DiskRecord ->
-   current Desired -> immutable accepted observation payload`顺序在一个PG事务锁定并逐字段重验：
-   receive-state仍精确指向该session binding、heartbeat sequence和observation ID，且immutable payload就是
-   被引用row；该Cat的applied revision/
-   placement匹配Desired；`ObservedRuntimeStatus.step`与valid checkpoint的step相同且精确为
-   `commit_initialized {volume_id, initialization_token, expected_blank_head, new_remote_head}`；同一`ObservedVolume`绑定该Disk/
-   Volume，authority为当前attachment/epoch拥有的exact new head，并有同attachment/epoch/placement的
-   active、非fenced lineage满足
-   `local_durable_generation == remote_durable_generation == head.generation`。事务中的
-   Volume还必须为Active+Owned的同一attachment/epoch/head，Persistent role仍是同一Uninitialized
-   token/UUID/blank head，Disk/Volume/Desired的size/durability及Desired initialize tuple全部一致。
-   通过后以本事务DB now原子改为
-   `Initialized {same token, uuid, blank head, initialized_head, initialized_at}`。
-8. Guest Agent mount并回报 device identity、UUID、mount path、read/write状态。每轮probe使用fresh
-   current Volume head，并要求它是launch checkpoint head的同attachment/epoch合法successor；实际Mount前在
-   最终launch barrier后再fresh读取，要求相对launch lower bound和首次读取都不回退、same-generation root不
-   冲突，并把第二次current head发送给Guest。只有全部Persistent按slot完成且完整mounted-set匹配后Running才
-   Ready并打开 route admission；late/manual mount不能提前生成route authority。
+signed `InspectPersistentInitialization`的binding闭合：
 
-初始化阶段即使是 Relaxed volume也必须先达到 `R == L`。否则 Host 丢失后 Control Store 会记得
-UUID，而远端盘仍是空白。第6步响应不明时，已是Initialized且token、UUID、blank head和initialized head
-全部相同就返回原`initialized_at`且不改row；旧session/attachment/epoch、错UUID/head、`R != L`、任一字段
-不同、单边状态或不匹配evidence都fail closed并保留现状。没有另一条initialization transition记录。
+- lifecycle Operation/request fingerprint、Cat/Node/placement；
+- runtime config ID/digest与exact Persistent `RuntimeVolumeConfig`；
+- current Start grant receipt、attachment/epoch与Volume head。
 
+AgentSession只认证outer request，刻意不进入initialization identity；Agent replacement恢复同一Start时不能
+因此得到第二个format authority。inspect只返回closed
+`Uninitialized {token, filesystem_uuid, expected_blank_head}`或
+`Initialized {same tuple, initialized_head, initialized_at}`。
+
+若为Uninitialized，Node在private execution journal中先持久化exact format plan；fresh验证Volume仍是同一
+Active+Owned attachment/epoch、同一blank predecessor后，Guest按稳定virtio identity检查设备。只有全盘严格
+blank才可用同一token执行`mkfs.ext4 -U <filesystem_uuid>`；期望UUID可adopt，其他UUID、部分格式痕迹、
+head/epoch/attachment变化或模糊证据均零mkfs并quarantine。format与commit是Node-private相邻恢复步骤，
+不是public lifecycle状态。
+
+commit前磁盘仍unmounted。Guest返回
+`LifecyclePersistentInitializationGuestProbe {exact_ext4_unmounted, runtime_incarnation,
+device serial/slot/major/minor/size, filesystem_uuid, challenge/response digest}`；随后device FLUSH和blockd
+drain必须产生同attachment的非blank `initialized_head`、`L == R == head.generation`和pending=0。
+signed `CommitPersistentInitialization`精确携带binding、`format_plan_digest`、token/UUID、blank/new head、
+Guest probe和完整flush/drain receipt。
+
+Control在一个PostgreSQL transaction重验current session、unresolved Start、config、Start grant、
+Volume/Disk与上述每个字段，只允许同一Uninitialized tuple单向写为Initialized，并保存
+`LifecyclePersistentInitializationCommitReceipt`及
+`cats.atomic-lifecycle.persistent-initialization-commit-receipt.v1` digest。相同exact commit返回原
+`initialized_at`/receipt；错session只拒绝transport，错command/config/grant/attachment/head/UUID、
+`R != L`、单边状态或不同payload都fail closed，不存在第二条initialization job/ledger。
+
+commit确认后Guest才mount exact UUID/path并返回read/write与完整mounted-set readiness；每轮mount probe使用
+fresh current head且不得回退或same-generation换root。只有全部Persistent slot匹配，Start才可返回
+RuntimeReady；所有Endpoint gate仍Closed，后续Route Enable才可Serving。
 ## 9. 容量不可变
 
 `size_bytes` 是创建卷时写入的不可变属性，并包含在每个 Root 和`DiskSnapshotRecord`中。所有读取都必须
@@ -1071,7 +1138,7 @@ create、delete和restore都要求满足§3.3的唯一合法`Idempotency-Key`和
 和route permission，但不以目标Disk或Snapshot是否仍存在决定重放；随后取得§3的key reservation。
 已有相同fingerprint的result时只返回其不可变status/content-type/body，绝不再读或修改Snapshot/Volume；不同
 fingerprint立即冲突。只有尚无result的首次请求才继续按`VolumeRecord -> DiskRecord(owner Workspace)/
-Cat/Desired -> DiskSnapshotRecord`锁序重验认证Workspace拥有Disk、Disk/volume绑定及各操作前置，并在
+Cat/config/current lifecycle head -> DiskSnapshotRecord`锁序重验认证Workspace拥有Disk、Disk/volume绑定及各操作前置，并在
 同一commit写业务变化与最终result。跨Workspace miss回滚reservation且不写Operation、result或资源。
 
 ### 10.1 创建
@@ -1087,7 +1154,8 @@ create_snapshot {
 }
 ```
 
-首次事务重验产品Disk仍为Active、属于认证Workspace、所属Cat处于精确stable Cold，且
+首次事务重验产品Disk仍为Active、属于认证Workspace、所属Cat current head是exact terminal Cold result且
+其normal release receipt覆盖该Disk/volume，且
 `DiskRecord.volume_id`与Active + Unowned的`VolumeRecord`一致；epoch、size和exact RemoteHead必须与
 请求完全相同。服务端随后分配一个全局唯一且永不复用的`snapshot_id`，插入包含精确disk/volume、
 size、head和`created_at`的`DiskSnapshotRecord`，并原子写入包含
@@ -1156,45 +1224,39 @@ Disk删除不做隐式cascade。
 普通入口共同要求没有live `DiskSnapshotRecord`、`R == L`、blockd及其upload workers已停止、精确release
 完成且Volume为Unowned。role-specific前置严格分开：
 
-- Root不接受直接Root Disk DELETE API，只能由已有Cat lifecycle Operation驱动；同一个server分配的
-  `delete_id`必须同时进入Deleted Desired的exact Root
-  `delete_disposable_root` disposition和`BeginDeleteRequest`。只有两条current-only normal路径：
-  - **Cold fast path**：covered Cat Destroy事务按§1锁定current NodeIdentity/session/receive-state、immutable complete
-    stable-Cold observation、Root Volume、Disk/Cat、current Cold Desired/settled Operation和snapshots，逐字段
-    证明同placement、同Root disk/volume/attachment/size/durability、无runtime/blockd、`R == L`且Active +
-    Unowned。随后同一commit写新current Deleted Desired、绑定它的Pending Cat Operation、双方
-    `Deleting(delete_id)`/normal BeginDelete direct result及API result；全有或全无。
-  - **Deleted converge path**：若Cat Destroy已只提交current Deleted Desired/Operation，normal begin事务先锁
-    current NodeIdentity/AgentSession/highest receive-state及其immutable current-revision observation，再锁Volume/Disk/Cat/
-    Desired/Operation/snapshots。observation必须应用该exact Deleted revision/placement并证明Root已经
-    `R == L`、Active + Unowned且没有runtime/blockd/residue；Operation与Root intent/disposition/delete ID仍
-    逐字段相同。它不读取前一Desired或旧Cold observation。
-  仍Owned时不能normal begin：`R == L`由Node用同一Deleted disposition/delete ID做
-  [Runtime §7](runtime-reconciliation-v1.md#7-reconcile-与物理-effect) exact cleanup/release，
-  接受新的current observation后再走第二条；可达Host的`R < L`只走§11.2 authorization，Active
-  HostFenceEvent下任何仍Owned状态也只走authorization，即使最后已知`R == L`或L未知。live Cold direct
-  delete、旧revision/observation、错delete ID、别的Cat或仅凭Disk未绑定都必须拒绝。
+- Root不接受直接Root Disk DELETE API，只能由current DeleteCat Operation驱动；同一个server分配的
+  `delete_id`必须同时进入exact `DeleteSpec` Root `discard_with_cat` disposition和
+  `BeginDeleteRequest`。Node在同一DeleteCat内部先完成strong Stop与全部Persistent disposition，再按current
+  Root `VolumeRecord`选择唯一入口：
+  - Root已由本Operation exact release且`R == L`时，用normal BeginDelete；事务锁current
+    NodeIdentity/AgentSession、unresolved Delete Operation/Cat chain、Volume、Disk/config与snapshots，逐字段
+    闭合Operation ID/fingerprint/placement、Root identity/size/durability、release receipt、Active + Unowned与
+    no live snapshot；不读取Observation。
+  - Root仍Owned且`R < L`时只能走§11.2 exact disposable authorization。Active HostFenceEvent恢复路径下任何
+    仍Owned Root同样只走authorization，即使最后已知`R == L`或L未知；它不伪造Node release。
+  - wrong Operation/fingerprint/delete ID、Persistent尚未全部完成、foreign lineage或仅凭Disk未绑定都拒绝。
 
 Root cleanup/release与authorization derive以现有`VolumeRecord`作为分支gate，不增加row。derive事务创建
-authorization后必须取得Volume锁并fresh重验current Deleted exact lineage及Active + Owned才能commit；
-release取得Volume锁后必须fresh读取同一delete ID/revision的authorization，任一已commit就拒绝，并重验
-current Deleted。release先commit时derive随后看到Unowned并整笔回滚；derive先commit时release看到auth并
+authorization后必须取得Volume锁并fresh重验current Delete Operation exact lineage及Active + Owned才能commit；
+release取得Volume锁后必须fresh读取同一delete ID/Operation的authorization，任一已commit就拒绝，并重验
+current command。release先commit时derive随后看到Unowned并整笔回滚；derive先commit时release看到auth并
 零副作用拒绝。这个fresh probe必须以projection current scope **或** canonical authorization中的同一
-volume/delete/revision/placement scope选出至多两个候选，再完整closed decode并交叉验证projection；任一方向
-drift都属于corruption，而旧lineage不进入候选。schema v11必须在启动时精确校验两个独立index：canonical
+volume/delete/Operation/placement scope选出至多两个候选，再完整closed decode并交叉验证projection；任一方向
+drift都属于corruption，而旧lineage不进入候选。clean-slate schema 17必须在启动时精确校验
+两个独立index：canonical
 arm由`GIN ((record->'authorization') jsonb_path_ops)`承载，projection arm由partial ordered B-tree
-`(volume_id, desired_revision, placement_epoch, authorization_id COLLATE "C") WHERE kind='disposable_root_delete'`
+`(volume_id, lifecycle_operation_id, placement_epoch, authorization_id COLLATE "C") WHERE kind='disposable_root_delete'`
 承载。两臂各自至多取两个ID、`UNION`去重后才读取完整row；同一健康row命中两臂不能误报重复，外层
 `LIMIT 2`本身不能作为任一臂全历史扫描的bound。
 不能在锁前缓存“无authorization”后越过这个重验。
-- Persistent不读取或保存“历史上属于哪个Cat”。它要求全部current完整Desired都不引用该Disk，且current
+- Persistent不读取或保存“历史上属于哪个Cat”。显式Disk delete要求全部current `CatRuntimeConfig`都不引用该Disk，且current
   accepted complete inventory按
-  [Inventory Spine §5.4](runtime-inventory-observation-v1.md#54-服务端-attestation-与-current-read-model)在同一
+  [Runtime Inventory and Telemetry v1 §9](runtime-inventory-observation-v1.md#9-store-transaction与schema)在同一
   snapshot重验live session、60秒freshness、内部binding和current assigned-set snapshot，随后对相关物理
   identity证明不存在该volume的blockd、active lineage、device、mount或其他residue；任一缺失/旧inventory、
   session/assigned set变化或partial-only事实都拒绝。
 
-attach/detach/move与begin-delete均锁同一VolumeRecord、DiskRecord和涉及的current Desired rows；attach先提交
+attach/detach/move与begin-delete均锁同一VolumeRecord、DiskRecord和涉及的current config rows；attach先提交
 则delete看到绑定而拒绝，delete先提交则attach看到Deleting而拒绝，不存在已删除Disk被并发重新绑定的窗口。
 
 ```text
@@ -1203,8 +1265,14 @@ BeginDeleteRequest {
   disk_id: Id,
   volume_id: Id,
   expected_unowned_epoch: FenceEpoch,
-  expected_head: RemoteHead
+  expected_head: RemoteHead,
+  origin: BeginDeleteOrigin
 }
+
+BeginDeleteOrigin =
+  { kind: "lifecycle_delete", lifecycle_operation_id: Id,
+    lifecycle_request_fingerprint: Sha256Digest }
+| { kind: "disk_api", api_request_fingerprint: Sha256Digest }
 
 BeginDeleteResult {
   delete_id: Id,
@@ -1215,7 +1283,7 @@ BeginDeleteResult {
 }
 ```
 
-`BeginDeleteRequest`按`VolumeRecord -> Control Disk/Cat/Desired rows -> DiskSnapshotRecord rows`锁序，
+`BeginDeleteRequest`按`VolumeRecord -> Control Disk/Cat/config/Operation rows -> DiskSnapshotRecord rows`锁序，
 在同一事务按role重验上述全部前置、Control Disk仍为Active、VolumeRecord精确为Active + Unowned，然后原子执行：
 
 - `Control Disk Active -> Deleting(delete_id)`；
@@ -1256,47 +1324,59 @@ DisposableRootDeleteAuthorization {
   disk_id: Id,
   volume_id: Id,
   cat_id: Id,
-  desired_revision: Revision,
+  lifecycle_operation_id: Id,
+  lifecycle_request_fingerprint: Sha256Digest,
   placement_epoch: Epoch,
   expected_attachment_id: Id,
   expected_epoch: FenceEpoch,
   expected_head: RemoteHead,
+  disposition: "discard_with_cat",
+  persistent_dispositions_digest: Sha256Digest,
   isolation_basis: DisposableDeleteIsolationBasis,
   not_after: UnixMillis
 }
 
 DisposableDeleteIsolationBasis =
   {
-    kind: "runtime_stopped",
+    kind: "strong_stop",
     node_id: Id,
     agent_session_epoch: Epoch,
-    runtime_incarnation: RandomId128,
-    observation_id: RandomId128
+    lifecycle_operation_id: Id,
+    strong_stop_receipt_digest: Sha256Digest,
+    execution_absence_proof_digest: Sha256Digest,
+    inventory_attestation_digest: Sha256Digest
   }
-| { kind: "host_fence_event", event_id: Id }
+| {
+    kind: "host_fence_event",
+    event_id: Id,
+    interrupted_operation_id: Id,
+    host_lost_result_digest: Sha256Digest
+  }
 ```
 
-Control Plane 只为当前 `Deleted` Desired 中明确标为 disposable 的 RootDisk建立授权。
-`authorized_node_id`在同一派生事务中复制该Deleted placement Node：`runtime_stopped`是可达执行Node，
+Control Plane只为current Delete Operation的canonical request中明确`discard_with_cat`的RootDisk建立授权，且
+exact Persistent set必须已经全部`R == L`、normal released、retained detached。
+`authorized_node_id`在同一派生事务中复制该Delete placement Node：`strong_stop`是可达执行Node，
 `host_fence_event`内部worker路径仍保留被隔离的原placement Node，但该worker不使用Node HTTP或
-evidence route。它随payload不可变，不会因后续revision/session变化改绑新Node。可达 Host 必须
-先关闭admission、停止Guest/VMM和blockd，并提交精确stop observation，且只有`R < L`才走授权；`R == L`
+evidence route。它随payload不可变，不会因后续chain/session变化改绑新Node。可达 Host 必须
+先关闭admission、停止Guest/VMM和Guest-facing block frontend，并提交exact strong-Stop/inventory proof，且只有`R < L`才走授权；`R == L`
 必须先走上述normal release。失联Host必须已有Active HostFenceEvent；此时任何仍Owned的exact Root都可授权，
-不要求或伪造`R < L`，包括最后observation为`R == L`、L未知或没有最后observation。授权绑定current
-revision/placement、delete ID、remote head和最后owner/epoch，不能
+不要求或伪造`R < L`，包括last known为`R == L`或L未知。授权绑定current
+Operation/fingerprint/placement、delete ID、disposition、Persistent completion、remote head和最后owner/epoch；
+strong_stop arm另外绑定strong Stop result/proof，HostFence arm只绑定event/interrupted Operation/HostLost digest且
+绝不伪造strong Stop，不能
 跨Disk、Cat、卷、attachment或重试身份复用。唯一Control Store writer在锁定这些权威row的同一
 PostgreSQL事务中写完整immutable authorization；不增加第二套签名，Node消费时只提交`authorization_id`。
 
 HostFenceEvent来源的首次消费使用固定锁序
-`HostFenceEvent -> AuthorizationRecord -> VolumeRecord -> Control Disk/Desired/DiskSnapshotRecord rows`；
-RuntimeStopped来源使用相同后缀而没有event行。一个PostgreSQL事务读取服务器端authorization row，重验
-event或stop observation、authorization完整tuple、Control Disk仍为Active、当前Deleted Desired仍把该Root标为disposable，
-并确认没有live `DiskSnapshotRecord`。两种basis都必须从current accepted full observation按volume ID扫描
-全部runtime和Node residue：恰有一个expected runtime中的ObservedVolume与intent及old owner/epoch/head逐字段
-相同，且全Node没有该volume的duplicate/foreign volume、blockd、mount或residue，expected volume没有device。
-RuntimeStopped还要求exact observation/session/runtime incarnation、Guest/VMM/process/mount stopped以及唯一
-Active、unfenced、`R < L` lineage；HostFenceEvent则要求expected metadata volume的lineage为空。event只fence
-旧Host，不能替代current Host的这次physical检查。全部通过后才原子执行：
+`HostFenceEvent -> AuthorizationRecord -> VolumeRecord -> Control Disk/config/Operation/DiskSnapshotRecord rows`；
+StrongStop来源使用相同后缀而没有event行。一个PostgreSQL事务读取服务器端authorization row，重验
+event或authenticated strong-Stop proof、authorization完整tuple、Control Disk仍为Active、current Delete
+Operation/request仍把该Root标为`discard_with_cat`、全部Persistent dispositions仍闭合，并确认没有live
+`DiskSnapshotRecord`。StrongStop basis还要求current AgentSession、session-bound complete inventory attestation、
+exact execution absence、Guest/VMM/frontend/mount stopped以及唯一Active、unfenced、`R < L` Root lineage；
+HostFenceEvent basis要求exact Active event/HostLost result与metadata owner/epoch/head。Observation、heartbeat timeout
+或目录缺失都不能替代这些proof。全部通过后才原子执行：
 
 - `VolumeRecord Active + Owned(expected owner/epoch) -> Deleting(delete_id, owner cleared, epoch + 1)`；
 - `Control Disk Active -> Deleting(delete_id)`；
@@ -1318,7 +1398,7 @@ epoch永久不能publish，Node才可删除授权所指lineage的`R < L` tail。
 
 1. sweeper只按稳定ID分页扫描Control Disk/Volume双方同一`Deleting(delete_id)`的level-triggered状态；
    不创建job、claim、lease或第二个Operation。§11.1 begin已证明blockd stopped、精确release和`R == L`；
-   §11.2 begin已消费stop/HostFence授权并fence旧epoch。Deleting禁止进入新Desired或normal acquire，
+   §11.2 begin已消费strong-stop/HostFence授权并fence旧epoch。Deleting禁止进入新runtime command或normal acquire，
    因而begin后不存在可合法创建新Root的writer。正常stop必须join全部blockd upload worker并确认没有
    in-flight PUT；HostFence路径只能使用Runtime规格中已完成object-write cutoff/barrier语义的同一Active
    HostFenceEvent：旧Host不能再发起PUT，barrier前已经被BlobStore接受的PUT必须已成功且对后续LIST可见，
@@ -1358,37 +1438,44 @@ completion只允许一个exact compare/CAS事务提交，后到者看到rows已�
 tombstone；但只要某个Active HostFenceEvent的Consumed authorization引用该卷，精确
 `DeleteCompletionReceipt`、event和authorization都必须保留，供合法后继校验。
 
-## 12. 两 revision Cold 迁移
+## 12. Atomic Cold handoff 迁移
 
 计划迁移不使用 takeover：
 
-1. revision N+1仍由源 Node负责，目标为 Cold。源关闭 admission、drain guards和Guest，所有
-   保留卷到 `R == L`，停止 blockd并逐卷 release，最后发布精确 Cold observation。
-2. 只有 N+1 Operation成功后，Control Plane选择目标 Node，在事务中写 revision N+2、提高
-   placement epoch，目标为 Running并携带完整磁盘集合。
-3. 目标对每卷执行 normal acquire；因为源已 release，volume必须是 Unowned。
-4. 旧 revision、placement、attachment和route grant全部失败。
+1. source `ColdCat` command关闭admission、strong Stop并使全部Root/Persistent `R == L`。当卷
+   仍Owned时做exact normal release；命令开始时已Unowned时使用closed
+   `AlreadyUnowned` provenance，不伪造attachment/release。只有exact authenticated `ColdResult`
+   terminal settlement可完成source Operation。
+2. Control验证`ColdResult.volume_dispositions`完整覆盖source Cold Operation冻结的
+   immutable config，并且每个digest与variant匹配后选择target Node、提高placement epoch并创建
+   target `StartCat`。若Cold window内已attach/detach，target Start冻结latest current config；typed predecessor仍必须是
+   `CrossNodeColdHandoff {cold_operation_id,cold_result_digest,source_node_id,source_placement,
+   volume_disposition_receipts,target_placement}`，其中每卷receipt是
+   `NormallyReleased {volume_id,normal_release_receipt_digest}`或
+   `AlreadyUnowned {volume_id,already_unowned_receipt_digest}`的closed union。
+3. target对每卷执行绑定Start Operation/fingerprint的normal acquire；两种source disposition都
+   必须在Volume Authority中闭合为current exact Unowned epoch/head，target不能把
+   `AlreadyUnowned`改写为虚构release。
+4. old operation/placement/attachment/route Grant全部fail closed；target不读取或解释source checkpoint。
 
-源未证明 Cold/release时不创建 N+2。开发期不提供一个跨两 revision的 Node workflow；API可以
-显式返回两个精确 Operation，fleet drain也按相同当前状态规则推进。
+source未返回exact Cold/mixed disposition set时不创建target Start。两条Operation是causal
+chain，不存在跨Node workflow、desired-state revision或Observation推断。
 
 非计划 Host loss不走这条路径，只能走 HostFenceEvent + per-volume takeover。
 
-## 13. 模块依赖和实施顺序
+## 13. 实现边界
 
-1. 先建立旧实现必失败的 characterization tests：普通抢占、重复 acquire、silent release、旧 pack
-   新 epoch replay、expired-owner delete、snapshot create/delete/GC和初始化 crash点。
-2. 一次替换pure domain/MetadataStore schema、trait和唯一PostgreSQL authority adapter；SQLite只复用窄
-   data-domain fixture。HostFenceEvent、`AuthorizationConsumedReceipt`与VolumeRecord使用同一
-   PG事务域和固定锁序。
-3. 一次替换 pack header、data-dir identity、blockd启动参数和status；删除旧 pack parser。
-4. 接入 RuntimeCheckpoint、VolumeIntent/Observation和Node lease executor。
-5. 接入 Guest Agent probe/format/mount和Cold-only API前置条件。
-6. 实现唯一byte-level fingerprint与§3.3 scoped `ApiIdempotencyResult`、exact `DiskRecord`、单一
-   `DiskSnapshotRecord`、Persistent create/initialization CAS、snapshot-aware GC、same-disk restore、
-   Control/Volume原子begin-delete和level-triggered fail-closed sweeper。
-7. 接入 HostFenceEvent/takeover与两 revision Cold migration。
-8. 同一发布删除旧 acquire/revoke、hot disk mutation、resize API和无条件 delete路径。
+clean-slate schema 17已组成唯一PostgreSQL Volume authority adapter、signed lifecycle-volume
+transition route、command-scoped receipt ledger、Start grant/renewal、Cold mixed disposition、Delete begin/
+completion、Cold-window config succession、Persistent inspect/commit initialization与snapshot-aware delete sweeper。Node私有journal/
+physical manifest负责effect crash recovery，不是Control protocol或另一storage authority。
+
+发布可达性与失败后继的唯一canonical gate是
+[Atomic Runtime Lifecycle v1 §11](atomic-runtime-lifecycle-v1.md#11-acceptance-matrix)。本规格不另行复制
+rolling implementation checklist；特别是Cold-only attach/detach必须在产品级验收中证明新
+runtime-config head须按§7的历史Cold receipts + current pristine slots规则进入下一Start，并在
+新Persistent首次使用时继续进入§8.2的signed initialization；不得用内部seeded
+fixture取代这条product oracle。
 
 ## 14. 最小验收矩阵
 
@@ -1399,42 +1486,42 @@ tombstone；但只要某个Active HostFenceEvent的Consumed authorization引用�
 | API fingerprint fixed vectors | 独立实现按五个u64-BE frame重算§3.3三个hash；body key order/whitespace、raw percent spelling/query order或If-Match Generation任一改变都会冲突，Idempotency-Key/auth/cookie/request ID/User-Agent变化不改hash |
 | API envelope/result exact replay | Idempotency-Key缺失、重复、空、非printable或超过512 bytes，以及wrong media type/non-identity encoding均在reservation前拒绝；hit不读resource并逐字节重放status/content-type/body，且route不依赖未保存的ETag/Location；response body超过1MiB则业务/result都不能commit；transport/commit unknown本身不结算失败row，最终只可能业务+result全有或全无 |
 | Cat create closed request | 4095/4096/4097-byte边界、非canonical/percent-encoded path、`?x=1`/结尾裸`?`、wrong/duplicate media与encoding、任一If-Match、unknown/duplicate/missing/null字段、非canonical integer、name首尾/大小写/长度、旧image alias/disk/auto-suspend/expiry都在fast lookup前按合同拒绝；合法raw bytes匹配§3.3 Cat vector |
-| DiskRecord identity/closed role | `volume_id`全局一对一；Root与Cat同Workspace且每Cat恰好一个，Persistent同时最多一个current Desired；Root只含不可变cat ID，Persistent只含两态initialization且仅允许同lineage的一次Uninitialized→Initialized；`{disk}`只解析disk_id，name只能显式lookup；完成删除后row缺席 |
-| Root create crash/重放 | Cat + default Endpoint/hostname lookup + current完整Desired + runtime Operation + generation-zero/unowned Root Disk/Volume + API result同一PG commit或全无；相同key只返回原operation ID且不生成第二identity；Root无Persistent initialization或第二Disk Operation |
+| DiskRecord identity/closed role | `volume_id`全局一对一；Root与Cat同Workspace且每Cat恰好一个，Persistent同时最多一个current CatRuntimeConfig；Root只含不可变cat ID，Persistent只含两态initialization且仅允许同lineage的一次Uninitialized→Initialized；`{disk}`只解析disk_id，name只能显式lookup；完成删除后row缺席 |
+| Root create crash/重放 | Cat/cat_creation_id + CatRuntimeConfig + default Endpoint/binding/hostname lookup + Genesis Start Operation + generation-zero/unowned Root Disk/Volume + API result同一PG commit或全无；相同key只返回原operation ID且不生成第二identity；Root无Persistent initialization或第二Disk Operation |
 | Root create fast lookup/竞态 | exact fast hit不执行placement/capacity；异fingerprint在resource前冲突；fast miss后另一session以同key先commit时，业务事务reservation+reread命中、丢弃整组candidate且零candidate row |
 | Root create manifest/release/planner来源 | boot digest只读同digest immutable manifest，size按4MiB向上取整且覆盖manifest/不超1TiB；guest digest只来自验证过的release receipt；planner只选匹配digest的current session/fresh full inventory、无Active HostFenceEvent、post-assigned count最多1024的Node并返回exact network，任何缺失都不以fixture/default补齐 |
 | Root create name并发 | 两个不同key同Workspace/name经CatNameLock只能一方提交202全套rows，另一方零业务row并提交fixed 409；原Cat后来删除后，409 key仍逐byte重放；unique violation不能充当409路径 |
 | Root create candidate/corruption | 每类candidate ID/Endpoint/hostname/name碰撞、existing Cat cross-row corruption、serialization/connection failure均不写409/result或半rows；collision只用全新未使用bundle和重新编码的202重试 |
-| Root create exact初态/时间 | Desired固定revision1/Running/placement epoch1/cancel-and-drain、一个Root、一个web HTTP:8080 route epoch1；Volume仅接受Active+Unowned、epoch0、blank head、null owner/expiry/transition，Root normal acquire expected epoch0；Cat/Endpoint/Disk/Operation/result五处使用同一DB-now，Operation为Pending/null；202/409 fixed vector由独立encoder逐byte重算 |
-| Endpoint单一authority | EndpointRecord只保留immutable product identity/name；hostname lookup只定位current Desired；三者同txn且signer必须重读完整binding。改record/lookup/Desired任一identity/revision或制造hostname并发碰撞都fail closed，不采用旧binding |
+| Root create exact初态/时间 | config固定一个Root、default web HTTP:8080 route epoch1、placement epoch1、Genesis Start request；Volume仅接受Active+Unowned、epoch0、blank head、null owner/expiry/transition，Root normal acquire expected epoch0；Cat/Endpoint/Disk/Operation/result使用同一DB-now，Operation为unresolved；所有gate Closed，202/409 fixed vector由独立encoder逐byte重算 |
+| Endpoint单一authority | EndpointRecord只保留immutable product identity/name；hostname lookup只定位current EndpointBinding；三者同txn且signer必须重读完整binding+Serving/effective RuntimeReady。改record/lookup/binding任一identity/epoch或制造hostname并发碰撞都fail closed，不采用旧binding |
 | Persistent create crash/重放 | Disk + empty exact Volume + 201 result同一PG commit或全无；相同key只返回原201且无Operation，异fingerprint不读resource |
-| initialization CAS/重放 | 锁current NodeIdentity、AgentSession与highest accepted head后才锁Volume/Disk/Desired/observation；observation ID、revision/placement、valid checkpoint `commit_initialized`、Owned attachment/epoch/head和active lineage逐字段匹配，new head非空且generation>0、R==L；session replacement或新observation先提交则旧evidence零副作用，initialize先提交则replacement随后正常前进；exact tuple保留首次time且无ledger |
+| initialization CAS/重放 | 锁current NodeIdentity、AgentSession与unresolved Start Operation/head后才锁Volume/Disk/config；signed request绑定Operation/fingerprint/placement、valid command checkpoint `commit_initialized`、Guest probe/flush、Owned attachment/epoch/head和active lineage，new head非空且generation>0、R==L；session replacement或command settlement先提交则旧evidence零副作用；exact tuple保留首次time且无第二ledger，Observation不参与 |
 | normal acquire响应丢失/异payload | 相同RandomId128且完整request相同返回原result/absolute expiry；同ID异任一字段Stale，不使用domain request hash、不产生第二次fence |
 | lease duration/DB time | 0、非canonical number、DB-now checked-add溢出均零副作用；acquire、renew与takeover都把该次唯一DB-now加duration所得值写为absolute expiry；expiry lapse仍不授予takeover/revoke |
 | expired other owner | normal acquire始终OtherWriter；精确owner/epoch可继续renew |
 | release响应丢失/异payload | 相同RandomId128且完整request相同返回原result；同ID异payload Stale，旧epoch永久不能publish |
 | stale acquire晚到release之后 | expected epoch不匹配，不能重新占有volume |
 | authorization单一authority | Node只传authorization ID；两类payload都含派生时immutable `authorized_node_id`且consume caller必须匹配；锁定row中的payload/receipt是唯一权威，receipt不重复Node ID，Volume last_transition仅ID marker；不存在客户端payload、第二签名或重复receipt副本 |
-| Control-signed authorization evidence read | A19 proof绑定current provisioned NodeIdentity/exact active credential lineage/AgentSession，唯一业务key为authorization ID；只有immutable `authorized_node_id`匹配可读，同一RR snapshot在NodeIdentity/credential share lock下只返回exact primary、derived current Volume/null、derived completion/null和current marker/completion直接引用的最多一个direct authorization；transaction为取得row lock不声明SQL READ ONLY但零domain write；不读current Desired，不接受volume/delete/successor key，不枚举全volume历史，不返回bool或chain ledger；blockd object graph无此client |
-| authorization response-loss/current successor | takeover consume commit丢response后，分别以direct current state、合法renew/head-CAS/release、以及指向第二authorization的更大epoch current marker做正例；只有厚receipt、current marker/最多一direct successor row、epoch/head单调和closed successor全部通过才adopt；Consumed + null marker但缺same-disk restore result保持Blocked |
-| authorization response-loss/delete completion | disposable consume commit后断response，sweeper随即写exact completion并删除Volume/Disk；按原authorization ID的snapshot必须返回`current_volume=null`+唯一matching receipt并闭合；row absent但receipt缺失/错variant/错volume/delete/prior attachment/epoch/head均Blocked |
-| authorization evidence corruption/isolation | 破坏primary/current/receipt/direct任一JSON/projection、制造current+completion并存、同volume重复completion或缺少/跨volume引用都fail closed；先用已知授权正例校准查询探针，再证明wrong/retired Node、无关authorization和任何额外key不能读到其volume/receipt/auth；absent/wrong Node同类404；Node无authorization/completion raw SQL credential，Control read零write |
+| signed command-scoped replay | current AgentSession、unresolved Operation/request fingerprint、Cat/Node/placement、command kind、transition identity与sorted targets逐字段相同才返回immutable ledger中的原receipt bytes；任一identity/payload不同fail closed，不接受任意authorization/volume/delete/successor查询key |
+| authorization response-loss/current successor | takeover/disposable consume丢response只重放原command transition；后续合法renew/head-CAS/release/第二authorization不能改变已存receipt bytes。ledger、current marker、epoch/head或closed receipt任一不一致保持Blocked/Quarantined，不读取或枚举authorization history |
+| authorization response-loss/delete completion | disposable consume或delete completion丢response后重放原command transition，exact ledger返回同一consumed/completion receipt；Volume/Disk已合法删除时仍不得从row absence猜成功，receipt缺失/错variant/错volume/delete/prior attachment/epoch/head均Blocked |
+| retired transport absence/isolation | pre-cutover Runtime Volume Transitions DTO/codec/constants/spec与mutation/evidence parser均不存在；旧ContractName严格拒绝。先用current lifecycle-volume transition正例校准探针，再证明旧path/payload、wrong/retired Node、wrong Operation/session/fingerprint与额外query key均零domain write；Node无authorization/completion raw SQL credential |
 | Host takeover | 只有精确逐卷授权成功；跨volume/placement/replay失败；receipt精确记录event/volume/new attachment/resulting epoch/head |
 | consumed授权的后继 | direct takeover/disposable state缺失或写错对应authorization marker必须Blocked；更大epoch的takeover→release/restore/delete按closed状态机、epoch单调和head generation非倒退验证；delete→sweep以精确DeleteCompletionReceipt重连；缺失/错receipt保持Blocked，不复制中间链 |
-| pure D / cross-row split | pure-domain table只输入Volume/Event/Authorization rows且可复用于SQLite fixture；唯一PG integration逐项改变Cold、R==L、blockd stop、Desired、Disk、Snapshot、stop observation并断言同事务拒绝；不存在bool/VerifiedContext旁路 |
+| pure D / cross-row split | pure-domain table只输入Volume/Event/Authorization rows且可复用于SQLite fixture；唯一PG integration逐项改变Cold result、R==L、blockd stop、Operation/config、Disk、Snapshot、strong-Stop proof并断言同事务拒绝；不存在bool/VerifiedContext旁路 |
 | acquire origin namespace | normal/takeover即使携带相同文本ID也不是同一lineage并进入quarantine；缺失/unknown variant和旧裸字段严格拒绝，不能猜namespace |
 | 旧pending目录遇到新attachment | quarantine，remote Root不改变 |
 | 相同lineage blockd crash | identity、全部pending pack、runtime evidence与当前grant的服务器端acquire marker逐字段绑定同一完整`AcquireOrigin`后，才从pack恢复L并按序publish；任一冲突quarantine |
 | resize请求 | API不存在；`size_bytes` 在Volume/Root/Snapshot中始终一致 |
 | normal acquire与begin-delete并发 | 两者锁同一VolumeRecord且只能一方提交；不存在Control Deleting但Volume仍可acquire的窗口 |
-| Persistent绑定与delete并发 | attach/detach/delete锁同一Disk/Volume/current Desired；attach先提交则delete因current引用拒绝，delete先提交则attach因Deleting拒绝；delete不读取历史Cat，缺current complete inventory或任一residue时保持Active |
-| Root normal begin authority | direct Root Disk DELETE拒绝；Cold fast path把current Cold evidence验证、Deleted Desired/Pending Operation、normal BeginDelete和API result置于同一commit；其他可达路径只用current Deleted observation的R==L+Unowned证据，仍Owned的R==L先exact release、R<L只authorization；Active HostFence下任何仍Owned状态只authorization；全部绑定同一revision/delete ID，旧observation/ID零副作用 |
-| Root normal begin crash | fast path在任一点crash后上述rows/result全有或全无；Deleted converge在release前/响应不明/接受current Unowned observation后crash都以原release/delete ID重放，不需要历史Desired或Cold payload |
+| Persistent绑定与delete并发 | attach/detach/delete锁同一Disk/Volume/current config；attach先提交则delete因current引用拒绝，delete先提交则attach因Deleting拒绝；delete不读取历史Cat，缺current complete inventory或任一residue时保持Active |
+| Root normal begin authority | direct Root Disk DELETE拒绝；current Delete Operation在strong Stop与全部Persistent disposition完成后，Root R=L先exact release再normal BeginDelete，R<L只exact disposable authorization；Active HostFence下任何仍Owned状态只authorization；全部绑定Operation/fingerprint/placement/delete ID，Observation零authority |
+| Root normal begin crash | Delete在release前/response unknown/Unowned begin/result publication各点crash都以原Operation/fingerprint/release/delete ID重放，不需要历史Desired/Observation/Cold payload |
 | Root release/auth derive竞态 | 两个PG session都以VolumeRecord为branch gate并在锁后重验；release先提交使derive因Unowned全回滚，derive先提交使release看到同delete lineage auth而零副作用拒绝，不出现auth+Unowned |
-| Root在release前失联 | 最后observation即使`R == L`，Active HostFenceEvent下仍Owned Root也可用exact owner/epoch/head authorization进入Deleting；不要求伪造`R < L`或等待不可达Node release |
+| Root在release前失联 | last known即使`R == L`，Active HostFenceEvent+HostLost下仍Owned Root也可用exact Operation/owner/epoch/head authorization进入Deleting；不要求伪造`R < L`或等待不可达Node release |
 | Disk delete 202/GET/replay | 首次begin事务原子写双方Deleting及exact 202 result且不建Operation；GET先见Deleting、completion后404，同key始终重放原202 |
 | delete LIST/late PUT/crash | adapter contract suite用已成功PUT正样本判定stale-empty fake/adapter不合格；暂停一个已接受PUT时HostFence barrier不得返回且不能commit receipt，PUT成功可见或永久失败后才delete/re-list empty；多sweeper只有一个exact completion CAS，receipt后再次LIST仍empty；任一失败保留Deleting且不存job/claim/opaque bool |
-| disposable Root `R < L` | 固定event/auth/volume/control锁序；closed receipt与两边Deleting原子提交后才删lineage；Volume只存authorization ID marker，PersistentDisk拒绝 |
+| disposable Root `R < L` | common authorization逐字段绑定Delete Operation/fingerprint、Node/Cat/placement、Root attachment/epoch/head、discard disposition与Persistent completion；reachable arm另绑strong-Stop result/proof/session/inventory，HostFence arm只绑event/interrupted op/HostLost digest；固定event/auth/volume/control锁序，closed receipt与两边Deleting原子提交后才删lineage；PersistentDisk拒绝 |
 | mkfs各步骤crash | 只adopt期望UUID或quarantine；Initialized前R==L |
 | Running磁盘变更 | API拒绝，先Cold；不存在hotplug竞态 |
 | Snapshot与GC并发 | record命名的对象始终存活；坏record使GC fail closed |

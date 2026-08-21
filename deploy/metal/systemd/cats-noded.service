@@ -11,9 +11,9 @@ Environment=CATS_GUEST_NETWORK_CIDR=10.240.0.0/16
 Environment=CATS_NODE_LISTEN=127.0.0.1:7301
 Environment=CATS_NODE_SERVICE_NAME=cats-noded
 EnvironmentFile=/etc/cats/cats.env
-# The direct-development installer has no validated four-artifact transaction.
-# Clear even a stale EnvironmentFile/manager value because the CLI otherwise
-# accepts this setting from its process environment.
+# The listener address is release-fixed below. Clear any stale manager or
+# EnvironmentFile override; startup still requires the four fixed Route v2
+# artifacts and the separately configured HTTPS rotation origin.
 UnsetEnvironment=CATS_ROUTE_V2_MACHINE_LISTEN
 # Per-Cat VMM/blockd processes are PID-1-owned sibling transient services in
 # system.slice, not children of this service cgroup. Reap every process that
@@ -30,9 +30,21 @@ ExecStartPre=/opt/cats/bin/setup-guest-network
 ExecStart=/opt/cats/bin/cats-noded \
   --listen ${CATS_NODE_LISTEN} \
   --control-plane-url ${CATS_CONTROL_PLANE_URL} \
+  --route-v2-machine-listen 0.0.0.0:7444 \
+  --route-v2-rotation-origin ${CATS_ROUTE_V2_ROTATION_ORIGIN} \
   --guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json \
   --blockd-bin /opt/cats/bin/cats-blockd \
-  --guest-agent-bin /opt/cats/bin/cats-guest-agent \
+  --runtime-systemctl-bin /usr/bin/systemctl \
+  --runtime-systemd-run-bin /usr/bin/systemd-run \
+  --runtime-cgroup-root /sys/fs/cgroup \
+  --runtime-proc-root /proc \
+  --runtime-network-class-root /sys/class/net \
+  --runtime-sys-block-root /sys/block \
+  --runtime-device-root /dev \
+  --runtime-blockd-socket-root /run/cats/blockd-v1 \
+  --runtime-vmm-socket-root /run/cats/vmm-v1 \
+  --runtime-inventory-scan-timeout-ms 5000 \
+  --runtime-effect-step-timeout-ms 30000 \
   --vmm-launcher-bin /opt/cats/bin/cats-vmm-launcher \
   --vmm ch \
   --ch-bin /usr/local/bin/cloud-hypervisor \

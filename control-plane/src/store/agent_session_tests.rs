@@ -205,21 +205,6 @@ fn first_registration_replay_and_replacement_keep_one_current_session() {
     let authenticated = authenticated(&identity);
     let policy = policy();
 
-    store
-        .with(|client| {
-            client.execute(
-                "INSERT INTO nodes (
-                    id, agent_url, gateway_url, state, cpus, memory_mib,
-                    last_heartbeat_ms, telemetry_json, scheduling_disabled,
-                    reported_cats_json, route_grant_public_key_sha256
-                 ) VALUES ('legacy-sentinel', 'http://old-node', 'http://old-gateway',
-                    'ready', 2, 4096, 77, 'sentinel', FALSE, '[]', NULL)",
-                &[],
-            )?;
-            Ok(())
-        })
-        .unwrap();
-
     let before_registration = database_now_ms(&store);
     let first_attempt = attempt(&identity, 1, 11, 111, None);
     let first = registered(
@@ -292,19 +277,6 @@ fn first_registration_replay_and_replacement_keep_one_current_session() {
     );
     assert_eq!(lost_old_response, first);
     assert_eq!(current_session(&store, &identity.node_id), replacement);
-
-    let sentinel: (String, i64, String) = store
-        .with(|client| {
-            client
-                .query_one(
-                    "SELECT state, last_heartbeat_ms, telemetry_json
-                       FROM nodes WHERE id='legacy-sentinel'",
-                    &[],
-                )
-                .map(|row| (row.get(0), row.get(1), row.get(2)))
-        })
-        .unwrap();
-    assert_eq!(sentinel, ("ready".to_owned(), 77, "sentinel".to_owned()));
 }
 
 #[test]

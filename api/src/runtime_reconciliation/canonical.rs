@@ -1,19 +1,15 @@
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 #[cfg(feature = "proposed-node-residue-reclamation")]
 use super::types::AuthorizedServingAcquire;
 use super::types::{
     AsciiText, Base64UrlNoPad, ContractError, ContractErrorDetail, ContractName, ContractVersion,
-    DesiredRuntimeSpec, Epoch, GuestRuntimeProfileReceipt, Id, JsonPointer, KeyId,
-    MalformedProblem, NodeObservation, ProviderScope, RuntimeCheckpoint,
+    Epoch, GuestRuntimeProfileReceipt, Id, JsonPointer, KeyId, MalformedProblem, ProviderScope,
     RuntimeProvisionerActiveSet, Sha256Digest,
 };
 
-const SPEC_DOMAIN: &[u8] = b"cats.runtime.desired-spec.v1";
-const CHECKPOINT_DOMAIN: &[u8] = b"cats.runtime.checkpoint-content.v1";
-const INVENTORY_DOMAIN: &[u8] = b"cats.runtime.inventory.v1";
 const KEY_RING_DOMAIN: &[u8] = b"cats.runtime.key-ring.v1";
 const OBJECT_WRITE_WRITER_AUTHORITY_ID_DOMAIN: &[u8] = b"cats.object-write.writer-authority-id.v1";
 const GUEST_RUNTIME_PROFILE_DOMAIN: &[u8] = b"cats.runtime.guest-runtime-profile.v1";
@@ -37,118 +33,6 @@ pub fn guest_config_digest(
 ) -> Result<Sha256Digest, ContractError> {
     let canonical = super::wire::encode_guest_runtime_profile_receipt(receipt)?;
     Ok(digest_bytes(GUEST_RUNTIME_PROFILE_DOMAIN, &canonical))
-}
-
-/// Computes the DesiredRuntimeSpec digest after context-free intrinsic validation.
-pub fn spec_digest(spec: &DesiredRuntimeSpec) -> Result<Sha256Digest, ContractError> {
-    let mut value = as_value(spec, ContractName::DesiredRuntimeSpec)?;
-    value
-        .as_object_mut()
-        .expect("DesiredRuntimeSpec serializes as an object")
-        .remove("spec_digest");
-    let digest = digest_value(SPEC_DOMAIN, &value);
-    let mut validation_value = as_value(spec, ContractName::DesiredRuntimeSpec)?;
-    validation_value
-        .as_object_mut()
-        .expect("DesiredRuntimeSpec serializes as an object")
-        .insert(
-            "spec_digest".to_owned(),
-            Value::String(digest.as_str().to_owned()),
-        );
-    let encoded = serde_json::to_vec(&validation_value)
-        .map_err(|_| invalid(ContractName::DesiredRuntimeSpec, ""))?;
-    super::wire::decode_desired_runtime_spec(&encoded)?;
-    Ok(digest)
-}
-
-/// Computes the digest binding every field in a RuntimeCheckpoint.
-pub fn checkpoint_content_digest(
-    checkpoint: &RuntimeCheckpoint,
-) -> Result<Sha256Digest, ContractError> {
-    let value = as_value(checkpoint, ContractName::RuntimeCheckpoint)?;
-    let encoded =
-        serde_json::to_vec(&value).map_err(|_| invalid(ContractName::RuntimeCheckpoint, ""))?;
-    super::wire::decode_runtime_checkpoint(&encoded)?;
-    Ok(digest_value(CHECKPOINT_DOMAIN, &value))
-}
-
-/// Computes the physical inventory projection digest for a complete observation.
-pub fn inventory_digest(observation: &NodeObservation) -> Result<Sha256Digest, ContractError> {
-    if !observation.complete_inventory || observation.inventory_read_position.is_none() {
-        return Err(invalid(ContractName::NodeObservation, ""));
-    }
-    let digest = unchecked_inventory_digest(observation);
-    let mut validation_value = as_value(observation, ContractName::NodeObservation)?;
-    validation_value
-        .as_object_mut()
-        .expect("NodeObservation serializes as an object")
-        .insert(
-            "inventory_digest".to_owned(),
-            Value::String(digest.as_str().to_owned()),
-        );
-    let encoded = serde_json::to_vec(&validation_value)
-        .map_err(|_| invalid(ContractName::NodeObservation, ""))?;
-    super::wire::decode_node_observation(&encoded)?;
-
-    let mut source = as_value(observation, ContractName::NodeObservation)?;
-    let source = source
-        .as_object_mut()
-        .expect("NodeObservation serializes as an object");
-    let read_position = source
-        .remove("inventory_read_position")
-        .and_then(|value| (!value.is_null()).then_some(value))
-        .ok_or_else(|| invalid(ContractName::NodeObservation, "/inventory_read_position"))?;
-    let runtimes = source
-        .remove("runtimes")
-        .expect("NodeObservation always serializes runtimes");
-    let mut projected_runtimes = runtimes
-        .as_array()
-        .expect("NodeObservation.runtimes serializes as an array")
-        .clone();
-    for runtime in &mut projected_runtimes {
-        runtime
-            .as_object_mut()
-            .expect("ObservedRuntimeStatus serializes as an object")
-            .remove("conditions");
-    }
-    let residue = source
-        .remove("residue")
-        .expect("NodeObservation always serializes residue");
-
-    let mut projection = Map::new();
-    for key in [
-        "version",
-        "node_id",
-        "node_boot_id",
-        "agent_instance_id",
-        "agent_session_epoch",
-        "inventory_epoch",
-    ] {
-        projection.insert(
-            key.to_owned(),
-            source
-                .remove(key)
-                .expect("NodeObservation projection field always serializes"),
-        );
-    }
-    projection.insert("inventory_read_position".to_owned(), read_position);
-    projection.insert("runtimes".to_owned(), Value::Array(projected_runtimes));
-    projection.insert("residue".to_owned(), residue);
-    let projected_digest = digest_value(INVENTORY_DOMAIN, &Value::Object(projection));
-    debug_assert_eq!(projected_digest, digest);
-    Ok(projected_digest)
-}
-
-/// Returns the exact canonical JSON wire size of a typed Node observation.
-///
-/// This is a size-only preflight: callers must still use
-/// [`super::wire::encode_node_observation`] to validate and encode observations
-/// that fit the wire budget.
-pub fn node_observation_canonical_wire_size(
-    observation: &NodeObservation,
-) -> Result<usize, ContractError> {
-    let value = as_value(observation, ContractName::NodeObservation)?;
-    Ok(value_bytes(&value).len())
 }
 
 /// Computes the digest for one atomically loaded key-ring version.
@@ -216,62 +100,6 @@ pub fn canonical_ed25519_spki_sha256(public_key_spki: &Base64UrlNoPad) -> Option
     Some(Sha256Digest::from_bytes(Sha256::digest(der).into()))
 }
 
-pub(crate) fn unchecked_spec_digest(spec: &DesiredRuntimeSpec) -> Sha256Digest {
-    let mut value = serde_json::to_value(spec).expect("typed contracts are serializable");
-    value
-        .as_object_mut()
-        .expect("DesiredRuntimeSpec serializes as an object")
-        .remove("spec_digest");
-    digest_value(SPEC_DOMAIN, &value)
-}
-
-pub(crate) fn unchecked_inventory_digest(observation: &NodeObservation) -> Sha256Digest {
-    let mut source = serde_json::to_value(observation).expect("typed contracts are serializable");
-    let source = source
-        .as_object_mut()
-        .expect("NodeObservation serializes as an object");
-    let mut projection = Map::new();
-    for key in [
-        "version",
-        "node_id",
-        "node_boot_id",
-        "agent_instance_id",
-        "agent_session_epoch",
-        "inventory_epoch",
-        "inventory_read_position",
-        "runtimes",
-        "residue",
-    ] {
-        let mut value = source
-            .remove(key)
-            .expect("NodeObservation projection field always serializes");
-        if key == "runtimes" {
-            for runtime in value
-                .as_array_mut()
-                .expect("NodeObservation.runtimes serializes as an array")
-            {
-                runtime
-                    .as_object_mut()
-                    .expect("ObservedRuntimeStatus serializes as an object")
-                    .remove("conditions");
-            }
-        }
-        projection.insert(key.to_owned(), value);
-    }
-    digest_value(INVENTORY_DOMAIN, &Value::Object(projection))
-}
-
-pub(crate) fn unchecked_key_ring_digest(version: Epoch, kids: &[KeyId]) -> Sha256Digest {
-    digest_value(
-        KEY_RING_DOMAIN,
-        &serde_json::json!({
-            "version": ContractVersion::V1,
-            "key_ring_version": version,
-            "loaded_kids": kids,
-        }),
-    )
-}
-
 fn as_value<T: Serialize>(value: &T, contract: ContractName) -> Result<Value, ContractError> {
     serde_json::to_value(value).map_err(|_| invalid(contract, ""))
 }
@@ -301,7 +129,13 @@ fn digest_bytes(domain: &[u8], canonical: &[u8]) -> Sha256Digest {
     Sha256Digest::from_bytes(hasher.finalize().into())
 }
 
-pub(crate) fn value_bytes(value: &Value) -> Vec<u8> {
+/// Encode one JSON value in the repository's canonical form: object keys are
+/// ordered by their UTF-8 bytes, insignificant whitespace is absent, and
+/// strings use the minimal fixed escaping rules below.
+///
+/// Persistence journals use this same primitive as public wire codecs so a
+/// restart can reject semantically equivalent but byte-different documents.
+pub fn value_bytes(value: &Value) -> Vec<u8> {
     let mut canonical = Vec::new();
     write_value(value, &mut canonical);
     canonical

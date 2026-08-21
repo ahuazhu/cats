@@ -8,16 +8,25 @@ use std::fs::{self, File};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use cats_api::runtime_lifecycle::{
+    DiskRole, PlacementIdentity, RuntimeVolumeConfig, RuntimeVolumeGuestBinding,
+};
+use cats_api::runtime_lifecycle_volume::{
+    LifecycleCommandStartVolumeGrantReceipt, LifecycleStartVolumeGrantAuthority,
+    LifecycleVolumeCommandScope,
+};
+use cats_api::runtime_reconciliation::WireU64;
 use cats_api::runtime_reconciliation::{
     AsciiText, Epoch, FenceEpoch, Generation, Id, NormalAcquireRequest, NormalAcquireResult,
-    RandomId128, RemoteHead, Revision, Sha256Digest,
+    RandomId128, RemoteHead, Sha256Digest, VolumeTransitionSource,
 };
 use cats_storage::authority::{
-    AttachmentLineageIdentity, AuthorityError, AuthorizedServingAcquire,
+    authorized_serving_attachment_from_start_volume_grant, AuthorityError,
     AuthorizedServingAttachment, LastVolumeTransition, RenewLeaseRequest, RenewLeaseResult,
     UnixMillis, VolumeAdminState, VolumeDataAuthority, VolumeDurability, VolumeHeadCasRequest,
     VolumeHeadCasResult, VolumeRecord,
 };
+use cats_storage::lifecycle_volume::command_start_volume_grant_receipt_digest_from_closed_receipt;
 use rusqlite::{params, Connection, OptionalExtension};
 
 const TEST_LEASE_EXPIRY: u64 = 8_000_000_000_000_000_000;
@@ -55,7 +64,8 @@ pub struct SqliteTestVolumeGrant {
     pub lease_duration_ms: u64,
     pub durability: VolumeDurability,
     pub node_id: Id,
-    pub desired_revision: Revision,
+    pub operation_id: Id,
+    pub request_fingerprint: Sha256Digest,
     pub placement_epoch: Epoch,
 }
 
@@ -75,7 +85,8 @@ impl SqliteTestVolumeGrant {
             lease_duration_ms,
             durability,
             node_id: Id::new("node_test").expect("constant Node ID is canonical"),
-            desired_revision: Revision::new(1).expect("one is a Revision"),
+            operation_id: Id::new("operation_test").expect("constant Operation ID is canonical"),
+            request_fingerprint: Sha256Digest::from_bytes([1; 32]),
             placement_epoch: Epoch::new(1).expect("one is an Epoch"),
         }
     }
@@ -113,7 +124,6 @@ impl SqliteTestVolumeAuthority {
             transition_id: transition_id.clone(),
             attachment_id: grant.attachment_id.clone(),
             expected_unowned_epoch: previous_epoch,
-            desired_revision: grant.desired_revision,
             placement_epoch: grant.placement_epoch,
             lease_duration_ms: grant.lease_duration_ms,
         };
@@ -135,33 +145,40 @@ impl SqliteTestVolumeAuthority {
     }
 
     pub fn authorized_attachment(&self) -> AuthorizedServingAttachment {
-        AuthorizedServingAttachment {
-            identity: AttachmentLineageIdentity {
-                volume_id: self.grant.volume_id.clone(),
-                attachment_id: self.grant.attachment_id.clone(),
-                attachment_epoch: self.grant.attachment_epoch,
-                acquire_origin: cats_storage::authority::AcquireOrigin::Normal {
-                    transition_id: self.request.transition_id.clone(),
-                },
+        let current = self
+            .load_volume(&self.grant.volume_id)
+            .expect("installed test Volume is readable");
+        let grant = LifecycleCommandStartVolumeGrantReceipt {
+            scope: LifecycleVolumeCommandScope {
+                operation_id: self.grant.operation_id.clone(),
+                request_fingerprint: self.grant.request_fingerprint.clone(),
+                cat_id: Id::new("cat_test").expect("constant Cat ID is canonical"),
                 node_id: self.grant.node_id.clone(),
-                placement_epoch: self.grant.placement_epoch,
+                placement_identity: PlacementIdentity {
+                    node_id: self.grant.node_id.clone(),
+                    placement_epoch: self.grant.placement_epoch,
+                },
             },
-            object_write_credential: None,
-            size_bytes: self
-                .load_volume(&self.grant.volume_id)
-                .expect("installed test Volume is readable")
-                .size_bytes,
-            durability: self.grant.durability,
-            head: self
-                .load_volume(&self.grant.volume_id)
-                .expect("installed test Volume is readable")
-                .head,
-            lease_expires_at: self.result.lease_expires_at,
-            acquire: AuthorizedServingAcquire::Normal {
+            grant_sequence: WireU64::new(0).expect("zero is a grant sequence"),
+            volume: RuntimeVolumeConfig {
+                volume_id: self.grant.volume_id.clone(),
+                disk_id: Id::new("disk_test").expect("constant Disk ID is canonical"),
+                disk_role: DiskRole::Root,
+                size_bytes: current.size_bytes,
+                durability: self.grant.durability,
+                guest_device_serial: Id::new("root-boot").expect("constant serial is canonical"),
+                guest_device_slot: 0,
+                guest_binding: RuntimeVolumeGuestBinding::RootBoot,
+            },
+            authority: LifecycleStartVolumeGrantAuthority::NormalAcquire {
                 request: self.request.clone(),
                 result: self.result.clone(),
             },
-        }
+        };
+        let digest = command_start_volume_grant_receipt_digest_from_closed_receipt(&grant)
+            .expect("test Start grant is closed");
+        authorized_serving_attachment_from_start_volume_grant(&grant, &digest, None)
+            .expect("test Start grant converts to a serving attachment")
     }
 }
 
@@ -216,6 +233,10 @@ impl VolumeDataAuthority for SqliteTestVolumeAuthority {
             })
             .transpose()?;
         record.last_transition = Some(LastVolumeTransition::NormalAcquire {
+            source: VolumeTransitionSource::Lifecycle {
+                operation_id: self.grant.operation_id.clone(),
+                request_fingerprint: self.grant.request_fingerprint.clone(),
+            },
             request: self.request.clone(),
             result: self.result.clone(),
         });

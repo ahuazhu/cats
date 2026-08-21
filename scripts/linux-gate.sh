@@ -324,6 +324,17 @@ docker_cli() {
   docker_cli_operation interruptible "$@"
 }
 
+report_docker_capture_failure() {
+  if [[ -s "$LINUX_DOCKER_STDOUT" ]]; then
+    echo "==> captured Docker stdout" >&2
+    cat "$LINUX_DOCKER_STDOUT" >&2
+  fi
+  if [[ -s "$LINUX_DOCKER_STDERR" ]]; then
+    echo "==> captured Docker stderr" >&2
+    cat "$LINUX_DOCKER_STDERR" >&2
+  fi
+}
+
 docker_create_cli() {
   local resource_kind="$1"
   local expected_name="$2"
@@ -575,18 +586,31 @@ trap 'linux_gate_signal 143' TERM
 
 main() {
   local attempt
-  local expected_focused_test="runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart: test"
+  local blockd_installed=false
+  local collected_failures=""
+  local collected_status=0
+  local expected_node_privileged_inventory="$LINUX_CAPTURE_DIR/node-privileged.expected"
   local expected_root_control_inventory="$LINUX_CAPTURE_DIR/root-control.expected"
   local image_inspection=""
   local iidfile_expected=""
   local iidfile_expected_lf=""
   local listed_test=""
-  local listed_test_count=0
-  local listed_test_mismatch=false
+  local observed_node_privileged_inventory="$LINUX_CAPTURE_DIR/node-privileged.observed"
   local observed_root_control_inventory="$LINUX_CAPTURE_DIR/root-control.observed"
   local observed=""
+  local node_privileged_inventory_ready=false
+  local root_control_inventory_ready=false
   local status=0
   local systemd_ready=false
+  local workspace_gate_status=0
+
+  collect_gate_failure() {
+    local label="$1"
+    local failure_status="$2"
+    collected_status=1
+    collected_failures="$collected_failures $label(exit=$failure_status)"
+    echo "==> Linux quality stage failed: $label (exit $failure_status)" >&2
+  }
 
   command -v docker >/dev/null 2>&1 || {
     echo "docker is required for the Linux quality gate" >&2
@@ -624,18 +648,59 @@ main() {
     -v cats-cargo-registry:/usr/local/cargo/registry \
     -v "$LINUX_TARGET_VOLUME:/target" \
     rust:1.97.1-bookworm \
-    sh -c 'apt-get update -qq &&
-           apt-get install -qy --no-install-recommends e2fsprogs jq zstd &&
-           rustup component add clippy rustfmt &&
-           ./scripts/quality.sh skills &&
-           cargo fmt --all -- --check &&
-           cargo check --workspace --all-targets --locked --target-dir "$CATS_LINUX_TARGET_DIRECTORY" &&
-           cargo build --workspace --locked --target-dir "$CATS_LINUX_TARGET_DIRECTORY" &&
-           cargo clippy --workspace --all-targets --locked --target-dir "$CATS_LINUX_TARGET_DIRECTORY" -- -D warnings &&
-           cargo test --workspace --locked --target-dir "$CATS_LINUX_TARGET_DIRECTORY" -- --test-threads=4 &&
-           RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked --target-dir "$CATS_LINUX_TARGET_DIRECTORY"' \
-    && docker_cli inherit 72000 start --attach "$LINUX_WORKSPACE_GATE"; then
-    :
+    sh -ceu 'if ! apt-get update -qq \
+             || ! apt-get install -qy --no-install-recommends e2fsprogs jq zstd \
+             || ! rustup component add clippy rustfmt; then
+             exit 125
+           fi
+           linux_status=0
+           linux_build_ready=false
+           linux_failures=""
+           run_linux_stage() {
+             stage_name="$1"
+             shift
+             if "$@"; then
+               if [ "$stage_name" = build ]; then
+                 linux_build_ready=true
+               fi
+               echo "==> Linux quality stage passed: $stage_name"
+             else
+               stage_status=$?
+               linux_status=1
+               linux_failures="$linux_failures $stage_name(exit=$stage_status)"
+               echo "==> Linux quality stage failed: $stage_name (exit $stage_status)" >&2
+             fi
+           }
+           run_linux_stage skills ./scripts/quality.sh skills
+           run_linux_stage fmt cargo fmt --all -- --check
+           run_linux_stage check cargo check --workspace --all-targets --locked --keep-going --target-dir "$CATS_LINUX_TARGET_DIRECTORY"
+           run_linux_stage build cargo build --workspace --locked --keep-going --target-dir "$CATS_LINUX_TARGET_DIRECTORY"
+           run_linux_stage clippy cargo clippy --workspace --all-targets --locked --target-dir "$CATS_LINUX_TARGET_DIRECTORY" -- -D warnings
+           run_linux_stage tests cargo test --workspace --locked --no-fail-fast --target-dir "$CATS_LINUX_TARGET_DIRECTORY" -- --test-threads=4
+           run_linux_stage rustdoc env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked --target-dir "$CATS_LINUX_TARGET_DIRECTORY"
+           if [ "$linux_status" -ne 0 ]; then
+             echo "==> Linux quality stage failures:$linux_failures" >&2
+           fi
+           if [ "$linux_build_ready" != true ]; then
+             exit 2
+           fi
+           exit "$linux_status"' \
+    ; then
+    if docker_cli inherit 72000 start --attach "$LINUX_WORKSPACE_GATE"; then
+      :
+    else
+      workspace_gate_status=$?
+      if [[ "$workspace_gate_status" -eq 1 ]]; then
+        # The workspace process reserves exit 1 for collected independent
+        # failures after a successful current-source build. Preserve that
+        # failure for the final summary while still exercising the privileged
+        # groups against those exact artifacts. Exit 2 or setup failures do
+        # not prove a usable build and therefore stop dependent execution.
+        collect_gate_failure workspace "$workspace_gate_status"
+      else
+        status="$workspace_gate_status"
+      fi
+    fi
   else
     status=$?
   fi
@@ -683,11 +748,12 @@ main() {
       fi
     else
       status=$?
+      report_docker_capture_failure
     fi
   fi
 
-  # Privilege is confined to this owner-labeled container and one exact,
-  # ignored test. Its source bind is read-only, while the target volume reuses
+  # Privilege is confined to this owner-labeled container and exact ignored
+  # inventories. Its source bind is read-only, while the target volume reuses
   # the workspace gate's already-built Linux artifacts. Create and start stay
   # separate so an interrupted start has no late-create authority.
   if [[ "$status" -eq 0 ]]; then
@@ -863,7 +929,7 @@ main() {
         cleanup_fixture'; then
       :
     else
-      status=$?
+      collect_gate_failure systemd-topology "$?"
     fi
   fi
   if [[ "$status" -eq 0 ]]; then
@@ -878,12 +944,12 @@ main() {
         test -x "$target_binary"
         test ! -L "$target_binary"
         cmp -s "$source_binary" "$target_binary"' sh "$LINUX_TARGET_DIRECTORY"; then
-      :
+      blockd_installed=true
     else
-      status=$?
+      collect_gate_failure blockd-install "$?"
     fi
   fi
-  if [[ "$status" -eq 0 ]]; then
+  if [[ "$status" -eq 0 && "$blockd_installed" == true ]]; then
     # These real-binary tests intentionally exercise the installed
     # /run/cats/blockd-v1 namespace. The native qualification builder and the
     # workspace-wide Linux container are unprivileged, so keep the tests
@@ -910,67 +976,84 @@ main() {
       done <"$LINUX_DOCKER_STDOUT"
       if ! cmp -s "$expected_root_control_inventory" "$observed_root_control_inventory"; then
         echo "privileged blockd root-control test inventory was not the exact known positive" >&2
-        status=1
+        collect_gate_failure root-control-inventory 1
+      else
+        root_control_inventory_ready=true
       fi
     else
-      status=$?
+      workspace_gate_status=$?
+      report_docker_capture_failure
+      collect_gate_failure root-control-inventory "$workspace_gate_status"
     fi
   fi
-  if [[ "$status" -eq 0 ]]; then
+  if [[ "$status" -eq 0 && "$root_control_inventory_ready" == true ]]; then
     if docker_cli inherit 12600 exec "$LINUX_SYSTEMD_GATE" \
       timeout --signal=TERM --kill-after=30s 20m \
-      cargo test -p cats-blockd-daemon --test root_provision_control --locked \
+      cargo test -p cats-blockd-daemon --test root_provision_control --locked --no-fail-fast \
         --target-dir "$LINUX_TARGET_DIRECTORY" \
         -- --ignored --test-threads=1 --nocapture; then
       :
     else
-      status=$?
+      collect_gate_failure root-control-tests "$?"
     fi
   fi
   if [[ "$status" -eq 0 ]]; then
-    # Rust's exact test filter exits successfully even when it selects zero
-    # tests. Calibrate this probe before trusting the focused run: exactly one
-    # listed test entry must exist, and it must be the intended ignored E2E.
+    # Rust's test filter exits successfully even when it selects zero tests.
+    # Calibrate the privileged Node probe against the exact current physical
+    # network inventory before trusting the run. These tests need a private
+    # network namespace, CAP_NET_ADMIN and /dev/net/tun; the unprivileged
+    # workspace container intentionally cannot execute them.
     # The fresh systemd image may initialize Rust components before Cargo can
-    # reuse the workspace target, so give this compile-capable probe the same
-    # bounded execution window as the focused test itself.
+    # reuse the workspace target, so both inventory and execution are bounded.
+    printf '%s\n' \
+      'ch::tests::real_linux_pending_tap_rejects_name_replacement_at_every_configuration_boundary: test' \
+      'ch::tests::real_linux_scoped_tap_is_published_and_exact_in_a_private_network_namespace: test' \
+      | LC_ALL=C sort >"$expected_node_privileged_inventory"
     if docker_cli capture 12600 exec "$LINUX_SYSTEMD_GATE" \
       timeout --signal=TERM --kill-after=30s 20m \
-      cargo test -p cats-node-agent --lib --locked \
+      cargo test -p cats-node-agent --lib --all-features --locked \
         --target-dir "$LINUX_TARGET_DIRECTORY" \
-        runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart \
-        -- --ignored --exact --list; then
+        ch::tests::real_linux_ \
+        -- --ignored --list; then
+      : >"$observed_node_privileged_inventory"
       while IFS= read -r listed_test; do
         case "$listed_test" in
-          *": test")
-            listed_test_count=$((listed_test_count + 1))
-            if [[ "$listed_test" != "$expected_focused_test" ]]; then
-              listed_test_mismatch=true
-            fi
-            ;;
+          *": test") printf '%s\n' "$listed_test" >>"$observed_node_privileged_inventory" ;;
         esac
       done <"$LINUX_DOCKER_STDOUT"
-      if [[ "$listed_test_count" -ne 1 || "$listed_test_mismatch" == true ]]; then
-        echo "focused Linux Runtime E2E test inventory was not the exact known positive" >&2
-        status=1
+      LC_ALL=C sort -o "$observed_node_privileged_inventory" \
+        "$observed_node_privileged_inventory"
+      if ! cmp -s "$expected_node_privileged_inventory" \
+        "$observed_node_privileged_inventory"; then
+        echo "privileged Node test inventory was not the exact known positive" >&2
+        report_docker_capture_failure
+        collect_gate_failure node-privileged-inventory 1
+      else
+        node_privileged_inventory_ready=true
       fi
     else
-      status=$?
+      workspace_gate_status=$?
+      report_docker_capture_failure
+      collect_gate_failure node-privileged-inventory "$workspace_gate_status"
     fi
   fi
-  if [[ "$status" -eq 0 ]]; then
+  if [[ "$status" -eq 0 && "$node_privileged_inventory_ready" == true ]]; then
     if docker_cli inherit 12600 exec "$LINUX_SYSTEMD_GATE" \
       timeout --signal=TERM --kill-after=30s 20m \
-      cargo test -p cats-node-agent --lib --locked \
+      cargo test -p cats-node-agent --lib --all-features --locked --no-fail-fast \
         --target-dir "$LINUX_TARGET_DIRECTORY" \
-        runtime_cutover::cross_component_e2e::postgres_control_and_production_cutover_adopts_serving_relaxed_pending_pack_across_restart \
-        -- --ignored --exact --nocapture; then
+        ch::tests::real_linux_ \
+        -- --ignored --test-threads=1 --nocapture; then
       :
     else
-      status=$?
+      collect_gate_failure node-privileged-tests "$?"
     fi
   fi
 
+  if [[ "$status" -eq 0 && "$collected_status" -ne 0 ]]; then
+    echo "==> Linux quality stage failures:$collected_failures" >&2
+    status="$collected_status"
+  fi
   return "$status"
 }
 

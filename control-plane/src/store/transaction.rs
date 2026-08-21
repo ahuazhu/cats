@@ -302,45 +302,6 @@ impl AuthorityRequestContext {
     }
 
     #[cfg(test)]
-    pub(crate) fn pause_before_commit_claim_for_test(
-        &self,
-        entered: Arc<std::sync::Barrier>,
-        release: Arc<std::sync::Barrier>,
-    ) {
-        *self
-            .before_commit_claim
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(CommitClaimBarrier { entered, release });
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pause_after_commit_claim_for_test(
-        &self,
-        entered: Arc<std::sync::Barrier>,
-        release: Arc<std::sync::Barrier>,
-    ) {
-        *self
-            .after_commit_claim
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(CommitClaimBarrier { entered, release });
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pause_before_definite_commit_reset_for_test(
-        &self,
-        entered: Arc<std::sync::Barrier>,
-        release: Arc<std::sync::Barrier>,
-    ) {
-        *self
-            .before_definite_commit_reset
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(CommitClaimBarrier { entered, release });
-    }
-
-    #[cfg(test)]
     fn wait_at_commit_barrier(&self, barrier: &std::sync::Mutex<Option<CommitClaimBarrier>>) {
         let barrier = barrier
             .lock()
@@ -1140,11 +1101,6 @@ fn retry_delay(attempt: usize) -> Duration {
     let jitter = RETRY_JITTER_SEQUENCE.fetch_add(1, Ordering::Relaxed) % 5;
     let base = u64::try_from(attempt + 1).unwrap_or(1) * 3;
     Duration::from_millis(base + jitter)
-}
-
-#[cfg(test)]
-pub(super) const fn authority_transaction_attempts() -> usize {
-    AUTHORITY_TRANSACTION_ATTEMPTS
 }
 
 #[cfg(test)]

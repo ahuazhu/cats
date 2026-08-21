@@ -29,7 +29,7 @@ pub const PRODUCTION_QUALIFICATION_PRODUCT_INVENTORY_PATH: &str =
     "/v1/admin/production/qualification-product-inventory-discoveries";
 pub const PRODUCTION_MUTATION_ADMISSION_REQUEST_MAX_WIRE_BYTES: usize = 65_536;
 pub const PRODUCTION_MUTATION_ADMISSION_RESPONSE_MAX_WIRE_BYTES: usize = 131_072;
-pub const PRODUCTION_MUTATION_ADMISSION_SCHEMA_VERSION: u64 = 16;
+pub const PRODUCTION_MUTATION_ADMISSION_SCHEMA_VERSION: u64 = 17;
 pub const PRODUCTION_MUTATION_ADMISSION_METHOD: &str = "POST";
 pub const PRODUCTION_CUTOVER_CREDENTIAL_ID_HEADER: &str = "cats-production-cutover-credential-id";
 pub const PRODUCTION_CUTOVER_SIGNATURE_HEADER: &str = "cats-production-cutover-signature";
@@ -443,10 +443,10 @@ pub struct ProductionQualificationProductInventoryCounts {
     pub persistent_disk_count: WireU64,
     pub disk_snapshot_count: WireU64,
     pub endpoint_count: WireU64,
-    pub hostname_desired_lookup_count: WireU64,
-    pub pending_runtime_operation_count: WireU64,
+    pub hostname_endpoint_lookup_count: WireU64,
+    pub unresolved_lifecycle_operation_count: WireU64,
     pub deleted_cat_tombstone_count: WireU64,
-    pub terminal_runtime_operation_history_count: WireU64,
+    pub terminal_lifecycle_operation_history_count: WireU64,
     pub api_idempotency_receipt_count: WireU64,
 }
 
@@ -1032,8 +1032,8 @@ fn validate_qualification_product_inventory_receipt(
         receipt.counts.persistent_disk_count,
         receipt.counts.disk_snapshot_count,
         receipt.counts.endpoint_count,
-        receipt.counts.hostname_desired_lookup_count,
-        receipt.counts.pending_runtime_operation_count,
+        receipt.counts.hostname_endpoint_lookup_count,
+        receipt.counts.unresolved_lifecycle_operation_count,
     ];
     let expected_total = current_counts
         .into_iter()
@@ -1167,7 +1167,8 @@ mod tests {
             deployment_id: Id::new("deployment_a").unwrap(),
             release_id: Id::new("release_a").unwrap(),
             source_commit_sha: "a".repeat(40),
-            control_schema_version: WireU64::new(16).unwrap(),
+            control_schema_version: WireU64::new(PRODUCTION_MUTATION_ADMISSION_SCHEMA_VERSION)
+                .unwrap(),
             source_manifest_sha256: digest('0'),
             source_bundle_sha256: digest('1'),
             release_manifest_sha256: digest('2'),
@@ -1193,7 +1194,8 @@ mod tests {
             deployment_id: Id::new("deployment_a").unwrap(),
             release_id: Id::new("release_a").unwrap(),
             source_commit_sha: "a".repeat(40),
-            control_schema_version: WireU64::new(16).unwrap(),
+            control_schema_version: WireU64::new(PRODUCTION_MUTATION_ADMISSION_SCHEMA_VERSION)
+                .unwrap(),
             source_manifest_sha256: digest('0'),
             source_bundle_sha256: digest('1'),
             build_receipt_sha256: digest('2'),
@@ -1394,10 +1396,10 @@ mod tests {
             persistent_disk_count: WireU64::new(2).unwrap(),
             disk_snapshot_count: WireU64::new(1).unwrap(),
             endpoint_count: WireU64::new(1).unwrap(),
-            hostname_desired_lookup_count: WireU64::new(1).unwrap(),
-            pending_runtime_operation_count: WireU64::new(1).unwrap(),
+            hostname_endpoint_lookup_count: WireU64::new(1).unwrap(),
+            unresolved_lifecycle_operation_count: WireU64::new(1).unwrap(),
             deleted_cat_tombstone_count: WireU64::new(3).unwrap(),
-            terminal_runtime_operation_history_count: WireU64::new(4).unwrap(),
+            terminal_lifecycle_operation_history_count: WireU64::new(4).unwrap(),
             api_idempotency_receipt_count: WireU64::new(5).unwrap(),
         };
         let receipt = ProductionQualificationProductInventoryReceipt {

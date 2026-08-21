@@ -18,8 +18,8 @@ open:
    Closed.
 
 These are explicit `DEFERRED` inputs, not operator-discretion checks. A
-successful E13 run, an E3 `usage-final-terminal-receipt` qualification case, an empty stream, an
-operator-written digest or `enable_public_ingress=false` does not satisfy them. Do not patch,
+successful E13 run, any receipt from the retired E3 harness, an empty stream, an operator-written
+digest or `enable_public_ingress=false` does not satisfy them. Do not patch,
 replace or bypass the reset binary. Consequently this runbook has two explicit stages. The
 currently executable closed-candidate stage is:
 
@@ -27,13 +27,14 @@ currently executable closed-candidate stage is:
 - enter maintenance and retain the old namespace;
 - create a fresh Control schema and fresh ChunkStore prefix, while reusing the explicitly reviewed
   current Usage schema/stream/table/archive for this no-user candidate;
-- provision cordoned Nodes, run E12 and E3, and retain all evidence;
+- provision cordoned Nodes, run E12, and retain its evidence;
 - stop after the final gates with ingress Closed and Nodes cordoned.
 
 The second stage begins with final Usage closure/fresh targets and reset. Destructive retirement,
 mutation opening, Node uncordon, public ingress and creation of new product resources remain held.
 The reset blocker is repeated at that phase so it cannot be missed when operators follow the
-document sequentially. It does not prevent the closed first deployment or its internal E3 test.
+document sequentially. It does not prevent the closed first deployment, but the missing atomic
+runtime-path qualification prevents Stage B.
 
 ## Fixed notation and safety rules
 
@@ -50,7 +51,7 @@ absolute, private locations and must be created outside the checkout:
 - `/approved/release/<FINAL_RELEASE_SHA>/` — exact immutable release artifacts.
 
 Prepare the dedicated operator execution Host with the release-bound verification toolchain before
-any phase that consumes it (E3 qualification and the reset proof set):
+any phase that consumes it (future atomic runtime qualification and the reset proof set):
 `sudo deploy/aws/install-operator-tools.sh --bundle /approved/release/<FINAL_RELEASE_SHA>/cats-worker.tar.zst --bundle-sha256 <WORKER_BUNDLE_SHA256> --trust-file /approved/cutover/<CUTOVER_ID>/production-cutover-operator-trust.v1.json`
 installs exactly `/opt/cats/bin/cats`, both usage verifiers and
 `/etc/cats/production-cutover-operator-trust.v1.json`; it never installs a worker unit, VMM, Guest
@@ -84,11 +85,8 @@ this runbook.
 ## Stage A — closed candidate and internal qualification (executable)
 
 This stage ends after phase 8. Normal product mutation remains Closed. Public ingress remains
-disabled and all Nodes remain cordoned except for each explicitly approved, bounded E3
-qualification window in phase 7: that window makes exactly one qualification Node schedulable and
-opens ingress only long enough to exercise its run-bound Endpoint. The saved close plan and exact
-A23 re-cordon apply run after either success or failure; Stage A cannot finish in the temporary
-state.
+disabled and all Nodes remain cordoned. Phase 7 records the missing atomic runtime-path
+qualification as deferred; it authorizes no temporary schedulable or ingress-open window.
 
 ## 0. Freeze and qualify the exact release before the window
 
@@ -507,7 +505,7 @@ deploy/aws/run-postgres-probe.sh \
 ```
 
 The schema query must return exactly `15`. Starting Gateway here does not open public ingress;
-E12 and E3 still require every Node-local lifecycle/route gate Closed.
+E12 and the future atomic qualifier still require every Node-local lifecycle/route gate Closed.
 
 For each Host, prepare/export its Host-local identity while the Node service is stopped:
 
@@ -635,330 +633,22 @@ Node from `--expected-node`.
 
 <!-- cutover-stage: 60-e3-runtime-path -->
 
-## 7. E3: qualify create → Running → durable I/O → route → restart → usage → delete
+## 7. Atomic runtime-path qualification is not yet installed
 
-This is an isolated qualification on already-provisioned metal; it is not a public production Cat.
-The placement planner has no cordoned bypass, so each invocation temporarily makes exactly its
-named qualification Node schedulable through an ordinary A23 policy revision. The public HTTP/WS
-case likewise uses one operator-approved qualification-ingress window; no private Gateway bypass
-or second route is introduced. The repo-owned E3
-scenario driver is an input to the orchestrator and must be tracked, executable and byte-identical
-to `<FINAL_RELEASE_SHA>`. If `<FINAL_RELEASE_SCENARIO_DRIVER>` is absent from the final release,
-record `DEFERRED(E3_SCENARIO_DRIVER)` and stop.
+The RuntimeCheckpoint-era E3 probe, scenario runner and checked-in qualification catalog are
+not members of this clean-slate release. They must not be copied into the worker bundle,
+installed on a Node, invoked from this runbook, or used as production evidence.
 
-**Assert first.** E12 is green; build receipt and release manifest bind the same SHA; the release
-manifest digest was independently approved; and
-`/opt/cats/release/worker-installation-receipt.v1.json` is the root-owned, single-link receipt from
-the exact worker installation. Its worker bundle and member set must match the approved manifest.
-Every binary, config, non-secret coordinate and key fingerprint below is explicit; each output
-directory is absolute and does not yet exist. The control token is one root-owned mode-0600 file
-passed by path, never argv content or manifest data. Before either invocation, while every Node is
-still cordoned, save and review `qualification-ingress-open.tfplan`; it must change only
-`enable_public_ingress=false -> true`. Also save and review the complete
-`qualification-ingress-close.tfvars` with that one value fixed false and every other input
-byte-identical. Bind the persistent window journal, install the early cleanup guard below, durably
-mark the open effect initiated, and only then apply the open plan. Immediately plan against the now-open live state and save and review
-`qualification-ingress-close.tfplan`. It must only remove or close qualification ingress. A close
-plan made against the earlier Closed state is invalid.
-Retain `terraform show -json` for both plans; pass those two JSON files as the required runner
-configs. Run both block paths against the same release and scenario oracle.
-
-Install the EXIT/INT/TERM guard before the ingress-open effect. Until the saved close plan is
-reviewed, it uses only the pre-approved false tfvars and exact targeted resource set below, and
-rejects every non-no-op managed change outside that set before apply. Approval atomically switches
-the guard to the saved close plan. Then apply the reviewed full A23 policy that changes only the
-exact qualification Node from `cordoned` to `schedulable`, using its exact current revision, and run
-E3. Capture the runner status without exiting the operator shell. Whether the runner returns 0, 78 or any failure,
-cleanup first exact-re-cordons the Node, then applies the saved ingress-close plan, then reruns the
-exact E12 fleet verifier. If the schedulable apply response is ambiguous, cleanup first replays that
-same durable CLI request to a terminal result before it submits the exact next-revision re-cordon.
-Failure of one cleanup action must not suppress the later actions; all three must be attempted and
-all three must succeed. INT/TERM received during cleanup is latched rather than starting recursive
-cleanup: each effect runs at most once, remaining effects continue, and the first cleanup error wins
-over the pending 130/143 status; otherwise that pending signal status is returned exactly:
-
-```sh
-set -euo pipefail
-test "$(git rev-parse HEAD)" = <FINAL_RELEASE_SHA>
-test "$(git hash-object deploy/metal/runtime-cutover-e3-window.sh)" = \
-  "$(git rev-parse <FINAL_RELEASE_SHA>:deploy/metal/runtime-cutover-e3-window.sh)"
-test "$(git hash-object deploy/metal/runtime-cutover-ingress-close-plan.sh)" = \
-  "$(git rev-parse <FINAL_RELEASE_SHA>:deploy/metal/runtime-cutover-ingress-close-plan.sh)"
-. deploy/metal/runtime-cutover-e3-window.sh
-install -d -m 0700 /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-e3-window-state
-cats_e3_window_bind \
-  /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-e3-window-state \
-  <CUTOVER_ID>-<BLOCK_PATH>-e3-window
-
-cats_e3_window_emergency_close() {
-  terraform -chdir=deploy/aws/terraform/stacks/production-application plan \
-    -input=false \
-    -var-file=/approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-close.tfvars \
-    -target=module.cats_kubernetes.kubernetes_namespace_v1.cats \
-    -target=module.cats_kubernetes.kubernetes_manifest.ingress_class_params \
-    -target=module.cats_kubernetes.kubernetes_ingress_class_v1.public \
-    -target=module.cats_kubernetes.kubernetes_ingress_v1.public \
-    -target=aws_route53_record.public \
-    -out=/approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-emergency-close.tfplan || return
-  terraform -chdir=deploy/aws/terraform/stacks/production-application show \
-    -json /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-emergency-close.tfplan \
-    > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-qualification-ingress-emergency-close-plan.json || return
-  deploy/metal/runtime-cutover-ingress-close-plan.sh \
-    /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-qualification-ingress-emergency-close-plan.json || return
-  terraform -chdir=deploy/aws/terraform/stacks/production-application apply \
-    -input=false /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-emergency-close.tfplan \
-    > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-qualification-ingress-emergency-close-apply.txt
-}
-
-cats_e3_window_saved_close() {
-  terraform -chdir=deploy/aws/terraform/stacks/production-application apply \
-    -input=false /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-close.tfplan \
-    > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-qualification-ingress-close-apply.txt
-}
-
-cats_e3_window_run_e12() {
-  /approved/staged-worker/cats \
-    --api-url <FRESH_PRIVATE_CONTROL_ORIGIN> --json \
-    admin fleet-verify \
-    --expected-node <NODE_1_ID> \
-    --expected-node <NODE_2_ID> \
-    --key-ring /approved/secrets/<CUTOVER_ID>/route-v2-r1/node/public-key-ring.v1.json \
-    --release-commit <FINAL_RELEASE_SHA> \
-    --timeout-seconds 600 \
-    --poll-interval-ms 1000 \
-    > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-post-cleanup-fleet-verification.v1.json
-}
-
-<VERIFY_EXACT_FALSE_TFVARS_APPROVAL_RECEIPT>
-cats_e3_window_install_guard
-cats_e3_window_mark_open_initiated
-terraform -chdir=deploy/aws/terraform/stacks/production-application apply \
-  -input=false /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-open.tfplan \
-  > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-qualification-ingress-open-apply.txt
-
-terraform -chdir=deploy/aws/terraform/stacks/production-application plan \
-  -input=false \
-  -var-file=/approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-close.tfvars \
-  -out=/approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-close.tfplan
-
-terraform -chdir=deploy/aws/terraform/stacks/production-application show \
-  -json /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-qualification-ingress-close.tfplan \
-  > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-qualification-ingress-close-plan.json
-
-# Review the JSON now. It must only remove/close qualification ingress. Do not
-# continue until that assertion has an operator approval receipt.
-<VERIFY_EXACT_CLOSE_PLAN_APPROVAL_RECEIPT>
-cats_e3_window_use_saved_close
-
-apply_schedulable_policy() {
-  /approved/staged-worker/cats \
-    --api-url <FRESH_PRIVATE_CONTROL_ORIGIN> --json \
-    admin runtime-node policy apply \
-    --node <QUALIFICATION_NODE_ID> \
-    --expected-revision <EXACT_CURRENT_CORDONED_POLICY_REVISION> \
-    --file /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-schedulable-policy.v1.json \
-    --deployment-id <FRESH_DEPLOYMENT_ID> \
-    --provisioner-credential-id <FRESH_PROVISIONER_CREDENTIAL_ID> \
-    --provisioner-private-key-file /approved/secrets/<CUTOVER_ID>/runtime-provisioner-key.pem
-}
-
-cats_e3_window_apply_schedulable_policy() {
-  apply_schedulable_policy \
-    > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-schedulable-replay-result.v1.json
-}
-
-cats_e3_window_exact_re_cordon() {
-  /approved/staged-worker/cats \
-    --api-url <FRESH_PRIVATE_CONTROL_ORIGIN> --json \
-    admin runtime-node policy apply \
-    --node <QUALIFICATION_NODE_ID> \
-    --expected-revision <EXACT_SCHEDULABLE_POLICY_REVISION> \
-    --file /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-re-cordoned-policy.v1.json \
-    --deployment-id <FRESH_DEPLOYMENT_ID> \
-    --provisioner-credential-id <FRESH_PROVISIONER_CREDENTIAL_ID> \
-    --provisioner-private-key-file /approved/secrets/<CUTOVER_ID>/runtime-provisioner-key.pem \
-    > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-re-cordoned-result.v1.json || return
-  jq -e --arg node <QUALIFICATION_NODE_ID> --argjson revision <EXACT_RE_CORDONED_POLICY_REVISION> \
-    '.version == 1 and .node_id == $node and .outcome == "policy_updated"
-     and .identity_state == "provisioned" and .policy_revision == $revision' \
-    /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-re-cordoned-result.v1.json || return
-  jq -e --arg node <QUALIFICATION_NODE_ID> --argjson revision <EXACT_RE_CORDONED_POLICY_REVISION> \
-    '.version == 1 and .node_id == $node and .policy_revision == $revision
-     and .scheduling_state == "cordoned"' \
-    /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-re-cordoned-policy.v1.json
-}
-
-cats_e3_window_mark_qualification_initiated
-set +e
-apply_schedulable_policy \
-  > /approved/evidence/<CUTOVER_ID>/70-<BLOCK_PATH>-schedulable-result.v1.json
-schedulable_apply_status=$?
-set -e
-if [ "$schedulable_apply_status" -ne 0 ]; then
-  exit "$schedulable_apply_status"
-fi
-cats_e3_window_mark_qualification_terminal
-
-set +e
-deploy/metal/runtime-cutover-e2e.sh <THE_MATCHING_FULL_INVOCATION_BELOW>
-e3_status=$?
-cleanup_status=0
-cats_e3_window_finish || cleanup_status=$?
-set -e
-
-if [ "$cleanup_status" -ne 0 ]; then
-  exit "$cleanup_status"
-fi
-
-case "$e3_status" in 0|78) ;; *) exit "$e3_status" ;; esac
-```
-
-The early guard is live before `cats_e3_window_mark_open_initiated`, which itself durably records
-open intent before the open effect, so an ambiguous open response also takes the emergency close
-path. The saved-plan switch is one journaled transition after approval; every earlier failure
-remains on the targeted emergency close. Clear the guard only after exact re-cordon, ingress-close
-and post-cleanup E12 results all exist. E12 proves empty/session/full-inventory/ring, while the
-latest A23 result and full policy independently prove exact re-cordon.
-Do not continue to the other block path if ingress-close, A23 re-cordon or E12 fails.
-
-**Crash recovery for the operator window.** Every window transition and every one-shot cleanup
-effect above is journaled into the mode-0700 state directory as no-overwrite mode-0600 marker
-files (same-directory 0600 temporary, fsync, no-replace link, directory fsync), and the live
-operator shell holds the journal's flock for its lifetime, so a second shell cannot adopt a held
-window. If the operator shell is SIGKILLed or the Host is lost at any point after
-`cats_e3_window_bind`, open a fresh shell, repeat the hash assertions and `source` line above,
-redefine the same five effect functions, then run:
-
-```sh
-cats_e3_window_adopt /approved/cutover/<CUTOVER_ID>/<BLOCK_PATH>-e3-window-state
-```
-
-Adoption recovers `ingress_open_initiated`, the close mode, the qualification transition and every
-cleanup-effect record, prints the recovered state plus the allowed next actions, and fails closed —
-missing binding, unknown or non-canonical marker, orphan temporary from an interrupted publish,
-mode/ownership violation or a completion record without its attempted record all refuse adoption
-and demand manual inspection; nothing is guessed. After a successful adopt, run
-`cats_e3_window_install_guard` and either resume the mainline exactly where the journal stopped or
-run `cats_e3_window_finish` to drive the remaining cleanup ladder. The attempted marker is written
-before each effect runs, so an attempted record without a completion record means the outcome is
-unknown: cleanup reports that effect as ambiguous and never reruns it. Discover the physical
-postcondition manually (A23 policy revision, live ingress state, E12 evidence), record it with
-`cats_e3_window_resolve_effect <replay|re-cordon|ingress-close|e12> <exit-status>`, then run
-`cats_e3_window_finish` again. Marker existence is the at-most-once authority: no shell, original
-or adopted, repeats an already-attempted effect.
-
-**Command — kernel NBD:**
-
-```sh
-deploy/metal/runtime-cutover-e2e.sh \
-  --exact-commit <FINAL_RELEASE_SHA> \
-  --block-path kernel-nbd \
-  --run-id <CUTOVER_ID>-kernel-nbd \
-  --output-dir /approved/evidence/<CUTOVER_ID>/70-metal-kernel-nbd \
-  --build-receipt /approved/evidence/<CUTOVER_ID>/00-release/<BUILD_RECEIPT>.json \
-  --release-manifest /approved/release/<FINAL_RELEASE_SHA>/release-manifest.v1.json \
-  --release-manifest-sha256 sha256:<INDEPENDENTLY_APPROVED_RELEASE_MANIFEST_SHA256> \
-  --installer-receipt /opt/cats/release/worker-installation-receipt.v1.json \
-  --token-file /approved/secrets/<CUTOVER_ID>/e3-control-token \
-  --control-origin <FRESH_PRIVATE_CONTROL_ORIGIN> \
-  --workspace-id <QUALIFICATION_WORKSPACE_ID> \
-  --expected-node <KERNEL_NBD_QUALIFICATION_NODE_ID> \
-  --qualification-node <KERNEL_NBD_QUALIFICATION_NODE_ID> \
-  --cat-name <KERNEL_NBD_QUALIFICATION_CAT_NAME> \
-  --boot-image-digest sha256:<QUALIFIED_BOOT_IMAGE_DIGEST> \
-  --endpoint-name <QUALIFICATION_ENDPOINT_NAME> \
-  --endpoint-hostname <QUALIFICATION_ENDPOINT_HOSTNAME> \
-  --guest-kernel <QUALIFIED_GUEST_KERNEL_RELEASE> \
-  --binary <LABEL>=<ABSOLUTE_BINARY_PATH> \
-  --config route-key-ring=<ABSOLUTE_ROUTE_KEY_RING_PATH> \
-  --config qualification-ingress-open-plan=/approved/evidence/<CUTOVER_ID>/70-kernel-nbd-qualification-ingress-open-plan.json \
-  --config qualification-ingress-close-plan=/approved/evidence/<CUTOVER_ID>/70-kernel-nbd-qualification-ingress-close-plan.json \
-  --key-fingerprint <LABEL>=sha256:<PUBLIC_KEY_FINGERPRINT> \
-  --scenario-driver <FINAL_RELEASE_SCENARIO_DRIVER>
-```
-
-**Command — native vhost-user-blk:**
-
-```sh
-deploy/metal/runtime-cutover-e2e.sh \
-  --exact-commit <FINAL_RELEASE_SHA> \
-  --block-path vhost-user \
-  --run-id <CUTOVER_ID>-vhost-user \
-  --output-dir /approved/evidence/<CUTOVER_ID>/70-metal-vhost-user \
-  --build-receipt /approved/evidence/<CUTOVER_ID>/00-release/<BUILD_RECEIPT>.json \
-  --release-manifest /approved/release/<FINAL_RELEASE_SHA>/release-manifest.v1.json \
-  --release-manifest-sha256 sha256:<INDEPENDENTLY_APPROVED_RELEASE_MANIFEST_SHA256> \
-  --installer-receipt /opt/cats/release/worker-installation-receipt.v1.json \
-  --token-file /approved/secrets/<CUTOVER_ID>/e3-control-token \
-  --control-origin <FRESH_PRIVATE_CONTROL_ORIGIN> \
-  --workspace-id <QUALIFICATION_WORKSPACE_ID> \
-  --expected-node <VHOST_USER_QUALIFICATION_NODE_ID> \
-  --qualification-node <VHOST_USER_QUALIFICATION_NODE_ID> \
-  --cat-name <VHOST_USER_QUALIFICATION_CAT_NAME> \
-  --boot-image-digest sha256:<QUALIFIED_BOOT_IMAGE_DIGEST> \
-  --endpoint-name <QUALIFICATION_ENDPOINT_NAME> \
-  --endpoint-hostname <QUALIFICATION_ENDPOINT_HOSTNAME> \
-  --guest-kernel <QUALIFIED_GUEST_KERNEL_RELEASE> \
-  --binary <LABEL>=<ABSOLUTE_BINARY_PATH> \
-  --config route-key-ring=<ABSOLUTE_ROUTE_KEY_RING_PATH> \
-  --config qualification-ingress-open-plan=/approved/evidence/<CUTOVER_ID>/70-vhost-user-qualification-ingress-open-plan.json \
-  --config qualification-ingress-close-plan=/approved/evidence/<CUTOVER_ID>/70-vhost-user-qualification-ingress-close-plan.json \
-  --key-fingerprint <LABEL>=sha256:<PUBLIC_KEY_FINGERPRINT> \
-  --scenario-driver <FINAL_RELEASE_SCENARIO_DRIVER>
-```
-
-Repeat `--expected-node`, `--binary`, additional `--config` and `--key-fingerprint` for the complete
-reviewed fleet/input set. No `CATS_TOKEN` or `CATS_E3_*` ambient value is an input: the runner clears
-them and reconstructs the scenario environment from these arguments. Binary
-digests and installed paths are not caller assertions: the runner derives them from
-`.artifacts.worker.members` and the installer receipt, copies every input to a private stable stage,
-and re-hashes the original inputs at the end. The explicit binaries include the installed
-`cats-noded`, `cats`, `cats-runtime-e3-probe`, `cats-e3-guest-workload`, and the receipt-recorded
-`curl`, `systemctl`, `journalctl` and GNU `timeout`; focused test binaries are not live prerequisites.
-
-There are exactly nine ordered cases. In the current release, seven pass and two return the typed
-exit 78: V5 is `DEFERRED(V5_PERSISTENT_DISK_ATTACH_MUTATION)` and E9 lacks its accepted terminal
-archive/projector receipt. Assert this honest blocked result for each output directory:
-
-```sh
-sha256sum -c /approved/evidence/<CUTOVER_ID>/70-metal-kernel-nbd/SHA256SUMS
-jq -e '.state == "blocked" and .exact_commit == "<FINAL_RELEASE_SHA>" and .block_path == "kernel-nbd" and .exit_code == 78' \
-  /approved/evidence/<CUTOVER_ID>/70-metal-kernel-nbd/manifest.json
-jq -e -s 'map(.case_id) == ["control-startup-schema","node-registration-full-inventory","cat-create-running","durable-write-flush","route-http-ws","agent-restart-adoption","volume-init-matrix","usage-final-terminal-receipt","delete-cleanup"] and ([.[] | select(.status == "passed")] | length) == 7 and (.[] | select(.case_id == "volume-init-matrix") | .status == "blocked" and .run_exit_code == 78) and (.[] | select(.case_id == "usage-final-terminal-receipt") | .status == "blocked" and .run_exit_code == 78) and all(.[]; .cleanup_exit_code == 0 and .evidence_exit_code == 0)' \
-  /approved/evidence/<CUTOVER_ID>/70-metal-kernel-nbd/scenario-results.jsonl
-
-sha256sum -c /approved/evidence/<CUTOVER_ID>/70-metal-vhost-user/SHA256SUMS
-jq -e '.state == "blocked" and .exact_commit == "<FINAL_RELEASE_SHA>" and .block_path == "vhost-user" and .exit_code == 78' \
-  /approved/evidence/<CUTOVER_ID>/70-metal-vhost-user/manifest.json
-jq -e -s 'map(.case_id) == ["control-startup-schema","node-registration-full-inventory","cat-create-running","durable-write-flush","route-http-ws","agent-restart-adoption","volume-init-matrix","usage-final-terminal-receipt","delete-cleanup"] and ([.[] | select(.status == "passed")] | length) == 7 and (.[] | select(.case_id == "volume-init-matrix") | .status == "blocked" and .run_exit_code == 78) and (.[] | select(.case_id == "usage-final-terminal-receipt") | .status == "blocked" and .run_exit_code == 78) and all(.[]; .cleanup_exit_code == 0 and .evidence_exit_code == 0)' \
-  /approved/evidence/<CUTOVER_ID>/70-metal-vhost-user/scenario-results.jsonl
-```
-
-After V5 is implemented, the only acceptable intermediate shape is eight passed cases plus the same
-typed E9 block. Neither the current seven-plus-two shape nor that future eight-plus-one shape opens
-Stage B: keep the fleet cordoned until all nine pass, the manifest is `passed`, and exit code is zero.
-The fixed sequence otherwise proves create and stable Running, Guest write plus successful
-FLUSH/sync, public Gateway HTTP and WebSocket, an exact `cats-worker.service` restart with changed
-AgentSession and fresh session-bound full inventory, post-restart Guest and route/gate evidence,
-durable usage delivery, and exact delete cleanup.
-
-**Retain.** For each block path retain the schedulable result and any exact replay result, exact
-re-cordon result, any emergency close plan/JSON/apply transcript, saved ingress-close apply
-transcript, post-cleanup E12 result, `manifest.json`,
-`scenario-results.jsonl`, bounded journal, `final-inventory.json`, `exit-code` and `SHA256SUMS`
-through the append-only evidence boundary.
-
-**Cancel point.** A failed case still runs bounded diagnostics and cleanup, then exits nonzero.
-The operator trap must restore ingress Closed, exact-re-cordon the qualification Node and rerun E12
-before diagnosis. Preserve the entire output directory; do not skip a case, edit JSONL or reuse an
-existing output directory.
-
+Keep every Node cordoned and record `DEFERRED(ATOMIC_RUNTIME_PATH_QUALIFICATION)` here. A future
+qualification command must be designed against the atomic lifecycle command journal, installed
+manifests and full physical inventory, then accepted as its own release-bound contract. Until
+that command and its calibrated evidence verifier exist, do not proceed to Stage B.
 <!-- cutover-stage: 70-final-gates -->
 
-## 8. Recheck final full, Linux and metal gates
+## 8. Recheck final full and Linux gates
 
 **Assert first.** No source or artifact changed after the receipts above. Any change creates a new
-final SHA and invalidates E12/E3; it is not a same-window patch.
+final SHA and invalidates E12 and every future qualification receipt; it is not a same-window patch.
 
 **Command:**
 
@@ -978,9 +668,6 @@ cats-run-build \
 
 cats-publish-content-addressed evidence \
   /srv/cats-build/target/<FINAL_RELEASE_SHA>-<SOURCE_MANIFEST_SHA256>-<SOURCE_BUNDLE_SHA256>/<FINAL_QUALIFICATION_JOB_ID>/output/quality-full.log
-
-sha256sum -c /approved/evidence/<CUTOVER_ID>/70-metal-kernel-nbd/SHA256SUMS
-sha256sum -c /approved/evidence/<CUTOVER_ID>/70-metal-vhost-user/SHA256SUMS
 ```
 
 Take `<FINAL_QUALIFICATION_JOB_ID>` only from this successful final native build receipt, then
@@ -988,10 +675,11 @@ publish its frozen log before retaining the final publication receipt. Do not re
 job ID or its earlier green receipt.
 
 The Docker Linux command is an iteration/compatibility signal, not a substitute for the native
-x86_64 Linux `full` receipt. The two metal manifests remain the real KVM qualification.
+x86_64 Linux `full` receipt. Neither receipt substitutes for the deferred real-KVM atomic runtime
+qualification.
 
-**Retain.** Both local provenance-bearing logs, the final native Linux build receipt/publication
-receipt and revalidated metal checksum results under `80-final-gates/`.
+**Retain.** Both local provenance-bearing logs and the final native Linux build
+receipt/publication receipt under `80-final-gates/`.
 
 **Cancel point.** Any gate failure returns to a new release SHA and repeats the sequence from phase
 0. Keep maintenance, ingress and Nodes Closed; do not carry old green evidence across the change.
@@ -1000,18 +688,19 @@ receipt and revalidated metal checksum results under `80-final-gates/`.
 
 Stage A may remain running as a closed candidate while this stage is blocked. It cannot serve
 public users or become schedulable. Stage B requires accepted E13/reset consumption, the accepted
-E9 final usage epoch/barrier, accepted cross-component Closed-admission proof and a disjoint fresh
-Usage schema/stream/table/archive. The exact provisioning input for that final fresh Usage boundary
-is currently `DEFERRED(FINAL_FRESH_USAGE_TARGETS)`; do not infer it from the reused candidate target
-or create it with an unreviewed command.
+atomic runtime-path qualification, the accepted E9 final usage epoch/barrier, accepted
+cross-component Closed-admission proof and a disjoint fresh Usage schema/stream/table/archive. The
+exact provisioning input for that final fresh Usage boundary is currently
+`DEFERRED(FINAL_FRESH_USAGE_TARGETS)`; do not infer it from the reused candidate target or create it
+with an unreviewed command.
 
 <!-- cutover-stage: 80-reset-read-only -->
 
 ## 9. Build and review the exact reset plan; dry-run only
 
 **Assert first.** This phase is not reachable while Stage A reuses the current Usage target. First
-provide the disjoint final fresh Usage target and accepted proof inputs above. Then require E12/E3/
-final gates green and make the post-green document follow the exact schema in
+provide the disjoint final fresh Usage target and accepted proof inputs above. Then require E12,
+the accepted atomic runtime qualification, and final gates green, and make the post-green document follow the exact schema in
 [`production-clean-slate-reset.md`](../deploy/aws/production-clean-slate-reset.md). It binds the same
 release, artifact, reset ID, fresh targets and qualification digest and is at most 900 seconds old.
 Its `old_writers` fields remain declarations until an accepted consumer says otherwise.
@@ -1193,7 +882,7 @@ Immediately re-discover the exact planned Closed revision and signed-command lif
 forward-only `mutation-admission-open-finalizing` marker, then settle the one exact Open command as
 the final external effect and publish `open-complete`. Before the marker, failure closes Ingress and
 re-cordons every possibly schedulable Node; after it, cancellation or ambiguity only exact-forward
-settles Open and never EmergencyClose. Do not reuse the E3 qualification Cat, any retired ID,
+settles Open and never EmergencyClose. Do not reuse any qualification Cat, retired ID,
 credential, SPKI, schema, prefix, stream or table.
 
 **Retain.** Independent final-reset verification, mutation-open receipt, every schedulable policy
@@ -1206,15 +895,16 @@ command to `open-complete`; do not compensate with ad hoc Ingress, Node or admis
 ## Operator sign-off checklist
 
 - One final SHA and release manifest bind all binaries, configs, Guest payload and receipts.
-- Maintenance is a reviewed Terraform transition; the only pre-reset ingress exception is each
-  bounded E3 window, whose Node is exact-re-cordoned before its saved close plan is applied and E12
-  is repeated.
+- Maintenance is a reviewed Terraform transition; there is no pre-reset ingress exception while
+  the atomic runtime-path qualifier remains deferred.
 - Stage A uses a fresh Control schema and ChunkStore prefix but the reviewed current Usage target;
   Stage B requires a disjoint final fresh Usage target.
 - A23 initial policies are cordoned; E12 proves the exact empty/session/full-inventory/ring facts,
   while each latest signed A23 result plus its exact full policy proves the Node is re-cordoned.
-- Both E3 block paths report all nine cases with checksum-valid seven-pass/two-typed-block evidence.
-- Local/full, compatibility Linux, native x86_64 Linux and real metal evidence are retained.
+- Atomic runtime-path qualification is `DEFERRED(ATOMIC_RUNTIME_PATH_QUALIFICATION)`; Stage B is not
+  reachable until a release-bound replacement is accepted and green.
+- Local/full, compatibility Linux and native x86_64 Linux evidence are retained; the replacement
+  atomic qualifier must define and retain its own real-metal evidence.
 - Reset planning begins only in Stage B and repeats every exact target; production execute remains
   blocked today.
 - No uncordon, mutation/public opening or new product resource occurs before verified final reset.

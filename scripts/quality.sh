@@ -129,7 +129,7 @@ print_source_provenance() {
 
 run_fmt() {
   echo "==> cargo fmt"
-  cargo fmt --all -- --check
+  cargo fmt --all -- --check || return 1
 }
 
 run_skills() {
@@ -181,7 +181,7 @@ run_skills() {
 
 run_release_images() {
   echo "==> release Dockerfile targets"
-  python3 scripts/check-release-dockerfiles.py
+  python3 scripts/check-release-dockerfiles.py || return 1
 }
 
 require_tool_version() {
@@ -212,19 +212,21 @@ run_deps() {
   require_tool_version \
     cargo-deny \
     "cargo-deny $CATS_CARGO_DENY_VERSION" \
-    "cargo install --locked cargo-deny --version $CATS_CARGO_DENY_VERSION"
+    "cargo install --locked cargo-deny --version $CATS_CARGO_DENY_VERSION" \
+    || return 1
   require_tool_version \
     cargo-machete \
     "$CATS_CARGO_MACHETE_VERSION" \
-    "cargo install --locked cargo-machete --version $CATS_CARGO_MACHETE_VERSION"
+    "cargo install --locked cargo-machete --version $CATS_CARGO_MACHETE_VERSION" \
+    || return 1
 
   echo "==> cargo deny"
-  cargo deny --locked check --hide-inclusion-graph
+  cargo deny --locked check --hide-inclusion-graph || return 1
 
   echo "==> cargo machete"
-  lock_before="$(cksum Cargo.lock)"
-  cargo machete --with-metadata
-  lock_after="$(cksum Cargo.lock)"
+  lock_before="$(cksum Cargo.lock)" || return 1
+  cargo machete --with-metadata || return 1
+  lock_after="$(cksum Cargo.lock)" || return 1
   [[ "$lock_before" == "$lock_after" ]] || {
     echo "cargo machete changed Cargo.lock; regenerate and commit the lockfile" >&2
     return 1
@@ -233,17 +235,17 @@ run_deps() {
 
 run_build() {
   echo "==> cargo build"
-  cargo build --workspace --locked
+  cargo build --workspace --locked || return 1
 }
 
 run_check() {
   echo "==> cargo check"
-  cargo check --workspace --all-targets --locked
+  cargo check --workspace --all-targets --locked || return 1
 }
 
 run_clippy() {
   echo "==> cargo clippy"
-  cargo clippy --workspace --all-targets --locked -- -D warnings
+  cargo clippy --workspace --all-targets --locked -- -D warnings || return 1
 }
 
 # The control store is PostgreSQL-only, and its tests refuse to run without a
@@ -260,7 +262,8 @@ with_test_postgres() {
   }
   local name="cats-test-pg-$$"
   docker run --rm -d --name "$name" \
-    -e POSTGRES_PASSWORD=cats -p 127.0.0.1:0:5432 postgres:16 >/dev/null
+    -e POSTGRES_PASSWORD=cats -p 127.0.0.1:0:5432 postgres:16 >/dev/null \
+    || return 1
   local status=0
   local port=""
   local i
@@ -284,32 +287,83 @@ with_test_postgres() {
 run_test() {
   prepare_native_test_process || return 1
   echo "==> cargo test"
-  with_test_postgres cargo test --workspace --locked -- --test-threads=4
+  with_test_postgres cargo test --workspace --locked --no-fail-fast -- --test-threads=4
 }
 
 run_doc() {
   echo "==> cargo doc"
-  RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+  RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked || return 1
+}
+
+QUALITY_FAILURES=()
+
+run_collected_stage() {
+  local label="$1"
+  local runner="$2"
+  local stage_status=0
+
+  if "$runner"; then
+    echo "==> quality stage passed: $label"
+  else
+    stage_status=$?
+    QUALITY_FAILURES+=("$label (exit $stage_status)")
+    echo "==> quality stage failed: $label (exit $stage_status)" >&2
+  fi
+
+  # A failed stage is recorded rather than returned so later independent
+  # gates still run. run_collected_gates returns the final aggregate status.
+  return 0
+}
+
+run_collected_gates() {
+  local label
+  local runner
+  local failure
+
+  QUALITY_FAILURES=()
+  while [[ "$#" -gt 0 ]]; do
+    [[ "$#" -ge 2 ]] || {
+      echo "quality gate collector received an incomplete stage" >&2
+      return 2
+    }
+    label="$1"
+    runner="$2"
+    shift 2
+    run_collected_stage "$label" "$runner"
+  done
+
+  if [[ "${#QUALITY_FAILURES[@]}" -eq 0 ]]; then
+    echo "==> all quality stages passed"
+    return 0
+  fi
+
+  echo "==> quality stage failures (${#QUALITY_FAILURES[@]}):" >&2
+  for failure in "${QUALITY_FAILURES[@]}"; do
+    echo "  - $failure" >&2
+  done
+  return 1
 }
 
 run_fast() {
-  run_fmt
-  run_skills
-  run_release_images
-  run_check
-  run_clippy
+  run_collected_gates \
+    fmt run_fmt \
+    skills run_skills \
+    release-images run_release_images \
+    check run_check \
+    clippy run_clippy
 }
 
 run_full() {
-  run_fmt
-  run_skills
-  run_release_images
-  run_deps
-  run_check
-  run_build
-  run_clippy
-  run_test
-  run_doc
+  run_collected_gates \
+    fmt run_fmt \
+    skills run_skills \
+    release-images run_release_images \
+    dependencies run_deps \
+    check run_check \
+    build run_build \
+    clippy run_clippy \
+    tests run_test \
+    rustdoc run_doc
 }
 
 run_linux() {

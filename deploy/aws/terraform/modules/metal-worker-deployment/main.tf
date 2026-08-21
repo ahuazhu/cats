@@ -215,8 +215,9 @@ locals {
     # unit/recovery helper covers a reboot. Only then may prepare expose a
     # candidate release identity. Prove physical idle immediately before the
     # masked stop.
-    metering_root="$(cats_worker_metering_root cats-worker)"
-    "$stage_path/require-idle-worker.sh" "$metering_root" "${var.install_root}/bin"
+    cgroup_v2_root="$(cats_worker_cgroup_v2_root)"
+    "$stage_path/require-idle-worker.sh" \
+      "$cgroup_v2_root" "${var.install_root}/bin" "${var.install_root}/bin/cloud-hypervisor"
     cats_gate_node_service cats-worker
     cats_worker_deployment_crash_probe after-mask-worker
 
@@ -264,8 +265,6 @@ locals {
     cats_worker_deployment_crash_probe after-install-cats-route-v2-node-r1-validator
     install -D -m 0755 "$stage_path/cats-vmm-launcher" "${var.install_root}/bin/cats-vmm-launcher"
     cats_worker_deployment_crash_probe after-install-cats-vmm-launcher
-    install -D -m 0755 "$stage_path/cats-runtime-e3-probe" "${var.install_root}/bin/cats-runtime-e3-probe"
-    cats_worker_deployment_crash_probe after-install-cats-runtime-e3-probe
     install -D -m 0755 "$stage_path/cats-usage-schema-v16-verifier" "${var.install_root}/bin/cats-usage-schema-v16-verifier"
     cats_worker_deployment_crash_probe after-install-cats-usage-schema-v16-verifier
     install -D -m 0755 "$stage_path/cats-usage-terminal-receipt-verifier" "${var.install_root}/bin/cats-usage-terminal-receipt-verifier"
@@ -401,7 +400,6 @@ member_names = (
     "cats-noded",
     "cats-route-v2-node-r1-validator",
     "cats-vmm-launcher",
-    "cats-runtime-e3-probe",
     "cats-usage-schema-v16-verifier",
     "cats-usage-terminal-receipt-verifier",
     "cats-blockd",
@@ -517,7 +515,7 @@ CATS_BASE_ENVIRONMENT
     fi
 
     environment_temp="$(mktemp /var/tmp/cats-worker-env.XXXXXX)"
-    awk -v metering_root="$metering_root" '
+    awk '
       NR == FNR {
         key = $0
         sub(/=.*/, "", key)
@@ -533,9 +531,6 @@ CATS_BASE_ENVIRONMENT
           # A rolling cutover must remove a bearer or listener override left
           # by an older release; the production unit passes literal 7444.
           next
-        } else if (key == "CATS_METERING_CGROUP_ROOT") {
-          print "CATS_METERING_CGROUP_ROOT=" metering_root
-          metering_found = 1
         } else if (key in replacement) {
           print replacement[key]
           replaced[key] = 1
@@ -549,9 +544,6 @@ CATS_BASE_ENVIRONMENT
           if (!(key in replaced)) {
             print replacement[key]
           }
-        }
-        if (!metering_found) {
-          print "CATS_METERING_CGROUP_ROOT=" metering_root
         }
       }
     ' "$runtime_overlay" "${var.worker_environment_file}" > "$environment_temp"
@@ -592,7 +584,9 @@ CATS_BASE_ENVIRONMENT
     release_transaction_active=0
     cats_worker_deployment_crash_probe after-release-commit
     echo "Route v2 Node artifact set installed from the scoped secret reference"
-    "${var.install_root}/bin/cats-noded" --help | grep -q -- "--metering-cgroup-root"
+    "${var.install_root}/bin/cats-noded" --help | grep -q -- "--runtime-cgroup-root"
+    ! "${var.install_root}/bin/cats-noded" --help | grep -q -- "--guest-agent-bin"
+    ! "${var.install_root}/bin/cats-noded" --help | grep -q -- "--metering-cgroup-root"
     # Secret version ${aws_secretsmanager_secret_version.worker_runtime.version_id}
   SCRIPT
 }

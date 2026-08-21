@@ -171,7 +171,7 @@ fn domain_digest(domain: &[u8], canonical: &[u8]) -> Sha256Digest {
 mod tests {
     use cats_api::runtime_reconciliation::{
         AsciiText, Epoch, FenceEpoch, Generation, Id, NodeBootId, ProviderScope, RandomId128,
-        RemoteHead, Revision, Sha256Digest, UnixMillis, VolumeDurability, WireU64,
+        RemoteHead, Sha256Digest, UnixMillis, VolumeDurability, WireU64,
     };
 
     use crate::authority::{
@@ -415,7 +415,6 @@ mod tests {
             transition_id: RandomId128::new("00000000000000000000000000000001").unwrap(),
             attachment_id: id("attachment-old"),
             expected_unowned_epoch: unowned.lease_epoch,
-            desired_revision: Revision::new(11).unwrap(),
             placement_epoch: Epoch::new(3).unwrap(),
             lease_duration_ms: 5_000,
         };
@@ -424,14 +423,19 @@ mod tests {
         let authorization = AuthorizationRecord {
             authorization: VolumeAuthorization::Takeover(VolumeTakeoverAuthorization {
                 authorization_id: authorization_id.clone(),
+                operation_id: id("operation-takeover-1"),
+                request_fingerprint: Sha256Digest::from_bytes([12; 32]),
                 authorized_node_id: id("node-new"),
                 host_fence_event_id: event.event_id.clone(),
+                interrupted_operation_id: id("operation-interrupted-1"),
+                host_lost_result_digest: Sha256Digest::from_bytes([13; 32]),
+                disk_id: id("disk-1"),
                 volume_id: owned.volume_id.clone(),
+                cat_id: id("cat-1"),
                 expected_attachment_id: owned.lease_owner.clone().unwrap(),
                 expected_epoch: owned.lease_epoch,
                 expected_head: owned.head.clone(),
                 new_attachment_id: id("attachment-new"),
-                desired_revision: Revision::new(12).unwrap(),
                 new_placement_epoch: Epoch::new(4).unwrap(),
                 lease_duration_ms: 6_000,
                 not_after: time(100),

@@ -15,7 +15,7 @@ usage: runtime-cutover-usage-terminal-finalize.sh \
   --release-manifest </absolute/release-manifest.json> \
   --release-manifest-sha256 <sha256:64hex> \
   --installer-receipt </absolute/installer-receipt.json> \
-  --qualification-catalog </absolute/runtime-cutover-e2e-catalog.v1.json> \
+  --qualification-catalog </absolute/qualification-catalog.v1.json> \
   --usage-terminal-targets </absolute/root-only/usage-terminal-targets.json> \
   --usage-terminal-targets-sha256 <sha256:64hex> \
   --token-file </absolute/root-only/control-token> \

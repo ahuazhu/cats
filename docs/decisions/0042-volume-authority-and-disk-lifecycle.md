@@ -1,9 +1,16 @@
 # ADR-0042：用一个条件状态机管理 Volume Authority 与磁盘生命周期
 
-- 状态：Accepted
+- 状态：Accepted；Desired/Observation lifecycle integration与RuntimeStopped authorization basis已由
+  [ADR-0056](0056-atomic-per-cat-runtime-lifecycle.md)取代，storage CAS/receipt state machine保留
 - 日期：2026-08-08
 - 规格：[Volume Authority 与磁盘生命周期](../specs/volume-authority.md)
-- Runtime transition transport：[Runtime Volume Transitions v1](../specs/runtime-volume-transitions-v1.md)
+- Current runtime transition transport：
+  [Atomic Runtime Lifecycle v1](../specs/atomic-runtime-lifecycle-v1.md)的command-scoped signed route；
+  pre-cutover Runtime Volume Transitions spec已删除
+
+> Atomic release以exact lifecycle Operation/request/result替代Desired/Observation输入；disposable Root的可达
+> Node arm绑定strong-Stop proof，HostFence arm只绑定event/interrupted Operation/HostLost digest。精确schema以
+> [Volume Authority §11.2](../specs/volume-authority.md#112-放弃本地-tail-的-disposable-root)为准。
 
 ## 背景
 
@@ -60,9 +67,9 @@ Control Store writer在同一PG trust/transaction域写完整immutable payload�
 ### 3. Node取得grant，blockd只采用grant
 
 Node在RuntimeCheckpoint记录normal acquire/release的typed request、takeover或disposable authorization ID，
-只经Runtime
-Volume Transitions signed mutation提交；authorization模糊结果只经绑定current Node/session与
-`authorized_node_id`的Control-signed exact evidence read解析，Node没有authorization/completion表SQL权限。
+本文原先只经Runtime Volume Transitions signed mutation/evidence read提交与解析；该pre-cutover spec、DTO、
+codec和route parser已删除。current atomic release只经command-scoped signed mutation提交，模糊结果只重放
+同一exact transition并读取immutable receipt；Node没有authorization/completion表SQL权限。
 然后Node把精确attachment/epoch交给blockd。release checkpoint还绑定完整物理
 target、full-inventory/Desired读取位置、唯一transition ID、generation和disposition；响应丢失
 只能重放同一request或采用精确的last-transition postcondition，不得从“当前是Unowned”

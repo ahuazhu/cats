@@ -1,13 +1,21 @@
 # ADR-0040：电平触发的 Runtime Reconciliation
 
-- 状态：Accepted
+- 状态：Accepted；lifecycle coordination、Desired-driven reconcile 与 observation-based Operation
+  settlement 已由 [ADR-0056](0056-atomic-per-cat-runtime-lifecycle.md) 取代
 - 日期：2026-08-08
 - 取代：ADR-0002 中的旧协调合同
 - 规格：[Runtime Reconciliation v1](../specs/runtime-reconciliation-v1.md)
-- Internal delivery/acceptance：[Runtime Inventory and Observation Spine v1](../specs/runtime-inventory-observation-v1.md)
-- Volume transition transport：[Runtime Volume Transitions v1](../specs/runtime-volume-transitions-v1.md)
+- 保留的inventory foundation：[Runtime Inventory and Telemetry v1](../specs/runtime-inventory-observation-v1.md)
+- Current Volume transition transport：
+  [Atomic Runtime Lifecycle v1](../specs/atomic-runtime-lifecycle-v1.md)的command-scoped signed route；
+  本ADR使用的pre-cutover Runtime Volume Transitions spec已删除
 - composition：[Runtime Composition Artifacts v1](../specs/runtime-composition-artifacts-v1.md)
 - placement policy：[ADR-0043](0043-provisioner-owned-runtime-placement-policy.md)
+
+> ADR-0056 只取代本文的 lifecycle intent/execution/settlement authority。本文的 provisioned
+> NodeIdentity、AgentSession、Host-global lock、complete inventory/attestation、HostFence ordering 与 Volume
+> Authority composition 继续有效；旧 Desired/reconcile/observation-settlement 不能作为 atomic release 的
+> fallback 或兼容路径。
 
 ## 背景
 
@@ -51,9 +59,10 @@ DesiredRuntimeSpec(revision, placement)
 
 Volume 的精确状态机由 [Volume Authority](../specs/volume-authority.md) 定义；Runtime 只编排
 它的窄acquire/publish/release/takeover/delete接口。Node到Control的acquire/release/disposable consume
-只使用[Runtime Volume Transitions v1](../specs/runtime-volume-transitions-v1.md)冻结的签名mutation边界和
-单一PostgreSQL transaction；authorization response-loss只使用同一规格的Control-signed exact evidence
-read。Node没有Control表的raw SQL权限，blockd不获得ownership mutation或authorization read能力。
+在本文被取代前使用pre-cutover Runtime Volume Transitions签名mutation/evidence read；该spec、DTO、codec、
+constant与route parser现已删除。current atomic release只使用
+[Atomic Runtime Lifecycle v1](../specs/atomic-runtime-lifecycle-v1.md)冻结的command-scoped signed mutation与
+immutable receipt replay；Node没有Control表的raw SQL权限，blockd不获得ownership mutation或authorization read能力。
 
 只有能把业务rows与结果在唯一Control PostgreSQL事务中原子提交的Workspace product mutation使用
 `ApiIdempotencyResult`；精确scope、request envelope、fingerprint和重放合同以

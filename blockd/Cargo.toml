@@ -6,7 +6,7 @@ rust-version.workspace = true
 publish = false
 
 [features]
-test-vhost-user-frontend = []
+test-vhost-user-frontend = ["vhost/vhost-user-frontend"]
 
 [dependencies]
 cats-api = { workspace = true }

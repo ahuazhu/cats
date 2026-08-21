@@ -107,7 +107,7 @@ PersistentDisk 是 RWO。所有 ownership 变化使用带 `transition_id` 和 ex
 - takeover只消费从Active `HostFenceEvent`派生的逐卷授权；计划handoff先release再normal acquire；
 - renew和Root CAS都携带精确owner/epoch，旧epoch永久fail closed。
 
-Node先执行lease transition并把精确grant写入checkpoint，再启动blockd。blockd只采用、renew和使用
+Node在atomic command内执行lease transition并把精确grant写入RuntimeCommandCheckpoint，再启动blockd。blockd只采用、renew和使用
 该grant，不自行acquire、takeover或增加epoch。本地data-dir和每个pending pack都绑定volume、
 attachment、epoch和acquire transition；新attachment不能发布旧lineage的`R < L`数据。
 
@@ -119,18 +119,19 @@ Metadata fencing只阻止旧写者发布Root，不能证明旧VMM已停止。跨
 
 - RootDisk与Cat同生命周期；PersistentDisk独立存在。PersistentDisk创建时预定ext4 UUID和一次性
   initialization token。Disk与Volume全局一对一，Root与同Workspace Cat一对一，PersistentDisk同时
-  最多被一个current完整Desired引用；product path只用immutable disk ID。Guest Agent格式化后必须再次
-  probe exact UUID并让blockd达到`R == L`；Control Store先锁current NodeIdentity、AgentSession/highest accepted head，
-  再逐字段匹配observation/checkpoint/owner/epoch/head后才写`Initialized`。正确UUID和mount path都Ready后，
-  Cat才可Running；session replacement或新observation与初始化竞争同一锁前缀。
-- Cat create在一个PG commit写Cat、current完整Desired、runtime Operation、唯一Root Disk、generation-zero/
+  最多被一个current CatRuntimeConfig引用；product path只用immutable disk ID。Guest Agent格式化后必须再次
+  probe exact UUID并让blockd达到`R == L`；Control Store锁current NodeIdentity/AgentSession/Start Operation/
+  Cat head/Volume/Disk/config，再逐字段匹配signed Guest/flush evidence、checkpoint、owner/epoch/head后写
+  Initialized，Observation不参与。正确UUID和mount path是RuntimeReady条件，route仍需separate Enable。
+- Cat create在一个PG commit写Cat/config、Genesis Start Operation、唯一Root Disk、generation-zero/
   Unowned Volume和exact API result。Root没有Persistent initialization状态或第二个Disk Operation。
 - PersistentDisk只能在Cat稳定Cold时加入或移出完整磁盘集合。DiskSnapshot和restore也只在
   Cold/unowned时执行。volume容量创建后不可变；需要其他容量时新建Disk并在Guest内复制数据。
-- 普通Stop/Cold、Warm和迁移对两类保留盘执行相同final drain。
+- Warm、Cold和迁移对两类保留盘执行final drain；Stop只保证Killed，不要求R=L/release。
 - Destroy唯一例外：Guest/VMM停止后，控制面明确列出的disposable RootDisk可以丢弃未发布tail；
-  但必须先消费绑定Deleted revision、delete ID、attachment、owner/epoch和stop/fence证据的精确
-  删除授权，把Volume原子置为Deleting并提高epoch，随后才删除该lineage。PersistentDisk仍必须
+  但必须先消费绑定Delete Operation/fingerprint、Node/Cat/placement、delete ID、attachment、owner/epoch/head、
+  disposition与Persistent completion的exact authorization；可达Node与HostFence使用closed不同proof arm。
+  Volume原子置为Deleting并提高epoch后才删除lineage。PersistentDisk仍必须
   `R == L`。未知、遗漏或冲突分类一律fail closed。
 - durability是每盘创建时确定的属性，不能在已有ACK语义上原地切换。
 
@@ -162,11 +163,10 @@ DiskSnapshot只在Cold/unowned时创建一条精确包含disk/volume/size/genera
 一个新的、单调递增generation；不支持clone或跨volume COW。
 
 Volume删除先进入`Deleting(delete_id)`并提高epoch，再清对象。普通卷要求Cold、`R == L`且owner
-为空；Root normal begin只允许同一delete ID的current-only路径：stable Cold Destroy同事务写
-Deleted/Operation/begin/API result，或current Deleted observation证明exact release、Unowned和`R == L`。
-直接Root Disk DELETE和live Cold direct delete均拒绝。disposable `R < L` Root可以消费精确删除
-授权从Owned直接进入Deleting；Active HostFence下任何仍Owned Root（最后R==L或L未知也包括）同样可授权，
-因为Node已无法release。release与derive用VolumeRecord锁后重验保证只有一条分支提交。lease TTL、控制面缺行或
+为空；Root只由current DeleteCat驱动：R=L时exact release后normal begin，default Root R<L时消费绑定
+Operation/fingerprint/Node/Cat/placement/attachment/epoch/head/disposition的exact authorization后从Owned直接进入
+Deleting。可达Node arm另绑定strong-Stop proof；HostFence arm只绑定event/interrupted Operation/HostLost digest，
+不伪造Stop。全部Persistent必须先R=L/release/detach。release与derive用VolumeRecord锁后重验保证只有一条分支提交。lease TTL、控制面缺行或
 本地目录缺失都不是删除证明。
 
 normal begin前必须停止blockd并join upload workers；HostFenceEvent必须由provider cutoff阻止旧Host发起新

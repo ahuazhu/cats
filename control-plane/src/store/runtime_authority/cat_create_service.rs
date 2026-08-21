@@ -14,30 +14,51 @@ use cats_api::cat_create::{
     CatCreateV2Request, CatCreateV2ValidationError, CAT_CREATE_V2_MAX_ROOT_SIZE_BYTES,
 };
 use cats_api::error::{ApiError, ErrorCode};
+use cats_api::production_mutation_admission::ProductionQualificationMutationClass;
+use cats_api::runtime_inventory::{encode_runtime_inventory_report, RuntimeInventoryBody};
+use cats_api::runtime_lifecycle::{
+    encode_immutable_runtime_config, encode_lifecycle_command_envelope,
+    DiskRole as LifecycleDiskRole, ImmutableRuntimeConfig, LifecycleCommand,
+    LifecycleCommandEnvelope, LifecyclePredecessor, PlacementIdentity, RuntimeNetworkConfig,
+    RuntimeVolumeAuthorityInput, RuntimeVolumeConfig, RuntimeVolumeGuestBinding, StartSource,
+    StartSpec, StartVolumeAuthority,
+};
 use cats_api::runtime_reconciliation::{
-    encode_admission_inventory_attestation, encode_agent_session, encode_desired_runtime_spec,
-    encode_node_identity, encode_node_observation, encode_node_placement_policy,
-    guest_config_digest, spec_digest, AppliedDesiredEvidence, AsciiText, AssignedKind,
-    AssignedPlacement, ContractVersion, DesiredRuntimeSpec, DiskKind, Durability, EndpointIntent,
-    Epoch, FenceEpoch, Generation, GuestDeviceIdentity, GuestRuntimeProfileReceipt, Hostname,
-    HttpProtocol, Id, NetworkConfig, NodeIdentityState, RandomId128, Revision, RuntimeConfig,
-    RuntimeSchedulingState, RuntimeTarget, RuntimeTransition, Sha256Digest, VolumeAccess,
-    VolumeAcquire, VolumeDisposition, VolumeIntent,
+    encode_agent_session, encode_node_identity, encode_node_placement_policy, guest_config_digest,
+    AsciiText, ContractVersion, Durability, Epoch, FenceEpoch, Generation,
+    GuestRuntimeProfileReceipt, Hostname, Id, NodeIdentityState, RandomId128,
+    RuntimeSchedulingState, Sha256Digest,
 };
 use cats_storage::authority::{RemoteHead, VolumeAdminState, VolumeDurability, VolumeRecord};
+use postgres::Transaction;
 use serde::Deserialize;
 
-use super::covered_commit::{CommitResolutionRegistry, CoveredCommitCancellation};
-use super::placement_planner::PlacementTargetSnapshot;
+use super::covered_commit::{
+    CommitResolutionRegistry, CoveredCommitCancellation, CoveredCommitState,
+};
+use super::lifecycle_commands::{
+    admit_lifecycle_command_in, LifecycleAdmissionRejection, LifecycleCommandAdmission,
+};
+use super::placement_planner::{
+    revalidate_cat_create_placement, runtime_network_id_exists, PlacementCommitLoad,
+    PlacementTargetSnapshot,
+};
 use super::product::{
     api_request_fingerprint, encode_cat_create_accepted_response,
-    encode_cat_name_conflict_response, ApiIdempotencyRequest, ApiIdempotencyResult,
-    CatCreateCandidate, CatCreateEnvelopes, CoveredCatCreateError, CoveredCatCreateRequest,
-    DiskAdminState, DiskRecordCandidate, DiskRole, EndpointRecordCandidate, ExactContentType,
-    ExactHttpResponse, HostnameDesiredLookup, IfMatchFingerprint,
+    encode_cat_name_conflict_response, lock_disk_name, ApiIdempotencyRequest, ApiIdempotencyResult,
+    CatRecord, DiskAdminState, DiskRecord, DiskRecordCandidate, DiskRole, EndpointRecord,
+    EndpointRecordCandidate, ExactContentType, IfMatchFingerprint,
 };
 use super::product_identity::ProductIdentitySource;
+use super::product_rows::{
+    insert_api_result, insert_disk, load_api_result_for_update, load_cat_by_name_unlocked,
+};
+use super::production_mutation_admission::require_production_product_mutation_admitted;
+use super::rows::{database_now, insert_volume};
 use super::runtime_spine::PLACEMENT_INVENTORY_MAX_AGE_MS;
+use crate::store::transaction::{
+    AuthorityExecutionError, AuthorityTransactionError, AuthorityTxResult,
+};
 use crate::store::{Result, Store};
 
 pub(crate) const CAT_CREATE_MAX_BODY_BYTES: usize = 4096;
@@ -251,11 +272,10 @@ pub(crate) struct CatCreatePlanRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CatCreatePlacementMutation {
     pub(crate) cat_id: Id,
-    pub(crate) desired_revision: Revision,
     pub(crate) placement_epoch: Epoch,
     pub(crate) vcpus: u32,
     pub(crate) memory_bytes: u64,
-    pub(crate) network_config: NetworkConfig,
+    pub(crate) network_config: RuntimeNetworkConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,10 +309,10 @@ pub(crate) trait CatCreatePlacementPlanner: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CatCreateIdentities {
     cat: RandomId128,
+    cat_creation: RandomId128,
     disk: RandomId128,
     volume: RandomId128,
-    attachment: RandomId128,
-    volume_intent: RandomId128,
+    config: RandomId128,
     operation: RandomId128,
     endpoint: RandomId128,
     network: RandomId128,
@@ -303,16 +323,41 @@ impl CatCreateIdentities {
     fn generate(source: &dyn ProductIdentitySource) -> Result<Self> {
         Ok(Self {
             cat: source.random_id()?,
+            cat_creation: source.random_id()?,
             disk: source.random_id()?,
             volume: source.random_id()?,
-            attachment: source.random_id()?,
-            volume_intent: source.random_id()?,
+            config: source.random_id()?,
             operation: source.random_id()?,
             endpoint: source.random_id()?,
             network: source.random_id()?,
             acquire_transition: source.random_id()?,
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AtomicCatCreateCandidate {
+    cat_id: Id,
+    cat_creation_id: Id,
+    workspace_id: Id,
+    name: Id,
+    root_disk: DiskRecordCandidate,
+    volume: VolumeRecord,
+    runtime_config: cats_api::runtime_lifecycle::ImmutableRuntimeConfig,
+    start_volume_authorities: Vec<cats_api::runtime_lifecycle::StartVolumeAuthority>,
+    endpoint: EndpointRecordCandidate,
+    hostname: Hostname,
+    operation_id: Id,
+    node_id: Id,
+    placement_epoch: Epoch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AtomicCatCreateRequest {
+    idempotency: ApiIdempotencyRequest,
+    candidate: AtomicCatCreateCandidate,
+    accepted_response_body: Vec<u8>,
+    name_conflict_response_body: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -359,6 +404,13 @@ enum CatCreateCommitOutcome {
     Committed(ApiIdempotencyResult),
     CandidateIdentityCollision,
     PlacementStale,
+}
+
+#[derive(Debug)]
+enum AtomicCatCreateError {
+    CandidateIdentityCollision,
+    PlacementStale,
+    Store(ApiError),
 }
 
 pub(crate) struct CatCreateService {
@@ -533,7 +585,7 @@ impl CatCreateService {
         tokio::spawn(async move {
             let execution_store = Arc::clone(&store);
             let execution = execution_store.execute(move |store| {
-                Ok(store.create_cat_covered_with_placement(
+                Ok(store.create_atomic_cat_covered_with_placement(
                     &covered,
                     &planned_target,
                     &planned_mutation,
@@ -555,20 +607,20 @@ impl CatCreateService {
             };
             let outcome = match execution_outcome {
                 Ok(Ok(result)) => Ok(CatCreateCommitOutcome::Committed(result)),
-                Ok(Err(CoveredCatCreateError::CandidateCollision(_))) => {
+                Ok(Err(AtomicCatCreateError::CandidateIdentityCollision)) => {
                     Ok(CatCreateCommitOutcome::CandidateIdentityCollision)
                 }
-                Ok(Err(CoveredCatCreateError::PlacementStale)) => {
+                Ok(Err(AtomicCatCreateError::PlacementStale)) => {
                     Ok(CatCreateCommitOutcome::PlacementStale)
                 }
-                Ok(Err(CoveredCatCreateError::Store(error))) | Err(error)
+                Ok(Err(AtomicCatCreateError::Store(error))) | Err(error)
                     if commit_observer.commit_was_sent() =>
                 {
                     resolve_cat_create_commit_loop(store, resolution_request, error)
                         .await
                         .map(CatCreateCommitOutcome::Committed)
                 }
-                Ok(Err(CoveredCatCreateError::Store(error))) | Err(error) => Err(error),
+                Ok(Err(AtomicCatCreateError::Store(error))) | Err(error) => Err(error),
             };
             let _ = result_tx.send(outcome);
             drop(active);
@@ -717,52 +769,52 @@ fn validate_plan_evidence(
     request: &CatCreatePlanRequest,
     active_guest_digest: &Sha256Digest,
 ) -> Result<()> {
-    let admission = &plan.target.admission;
     encode_node_placement_policy(&plan.target.policy)
         .map_err(|_| ApiError::internal("placement planner returned an invalid policy"))?;
-    encode_node_identity(&admission.node_identity)
+    encode_node_identity(&plan.target.node_identity)
         .map_err(|_| ApiError::internal("placement planner returned an invalid NodeIdentity"))?;
-    encode_agent_session(&admission.agent_session)
+    encode_agent_session(&plan.target.agent_session)
         .map_err(|_| ApiError::internal("placement planner returned an invalid AgentSession"))?;
-    encode_admission_inventory_attestation(&admission.inventory_attestation).map_err(|_| {
-        ApiError::internal("placement planner returned an invalid admission inventory attestation")
-    })?;
-    encode_node_observation(&admission.full_inventory_observation).map_err(|_| {
-        ApiError::internal("placement planner returned an invalid full inventory observation")
-    })?;
-    for desired in &admission.assigned_desired_specs {
-        encode_desired_runtime_spec(desired).map_err(|_| {
-            ApiError::internal("placement planner returned an invalid assigned Desired spec")
-        })?;
-    }
-    let observation = &admission.full_inventory_observation;
-    let attestation = &admission.inventory_attestation;
+    encode_runtime_inventory_report(&plan.target.full_inventory_report)
+        .map_err(|_| ApiError::internal("placement planner returned an invalid full inventory"))?;
+    let attestation = &plan.target.inventory_attestation;
+    let report = &plan.target.full_inventory_report;
+    let RuntimeInventoryBody::Full {
+        inventory_epoch,
+        scan_id,
+        inventory_digest,
+        ..
+    } = &report.inventory
+    else {
+        return Err(ApiError::internal(
+            "placement planner returned a Partial inventory",
+        ));
+    };
+    let session = plan.target.session_binding();
     if plan.mutation.cat_id != request.cat_id
-        || plan.mutation.desired_revision != Revision::new(1).expect("one is a valid Revision")
         || plan.mutation.placement_epoch != Epoch::new(1).expect("one is a valid Epoch")
         || plan.mutation.vcpus != request.vcpus
         || plan.mutation.memory_bytes != request.memory_bytes
-        || plan.mutation.network_config.network_id != request.network_id
-        || admission.node_identity.state != NodeIdentityState::Provisioned
-        || plan.target.policy.node_id != admission.node_identity.node_id
+        || runtime_network_id(&plan.mutation.network_config) != &request.network_id
+        || plan.target.node_identity.state != NodeIdentityState::Provisioned
+        || plan.target.policy.node_id != plan.target.node_identity.node_id
         || plan.target.policy.scheduling_state != RuntimeSchedulingState::Schedulable
         || plan.target.policy.capabilities.guest_config_digest != *active_guest_digest
         || plan.target.active_host_fence_event.is_some()
-        || admission.node_identity.node_id != admission.agent_session.node_id
-        || admission.node_identity.immutable_host_id != admission.agent_session.immutable_host_id
-        || admission.agent_session.node_id != attestation.node_id
-        || admission.agent_session.agent_session_epoch != attestation.agent_session_epoch
-        || admission.agent_session.guest_config_digest != *active_guest_digest
-        || admission.evaluated_at_unix_ms >= admission.agent_session.lease_deadline_unix_ms
-        || !observation.complete_inventory
-        || observation.node_id != admission.agent_session.node_id
-        || observation.node_boot_id != admission.agent_session.node_boot_id
-        || observation.agent_instance_id != admission.agent_session.agent_instance_id
-        || observation.agent_session_epoch != admission.agent_session.agent_session_epoch
-        || observation.inventory_epoch != attestation.inventory_epoch
-        || observation.inventory_digest.as_ref() != Some(&attestation.inventory_digest)
-        || observation.inventory_read_position != Some(attestation.inventory_read_position)
-        || attestation.accepted_at_unix_ms > admission.evaluated_at_unix_ms
+        || plan.target.node_identity.node_id != plan.target.agent_session.node_id
+        || plan.target.node_identity.immutable_host_id
+            != plan.target.agent_session.immutable_host_id
+        || plan.target.agent_session.guest_config_digest != *active_guest_digest
+        || plan.target.evaluated_at_unix_ms >= plan.target.agent_session.lease_deadline_unix_ms
+        || attestation.version != ContractVersion::V1
+        || attestation.session != session
+        || report.session != session
+        || attestation.inventory_epoch != *inventory_epoch
+        || attestation.scan_id != *scan_id
+        || attestation.inventory_digest != *inventory_digest
+        || attestation.source_report_id != report.report_id
+        || attestation.source_sequence != report.sequence
+        || attestation.accepted_at_unix_ms > plan.target.evaluated_at_unix_ms
     {
         return Err(ApiError::internal(
             "placement planner evidence is not bound to one current compatible Node session",
@@ -773,37 +825,440 @@ fn validate_plan_evidence(
         .get()
         .checked_add(PLACEMENT_INVENTORY_MAX_AGE_MS)
         .ok_or_else(|| ApiError::internal("placement inventory freshness overflow"))?;
-    if admission.evaluated_at_unix_ms.get() >= stale_at {
+    if plan.target.evaluated_at_unix_ms.get() >= stale_at {
         return Err(ApiError::internal(
             "placement planner returned stale admission inventory",
         ));
     }
-    for desired in &admission.assigned_desired_specs {
-        if desired.placement.node_id != admission.node_identity.node_id {
-            return Err(ApiError::internal(
-                "placement planner assigned set contains another Node",
-            ));
-        }
-        let expected = AppliedDesiredEvidence {
-            desired_revision: desired.desired_revision,
-            spec_digest: desired.spec_digest.clone(),
-            placement: desired.placement.clone(),
-            target: desired.target,
-        };
-        if !observation.runtimes.iter().any(|runtime| {
-            runtime.cat_id == desired.cat_id && runtime.applied_desired.as_ref() == Some(&expected)
-        }) {
-            return Err(ApiError::internal(
-                "placement planner full inventory omitted an assigned Cat binding",
-            ));
-        }
-    }
     Ok(())
+}
+
+fn runtime_network_id(config: &RuntimeNetworkConfig) -> &Id {
+    match config {
+        RuntimeNetworkConfig::IsolatedIpv4 { network_id, .. } => network_id,
+    }
 }
 
 fn prefixed_id(prefix: &str, random: &RandomId128) -> Result<Id> {
     Id::new(format!("{prefix}{}", random.as_str()))
         .ok_or_else(|| ApiError::internal("candidate identity is invalid"))
+}
+
+fn reserve_cat_create_api_key(
+    transaction: &mut Transaction<'_>,
+    request: &ApiIdempotencyRequest,
+) -> AuthorityTxResult<()> {
+    transaction.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended(
+            current_schema() || ':api-result:' || $1 || ':' || $2 || ':' || $3,
+            0::BIGINT
+         ))",
+        &[
+            &request.authenticated_workspace_id.as_str(),
+            &request.canonical_route.as_str(),
+            &request.idempotency_key.as_str(),
+        ],
+    )?;
+    Ok(())
+}
+
+pub(super) fn lock_cat_create_text(
+    transaction: &mut Transaction<'_>,
+    domain: &'static str,
+    first: &str,
+    second: &str,
+) -> AuthorityTxResult<()> {
+    transaction.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended(
+            current_schema() || ':atomic-cat-create:' || $1 || ':' || $2 || ':' || $3,
+            0::BIGINT
+         ))",
+        &[&domain, &first, &second],
+    )?;
+    Ok(())
+}
+
+fn exact_cat_create_replay(
+    result: ApiIdempotencyResult,
+    request: &ApiIdempotencyRequest,
+) -> AuthorityTxResult<ApiIdempotencyResult> {
+    if result.request_fingerprint != request.request_fingerprint {
+        return Err(
+            ApiError::conflict("idempotency key was already used for a different request").into(),
+        );
+    }
+    Ok(result)
+}
+
+fn cat_create_api_result(
+    request: &ApiIdempotencyRequest,
+    status: u16,
+    body: Vec<u8>,
+    now: cats_api::runtime_reconciliation::UnixMillis,
+) -> ApiIdempotencyResult {
+    ApiIdempotencyResult {
+        authenticated_workspace_id: request.authenticated_workspace_id.clone(),
+        canonical_route: request.canonical_route.clone(),
+        idempotency_key: request.idempotency_key.clone(),
+        request_fingerprint: request.request_fingerprint.clone(),
+        http_status: status,
+        content_type: Some(ExactContentType::ApplicationJson),
+        response_body: body,
+        created_at: now,
+    }
+}
+
+fn cat_create_candidates_exist(
+    transaction: &mut Transaction<'_>,
+    candidate: &AtomicCatCreateCandidate,
+) -> AuthorityTxResult<bool> {
+    let row = transaction.query_one(
+        "SELECT
+            EXISTS (SELECT 1 FROM cat_records WHERE cat_id=$1) AS cat_exists,
+            EXISTS (SELECT 1 FROM disk_records WHERE disk_id=$2) AS disk_exists,
+            EXISTS (SELECT 1 FROM volume_records WHERE volume_id=$3) AS volume_exists,
+            EXISTS (SELECT 1 FROM endpoint_records WHERE endpoint_id=$4) AS endpoint_exists,
+            EXISTS (SELECT 1 FROM runtime_operations WHERE operation_id=$5) AS operation_exists,
+            EXISTS (SELECT 1 FROM cat_runtime_configs WHERE config_id=$6) AS config_exists,
+            EXISTS (SELECT 1 FROM hostname_endpoint_lookups WHERE hostname=$7) AS hostname_exists",
+        &[
+            &candidate.cat_id.as_str(),
+            &candidate.root_disk.disk_id.as_str(),
+            &candidate.volume.volume_id.as_str(),
+            &candidate.endpoint.endpoint_id.as_str(),
+            &candidate.operation_id.as_str(),
+            &candidate.runtime_config.config_id.as_str(),
+            &candidate.hostname.as_str(),
+        ],
+    )?;
+    Ok(row.try_get::<_, bool>("cat_exists")?
+        || row.try_get::<_, bool>("disk_exists")?
+        || row.try_get::<_, bool>("volume_exists")?
+        || row.try_get::<_, bool>("endpoint_exists")?
+        || row.try_get::<_, bool>("operation_exists")?
+        || row.try_get::<_, bool>("config_exists")?
+        || row.try_get::<_, bool>("hostname_exists")?)
+}
+
+fn insert_atomic_cat(
+    transaction: &mut Transaction<'_>,
+    candidate: &AtomicCatCreateCandidate,
+    now: cats_api::runtime_reconciliation::UnixMillis,
+) -> AuthorityTxResult<()> {
+    let record = CatRecord {
+        cat_id: candidate.cat_id.clone(),
+        workspace_id: candidate.workspace_id.clone(),
+        name: candidate.name.clone(),
+        created_at: now,
+    };
+    let record_json = serde_json::to_string(&record)
+        .map_err(|_| ApiError::internal("Cat record cannot be encoded"))?;
+    let now_pg = i64::try_from(now.get())
+        .map_err(|_| ApiError::internal("database time exceeds PostgreSQL BIGINT"))?;
+    transaction.execute(
+        "INSERT INTO cat_records (
+            cat_id, record, workspace_id, name, cat_creation_id,
+            lifecycle_head_operation_id, stable_state,
+            effective_runtime_ready_operation_id, runtime_incarnation,
+            current_runtime_config_id, current_runtime_config_sha256,
+            created_at, deleted_at
+         ) VALUES ($1,$2::TEXT::jsonb,$3,$4,$5,NULL,NULL,NULL,NULL,$6,$7,$8,NULL)",
+        &[
+            &candidate.cat_id.as_str(),
+            &record_json,
+            &candidate.workspace_id.as_str(),
+            &candidate.name.as_str(),
+            &candidate.cat_creation_id.as_str(),
+            &candidate.runtime_config.config_id.as_str(),
+            &candidate.runtime_config.config_digest.as_str(),
+            &now_pg,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_atomic_runtime_config(
+    transaction: &mut Transaction<'_>,
+    candidate: &AtomicCatCreateCandidate,
+    now: cats_api::runtime_reconciliation::UnixMillis,
+) -> AuthorityTxResult<()> {
+    let canonical = encode_immutable_runtime_config(&candidate.runtime_config)
+        .map_err(|_| ApiError::internal("immutable runtime config cannot be encoded"))?;
+    let now_pg = i64::try_from(now.get())
+        .map_err(|_| ApiError::internal("database time exceeds PostgreSQL BIGINT"))?;
+    transaction.execute(
+        "INSERT INTO cat_runtime_configs (
+            config_id, workspace_id, cat_id, canonical_config_bytes,
+            canonical_config_sha256, created_at_unix_ms
+         ) VALUES ($1,$2,$3,$4,$5,$6)",
+        &[
+            &candidate.runtime_config.config_id.as_str(),
+            &candidate.workspace_id.as_str(),
+            &candidate.cat_id.as_str(),
+            &canonical,
+            &candidate.runtime_config.config_digest.as_str(),
+            &now_pg,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_atomic_cat_product_rows(
+    transaction: &mut Transaction<'_>,
+    candidate: &AtomicCatCreateCandidate,
+    now: cats_api::runtime_reconciliation::UnixMillis,
+) -> AuthorityTxResult<()> {
+    insert_atomic_cat(transaction, candidate, now)?;
+    insert_atomic_runtime_config(transaction, candidate, now)?;
+    insert_volume(transaction, &candidate.volume)?;
+    insert_disk(
+        transaction,
+        &DiskRecord {
+            disk_id: candidate.root_disk.disk_id.clone(),
+            workspace_id: candidate.root_disk.workspace_id.clone(),
+            name: candidate.root_disk.name.clone(),
+            volume_id: candidate.root_disk.volume_id.clone(),
+            size_bytes: candidate.root_disk.size_bytes,
+            durability: candidate.root_disk.durability,
+            created_at: now,
+            admin_state: candidate.root_disk.admin_state.clone(),
+            role: candidate.root_disk.role.clone(),
+        },
+    )?;
+    let endpoint = EndpointRecord {
+        endpoint_id: candidate.endpoint.endpoint_id.clone(),
+        workspace_id: candidate.endpoint.workspace_id.clone(),
+        cat_id: candidate.endpoint.cat_id.clone(),
+        name: candidate.endpoint.name.clone(),
+        created_at: now,
+    };
+    let endpoint_json = serde_json::to_string(&endpoint)
+        .map_err(|_| ApiError::internal("Endpoint record cannot be encoded"))?;
+    let now_pg = i64::try_from(now.get())
+        .map_err(|_| ApiError::internal("database time exceeds PostgreSQL BIGINT"))?;
+    transaction.execute(
+        "INSERT INTO endpoint_records (
+            endpoint_id, record, workspace_id, cat_id, name,
+            binding_state, hostname, protocol, target_port, route_epoch,
+            route_head_operation_id, effective_serving_operation_id,
+            created_at, updated_at_unix_ms
+         ) VALUES (
+            $1,$2::TEXT::jsonb,$3,$4,$5,
+            'bound',$6,'http',8080,1,NULL,NULL,$7,$7
+         )",
+        &[
+            &endpoint.endpoint_id.as_str(),
+            &endpoint_json,
+            &endpoint.workspace_id.as_str(),
+            &endpoint.cat_id.as_str(),
+            &endpoint.name.as_str(),
+            &candidate.hostname.as_str(),
+            &now_pg,
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO hostname_endpoint_lookups (
+            hostname, workspace_id, cat_id, endpoint_id
+         ) VALUES ($1,$2,$3,$4)",
+        &[
+            &candidate.hostname.as_str(),
+            &candidate.workspace_id.as_str(),
+            &candidate.cat_id.as_str(),
+            &candidate.endpoint.endpoint_id.as_str(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn build_genesis_start_command(
+    candidate: &AtomicCatCreateCandidate,
+    now: cats_api::runtime_reconciliation::UnixMillis,
+) -> Result<LifecycleCommandEnvelope> {
+    let effect_deadline_unix_ms = now
+        .get()
+        .checked_add(120_000)
+        .and_then(cats_api::runtime_reconciliation::UnixMillis::new)
+        .ok_or_else(|| ApiError::failed_precondition("Genesis Start deadline is exhausted"))?;
+    let placement = PlacementIdentity {
+        node_id: candidate.node_id.clone(),
+        placement_epoch: candidate.placement_epoch,
+    };
+    LifecycleCommandEnvelope::new(
+        candidate.operation_id.clone(),
+        candidate.workspace_id.clone(),
+        candidate.cat_id.clone(),
+        candidate.node_id.clone(),
+        placement.clone(),
+        candidate.runtime_config.clone(),
+        None,
+        LifecyclePredecessor::Genesis {
+            cat_creation_id: candidate.cat_creation_id.clone(),
+            target_placement: placement,
+        },
+        LifecycleCommand::Start(Box::new(StartSpec {
+            volume_authorities: candidate.start_volume_authorities.clone(),
+            source: StartSource::Genesis,
+            effect_deadline_unix_ms,
+        })),
+    )
+    .map_err(|_| ApiError::internal("constructed Genesis Start violates the frozen contract"))
+}
+
+impl Store {
+    fn create_atomic_cat_covered_with_placement(
+        &self,
+        request: &AtomicCatCreateRequest,
+        planned_target: &PlacementTargetSnapshot,
+        planned_mutation: &CatCreatePlacementMutation,
+        active_guest_digest: &Sha256Digest,
+        commit_state: &CoveredCommitState,
+    ) -> std::result::Result<ApiIdempotencyResult, AtomicCatCreateError> {
+        let mut candidate_collision = false;
+        let outcome = self.authority_transaction_outcome_with_definite_retry(
+            |transaction| {
+                commit_state.checkpoint(transaction)?;
+                reserve_cat_create_api_key(transaction, &request.idempotency)?;
+                commit_state.checkpoint(transaction)?;
+                if let Some(result) = load_api_result_for_update(transaction, &request.idempotency)?
+                {
+                    let result = exact_cat_create_replay(result, &request.idempotency)?;
+                    commit_state.begin_commit(transaction)?;
+                    return Ok(result);
+                }
+                require_production_product_mutation_admitted(
+                    transaction,
+                    &request.idempotency.authenticated_workspace_id,
+                    ProductionQualificationMutationClass::CatCreate,
+                )?;
+                let now = database_now(transaction)?;
+                let network_id =
+                    runtime_network_id(&request.candidate.runtime_config.network_config);
+                lock_cat_create_text(transaction, "network-id", network_id.as_str(), "candidate")?;
+                if runtime_network_id_exists(transaction, network_id)? {
+                    candidate_collision = true;
+                    return Err(AuthorityTransactionError::CandidateCollision);
+                }
+                if revalidate_cat_create_placement(
+                    transaction,
+                    planned_target,
+                    planned_mutation,
+                    active_guest_digest,
+                    now,
+                    &mut |transaction| commit_state.checkpoint(transaction),
+                )? != PlacementCommitLoad::Accepted
+                {
+                    return Err(AuthorityTransactionError::PlacementStale);
+                }
+                lock_cat_create_text(
+                    transaction,
+                    "cat-name",
+                    request.candidate.workspace_id.as_str(),
+                    request.candidate.name.as_str(),
+                )?;
+                if load_cat_by_name_unlocked(
+                    transaction,
+                    &request.candidate.workspace_id,
+                    &request.candidate.name,
+                )?
+                .is_some()
+                {
+                    let result = cat_create_api_result(
+                        &request.idempotency,
+                        409,
+                        request.name_conflict_response_body.clone(),
+                        database_now(transaction)?,
+                    );
+                    insert_api_result(transaction, &result)?;
+                    commit_state.begin_commit(transaction)?;
+                    return Ok(result);
+                }
+                lock_disk_name(
+                    transaction,
+                    &request.candidate.workspace_id,
+                    &request.candidate.root_disk.name,
+                )?;
+                for (domain, identity) in [
+                    ("cat-id", request.candidate.cat_id.as_str()),
+                    (
+                        "config-id",
+                        request.candidate.runtime_config.config_id.as_str(),
+                    ),
+                    ("disk-id", request.candidate.root_disk.disk_id.as_str()),
+                    (
+                        "endpoint-id",
+                        request.candidate.endpoint.endpoint_id.as_str(),
+                    ),
+                    ("operation-id", request.candidate.operation_id.as_str()),
+                    ("volume-id", request.candidate.volume.volume_id.as_str()),
+                ] {
+                    lock_cat_create_text(transaction, domain, identity, "candidate")?;
+                }
+                lock_cat_create_text(
+                    transaction,
+                    "hostname",
+                    request.candidate.hostname.as_str(),
+                    "candidate",
+                )?;
+                if cat_create_candidates_exist(transaction, &request.candidate)? {
+                    candidate_collision = true;
+                    return Err(AuthorityTransactionError::CandidateCollision);
+                }
+                insert_atomic_cat_product_rows(transaction, &request.candidate, now)?;
+                let command = build_genesis_start_command(&request.candidate, now)?;
+                let canonical = encode_lifecycle_command_envelope(&command)
+                    .map_err(|_| ApiError::internal("Genesis Start cannot be encoded"))?;
+                match admit_lifecycle_command_in(
+                    transaction,
+                    &request.candidate.workspace_id,
+                    &command,
+                    &canonical,
+                )? {
+                    LifecycleCommandAdmission::Admitted(_) => {}
+                    LifecycleCommandAdmission::ExactReplay(_) => {
+                        return Err(ApiError::internal(
+                            "new Cat Genesis Start unexpectedly replayed an Operation",
+                        )
+                        .into());
+                    }
+                    LifecycleCommandAdmission::Rejected(
+                        LifecycleAdmissionRejection::OperationIdentityConflict { .. },
+                    ) => {
+                        candidate_collision = true;
+                        return Err(AuthorityTransactionError::CandidateCollision);
+                    }
+                    LifecycleCommandAdmission::Rejected(_) => {
+                        return Err(ApiError::internal(
+                            "new Cat Genesis Start was rejected after candidate validation",
+                        )
+                        .into());
+                    }
+                }
+                let result = cat_create_api_result(
+                    &request.idempotency,
+                    202,
+                    request.accepted_response_body.clone(),
+                    database_now(transaction)?,
+                );
+                insert_api_result(transaction, &result)?;
+                commit_state.begin_commit(transaction)?;
+                Ok(result)
+            },
+            || commit_state.reset_after_definite_retry(),
+        );
+        match outcome {
+            Ok(result) => Ok(result),
+            Err(AuthorityExecutionError::CandidateCollision) if candidate_collision => {
+                Err(AtomicCatCreateError::CandidateIdentityCollision)
+            }
+            Err(AuthorityExecutionError::PlacementStale) => {
+                Err(AtomicCatCreateError::PlacementStale)
+            }
+            Err(AuthorityExecutionError::Store(error)) => Err(AtomicCatCreateError::Store(error)),
+            Err(AuthorityExecutionError::CandidateCollision) => Err(AtomicCatCreateError::Store(
+                ApiError::internal("Cat create lost its candidate collision marker"),
+            )),
+        }
+    }
 }
 
 fn build_covered_request(
@@ -812,12 +1267,12 @@ fn build_covered_request(
     plan: CatCreatePlan,
     guest_config_digest: Sha256Digest,
     root_size_bytes: u64,
-) -> Result<CoveredCatCreateRequest> {
+) -> Result<AtomicCatCreateRequest> {
     let cat_id = prefixed_id("cat_", &identities.cat)?;
+    let cat_creation_id = prefixed_id("creation_", &identities.cat_creation)?;
     let disk_id = prefixed_id("disk_", &identities.disk)?;
     let volume_id = prefixed_id("vol_", &identities.volume)?;
-    let attachment_id = prefixed_id("att_", &identities.attachment)?;
-    let volume_intent_id = prefixed_id("vint_", &identities.volume_intent)?;
+    let config_id = prefixed_id("cfg_", &identities.config)?;
     let operation_id = prefixed_id("op_", &identities.operation)?;
     let endpoint_id = prefixed_id("ep_", &identities.endpoint)?;
     let hostname = Hostname::new(format!(
@@ -845,74 +1300,40 @@ fn build_covered_request(
         lease_expires_at: None,
         last_transition: None,
     };
-    let mut desired = DesiredRuntimeSpec {
-        version: ContractVersion::V1,
-        workspace_id: ingress.idempotency.authenticated_workspace_id.clone(),
-        cat_id: cat_id.clone(),
-        desired_revision: Revision::new(1).expect("one is a valid Revision"),
-        target: RuntimeTarget::Running,
-        placement: AssignedPlacement {
-            kind: AssignedKind::Assigned,
-            node_id: plan.target.admission.node_identity.node_id,
-            placement_epoch: Epoch::new(1).expect("one is a valid Epoch"),
-        },
-        runtime: RuntimeConfig {
-            vcpus: ingress.request.vcpus,
-            memory_bytes: ingress.request.memory_bytes,
-            boot_image_digest: ingress.request.boot_image_digest,
-            guest_config_digest,
-            network_config: plan.mutation.network_config,
-        },
-        volumes: vec![VolumeIntent {
-            volume_intent_id,
-            disk_id: disk_id.clone(),
+    let network_config = plan.mutation.network_config;
+    let runtime_config = ImmutableRuntimeConfig::new(
+        config_id,
+        ingress.request.boot_image_digest,
+        ingress.request.vcpus,
+        ingress.request.memory_bytes,
+        guest_config_digest,
+        network_config,
+        vec![RuntimeVolumeConfig {
             volume_id: volume_id.clone(),
-            attachment_id,
+            disk_id: disk_id.clone(),
+            disk_role: LifecycleDiskRole::Root,
             size_bytes: root_size_bytes,
-            disk_kind: DiskKind::Root,
-            access: VolumeAccess::ReadWriteOnce,
             durability: ingress.request.durability,
-            guest_device: GuestDeviceIdentity {
-                serial: Id::new("cats-root").expect("static Root serial is valid"),
-                slot: 0,
-            },
-            acquire: VolumeAcquire::Normal {
-                transition_id: identities.acquire_transition,
-                expected_unowned_epoch: FenceEpoch::new(0).expect("zero is a valid FenceEpoch"),
-            },
-            disposition: VolumeDisposition::Retain,
-            mount: None,
+            guest_device_serial: Id::new("cats-root").expect("static Root serial is valid"),
+            guest_device_slot: 0,
+            guest_binding: RuntimeVolumeGuestBinding::RootBoot,
         }],
-        endpoints: vec![EndpointIntent {
-            endpoint_id: endpoint_id.clone(),
-            hostname: hostname.clone(),
-            route_epoch: Epoch::new(1).expect("one is a valid Epoch"),
-            protocol: HttpProtocol::Http,
-            target_port: 8080,
-        }],
-        transition: RuntimeTransition::CancelAndDrain,
-        spec_digest: Sha256Digest::from_bytes([0; 32]),
-    };
-    desired.spec_digest = spec_digest(&desired)
-        .map_err(|_| ApiError::internal("constructed initial Desired is invalid"))?;
-
-    let accepted = ExactHttpResponse::new(
-        202,
-        Some(ExactContentType::ApplicationJson),
-        encode_cat_create_accepted_response(&cat_id, &operation_id)?,
-    )?;
-    let conflict = ExactHttpResponse::new(
-        409,
-        Some(ExactContentType::ApplicationJson),
-        encode_cat_name_conflict_response(),
-    )?;
-    let envelopes =
-        CatCreateEnvelopes::new(accepted, cat_id.clone(), operation_id.clone(), conflict)?;
+    )
+    .map_err(|_| ApiError::internal("constructed immutable runtime config is invalid"))?;
+    let start_volume_authorities = vec![StartVolumeAuthority {
+        volume_id: volume_id.clone(),
+        disk_id: disk_id.clone(),
+        authority: RuntimeVolumeAuthorityInput::NormalUnowned {
+            expected_unowned_epoch: FenceEpoch::new(0).expect("zero is a valid FenceEpoch"),
+            transition_id: identities.acquire_transition,
+        },
+    }];
     let workspace_id = ingress.idempotency.authenticated_workspace_id.clone();
-    Ok(CoveredCatCreateRequest {
+    Ok(AtomicCatCreateRequest {
         idempotency: ingress.idempotency,
-        candidate: CatCreateCandidate {
+        candidate: AtomicCatCreateCandidate {
             cat_id: cat_id.clone(),
+            cat_creation_id,
             workspace_id: workspace_id.clone(),
             name: ingress.request.name,
             root_disk: DiskRecordCandidate {
@@ -928,23 +1349,21 @@ fn build_covered_request(
                 },
             },
             volume,
-            desired,
+            runtime_config,
+            start_volume_authorities,
             endpoint: EndpointRecordCandidate {
                 endpoint_id: endpoint_id.clone(),
                 workspace_id: workspace_id.clone(),
                 cat_id: cat_id.clone(),
                 name: Id::new("web").expect("static Endpoint name is valid"),
             },
-            hostname_lookup: HostnameDesiredLookup {
-                hostname,
-                workspace_id,
-                cat_id,
-                endpoint_id,
-                desired_revision: Revision::new(1).expect("one is a valid Revision"),
-            },
-            operation_id,
+            hostname,
+            operation_id: operation_id.clone(),
+            node_id: plan.target.node_identity.node_id,
+            placement_epoch: Epoch::new(1).expect("one is a valid Epoch"),
         },
-        envelopes,
+        accepted_response_body: encode_cat_create_accepted_response(&cat_id, &operation_id)?,
+        name_conflict_response_body: encode_cat_name_conflict_response(),
     })
 }
 

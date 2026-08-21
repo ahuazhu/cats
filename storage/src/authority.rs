@@ -7,6 +7,10 @@
 use std::collections::BTreeSet;
 
 use cats_api::object_write_gateway::ObjectWriteCredentialReference;
+use cats_api::runtime_lifecycle_volume::{
+    LifecycleCommandStartVolumeGrantReceipt, LifecycleServingAcquire,
+    LifecycleStartVolumeGrantAuthority,
+};
 #[cfg(feature = "proposed-node-residue-reclamation")]
 pub use cats_api::runtime_reconciliation::{
     residue_acquisition_digest, AuthorizedServingAcquire, DiskKind,
@@ -17,11 +21,11 @@ pub use cats_api::runtime_reconciliation::{
     AcquireOrigin, AsciiText, AuthorizationConsumedReceipt, AuthorizationRecord,
     AuthorizationState, BeginDeleteRequest, BeginDeleteResult,
     BeginDisposableDeleteConsumedReceipt, DeleteCompletionReceipt, DisposableDeleteIsolationBasis,
-    DisposableRootDeleteAuthorization, Epoch, FenceEpoch, Generation, Id, LastVolumeTransition,
-    NodeBootId, NormalAcquireRequest, NormalAcquireResult, RandomId128, ReleaseRequest,
-    ReleaseResult, RemoteHead, Revision, Sha256Digest, TakeoverConsumedReceipt, UnixMillis,
-    VolumeAcquireRequest, VolumeAdminState, VolumeAuthorization, VolumeDurability, VolumeRecord,
-    VolumeTakeoverAuthorization,
+    DisposableRootDeleteAuthorization, DisposableRootDisposition, Epoch, FenceEpoch, Generation,
+    Id, LastVolumeTransition, NodeBootId, NormalAcquireRequest, NormalAcquireResult, RandomId128,
+    ReleaseRequest, ReleaseResult, RemoteHead, Revision, Sha256Digest, TakeoverConsumedReceipt,
+    UnixMillis, VolumeAdminState, VolumeAuthorization, VolumeDurability, VolumeRecord,
+    VolumeTakeoverAuthorization, VolumeTransitionSource,
 };
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +56,7 @@ pub struct AttachmentLineageIdentity {
 #[serde(deny_unknown_fields)]
 pub struct AuthorizedServingAttachment {
     pub identity: AttachmentLineageIdentity,
+    pub transition_source: VolumeTransitionSource,
     /// Public binding only. The matching attachment-scoped private key lives
     /// in a separate root-only artifact and never enters this receipt.
     /// `None` means no object-write credential is bound to this attachment;
@@ -70,6 +75,27 @@ pub struct AuthorizedServingAttachment {
     pub head: RemoteHead,
     pub lease_expires_at: UnixMillis,
     pub acquire: AuthorizedServingAcquire,
+    /// Closed proof for the lease/head projection currently exposed to
+    /// blockd. The immutable acquire marker above is never rewritten by a
+    /// later renewal. Instead each command-scoped renewal carries its own
+    /// complete Start-grant receipt and independently recomputable digest.
+    pub current_lease: AuthorizedServingCurrentLeaseProof,
+}
+
+/// Exact command-scoped authority behind the attachment's *current* expiry
+/// and head. `grant.authority` distinguishes the initial acquire from a later
+/// same-owner renewal, while `grant_sequence` prevents an old renewal round
+/// from being substituted for the current one.
+///
+/// The complete receipt is mandatory so blockd can recompute the digest and
+/// compare every scope/config/owner field. A Host-fence takeover cannot use
+/// this carrier until the Start protocol defines a real Takeover grant arm;
+/// no compatibility or opaque proof arm exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizedServingCurrentLeaseProof {
+    pub grant: Box<LifecycleCommandStartVolumeGrantReceipt>,
+    pub grant_receipt_digest: Sha256Digest,
 }
 
 /// Immutable, thick authority that created one serving attachment. Normal
@@ -91,10 +117,12 @@ pub enum AuthorizedServingAcquire {
 
 impl AuthorizedServingAttachment {
     pub fn lease_duration_ms(&self) -> u64 {
-        match &self.acquire {
-            AuthorizedServingAcquire::Normal { request, .. } => request.lease_duration_ms,
-            AuthorizedServingAcquire::Takeover { authorization, .. } => {
-                authorization.lease_duration_ms
+        match &self.current_lease.grant.authority {
+            LifecycleStartVolumeGrantAuthority::NormalAcquire { request, .. } => {
+                request.lease_duration_ms
+            }
+            LifecycleStartVolumeGrantAuthority::RenewSameNode { request, .. } => {
+                request.lease_duration_ms.get()
             }
         }
     }
@@ -122,15 +150,6 @@ impl AuthorizedServingAttachment {
         }
     }
 
-    pub fn acquire_desired_revision(&self) -> Revision {
-        match &self.acquire {
-            AuthorizedServingAcquire::Normal { request, .. } => request.desired_revision,
-            AuthorizedServingAcquire::Takeover { authorization, .. } => {
-                authorization.desired_revision
-            }
-        }
-    }
-
     pub fn acquire_placement_epoch(&self) -> Epoch {
         match &self.acquire {
             AuthorizedServingAcquire::Normal { request, .. } => request.placement_epoch,
@@ -144,34 +163,14 @@ impl AuthorizedServingAttachment {
         match &self.acquire {
             AuthorizedServingAcquire::Normal { request, result } => {
                 LastVolumeTransition::NormalAcquire {
+                    source: self.transition_source.clone(),
                     request: request.clone(),
                     result: result.clone(),
                 }
             }
             AuthorizedServingAcquire::Takeover { authorization, .. } => {
                 LastVolumeTransition::Takeover {
-                    authorization_id: authorization.authorization_id.clone(),
-                }
-            }
-        }
-    }
-
-    /// Lossless projection used by runtime checkpoints.  The takeover arm
-    /// deliberately carries only the authorization identifier because the
-    /// complete consumed authorization remains sealed in this artifact.
-    pub fn checkpoint_acquire_request(&self) -> VolumeAcquireRequest {
-        match &self.acquire {
-            AuthorizedServingAcquire::Normal { request, .. } => VolumeAcquireRequest::Normal {
-                volume_id: request.volume_id.clone(),
-                transition_id: request.transition_id.clone(),
-                attachment_id: request.attachment_id.clone(),
-                expected_unowned_epoch: request.expected_unowned_epoch,
-                desired_revision: request.desired_revision,
-                placement_epoch: request.placement_epoch,
-                lease_duration_ms: request.lease_duration_ms,
-            },
-            AuthorizedServingAcquire::Takeover { authorization, .. } => {
-                VolumeAcquireRequest::Takeover {
+                    source: self.transition_source.clone(),
                     authorization_id: authorization.authorization_id.clone(),
                 }
             }
@@ -192,13 +191,46 @@ pub fn validate_authorized_serving_attachment(
     {
         return Err(AuthorityError::BackendUnknown);
     }
-    match (&identity.acquire_origin, &attachment.acquire) {
+    let grant = attachment.current_lease.grant.as_ref();
+    let recomputed_grant_digest =
+        crate::lifecycle_volume::command_start_volume_grant_receipt_digest_from_closed_receipt(
+            grant,
+        )
+        .map_err(|_| AuthorityError::BackendUnknown)?;
+    if recomputed_grant_digest != attachment.current_lease.grant_receipt_digest
+        || grant.volume.volume_id != identity.volume_id
+        || grant.volume.size_bytes != attachment.size_bytes
+        || grant.volume.durability != attachment.durability
+        || grant.scope.node_id != identity.node_id
+        || grant.scope.placement_identity.node_id != identity.node_id
+        || grant.scope.placement_identity.placement_epoch != identity.placement_epoch
+    {
+        return Err(AuthorityError::BackendUnknown);
+    }
+
+    match (
+        &identity.acquire_origin,
+        &attachment.acquire,
+        &grant.authority,
+    ) {
         (
             AcquireOrigin::Normal { transition_id },
             AuthorizedServingAcquire::Normal { request, result },
+            LifecycleStartVolumeGrantAuthority::NormalAcquire {
+                request: grant_request,
+                result: grant_result,
+            },
         ) => {
             validate_normal_acquire_pair(request, result)?;
-            if request.volume_id != identity.volume_id
+            if grant.grant_sequence.get() != 0
+                || grant_request != request
+                || grant_result != result
+                || attachment.transition_source
+                    != (VolumeTransitionSource::Lifecycle {
+                        operation_id: grant.scope.operation_id.clone(),
+                        request_fingerprint: grant.scope.request_fingerprint.clone(),
+                    })
+                || request.volume_id != identity.volume_id
                 || request.transition_id != *transition_id
                 || request.attachment_id != identity.attachment_id
                 || request.placement_epoch != identity.placement_epoch
@@ -213,30 +245,144 @@ pub fn validate_authorized_serving_attachment(
             }
         }
         (
+            AcquireOrigin::Normal { transition_id },
+            AuthorizedServingAcquire::Normal { request, result },
+            LifecycleStartVolumeGrantAuthority::RenewSameNode {
+                expected_source,
+                serving_acquire,
+                request: renew_request,
+                result: renew_result,
+            },
+        ) => {
+            validate_normal_acquire_pair(request, result)?;
+            let LifecycleServingAcquire::Normal {
+                request: grant_acquire_request,
+                result: grant_acquire_result,
+            } = serving_acquire.as_ref();
+            if grant.grant_sequence.get() == 0
+                || grant_acquire_request != request
+                || grant_acquire_result != result
+                || expected_source != &attachment.transition_source
+                || !matches!(expected_source, VolumeTransitionSource::Lifecycle { .. })
+                || request.volume_id != identity.volume_id
+                || request.transition_id != *transition_id
+                || request.attachment_id != identity.attachment_id
+                || request.placement_epoch != identity.placement_epoch
+                || result.volume_id != identity.volume_id
+                || result.transition_id != *transition_id
+                || result.attachment_id != identity.attachment_id
+                || result.resulting_epoch != identity.attachment_epoch
+                || renew_request.volume_id != identity.volume_id
+                || renew_request.attachment_id != identity.attachment_id
+                || renew_request.expected_epoch != identity.attachment_epoch
+                || renew_result.volume_id != identity.volume_id
+                || renew_result.attachment_id != identity.attachment_id
+                || renew_result.epoch != identity.attachment_epoch
+                || !remote_head_is_same_or_later(&attachment.head, &renew_result.resulting_head)
+                || renew_result.lease_expires_at != attachment.lease_expires_at
+            {
+                return Err(AuthorityError::BackendUnknown);
+            }
+        }
+        (
             AcquireOrigin::Takeover { authorization_id },
             AuthorizedServingAcquire::Takeover {
                 authorization,
                 receipt,
             },
+            _,
         ) => {
-            validate_takeover_receipt(authorization, receipt)?;
-            let initial_expiry =
-                checked_expiry(receipt.consumed_at, authorization.lease_duration_ms)?;
-            if authorization.authorization_id != *authorization_id
-                || authorization.authorized_node_id != identity.node_id
-                || authorization.volume_id != identity.volume_id
-                || authorization.new_attachment_id != identity.attachment_id
-                || authorization.new_placement_epoch != identity.placement_epoch
-                || receipt.resulting_epoch != identity.attachment_epoch
-                || initial_expiry != attachment.lease_expires_at
-                || !remote_head_is_same_or_later(&attachment.head, &receipt.resulting_head)
-            {
-                return Err(AuthorityError::BackendUnknown);
-            }
+            // Atomic Start currently returns a typed TakeoverUnavailable and
+            // has no Takeover Start-grant receipt. Do not let a generic thick
+            // takeover proof masquerade as the mandatory command grant.
+            let _ = (authorization_id, authorization, receipt);
+            return Err(AuthorityError::BackendUnknown);
         }
         _ => return Err(AuthorityError::BackendUnknown),
     }
     Ok(())
+}
+
+/// Construct the sole production blockd authority carrier from one validated
+/// command-scoped Start grant plus the Node-local public credential binding.
+///
+/// The helper independently recomputes the receipt digest before projecting
+/// fields. A Node cannot alter the original acquire expiry after a renewal:
+/// the immutable acquire remains in `acquire`, while `current_lease` and the
+/// top-level expiry/head come from the latest grant result.
+pub fn authorized_serving_attachment_from_start_volume_grant(
+    grant: &LifecycleCommandStartVolumeGrantReceipt,
+    grant_receipt_digest: &Sha256Digest,
+    object_write_credential: Option<ObjectWriteCredentialReference>,
+) -> Result<AuthorizedServingAttachment> {
+    let recomputed =
+        crate::lifecycle_volume::command_start_volume_grant_receipt_digest_from_closed_receipt(
+            grant,
+        )
+        .map_err(|_| AuthorityError::BackendUnknown)?;
+    if &recomputed != grant_receipt_digest {
+        return Err(AuthorityError::BackendUnknown);
+    }
+
+    let (transition_source, acquire_request, acquire_result, head, lease_expires_at) =
+        match &grant.authority {
+            LifecycleStartVolumeGrantAuthority::NormalAcquire { request, result } => (
+                VolumeTransitionSource::Lifecycle {
+                    operation_id: grant.scope.operation_id.clone(),
+                    request_fingerprint: grant.scope.request_fingerprint.clone(),
+                },
+                request.clone(),
+                result.clone(),
+                result.resulting_head.clone(),
+                result.lease_expires_at,
+            ),
+            LifecycleStartVolumeGrantAuthority::RenewSameNode {
+                expected_source,
+                serving_acquire,
+                result,
+                ..
+            } => {
+                let LifecycleServingAcquire::Normal {
+                    request,
+                    result: acquire_result,
+                } = serving_acquire.as_ref();
+                (
+                    expected_source.clone(),
+                    request.clone(),
+                    acquire_result.clone(),
+                    result.resulting_head.clone(),
+                    result.lease_expires_at,
+                )
+            }
+        };
+    let attachment = AuthorizedServingAttachment {
+        identity: AttachmentLineageIdentity {
+            volume_id: grant.volume.volume_id.clone(),
+            attachment_id: acquire_result.attachment_id.clone(),
+            attachment_epoch: acquire_result.resulting_epoch,
+            acquire_origin: AcquireOrigin::Normal {
+                transition_id: acquire_result.transition_id.clone(),
+            },
+            node_id: grant.scope.node_id.clone(),
+            placement_epoch: grant.scope.placement_identity.placement_epoch,
+        },
+        transition_source,
+        object_write_credential,
+        size_bytes: grant.volume.size_bytes,
+        durability: grant.volume.durability,
+        head,
+        lease_expires_at,
+        acquire: AuthorizedServingAcquire::Normal {
+            request: acquire_request,
+            result: acquire_result,
+        },
+        current_lease: AuthorizedServingCurrentLeaseProof {
+            grant: Box::new(grant.clone()),
+            grant_receipt_digest: grant_receipt_digest.clone(),
+        },
+    };
+    validate_authorized_serving_attachment(&attachment)?;
+    Ok(attachment)
 }
 
 /// Prove that a strict authority reread is exactly the Node-supplied serving
@@ -266,6 +412,9 @@ pub fn validate_authorized_serving_record(
         || !head_is_current
         || record.lease_owner.as_ref() != Some(&attachment.identity.attachment_id)
         || record.lease_epoch != attachment.identity.attachment_epoch
+        || !record
+            .lease_expires_at
+            .is_some_and(|expiry| expiry >= attachment.lease_expires_at)
         || expected_expiry.is_some_and(|expiry| record.lease_expires_at != Some(expiry))
     {
         return Err(AuthorityError::BackendUnknown);
@@ -274,14 +423,16 @@ pub fn validate_authorized_serving_record(
         AuthorizedServingAcquire::Normal { request, result } => {
             record.last_transition
                 == Some(LastVolumeTransition::NormalAcquire {
+                    source: attachment.transition_source.clone(),
                     request: request.clone(),
                     result: result.clone(),
                 })
         }
         AuthorizedServingAcquire::Takeover { authorization, .. } => matches!(
             &record.last_transition,
-            Some(LastVolumeTransition::Takeover { authorization_id })
-                if authorization_id == &authorization.authorization_id
+            Some(LastVolumeTransition::Takeover { source, authorization_id })
+                if source == &attachment.transition_source
+                    && authorization_id == &authorization.authorization_id
         ),
     };
     if !marker_matches {
@@ -298,7 +449,7 @@ pub fn validate_authorized_serving_record(
 /// Sharing this release number lets the adapter reject an unstamped or
 /// incompatible authority shape without importing the product store or
 /// duplicating its schema.
-pub const AUTHORITY_RELEASE_SCHEMA_VERSION: i64 = 16;
+pub const AUTHORITY_RELEASE_SCHEMA_VERSION: i64 = 17;
 
 /// Maximum number of currently-owned Volume authority rows one Node snapshot
 /// may return. Runtime Reconciliation admits at most 1,024 Cats with at most
@@ -535,7 +686,9 @@ pub struct VolumeRecordProjection {
     pub lease_expires_at: Option<UnixMillis>,
     pub last_transition_kind: Option<&'static str>,
     pub last_transition_id: Option<String>,
-    pub transition_desired_revision: Option<Revision>,
+    pub transition_source_kind: Option<&'static str>,
+    pub transition_operation_id: Option<String>,
+    pub transition_request_fingerprint: Option<String>,
     pub transition_placement_epoch: Option<Epoch>,
     pub transition_lease_duration_ms: Option<u64>,
 }
@@ -550,42 +703,66 @@ pub fn project_volume_record(record: &VolumeRecord) -> Result<VolumeRecordProjec
         VolumeDurability::Strict => "strict",
         VolumeDurability::Relaxed => "relaxed",
     };
-    let (kind, transition_id, revision, placement, duration) = match &record.last_transition {
+    let (kind, transition_id, source, placement, duration) = match &record.last_transition {
         None => (None, None, None, None, None),
-        Some(LastVolumeTransition::NormalAcquire { request, .. }) => (
+        Some(LastVolumeTransition::NormalAcquire {
+            source, request, ..
+        }) => (
             Some("normal_acquire"),
             Some(request.transition_id.to_string()),
-            Some(request.desired_revision),
+            Some(source),
             Some(request.placement_epoch),
             Some(request.lease_duration_ms),
         ),
-        Some(LastVolumeTransition::Release { request, .. }) => (
+        Some(LastVolumeTransition::Release {
+            source, request, ..
+        }) => (
             Some("release"),
             Some(request.transition_id.to_string()),
-            None,
+            Some(source),
             None,
             None,
         ),
-        Some(LastVolumeTransition::Takeover { authorization_id }) => (
+        Some(LastVolumeTransition::Takeover {
+            source,
+            authorization_id,
+        }) => (
             Some("takeover"),
             Some(authorization_id.to_string()),
-            None,
+            Some(source),
             None,
             None,
         ),
-        Some(LastVolumeTransition::BeginDelete { request, .. }) => (
+        Some(LastVolumeTransition::BeginDelete {
+            source, request, ..
+        }) => (
             Some("begin_delete"),
             Some(request.delete_id.to_string()),
-            None,
+            Some(source),
             None,
             None,
         ),
-        Some(LastVolumeTransition::BeginDisposableDelete { authorization_id }) => (
+        Some(LastVolumeTransition::BeginDisposableDelete {
+            source,
+            authorization_id,
+        }) => (
             Some("begin_disposable_delete"),
             Some(authorization_id.to_string()),
+            Some(source),
             None,
             None,
-            None,
+        ),
+    };
+    let (source_kind, operation_id, request_fingerprint) = match source {
+        None => (None, None, None),
+        Some(VolumeTransitionSource::Independent) => (Some("independent"), None, None),
+        Some(VolumeTransitionSource::Lifecycle {
+            operation_id,
+            request_fingerprint,
+        }) => (
+            Some("lifecycle"),
+            Some(operation_id.to_string()),
+            Some(request_fingerprint.to_string()),
         ),
     };
     Ok(VolumeRecordProjection {
@@ -602,7 +779,9 @@ pub fn project_volume_record(record: &VolumeRecord) -> Result<VolumeRecordProjec
         lease_expires_at: record.lease_expires_at,
         last_transition_kind: kind,
         last_transition_id: transition_id,
-        transition_desired_revision: revision,
+        transition_source_kind: source_kind,
+        transition_operation_id: operation_id,
+        transition_request_fingerprint: request_fingerprint,
         transition_placement_epoch: placement,
         transition_lease_duration_ms: duration,
     })
@@ -650,7 +829,9 @@ pub fn validate_volume_record(record: &VolumeRecord) -> Result<()> {
     };
 
     match last {
-        LastVolumeTransition::NormalAcquire { request, result } => {
+        LastVolumeTransition::NormalAcquire {
+            request, result, ..
+        } => {
             validate_normal_acquire_pair(request, result)?;
             if request.volume_id != record.volume_id
                 || !matches!(record.admin_state, VolumeAdminState::Active)
@@ -661,7 +842,9 @@ pub fn validate_volume_record(record: &VolumeRecord) -> Result<()> {
                 return Err(AuthorityError::BackendUnknown);
             }
         }
-        LastVolumeTransition::Release { request, result } => {
+        LastVolumeTransition::Release {
+            request, result, ..
+        } => {
             validate_release_pair(request, result)?;
             if request.volume_id != record.volume_id
                 || !matches!(record.admin_state, VolumeAdminState::Active)
@@ -679,7 +862,9 @@ pub fn validate_volume_record(record: &VolumeRecord) -> Result<()> {
                 return Err(AuthorityError::BackendUnknown);
             }
         }
-        LastVolumeTransition::BeginDelete { request, result } => {
+        LastVolumeTransition::BeginDelete {
+            request, result, ..
+        } => {
             validate_begin_delete_pair(request, result)?;
             if request.volume_id != record.volume_id
                 || record.lease_epoch != result.resulting_epoch
@@ -791,21 +976,21 @@ pub fn classify_residue_reclaim_authority(
 
     let proof = match (current_volume, delete_completion) {
         (Some(record), None) => Some(ResidueReclaimProof::OrdinaryRelease {
-            current_volume: record.clone(),
+            current_volume: Box::new(record.clone()),
         }),
         (None, Some(completion @ DeleteCompletionReceipt::Normal { .. })) => {
             if consumed_authorization.is_some() {
                 return Err(AuthorityError::BackendUnknown);
             }
             Some(ResidueReclaimProof::NormalDeleteCompletion {
-                completion: completion.clone(),
+                completion: Box::new(completion.clone()),
             })
         }
         (None, Some(completion @ DeleteCompletionReceipt::DisposableRoot { .. })) => {
             consumed_authorization.map(|authorization| {
                 ResidueReclaimProof::DisposableRootDeleteCompletion {
-                    completion: completion.clone(),
-                    consumed_authorization: authorization.clone(),
+                    completion: Box::new(completion.clone()),
+                    consumed_authorization: Box::new(authorization.clone()),
                 }
             })
         }
@@ -892,7 +1077,21 @@ pub fn normal_acquire(
     request: &NormalAcquireRequest,
     db_now: UnixMillis,
 ) -> Result<(VolumeRecord, NormalAcquireResult)> {
-    if let Some(result) = replay_normal_acquire(record, request)? {
+    normal_acquire_with_source(
+        record,
+        &VolumeTransitionSource::Independent,
+        request,
+        db_now,
+    )
+}
+
+pub fn normal_acquire_with_source(
+    record: &VolumeRecord,
+    source: &VolumeTransitionSource,
+    request: &NormalAcquireRequest,
+    db_now: UnixMillis,
+) -> Result<(VolumeRecord, NormalAcquireResult)> {
+    if let Some(result) = replay_normal_acquire_with_source(record, source, request)? {
         return Ok((record.clone(), result));
     }
     let lease_expires_at = checked_expiry(db_now, request.lease_duration_ms)?;
@@ -919,6 +1118,7 @@ pub fn normal_acquire(
     updated.lease_epoch = resulting_epoch;
     updated.lease_expires_at = Some(lease_expires_at);
     updated.last_transition = Some(LastVolumeTransition::NormalAcquire {
+        source: source.clone(),
         request: request.clone(),
         result: result.clone(),
     });
@@ -931,14 +1131,23 @@ pub fn replay_normal_acquire(
     record: &VolumeRecord,
     request: &NormalAcquireRequest,
 ) -> Result<Option<NormalAcquireResult>> {
+    replay_normal_acquire_with_source(record, &VolumeTransitionSource::Independent, request)
+}
+
+pub fn replay_normal_acquire_with_source(
+    record: &VolumeRecord,
+    source: &VolumeTransitionSource,
+    request: &NormalAcquireRequest,
+) -> Result<Option<NormalAcquireResult>> {
     validate_volume_record(record)?;
     if let Some(last_id) = normal_transition_id(record.last_transition.as_ref()) {
         if last_id == &request.transition_id {
             return match record.last_transition.as_ref() {
                 Some(LastVolumeTransition::NormalAcquire {
+                    source: original_source,
                     request: original,
                     result,
-                }) if original == request => Ok(Some(result.clone())),
+                }) if original_source == source && original == request => Ok(Some(result.clone())),
                 _ => Err(AuthorityError::StaleTransition),
             };
         }
@@ -1027,14 +1236,25 @@ pub fn release(
     record: &VolumeRecord,
     request: &ReleaseRequest,
 ) -> Result<(VolumeRecord, ReleaseResult)> {
+    release_with_source(record, &VolumeTransitionSource::Independent, request)
+}
+
+pub fn release_with_source(
+    record: &VolumeRecord,
+    source: &VolumeTransitionSource,
+    request: &ReleaseRequest,
+) -> Result<(VolumeRecord, ReleaseResult)> {
     validate_volume_record(record)?;
     if let Some(last_id) = normal_transition_id(record.last_transition.as_ref()) {
         if last_id == &request.transition_id {
             return match record.last_transition.as_ref() {
                 Some(LastVolumeTransition::Release {
+                    source: original_source,
                     request: original,
                     result,
-                }) if original == request => Ok((record.clone(), result.clone())),
+                }) if original_source == source && original == request => {
+                    Ok((record.clone(), result.clone()))
+                }
                 _ => Err(AuthorityError::StaleTransition),
             };
         }
@@ -1063,6 +1283,7 @@ pub fn release(
     updated.lease_epoch = resulting_epoch;
     updated.lease_expires_at = None;
     updated.last_transition = Some(LastVolumeTransition::Release {
+        source: source.clone(),
         request: request.clone(),
         result: result.clone(),
     });
@@ -1076,6 +1297,25 @@ pub fn consume_takeover(
     authorization_id: &Id,
     db_now: UnixMillis,
 ) -> Result<(VolumeRecord, AuthorizationRecord, TakeoverResult)> {
+    let source = authorization_transition_source(authorization_record, true)?;
+    consume_takeover_with_source(
+        record,
+        event,
+        authorization_record,
+        authorization_id,
+        &source,
+        db_now,
+    )
+}
+
+pub fn consume_takeover_with_source(
+    record: &VolumeRecord,
+    event: &HostFenceEvent,
+    authorization_record: &AuthorizationRecord,
+    authorization_id: &Id,
+    source: &VolumeTransitionSource,
+    db_now: UnixMillis,
+) -> Result<(VolumeRecord, AuthorizationRecord, TakeoverResult)> {
     validate_host_fence_event(event)?;
     consume_takeover_bound_to_event(
         record,
@@ -1087,6 +1327,7 @@ pub fn consume_takeover(
         },
         authorization_record,
         authorization_id,
+        source,
         db_now,
     )
 }
@@ -1103,6 +1344,25 @@ pub fn consume_trusted_takeover_v1(
     authorization_id: &Id,
     db_now: UnixMillis,
 ) -> Result<(VolumeRecord, AuthorizationRecord, TakeoverResult)> {
+    let source = authorization_transition_source(authorization_record, true)?;
+    consume_trusted_takeover_v1_with_source(
+        record,
+        event,
+        authorization_record,
+        authorization_id,
+        &source,
+        db_now,
+    )
+}
+
+pub fn consume_trusted_takeover_v1_with_source(
+    record: &VolumeRecord,
+    event: &TrustedHostFenceEventV1,
+    authorization_record: &AuthorizationRecord,
+    authorization_id: &Id,
+    source: &VolumeTransitionSource,
+    db_now: UnixMillis,
+) -> Result<(VolumeRecord, AuthorizationRecord, TakeoverResult)> {
     validate_trusted_host_fence_event_v1(event)
         .map_err(|_| AuthorityError::InvalidAuthorization)?;
     consume_takeover_bound_to_event(
@@ -1111,6 +1371,7 @@ pub fn consume_trusted_takeover_v1(
         TakeoverFenceAdmission::TrustedTerminalV1,
         authorization_record,
         authorization_id,
+        source,
         db_now,
     )
 }
@@ -1128,6 +1389,7 @@ fn consume_takeover_bound_to_event(
     event_admission: TakeoverFenceAdmission,
     authorization_record: &AuthorizationRecord,
     authorization_id: &Id,
+    source: &VolumeTransitionSource,
     db_now: UnixMillis,
 ) -> Result<(VolumeRecord, AuthorizationRecord, TakeoverResult)> {
     validate_volume_record(record)?;
@@ -1135,7 +1397,12 @@ fn consume_takeover_bound_to_event(
     let VolumeAuthorization::Takeover(authorization) = &authorization_record.authorization else {
         return Err(AuthorityError::InvalidAuthorization);
     };
-    if &authorization.authorization_id != authorization_id
+    if source
+        != &(VolumeTransitionSource::Lifecycle {
+            operation_id: authorization.operation_id.clone(),
+            request_fingerprint: authorization.request_fingerprint.clone(),
+        })
+        || &authorization.authorization_id != authorization_id
         || &authorization.host_fence_event_id != event_id
         || authorization.volume_id != record.volume_id
     {
@@ -1189,6 +1456,7 @@ fn consume_takeover_bound_to_event(
     updated.lease_epoch = resulting_epoch;
     updated.lease_expires_at = Some(lease_expires_at);
     updated.last_transition = Some(LastVolumeTransition::Takeover {
+        source: source.clone(),
         authorization_id: authorization.authorization_id.clone(),
     });
     let updated_authorization = AuthorizationRecord {
@@ -1228,14 +1496,23 @@ pub fn begin_delete(
     record: &VolumeRecord,
     request: &BeginDeleteRequest,
 ) -> Result<(VolumeRecord, BeginDeleteResult)> {
+    begin_delete_with_source(record, &VolumeTransitionSource::Independent, request)
+}
+
+pub fn begin_delete_with_source(
+    record: &VolumeRecord,
+    source: &VolumeTransitionSource,
+    request: &BeginDeleteRequest,
+) -> Result<(VolumeRecord, BeginDeleteResult)> {
     validate_volume_record(record)?;
     if let Some(LastVolumeTransition::BeginDelete {
+        source: original_source,
         request: original,
         result,
     }) = record.last_transition.as_ref()
     {
         if original.delete_id == request.delete_id {
-            return if original == request {
+            return if original_source == source && original == request {
                 Ok((record.clone(), result.clone()))
             } else {
                 Err(AuthorityError::StaleTransition)
@@ -1272,6 +1549,7 @@ pub fn begin_delete(
     };
     updated.lease_epoch = resulting_epoch;
     updated.last_transition = Some(LastVolumeTransition::BeginDelete {
+        source: source.clone(),
         request: request.clone(),
         result: result.clone(),
     });
@@ -1289,6 +1567,29 @@ pub fn consume_disposable_root_delete(
     AuthorizationRecord,
     BeginDisposableDeleteConsumedReceipt,
 )> {
+    let source = authorization_transition_source(authorization_record, false)?;
+    consume_disposable_root_delete_with_source(
+        record,
+        host_fence_event,
+        authorization_record,
+        authorization_id,
+        &source,
+        db_now,
+    )
+}
+
+pub fn consume_disposable_root_delete_with_source(
+    record: &VolumeRecord,
+    host_fence_event: Option<&HostFenceEvent>,
+    authorization_record: &AuthorizationRecord,
+    authorization_id: &Id,
+    source: &VolumeTransitionSource,
+    db_now: UnixMillis,
+) -> Result<(
+    VolumeRecord,
+    AuthorizationRecord,
+    BeginDisposableDeleteConsumedReceipt,
+)> {
     validate_volume_record(record)?;
     if let Some(event) = host_fence_event {
         validate_host_fence_event(event)?;
@@ -1299,7 +1600,12 @@ pub fn consume_disposable_root_delete(
     else {
         return Err(AuthorityError::InvalidAuthorization);
     };
-    if &authorization.authorization_id != authorization_id
+    if source
+        != &(VolumeTransitionSource::Lifecycle {
+            operation_id: authorization.operation_id.clone(),
+            request_fingerprint: authorization.request_fingerprint.clone(),
+        })
+        || &authorization.authorization_id != authorization_id
         || authorization.volume_id != record.volume_id
     {
         return Err(AuthorityError::InvalidAuthorization);
@@ -1349,6 +1655,7 @@ pub fn consume_disposable_root_delete(
     updated.lease_epoch = resulting_epoch;
     updated.lease_expires_at = None;
     updated.last_transition = Some(LastVolumeTransition::BeginDisposableDelete {
+        source: source.clone(),
         authorization_id: authorization.authorization_id.clone(),
     });
     let updated_authorization = AuthorizationRecord {
@@ -1367,8 +1674,9 @@ pub fn complete_normal_delete(
     completed_at: UnixMillis,
 ) -> Result<DeleteCompletionReceipt> {
     validate_volume_record(record)?;
-    let Some(LastVolumeTransition::BeginDelete { request, result }) =
-        record.last_transition.as_ref()
+    let Some(LastVolumeTransition::BeginDelete {
+        request, result, ..
+    }) = record.last_transition.as_ref()
     else {
         return Err(if matches!(record.admin_state, VolumeAdminState::Active) {
             AuthorityError::AdminBusy
@@ -1396,7 +1704,9 @@ pub fn complete_disposable_root_delete(
     validate_volume_record(record)?;
     validate_authorization_record(authorization_record)?;
     let (
-        LastVolumeTransition::BeginDisposableDelete { authorization_id },
+        LastVolumeTransition::BeginDisposableDelete {
+            authorization_id, ..
+        },
         VolumeAuthorization::DisposableRootDelete(authorization),
         AuthorizationState::Consumed(consumed),
     ) = (
@@ -1551,12 +1861,17 @@ fn validate_disposable_authorization(
     authorization: &DisposableRootDeleteAuthorization,
 ) -> Result<()> {
     validate_stored_head(&authorization.expected_head)?;
-    if matches!(
-        &authorization.isolation_basis,
-        DisposableDeleteIsolationBasis::RuntimeStopped { node_id, .. }
-            if node_id != &authorization.authorized_node_id
-    ) {
-        return Err(AuthorityError::BackendUnknown);
+    if let DisposableDeleteIsolationBasis::LifecycleStrongStop {
+        node_id,
+        strong_stop_operation_id,
+        ..
+    } = &authorization.isolation_basis
+    {
+        if node_id != &authorization.authorized_node_id
+            || strong_stop_operation_id != &authorization.operation_id
+        {
+            return Err(AuthorityError::BackendUnknown);
+        }
     }
     Ok(())
 }
@@ -1586,8 +1901,8 @@ fn validate_disposable_event_basis(
     event: Option<&HostFenceEvent>,
 ) -> Result<()> {
     match (&authorization.isolation_basis, event) {
-        (DisposableDeleteIsolationBasis::RuntimeStopped { .. }, None) => Ok(()),
-        (DisposableDeleteIsolationBasis::HostFenceEvent { event_id }, Some(event))
+        (DisposableDeleteIsolationBasis::LifecycleStrongStop { .. }, None) => Ok(()),
+        (DisposableDeleteIsolationBasis::HostFenceEvent { event_id, .. }, Some(event))
             if event_id == &event.event_id =>
         {
             Ok(())
@@ -1610,7 +1925,7 @@ fn disposable_direct_postcondition(
         && record.head == receipt.resulting_head
         && matches!(
             &record.last_transition,
-            Some(LastVolumeTransition::BeginDisposableDelete { authorization_id })
+            Some(LastVolumeTransition::BeginDisposableDelete { authorization_id, .. })
                 if authorization_id == &authorization.authorization_id
         )
 }
@@ -1626,6 +1941,27 @@ fn takeover_result(
         resulting_epoch: receipt.resulting_epoch,
         resulting_head: receipt.resulting_head.clone(),
         lease_expires_at: checked_expiry(receipt.consumed_at, authorization.lease_duration_ms)?,
+    })
+}
+
+fn authorization_transition_source(
+    record: &AuthorizationRecord,
+    takeover: bool,
+) -> Result<VolumeTransitionSource> {
+    let (operation_id, request_fingerprint) = match (&record.authorization, takeover) {
+        (VolumeAuthorization::Takeover(authorization), true) => (
+            &authorization.operation_id,
+            &authorization.request_fingerprint,
+        ),
+        (VolumeAuthorization::DisposableRootDelete(authorization), false) => (
+            &authorization.operation_id,
+            &authorization.request_fingerprint,
+        ),
+        _ => return Err(AuthorityError::InvalidAuthorization),
+    };
+    Ok(VolumeTransitionSource::Lifecycle {
+        operation_id: operation_id.clone(),
+        request_fingerprint: request_fingerprint.clone(),
     })
 }
 
