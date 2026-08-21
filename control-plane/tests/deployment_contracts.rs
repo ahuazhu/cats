@@ -765,13 +765,23 @@ fn route_v2_deployment_wires_closed_artifact_sets_without_private_bytes_in_terra
     for expected in [
         "CATS_OBJECT_WRITE_GATEWAY_URL",
         "object_write_gateway_url",
-        "CATS_OBJECT_WRITE_GATEWAY_CA_FILE=/etc/cats/route-v2/node-server-ca-bundle.pem",
+        "CATS_OBJECT_WRITE_GATEWAY_CA_FILE=${local.object_write_gateway_ca_file}",
+        "object_write_gateway_ca_file",
     ] {
         assert!(
             worker.contains(expected) || worker_variables.contains(expected),
             "worker deployment lost ObjectWrite Gateway capability input {expected:?}"
         );
     }
+    assert_eq!(
+        worker.matches("\"/etc/cats/route-v2\"").count(),
+        1,
+        "the Route v2 install root must have one Terraform source"
+    );
+    assert!(
+        worker.contains("\"$route_v2_stage\" \"${local.route_v2_install_root}\""),
+        "the Route v2 installer and Gateway CA environment must share one install root"
+    );
     assert!(
         worker_variables
             .contains("object_write_gateway_url must be one canonical HTTPS DNS origin."),
