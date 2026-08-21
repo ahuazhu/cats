@@ -419,7 +419,7 @@ mod tests {
 
     #[test]
     fn startup_rejects_mismatch_ttl_and_expired_snapshot() {
-        let other = include_bytes!("../../tests/fixtures/route_grant_other_public_ed25519.pem");
+        let other = include_bytes!("../../tests/fixtures/route_grant_v2_other_public_ed25519.pem");
         assert!(RouteGrantV2Signer::from_ed25519_pem(PRIVATE_KEY, other, 120).is_err());
         assert!(RouteGrantV2Signer::from_ed25519_pem(PRIVATE_KEY, PUBLIC_KEY, 0).is_err());
         let signer = RouteGrantV2Signer::from_ed25519_pem(PRIVATE_KEY, PUBLIC_KEY, 120).unwrap();

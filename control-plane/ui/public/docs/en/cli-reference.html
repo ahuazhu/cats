@@ -3,6 +3,7 @@
 <tr><td><code>--api-url</code> / <code>CATS_API_URL</code></td><td>Control-plane base URL</td></tr>
 <tr><td><code>--workspace</code> / <code>CATS_WORKSPACE</code></td><td>Select one immutable Workspace for this command</td></tr>
 <tr><td><code>--token</code> / <code>CATS_TOKEN</code></td><td>Machine or administrator credential</td></tr>
+<tr><td><code>--no-wait</code></td><td>Print the accepted Operation ID without waiting for settlement</td></tr>
 <tr><td><code>--json</code></td><td>Print machine-readable output where supported</td></tr>
 </tbody></table>
 <p><code>cats --help</code> and <code>cats &lt;command&gt; --help</code> are version-authoritative.</p>
@@ -24,19 +25,27 @@ cats token revoke ID</code></pre>
                  [--root-size SIZE]
                  [--durability strict|relaxed]
 cats ls
-cats get CAT_ID</code></pre>
+cats get CAT_ID
+cats run CAT_ID
+cats suspend CAT_ID
+cats warm CAT_ID
+cats cold CAT_ID
+cats destroy CAT_ID</code></pre>
 <p><code>create</code> requires one digest-pinned boot image. It defaults to 2 CPUs, 2 GiB memory, a 1 GiB RootDisk, and Strict durability. List follows bounded cursors; item lookup accepts only immutable <code>cat_…</code> IDs.</p>
+<p>The five lifecycle commands for an existing Cat also require an immutable <code>cat_…</code> ID. The CLI persists the exact empty request and Idempotency-Key before sending it, and replays both after an ambiguous response. By default it waits on the returned Operation; <code>--no-wait</code> prints the Operation ID immediately. The retired <code>start</code>, <code>stop</code>, <code>delete</code>, and <code>resume</code> commands are not compatibility aliases.</p>
 
 <h2 id="disks">Current PersistentDisk commands</h2>
 <pre><code>cats disk create NAME --size SIZE [--durability strict|relaxed]
 cats disk ls
-cats disk get DISK_ID</code></pre>
-<p>The create request is persisted before transport. An ambiguous retry of the same command reuses the exact path, body, and Idempotency-Key. Capacity is immutable in this release. Disk item lookup accepts only immutable <code>disk_…</code> IDs.</p>
+cats disk get DISK_ID
+cats disk attach DISK_ID --cat CAT_ID --mount-path /absolute/guest/path
+cats disk detach DISK_ID --cat CAT_ID --mount-path /absolute/guest/path</code></pre>
+<p>Create, attach, and detach requests are persisted before transport. An ambiguous retry of the same command reuses the exact path, body, and Idempotency-Key. Capacity is immutable in this release. Disk item lookup accepts only immutable <code>disk_…</code> IDs; binding mutations require a terminal Cold Cat and an exact absolute Guest path.</p>
 
 <h2 id="operations">Operation commands</h2>
 <pre><code>cats operation get OPERATION_ID
 cats operation wait OPERATION_ID</code></pre>
-<p>Cat create returns an Operation ID. Both commands use the exact Workspace-scoped Operation lookup; there is no Operation list.</p>
+<p>Cat create and the five lifecycle commands return an Operation ID. Both Operation commands use the exact Workspace-scoped product lookup; there is no Operation list and no Node execution payload.</p>
 
 <h2 id="cutover">Cutover boundary</h2>
-<p>Lifecycle, Guest command, deployment, Endpoint, Cat delete, and PersistentDisk mutation commands are absent from shipped help. Compatibility parsing, where retained, fails before constructing an HTTP client and never probes a legacy route.</p>
+<p>Guest command, deployment, Endpoint, Disk delete, Snapshot, and capacity mutation commands are absent from shipped help. Retired lifecycle aliases are not parsed and never probe a legacy route.</p>

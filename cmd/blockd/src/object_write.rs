@@ -364,15 +364,23 @@ mod tests {
         object_write_private_file_fsync_receipt_id, ObjectWriteCredentialRegisteredArtifact,
         ObjectWriteCredentialRegistration, ObjectWriteCredentialRegistrationReceipt,
     };
+    use cats_api::runtime_lifecycle::{
+        DiskRole, PlacementIdentity, RuntimeVolumeConfig, RuntimeVolumeGuestBinding,
+    };
+    use cats_api::runtime_lifecycle_volume::{
+        LifecycleCommandStartVolumeGrantReceipt, LifecycleStartVolumeGrantAuthority,
+        LifecycleVolumeCommandScope,
+    };
     use cats_api::runtime_reconciliation::{
-        canonical_ed25519_spki_sha256, AcquireOrigin, Base64UrlNoPad, ContractVersion, Epoch,
-        FenceEpoch, Generation, Id, NodeBootId, NormalAcquireRequest, NormalAcquireResult,
-        RandomId128, RemoteHead, Revision, SessionBinding, Sha256Digest, UnixMillis,
+        canonical_ed25519_spki_sha256, Base64UrlNoPad, ContractVersion, Epoch, FenceEpoch,
+        Generation, Id, NodeBootId, NormalAcquireRequest, NormalAcquireResult, RandomId128,
+        RemoteHead, SessionBinding, Sha256Digest, UnixMillis, WireU64,
     };
     use cats_object_store_file::FileBlobStoreFactory;
     use cats_storage::authority::{
-        AttachmentLineageIdentity, AuthorizedServingAcquire, VolumeDurability,
+        authorized_serving_attachment_from_start_volume_grant, VolumeDurability,
     };
+    use cats_storage::lifecycle_volume::command_start_volume_grant_receipt_digest_from_closed_receipt;
     use cats_storage::{open_blob_store, AdapterConfig, BlobStoreFactory};
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
@@ -513,7 +521,6 @@ mod tests {
             transition_id: transition.clone(),
             attachment_id: id(ATTACHMENT_ID),
             expected_unowned_epoch: FenceEpoch::new(ATTACHMENT_EPOCH - 1).unwrap(),
-            desired_revision: Revision::new(5).unwrap(),
             placement_epoch: Epoch::new(2).unwrap(),
             lease_duration_ms: 5_000,
         };
@@ -525,24 +532,32 @@ mod tests {
             resulting_head: head.clone(),
             lease_expires_at: UnixMillis::new(1_900_000_005_000).unwrap(),
         };
-        AuthorizedServingAttachment {
-            identity: AttachmentLineageIdentity {
-                volume_id: request.volume_id.clone(),
-                attachment_id: request.attachment_id.clone(),
-                attachment_epoch: result.resulting_epoch,
-                acquire_origin: AcquireOrigin::Normal {
-                    transition_id: transition,
-                },
+        let grant = LifecycleCommandStartVolumeGrantReceipt {
+            scope: LifecycleVolumeCommandScope {
+                operation_id: id("operation_start_owgateway"),
+                request_fingerprint: Sha256Digest::from_bytes([5; 32]),
+                cat_id: id("cat_owgateway"),
                 node_id: id("node_owgateway"),
-                placement_epoch: request.placement_epoch,
+                placement_identity: PlacementIdentity {
+                    node_id: id("node_owgateway"),
+                    placement_epoch: request.placement_epoch,
+                },
             },
-            object_write_credential: credential,
-            size_bytes: 4 * 1024 * 1024,
-            durability: VolumeDurability::Strict,
-            head,
-            lease_expires_at: result.lease_expires_at,
-            acquire: AuthorizedServingAcquire::Normal { request, result },
-        }
+            grant_sequence: WireU64::new(0).unwrap(),
+            volume: RuntimeVolumeConfig {
+                volume_id: request.volume_id.clone(),
+                disk_id: id("disk_root_owgateway"),
+                disk_role: DiskRole::Root,
+                size_bytes: 4 * 1024 * 1024,
+                durability: VolumeDurability::Strict,
+                guest_device_serial: id("root-boot"),
+                guest_device_slot: 0,
+                guest_binding: RuntimeVolumeGuestBinding::RootBoot,
+            },
+            authority: LifecycleStartVolumeGrantAuthority::NormalAcquire { request, result },
+        };
+        let digest = command_start_volume_grant_receipt_digest_from_closed_receipt(&grant).unwrap();
+        authorized_serving_attachment_from_start_volume_grant(&grant, &digest, credential).unwrap()
     }
 
     /// One registered credential exactly as the Node publishes it: a 0700

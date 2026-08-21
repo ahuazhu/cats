@@ -10,6 +10,8 @@ use anyhow::{bail, Result};
 
 pub(crate) enum PreparedCatCreate {}
 
+pub(crate) enum PreparedCatLifecycle {}
+
 pub(crate) enum PreparedPersistentDiskCreate {}
 
 pub(crate) enum PreparedPersistentDiskBinding {}
@@ -18,6 +20,27 @@ pub(crate) enum PreparedPersistentDiskBinding {}
 pub(crate) enum PersistentDiskBindingAction {
     Attach,
     Detach,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatLifecycleAction {
+    Run,
+    Suspend,
+    Warm,
+    Cold,
+    Destroy,
+}
+
+impl CatLifecycleAction {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::Suspend => "suspend",
+            Self::Warm => "warm",
+            Self::Cold => "cold",
+            Self::Destroy => "destroy",
+        }
+    }
 }
 
 impl PersistentDiskBindingAction {
@@ -63,6 +86,55 @@ impl PreparedCatCreate {
     }
 
     pub(crate) fn body(&self) -> Result<Vec<u8>> {
+        match *self {}
+    }
+
+    pub(crate) fn assert_current(&self) -> Result<()> {
+        match *self {}
+    }
+
+    pub(crate) fn pending_path(&self) -> PathBuf {
+        match *self {}
+    }
+
+    pub(crate) fn clear(&self) -> Result<()> {
+        match *self {}
+    }
+}
+
+impl PreparedCatLifecycle {
+    pub(crate) fn prepare(
+        _origin: &str,
+        _workspace_id: &str,
+        _cat_id: &str,
+        _action: CatLifecycleAction,
+    ) -> Result<Self> {
+        bail!(
+            "durable Cat-lifecycle recovery is unavailable on this platform; no HTTP request was sent"
+        )
+    }
+
+    pub(crate) fn origin(&self) -> &str {
+        match *self {}
+    }
+
+    pub(crate) fn target(&self) -> &str {
+        match *self {}
+    }
+
+    pub(crate) fn idempotency_key(&self) -> &str {
+        match *self {}
+    }
+
+    pub(crate) fn workspace_id(&self) -> &str {
+        match *self {}
+    }
+
+    pub(crate) fn cat_id(&self) -> &cats_api::runtime_reconciliation::Id {
+        match *self {}
+    }
+
+    pub(crate) fn action(&self) -> CatLifecycleAction {
         match *self {}
     }
 
@@ -238,6 +310,17 @@ mod tests {
             "disk_01",
             PersistentDiskBindingAction::Attach,
             b"{}",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("no HTTP request was sent"));
+
+        let error = PreparedCatLifecycle::prepare(
+            "https://cats.run",
+            "ws_01",
+            "cat_01",
+            CatLifecycleAction::Run,
         )
         .err()
         .unwrap()

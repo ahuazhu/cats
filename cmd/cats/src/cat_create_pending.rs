@@ -32,6 +32,7 @@ const CONTENT_TYPE: &str = "application/json";
 const PENDING_MAX_BYTES: usize = 16 * 1024;
 const BODY_MAX_BYTES: usize = 4 * 1024;
 const CAT_STATE_DIRECTORY: &str = "cat-create-v2-authority-v1";
+const CAT_LIFECYCLE_STATE_DIRECTORY: &str = "cat-lifecycle-v1-authority-v1";
 const PERSISTENT_DISK_STATE_DIRECTORY: &str = "persistent-disk-create-v1-authority-v1";
 const PERSISTENT_DISK_BINDING_STATE_DIRECTORY: &str = "persistent-disk-binding-v2-authority-v1";
 
@@ -46,6 +47,12 @@ const CAT_NAMESPACE: PendingNamespace = PendingNamespace {
     description: "Cat-create",
     lock_scope: "cat-create-v2",
     file_prefix: "cat",
+};
+
+const CAT_LIFECYCLE_NAMESPACE: PendingNamespace = PendingNamespace {
+    description: "Cat-lifecycle",
+    lock_scope: "cat-lifecycle-v1",
+    file_prefix: "lifecycle",
 };
 
 const PERSISTENT_DISK_NAMESPACE: PendingNamespace = PendingNamespace {
@@ -65,6 +72,28 @@ const PERSISTENT_DISK_BINDING_NAMESPACE: PendingNamespace = PendingNamespace {
 pub(crate) enum PersistentDiskBindingAction {
     Attach,
     Detach,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CatLifecycleAction {
+    Run,
+    Suspend,
+    Warm,
+    Cold,
+    Destroy,
+}
+
+impl CatLifecycleAction {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::Suspend => "suspend",
+            Self::Warm => "warm",
+            Self::Cold => "cold",
+            Self::Destroy => "destroy",
+        }
+    }
 }
 
 impl PersistentDiskBindingAction {
@@ -693,6 +722,184 @@ impl PreparedPersistentDiskBinding {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatLifecyclePendingRecord {
+    version: u32,
+    origin: String,
+    authenticated_workspace_id: String,
+    cat_id: Id,
+    action: CatLifecycleAction,
+    method: String,
+    target: String,
+    idempotency_key: String,
+    request_sha256: String,
+}
+
+impl CatLifecyclePendingRecord {
+    fn new(
+        origin: &str,
+        workspace_id: &str,
+        cat_id: &str,
+        action: CatLifecycleAction,
+    ) -> Result<Self> {
+        let origin = canonical_api_origin(origin)?;
+        let workspace_id = canonical_workspace_id(workspace_id)?;
+        let cat_id = canonical_product_id(cat_id, "cat_", "Cat")?;
+        let record = Self {
+            version: STATE_VERSION,
+            origin,
+            target: cat_lifecycle_target(&workspace_id, &cat_id, action),
+            authenticated_workspace_id: workspace_id,
+            cat_id,
+            action,
+            method: METHOD.to_owned(),
+            idempotency_key: format!("cli-{}", uuid::Uuid::new_v4().simple()),
+            request_sha256: sha256_digest(&[]),
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.version == STATE_VERSION,
+            "pending Cat-lifecycle state has an unsupported version"
+        );
+        anyhow::ensure!(
+            canonical_api_origin(&self.origin)? == self.origin,
+            "pending Cat-lifecycle state contains a non-canonical API origin"
+        );
+        let workspace_id = canonical_workspace_id(&self.authenticated_workspace_id)?;
+        let cat_id = canonical_product_id(self.cat_id.as_str(), "cat_", "Cat")?;
+        anyhow::ensure!(
+            cat_id == self.cat_id
+                && self.method == METHOD
+                && self.target == cat_lifecycle_target(&workspace_id, &cat_id, self.action)
+                && self.request_sha256 == sha256_digest(&[]),
+            "pending Cat-lifecycle state changed its exact empty-body HTTP request binding"
+        );
+        validate_idempotency_key(&self.idempotency_key, "Cat-lifecycle")
+    }
+
+    fn validate_for_slot(&self, slot: &str) -> Result<()> {
+        self.validate()?;
+        anyhow::ensure!(
+            cat_lifecycle_request_slot(&self.authenticated_workspace_id, &self.cat_id) == slot,
+            "pending Cat-lifecycle state does not bind its storage slot"
+        );
+        Ok(())
+    }
+
+    fn binds(&self, desired: &Self) -> Result<bool> {
+        self.validate()?;
+        desired.validate()?;
+        Ok(self.origin == desired.origin
+            && self.authenticated_workspace_id == desired.authenticated_workspace_id
+            && self.cat_id == desired.cat_id
+            && self.action == desired.action
+            && self.method == desired.method
+            && self.target == desired.target
+            && self.request_sha256 == desired.request_sha256)
+    }
+}
+
+/// A held cross-process authority lock plus one exact persisted empty-body
+/// atomic lifecycle request. All six actions share one per-Cat slot so an
+/// unresolved response must be replayed before a different action is issued.
+pub(crate) struct PreparedCatLifecycle {
+    state: PendingState,
+    record: CatLifecyclePendingRecord,
+}
+
+impl PreparedCatLifecycle {
+    pub(crate) fn prepare(
+        origin: &str,
+        workspace_id: &str,
+        cat_id: &str,
+        action: CatLifecycleAction,
+    ) -> Result<Self> {
+        Self::prepare_in(
+            &cat_lifecycle_state_root()?,
+            origin,
+            workspace_id,
+            cat_id,
+            action,
+        )
+    }
+
+    fn prepare_in(
+        root: &Path,
+        origin: &str,
+        workspace_id: &str,
+        cat_id: &str,
+        action: CatLifecycleAction,
+    ) -> Result<Self> {
+        let desired = CatLifecyclePendingRecord::new(origin, workspace_id, cat_id, action)?;
+        let slot = cat_lifecycle_request_slot(&desired.authenticated_workspace_id, &desired.cat_id);
+        let state = PendingState::acquire(
+            root,
+            &desired.authenticated_workspace_id,
+            &desired.cat_id,
+            CAT_LIFECYCLE_NAMESPACE,
+            slot,
+        )?;
+        let record = match state.load_pending::<CatLifecyclePendingRecord>()? {
+            Some(existing) => {
+                anyhow::ensure!(
+                    existing.binds(&desired)?,
+                    "an unresolved Cat-lifecycle request for this Workspace and Cat is bound to a different origin, action, or path; no HTTP request was sent (pending {})",
+                    state.pending_path().display()
+                );
+                existing
+            }
+            None => {
+                desired.validate_for_slot(&state.slot)?;
+                state.publish_pending(&desired)?;
+                desired
+            }
+        };
+        record.validate_for_slot(&state.slot)?;
+        Ok(Self { state, record })
+    }
+
+    pub(crate) fn origin(&self) -> &str {
+        &self.record.origin
+    }
+
+    pub(crate) fn target(&self) -> &str {
+        &self.record.target
+    }
+
+    pub(crate) fn idempotency_key(&self) -> &str {
+        &self.record.idempotency_key
+    }
+
+    pub(crate) fn workspace_id(&self) -> &str {
+        &self.record.authenticated_workspace_id
+    }
+
+    pub(crate) fn cat_id(&self) -> &Id {
+        &self.record.cat_id
+    }
+
+    pub(crate) fn action(&self) -> CatLifecycleAction {
+        self.record.action
+    }
+
+    pub(crate) fn assert_current(&self) -> Result<()> {
+        self.state.assert_current_authority()
+    }
+
+    pub(crate) fn pending_path(&self) -> PathBuf {
+        self.state.pending_path()
+    }
+
+    pub(crate) fn clear(&self) -> Result<()> {
+        self.state.delete_pending()
+    }
+}
+
 pub(crate) fn canonical_api_origin(value: &str) -> Result<String> {
     let parsed = reqwest::Url::parse(value).context("invalid Cats API origin")?;
     let has_userinfo = value.split_once("://").is_some_and(|(_, remainder)| {
@@ -732,6 +939,13 @@ fn canonical_product_id(value: &str, prefix: &str, description: &str) -> Result<
 
 fn cat_create_target(workspace_id: &str) -> String {
     format!("/v1/workspaces/{workspace_id}/cats")
+}
+
+fn cat_lifecycle_target(workspace_id: &str, cat_id: &Id, action: CatLifecycleAction) -> String {
+    format!(
+        "/v1/workspaces/{workspace_id}/cats/{cat_id}/actions/{}",
+        action.as_str()
+    )
 }
 
 fn persistent_disk_create_target(workspace_id: &str) -> String {
@@ -872,6 +1086,20 @@ fn persistent_disk_state_root() -> Result<PathBuf> {
     Ok(parent.join(PERSISTENT_DISK_STATE_DIRECTORY))
 }
 
+fn cat_lifecycle_state_root() -> Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(root) = TEST_CAT_LIFECYCLE_STATE_ROOT.with(|slot| slot.borrow().clone()) {
+        return Ok(root);
+    }
+    #[cfg(test)]
+    if let Some(root) = std::env::var_os("CATS_TEST_CAT_LIFECYCLE_STATE_ROOT") {
+        return Ok(PathBuf::from(root));
+    }
+    let config = crate::config::config_path();
+    let parent = config.parent().context("Cats config path has no parent")?;
+    Ok(parent.join(CAT_LIFECYCLE_STATE_DIRECTORY))
+}
+
 fn persistent_disk_binding_state_root() -> Result<PathBuf> {
     #[cfg(test)]
     if let Some(root) = TEST_PERSISTENT_DISK_BINDING_STATE_ROOT.with(|slot| slot.borrow().clone()) {
@@ -891,12 +1119,39 @@ thread_local! {
     static TEST_STATE_ROOT: std::cell::RefCell<Option<PathBuf>> = const {
         std::cell::RefCell::new(None)
     };
+    static TEST_CAT_LIFECYCLE_STATE_ROOT: std::cell::RefCell<Option<PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
     static TEST_PERSISTENT_DISK_STATE_ROOT: std::cell::RefCell<Option<PathBuf>> = const {
         std::cell::RefCell::new(None)
     };
     static TEST_PERSISTENT_DISK_BINDING_STATE_ROOT: std::cell::RefCell<Option<PathBuf>> = const {
         std::cell::RefCell::new(None)
     };
+}
+
+#[cfg(test)]
+pub(crate) struct TestCatLifecycleStateRootGuard;
+
+#[cfg(test)]
+impl TestCatLifecycleStateRootGuard {
+    pub(crate) fn set(root: PathBuf) -> Self {
+        TEST_CAT_LIFECYCLE_STATE_ROOT.with(|slot| {
+            assert!(
+                slot.borrow().is_none(),
+                "Cat-lifecycle test state root is already set"
+            );
+            *slot.borrow_mut() = Some(root);
+        });
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestCatLifecycleStateRootGuard {
+    fn drop(&mut self) {
+        TEST_CAT_LIFECYCLE_STATE_ROOT.with(|slot| *slot.borrow_mut() = None);
+    }
 }
 
 #[cfg(test)]
@@ -1407,6 +1662,15 @@ fn request_slot(workspace_id: &str, name: &str) -> String {
     lowercase_hex(&hasher.finalize())
 }
 
+fn cat_lifecycle_request_slot(workspace_id: &str, cat_id: &Id) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"cats.cat-lifecycle-v1.pending-slot.v1\0");
+    hasher.update(workspace_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(cat_id.as_str().as_bytes());
+    lowercase_hex(&hasher.finalize())
+}
+
 fn persistent_disk_request_slot(workspace_id: &str, name: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"cats.persistent-disk-create-v1.pending-slot.v1\0");
@@ -1466,7 +1730,7 @@ mod tests {
 
     fn persistent_disk_body(size_bytes: u64) -> Vec<u8> {
         serde_json::to_vec(&PersistentDiskCreateV1Request {
-            durability: cats_api::resources::DiskDurability::Strict,
+            durability: cats_api::persistent_disk::DiskDurability::Strict,
             name: Id::new("data").unwrap(),
             size_bytes,
         })
@@ -1733,6 +1997,58 @@ mod tests {
         )
         .unwrap();
         assert_eq!(recovered.idempotency_key(), key);
+    }
+
+    #[test]
+    fn cat_lifecycle_restart_replays_exact_empty_request_and_blocks_contrary_action() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("lifecycle-state");
+        let first = PreparedCatLifecycle::prepare_in(
+            &root,
+            "https://CONTROL.example:443",
+            "ws_01",
+            "cat_01",
+            CatLifecycleAction::Warm,
+        )
+        .unwrap();
+        let key = first.idempotency_key().to_owned();
+        let pending_path = first.pending_path();
+        assert_eq!(
+            first.target(),
+            "/v1/workspaces/ws_01/cats/cat_01/actions/warm"
+        );
+        assert_eq!(first.cat_id(), &Id::new("cat_01").unwrap());
+        assert_eq!(first.action(), CatLifecycleAction::Warm);
+        drop(first);
+
+        let contrary = PreparedCatLifecycle::prepare_in(
+            &root,
+            "https://control.example",
+            "ws_01",
+            "cat_01",
+            CatLifecycleAction::Cold,
+        )
+        .err()
+        .unwrap();
+        assert!(contrary
+            .to_string()
+            .contains("different origin, action, or path"));
+
+        let replay = PreparedCatLifecycle::prepare_in(
+            &root,
+            "https://control.example",
+            "ws_01",
+            "cat_01",
+            CatLifecycleAction::Warm,
+        )
+        .unwrap();
+        assert_eq!(replay.idempotency_key(), key);
+        replay.clear().unwrap();
+        assert!(!pending_path.exists());
     }
 
     #[test]

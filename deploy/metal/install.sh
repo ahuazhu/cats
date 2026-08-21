@@ -18,6 +18,21 @@ GUEST_RUNTIME_RELEASE_SOURCE=${CATS_GUEST_RUNTIME_RELEASE_DIR:-}
   echo "CATS_GUEST_RUNTIME_RELEASE_DIR must name the qualified guest-runtime-release.v1 payload" >&2
   exit 1
 }
+for route_v2_artifact in \
+  gateway-workload-authority.v1.json \
+  gateway-client-ca-bundle.pem \
+  control-machine-server-certificate.pem \
+  control-machine-server-private-key.pem \
+  signer.v1.json \
+  public-key-ring.v1.json \
+  rotation-operator-trust.v1.json \
+  signer-private-key.pem
+do
+  [[ -f /etc/cats/route-v2/$route_v2_artifact ]] || {
+    echo "/etc/cats/route-v2/$route_v2_artifact missing: install the closed Route v2 control artifact set before Cats" >&2
+    exit 1
+  }
+done
 "$REPO/deploy/aws/metal/validate-node-identity-installation.sh"
 . "$REPO/deploy/aws/metal/worker-deployment-transaction.sh"
 
@@ -59,11 +74,10 @@ fi
 export CATS_NODE_SERVICE_NAME=cats-noded
 release_installer="$REPO/deploy/aws/metal/install-guest-runtime-release.sh"
 "$release_installer" verify "$GUEST_RUNTIME_RELEASE_SOURCE"
-metering_root=$(cats_worker_metering_root cats-noded)
-"$REPO/deploy/aws/metal/require-idle-worker.sh" "$metering_root" "$PREFIX/bin"
+cgroup_v2_root=$(cats_worker_cgroup_v2_root)
+"$REPO/deploy/aws/metal/require-idle-worker.sh" \
+  "$cgroup_v2_root" "$PREFIX/bin" /usr/local/bin/cloud-hypervisor
 release_transaction_active=0
-route_key_temp=""
-route_public_temp=""
 deployment_cleanup() {
   status=$?
   trap - EXIT INT TERM
@@ -72,8 +86,6 @@ deployment_cleanup() {
     cats_stop_node_service cats-noded >/dev/null 2>&1 || true
     "$release_installer" rollback >/dev/null 2>&1 || true
   fi
-  [[ -z $route_key_temp ]] || rm -f -- "$route_key_temp"
-  [[ -z $route_public_temp ]] || rm -f -- "$route_public_temp"
   exit "$status"
 }
 trap deployment_cleanup EXIT
@@ -81,13 +93,18 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 cats_acquire_worker_deployment_lock
 # The unlocked check above is only an early, non-mutating preflight. Recompute
-# the cgroup path after serialization and prove physical idle again immediately
+# the cgroup root after serialization and prove physical idle again immediately
 # before masking/stopping the service, because another deployment may have
 # started runtime children while this process waited for the Host lock.
-metering_root=$(cats_worker_metering_root cats-noded)
-"$REPO/deploy/aws/metal/require-idle-worker.sh" "$metering_root" "$PREFIX/bin"
+cgroup_v2_root=$(cats_worker_cgroup_v2_root)
+"$REPO/deploy/aws/metal/require-idle-worker.sh" \
+  "$cgroup_v2_root" "$PREFIX/bin" /usr/local/bin/cloud-hypervisor
 cats_gate_node_service cats-noded
 cats_worker_deployment_crash_probe after-mask-worker
+# `enable --now` does not restart an already-running service. Stop Control
+# before replacing its binary/unit so the process that later becomes Ready is
+# necessarily the mandatory Route v2 composition from this release.
+systemctl stop cats-controld.service >/dev/null 2>&1 || true
 
 install -D -m 0755 "$REPO/deploy/aws/metal/install-guest-runtime-release.sh" \
   "$PREFIX/bin/install-guest-runtime-release"
@@ -228,25 +245,6 @@ if [[ ! -f /etc/cats/cats.env ]]; then
   cats_worker_deployment_crash_probe after-install-cats-environment
   echo "    wrote /etc/cats/cats.env (edit for S3; defaults to local file blobstore)"
 fi
-
-# The single-host development shape owns one local signing key. Keep the
-# private half root-only and derive the public half on every install so the
-# files cannot silently drift apart. Production supplies the pair through its
-# separate control-plane and worker deployment states.
-if [[ ! -f /etc/cats/route-grant-private.pem ]]; then
-  route_key_temp=$(mktemp /var/tmp/cats-route-grant-private.XXXXXX)
-  openssl genpkey -algorithm ED25519 -out "$route_key_temp"
-  install -o root -g root -m 0600 "$route_key_temp" /etc/cats/route-grant-private.pem
-  cats_worker_deployment_crash_probe after-install-route-private-key
-  rm -f -- "$route_key_temp"
-  route_key_temp=""
-fi
-route_public_temp=$(mktemp /var/tmp/cats-route-grant-public.XXXXXX)
-openssl pkey -in /etc/cats/route-grant-private.pem -pubout -out "$route_public_temp"
-install -o root -g root -m 0644 "$route_public_temp" /etc/cats/route-grant-public.pem
-cats_worker_deployment_crash_probe after-install-route-public-key
-rm -f -- "$route_public_temp"
-route_public_temp=""
 
 echo "==> systemd units"
 # A host upgraded from the V1 development shape may still have the old

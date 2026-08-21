@@ -23,9 +23,12 @@ pub(crate) use cats_api::route_signing_operator::{
     RouteGrantV2SigningAuthorityCommand, RouteGrantV2SigningAuthorityCommandKind,
     RouteGrantV2SigningAuthorityCommandResult,
 };
+use cats_api::runtime_inventory::{
+    ObservedCommandJournal, ObservedRuntimePhysicalState, RuntimeInventoryBody,
+};
 use cats_api::runtime_reconciliation::{
-    key_ring_digest, Base64UrlNoPad, Epoch, Id, KeyId, LifecycleAdmission, NodeIdentityState,
-    RouteGateState, RuntimeSchedulingState, Sha256Digest, UnixMillis,
+    AgentSession, Base64UrlNoPad, Epoch, Id, KeyId, NodeIdentityState, RuntimeSchedulingState,
+    SessionBinding, Sha256Digest, UnixMillis,
 };
 use cats_storage::authority::AuthorityError;
 use postgres::{Row, Transaction};
@@ -35,13 +38,17 @@ use super::gateway_identity::lock_route_v2_machine_authority_exclusive;
 use super::gateway_identity::lock_route_v2_machine_authority_shared;
 use super::pg_codec::PgBigInt;
 use super::placement_policy::load_policy_unlocked;
+use super::route_signer::load_route_ring_ack_in;
 use super::rows::database_now;
 use super::rows::load_active_event_by_node_unlocked;
-use super::runtime_spine::{load_placement_admission_at_in, PlacementAdmissionLoad};
+use super::runtime_spine::{
+    load_runtime_full_inventory_for_update, runtime_full_inventory_is_fresh_at,
+    PLACEMENT_INVENTORY_MAX_AGE_MS,
+};
 use crate::route_grant_v2::InstalledRouteGrantV2SigningAuthority;
 use crate::store::agent_sessions::{
-    load_identity_by_node_for_update, load_provisioned_identities_after,
-    PROVISIONED_NODE_ID_PAGE_SIZE,
+    load_current_session_for_update, load_identity_by_node_for_update,
+    load_provisioned_identities_after, PROVISIONED_NODE_ID_PAGE_SIZE,
 };
 use crate::store::transaction::{
     AuthorityRequestDisposition, AuthorityTransactionError, AuthorityTxResult,
@@ -302,14 +309,6 @@ impl Store {
             lock_route_v2_machine_authority_shared(transaction)?;
             route_grant_v2_signer_is_current_in(transaction, binding)
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn route_grant_v2_signer_is_current_for_test(
-        &self,
-        binding: &RouteGrantV2SignerBinding,
-    ) -> Result<bool> {
-        self.route_grant_v2_signer_is_current(binding)
     }
 }
 
@@ -1944,15 +1943,16 @@ fn lock_current_provisioned_fleet(
     )>,
 > {
     // The singleton Route writer lock is always acquired first. These SHARE
-    // locks then close both a newly provisioned phantom and policy/session/
-    // full-observation drift until the signer pointer commits.
+    // locks then close a newly provisioned phantom and every durable
+    // session/inventory/lifecycle/Route fact consumed below until the signer
+    // pointer commits. Observation read models and legacy Desired tables are
+    // deliberately absent.
     transaction.batch_execute(
         "LOCK TABLE node_identities, runtime_node_placement_policies,
-                    current_agent_sessions, runtime_desired_read_states,
-                    runtime_observation_receive_states,
-                    runtime_admission_inventory_states,
-                    runtime_current_cat_observations,
-                    desired_runtime_specs, host_fence_events
+                    current_agent_sessions,
+                    runtime_full_inventory_attestations,
+                    route_node_ring_acks, cat_records, runtime_operations,
+                    endpoint_records, route_operations, host_fence_events
              IN SHARE MODE",
     )?;
     let mut identities = Vec::new();
@@ -1991,12 +1991,6 @@ fn all_schedulable_nodes_ack_ring(
     ring: &RouteGrantV2PublicKeyRingArtifact,
     now: UnixMillis,
 ) -> AuthorityTxResult<bool> {
-    let expected_digest = ring.digest().map_err(corrupt)?;
-    let expected_kids = ring
-        .keys
-        .iter()
-        .map(|entry| entry.kid.clone())
-        .collect::<Vec<_>>();
     for (identity, policy) in lock_current_provisioned_fleet(transaction)? {
         if policy.scheduling_state != RuntimeSchedulingState::Schedulable {
             continue;
@@ -2004,22 +1998,13 @@ fn all_schedulable_nodes_ack_ring(
         if load_active_event_by_node_unlocked(transaction, &identity.node_id)?.is_some() {
             return Ok(false);
         }
-        let PlacementAdmissionLoad::Accepted(admission) = load_placement_admission_at_in(
-            transaction,
-            &identity.node_id,
-            &policy.capabilities.guest_config_digest,
-            now,
-        )?
-        else {
+        let Some(session) = load_current_session_for_update(transaction, &identity.node_id)? else {
             return Ok(false);
         };
-        let observation = &admission.full_inventory_observation;
-        if admission.node_identity != identity
-            || observation.key_ring_version != Some(ring.ring_version)
-            || observation.key_ring_digest.as_ref() != Some(&expected_digest)
-            || observation.loaded_kids != expected_kids
-            || key_ring_digest(ring.ring_version, &observation.loaded_kids).map_err(corrupt)?
-                != expected_digest
+        if session.node_id != identity.node_id
+            || session.guest_config_digest != policy.capabilities.guest_config_digest
+            || session.lease_deadline_unix_ms <= now
+            || !node_ack_matches_ring(transaction, &session, ring, now)?
         {
             return Ok(false);
         }
@@ -2035,30 +2020,14 @@ fn all_provisioned_nodes_closed_or_fenced(
         if load_active_event_by_node_unlocked(transaction, &identity.node_id)?.is_some() {
             continue;
         }
-        let PlacementAdmissionLoad::Accepted(admission) = load_placement_admission_at_in(
-            transaction,
-            &identity.node_id,
-            &policy.capabilities.guest_config_digest,
-            now,
-        )?
-        else {
+        let Some(session) = load_current_session_for_update(transaction, &identity.node_id)? else {
             return Ok(false);
         };
-        if admission.node_identity != identity
-            || !admission.full_inventory_observation.residue.is_empty()
-            || admission
-                .full_inventory_observation
-                .runtimes
-                .iter()
-                .any(|runtime| {
-                    runtime.lifecycle_admission != LifecycleAdmission::Closed
-                        || runtime.platform_guards != 0
-                        || runtime.routes.iter().any(|route| {
-                            route.gate != RouteGateState::Closed
-                                || route.active_guards != 0
-                                || route.cancellation_pending
-                        })
-                })
+        if session.node_id != identity.node_id
+            || session.guest_config_digest != policy.capabilities.guest_config_digest
+            || session.lease_deadline_unix_ms <= now
+            || !node_route_machine_is_durably_closed(transaction, &identity.node_id)?
+            || !node_full_inventory_is_unambiguously_closed(transaction, &session, now)?
         {
             return Ok(false);
         }
@@ -2071,42 +2040,19 @@ fn all_provisioned_nodes_closed_or_fenced_and_ack_ring(
     ring: &RouteGrantV2PublicKeyRingArtifact,
     now: UnixMillis,
 ) -> AuthorityTxResult<bool> {
-    let expected_digest = ring.digest().map_err(corrupt)?;
-    let expected_kids = ring
-        .keys
-        .iter()
-        .map(|entry| entry.kid.clone())
-        .collect::<Vec<_>>();
     for (identity, policy) in lock_current_provisioned_fleet(transaction)? {
         if load_active_event_by_node_unlocked(transaction, &identity.node_id)?.is_some() {
             continue;
         }
-        let PlacementAdmissionLoad::Accepted(admission) = load_placement_admission_at_in(
-            transaction,
-            &identity.node_id,
-            &policy.capabilities.guest_config_digest,
-            now,
-        )?
-        else {
+        let Some(session) = load_current_session_for_update(transaction, &identity.node_id)? else {
             return Ok(false);
         };
-        let observation = &admission.full_inventory_observation;
-        if admission.node_identity != identity
-            || observation.key_ring_version != Some(ring.ring_version)
-            || observation.key_ring_digest.as_ref() != Some(&expected_digest)
-            || observation.loaded_kids != expected_kids
-            || key_ring_digest(ring.ring_version, &observation.loaded_kids).map_err(corrupt)?
-                != expected_digest
-            || !observation.residue.is_empty()
-            || observation.runtimes.iter().any(|runtime| {
-                runtime.lifecycle_admission != LifecycleAdmission::Closed
-                    || runtime.platform_guards != 0
-                    || runtime.routes.iter().any(|route| {
-                        route.gate != RouteGateState::Closed
-                            || route.active_guards != 0
-                            || route.cancellation_pending
-                    })
-            })
+        if session.node_id != identity.node_id
+            || session.guest_config_digest != policy.capabilities.guest_config_digest
+            || session.lease_deadline_unix_ms <= now
+            || !node_ack_matches_ring(transaction, &session, ring, now)?
+            || !node_route_machine_is_durably_closed(transaction, &identity.node_id)?
+            || !node_full_inventory_is_unambiguously_closed(transaction, &session, now)?
         {
             return Ok(false);
         }
@@ -2133,9 +2079,22 @@ pub(super) fn node_acks_current_published_ring_in(
     }
     let ring = &current.ring;
     let now = database_now(transaction)?;
-    let PlacementAdmissionLoad::Accepted(admission) =
-        load_placement_admission_at_in(transaction, node_id, active_guest_digest, now)?
-    else {
+    let Some(session) = load_current_session_for_update(transaction, node_id)? else {
+        return Ok(false);
+    };
+    Ok(session.node_id == *node_id
+        && session.guest_config_digest == *active_guest_digest
+        && session.lease_deadline_unix_ms > now
+        && node_ack_matches_ring(transaction, &session, ring, now)?)
+}
+
+fn node_ack_matches_ring(
+    transaction: &mut Transaction<'_>,
+    session: &AgentSession,
+    ring: &RouteGrantV2PublicKeyRingArtifact,
+    evaluated_at: UnixMillis,
+) -> AuthorityTxResult<bool> {
+    let Some(stored) = load_route_ring_ack_in(transaction, &session.node_id)? else {
         return Ok(false);
     };
     let expected_kids = ring
@@ -2143,21 +2102,94 @@ pub(super) fn node_acks_current_published_ring_in(
         .iter()
         .map(|entry| entry.kid.clone())
         .collect::<Vec<_>>();
-    let expected_digest = ring.digest().map_err(corrupt)?;
-    Ok(admission.node_identity.node_id == *node_id
-        && admission.full_inventory_observation.key_ring_version == Some(ring.ring_version)
-        && admission
-            .full_inventory_observation
-            .key_ring_digest
-            .as_ref()
-            == Some(&expected_digest)
-        && admission.full_inventory_observation.loaded_kids == expected_kids
-        && key_ring_digest(
-            ring.ring_version,
-            &admission.full_inventory_observation.loaded_kids,
-        )
-        .map_err(corrupt)?
-            == expected_digest)
+    Ok(stored.ack.session == session_binding(session)
+        && stored.accepted_at_unix_ms <= evaluated_at
+        && stored.ack.ring_version == ring.ring_version
+        && stored.ack.key_ring_digest == ring.digest().map_err(corrupt)?
+        && stored.ack.loaded_kids == expected_kids)
+}
+
+/// Durable Control authority must already say that this Node owns no Running
+/// lifecycle or current Route effect. Full inventory below is an additional
+/// physical ambiguity gate; it cannot manufacture this durable closure.
+fn node_route_machine_is_durably_closed(
+    transaction: &mut Transaction<'_>,
+    node_id: &Id,
+) -> AuthorityTxResult<bool> {
+    let row = transaction.query_one(
+        "SELECT NOT EXISTS (
+            SELECT 1 FROM runtime_operations r
+             WHERE r.node_id=$1 AND r.state='unresolved'
+            UNION ALL
+            SELECT 1 FROM cat_records c
+              JOIN runtime_operations r
+                ON r.operation_id=c.effective_runtime_ready_operation_id
+             WHERE r.node_id=$1
+               AND c.effective_runtime_ready_operation_id IS NOT NULL
+            UNION ALL
+            SELECT 1 FROM route_operations r
+             WHERE r.node_id=$1 AND r.state='unresolved'
+            UNION ALL
+            SELECT 1 FROM endpoint_records e
+              JOIN route_operations r
+                ON r.operation_id=e.effective_serving_operation_id
+             WHERE r.node_id=$1
+               AND e.effective_serving_operation_id IS NOT NULL
+        )",
+        &[&node_id.as_str()],
+    )?;
+    row.try_get(0).map_err(Into::into)
+}
+
+fn node_full_inventory_is_unambiguously_closed(
+    transaction: &mut Transaction<'_>,
+    session: &AgentSession,
+    evaluated_at: UnixMillis,
+) -> AuthorityTxResult<bool> {
+    let Some(inventory) = load_runtime_full_inventory_for_update(transaction, &session.node_id)?
+    else {
+        return Ok(false);
+    };
+    if !runtime_full_inventory_is_fresh_at(
+        &inventory,
+        session,
+        evaluated_at,
+        PLACEMENT_INVENTORY_MAX_AGE_MS,
+    )? {
+        return Ok(false);
+    }
+    let RuntimeInventoryBody::Full {
+        cats,
+        unattributed_artifacts,
+        ..
+    } = &inventory.full_report.inventory
+    else {
+        return Err(corrupt(
+            "full-inventory authority loader returned a partial report",
+        ));
+    };
+    Ok(unattributed_artifacts.is_empty()
+        && cats.iter().all(|cat| {
+            !matches!(
+                cat.observed_physical_state,
+                ObservedRuntimePhysicalState::Executing | ObservedRuntimePhysicalState::Ambiguous
+            ) && !matches!(
+                cat.observed_command_journal,
+                Some(
+                    ObservedCommandJournal::Accepted { .. }
+                        | ObservedCommandJournal::Executing { .. }
+                )
+            )
+        }))
+}
+
+fn session_binding(session: &AgentSession) -> SessionBinding {
+    SessionBinding {
+        node_id: session.node_id.clone(),
+        node_boot_id: session.node_boot_id.clone(),
+        agent_instance_id: session.agent_instance_id.clone(),
+        agent_session_epoch: session.agent_session_epoch,
+    }
 }
 
 pub(super) fn load_current_signer(

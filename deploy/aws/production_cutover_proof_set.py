@@ -1084,10 +1084,8 @@ class SubprocessUsageSchemaV16Verifier:
 class RouteV2RotationQualificationEvidenceVerifier:
     """Reviewed G3 typed verifier over the three exact rotation evidence files.
 
-    The producer is the dedicated qualification-cell runner
-    (``deploy/metal/runtime-cutover-e2e.sh`` driving
-    ``deploy/metal/runtime-cutover-v2-scenarios.sh``).  This adapter validates
-    the terminal receipt, the Node ring-ACK set and the transcript as one
+    The producer is a release-bound dedicated qualification cell. This adapter
+    validates the terminal receipt, the Node ring-ACK set and the transcript as one
     bound terminal set: exact kinds and case identity, exact release/catalog
     binding, the closed seven-phase signed command chain, both closed
     disable/recovery checkpoints, the recovered fresh-endpoint proof and the

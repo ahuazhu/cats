@@ -30,8 +30,10 @@ cat /proc/sys/kernel/random/boot_id
 
 On a reachable exact local Host, after maintenance admission is closed and the
 Node is cordoned/drained, run as root. The inventory supplies the exact
-machine-id digest, boot ID, `require-idle-worker` path, metering cgroup root,
-runtime binary root, units and executable paths:
+machine-id digest, boot ID, `require-idle-worker` path, cgroup-v2 mount root,
+runtime binary root, units and executable paths. The cgroup path must be the
+canonical cgroup2 mount root (normally `/sys/fs/cgroup`), never a delegated
+subtree:
 
 ```sh
 sudo python3 /absolute/reviewed/old-host-positive-stop.py local-stop \

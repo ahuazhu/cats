@@ -558,11 +558,6 @@ fn register_agent_session_in(
         ));
     }
 
-    crate::store::runtime_authority::host_fence_recovery_batch::require_product_mutation_unblocked_in(
-        transaction,
-        &identity.node_id,
-    )?;
-
     if identity.state != NodeIdentityState::Provisioned {
         return Ok(identity_rejected());
     }
@@ -788,43 +783,6 @@ pub(super) fn load_provisioned_identities_after(
                 ));
             }
             Ok(identity)
-        })
-        .collect()
-}
-
-/// Strictly decodes one bounded keyset page of the complete NodeIdentity
-/// history for a fleet-wide verification snapshot. Retired rows remain in
-/// the scan so projection corruption cannot hide behind a state predicate,
-/// but their unbounded history never becomes a fleet cardinality limit.
-pub(super) fn load_identity_history_after_for_fleet_verification(
-    transaction: &mut Transaction<'_>,
-    after: Option<&Id>,
-) -> AuthorityTxResult<Vec<(NodeIdentity, bool, bool)>> {
-    let sql = format!(
-        "SELECT {NODE_IDENTITY_COLUMNS},
-                EXISTS (
-                    SELECT 1 FROM current_agent_sessions AS session
-                     WHERE session.node_id=node_identities.node_id
-                ) AS has_current_session,
-                EXISTS (
-                    SELECT 1 FROM runtime_admission_inventory_states AS inventory
-                     WHERE inventory.node_id=node_identities.node_id
-                ) AS has_admission_inventory
-           FROM node_identities
-          WHERE ($1::TEXT IS NULL OR node_id COLLATE \"C\" > $1 COLLATE \"C\")
-          ORDER BY node_id COLLATE \"C\"
-          LIMIT $2"
-    );
-    let after = after.map(Id::as_str);
-    transaction
-        .query(&sql, &[&after, &PROVISIONED_NODE_ID_QUERY_LIMIT])?
-        .iter()
-        .map(|row| {
-            Ok((
-                decode_identity(row)?,
-                row.try_get("has_current_session")?,
-                row.try_get("has_admission_inventory")?,
-            ))
         })
         .collect()
 }

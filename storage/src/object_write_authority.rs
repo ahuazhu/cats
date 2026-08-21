@@ -2537,7 +2537,10 @@ mod tests {
             deployment_id: id("deployment-a"),
             release_id: id("release-a"),
             source_commit_sha: "a".repeat(40),
-            control_schema_version: WireU64::new(16).unwrap(),
+            control_schema_version: WireU64::new(
+                cats_api::object_write_gateway::OBJECT_WRITE_QUALIFICATION_CONTROL_SCHEMA_VERSION,
+            )
+            .unwrap(),
             qualification_catalog_sha256: Sha256Digest::from_bytes([4; 32]),
             admission_binding_sha256: Sha256Digest::from_bytes([6; 32]),
             admission_revision: Epoch::new(7).unwrap(),

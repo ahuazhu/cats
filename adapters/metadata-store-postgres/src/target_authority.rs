@@ -10,7 +10,7 @@ use std::sync::{mpsc, Arc};
 use cats_storage::authority::{
     compare_and_swap_head, project_volume_record, renew_lease, validate_volume_owner_binding,
     AuthorityError, Epoch, FenceEpoch, Generation, Id, NodeVolumeInventoryRecord,
-    NodeVolumeInventorySnapshot, RenewLeaseRequest, RenewLeaseResult, Revision,
+    NodeVolumeInventorySnapshot, RenewLeaseRequest, RenewLeaseResult,
     RuntimeVolumeInventoryAuthority, UnixMillis, VolumeDataAuthority, VolumeHeadCasRequest,
     VolumeHeadCasResult, VolumeOwnerBinding, VolumeRecord, VolumeRecordProjection,
     AUTHORITY_RELEASE_SCHEMA_VERSION, MAX_NODE_OWNED_VOLUMES,
@@ -27,7 +27,8 @@ const VOLUME_COLUMNS: &str = "
     volume_id, record::text AS record_json, size_bytes, durability,
     admin_state, delete_id, head_generation, head_root_hash,
     head_root_object_id, lease_owner, lease_epoch, lease_expires_at,
-    last_transition_kind, last_transition_id, transition_desired_revision,
+    last_transition_kind, last_transition_id, transition_source_kind,
+    transition_operation_id, transition_request_fingerprint,
     transition_placement_epoch, transition_lease_duration_ms,
     owner_binding::text AS owner_binding_json, owner_node_id";
 
@@ -501,10 +502,6 @@ fn update_volume(
         .lease_expires_at
         .map(|value| to_pg(value.get()))
         .transpose()?;
-    let transition_revision = projection
-        .transition_desired_revision
-        .map(|value| to_pg(value.get()))
-        .transpose()?;
     let transition_placement = projection
         .transition_placement_epoch
         .map(|value| to_pg(value.get()))
@@ -521,9 +518,10 @@ fn update_volume(
                 head_root_hash=$8, head_root_object_id=$9, lease_owner=$10,
                 lease_epoch=$11, lease_expires_at=$12,
                 last_transition_kind=$13, last_transition_id=$14,
-                transition_desired_revision=$15,
-                transition_placement_epoch=$16,
-                transition_lease_duration_ms=$17
+                transition_source_kind=$15, transition_operation_id=$16,
+                transition_request_fingerprint=$17,
+                transition_placement_epoch=$18,
+                transition_lease_duration_ms=$19
               WHERE volume_id=$1",
             &[
                 &projection.volume_id,
@@ -540,7 +538,9 @@ fn update_volume(
                 &lease_expires_at,
                 &projection.last_transition_kind,
                 &projection.last_transition_id,
-                &transition_revision,
+                &projection.transition_source_kind,
+                &projection.transition_operation_id,
+                &projection.transition_request_fingerprint,
                 &transition_placement,
                 &transition_duration,
             ],
@@ -624,9 +624,11 @@ fn projection_from_row(row: &Row) -> Result<VolumeRecordProjection, AuthorityErr
             .transpose()?,
         last_transition_kind,
         last_transition_id: optional_string(row, "last_transition_id")?,
-        transition_desired_revision: optional_integer(row, "transition_desired_revision")?
-            .map(revision)
+        transition_source_kind: optional_string(row, "transition_source_kind")?
+            .map(|value| static_str(value, &["independent", "lifecycle"]))
             .transpose()?,
+        transition_operation_id: optional_string(row, "transition_operation_id")?,
+        transition_request_fingerprint: optional_string(row, "transition_request_fingerprint")?,
         transition_placement_epoch: optional_integer(row, "transition_placement_epoch")?
             .map(epoch)
             .transpose()?,
@@ -690,13 +692,6 @@ fn fence_epoch(value: i64) -> Result<FenceEpoch, AuthorityError> {
         .ok_or(AuthorityError::BackendUnknown)
 }
 
-fn revision(value: i64) -> Result<Revision, AuthorityError> {
-    u64::try_from(value)
-        .ok()
-        .and_then(Revision::new)
-        .ok_or(AuthorityError::BackendUnknown)
-}
-
 fn epoch(value: i64) -> Result<Epoch, AuthorityError> {
     u64::try_from(value)
         .ok()
@@ -722,6 +717,7 @@ mod tests {
     use cats_control_plane::store::Store;
     use cats_storage::authority::{
         AsciiText, LastVolumeTransition, Sha256Digest, VolumeAdminState, VolumeDurability,
+        VolumeTransitionSource,
     };
     use postgres::NoTls;
 
@@ -804,6 +800,7 @@ mod tests {
             // Deliberately expired: expiry lapse alone is not fencing.
             lease_expires_at: Some(unix_millis(1)),
             last_transition: Some(LastVolumeTransition::Takeover {
+                source: VolumeTransitionSource::Independent,
                 authorization_id: id("takeover-target-authority"),
             }),
         }
@@ -840,9 +837,6 @@ mod tests {
         let lease_expires_at = projection
             .lease_expires_at
             .map(|value| to_pg(value.get()).unwrap());
-        let transition_revision = projection
-            .transition_desired_revision
-            .map(|value| to_pg(value.get()).unwrap());
         let transition_placement = projection
             .transition_placement_epoch
             .map(|value| to_pg(value.get()).unwrap());
@@ -870,12 +864,13 @@ mod tests {
                     head_generation, head_root_hash, head_root_object_id,
                     lease_owner, lease_epoch, lease_expires_at,
                     last_transition_kind, last_transition_id,
-                    transition_desired_revision, transition_placement_epoch,
+                    transition_source_kind, transition_operation_id,
+                    transition_request_fingerprint, transition_placement_epoch,
                     transition_lease_duration_ms, owner_binding, owner_node_id
                  ) VALUES (
                     $1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9,
-                    $10, $11, $12, $13, $14, $15, $16, $17,
-                    $18::TEXT::jsonb, $19
+                    $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
+                    $20::TEXT::jsonb, $21
                  )",
                 &[
                     &projection.volume_id,
@@ -892,7 +887,9 @@ mod tests {
                     &lease_expires_at,
                     &projection.last_transition_kind,
                     &projection.last_transition_id,
-                    &transition_revision,
+                    &projection.transition_source_kind,
+                    &projection.transition_operation_id,
+                    &projection.transition_request_fingerprint,
                     &transition_placement,
                     &transition_duration,
                     &owner_binding_json,
@@ -913,8 +910,8 @@ mod tests {
                 "INSERT INTO volume_records (
                     volume_id, record, size_bytes, durability, admin_state,
                     head_generation, lease_owner, lease_epoch, lease_expires_at,
-                    last_transition_kind, last_transition_id, owner_binding,
-                    owner_node_id
+                    last_transition_kind, last_transition_id,
+                    transition_source_kind, owner_binding, owner_node_id
                  )
                  SELECT
                     'generated-volume-' || value,
@@ -933,12 +930,13 @@ mod tests {
                         'lease_expires_at', 9999999999999,
                         'last_transition', jsonb_build_object(
                             'kind', 'takeover',
+                            'source', jsonb_build_object('kind', 'independent'),
                             'authorization_id', 'generated-auth-' || value
                         )
                     ),
                     4096, 'strict', 'active', 0,
                     'generated-attachment-' || value, 1, 9999999999999,
-                    'takeover', 'generated-auth-' || value,
+                    'takeover', 'generated-auth-' || value, 'independent',
                     jsonb_build_object(
                         'volume_id', 'generated-volume-' || value,
                         'owner_node_id', $1::text,

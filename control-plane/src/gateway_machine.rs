@@ -136,26 +136,6 @@ impl GatewayMachineListener {
         service?;
         listener
     }
-
-    #[cfg(test)]
-    pub(crate) async fn wait_until_stopped_for_test(&self) {
-        tokio::time::timeout(cats_test_support::poll_bound(), async {
-            loop {
-                let stopped = self
-                    .task
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .as_ref()
-                    .is_none_or(tokio::task::JoinHandle::is_finished);
-                if stopped {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("Gateway machine listener did not stop after fatal signer drift");
-    }
 }
 
 impl Drop for GatewayMachineListener {

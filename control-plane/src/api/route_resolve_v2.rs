@@ -62,13 +62,6 @@ pub(crate) struct AuthenticatedGatewayPrincipal {
     _private: (),
 }
 
-#[cfg(test)]
-impl AuthenticatedGatewayPrincipal {
-    pub(crate) const fn for_test() -> Self {
-        Self { _private: () }
-    }
-}
-
 /// Post-transport dependencies for one resolve lane. Keeping these separate
 /// from [`AppState`] lets the machine-authenticated listener compose exactly
 /// this route without inheriting the public API's bearer/session middleware.
@@ -193,13 +186,6 @@ impl RouteResolveV2Admission {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .active
     }
-
-    #[cfg(test)]
-    fn exhaust_for_test(&self) -> tokio::sync::OwnedSemaphorePermit {
-        Arc::clone(&self.permits)
-            .try_acquire_many_owned(self.permits.available_permits() as u32)
-            .expect("test admission permits are available")
-    }
 }
 
 struct RouteResolveV2Lease {
@@ -273,71 +259,6 @@ impl RouteResolveV2Service {
             #[cfg(test)]
             store_pause: Mutex::new(None),
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        store: Arc<Store>,
-        route_grant_signer: Arc<crate::route_grant_v2::RouteGrantV2Signer>,
-        active_guest_digest: cats_api::runtime_reconciliation::Sha256Digest,
-    ) -> Self {
-        Self {
-            store,
-            route_grant_signer: Some(route_grant_signer),
-            route_grant_signer_binding: None,
-            active_guest_digest,
-            authentication_admission: Arc::new(RouteResolveV2Admission::new(32)),
-            admission: Arc::new(RouteResolveV2Admission::new(32)),
-            machine_control: None,
-            test_authentication_bypass: true,
-            store_pause: Mutex::new(None),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn without_signer_for_test(
-        store: Arc<Store>,
-        active_guest_digest: cats_api::runtime_reconciliation::Sha256Digest,
-    ) -> Self {
-        Self {
-            store,
-            route_grant_signer: None,
-            route_grant_signer_binding: None,
-            active_guest_digest,
-            authentication_admission: Arc::new(RouteResolveV2Admission::new(32)),
-            admission: Arc::new(RouteResolveV2Admission::new(32)),
-            machine_control: None,
-            test_authentication_bypass: true,
-            store_pause: Mutex::new(None),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn exhaust_admission_for_test(&self) -> tokio::sync::OwnedSemaphorePermit {
-        self.admission.exhaust_for_test()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn active_requests_for_test(&self) -> usize {
-        self.admission.active_count()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pause_store_after_start_for_test(
-        &self,
-        entered: Arc<std::sync::Barrier>,
-        release: Arc<std::sync::Barrier>,
-    ) {
-        *self
-            .store_pause
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(RouteResolveV2StorePause { entered, release });
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn shutdown_for_test(&self) -> anyhow::Result<()> {
-        self.shutdown().await
     }
 
     pub(crate) fn begin_shutdown(&self) {
@@ -722,9 +643,9 @@ fn authority_rejection_response(rejection: RouteGrantV2AuthorityRejection) -> Re
         RouteGrantV2AuthorityRejection::Gone => {
             rejection_response(StatusCode::GONE, RouteResolveV2RejectionCode::Gone, &[])
         }
-        RouteGrantV2AuthorityRejection::WakeRequired => rejection_response(
+        RouteGrantV2AuthorityRejection::RunRequired => rejection_response(
             StatusCode::CONFLICT,
-            RouteResolveV2RejectionCode::WakeRequired,
+            RouteResolveV2RejectionCode::RunRequired,
             &[],
         ),
         RouteGrantV2AuthorityRejection::Pending => rejection_response(

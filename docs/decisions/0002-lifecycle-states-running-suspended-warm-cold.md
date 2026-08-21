@@ -2,7 +2,7 @@
 
 - 状态：Accepted
 - 日期：2026-07-21
-- 协调协议：[ADR-0040](0040-level-triggered-runtime-reconciliation.md)
+- 协调协议：[ADR-0056](0056-atomic-per-cat-runtime-lifecycle.md)；ADR-0040 coordination已被取代
 
 ## 决定
 
@@ -44,10 +44,9 @@ drain 后的 Cold boot。完整资源与屏障说明见 [`runtime-lifecycle.md`]
 
 ## 协调接口
 
-PostgreSQL 保存带 `desired_revision` 的稳定目标；Node 每 Cat 串行检查物理事实并收敛；
-observation 携带 applied revision、placement epoch、runtime incarnation、Condition 和逐卷
-`R/L`。Operation 只由同 revision 的目标 postcondition 结算。通知、响应丢失和组件重启不改变
-四态定义或上述屏障。
+PostgreSQL每Cat最多admit一条unresolved atomic lifecycle Operation；Node以durable journal执行并返回exact
+terminal result，Control只用该result结算。Observation只做telemetry。typed predecessor、response-loss replay与
+Route interlock由ADR-0056冻结；它们不改变四态定义或上述数据屏障。
 
 ## 证据边界
 

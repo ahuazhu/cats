@@ -16,7 +16,7 @@ use cats_api::chunk::{CHUNKS_PER_LEAF, CHUNK_SIZE};
 use cats_api::runtime_reconciliation::{
     decode_provision_root_image_result, encode_provision_root_image_request, AcquireOrigin,
     AsciiText, Epoch, FenceEpoch, Generation, Id, NormalAcquireRequest, NormalAcquireResult,
-    ProvisionRootImageRequest, RandomId128, RemoteHead, Revision, Sha256Digest,
+    ProvisionRootImageRequest, RandomId128, RemoteHead, Sha256Digest,
     PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES,
 };
 use cats_blockd::format::{self, LeafRef};
@@ -25,12 +25,15 @@ use cats_control_plane::store::Store;
 use cats_metadata_store_postgres::PostgresVolumeDataAuthority;
 use cats_object_store_file::FileBlobStore;
 use cats_storage::authority::{
-    project_volume_record, AttachmentLineageIdentity, AuthorizedServingAcquire,
-    AuthorizedServingAttachment, LastVolumeTransition, UnixMillis, VolumeAdminState,
-    VolumeDataAuthority, VolumeDurability, VolumeOwnerBinding, VolumeRecord,
+    project_volume_record, AuthorizedServingAttachment, LastVolumeTransition, UnixMillis,
+    VolumeAdminState, VolumeDataAuthority, VolumeDurability, VolumeOwnerBinding, VolumeRecord,
 };
 use cats_storage::BlobStore;
 use postgres::{Client, NoTls};
+
+#[path = "support/lifecycle_volume.rs"]
+mod lifecycle_volume;
+use lifecycle_volume::TestLifecycleScope;
 
 const VOLUME_ID: &str = "vol_root_provision";
 const ATTACHMENT_ID: &str = "att_root_provision";
@@ -61,10 +64,13 @@ impl Env {
         let canonical_root = dir.path().canonicalize().unwrap();
         let blob = Arc::new(FileBlobStore::open(canonical_root.join("blob")).unwrap());
         let postgres_url = cats_control_plane::testsupport::isolated_control_store_url();
-        drop(Store::connect(&postgres_url, None).unwrap());
+        let store = Store::connect(&postgres_url, None).unwrap();
+        let scope = TestLifecycleScope::new(ACQUIRE_TRANSITION, NODE_ID, Epoch::new(3).unwrap());
+        scope.seed_operation(&store, &postgres_url);
+        drop(store);
         let mut postgres = Client::connect(&postgres_url, NoTls).unwrap();
         let epoch = 7;
-        insert_volume(&mut postgres, &owned_volume(epoch));
+        insert_volume(&mut postgres, &owned_volume(epoch, &scope));
         assert_legacy_metadata_absent(&mut postgres);
 
         let image = canonical_root.join("root.img");
@@ -86,7 +92,7 @@ impl Env {
         provision_installed_directory(&owner_directory, 0o700);
         let owner_metadata = std::fs::symlink_metadata(&owner_directory).unwrap();
         let owner_directory_identity = (owner_metadata.dev(), owner_metadata.ino());
-        let attachment = authorized_attachment(epoch);
+        let attachment = authorized_attachment(epoch, &scope);
         let data_dir = canonical_root.join("control-data");
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -248,7 +254,7 @@ fn provision_installed_directory(path: &Path, mode: u32) {
     );
 }
 
-fn owned_volume(epoch: i64) -> VolumeRecord {
+fn owned_volume(epoch: i64, scope: &TestLifecycleScope) -> VolumeRecord {
     let (request, result) = acquire_receipt(epoch);
     VolumeRecord {
         volume_id: Id::new(VOLUME_ID).unwrap(),
@@ -262,8 +268,12 @@ fn owned_volume(epoch: i64) -> VolumeRecord {
         },
         lease_owner: Some(Id::new(ATTACHMENT_ID).unwrap()),
         lease_epoch: FenceEpoch::new(u64::try_from(epoch).unwrap()).unwrap(),
-        lease_expires_at: Some(UnixMillis::new(1).unwrap()),
-        last_transition: Some(LastVolumeTransition::NormalAcquire { request, result }),
+        lease_expires_at: Some(result.lease_expires_at),
+        last_transition: Some(LastVolumeTransition::NormalAcquire {
+            source: scope.source(),
+            request,
+            result,
+        }),
     }
 }
 
@@ -273,7 +283,6 @@ fn acquire_receipt(epoch: i64) -> (NormalAcquireRequest, NormalAcquireResult) {
         transition_id: RandomId128::new(ACQUIRE_TRANSITION).unwrap(),
         attachment_id: Id::new(ATTACHMENT_ID).unwrap(),
         expected_unowned_epoch: FenceEpoch::new(u64::try_from(epoch - 1).unwrap()).unwrap(),
-        desired_revision: Revision::new(5).unwrap(),
         placement_epoch: Epoch::new(3).unwrap(),
         lease_duration_ms: 60_000,
     };
@@ -283,34 +292,16 @@ fn acquire_receipt(epoch: i64) -> (NormalAcquireRequest, NormalAcquireResult) {
         attachment_id: request.attachment_id.clone(),
         resulting_epoch: FenceEpoch::new(u64::try_from(epoch).unwrap()).unwrap(),
         resulting_head: blank_head(),
-        lease_expires_at: UnixMillis::new(1_900_000_060_000).unwrap(),
+        // Control-only startup must exercise a real database-time renewal;
+        // keep the immutable acquire expired rather than inventing a future
+        // expiry that a shorter exact renewal could not reproduce.
+        lease_expires_at: UnixMillis::new(request.lease_duration_ms).unwrap(),
     };
     (request, result)
 }
 
-fn authorized_attachment(epoch: i64) -> AuthorizedServingAttachment {
-    let (acquire_request, acquire_result) = acquire_receipt(epoch);
-    AuthorizedServingAttachment {
-        identity: AttachmentLineageIdentity {
-            volume_id: acquire_request.volume_id.clone(),
-            attachment_id: acquire_request.attachment_id.clone(),
-            attachment_epoch: acquire_result.resulting_epoch,
-            acquire_origin: AcquireOrigin::Normal {
-                transition_id: acquire_request.transition_id.clone(),
-            },
-            node_id: Id::new("node_a").unwrap(),
-            placement_epoch: acquire_request.placement_epoch,
-        },
-        object_write_credential: None,
-        size_bytes: VOLUME_SIZE,
-        durability: VolumeDurability::Strict,
-        head: blank_head(),
-        lease_expires_at: acquire_result.lease_expires_at,
-        acquire: AuthorizedServingAcquire::Normal {
-            request: acquire_request,
-            result: acquire_result,
-        },
-    }
+fn authorized_attachment(epoch: i64, scope: &TestLifecycleScope) -> AuthorizedServingAttachment {
+    scope.authorized_root_attachment(&owned_volume(epoch, scope), "disk_root", "root-boot")
 }
 
 fn blank_head() -> RemoteHead {
@@ -329,9 +320,6 @@ fn insert_volume(client: &mut Client, record: &VolumeRecord) {
     let lease_epoch = i64::try_from(projection.lease_epoch.get()).unwrap();
     let lease_expires_at = projection
         .lease_expires_at
-        .map(|value| i64::try_from(value.get()).unwrap());
-    let transition_revision = projection
-        .transition_desired_revision
         .map(|value| i64::try_from(value.get()).unwrap());
     let transition_placement = projection
         .transition_placement_epoch
@@ -353,12 +341,13 @@ fn insert_volume(client: &mut Client, record: &VolumeRecord) {
                 head_generation, head_root_hash, head_root_object_id,
                 lease_owner, lease_epoch, lease_expires_at,
                 last_transition_kind, last_transition_id,
-                transition_desired_revision, transition_placement_epoch,
+                transition_source_kind, transition_operation_id,
+                transition_request_fingerprint, transition_placement_epoch,
                 transition_lease_duration_ms, owner_binding, owner_node_id
              ) VALUES (
                 $1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9,
-                $10, $11, $12, $13, $14, $15, $16, $17,
-                $18::TEXT::jsonb, $19
+                $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
+                $20::TEXT::jsonb, $21
              )",
             &[
                 &projection.volume_id,
@@ -375,7 +364,9 @@ fn insert_volume(client: &mut Client, record: &VolumeRecord) {
                 &lease_expires_at,
                 &projection.last_transition_kind,
                 &projection.last_transition_id,
-                &transition_revision,
+                &projection.transition_source_kind,
+                &projection.transition_operation_id,
+                &projection.transition_request_fingerprint,
                 &transition_placement,
                 &transition_duration,
                 &owner_binding_json,

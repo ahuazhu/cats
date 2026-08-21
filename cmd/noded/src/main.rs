@@ -1,13 +1,24 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use cats_node_agent::ch::{BlockPath, ChConfig};
+use cats_node_agent::lifecycle_command::installed::{
+    installed_atomic_lifecycle_executor, installed_atomic_start_runtime_port,
+    InstalledAtomicColdDeletePort, InstalledAtomicLifecycleConfig,
+    InstalledAtomicStartBlockdConfig, InstalledAtomicStartObjectWriteMode,
+    InstalledAtomicStartRuntimeConfig, InstalledAtomicStartVolumePort,
+    InstalledColdDeleteLocalPort, InstalledLifecycleKernelNbdConfig,
+    InstalledPhysicalInspectionConfig, InstalledSuspendWarmPlatform,
+};
+use cats_node_agent::lifecycle_volume_client::LifecycleVolumeHttpClient;
 use cats_node_agent::route_v2_machine::RouteV2MachineConfig;
-use cats_node_agent::runtime::reconciliation::AuthorizedBlockdLaunchConfig;
 use cats_node_agent::runtime_cutover::{spawn_signed_runtime_cutover, SignedRuntimeCutoverConfig};
-use cats_node_agent::runtime_spine::RuntimeSpineDeadlinePolicy;
+use cats_node_agent::runtime_inventory::{
+    ProductionRuntimeInventorySource, RuntimeInventoryForceFullCoordinator, StartupInventoryCache,
+};
 use cats_object_store_aws_s3::AwsS3BlobStoreFactory;
 use cats_object_store_file::FileBlobStoreFactory;
 use cats_storage::{open_blob_store, AdapterConfig, AdapterSelection, BlobStoreFactory};
@@ -26,15 +37,13 @@ struct Args {
         default_value = cats_api::route_grant_v2::ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH
     )]
     route_v2_public_key_ring_file: PathBuf,
-    /// Independent TLS listener for authenticated Gateway Route v2 tunnels.
-    /// Absence keeps this ingress closed and does not read its fixed artifacts.
+    /// Mandatory TLS listener for authenticated Gateway Route v2 tunnels.
     #[arg(long, env = "CATS_ROUTE_V2_MACHINE_LISTEN")]
-    route_v2_machine_listen: Option<String>,
+    route_v2_machine_listen: String,
     /// Server-authenticated HTTPS origin for adjacent Route v2 ring delivery.
-    /// It is mandatory with the machine listener and is independent from the
-    /// public management Control origin.
+    /// It is independent from the public management Control origin.
     #[arg(long, env = "CATS_ROUTE_V2_ROTATION_ORIGIN")]
-    route_v2_rotation_origin: Option<String>,
+    route_v2_rotation_origin: String,
     /// Bare HTTPS origin of the ObjectWrite Gateway. A production worker is
     /// denied direct object-store writes by IAM, so this is the only path by
     /// which a serving process can publish; it is independent from the public
@@ -67,8 +76,52 @@ struct Args {
     guest_runtime_profile_receipt_file: Option<PathBuf>,
     #[arg(long)]
     blockd_bin: PathBuf,
-    #[arg(long)]
-    guest_agent_bin: PathBuf,
+    /// Installed `systemctl` used for exact Cat-slice discovery and Stop.
+    #[arg(
+        long,
+        env = "CATS_RUNTIME_SYSTEMCTL_BIN",
+        default_value = "/usr/bin/systemctl"
+    )]
+    runtime_systemctl_bin: PathBuf,
+    /// Installed `systemd-run` used to create command-scoped child services.
+    #[arg(
+        long,
+        env = "CATS_RUNTIME_SYSTEMD_RUN_BIN",
+        default_value = "/usr/bin/systemd-run"
+    )]
+    runtime_systemd_run_bin: PathBuf,
+    /// Root of the unified cgroup-v2 namespace inspected by the lifecycle
+    /// runner. Test deployments may provide an isolated fixture root.
+    #[arg(long, env = "CATS_CGROUP_ROOT", default_value = "/sys/fs/cgroup")]
+    runtime_cgroup_root: PathBuf,
+    #[arg(long, env = "CATS_RUNTIME_PROC_ROOT", default_value = "/proc")]
+    runtime_proc_root: PathBuf,
+    #[arg(
+        long,
+        env = "CATS_RUNTIME_NETWORK_CLASS_ROOT",
+        default_value = "/sys/class/net"
+    )]
+    runtime_network_class_root: PathBuf,
+    #[arg(
+        long,
+        env = "CATS_RUNTIME_SYS_BLOCK_ROOT",
+        default_value = "/sys/block"
+    )]
+    runtime_sys_block_root: PathBuf,
+    #[arg(long, env = "CATS_RUNTIME_DEVICE_ROOT", default_value = "/dev")]
+    runtime_device_root: PathBuf,
+    #[arg(
+        long,
+        env = "CATS_RUNTIME_BLOCKD_SOCKET_ROOT",
+        default_value = "/run/cats/blockd-v1"
+    )]
+    runtime_blockd_socket_root: PathBuf,
+    #[arg(
+        long,
+        env = "CATS_RUNTIME_VMM_SOCKET_ROOT",
+        default_value = "/run/cats/vmm-v1"
+    )]
+    runtime_vmm_socket_root: PathBuf,
     #[arg(long)]
     metadata_store_adapter: String,
     #[arg(long = "metadata-store-option", value_name = "KEY=VALUE")]
@@ -100,10 +153,6 @@ struct Args {
     #[arg(long, env = "CATS_BLOCKD_MAX_LOCAL_BYTES",
           default_value_t = cats_api::blockd::DEFAULT_MAX_LOCAL_BYTES)]
     blockd_max_local_bytes: u64,
-    /// Delegated cgroup v2 subtree for authoritative billing counters.
-    #[arg(long, env = "CATS_METERING_CGROUP_ROOT")]
-    metering_cgroup_root: Option<PathBuf>,
-
     /// Local budget for one complete signed Runtime inventory scan. This is an
     /// operator safety limit, not a protocol or product latency SLA.
     #[arg(
@@ -120,25 +169,6 @@ struct Args {
         default_value_t = 30_000
     )]
     runtime_effect_step_timeout_ms: u64,
-
-    /// Concurrent-wake commitment budget in bytes (ADR-0002 §8). Accounted in
-    /// bytes because the 2026-07-21 run showed Guest memory page read-back is
-    /// the limit, not the VMM. Default is the validated operating point
-    /// (10 x 512 MiB), not a proven optimum: re-measure before raising it.
-    #[arg(long, env = "CATS_WAKE_COMMITMENT_BUDGET_BYTES",
-          default_value_t = cats_node_agent::admission::DEFAULT_WAKE_COMMITMENT_BUDGET_BYTES)]
-    wake_commitment_budget_bytes: u64,
-    /// Ceiling on concurrently admitted wakes, so many tiny Cats cannot
-    /// bypass the byte budget. Default is the validated concurrency.
-    #[arg(long, env = "CATS_MAX_CONCURRENT_WAKES",
-          default_value_t = cats_node_agent::admission::DEFAULT_MAX_CONCURRENT_WAKES)]
-    max_concurrent_wakes: usize,
-    /// How long a wake may queue for budget before the node reports it cannot
-    /// serve the wake. Above the slowest measured concurrent restore (EBS
-    /// first-health P50 19.05 s) so a slow medium queues instead of falling
-    /// back to Cold.
-    #[arg(long, env = "CATS_WAKE_QUEUE_TIMEOUT_SECS", default_value_t = 60)]
-    wake_queue_timeout_secs: u64,
 
     /// VMM mode: fake (host processes) or ch (Cloud Hypervisor, Linux+KVM).
     #[arg(long, default_value = "ch")]
@@ -199,26 +229,13 @@ async fn main() -> anyhow::Result<()> {
         AdapterConfig::from_cli(args.metadata_store_options).context("metadata adapter options")?;
     let object_config =
         AdapterConfig::from_cli(args.object_store_options).context("object adapter options")?;
-    let authorized_blockd_launch = AuthorizedBlockdLaunchConfig {
-        blockd_binary: args.blockd_bin.clone(),
-        metadata_store: AdapterSelection::new(
-            args.metadata_store_adapter.clone(),
-            metadata_config.clone(),
-        ),
-        object_store: AdapterSelection::new(
-            args.object_store_adapter.clone(),
-            object_config.clone(),
-        ),
-        max_staged_bytes: args.blockd_max_staged_bytes,
-        max_staged_packs: args.blockd_max_staged_packs,
-        max_local_bytes: args.blockd_max_local_bytes,
-        // Filled in by the cutover composition, which owns the credential
-        // namespace path and the validated gateway origin.
-        object_write_gateway: None,
-    };
+    let metadata_store =
+        AdapterSelection::new(args.metadata_store_adapter.clone(), metadata_config.clone());
+    let object_store =
+        AdapterSelection::new(args.object_store_adapter.clone(), object_config.clone());
     let object_factories: [&dyn BlobStoreFactory; 2] =
         [&FileBlobStoreFactory, &AwsS3BlobStoreFactory];
-    let blob_store = open_blob_store(
+    let root_image_store = open_blob_store(
         &args.object_store_adapter,
         &object_config,
         &object_factories,
@@ -227,8 +244,6 @@ async fn main() -> anyhow::Result<()> {
     let volume_authority =
         cats_metadata_store_postgres::PostgresVolumeDataAuthority::open_runtime(&metadata_config)
             .context("open PostgreSQL Runtime Volume authorities")?;
-    let volume_data_authority: Arc<dyn cats_storage::authority::VolumeDataAuthority> =
-        volume_authority.clone();
     let volume_inventory_authority: Arc<
         dyn cats_storage::authority::RuntimeVolumeInventoryAuthority,
     > = volume_authority;
@@ -236,71 +251,161 @@ async fn main() -> anyhow::Result<()> {
         cats_node_agent::agent_registration::AgentRegistrationConfig::load_installed(
             installed_receipt.receipt(),
         )?;
-    let route_v2_machine = match (
+    let route_v2_artifacts =
+        cats_api::runtime_artifacts::load_installed_node_route_v2_machine_artifacts(
+            &args.route_v2_public_key_ring_file,
+            &args.gateway_client_ca_bundle_file,
+            &args.node_route_v2_server_certificate_file,
+            &args.node_route_v2_server_private_key_file,
+        )
+        .context("load mandatory installed Route v2 machine artifacts")?;
+    let route_v2_machine = RouteV2MachineConfig::from_installed_artifacts(
         args.route_v2_machine_listen,
-        args.route_v2_rotation_origin.as_deref(),
-    ) {
-        (Some(listen), Some(rotation_origin)) => {
-            let artifacts =
-                cats_api::runtime_artifacts::load_installed_node_route_v2_machine_artifacts(
-                    &args.route_v2_public_key_ring_file,
-                    &args.gateway_client_ca_bundle_file,
-                    &args.node_route_v2_server_certificate_file,
-                    &args.node_route_v2_server_private_key_file,
-                )?;
-            Some(RouteV2MachineConfig::from_installed_artifacts(
-                listen,
-                agent_registration.identity().node_id.clone(),
-                &artifacts,
-                rotation_origin,
-            )?)
-        }
-        (None, None) => None,
-        _ => anyhow::bail!(
-            "--route-v2-machine-listen and --route-v2-rotation-origin must be configured together"
-        ),
-    };
-    // The Host's writer authority ID is not configuration: it is derived from
-    // the Node ID, so the fleet-shared worker environment cannot carry it. The
-    // credential port reads it from Control once per Agent session.
-    let object_write_gateway = args.object_write_gateway_url.map(|gateway_url| {
-        cats_node_agent::runtime_cutover::ObjectWriteGatewayComposition { gateway_url }
-    });
-    let deadline_policy = RuntimeSpineDeadlinePolicy::new(
-        Duration::from_millis(args.runtime_inventory_scan_timeout_ms),
-        Duration::from_millis(args.runtime_effect_step_timeout_ms),
+        agent_registration.identity().node_id.clone(),
+        &route_v2_artifacts,
+        &args.route_v2_rotation_origin,
     )
-    .context("validate signed Runtime scan/effect deadline policy")?;
-    let metering_cgroup_root = args
-        .metering_cgroup_root
-        .context("--metering-cgroup-root or CATS_METERING_CGROUP_ROOT is required")?;
+    .context("compose mandatory Route v2 listener and ring delivery")?;
+    let inventory_timeout = Duration::from_millis(args.runtime_inventory_scan_timeout_ms);
+    let effect_timeout = Duration::from_millis(args.runtime_effect_step_timeout_ms);
+    anyhow::ensure!(
+        !inventory_timeout.is_zero() && !effect_timeout.is_zero(),
+        "Runtime inventory/effect timeouts must be positive"
+    );
+
+    // These three values are created once and shared by lifecycle startup,
+    // installed effects, Route, and the observation-only inventory lane. A
+    // second scanner, registry, or force-Full sender would create a competing
+    // view of the same Cat.
+    let lifecycle_admission_registry =
+        cats_node_agent::admission_registry::LifecycleAdmissionRegistry::new_uninitialized();
+    let startup_inventory_cache = StartupInventoryCache::new();
+    let runtime_inventory_force_full = RuntimeInventoryForceFullCoordinator::new();
+    let state_directory = agent_registration.runtime_state_directory();
+
+    let kernel_nbd = match ch_config.block_path {
+        BlockPath::KernelNbd => Some(InstalledLifecycleKernelNbdConfig {
+            sys_block_root: args.runtime_sys_block_root,
+            device_root: args.runtime_device_root,
+            nbd_client_binary: ch_config.nbd_client_bin.clone(),
+            device_count: ch_config.nbd_devices,
+        }),
+        BlockPath::VhostUser => None,
+    };
+    let managed_process_binaries = BTreeSet::from([
+        args.blockd_bin.clone(),
+        ch_config.vmm_launcher_bin.clone(),
+        ch_config.ch_bin.clone(),
+    ]);
+    let physical = InstalledPhysicalInspectionConfig {
+        state_directory: state_directory.clone(),
+        node_id: agent_registration.identity().node_id.clone(),
+        volume_inventory_authority: Arc::clone(&volume_inventory_authority),
+        systemctl_binary: args.runtime_systemctl_bin,
+        cgroup_root: args.runtime_cgroup_root,
+        proc_root: args.runtime_proc_root,
+        ip_binary: ch_config.ip_bin.clone(),
+        network_class_root: args.runtime_network_class_root,
+        managed_socket_roots: vec![
+            args.runtime_blockd_socket_root,
+            args.runtime_vmm_socket_root,
+        ],
+        managed_process_binaries,
+        kernel_nbd,
+        inventory_timeout,
+        physical_probe_timeout: effect_timeout,
+    };
+    let lifecycle_volume_control = Arc::new(
+        LifecycleVolumeHttpClient::for_production(&args.control_plane_url, &agent_registration)
+            .context("open signed lifecycle Volume client")?,
+    );
+    let start_volume_port = InstalledAtomicStartVolumePort::new(
+        state_directory.clone(),
+        Arc::clone(&volume_inventory_authority),
+        Arc::clone(&lifecycle_volume_control),
+        Arc::clone(&lifecycle_admission_registry),
+        Duration::from_millis(args.runtime_volume_lease_duration_ms),
+        effect_timeout,
+    )
+    .context("compose installed atomic Start Volume port")?;
+
+    // Gateway mode derives the current writer-authority ID and credential key
+    // from this exact retained Agent registration. Direct-provider mode is
+    // accepted only when the installed Start adapter validates that the
+    // configured backend needs no Gateway credential.
+    let object_write_mode = match args.object_write_gateway_url {
+        Some(gateway_origin) => InstalledAtomicStartObjectWriteMode::Gateway {
+            gateway_origin,
+            control_plane_origin: args.control_plane_url.clone(),
+            registration: Arc::new(agent_registration.clone()),
+        },
+        None => InstalledAtomicStartObjectWriteMode::DirectProvider,
+    };
+    let suspend_warm_platform = InstalledSuspendWarmPlatform::for_production(physical.clone())
+        .context("compose installed Suspend/Warm platform")?;
+    let start_runtime_port =
+        installed_atomic_start_runtime_port(InstalledAtomicStartRuntimeConfig {
+            physical: physical.clone(),
+            admission_registry: Arc::clone(&lifecycle_admission_registry),
+            suspend_warm_platform: suspend_warm_platform.clone(),
+            ch: ch_config,
+            systemd_run_binary: args.runtime_systemd_run_bin,
+            blockd: InstalledAtomicStartBlockdConfig {
+                blockd_binary: args.blockd_bin,
+                metadata_store,
+                object_store,
+                lease_ttl_ms: args.blockd_lease_ttl_ms,
+                max_staged_bytes: args.blockd_max_staged_bytes,
+                max_staged_packs: args.blockd_max_staged_packs,
+                max_local_bytes: args.blockd_max_local_bytes,
+            },
+            root_image_store,
+            object_write_mode,
+            persistent_initialization_control: Arc::clone(&lifecycle_volume_control),
+            effect_timeout,
+            guest_ready_timeout: effect_timeout,
+        })
+        .context("compose installed atomic Start runtime port")?;
+    let cold_delete_local =
+        InstalledColdDeleteLocalPort::new(state_directory, Arc::clone(&volume_inventory_authority));
+    let cold_delete_port = InstalledAtomicColdDeletePort::new(
+        cold_delete_local,
+        Arc::clone(&lifecycle_volume_control),
+        Arc::clone(&lifecycle_admission_registry),
+        effect_timeout,
+    )
+    .context("compose installed Cold/Delete port")?;
+    let installed = installed_atomic_lifecycle_executor(InstalledAtomicLifecycleConfig {
+        physical,
+        admission_registry: Arc::clone(&lifecycle_admission_registry),
+        startup_inventory_cache: Arc::clone(&startup_inventory_cache),
+        start_volume_port,
+        start_runtime_port,
+        suspend_warm_platform,
+        cold_delete_port,
+        runtime_inventory_force_full: Arc::clone(&runtime_inventory_force_full),
+    })
+    .context("compose installed atomic lifecycle executor")?;
+    let runtime_inventory_source = ProductionRuntimeInventorySource::new(
+        Arc::clone(&installed.startup_inventory_cache),
+        Arc::clone(&installed.inventory_collection),
+    );
     let handle = spawn_signed_runtime_cutover(SignedRuntimeCutoverConfig {
         listen: args.listen,
         route_v2_machine,
         control_plane_url: args.control_plane_url,
         agent_registration,
-        ch_config,
-        authorized_blockd_launch,
-        guest_agent_binary: args.guest_agent_bin,
-        metering_cgroup_root: Some(metering_cgroup_root),
-        volume_data_authority,
-        volume_inventory_authority,
-        blob_store,
-        volume_lease_duration_ms: args.runtime_volume_lease_duration_ms,
-        deadline_policy,
-        object_write_gateway,
+        lifecycle_executor: installed.executor,
+        lifecycle_admission_registry: installed.admission_registry,
+        startup_inventory_cache: installed.startup_inventory_cache,
+        runtime_inventory_source,
+        runtime_inventory_force_full: installed.runtime_inventory_force_full,
     })
     .await?;
-    match handle.route_v2_addr {
-        Some(route_v2_addr) => eprintln!(
-            "signed Runtime listener {} and authenticated Route v2 listener {} are bound; readiness stays closed until complete inventory is attested",
-            handle.addr, route_v2_addr
-        ),
-        None => eprintln!(
-            "signed Runtime listener {} is bound; Route v2 machine ingress is closed; readiness stays closed until complete inventory is attested",
-            handle.addr
-        ),
-    }
+    eprintln!(
+        "signed Runtime listener {} and authenticated Route v2 listener {} are bound; readiness stays closed until complete inventory is attested",
+        handle.addr, handle.route_v2_addr
+    );
     handle.run_until_signal().await
 }
 
@@ -357,6 +462,11 @@ mod tests {
             "ch_cmdline",
             "ch_network_cidr",
             "route_grant_public_key_file",
+            "guest_agent_bin",
+            "metering_cgroup_root",
+            "wake_commitment_budget_bytes",
+            "max_concurrent_wakes",
+            "wake_queue_timeout_secs",
         ] {
             assert!(
                 !ids.contains(&forbidden),
@@ -366,6 +476,16 @@ mod tests {
         assert!(ids.contains(&"guest_runtime_profile_receipt_file"));
         assert!(ids.contains(&"runtime_volume_lease_duration_ms"));
         assert!(!ids.contains(&"auth_token"));
+        for required in ["route_v2_machine_listen", "route_v2_rotation_origin"] {
+            let argument = command
+                .get_arguments()
+                .find(|argument| argument.get_id().as_str() == required)
+                .expect("mandatory Route v2 argument exists");
+            assert!(
+                argument.is_required_set(),
+                "production Route v2 argument {required} must be mandatory"
+            );
+        }
     }
 
     #[test]
@@ -374,9 +494,30 @@ mod tests {
         assert!(source.contains("spawn_signed_runtime_cutover"));
         assert!(source.contains("PostgresVolumeDataAuthority::open_runtime"));
         assert!(source.contains("open_blob_store"));
+        assert!(source.contains("installed_atomic_lifecycle_executor"));
+        assert!(source.contains("installed_atomic_start_runtime_port"));
+        assert!(source.contains("ProductionRuntimeInventorySource::new"));
+        assert!(source.contains("load mandatory installed Route v2 machine artifacts"));
+        assert!(source.contains("compose mandatory Route v2 listener and ring delivery"));
+        let route_artifacts = source
+            .find("load_installed_node_route_v2_machine_artifacts")
+            .expect("mandatory Route v2 artifacts are loaded");
+        let daemon_spawn = source
+            .find("spawn_signed_runtime_cutover(SignedRuntimeCutoverConfig")
+            .expect("atomic daemon is spawned");
+        assert!(
+            route_artifacts < daemon_spawn,
+            "Route v2 artifacts must fail closed before lifecycle/inventory startup"
+        );
+        let optional_route_fallback = ["(None, ", "None) => None"].concat();
+        assert!(!source.contains(&optional_route_fallback));
         let legacy_spawn = ["server", "::{", "spawn"].concat();
         let legacy_runtime = ["Node", "Runtime", "::", "new"].concat();
+        let legacy_spine = ["Runtime", "Spine", "Deadline", "Policy"].concat();
+        let legacy_blockd = ["Authorized", "Blockd", "Launch", "Config"].concat();
         assert!(!source.contains(&legacy_spawn));
         assert!(!source.contains(&legacy_runtime));
+        assert!(!source.contains(&legacy_spine));
+        assert!(!source.contains(&legacy_blockd));
     }
 }

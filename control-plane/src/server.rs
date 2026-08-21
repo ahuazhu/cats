@@ -1,12 +1,11 @@
-//! Control-plane assembly: config, shared state, reconciler task and HTTP
-//! server. `spawn` is used by the binary and by every integration/E2E test.
+//! Control-plane assembly: config, shared state, singleton tasks and HTTP
+//! servers. Every process composes the independent Route v2 machine authority.
 
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Context;
 use cats_api::gateway_workload_identity::GatewayWorkloadIdentityAuthority;
@@ -17,22 +16,16 @@ use cats_api::runtime_artifacts::{
 use cats_api::runtime_reconciliation::{GuestRuntimeProfileReceipt, RuntimeProvisionerTrustBundle};
 use cats_metering::{CreditStore, UsageStore};
 use cats_storage::BlobStore;
-#[cfg(debug_assertions)]
-use cats_storage::MetadataStore;
 
-use crate::controller::{AutoTierPolicy, Controller, NodeLivenessAuthority};
 use crate::store::{
-    AuthorityRequestContext, DsnSource, ObservationStoreLane, SingletonRole, Store,
+    DsnSource, LifecycleStoreLane, ObservationStoreLane, RouteStoreLane, SingletonRole, Store,
 };
 
 const SINGLETON_ELECTION_RETRY: Duration = Duration::from_millis(500);
 const SINGLETON_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
-const RUNTIME_MAINTENANCE_PAGE_DEADLINE: Duration = Duration::from_secs(30);
 const RUNTIME_SPINE_GLOBAL_IN_FLIGHT: usize = 64;
 const ROUTE_RESOLVE_V2_GLOBAL_IN_FLIGHT: usize = 32;
 const GATEWAY_AUTHENTICATION_GLOBAL_IN_FLIGHT: usize = 32;
-const RUNTIME_VOLUME_TRANSITION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
-const FLEET_VERIFICATION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Non-authoritative, per-replica admission for signed A19/A20 Node ingress.
 /// PostgreSQL remains the concurrency authority; these permits only bound
@@ -78,414 +71,6 @@ impl RuntimeSpineAdmission {
         };
         semaphore.try_acquire_owned()
     }
-
-    #[cfg(test)]
-    pub(crate) fn available_global_permits_for_test(&self) -> usize {
-        self.global.available_permits()
-    }
-}
-
-/// Owns each fleet-verification Store execution independently of its HTTP
-/// connection. A dropped response cancels the request context, while this
-/// registry keeps graceful shutdown from abandoning the claimed connection
-/// lane or PostgreSQL transaction before physical settlement.
-pub(crate) struct FleetVerificationService {
-    accepting: AtomicBool,
-    active: AtomicUsize,
-    next_request_id: AtomicU64,
-    active_requests: Mutex<BTreeMap<u64, AuthorityRequestContext>>,
-    changed: tokio::sync::Notify,
-}
-
-impl FleetVerificationService {
-    pub(crate) fn new() -> Self {
-        Self {
-            accepting: AtomicBool::new(true),
-            active: AtomicUsize::new(0),
-            next_request_id: AtomicU64::new(1),
-            active_requests: Mutex::new(BTreeMap::new()),
-            changed: tokio::sync::Notify::new(),
-        }
-    }
-
-    pub(crate) fn begin(
-        self: &Arc<Self>,
-        request_context: AuthorityRequestContext,
-    ) -> Option<FleetVerificationRequestGuard> {
-        if !self.accepting.load(Ordering::Acquire) {
-            return None;
-        }
-        let request_id = self
-            .next_request_id
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_add(1)
-            })
-            .ok()?;
-        self.active.fetch_add(1, Ordering::AcqRel);
-        self.active_requests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(request_id, request_context.clone());
-        if !self.accepting.load(Ordering::Acquire) {
-            request_context.cancel();
-            self.finish(request_id);
-            return None;
-        }
-        Some(FleetVerificationRequestGuard {
-            service: self.clone(),
-            request_id,
-        })
-    }
-
-    fn finish(&self, request_id: u64) {
-        self.active_requests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&request_id);
-        if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.changed.notify_waiters();
-        }
-    }
-
-    fn begin_shutdown(&self) {
-        self.accepting.store(false, Ordering::Release);
-        for context in self
-            .active_requests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-        {
-            context.cancel();
-        }
-        self.changed.notify_waiters();
-    }
-
-    async fn shutdown(&self) -> anyhow::Result<()> {
-        self.begin_shutdown();
-        let joined = tokio::time::timeout(FLEET_VERIFICATION_SHUTDOWN_TIMEOUT, async {
-            loop {
-                let changed = self.changed.notified();
-                if self.active.load(Ordering::Acquire) == 0 {
-                    break;
-                }
-                changed.await;
-            }
-        })
-        .await;
-        anyhow::ensure!(
-            joined.is_ok(),
-            "fleet-verification requests exceeded the shutdown deadline"
-        );
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn active_for_test(&self) -> usize {
-        self.active.load(Ordering::Acquire)
-    }
-}
-
-pub(crate) struct FleetVerificationRequestGuard {
-    service: Arc<FleetVerificationService>,
-    request_id: u64,
-}
-
-impl Drop for FleetVerificationRequestGuard {
-    fn drop(&mut self) {
-        self.service.finish(self.request_id);
-    }
-}
-
-/// Owns every A22 Store closure independently of the client connection. A
-/// dropped handler cancels its request context, while this registry keeps the
-/// closure joined and lets graceful shutdown prove that no late mutation or
-/// read is still running.
-pub(crate) struct RuntimeVolumeTransitionService {
-    accepting: AtomicBool,
-    active: AtomicUsize,
-    next_request_id: AtomicU64,
-    active_requests: Mutex<BTreeMap<u64, AuthorityRequestContext>>,
-    changed: tokio::sync::Notify,
-    #[cfg(test)]
-    pause_after_admission: AtomicBool,
-    #[cfg(test)]
-    pause_entered: AtomicBool,
-    #[cfg(test)]
-    pause_changed: tokio::sync::Notify,
-    #[cfg(test)]
-    pause_before_node_resolution: AtomicBool,
-    #[cfg(test)]
-    node_resolution_entered: AtomicBool,
-    #[cfg(test)]
-    node_resolution_changed: tokio::sync::Notify,
-    #[cfg(test)]
-    pause_response_encoding: AtomicBool,
-    #[cfg(test)]
-    response_encoding_entered: AtomicBool,
-    #[cfg(test)]
-    response_encoding_changed: tokio::sync::Notify,
-    #[cfg(test)]
-    deadline_override_ms: AtomicU64,
-}
-
-impl RuntimeVolumeTransitionService {
-    fn new() -> Self {
-        Self {
-            accepting: AtomicBool::new(true),
-            active: AtomicUsize::new(0),
-            next_request_id: AtomicU64::new(1),
-            active_requests: Mutex::new(BTreeMap::new()),
-            changed: tokio::sync::Notify::new(),
-            #[cfg(test)]
-            pause_after_admission: AtomicBool::new(false),
-            #[cfg(test)]
-            pause_entered: AtomicBool::new(false),
-            #[cfg(test)]
-            pause_changed: tokio::sync::Notify::new(),
-            #[cfg(test)]
-            pause_before_node_resolution: AtomicBool::new(false),
-            #[cfg(test)]
-            node_resolution_entered: AtomicBool::new(false),
-            #[cfg(test)]
-            node_resolution_changed: tokio::sync::Notify::new(),
-            #[cfg(test)]
-            pause_response_encoding: AtomicBool::new(false),
-            #[cfg(test)]
-            response_encoding_entered: AtomicBool::new(false),
-            #[cfg(test)]
-            response_encoding_changed: tokio::sync::Notify::new(),
-            #[cfg(test)]
-            deadline_override_ms: AtomicU64::new(0),
-        }
-    }
-
-    pub(crate) fn begin(
-        self: &Arc<Self>,
-        request_context: AuthorityRequestContext,
-    ) -> Option<RuntimeVolumeTransitionRequestGuard> {
-        if !self.accepting.load(Ordering::Acquire) {
-            return None;
-        }
-        let request_id = self
-            .next_request_id
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_add(1)
-            })
-            .ok()?;
-        self.active.fetch_add(1, Ordering::AcqRel);
-        self.active_requests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(request_id, request_context.clone());
-        if !self.accepting.load(Ordering::Acquire) {
-            request_context.cancel();
-            self.finish(request_id);
-            return None;
-        }
-        Some(RuntimeVolumeTransitionRequestGuard {
-            service: self.clone(),
-            request_id,
-        })
-    }
-
-    fn finish(&self, request_id: u64) {
-        self.active_requests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&request_id);
-        if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.changed.notify_waiters();
-        }
-    }
-
-    fn begin_shutdown(&self) {
-        self.accepting.store(false, Ordering::Release);
-        for context in self
-            .active_requests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-        {
-            context.cancel();
-        }
-        self.changed.notify_waiters();
-    }
-
-    async fn shutdown(&self) -> anyhow::Result<()> {
-        self.begin_shutdown();
-        let joined = tokio::time::timeout(RUNTIME_VOLUME_TRANSITION_SHUTDOWN_TIMEOUT, async {
-            loop {
-                let changed = self.changed.notified();
-                if self.active.load(Ordering::Acquire) == 0 {
-                    break;
-                }
-                changed.await;
-            }
-        })
-        .await;
-        anyhow::ensure!(
-            joined.is_ok(),
-            "runtime volume-transition requests exceeded the shutdown deadline"
-        );
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn arm_pause_after_admission_for_test(&self) {
-        self.pause_entered.store(false, Ordering::Release);
-        self.pause_after_admission.store(true, Ordering::Release);
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn pause_after_admission_for_test(&self) {
-        if !self.pause_after_admission.load(Ordering::Acquire) {
-            return;
-        }
-        self.pause_entered.store(true, Ordering::Release);
-        self.pause_changed.notify_waiters();
-        loop {
-            let changed = self.pause_changed.notified();
-            if !self.pause_after_admission.load(Ordering::Acquire) {
-                break;
-            }
-            changed.await;
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn wait_for_paused_admission_for_test(&self) {
-        loop {
-            let changed = self.pause_changed.notified();
-            if self.pause_entered.load(Ordering::Acquire) {
-                break;
-            }
-            changed.await;
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn release_paused_admission_for_test(&self) {
-        self.pause_after_admission.store(false, Ordering::Release);
-        self.pause_changed.notify_waiters();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn arm_pause_before_node_resolution_for_test(&self) {
-        self.node_resolution_entered.store(false, Ordering::Release);
-        self.pause_before_node_resolution
-            .store(true, Ordering::Release);
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn pause_before_node_resolution_for_test(&self) {
-        if !self.pause_before_node_resolution.load(Ordering::Acquire) {
-            return;
-        }
-        self.node_resolution_entered.store(true, Ordering::Release);
-        self.node_resolution_changed.notify_waiters();
-        loop {
-            let changed = self.node_resolution_changed.notified();
-            if !self.pause_before_node_resolution.load(Ordering::Acquire) {
-                break;
-            }
-            changed.await;
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn wait_for_paused_node_resolution_for_test(&self) {
-        loop {
-            let changed = self.node_resolution_changed.notified();
-            if self.node_resolution_entered.load(Ordering::Acquire) {
-                break;
-            }
-            changed.await;
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn release_paused_node_resolution_for_test(&self) {
-        self.pause_before_node_resolution
-            .store(false, Ordering::Release);
-        self.node_resolution_changed.notify_waiters();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn arm_pause_response_encoding_for_test(&self) {
-        self.response_encoding_entered
-            .store(false, Ordering::Release);
-        self.pause_response_encoding.store(true, Ordering::Release);
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn pause_response_encoding_for_test(&self) {
-        if !self.pause_response_encoding.load(Ordering::Acquire) {
-            return;
-        }
-        self.response_encoding_entered
-            .store(true, Ordering::Release);
-        self.response_encoding_changed.notify_waiters();
-        loop {
-            let changed = self.response_encoding_changed.notified();
-            if !self.pause_response_encoding.load(Ordering::Acquire) {
-                break;
-            }
-            changed.await;
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn wait_for_paused_response_encoding_for_test(&self) {
-        loop {
-            let changed = self.response_encoding_changed.notified();
-            if self.response_encoding_entered.load(Ordering::Acquire) {
-                break;
-            }
-            changed.await;
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn release_paused_response_encoding_for_test(&self) {
-        self.pause_response_encoding.store(false, Ordering::Release);
-        self.response_encoding_changed.notify_waiters();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_deadline_override_for_test(&self, deadline: Duration) {
-        let millis = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
-        assert!(millis > 0, "the A22 test deadline must be non-zero");
-        self.deadline_override_ms.store(millis, Ordering::Release);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn clear_deadline_override_for_test(&self) {
-        self.deadline_override_ms.store(0, Ordering::Release);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn deadline_for_test(&self, production: Duration) -> Duration {
-        match self.deadline_override_ms.load(Ordering::Acquire) {
-            0 => production,
-            millis => Duration::from_millis(millis),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn active_for_test(&self) -> usize {
-        self.active.load(Ordering::Acquire)
-    }
-}
-
-pub(crate) struct RuntimeVolumeTransitionRequestGuard {
-    service: Arc<RuntimeVolumeTransitionService>,
-    request_id: u64,
-}
-
-impl Drop for RuntimeVolumeTransitionRequestGuard {
-    fn drop(&mut self) {
-        self.service.finish(self.request_id);
-    }
 }
 
 /// Ask an elected-role supervisor to stop if its election task is cancelled.
@@ -507,14 +92,6 @@ impl Drop for CancelSingletonOnDrop {
     }
 }
 
-struct CancelAuthorityRequestOnDrop(AuthorityRequestContext);
-
-impl Drop for CancelAuthorityRequestOnDrop {
-    fn drop(&mut self) {
-        self.0.cancel();
-    }
-}
-
 #[derive(Clone)]
 pub struct Config {
     /// `host:port`; use port 0 to pick a free port (tests).
@@ -532,10 +109,6 @@ pub struct Config {
     /// Append-only prepaid credit ledger. It may share the same physical
     /// database as the usage projection while remaining a separate port.
     pub credit_store: Arc<dyn CreditStore>,
-    /// Legacy storage fixture for the debug-only retired-product test
-    /// composition. This field does not exist in release builds.
-    #[cfg(debug_assertions)]
-    pub retired_storage_meta_for_tests: Option<Arc<dyn MetadataStore>>,
     /// Control-owned object-store boundary. A21 reads exact immutable
     /// golden-image keys; the delete sweeper removes only an authority-proved
     /// exact `volumes/<volume_id>/` prefix.
@@ -554,9 +127,6 @@ pub struct Config {
     /// operator key. It is loaded only from its canonical installed path.
     pub production_cutover_operator_trust_bundle:
         cats_api::production_mutation_admission::ProductionCutoverOperatorTrustBundle,
-    /// Private-key authority for short-lived V1 Endpoint Route Grants. It is
-    /// intentionally absent from Gateway and Node configuration.
-    pub route_grant_signer: Arc<crate::route_grant::RouteGrantSigner>,
     /// Administrator credential for fleet management and monitoring APIs.
     pub admin_token: String,
     /// Optional AuthKit configuration for browser sessions and user CLI
@@ -568,9 +138,6 @@ pub struct Config {
     /// Rollout kill switch for 402 admission and automatic Cold convergence.
     /// Production enables this only with a working top-up path.
     pub billing_enforcement_enabled: bool,
-    pub node_lease_timeout_ms: i64,
-    pub reconcile_interval_ms: u64,
-    pub auto_tier_policy: AutoTierPolicy,
     /// How long `POST .../oci-deployments` may hold a request open before it
     /// answers `202` with an operation to poll.
     ///
@@ -605,7 +172,7 @@ impl GatewayMachineConfig {
         gateway_artifacts: InstalledGatewayMachineArtifacts,
         signer_artifacts: InstalledRouteGrantV2Signer,
         rotation_operator_trust: InstalledRouteV2RotationOperatorTrust,
-        route_grant_ttl_seconds: u64,
+        route_grant_v2_ttl_seconds: u64,
     ) -> anyhow::Result<Self> {
         let listen = listen.into();
         let rotation_listen = rotation_listen.into();
@@ -629,7 +196,7 @@ impl GatewayMachineConfig {
         let signing_authority = Arc::new(
             crate::route_grant_v2::InstalledRouteGrantV2SigningAuthority::from_installed_artifacts(
                 &signer_artifacts,
-                route_grant_ttl_seconds,
+                route_grant_v2_ttl_seconds,
             )?,
         );
         let rotation_release_commit_sha = embedded_route_v2_rotation_release_commit_sha(
@@ -702,10 +269,10 @@ pub const DEFAULT_OCI_DEPLOY_SYNC_WAIT_MS: u64 = 240_000;
 pub struct AppState {
     pub store: Arc<Store>,
     pub(crate) observation_store: Arc<ObservationStoreLane>,
+    pub(crate) lifecycle_store: Arc<LifecycleStoreLane>,
+    pub(crate) route_store: Arc<RouteStoreLane>,
     pub usage: Arc<dyn UsageStore>,
     pub credits: Arc<dyn CreditStore>,
-    #[cfg(debug_assertions)]
-    pub retired_storage_meta_for_tests: Option<Arc<dyn MetadataStore>>,
     pub(crate) cat_create:
         Arc<crate::store::runtime_authority::cat_create_service::CatCreateService>,
     pub(crate) persistent_disk_create: Arc<
@@ -714,58 +281,36 @@ pub struct AppState {
     pub(crate) product_mutations:
         Arc<crate::store::runtime_authority::product_mutation_service::ProductMutationService>,
     pub(crate) readiness: Arc<ReadinessLatch>,
-    pub notify: Arc<tokio::sync::Notify>,
-    pub controller: Arc<Controller>,
     pub cfg: Arc<Config>,
     pub(crate) agent_session_registration_policy: Arc<crate::store::AgentSessionRegistrationPolicy>,
     pub(crate) runtime_spine_admission: Arc<RuntimeSpineAdmission>,
     /// Per-replica work bound for the machine-authenticated Route Grant v2
     /// resolve lane. Authentication is checked before a permit is acquired.
     pub(crate) route_resolve_admission: Arc<crate::api::route_resolve_v2::RouteResolveV2Admission>,
-    pub(crate) runtime_volume_transition_admission: Arc<RuntimeSpineAdmission>,
     /// Independent work bound for the Node's read of its own object-write
     /// writer authority. It is deliberately separate from the Desired-read and
     /// volume-transition lanes so one authority read per Agent session can
     /// never contend with, or be starved by, the reconcile loop.
     pub(crate) object_write_authority_read_admission: Arc<RuntimeSpineAdmission>,
-    pub(crate) runtime_volume_transition_service: Arc<RuntimeVolumeTransitionService>,
-    pub(crate) fleet_verification_service: Arc<FleetVerificationService>,
     pub(crate) runtime_node_authority:
         Arc<crate::api::runtime_node_authority::RuntimeNodeAuthorityService>,
     pub(crate) route_v2_signing_operator:
         Option<Arc<crate::api::route_signing_operator::RouteV2SigningOperatorService>>,
-    /// The retired product authority exists only in debug test compositions.
-    #[cfg(debug_assertions)]
-    pub(crate) retired_product_authority_for_tests: bool,
-}
-
-impl AppState {
-    pub(crate) const fn retired_product_authority_for_tests(&self) -> bool {
-        #[cfg(debug_assertions)]
-        {
-            self.retired_product_authority_for_tests
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            false
-        }
-    }
 }
 
 pub struct Handle {
     /// Bound address, e.g. `127.0.0.1:53412`.
     pub addr: std::net::SocketAddr,
-    /// Bound only when `spawn_with_gateway_machine` receives a complete fixed
-    /// machine composition.
+    /// Bound when the installed signer is active. A disabled signer keeps this
+    /// absent and poisons readiness while the rotation listener remains live.
     pub gateway_machine_addr: Option<std::net::SocketAddr>,
     /// Bound whenever the production Route rotation authority is installed,
     /// including while the loaded signer is disabled and readiness is closed.
     pub route_rotation_machine_addr: Option<std::net::SocketAddr>,
     pub state: AppState,
     server_task: tokio::task::JoinHandle<()>,
-    reconciler_task: Option<ManagedSingletonTask>,
-    billing_enforcer_task: Option<ManagedSingletonTask>,
     volume_delete_sweeper_task: Option<ManagedSingletonTask>,
+    route_controller_task: ManagedSingletonTask,
     image_manifest_resolver: Arc<
         crate::store::runtime_authority::image_manifest_resolver::ImmutableImageManifestResolver,
     >,
@@ -834,10 +379,6 @@ impl Handle {
         self.state.cat_create.begin_shutdown();
         self.state.persistent_disk_create.begin_shutdown();
         self.state.product_mutations.begin_shutdown();
-        self.state
-            .runtime_volume_transition_service
-            .begin_shutdown();
-        self.state.fleet_verification_service.begin_shutdown();
         self.state.route_resolve_admission.begin_shutdown();
         self.state.runtime_node_authority.begin_shutdown();
         if let Some(service) = &self.state.route_v2_signing_operator {
@@ -845,6 +386,8 @@ impl Handle {
         }
         self.image_manifest_resolver.begin_shutdown();
         self.state.observation_store.begin_shutdown();
+        self.state.lifecycle_store.begin_shutdown();
+        self.state.route_store.begin_shutdown();
         if let Some(shutdown) = self
             .server_shutdown
             .lock()
@@ -853,15 +396,10 @@ impl Handle {
         {
             let _ = shutdown.send(());
         }
-        if let Some(task) = &self.reconciler_task {
-            task.begin_shutdown();
-        }
-        if let Some(task) = &self.billing_enforcer_task {
-            task.begin_shutdown();
-        }
         if let Some(task) = &self.volume_delete_sweeper_task {
             task.begin_shutdown();
         }
+        self.route_controller_task.begin_shutdown();
     }
 
     pub async fn shutdown(&self) -> anyhow::Result<()> {
@@ -870,8 +408,8 @@ impl Handle {
         // bounds this wait by the provider transport deadline.
         self.begin_shutdown();
         let observation_store = self.state.observation_store.shutdown();
-        let volume_transitions = self.state.runtime_volume_transition_service.shutdown();
-        let fleet_verifications = self.state.fleet_verification_service.shutdown();
+        let lifecycle_store = self.state.lifecycle_store.shutdown();
+        let route_store = self.state.route_store.shutdown();
         let route_resolutions = self.state.route_resolve_admission.shutdown();
         let commit_resolutions = self.state.cat_create.shutdown_commit_resolutions();
         let persistent_disk_commit_resolutions = self
@@ -892,20 +430,6 @@ impl Handle {
             }
         };
         let manifest_reads = self.image_manifest_resolver.shutdown();
-        let reconciler = async {
-            if let Some(task) = &self.reconciler_task {
-                task.shutdown().await
-            } else {
-                Ok(())
-            }
-        };
-        let billing_enforcer = async {
-            if let Some(task) = &self.billing_enforcer_task {
-                task.shutdown().await
-            } else {
-                Ok(())
-            }
-        };
         let volume_delete_sweeper = async {
             if let Some(task) = &self.volume_delete_sweeper_task {
                 task.shutdown().await
@@ -913,6 +437,7 @@ impl Handle {
                 Ok(())
             }
         };
+        let route_controller = self.route_controller_task.shutdown();
         let gateway_machine = async {
             if let Some(listener) = &self.gateway_machine_listener {
                 listener.shutdown().await
@@ -929,8 +454,8 @@ impl Handle {
         };
         let (
             _,
-            transition_result,
-            fleet_verification_result,
+            _,
+            _,
             route_result,
             commit_result,
             persistent_disk_commit_result,
@@ -940,13 +465,12 @@ impl Handle {
             manifest_result,
             gateway_machine_result,
             route_rotation_machine_result,
-            reconciler_result,
-            billing_enforcer_result,
             volume_delete_sweeper_result,
+            route_controller_result,
         ) = tokio::join!(
             observation_store,
-            volume_transitions,
-            fleet_verifications,
+            lifecycle_store,
+            route_store,
             route_resolutions,
             commit_resolutions,
             persistent_disk_commit_resolutions,
@@ -956,9 +480,8 @@ impl Handle {
             manifest_reads,
             gateway_machine,
             route_rotation_machine,
-            reconciler,
-            billing_enforcer,
-            volume_delete_sweeper
+            volume_delete_sweeper,
+            route_controller
         );
         if !manifest_result {
             tracing::warn!("image manifest reads exceeded the shutdown deadline");
@@ -966,14 +489,11 @@ impl Handle {
         // Graceful shutdown has already stopped admission. Abort any unrelated
         // long-lived HTTP connection after Cat commit ownership is resolved.
         self.server_task.abort();
-        transition_result?;
-        fleet_verification_result?;
         route_result?;
         gateway_machine_result?;
         route_rotation_machine_result?;
-        reconciler_result?;
-        billing_enforcer_result?;
         volume_delete_sweeper_result?;
+        route_controller_result?;
         commit_result.map_err(anyhow::Error::from)?;
         persistent_disk_commit_result.map_err(anyhow::Error::from)?;
         product_mutation_commit_result.map_err(anyhow::Error::from)?;
@@ -1004,21 +524,6 @@ where
     F: Fn() -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    spawn_singleton_task_with_system_resolutions(store, role, move |_| make_task())
-}
-
-pub(crate) fn spawn_singleton_task_with_system_resolutions<F, Fut>(
-    store: Arc<Store>,
-    role: SingletonRole,
-    make_task: F,
-) -> tokio::task::JoinHandle<()>
-where
-    F: Fn(crate::store::runtime_authority::SystemDesiredMutationResolutionOwner) -> Fut
-        + Send
-        + Sync
-        + 'static,
-    Fut: Future<Output = ()> + Send + 'static,
-{
     tokio::spawn(run_singleton_election(store, role, make_task, None))
 }
 
@@ -1030,21 +535,6 @@ pub fn spawn_managed_singleton_task<F, Fut>(
 ) -> ManagedSingletonTask
 where
     F: Fn() -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = ()> + Send + 'static,
-{
-    spawn_managed_singleton_task_with_system_resolutions(store, role, move |_| make_task())
-}
-
-pub(crate) fn spawn_managed_singleton_task_with_system_resolutions<F, Fut>(
-    store: Arc<Store>,
-    role: SingletonRole,
-    make_task: F,
-) -> ManagedSingletonTask
-where
-    F: Fn(crate::store::runtime_authority::SystemDesiredMutationResolutionOwner) -> Fut
-        + Send
-        + Sync
-        + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
     let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1066,10 +556,7 @@ async fn run_singleton_election<F, Fut>(
     make_task: F,
     mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) where
-    F: Fn(crate::store::runtime_authority::SystemDesiredMutationResolutionOwner) -> Fut
-        + Send
-        + Sync
-        + 'static,
+    F: Fn() -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
     'election: loop {
@@ -1126,16 +613,8 @@ async fn run_singleton_election<F, Fut>(
 
         tracing::info!(role = role.name(), "acquired singleton leadership");
         let (cancel, cancelled) = tokio::sync::oneshot::channel();
-        let resolutions =
-            crate::store::runtime_authority::SystemDesiredMutationResolutionOwner::default();
-        let task = make_task(resolutions.clone());
-        let mut supervisor = tokio::spawn(run_elected_singleton(
-            session,
-            role,
-            task,
-            cancelled,
-            resolutions,
-        ));
+        let task = make_task();
+        let mut supervisor = tokio::spawn(run_elected_singleton(session, role, task, cancelled));
         // Declared after the JoinHandle so task cancellation sends the signal
         // before detaching the supervisor. The supervisor retains the advisory
         // lock until its role has actually stopped.
@@ -1204,7 +683,6 @@ async fn run_elected_singleton<Fut>(
     role: SingletonRole,
     task: Fut,
     mut cancelled: tokio::sync::oneshot::Receiver<()>,
-    resolutions: crate::store::runtime_authority::SystemDesiredMutationResolutionOwner,
 ) where
     Fut: Future<Output = ()> + Send + 'static,
 {
@@ -1249,12 +727,6 @@ async fn run_elected_singleton<Fut>(
             }
         }
     }
-    // Dropping the role cancels PRE_COMMIT work. A Store closure may already
-    // have been claimed by its blocking executor, or COMMIT may have been sent
-    // with an ambiguous response, so retain leadership through its physical
-    // rollback/commit and exact Operation resolution.
-    resolutions.close();
-    resolutions.wait_empty().await;
     if let Some(session) = session {
         if let Err(error) = crate::store::execute_leadership_cleanup(move || {
             session.close_now();
@@ -1290,70 +762,6 @@ async fn singleton_check(
     .await
 }
 
-async fn run_reconciler_role(controller: Arc<Controller>, store: Arc<Store>, interval: Duration) {
-    let reap_interrupted_deploys = async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            interval.tick().await;
-            match store
-                .execute(|store| store.fail_interrupted_oci_deployments())
-                .await
-            {
-                Ok(0) => {}
-                Ok(count) => tracing::warn!(
-                    count,
-                    "failed OCI deployments whose owner sessions disappeared"
-                ),
-                Err(error) => tracing::error!(
-                    %error,
-                    "checking interrupted OCI deployments failed"
-                ),
-            }
-        }
-    };
-    tokio::join!(controller.run(interval), reap_interrupted_deploys);
-}
-
-pub(crate) async fn run_runtime_maintenance_role(store: Arc<Store>, period: Duration) {
-    let mut cursor = crate::store::runtime_authority::sweepers::RuntimeMaintenanceCursor::default();
-    let mut interval = tokio::time::interval(period);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        interval.tick().await;
-        let page_cursor = cursor.clone();
-        let request =
-            AuthorityRequestContext::new(Instant::now() + RUNTIME_MAINTENANCE_PAGE_DEADLINE);
-        let cancel_on_drop = CancelAuthorityRequestOnDrop(request.clone());
-        let store_request = request.clone();
-        match store
-            .execute_authority_request_owned(&request, move |store| {
-                store.runtime_maintenance_scan_page(&page_cursor, &store_request)
-            })
-            .await
-        {
-            Ok(report) => {
-                cursor = report.next_cursor.clone();
-                tracing::debug!(
-                    sampled_pending_operations = report.sampled_pending_operations,
-                    settled_host_lost_operations = report.settled_host_lost_operations,
-                    retained_suspected_operations = report.retained_suspected_operations,
-                    sampled_deleted_tombstones = report.sampled_deleted_tombstones,
-                    sampled_retained_api_results = report.sampled_retained_api_results,
-                    "completed production runtime maintenance scan"
-                );
-            }
-            Err(error) => tracing::error!(%error, "production runtime maintenance scan failed"),
-        }
-        drop(cancel_on_drop);
-    }
-}
-
-/// Start the control plane inside the current tokio runtime.
-pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
-    spawn_inner(cfg, false, None).await
-}
-
 /// Start the public control plane plus the isolated mTLS Gateway machine
 /// listener. The machine authority is installed/exact-replayed before either
 /// listener binds; failure has no bearer/plain/public-router fallback.
@@ -1361,27 +769,6 @@ pub async fn spawn_with_gateway_machine(
     cfg: Config,
     gateway_machine: GatewayMachineConfig,
 ) -> anyhow::Result<Handle> {
-    spawn_inner(cfg, false, Some(gateway_machine)).await
-}
-
-/// Retired product/controller harness. It uses the exact production Node
-/// ingress map; in particular it cannot install heartbeat, inventory,
-/// registration, or work-status compatibility routes.
-#[cfg(debug_assertions)]
-pub async fn spawn_for_retired_product_tests(cfg: Config) -> anyhow::Result<Handle> {
-    spawn_inner(cfg, true, None).await
-}
-
-async fn spawn_inner(
-    cfg: Config,
-    retired_product_authority_for_tests: bool,
-    gateway_machine: Option<GatewayMachineConfig>,
-) -> anyhow::Result<Handle> {
-    #[cfg(not(debug_assertions))]
-    anyhow::ensure!(
-        !retired_product_authority_for_tests,
-        "retired product authority is absent from release builds"
-    );
     anyhow::ensure!(
         !cfg.auth_token.is_empty(),
         "service token must not be empty"
@@ -1390,24 +777,6 @@ async fn spawn_inner(
     anyhow::ensure!(
         cfg.auth_token != cfg.admin_token,
         "service and admin tokens must be different"
-    );
-    ensure_route_signing_keys_are_separate(
-        cfg.route_grant_signer.public_key_sha256(),
-        gateway_machine
-            .as_ref()
-            .and_then(|machine| machine.signing_authority.binding().active_kid()),
-    )?;
-    anyhow::ensure!(
-        cfg.auto_tier_policy
-            .warm_after_ms
-            .is_none_or(|value| value > 0),
-        "automatic Warm threshold must be positive"
-    );
-    anyhow::ensure!(
-        cfg.auto_tier_policy
-            .cold_after_ms
-            .is_none_or(|value| value > 0),
-        "automatic Cold threshold must be positive"
     );
     let cfg = Arc::new(cfg);
     let agent_session_registration_policy = Arc::new(
@@ -1444,31 +813,43 @@ async fn spawn_inner(
             "production Control build has no qualified release commit"
         ),
     }
-    if let Some(machine) = &gateway_machine {
-        if let Some(installed) = &machine.rotation_operator_trust {
-            let trust = installed.trust().clone();
-            let exact_bytes = installed.exact_bytes().to_vec();
-            store
-                .execute(move |store| {
-                    store.install_route_v2_rotation_operator_trust(&trust, &exact_bytes)
-                })
-                .await
-                .context("install Route v2 rotation operator trust")?;
-        }
-        let signing_authority = Arc::clone(&machine.signing_authority);
-        store
-            .execute(move |store| store.install_route_grant_v2_signer_authority(&signing_authority))
-            .await
-            .context("install Route Grant v2 signing authority")?;
-        let gateway_authority = machine.gateway_authority.clone();
+    if let Some(installed) = &gateway_machine.rotation_operator_trust {
+        let trust = installed.trust().clone();
+        let exact_bytes = installed.exact_bytes().to_vec();
         store
             .execute(move |store| {
-                store.install_gateway_workload_identity_authority(&gateway_authority)
+                store.install_route_v2_rotation_operator_trust(&trust, &exact_bytes)
             })
             .await
-            .context("install Gateway workload identity authority")?;
+            .context("install Route v2 rotation operator trust")?;
     }
+    let signing_authority = Arc::clone(&gateway_machine.signing_authority);
+    store
+        .execute(move |store| store.install_route_grant_v2_signer_authority(&signing_authority))
+        .await
+        .context("install Route Grant v2 signing authority")?;
+    let gateway_authority = gateway_machine.gateway_authority.clone();
+    store
+        .execute(move |store| store.install_gateway_workload_identity_authority(&gateway_authority))
+        .await
+        .context("install Gateway workload identity authority")?;
     let observation_store = ObservationStoreLane::connect_from_async(
+        cfg.control_store_dsn.clone(),
+        cfg.control_store_ca_file
+            .as_deref()
+            .and_then(|path| path.to_str())
+            .map(str::to_string),
+    )
+    .await?;
+    let lifecycle_store = LifecycleStoreLane::connect_from_async(
+        cfg.control_store_dsn.clone(),
+        cfg.control_store_ca_file
+            .as_deref()
+            .and_then(|path| path.to_str())
+            .map(str::to_string),
+    )
+    .await?;
+    let route_store = RouteStoreLane::connect_from_async(
         cfg.control_store_dsn.clone(),
         cfg.control_store_ca_file
             .as_deref()
@@ -1494,32 +875,8 @@ async fn spawn_inner(
             })
             .await?;
     }
-    if retired_product_authority_for_tests {
-        // Legacy OCI deploys are driven by an in-memory Node HTTP task. Only
-        // the explicit legacy harness is allowed to converge those rows; the
-        // signed production process must not claim ownership of that runtime.
-        match store
-            .execute(|store| store.fail_interrupted_oci_deployments())
-            .await
-        {
-            Ok(0) => {}
-            Ok(count) => {
-                tracing::warn!("failed {count} OCI deployment(s) interrupted by a restart")
-            }
-            Err(error) => {
-                tracing::error!("converging interrupted OCI deployments failed: {error}")
-            }
-        }
-    }
     let usage = cfg.usage_store.clone();
     let credits = cfg.credit_store.clone();
-    #[cfg(debug_assertions)]
-    anyhow::ensure!(
-        retired_product_authority_for_tests || cfg.retired_storage_meta_for_tests.is_none(),
-        "legacy storage metadata is only valid in the retired product test composition"
-    );
-    #[cfg(debug_assertions)]
-    let retired_storage_meta = cfg.retired_storage_meta_for_tests.clone();
     let image_manifests = Arc::new(
         crate::store::runtime_authority::image_manifest_resolver::ImmutableImageManifestResolver::new(
             cfg.image_blob.clone(),
@@ -1557,46 +914,26 @@ async fn spawn_inner(
         ),
     );
     let readiness = Arc::new(ReadinessLatch::new());
-    let gateway_machine_control = gateway_machine.as_ref().map(|_| {
-        Arc::new(
-            crate::api::route_resolve_v2::RouteResolveV2MachineControl::new(Arc::clone(&readiness)),
-        )
-    });
-    let route_v2_signing_operator = match gateway_machine.as_ref() {
-        Some(machine) => match (
-            machine.rotation_operator_trust.as_ref(),
-            machine.rotation_release_commit_sha.as_ref(),
-        ) {
-            (Some(installed), Some(release)) => Some(Arc::new(
-                crate::api::route_signing_operator::RouteV2SigningOperatorService::new(
-                    Arc::clone(&store),
-                    installed.trust().clone(),
-                    release.clone(),
-                    Arc::clone(&readiness),
-                    Arc::new(machine.signing_authority.binding().clone()),
-                    gateway_machine_control.clone(),
-                )?,
-            )),
-            (None, None) => None,
-            _ => anyhow::bail!("incomplete Route v2 rotation operator composition"),
-        },
-        None => None,
-    };
-    let notify = Arc::new(tokio::sync::Notify::new());
-    let controller = Controller::new_with_liveness_authority(
-        store.clone(),
-        #[cfg(debug_assertions)]
-        retired_storage_meta.clone(),
-        notify.clone(),
-        cfg.node_lease_timeout_ms,
-        cfg.auth_token.clone(),
-        cfg.auto_tier_policy,
-        if retired_product_authority_for_tests {
-            NodeLivenessAuthority::LegacyHeartbeatForTests
-        } else {
-            NodeLivenessAuthority::SignedSession
-        },
+    let gateway_machine_control = Arc::new(
+        crate::api::route_resolve_v2::RouteResolveV2MachineControl::new(Arc::clone(&readiness)),
     );
+    let route_v2_signing_operator = match (
+        gateway_machine.rotation_operator_trust.as_ref(),
+        gateway_machine.rotation_release_commit_sha.as_ref(),
+    ) {
+        (Some(installed), Some(release)) => Some(Arc::new(
+            crate::api::route_signing_operator::RouteV2SigningOperatorService::new(
+                Arc::clone(&store),
+                installed.trust().clone(),
+                release.clone(),
+                Arc::clone(&readiness),
+                Arc::new(gateway_machine.signing_authority.binding().clone()),
+                Some(Arc::clone(&gateway_machine_control)),
+            )?,
+        )),
+        (None, None) => None,
+        _ => anyhow::bail!("incomplete Route v2 rotation operator composition"),
+    };
     let state = AppState {
         runtime_node_authority: Arc::new(
             crate::api::runtime_node_authority::RuntimeNodeAuthorityService::new(
@@ -1609,16 +946,14 @@ async fn spawn_inner(
         route_v2_signing_operator,
         store,
         observation_store,
+        lifecycle_store,
+        route_store,
         usage,
         credits,
-        #[cfg(debug_assertions)]
-        retired_storage_meta_for_tests: retired_storage_meta,
         cat_create,
         persistent_disk_create,
         product_mutations,
         readiness,
-        notify,
-        controller: controller.clone(),
         cfg: cfg.clone(),
         agent_session_registration_policy,
         runtime_spine_admission: Arc::new(RuntimeSpineAdmission::new()),
@@ -1627,17 +962,11 @@ async fn spawn_inner(
                 ROUTE_RESOLVE_V2_GLOBAL_IN_FLIGHT,
             ),
         ),
-        runtime_volume_transition_admission: Arc::new(RuntimeSpineAdmission::new()),
         object_write_authority_read_admission: Arc::new(RuntimeSpineAdmission::new()),
-        runtime_volume_transition_service: Arc::new(RuntimeVolumeTransitionService::new()),
-        fleet_verification_service: Arc::new(FleetVerificationService::new()),
-        #[cfg(debug_assertions)]
-        retired_product_authority_for_tests,
     };
 
-    let (gateway_machine_listener, route_rotation_machine_listener) = if let Some(mut machine) =
-        gateway_machine
-    {
+    let (gateway_machine_listener, route_rotation_machine_listener) = {
+        let mut machine = gateway_machine;
         let route_rotation_machine_listener = match (
             machine.rotation_listen.take(),
             machine.rotation_tls_config.take(),
@@ -1659,9 +988,7 @@ async fn spawn_inner(
             &state.readiness,
             signer.is_some(),
         ) {
-            let control = gateway_machine_control
-                .clone()
-                .context("Gateway machine control disappeared before listener bind")?;
+            let control = Arc::clone(&gateway_machine_control);
             let service = Arc::new(
                 crate::api::route_resolve_v2::RouteResolveV2Service::for_gateway_machine(
                     Arc::clone(&state.store),
@@ -1692,8 +1019,6 @@ async fn spawn_inner(
             None
         };
         (gateway_machine_listener, route_rotation_machine_listener)
-    } else {
-        (None, None)
     };
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen)
@@ -1712,49 +1037,10 @@ async fn spawn_inner(
             tracing::error!("control plane server exited: {e}");
         }
     });
-    let interval = Duration::from_millis(cfg.reconcile_interval_ms);
-    let reconciler_task = Some(if retired_product_authority_for_tests {
-        let reconciler = controller.clone();
-        let reconciler_store = state.store.clone();
-        spawn_managed_singleton_task(state.store.clone(), SingletonRole::Reconciler, move || {
-            run_reconciler_role(reconciler.clone(), reconciler_store.clone(), interval)
-        })
-    } else {
-        let maintenance_store = state.store.clone();
-        let maintenance_interval = interval.max(Duration::from_secs(5));
-        spawn_managed_singleton_task(
-            state.store.clone(),
-            SingletonRole::RuntimeSweeper,
-            move || run_runtime_maintenance_role(maintenance_store.clone(), maintenance_interval),
-        )
-    });
-    let billing_enforcer_task = cfg.billing_enforcement_enabled.then(|| {
-        let enforcement_state = state.clone();
-        spawn_managed_singleton_task_with_system_resolutions(
-            state.store.clone(),
-            SingletonRole::BillingEnforcer,
-            move |resolution_owner| {
-                let enforcement_state = enforcement_state.clone();
-                async move {
-                    let mut cursor = None;
-                    let mut interval = tokio::time::interval(Duration::from_secs(10));
-                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                    loop {
-                        interval.tick().await;
-                        if let Err(error) = crate::api::enforce_exhausted_billing_accounts(
-                            &enforcement_state,
-                            &mut cursor,
-                            &resolution_owner,
-                        )
-                        .await
-                        {
-                            tracing::error!(error = %error.0, "billing credit enforcement failed");
-                        }
-                    }
-                }
-            },
-        )
-    });
+    // Billing enforcement previously published Desired mutations.  The
+    // clean-slate atomic lifecycle release has no such side channel; billing
+    // remains queryable, and enforcement must later admit an exact lifecycle
+    // command through the same one-unresolved-per-Cat lane.
     let delete_sweeper = Arc::new(
         crate::store::runtime_authority::delete_sweeper::DeleteSweeper::new(
             state.store.clone(),
@@ -1800,6 +1086,25 @@ async fn spawn_inner(
             }
         },
     ));
+    let route_controller_store = Arc::clone(&state.store);
+    let route_controller_task = spawn_managed_singleton_task(
+        Arc::clone(&state.store),
+        SingletonRole::RouteController,
+        move || {
+            let route_controller_store = Arc::clone(&route_controller_store);
+            async move {
+                // The elected supervisor owns cancellation. Constructing a
+                // fresh lightweight runner for each leadership tenure keeps
+                // scan cursor state local to that tenure while PostgreSQL
+                // remains the exact per-Endpoint authority.
+                crate::store::runtime_authority::route_controller::RouteController::new(
+                    route_controller_store,
+                )
+                .run()
+                .await;
+            }
+        },
+    );
 
     let gateway_machine_addr = gateway_machine_listener
         .as_ref()
@@ -1814,28 +1119,13 @@ async fn spawn_inner(
         route_rotation_machine_addr,
         state,
         server_task,
-        reconciler_task,
-        billing_enforcer_task,
         volume_delete_sweeper_task,
+        route_controller_task,
         image_manifest_resolver: image_manifests,
         server_shutdown: std::sync::Mutex::new(Some(server_shutdown)),
         gateway_machine_listener,
         route_rotation_machine_listener,
     })
-}
-
-/// Route Grant v1 remains live during the v2 cutover, but its signing key must
-/// never be repurposed as the independent Gateway-to-Node capability key. This
-/// check deliberately runs before any PostgreSQL connection or listener bind.
-fn ensure_route_signing_keys_are_separate(
-    legacy_v1_spki_sha256: &str,
-    route_v2_active_kid: Option<&cats_api::runtime_reconciliation::KeyId>,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        route_v2_active_kid.is_none_or(|kid| kid.as_str() != legacy_v1_spki_sha256),
-        "Route Grant v1 and v2 must use different Ed25519 signing keys"
-    );
-    Ok(())
 }
 
 fn gateway_machine_signer_may_serve_at_startup(
@@ -1850,24 +1140,8 @@ fn gateway_machine_signer_may_serve_at_startup(
 }
 
 #[cfg(test)]
-mod route_signing_key_separation_tests {
-    use super::{
-        ensure_route_signing_keys_are_separate, gateway_machine_signer_may_serve_at_startup,
-        ReadinessLatch,
-    };
-    use cats_api::runtime_reconciliation::KeyId;
-
-    #[test]
-    fn startup_rejects_reusing_the_legacy_v1_spki_as_the_v2_active_kid() {
-        let legacy = "fd56fed3251463eff0063169a7f8fa9dce585b6eee429581264297c98ec58bcb";
-        let reused = KeyId::new(legacy).unwrap();
-        assert!(ensure_route_signing_keys_are_separate(legacy, Some(&reused)).is_err());
-
-        let independent =
-            KeyId::new("2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99").unwrap();
-        ensure_route_signing_keys_are_separate(legacy, Some(&independent)).unwrap();
-        ensure_route_signing_keys_are_separate(legacy, None).unwrap();
-    }
+mod gateway_machine_startup_tests {
+    use super::{gateway_machine_signer_may_serve_at_startup, ReadinessLatch};
 
     #[test]
     fn disabled_v2_signer_closes_startup_readiness_and_machine_bind() {

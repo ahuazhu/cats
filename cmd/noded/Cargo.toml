@@ -18,10 +18,6 @@ name = "cats-route-v2-node-r1-validator"
 path = "src/route_v2_node_r1_validator.rs"
 
 [[bin]]
-name = "cats-runtime-e3-probe"
-path = "src/runtime_e3_probe.rs"
-
-[[bin]]
 name = "cats-usage-schema-v16-verifier"
 path = "src/usage_schema_v16_verifier.rs"
 
@@ -44,9 +40,6 @@ clap = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
-reqwest = { workspace = true, features = ["blocking"] }
-tokio-tungstenite = { workspace = true }
-futures-util = { workspace = true }
 libc = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }

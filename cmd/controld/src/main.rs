@@ -127,31 +127,16 @@ struct Args {
         value_name = "PATH"
     )]
     production_cutover_operator_trust_file: std::path::PathBuf,
-    /// PKCS#8 Ed25519 private key used only by the control plane to issue
-    /// short-lived V1 Endpoint Route Grants.
-    #[arg(long, env = "CATS_ROUTE_GRANT_PRIVATE_KEY_FILE")]
-    route_grant_private_key_file: std::path::PathBuf,
-    /// Matching Ed25519 public key. Startup signs and verifies a challenge so a
-    /// deployment cannot become Ready with independently mismatched key halves.
-    #[arg(long, env = "CATS_ROUTE_GRANT_PUBLIC_KEY_FILE")]
-    route_grant_public_key_file: std::path::PathBuf,
-    #[arg(
-        long,
-        env = "CATS_ROUTE_GRANT_TTL_SECONDS",
-        default_value_t = cats_control_plane::route_grant::DEFAULT_ROUTE_GRANT_TTL_SECONDS
-    )]
-    route_grant_ttl_seconds: u64,
-    /// Optional independent mTLS listener for Gateway Route v2 resolve. When
-    /// set, every policy/CA/certificate/key/signer file is loaded only from
-    /// its frozen installed path; there are no path or inline-byte options.
+    /// Mandatory independent mTLS listener for Gateway Route v2 resolve. Every
+    /// policy/CA/certificate/key/signer file is loaded only from its frozen
+    /// installed path; there are no path or inline-byte options.
     #[arg(long, env = "CATS_ROUTE_V2_MACHINE_LISTEN")]
-    route_v2_machine_listen: Option<String>,
-    /// Independent server-auth TLS listener for signed Route v2 rotation and
-    /// public successor/current discovery. Production composes it whenever
-    /// the Gateway machine listener is configured, and it stays bound while
+    route_v2_machine_listen: String,
+    /// Mandatory independent server-auth TLS listener for signed Route v2
+    /// rotation and public successor/current discovery. It stays bound while
     /// the loaded signer is disabled.
     #[arg(long, env = "CATS_ROUTE_V2_ROTATION_LISTEN")]
-    route_v2_rotation_listen: Option<String>,
+    route_v2_rotation_listen: String,
     #[arg(
         long,
         env = "CATS_ROUTE_GRANT_V2_TTL_SECONDS",
@@ -241,18 +226,6 @@ struct Args {
         hide = true
     )]
     workos_api_base_url: String,
-    #[arg(long, default_value_t = 10_000)]
-    node_lease_timeout_ms: i64,
-    #[arg(long, default_value_t = 500)]
-    reconcile_interval_ms: u64,
-    /// Seconds a stable Suspended Cat remains before automatic Warm.
-    /// Zero disables this automatic boundary.
-    #[arg(long, env = "CATS_AUTO_WARM_AFTER_SECONDS", default_value_t = 0)]
-    auto_warm_after_seconds: u64,
-    /// Seconds a stable Warm Cat remains before automatic Cold.
-    /// Zero disables this automatic boundary.
-    #[arg(long, env = "CATS_AUTO_COLD_AFTER_SECONDS", default_value_t = 86_400)]
-    auto_cold_after_seconds: u64,
     /// Milliseconds an OCI deploy may hold its request open before answering
     /// `202` with an operation to poll. Must stay below the idle timeout of the
     /// proxy in front of Cats, or that proxy answers 504 first.
@@ -262,18 +235,6 @@ struct Args {
         default_value_t = cats_control_plane::server::DEFAULT_OCI_DEPLOY_SYNC_WAIT_MS
     )]
     oci_deploy_sync_wait_ms: u64,
-}
-
-fn threshold_ms(seconds: u64, name: &str) -> anyhow::Result<Option<i64>> {
-    if seconds == 0 {
-        return Ok(None);
-    }
-    let millis = seconds
-        .checked_mul(1_000)
-        .ok_or_else(|| anyhow::anyhow!("{name} threshold is too large"))?;
-    Ok(Some(i64::try_from(millis).map_err(|_| {
-        anyhow::anyhow!("{name} threshold is too large")
-    })?))
 }
 
 #[cfg(unix)]
@@ -516,27 +477,6 @@ async fn main() -> anyhow::Result<()> {
                 .context("the control store needs a PostgreSQL URL: --control-store-url, CATS_CONTROL_POSTGRES_URL, CATS_CONTROL_POSTGRES_URL_FILE or CATS_POSTGRES_URL")?,
         ),
     };
-    let route_grant_private_key =
-        std::fs::read(&args.route_grant_private_key_file).with_context(|| {
-            format!(
-                "read route grant private key {}",
-                args.route_grant_private_key_file.display()
-            )
-        })?;
-    let route_grant_public_key =
-        std::fs::read(&args.route_grant_public_key_file).with_context(|| {
-            format!(
-                "read route grant public key {}",
-                args.route_grant_public_key_file.display()
-            )
-        })?;
-    let route_grant_signer = Arc::new(
-        cats_control_plane::route_grant::RouteGrantSigner::from_ed25519_pem(
-            &route_grant_private_key,
-            &route_grant_public_key,
-            args.route_grant_ttl_seconds,
-        )?,
-    );
     let guest_runtime_profile_receipt_path = args
         .guest_runtime_profile_receipt_file
         .as_deref()
@@ -553,60 +493,46 @@ async fn main() -> anyhow::Result<()> {
         cats_api::runtime_artifacts::load_installed_production_cutover_operator_trust_bundle(
             &args.production_cutover_operator_trust_file,
         )?;
-    let gateway_machine = if let (Some(listen), Some(rotation_listen)) = (
-        args.route_v2_machine_listen.clone(),
-        args.route_v2_rotation_listen.clone(),
-    ) {
-        use cats_api::gateway_workload_identity::{
-            CONTROL_MACHINE_SERVER_CERTIFICATE_PATH, CONTROL_MACHINE_SERVER_PRIVATE_KEY_PATH,
-            GATEWAY_CLIENT_CA_BUNDLE_PATH, GATEWAY_WORKLOAD_IDENTITY_AUTHORITY_PATH,
-        };
-        use cats_api::route_grant_v2::{
-            ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH, ROUTE_GRANT_V2_SIGNER_PRIVATE_KEY_PATH,
-            ROUTE_GRANT_V2_SIGNER_REFERENCE_PATH,
-        };
-
-        let gateway_artifacts =
-            cats_api::runtime_artifacts::load_installed_gateway_machine_artifacts(
-                std::path::Path::new(GATEWAY_WORKLOAD_IDENTITY_AUTHORITY_PATH),
-                std::path::Path::new(GATEWAY_CLIENT_CA_BUNDLE_PATH),
-                std::path::Path::new(CONTROL_MACHINE_SERVER_CERTIFICATE_PATH),
-                std::path::Path::new(CONTROL_MACHINE_SERVER_PRIVATE_KEY_PATH),
-            )?;
-        let signer_artifacts = cats_api::runtime_artifacts::load_installed_route_grant_v2_signer(
-            std::path::Path::new(ROUTE_GRANT_V2_SIGNER_REFERENCE_PATH),
-            std::path::Path::new(ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH),
-            std::path::Path::new(ROUTE_GRANT_V2_SIGNER_PRIVATE_KEY_PATH),
-        )?;
-        let rotation_operator_trust =
-            cats_api::runtime_artifacts::load_installed_route_v2_rotation_operator_trust(
-                std::path::Path::new(
-                    cats_api::route_signing_operator::ROUTE_V2_ROTATION_OPERATOR_TRUST_PATH,
-                ),
-            )?;
-        Some(cats_control_plane::server::GatewayMachineConfig::new(
-            listen,
-            rotation_listen,
-            gateway_artifacts,
-            signer_artifacts,
-            rotation_operator_trust,
-            args.route_grant_v2_ttl_seconds,
-        )?)
-    } else {
-        anyhow::ensure!(
-            args.route_v2_machine_listen.is_none() && args.route_v2_rotation_listen.is_none(),
-            "--route-v2-machine-listen and --route-v2-rotation-listen must be configured together"
-        );
-        None
+    use cats_api::gateway_workload_identity::{
+        CONTROL_MACHINE_SERVER_CERTIFICATE_PATH, CONTROL_MACHINE_SERVER_PRIVATE_KEY_PATH,
+        GATEWAY_CLIENT_CA_BUNDLE_PATH, GATEWAY_WORKLOAD_IDENTITY_AUTHORITY_PATH,
     };
+    use cats_api::route_grant_v2::{
+        ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH, ROUTE_GRANT_V2_SIGNER_PRIVATE_KEY_PATH,
+        ROUTE_GRANT_V2_SIGNER_REFERENCE_PATH,
+    };
+
+    let gateway_artifacts = cats_api::runtime_artifacts::load_installed_gateway_machine_artifacts(
+        std::path::Path::new(GATEWAY_WORKLOAD_IDENTITY_AUTHORITY_PATH),
+        std::path::Path::new(GATEWAY_CLIENT_CA_BUNDLE_PATH),
+        std::path::Path::new(CONTROL_MACHINE_SERVER_CERTIFICATE_PATH),
+        std::path::Path::new(CONTROL_MACHINE_SERVER_PRIVATE_KEY_PATH),
+    )?;
+    let signer_artifacts = cats_api::runtime_artifacts::load_installed_route_grant_v2_signer(
+        std::path::Path::new(ROUTE_GRANT_V2_SIGNER_REFERENCE_PATH),
+        std::path::Path::new(ROUTE_GRANT_V2_PUBLIC_KEY_RING_PATH),
+        std::path::Path::new(ROUTE_GRANT_V2_SIGNER_PRIVATE_KEY_PATH),
+    )?;
+    let rotation_operator_trust =
+        cats_api::runtime_artifacts::load_installed_route_v2_rotation_operator_trust(
+            std::path::Path::new(
+                cats_api::route_signing_operator::ROUTE_V2_ROTATION_OPERATOR_TRUST_PATH,
+            ),
+        )?;
+    let gateway_machine = cats_control_plane::server::GatewayMachineConfig::new(
+        args.route_v2_machine_listen,
+        args.route_v2_rotation_listen,
+        gateway_artifacts,
+        signer_artifacts,
+        rotation_operator_trust,
+        args.route_grant_v2_ttl_seconds,
+    )?;
     let server_config = cats_control_plane::server::Config {
         listen: args.listen,
         control_store_dsn,
         control_store_ca_file: args.control_store_ca_file,
         usage_store,
         credit_store,
-        #[cfg(debug_assertions)]
-        retired_storage_meta_for_tests: None,
         image_blob,
         auth_token: args.auth_token,
         guest_runtime_profile_receipt: guest_runtime_profile_receipt.receipt().clone(),
@@ -614,25 +540,15 @@ async fn main() -> anyhow::Result<()> {
         production_cutover_operator_trust_bundle: production_cutover_operator_trust
             .bundle()
             .clone(),
-        route_grant_signer,
         admin_token: args.admin_token,
         workos,
         stripe,
         billing_enforcement_enabled: args.billing_enforcement_enabled,
-        node_lease_timeout_ms: args.node_lease_timeout_ms,
-        reconcile_interval_ms: args.reconcile_interval_ms,
-        auto_tier_policy: cats_control_plane::controller::AutoTierPolicy {
-            warm_after_ms: threshold_ms(args.auto_warm_after_seconds, "automatic Warm")?,
-            cold_after_ms: threshold_ms(args.auto_cold_after_seconds, "automatic Cold")?,
-        },
         oci_deploy_sync_wait_ms: args.oci_deploy_sync_wait_ms,
     };
-    let handle = match gateway_machine {
-        Some(machine) => {
-            cats_control_plane::server::spawn_with_gateway_machine(server_config, machine).await?
-        }
-        None => cats_control_plane::server::spawn(server_config).await?,
-    };
+    let handle =
+        cats_control_plane::server::spawn_with_gateway_machine(server_config, gateway_machine)
+            .await?;
     let usage_projector_task = usage_projector.map(|projector| {
         cats_control_plane::server::spawn_managed_singleton_task(
             handle.state.store.clone(),

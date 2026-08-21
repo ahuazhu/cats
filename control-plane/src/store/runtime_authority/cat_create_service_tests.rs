@@ -3,14 +3,23 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use cats_api::agent_registration::AuthenticatedNodeCredential;
+use cats_api::runtime_inventory::{
+    full_inventory_digest, RuntimeInventoryBody, RuntimeInventoryReport,
+};
+use cats_api::runtime_lifecycle::{
+    decode_immutable_runtime_config, decode_lifecycle_command_envelope, LifecycleCommand,
+    LifecyclePredecessor, RuntimeNetworkConfig, RuntimeVolumeAuthorityInput,
+    RuntimeVolumeGuestBinding,
+};
 use cats_api::runtime_reconciliation::{
-    decode_desired_runtime_spec, guest_config_digest, AllocatableMemoryBytes, AllocatableVcpus,
-    AsciiText, AssignedKind, ContractVersion, DiskKind, Durability, Epoch, GuestIpv4Pool,
-    GuestIpv4PoolKind, GuestRuntimeProfileReceipt, Id, Ipv4Address, NodeIdentityState,
-    NodePlacementPolicy, NodeTransportTarget, RandomId128, Revision, RuntimePlacementBlockFrontend,
-    RuntimePlacementCapabilities, RuntimePlacementGuestNetwork, RuntimePlacementGuestTransport,
-    RuntimePlacementVmm, RuntimeSchedulingState, RuntimeTarget, RuntimeTransition, Sha256Digest,
-    VolumeAccess, VolumeAcquire, VolumeDisposition,
+    guest_config_digest, AgentRegistrationAttempt, AllocatableMemoryBytes, AllocatableVcpus,
+    AsciiText, ContractVersion, CredentialBinding, Durability, Epoch, GuestIpv4Pool,
+    GuestIpv4PoolKind, GuestRuntimeProfileReceipt, Id, Ipv4Address, NodeBootId, NodeIdentity,
+    NodeIdentityState, NodePlacementPolicy, NodeTransportTarget, ProviderScope, RandomId128,
+    RuntimePlacementBlockFrontend, RuntimePlacementCapabilities, RuntimePlacementGuestNetwork,
+    RuntimePlacementGuestTransport, RuntimePlacementVmm, RuntimeSchedulingState, Sequence,
+    SessionBinding, Sha256Digest, UnixMillis,
 };
 
 use super::cat_create_service::{
@@ -20,12 +29,9 @@ use super::cat_create_service::{
     CAT_CREATE_MAX_BODY_BYTES, CAT_CREATE_TOTAL_DEADLINE,
 };
 use super::placement_planner::PlacementTargetSnapshot;
-use super::product::CatRecord;
 use super::product_identity::ProductIdentitySource;
-use super::product_rows::insert_cat;
-use super::rows::database_now;
-use super::runtime_spine::PlacementAdmissionSnapshot;
-use crate::store::{Result, Store};
+use super::runtime_spine::RuntimeInventoryOutcome;
+use crate::store::{AgentRegistrationOutcome, AgentSessionRegistrationPolicy, Result, Store};
 
 const BOOT_DIGEST: &str = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
 
@@ -49,7 +55,7 @@ fn body(name: &str, root_size_bytes: u64) -> Vec<u8> {
     .into_bytes()
 }
 
-fn ingress(
+pub(crate) fn ingress(
     workspace: &Id,
     name: &str,
     key: &str,
@@ -289,13 +295,16 @@ struct FakePlanner {
     last_request: Mutex<Option<CatCreatePlanRequest>>,
     replace_network_id: bool,
     retire_node: bool,
-    admission: Mutex<PlacementAdmissionSnapshot>,
+    target: Mutex<PlacementTargetSnapshot>,
 }
 
-pub(crate) fn placement_policy(admission: &PlacementAdmissionSnapshot) -> NodePlacementPolicy {
+pub(crate) fn placement_policy(
+    node_id: &Id,
+    guest_config_digest: &Sha256Digest,
+) -> NodePlacementPolicy {
     NodePlacementPolicy {
         version: ContractVersion::V1,
-        node_id: admission.node_identity.node_id.clone(),
+        node_id: node_id.clone(),
         policy_revision: Epoch::new(1).unwrap(),
         scheduling_state: RuntimeSchedulingState::Schedulable,
         allocatable_vcpus: AllocatableVcpus::new(8).unwrap(),
@@ -306,7 +315,7 @@ pub(crate) fn placement_policy(admission: &PlacementAdmissionSnapshot) -> NodePl
             guest_network: RuntimePlacementGuestNetwork::IsolatedIpv4,
             guest_transport: RuntimePlacementGuestTransport::Vsock,
             guest_agent_protocol_version: ContractVersion::V1,
-            guest_config_digest: admission.agent_session.guest_config_digest.clone(),
+            guest_config_digest: guest_config_digest.clone(),
         },
         guest_ipv4_pool: GuestIpv4Pool {
             kind: GuestIpv4PoolKind::PrivateIpv4_16,
@@ -335,21 +344,20 @@ impl CatCreatePlacementPlanner for FakePlanner {
         } else {
             NodeIdentityState::Provisioned
         };
-        let mut admission = self.admission.lock().unwrap().clone();
-        admission.node_identity.state = node_state;
-        let policy = placement_policy(&admission);
+        let mut target = self.target.lock().unwrap().clone();
+        target.node_identity.state = node_state;
+        let policy = placement_policy(
+            &target.node_identity.node_id,
+            &target.agent_session.guest_config_digest,
+        );
+        target.policy = policy.clone();
         let network_config =
             super::placement_planner::allocate_network_for_test(&policy, &network_id);
         Box::pin(async move {
             Ok(CatCreatePlacementOutcome::Planned(CatCreatePlan {
-                target: PlacementTargetSnapshot {
-                    policy,
-                    admission,
-                    active_host_fence_event: None,
-                },
+                target,
                 mutation: CatCreatePlacementMutation {
                     cat_id: request.cat_id.clone(),
-                    desired_revision: Revision::new(1).unwrap(),
                     placement_epoch: Epoch::new(1).unwrap(),
                     vcpus: request.vcpus,
                     memory_bytes: request.memory_bytes,
@@ -396,6 +404,106 @@ fn release_receipt() -> GuestRuntimeProfileReceipt {
         initramfs_digest: Some(Sha256Digest::from_bytes([4; 32])),
         kernel_cmdline: AsciiText::new("console=hvc0 root=/dev/vda").unwrap(),
         guest_agent_protocol_version: ContractVersion::V1,
+    }
+}
+
+pub(crate) fn establish_empty_target(
+    store: &Store,
+    release: &GuestRuntimeProfileReceipt,
+) -> PlacementTargetSnapshot {
+    let identity = NodeIdentity {
+        version: ContractVersion::V1,
+        node_id: id("node_a"),
+        provider_scope: ProviderScope {
+            provider: id("test_provider"),
+            partition: id("test_partition"),
+            account_id: id("test_account"),
+            region: id("test_region"),
+        },
+        immutable_host_id: id("host_a"),
+        credential_id: id("credential_a"),
+        credential_binding: CredentialBinding::PublicKey {
+            public_key_spki_sha256: Sha256Digest::from_bytes([9; 32]),
+        },
+        state_path_id: id("state_path_a"),
+        state: NodeIdentityState::Provisioned,
+    };
+    let authenticated = AuthenticatedNodeCredential::new(
+        identity.credential_id.clone(),
+        identity.credential_binding.clone(),
+    );
+    let registration_policy =
+        AgentSessionRegistrationPolicy::from_release_receipt(release).unwrap();
+    store.provision_node_identity(&identity).unwrap();
+    let attempt = AgentRegistrationAttempt {
+        version: ContractVersion::V1,
+        node_id: identity.node_id.clone(),
+        immutable_host_id: identity.immutable_host_id.clone(),
+        node_boot_id: NodeBootId::new("11111111111111111111111111111111").unwrap(),
+        agent_instance_id: RandomId128::new("22222222222222222222222222222222").unwrap(),
+        registration_attempt_id: RandomId128::new("33333333333333333333333333333333").unwrap(),
+        guest_config_digest: guest_config_digest(release).unwrap(),
+        expected_agent_session_epoch: None,
+    };
+    let agent_session = match store
+        .register_agent_session(&authenticated, &attempt, &registration_policy)
+        .unwrap()
+    {
+        AgentRegistrationOutcome::Registered(session) => session,
+        AgentRegistrationOutcome::Rejected(rejection) => {
+            panic!("AgentSession registration rejected: {rejection:?}")
+        }
+    };
+    let session = SessionBinding {
+        node_id: agent_session.node_id.clone(),
+        node_boot_id: agent_session.node_boot_id.clone(),
+        agent_instance_id: agent_session.agent_instance_id.clone(),
+        agent_session_epoch: agent_session.agent_session_epoch,
+    };
+    let mut full_report = RuntimeInventoryReport {
+        version: ContractVersion::V1,
+        session,
+        report_id: RandomId128::new("44444444444444444444444444444444").unwrap(),
+        sequence: Sequence::new(1).unwrap(),
+        collected_at_unix_ms: UnixMillis::new(1).unwrap(),
+        inventory: RuntimeInventoryBody::Full {
+            inventory_epoch: Epoch::new(1).unwrap(),
+            scan_id: RandomId128::new("55555555555555555555555555555555").unwrap(),
+            inventory_digest: Sha256Digest::from_bytes([0; 32]),
+            cats: Vec::new(),
+            unattributed_artifacts: Vec::new(),
+        },
+    };
+    let digest = full_inventory_digest(&full_report).unwrap();
+    let RuntimeInventoryBody::Full {
+        inventory_digest, ..
+    } = &mut full_report.inventory
+    else {
+        unreachable!()
+    };
+    *inventory_digest = digest;
+    match store
+        .runtime_accept_inventory(&authenticated, &full_report)
+        .unwrap()
+    {
+        RuntimeInventoryOutcome::Accepted(_) => {}
+        RuntimeInventoryOutcome::Rejected(rejection) => {
+            panic!("full inventory rejected: {rejection:?}")
+        }
+    }
+    let inventory = store
+        .load_current_full_inventory(&identity.node_id)
+        .unwrap()
+        .unwrap();
+    let policy = placement_policy(&identity.node_id, &agent_session.guest_config_digest);
+    PlacementTargetSnapshot {
+        policy,
+        node_identity: identity,
+        agent_session,
+        inventory_attestation: inventory.attestation.clone(),
+        full_inventory_report: inventory.full_report,
+        active_host_fence_event: None,
+        evaluated_at_unix_ms: inventory.attestation.accepted_at_unix_ms,
     }
 }
 
@@ -446,13 +554,10 @@ fn service_fixture_at(
     let workspace = bootstrap_workspace(&store, slug);
     crate::testsupport::begin_production_qualification_for_product_test(&store, &workspace);
     let release = release_receipt();
-    let admission = super::runtime_spine_tests::establish_empty_admission(store.as_ref(), &release);
+    let target = establish_empty_target(store.as_ref(), &release);
     store
         .authority_transaction(|transaction| {
-            super::placement_policy::insert_policy_for_test(
-                transaction,
-                &placement_policy(&admission),
-            )
+            super::placement_policy::insert_policy_for_test(transaction, &target.policy)
         })
         .unwrap();
     let manifests = Arc::new(FakeManifestResolver {
@@ -464,7 +569,7 @@ fn service_fixture_at(
         last_request: Mutex::new(None),
         replace_network_id: false,
         retire_node: false,
-        admission: Mutex::new(admission),
+        target: Mutex::new(target),
     });
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -479,6 +584,14 @@ fn service_fixture_at(
     )
     .unwrap();
     (runtime, store, workspace, manifests, planner, service)
+}
+
+pub(crate) fn disk_name_race_fixture_at(
+    url: &str,
+    slug: &str,
+) -> (tokio::runtime::Runtime, Arc<Store>, Id, CatCreateService) {
+    let (runtime, store, workspace, _manifests, _planner, service) = service_fixture_at(url, slug);
+    (runtime, store, workspace, service)
 }
 
 #[test]
@@ -535,9 +648,9 @@ fn service_builds_the_complete_candidate_and_replays_before_external_reads() {
                         (SELECT count(*) FROM cat_records),
                         (SELECT count(*) FROM disk_records),
                         (SELECT count(*) FROM volume_records),
-                        (SELECT count(*) FROM desired_runtime_specs),
+                        (SELECT count(*) FROM cat_runtime_configs),
                         (SELECT count(*) FROM endpoint_records),
-                        (SELECT count(*) FROM hostname_desired_lookups),
+                        (SELECT count(*) FROM hostname_endpoint_lookups),
                         (SELECT count(*) FROM runtime_operations),
                         (SELECT count(*) FROM api_idempotency_results)",
                     &[],
@@ -547,97 +660,139 @@ fn service_builds_the_complete_candidate_and_replays_before_external_reads() {
         .unwrap();
     assert_eq!(counts, vec![1; 8]);
 
-    let desired_json: String = store
+    let (config_bytes, operation_bytes): (Vec<u8>, Vec<u8>) = store
         .with(|client| {
             client
-                .query_one("SELECT record::text FROM desired_runtime_specs", &[])
-                .map(|row| row.get(0))
+                .query_one(
+                    "SELECT config.canonical_config_bytes,
+                            operation.canonical_request_bytes
+                       FROM cat_records cat
+                       JOIN cat_runtime_configs config
+                         ON config.config_id=cat.current_runtime_config_id
+                       JOIN runtime_operations operation
+                         ON operation.cat_id=cat.cat_id
+                      WHERE cat.cat_id='cat_00000000000000000000000000000001'",
+                    &[],
+                )
+                .map(|row| (row.get(0), row.get(1)))
         })
         .unwrap();
-    let desired = decode_desired_runtime_spec(desired_json.as_bytes()).unwrap();
+    let config = decode_immutable_runtime_config(&config_bytes).unwrap();
     assert_eq!(
-        desired.cat_id.as_str(),
-        "cat_00000000000000000000000000000001"
+        config.config_id.as_str(),
+        "cfg_00000000000000000000000000000005"
     );
-    assert_eq!(desired.workspace_id, workspace);
-    assert_eq!(desired.desired_revision.get(), 1);
-    assert_eq!(desired.target, RuntimeTarget::Running);
-    assert_eq!(desired.placement.kind, AssignedKind::Assigned);
-    assert_eq!(desired.placement.node_id.as_str(), "node_a");
-    assert_eq!(desired.placement.placement_epoch.get(), 1);
-    assert_eq!(desired.transition, RuntimeTransition::CancelAndDrain);
-    assert_eq!(desired.runtime.vcpus, 2);
-    assert_eq!(desired.runtime.memory_bytes, 2_147_483_648);
-    assert_eq!(desired.runtime.boot_image_digest.as_str(), BOOT_DIGEST);
+    assert_eq!(config.vcpus, 2);
+    assert_eq!(config.memory_bytes, 2_147_483_648);
+    assert_eq!(config.boot_image_digest.as_str(), BOOT_DIGEST);
     assert_eq!(
-        desired.runtime.guest_config_digest,
+        config.guest_runtime_profile_digest,
         plan_request.guest_config_digest
     );
-    assert_eq!(
-        desired.runtime.network_config.network_id,
-        plan_request.network_id
-    );
-    assert_eq!(
-        desired.runtime.network_config.guest_mac.as_str(),
-        "02:ca:0a:00:28:aa"
-    );
-    assert_eq!(
-        desired.runtime.network_config.guest_ipv4.as_str(),
-        "10.0.40.170"
-    );
-    assert_eq!(desired.runtime.network_config.prefix_length, 30);
-    assert_eq!(
-        desired.runtime.network_config.gateway_ipv4.as_str(),
-        "10.0.40.169"
-    );
-    let [root] = desired.volumes.as_slice() else {
-        panic!("initial Desired must contain exactly one Root volume")
+    let RuntimeNetworkConfig::IsolatedIpv4 {
+        network_id,
+        guest_mac,
+        guest_ipv4,
+        prefix_length,
+        gateway_ipv4,
+    } = &config.network_config;
+    assert_eq!(network_id, &plan_request.network_id);
+    assert_eq!(guest_mac.as_str(), "02:ca:0a:00:28:aa");
+    assert_eq!(guest_ipv4.as_str(), "10.0.40.170");
+    assert_eq!(*prefix_length, 30);
+    assert_eq!(gateway_ipv4.as_str(), "10.0.40.169");
+    let [root] = config.volumes.as_slice() else {
+        panic!("Genesis config must contain exactly one Root volume")
     };
     assert_eq!(
-        root.volume_intent_id.as_str(),
-        "vint_00000000000000000000000000000005"
-    );
-    assert_eq!(
         root.disk_id.as_str(),
-        "disk_00000000000000000000000000000002"
+        "disk_00000000000000000000000000000003"
     );
     assert_eq!(
         root.volume_id.as_str(),
-        "vol_00000000000000000000000000000003"
+        "vol_00000000000000000000000000000004"
     );
-    assert_eq!(
-        root.attachment_id.as_str(),
-        "att_00000000000000000000000000000004"
-    );
-    assert_eq!(root.disk_kind, DiskKind::Root);
-    assert_eq!(root.access, VolumeAccess::ReadWriteOnce);
     assert_eq!(root.durability, Durability::Strict);
     assert_eq!(root.size_bytes, 4_194_304);
-    assert_eq!(root.guest_device.serial.as_str(), "cats-root");
-    assert_eq!(root.guest_device.slot, 0);
+    assert_eq!(root.guest_device_serial.as_str(), "cats-root");
+    assert_eq!(root.guest_device_slot, 0);
+    assert_eq!(root.guest_binding, RuntimeVolumeGuestBinding::RootBoot);
+
+    let operation = decode_lifecycle_command_envelope(&operation_bytes).unwrap();
+    assert_eq!(
+        operation.operation_id.as_str(),
+        "op_00000000000000000000000000000006"
+    );
+    assert_eq!(operation.workspace_id, workspace);
+    assert_eq!(
+        operation.cat_id.as_str(),
+        "cat_00000000000000000000000000000001"
+    );
+    assert_eq!(operation.node_id.as_str(), "node_a");
+    assert_eq!(operation.placement_identity.placement_epoch.get(), 1);
+    assert_eq!(operation.runtime_config(), &config);
     assert!(matches!(
-        &root.acquire,
-        VolumeAcquire::Normal {
-            transition_id,
-            expected_unowned_epoch
-        } if transition_id.as_str() == "00000000000000000000000000000009"
-            && expected_unowned_epoch.get() == 0
+        &operation.predecessor,
+        LifecyclePredecessor::Genesis {
+            cat_creation_id,
+            target_placement,
+        } if cat_creation_id.as_str() == "creation_00000000000000000000000000000002"
+            && target_placement.node_id.as_str() == "node_a"
+            && target_placement.placement_epoch.get() == 1
     ));
-    assert_eq!(root.disposition, VolumeDisposition::Retain);
-    assert!(root.mount.is_none());
-    let [endpoint] = desired.endpoints.as_slice() else {
-        panic!("initial Desired must contain exactly one Endpoint")
+    let LifecycleCommand::Start(start) = &operation.command else {
+        panic!("Genesis Operation must be Start")
     };
+    let [authority] = start.volume_authorities.as_slice() else {
+        panic!("Genesis Start must carry one exact Root authority")
+    };
+    assert_eq!(authority.volume_id, root.volume_id);
+    assert_eq!(authority.disk_id, root.disk_id);
+    assert!(matches!(
+        &authority.authority,
+        RuntimeVolumeAuthorityInput::NormalUnowned {
+            expected_unowned_epoch,
+            transition_id,
+        } if expected_unowned_epoch.get() == 0
+            && transition_id.as_str() == "00000000000000000000000000000009"
+    ));
+
+    let product_projection: (String, String, String, i64, Option<String>, Option<String>) = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT disk.disk_id, volume.volume_id, endpoint.hostname,
+                            endpoint.route_epoch, cat.lifecycle_head_operation_id,
+                            cat.stable_state
+                       FROM cat_records cat
+                       JOIN disk_records disk ON disk.root_cat_id=cat.cat_id
+                       JOIN volume_records volume ON volume.volume_id=disk.volume_id
+                       JOIN endpoint_records endpoint ON endpoint.cat_id=cat.cat_id",
+                    &[],
+                )
+                .map(|row| {
+                    (
+                        row.get(0),
+                        row.get(1),
+                        row.get(2),
+                        row.get(3),
+                        row.get(4),
+                        row.get(5),
+                    )
+                })
+        })
+        .unwrap();
     assert_eq!(
-        endpoint.endpoint_id.as_str(),
-        "ep_00000000000000000000000000000007"
+        product_projection,
+        (
+            "disk_00000000000000000000000000000003".to_owned(),
+            "vol_00000000000000000000000000000004".to_owned(),
+            "app-00000000000000000000000000000007.cats.run".to_owned(),
+            1,
+            None,
+            None,
+        )
     );
-    assert_eq!(
-        endpoint.hostname.as_str(),
-        "app-00000000000000000000000000000007.cats.run"
-    );
-    assert_eq!(endpoint.route_epoch.get(), 1);
-    assert_eq!(endpoint.target_port, 8080);
 }
 
 #[test]
@@ -666,20 +821,26 @@ fn service_persists_only_the_fixed_name_conflict_result() {
 fn candidate_collision_is_retryable_and_the_same_key_uses_a_fresh_whole_batch() {
     let (runtime, store, workspace, manifests, planner, service) =
         service_fixture("f2c-candidate-retry");
-    store
-        .authority_transaction(|transaction| {
-            let created_at = database_now(transaction)?;
-            insert_cat(
-                transaction,
-                &CatRecord {
-                    cat_id: id("cat_00000000000000000000000000000001"),
-                    workspace_id: workspace.clone(),
-                    name: id("seed-collision"),
-                    created_at,
-                },
-            )
-        })
+    // Seed the colliding ID through the same complete product transaction.
+    // The former test-only `insert_cat` wrote only the immutable JSON
+    // projection and stopped satisfying the clean-slate Cat/config foreign
+    // key shape, so its failure no longer characterized candidate retry.
+    let seed_manifests: Arc<dyn CatCreateManifestResolver> = manifests.clone();
+    let seed_planner: Arc<dyn CatCreatePlacementPlanner> = planner.clone();
+    let seed = CatCreateService::new(
+        Arc::clone(&store),
+        seed_manifests,
+        seed_planner,
+        Arc::new(SequentialIdentities::default()),
+        &release_receipt(),
+    )
+    .unwrap();
+    runtime
+        .block_on(seed.create(ingress(&workspace, "seed-collision", "seed-key")))
         .unwrap();
+    manifests.calls.store(0, Ordering::SeqCst);
+    planner.calls.store(0, Ordering::SeqCst);
+    *planner.last_request.lock().unwrap() = None;
 
     let first = runtime
         .block_on(service.create(ingress(&workspace, "app", "same-key")))
@@ -688,7 +849,11 @@ fn candidate_collision_is_retryable_and_the_same_key_uses_a_fresh_whole_batch() 
     let result_rows: i64 = store
         .with(|client| {
             client
-                .query_one("SELECT count(*) FROM api_idempotency_results", &[])
+                .query_one(
+                    "SELECT count(*) FROM api_idempotency_results
+                      WHERE authenticated_workspace_id=$1 AND idempotency_key='same-key'",
+                    &[&workspace.as_str()],
+                )
                 .map(|row| row.get(0))
         })
         .unwrap();
@@ -716,15 +881,13 @@ fn pre_commit_deadline_waits_for_rollback_and_leaves_no_cached_result() {
         .unwrap();
     let mut blocker = postgres::Client::connect(&url, postgres::NoTls).unwrap();
     let mut blocker_tx = blocker.transaction().unwrap();
-    blocker_tx
-        .query_one(
-            "SELECT pg_advisory_xact_lock(hashtextextended(
-                current_schema() || ':cat-name:' || $1 || ':' || $2,
-                0::BIGINT
-             ))",
-            &[&workspace.as_str(), &"app"],
-        )
-        .unwrap();
+    super::cat_create_service::lock_cat_create_text(
+        &mut blocker_tx,
+        "cat-name",
+        workspace.as_str(),
+        "app",
+    )
+    .unwrap();
 
     let headers_received_at = Instant::now()
         // Leave enough time for the shared bounded Store executor under the
@@ -1130,7 +1293,7 @@ fn service_rounds_root_size_to_the_chunk_boundary() {
 fn invalid_manifest_or_planner_binding_has_no_store_side_effect() {
     let (runtime, store, workspace, _manifests, base_planner, _service) =
         service_fixture("f2c-invalid");
-    let admission = base_planner.admission.lock().unwrap().clone();
+    let target = base_planner.target.lock().unwrap().clone();
     let oversized = Arc::new(FakeManifestResolver {
         calls: AtomicUsize::new(0),
         size_bytes: 8_388_608,
@@ -1140,7 +1303,7 @@ fn invalid_manifest_or_planner_binding_has_no_store_side_effect() {
         last_request: Mutex::new(None),
         replace_network_id: false,
         retire_node: false,
-        admission: Mutex::new(admission.clone()),
+        target: Mutex::new(target.clone()),
     });
     let service = CatCreateService::new(
         store.clone(),
@@ -1160,7 +1323,7 @@ fn invalid_manifest_or_planner_binding_has_no_store_side_effect() {
         last_request: Mutex::new(None),
         replace_network_id: true,
         retire_node: false,
-        admission: Mutex::new(admission.clone()),
+        target: Mutex::new(target.clone()),
     });
     let service = CatCreateService::new(
         store.clone(),
@@ -1182,7 +1345,7 @@ fn invalid_manifest_or_planner_binding_has_no_store_side_effect() {
         last_request: Mutex::new(None),
         replace_network_id: false,
         retire_node: true,
-        admission: Mutex::new(admission),
+        target: Mutex::new(target),
     });
     let service = CatCreateService::new(
         store.clone(),

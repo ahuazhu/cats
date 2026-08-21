@@ -191,17 +191,6 @@ variable "runtime_secret_data" {
   sensitive   = true
 }
 
-variable "route_grant_private_key_pem" {
-  description = "PKCS#8 Ed25519 private key for control-plane Route Grant signing. Supply through an approved secret store."
-  type        = string
-  sensitive   = true
-}
-
-variable "route_grant_public_key_pem" {
-  description = "Ed25519 public key derived by CI from route_grant_private_key_pem for startup key-pair verification."
-  type        = string
-}
-
 variable "production_cutover_operator_trust_bundle_json" {
   description = "Release-bound public E13 operator trust bundle. cats-controld loads it at startup and refuses to start without it; it carries no private material."
   type        = string
@@ -387,22 +376,6 @@ variable "endpoint_wildcard_host" {
   description = "Wildcard Endpoint host routed only to cats-gatewayd."
   type        = string
   default     = "*.cats.run"
-}
-
-variable "auto_warm_after_seconds" {
-  description = "Automatic Warm is disabled for the first release."
-  type        = number
-  default     = 0
-
-  validation {
-    condition     = var.auto_warm_after_seconds == 0
-    error_message = "auto_warm_after_seconds must remain zero until Warm ships."
-  }
-}
-
-variable "auto_cold_after_seconds" {
-  type    = number
-  default = 86400
 }
 
 variable "aws_region" {

@@ -34,7 +34,17 @@ ExecStart=/opt/cats/bin/cats-noded \
   --route-v2-rotation-origin $CATS_ROUTE_V2_ROTATION_ORIGIN \
   --guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json \
   --blockd-bin /opt/cats/bin/cats-blockd \
-  --guest-agent-bin /opt/cats/bin/cats-guest-agent \
+  --runtime-systemctl-bin /usr/bin/systemctl \
+  --runtime-systemd-run-bin /usr/bin/systemd-run \
+  --runtime-cgroup-root /sys/fs/cgroup \
+  --runtime-proc-root /proc \
+  --runtime-network-class-root /sys/class/net \
+  --runtime-sys-block-root /sys/block \
+  --runtime-device-root /dev \
+  --runtime-blockd-socket-root /run/cats/blockd-v1 \
+  --runtime-vmm-socket-root /run/cats/vmm-v1 \
+  --runtime-inventory-scan-timeout-ms 5000 \
+  --runtime-effect-step-timeout-ms 30000 \
   --vmm-launcher-bin /opt/cats/bin/cats-vmm-launcher \
   --metadata-store-adapter postgres \
   --metadata-store-option url-file=/run/cats/postgres-url \

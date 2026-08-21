@@ -265,8 +265,6 @@ example:
 
 ```sh
 export TF_VAR_runtime_secret_data='{"CATS_AUTH_TOKEN":"...","CATS_ADMIN_TOKEN":"..."}'
-export TF_VAR_route_grant_private_key_pem="$(cat /approved/secret/path/route-grant-private.pem)"
-export TF_VAR_route_grant_public_key_pem="$(openssl pkey -in /approved/secret/path/route-grant-private.pem -pubout)"
 export TF_VAR_runtime_provisioner_trust_bundle_json="$(cat /approved/provisioning/runtime-provisioner-trust.v1.json)"
 export TF_VAR_storage_postgres_url='postgresql://...'
 export TF_VAR_usage_postgres_url='postgresql://...'
@@ -454,8 +452,8 @@ Terraform uploads it under a content-addressed S3 key. The EC2 role may read
 only worker artifacts and the dedicated Secrets Manager runtime secret.
 An SSM State Manager association can download the bundle, verify the digest,
 install the host binaries/unit, atomically update the Cloud Hypervisor guest
-seed with the matching Guest Agent and systemd units, create the delegated
-metering cgroup root and restart `cats-worker`. The previous guest seed stays
+seed with the matching Guest Agent and systemd units, validate the canonical
+cgroup-v2 mount root and restart `cats-worker`. The previous guest seed stays
 at `rootfs.ext4.previous` for recovery. This machinery predates the current
 clean-slate exact-SHA qualification and is not authorization for a rolling
 upgrade of a nonempty worker.
@@ -469,11 +467,11 @@ does not provide an in-place lifecycle drain. If the worker is not already
 empty, the association must stay blocked pending a separately qualified
 migration or replacement procedure.
 
-The association independently refuses to change installed files while any Cat
-PID remains in the worker's metering cgroups **or** any `cats-blockd` /
-`cloud-hypervisor` process is alive on the host. The process-table check
-exists because a blockd is not metered: with the Guests gone the cgroup walk
-reads clean while a surviving blockd may still hold the only authoritative copy
+The association independently refuses to change installed files while any
+canonical `cats-cat-<digest>.slice` remains directly under the cgroup-v2 mount
+root **or** any `cats-blockd` / `cloud-hypervisor` process is alive on the
+host. The process-table check exists because a blockd can survive without a
+Cat slice: a clean cgroup walk alone could miss the only authoritative copy
 of an unpublished Relaxed journal. This process-table check remains a
 fail-closed empty-Host guard; it does not prove the signed scanner, per-Cat
 adoption or A23 cordon. Do not copy production binaries, patch the seed, or

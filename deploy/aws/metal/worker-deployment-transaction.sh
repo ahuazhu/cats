@@ -166,19 +166,11 @@ cats_retire_legacy_gateway() {
   rm -f -- "$unit_file" "$wants_link" "$binary_file"
 }
 
-cats_worker_metering_root() {
-  local service cgroup_mount service_cgroup service_slice
-  service=$1
+cats_worker_cgroup_v2_root() {
+  local cgroup_mount
   cgroup_mount=$(findmnt --noheadings --first-only --types cgroup2 --output TARGET) || return 1
-  [ -n "$cgroup_mount" ] || return 1
-  service_cgroup=$(systemctl show "$service" --property=ControlGroup --value) || return 1
-  if [ -z "$service_cgroup" ]; then
-    service_slice=$(systemctl show "$service" --property=Slice --value) || return 1
-    service_slice=${service_slice:-system.slice}
-    service_cgroup="/$service_slice/$service.service"
-  fi
-  case "$service_cgroup" in /*) ;; *) return 1 ;; esac
-  printf '%s%s/metering\n' "$cgroup_mount" "$service_cgroup"
+  case "$cgroup_mount" in /*) ;; *) return 1 ;; esac
+  printf '%s\n' "$cgroup_mount"
 }
 
 cats_gate_node_service() {

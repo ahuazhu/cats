@@ -5,6 +5,7 @@
 
 #![cfg(target_os = "linux")]
 
+use std::io::Read as _;
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -12,19 +13,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use cats_api::runtime_reconciliation::{
-    AcquireOrigin, Epoch, FenceEpoch, Generation, Id, NormalAcquireRequest, NormalAcquireResult,
-    RandomId128, RemoteHead, Revision,
+    Epoch, FenceEpoch, Generation, Id, NormalAcquireRequest, NormalAcquireResult, RandomId128,
+    RemoteHead,
 };
 use cats_block_client::{NbdClient, NbdError, EPERM};
 use cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot;
 use cats_control_plane::store::Store;
 use cats_metadata_store_postgres::PostgresVolumeDataAuthority;
 use cats_storage::authority::{
-    project_volume_record, AttachmentLineageIdentity, AuthorizedServingAcquire,
-    AuthorizedServingAttachment, LastVolumeTransition, UnixMillis, VolumeAdminState,
-    VolumeDataAuthority, VolumeDurability, VolumeOwnerBinding, VolumeRecord,
+    project_volume_record, AuthorizedServingAttachment, LastVolumeTransition, UnixMillis,
+    VolumeAdminState, VolumeDataAuthority, VolumeDurability, VolumeOwnerBinding, VolumeRecord,
 };
 use postgres::{Client, NoTls};
+
+#[path = "support/lifecycle_volume.rs"]
+mod lifecycle_volume;
+use lifecycle_volume::TestLifecycleScope;
 
 const CHUNK: u64 = cats_api::chunk::CHUNK_SIZE as u64;
 const VOL_SIZE: u64 = 4 * CHUNK;
@@ -92,6 +96,15 @@ impl TestEnv {
             });
         let head = current.map_or_else(blank_head, |record| record.head);
         let (request, result) = acquire_receipt(attachment, epoch, head.clone());
+        let scope = TestLifecycleScope::new(
+            request.transition_id.as_str(),
+            "node_nbd_crash",
+            request.placement_epoch,
+        );
+        scope.seed_operation(
+            &Store::connect(&self.postgres_url, None).unwrap(),
+            &self.postgres_url,
+        );
         let record = VolumeRecord {
             volume_id: Id::new("vol_it").unwrap(),
             size_bytes: VOL_SIZE,
@@ -101,7 +114,11 @@ impl TestEnv {
             lease_owner: Some(Id::new(attachment).unwrap()),
             lease_epoch: FenceEpoch::new(u64::try_from(epoch).unwrap()).unwrap(),
             lease_expires_at: Some(result.lease_expires_at),
-            last_transition: Some(LastVolumeTransition::NormalAcquire { request, result }),
+            last_transition: Some(LastVolumeTransition::NormalAcquire {
+                source: scope.source(),
+                request,
+                result,
+            }),
         };
         let mut transaction = client.transaction().unwrap();
         transaction
@@ -121,29 +138,17 @@ impl TestEnv {
             .unwrap();
         assert_eq!(record.lease_owner.as_ref().unwrap().as_str(), attachment);
         assert_eq!(record.lease_epoch.get(), u64::try_from(epoch).unwrap());
-        let LastVolumeTransition::NormalAcquire { request, result } =
+        let LastVolumeTransition::NormalAcquire { request, .. } =
             record.last_transition.clone().unwrap()
         else {
             panic!("test authority did not install a normal acquire marker");
         };
-        AuthorizedServingAttachment {
-            identity: AttachmentLineageIdentity {
-                volume_id: record.volume_id.clone(),
-                attachment_id: Id::new(attachment).unwrap(),
-                attachment_epoch: record.lease_epoch,
-                acquire_origin: AcquireOrigin::Normal {
-                    transition_id: request.transition_id.clone(),
-                },
-                node_id: Id::new("node_nbd_crash").unwrap(),
-                placement_epoch: request.placement_epoch,
-            },
-            object_write_credential: None,
-            size_bytes: record.size_bytes,
-            durability: record.durability,
-            head: record.head,
-            lease_expires_at: result.lease_expires_at,
-            acquire: AuthorizedServingAcquire::Normal { request, result },
-        }
+        TestLifecycleScope::new(
+            request.transition_id.as_str(),
+            "node_nbd_crash",
+            request.placement_epoch,
+        )
+        .authorized_root_attachment(&record, "disk_nbd_crash", "root-boot")
     }
 }
 
@@ -166,7 +171,6 @@ fn acquire_receipt(
         transition_id: RandomId128::new(format!("{sequence:032x}")).unwrap(),
         attachment_id: Id::new(attachment).unwrap(),
         expected_unowned_epoch: FenceEpoch::new(u64::try_from(epoch - 1).unwrap()).unwrap(),
-        desired_revision: Revision::new(u64::try_from(epoch).unwrap()).unwrap(),
         placement_epoch: Epoch::new(u64::try_from(epoch).unwrap()).unwrap(),
         lease_duration_ms: 1_500,
     };
@@ -176,7 +180,10 @@ fn acquire_receipt(
         attachment_id: request.attachment_id.clone(),
         resulting_epoch: FenceEpoch::new(u64::try_from(epoch).unwrap()).unwrap(),
         resulting_head: head,
-        lease_expires_at: UnixMillis::new(1_900_000_001_500).unwrap(),
+        // Force the real blockd startup path to renew from database time.
+        // A far-future fixture expiry would make `now + TTL` look like a
+        // regression and correctly fail the exact post-renew reread.
+        lease_expires_at: UnixMillis::new(request.lease_duration_ms).unwrap(),
     };
     (request, result)
 }
@@ -197,9 +204,6 @@ fn insert_volume(client: &mut impl postgres::GenericClient, record: &VolumeRecor
     let expires = projection
         .lease_expires_at
         .map(|value| i64::try_from(value.get()).unwrap());
-    let revision = projection
-        .transition_desired_revision
-        .map(|value| i64::try_from(value.get()).unwrap());
     let placement = projection
         .transition_placement_epoch
         .map(|value| i64::try_from(value.get()).unwrap());
@@ -213,12 +217,13 @@ fn insert_volume(client: &mut impl postgres::GenericClient, record: &VolumeRecor
                 head_generation, head_root_hash, head_root_object_id,
                 lease_owner, lease_epoch, lease_expires_at,
                 last_transition_kind, last_transition_id,
-                transition_desired_revision, transition_placement_epoch,
+                transition_source_kind, transition_operation_id,
+                transition_request_fingerprint, transition_placement_epoch,
                 transition_lease_duration_ms, owner_binding, owner_node_id
              ) VALUES (
                 $1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9,
-                $10, $11, $12, $13, $14, $15, $16, $17,
-                $18::TEXT::jsonb, $19
+                $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
+                $20::TEXT::jsonb, $21
              )",
             &[
                 &projection.volume_id,
@@ -235,7 +240,9 @@ fn insert_volume(client: &mut impl postgres::GenericClient, record: &VolumeRecor
                 &expires,
                 &projection.last_transition_kind,
                 &projection.last_transition_id,
-                &revision,
+                &projection.transition_source_kind,
+                &projection.transition_operation_id,
+                &projection.transition_request_fingerprint,
                 &placement,
                 &duration,
                 &owner_binding_json,
@@ -277,6 +284,8 @@ fn provision_installed_directory(path: &Path, mode: u32) {
 struct Server {
     child: Child,
     socket: PathBuf,
+    postgres_url: String,
+    diagnostic_context: String,
 }
 
 impl Server {
@@ -352,7 +361,7 @@ impl Server {
         .arg("--listen-control")
         .arg(&control_socket)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .env("CATS_BLOCKD_TEST_SOCKET_ROOT", &env.socket_root)
         .env("CATS_BLOCKD_TARGET_TEST_POSTGRES_URL", &env.postgres_url);
         cmd.env_remove("CATS_CRASH_POINT");
@@ -360,7 +369,12 @@ impl Server {
             cmd.env("CATS_CRASH_POINT", point);
         }
         let child = cmd.spawn().expect("spawn cats-blockd");
-        Self { child, socket }
+        Self {
+            child,
+            socket,
+            postgres_url: env.postgres_url.clone(),
+            diagnostic_context: format!("host={host}, crash_point={crash_point:?}"),
+        }
     }
 
     fn connect(&mut self) -> NbdClient {
@@ -370,7 +384,25 @@ impl Server {
                 return client;
             }
             if let Some(status) = self.child.try_wait().unwrap() {
-                panic!("cats-blockd exited early: {status}");
+                let mut stderr = String::new();
+                self.child
+                    .stderr
+                    .take()
+                    .unwrap()
+                    .read_to_string(&mut stderr)
+                    .unwrap();
+                let authority_record =
+                    match PostgresVolumeDataAuthority::connect(&self.postgres_url, None) {
+                        Ok(authority) => {
+                            format!("{:?}", authority.load_volume(&Id::new("vol_it").unwrap()))
+                        }
+                        Err(error) => format!("failed to reopen authority: {error}"),
+                    };
+                panic!(
+                    "cats-blockd exited early ({}): {status}: {stderr}\n\
+                     authority after exit: {authority_record}",
+                    self.diagnostic_context,
+                );
             }
             if Instant::now() > deadline {
                 panic!("timed out waiting for cats-blockd socket");
@@ -460,6 +492,7 @@ fn crash_matrix_every_window_recovers_exactly_once() {
             server.wait_exit(cats_test_support::poll_bound());
         }
         let mut server = Server::spawn(&env, "a", "att_a", 1, None);
+        server.diagnostic_context = format!("recover after crash_point={point}");
         let mut client = server.connect();
         assert_eq!(
             client.read(0, 64_000).unwrap(),

@@ -5,6 +5,7 @@
 | `--api-url` / `CATS_API_URL` | Control Plane Base URL |
 | `--workspace` / `CATS_WORKSPACE` | 为本次命令选择一个不可变 Workspace |
 | `--token` / `CATS_TOKEN` | Machine 或 Administrator Credential |
+| `--no-wait` | 输出已接受的 Operation ID，不等待结算 |
 | `--json` | 在支持时输出机器可读数据 |
 
 `cats --help` 与 `cats <command> --help` 是版本权威。
@@ -29,24 +30,33 @@
                      [--durability strict|relaxed]
     cats ls
     cats get CAT_ID
+    cats run CAT_ID
+    cats suspend CAT_ID
+    cats warm CAT_ID
+    cats cold CAT_ID
+    cats destroy CAT_ID
 
 `create` 要求 digest-pinned Boot Image，默认 2 CPU、2 GiB Memory、1 GiB RootDisk 与 Strict Durability。List 会跟随有界 Cursor；Item Lookup 只接受不可变 `cat_…` ID。
+
+已有 Cat 的五个 Lifecycle 命令也只接受不可变 `cat_…` ID。CLI 会在发送前持久化精确的空 Request 与 Idempotency-Key，并在响应不明确时原样重放。默认等待返回的 Operation；`--no-wait` 则立即输出 Operation ID。已退役的 `start`、`stop`、`delete` 与 `resume` 命令不是兼容别名。
 
 ## 当前 PersistentDisk 命令
 
     cats disk create NAME --size SIZE [--durability strict|relaxed]
     cats disk ls
     cats disk get DISK_ID
+    cats disk attach DISK_ID --cat CAT_ID --mount-path /absolute/guest/path
+    cats disk detach DISK_ID --cat CAT_ID --mount-path /absolute/guest/path
 
-Create Request 会在发送前持久化；同一命令遇到不明确响应时重用完全相同的 Path、Body 与 Idempotency-Key。这个 release 中容量不可变。Disk Item Lookup 只接受不可变 `disk_…` ID。
+Create、Attach 和 Detach Request 会在发送前持久化；同一命令遇到不明确响应时重用完全相同的 Path、Body 与 Idempotency-Key。这个 release 中容量不可变。Disk Item Lookup 只接受不可变 `disk_…` ID；Binding Mutation 要求终态 Cold Cat 与精确的 Guest 绝对路径。
 
 ## Operation 命令
 
     cats operation get OPERATION_ID
     cats operation wait OPERATION_ID
 
-Cat Create 返回 Operation ID。这两个命令都使用精确的 Workspace-scoped Operation Lookup；没有 Operation List。
+Cat Create 与已有 Cat 的五个 Lifecycle 命令都返回 Operation ID。这两个 Operation 命令都使用精确的 Workspace-scoped 产品 Lookup；没有 Operation List，也不返回 Node 执行 Payload。
 
 ## Cutover 边界
 
-Lifecycle、Guest Command、Deployment、Endpoint、Cat Delete 与 PersistentDisk Mutation 命令不会出现在发布版 Help 中。若保留兼容 Parser，它会在创建 HTTP Client 之前失败，绝不探测 Legacy Route。
+Guest Command、Deployment、Endpoint、Disk Delete、Snapshot 与容量变更命令不会出现在发布版 Help 中。已退役的 Lifecycle 别名不再解析，也绝不探测 Legacy Route。

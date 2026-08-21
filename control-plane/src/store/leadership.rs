@@ -13,6 +13,7 @@ pub enum SingletonRole {
     BillingEnforcer,
     UsageProjector,
     VolumeDeleteSweeper,
+    RouteController,
 }
 
 impl SingletonRole {
@@ -22,6 +23,7 @@ impl SingletonRole {
             Self::BillingEnforcer => 420_202,
             Self::UsageProjector => 420_203,
             Self::VolumeDeleteSweeper => 420_204,
+            Self::RouteController => 420_205,
         }
     }
 
@@ -32,6 +34,7 @@ impl SingletonRole {
             Self::BillingEnforcer => "billing-enforcer",
             Self::UsageProjector => "usage-projector",
             Self::VolumeDeleteSweeper => "volume-delete-sweeper",
+            Self::RouteController => "route-controller",
         }
     }
 }
@@ -146,7 +149,7 @@ impl Store {
 
     pub(super) fn try_oci_deployment_lease(
         &self,
-        operation_id: &str,
+        attempt_id: &str,
     ) -> Result<Option<OciDeploymentLease>> {
         let connection_budget = acquire_oci_connection_budget()?;
         let mut client =
@@ -158,7 +161,7 @@ impl Store {
                     "SELECT pg_try_advisory_lock(
                         hashtextextended(current_schema() || ':oci-owner:' || $1, 0::BIGINT)
                      )",
-                    &[&operation_id],
+                    &[&attempt_id],
                 )
                 .map_err(internal)?
                 .try_get(0)

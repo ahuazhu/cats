@@ -5,11 +5,16 @@ Cats provides durable Linux microVM resources behind one immutable Workspace bou
 The signed runtime cutover deliberately exposes a narrow product surface:
 
 - Create, list, and inspect Cats.
+- Run, Suspend, Warm, Cold, or Destroy one Cat through its exact
+  idempotent lifecycle action.
 - Create, list, and inspect PersistentDisks.
+- Attach or detach one PersistentDisk while its exact Cat is terminal Cold.
 - Inspect one exact accepted Operation by ID.
 - Use the Guest-local Runtime API and the independent identity/billing surfaces.
 
-Cat lifecycle, Guest command, deployment, Endpoint, and delete mutations are unavailable. PersistentDisk attachment, snapshot, capacity change, and delete mutations are also unavailable. The console and CLI fail closed instead of probing legacy routes.
+Guest command, Endpoint mutation, PersistentDisk snapshot, capacity change, and
+PersistentDisk deletion remain unavailable. The console and CLI fail closed
+instead of probing legacy routes.
 
 ## Choose a path
 
@@ -17,4 +22,7 @@ Cat lifecycle, Guest command, deployment, Endpoint, and delete mutations are una
 
 ## Product model
 
-A Cat owns one RootDisk. A PersistentDisk is an independent RWO resource whose release capacity is immutable. Desired runtime state and signed Volume Authority—not a browser or CLI—coordinate lifecycle and writer epochs.
+A Cat owns one RootDisk. A PersistentDisk is an independent RWO resource whose
+release capacity is immutable. An immutable runtime config, one signed atomic
+lifecycle command, and signed Volume Authority—not a browser or CLI—coordinate
+lifecycle and writer epochs.

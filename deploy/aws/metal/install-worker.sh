@@ -134,9 +134,9 @@ ROUTE_V2_INSTALL_STATE=$(cats_classify_route_v2_node_r1 \
 # Only after the artifact state is classified under the Host lock may systemd
 # be queried. Prove physical idle immediately before masking/stopping so a
 # worker deployment cannot race a runtime child.
-metering_root=$(cats_worker_metering_root cats-worker)
+cgroup_v2_root=$(cats_worker_cgroup_v2_root)
 "$CATS_REPO/deploy/aws/metal/require-idle-worker.sh" \
-  "$metering_root" "$CATS_PREFIX/bin"
+  "$cgroup_v2_root" "$CATS_PREFIX/bin" "$CATS_PREFIX/bin/cloud-hypervisor"
 cats_gate_node_service cats-worker
 cats_worker_deployment_crash_probe after-mask-worker
 
@@ -235,8 +235,6 @@ install -m 0755 "$CATS_REPO/target/release/cats-route-v2-node-r1-validator" "$CA
 cats_worker_deployment_crash_probe after-install-cats-route-v2-node-r1-validator
 install -m 0755 "$CATS_REPO/target/release/cats-vmm-launcher" "$CATS_PREFIX/bin/cats-vmm-launcher"
 cats_worker_deployment_crash_probe after-install-cats-vmm-launcher
-install -m 0755 "$CATS_REPO/target/release/cats-runtime-e3-probe" "$CATS_PREFIX/bin/cats-runtime-e3-probe"
-cats_worker_deployment_crash_probe after-install-cats-runtime-e3-probe
 install -m 0755 "$CATS_REPO/target/release/cats-usage-schema-v16-verifier" "$CATS_PREFIX/bin/cats-usage-schema-v16-verifier"
 cats_worker_deployment_crash_probe after-install-cats-usage-schema-v16-verifier
 install -m 0755 "$CATS_REPO/target/release/cats-usage-terminal-receipt-verifier" "$CATS_PREFIX/bin/cats-usage-terminal-receipt-verifier"

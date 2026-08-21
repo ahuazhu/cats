@@ -1,11 +1,20 @@
 use super::*;
+use cats_api::runtime_lifecycle::{
+    DiskRole, PlacementIdentity, RuntimeVolumeConfig, RuntimeVolumeGuestBinding,
+};
+use cats_api::runtime_lifecycle_volume::{
+    LifecycleCommandStartVolumeGrantReceipt, LifecycleStartVolumeGrantAuthority,
+    LifecycleVolumeCommandScope,
+};
+use cats_api::runtime_reconciliation::WireU64;
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_object_store_file::FileBlobStore;
 use cats_storage::authority::{
-    AcquireOrigin, AttachmentLineageIdentity, AuthorizedServingAttachment, LastVolumeTransition,
-    NormalAcquireRequest, RenewLeaseResult, UnixMillis, VolumeAdminState, VolumeDurability,
-    VolumeHeadCasResult, VolumeRecord,
+    authorized_serving_attachment_from_start_volume_grant, AuthorizedServingAttachment,
+    LastVolumeTransition, NormalAcquireRequest, RenewLeaseResult, UnixMillis, VolumeAdminState,
+    VolumeDurability, VolumeHeadCasResult, VolumeRecord, VolumeTransitionSource,
 };
+use cats_storage::lifecycle_volume::command_start_volume_grant_receipt_digest_from_closed_receipt;
 use cats_test_support::blob_doubles::{
     ConcurrencyProbe, CountingBlob, SizingBlob, SlowBlob, SwitchableFailureBlob,
 };
@@ -155,6 +164,7 @@ impl VolumeDataAuthority for TestVolumeDataAuthority {
                 .as_ref()
                 .map(|_| UnixMillis::new(1).expect("one is a valid timestamp")),
             last_transition: lease_owner.map(|_| LastVolumeTransition::Takeover {
+                source: VolumeTransitionSource::Independent,
                 authorization_id: Id::new("test-authority").expect("constant is a valid id"),
             }),
         })
@@ -249,7 +259,6 @@ fn serving_fixture(durability: VolumeDurability) -> ServingFixture {
         .unwrap(),
         attachment_id: Id::new("attA").unwrap(),
         expected_unowned_epoch: FenceEpoch::new(0).unwrap(),
-        desired_revision: cats_api::runtime_reconciliation::Revision::new(7).unwrap(),
         placement_epoch: cats_api::runtime_reconciliation::Epoch::new(3).unwrap(),
         lease_duration_ms: 60_000,
     };
@@ -268,31 +277,45 @@ fn serving_fixture(durability: VolumeDurability) -> ServingFixture {
         lease_expires_at: None,
         last_transition: None,
     };
-    let (record, result) = cats_storage::authority::normal_acquire(
+    let transition_source = VolumeTransitionSource::Lifecycle {
+        operation_id: Id::new("operation_start").unwrap(),
+        request_fingerprint: Sha256Digest::from_bytes([7; 32]),
+    };
+    let (record, result) = cats_storage::authority::normal_acquire_with_source(
         &unowned,
+        &transition_source,
         &request,
         UnixMillis::new(10_000).unwrap(),
     )
     .unwrap();
-    let identity = AttachmentLineageIdentity {
-        volume_id: request.volume_id.clone(),
-        attachment_id: request.attachment_id.clone(),
-        attachment_epoch: result.resulting_epoch,
-        acquire_origin: AcquireOrigin::Normal {
-            transition_id: request.transition_id.clone(),
+    let grant = LifecycleCommandStartVolumeGrantReceipt {
+        scope: LifecycleVolumeCommandScope {
+            operation_id: Id::new("operation_start").unwrap(),
+            request_fingerprint: Sha256Digest::from_bytes([7; 32]),
+            cat_id: Id::new("cat_test").unwrap(),
+            node_id: Id::new("node_a").unwrap(),
+            placement_identity: PlacementIdentity {
+                node_id: Id::new("node_a").unwrap(),
+                placement_epoch: request.placement_epoch,
+            },
         },
-        node_id: Id::new("node_a").unwrap(),
-        placement_epoch: request.placement_epoch,
+        grant_sequence: WireU64::new(0).unwrap(),
+        volume: RuntimeVolumeConfig {
+            volume_id: request.volume_id.clone(),
+            disk_id: Id::new("disk_root").unwrap(),
+            disk_role: DiskRole::Root,
+            size_bytes: record.size_bytes,
+            durability: record.durability,
+            guest_device_serial: Id::new("root-boot").unwrap(),
+            guest_device_slot: 0,
+            guest_binding: RuntimeVolumeGuestBinding::RootBoot,
+        },
+        authority: LifecycleStartVolumeGrantAuthority::NormalAcquire { request, result },
     };
-    let attachment = AuthorizedServingAttachment {
-        identity,
-        object_write_credential: None,
-        size_bytes: record.size_bytes,
-        durability: record.durability,
-        head: record.head.clone(),
-        lease_expires_at: result.lease_expires_at,
-        acquire: cats_storage::authority::AuthorizedServingAcquire::Normal { request, result },
-    };
+    let grant_digest =
+        command_start_volume_grant_receipt_digest_from_closed_receipt(&grant).unwrap();
+    let attachment =
+        authorized_serving_attachment_from_start_volume_grant(&grant, &grant_digest, None).unwrap();
     let data_dir = dir.path().join("serving-data");
     let mut config = EngineConfig::new(VOL, &data_dir, "attA");
     config.lease_ttl_ms = 60_000;
@@ -525,6 +548,47 @@ fn authorized_serving_renews_before_guest_io_and_writes_target_v2_lineage() {
         .unwrap()
         .lease_owner
         .is_some());
+}
+
+#[test]
+fn authorized_serving_restarts_after_the_same_grant_advances_its_head() {
+    let fixture = serving_fixture(VolumeDurability::Strict);
+    write_serving_identity(&fixture);
+    let first_authority: Arc<dyn VolumeDataAuthority> = fixture.authority.clone();
+    let engine = ChunkEngine::attach_authorized_serving(
+        fixture.config.clone(),
+        fixture.attachment.clone(),
+        fixture.blob.clone(),
+        first_authority,
+    )
+    .unwrap();
+    engine.write(0, b"committed before response loss").unwrap();
+    assert_eq!(engine.flush().unwrap(), 1);
+    engine.stop_authorized_serving().unwrap();
+    drop(engine);
+
+    assert_eq!(
+        fixture.attachment.head.generation,
+        Generation::new(0).unwrap()
+    );
+    assert_eq!(
+        fixture.authority.record.lock().unwrap().head.generation,
+        Generation::new(1).unwrap()
+    );
+
+    let restart_authority: Arc<dyn VolumeDataAuthority> = fixture.authority.clone();
+    let restarted = ChunkEngine::attach_authorized_serving(
+        fixture.config.clone(),
+        fixture.attachment.clone(),
+        fixture.blob.clone(),
+        restart_authority,
+    )
+    .unwrap();
+    assert_eq!(restarted.generation(), 1);
+    let mut recovered = vec![0; b"committed before response loss".len()];
+    restarted.read(0, &mut recovered).unwrap();
+    assert_eq!(recovered, b"committed before response loss");
+    restarted.stop_authorized_serving().unwrap();
 }
 
 #[test]

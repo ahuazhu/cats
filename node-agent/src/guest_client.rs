@@ -1,6 +1,9 @@
 //! Synchronous client for the guest agent protocol (unix socket dev
 //! transport). Called from `spawn_blocking` contexts in the async server.
 
+use std::io;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd as _;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -77,6 +80,31 @@ impl GuestClient {
     /// Connect with one caller-supplied bound covering both sides of the mux
     /// handshake. Fresh inventory uses its remaining scan deadline here.
     pub fn connect_hybrid_vsock_bounded(path: &Path, port: u32, timeout: Duration) -> Result<Self> {
+        Self::connect_hybrid_vsock_bounded_inner(path, port, timeout, None)
+    }
+
+    /// Connect to the exact installed VMM's hybrid-vsock mux.
+    ///
+    /// The peer PID is checked both before and after the mux handshake. This
+    /// closes path replacement and process-name ambiguity for lifecycle
+    /// effects without changing the Guest protocol or treating the transport
+    /// check as lifecycle authority.
+    pub(crate) fn connect_hybrid_vsock_bounded_exact_peer(
+        path: &Path,
+        port: u32,
+        timeout: Duration,
+        expected_vmm_pid: u32,
+    ) -> Result<Self> {
+        anyhow::ensure!(expected_vmm_pid > 0, "expected VMM PID is zero");
+        Self::connect_hybrid_vsock_bounded_inner(path, port, timeout, Some(expected_vmm_pid))
+    }
+
+    fn connect_hybrid_vsock_bounded_inner(
+        path: &Path,
+        port: u32,
+        timeout: Duration,
+        expected_vmm_pid: Option<u32>,
+    ) -> Result<Self> {
         anyhow::ensure!(
             port > 0 && port < u32::MAX,
             "vsock destination port is outside the canonical range"
@@ -87,6 +115,10 @@ impl GuestClient {
             .context("vsock handshake deadline overflow")?;
         let mut stream = connect_unix_before(path, deadline)
             .with_context(|| format!("connect vsock mux at {}", path.display()))?;
+        if let Some(expected_vmm_pid) = expected_vmm_pid {
+            ensure_unix_peer_pid(&stream, expected_vmm_pid)
+                .context("vsock mux peer is not the exact installed VMM")?;
+        }
         write_all_before(
             &mut stream,
             format!("CONNECT {port}\n").as_bytes(),
@@ -94,6 +126,10 @@ impl GuestClient {
         )
         .context("vsock handshake write")?;
         let hybrid_assigned_port = read_hybrid_vsock_ack_before(&mut stream, deadline)?;
+        if let Some(expected_vmm_pid) = expected_vmm_pid {
+            ensure_unix_peer_pid(&stream, expected_vmm_pid)
+                .context("vsock mux peer changed during the bounded handshake")?;
+        }
         ensure_before(deadline)?;
 
         // The connect and mux handshake stay nonblocking so one absolute
@@ -164,6 +200,78 @@ impl GuestClient {
             bail!("guest error: {message}");
         }
         Ok(resp.body)
+    }
+
+    /// Issue one Guest control request under the caller's absolute deadline.
+    ///
+    /// `SO_RCVTIMEO` and `SO_SNDTIMEO` are per syscall. Merely setting them
+    /// once lets a peer trickle a frame across several successful reads and
+    /// extend the lifecycle effect beyond its accepted deadline. The adapter
+    /// below refreshes each syscall from the same absolute deadline instead.
+    fn request_before(
+        &mut self,
+        body: GuestRequestBody,
+        deadline: Instant,
+    ) -> Result<GuestResponseBody> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut transport = DeadlineGuestTransport {
+            stream: &mut self.stream,
+            deadline,
+        };
+        write_frame(&mut transport, &GuestRequest { id, body })
+            .context("write deadline-bounded Guest request")?;
+        let resp: GuestResponse =
+            read_frame(&mut transport).context("read deadline-bounded Guest response")?;
+        if resp.id != id {
+            bail!("guest response id mismatch");
+        }
+        if let GuestResponseBody::Error { message } = &resp.body {
+            bail!("guest error: {message}");
+        }
+        Ok(resp.body)
+    }
+
+    pub(crate) fn syncfs_before(&mut self, deadline: Instant) -> Result<()> {
+        self.request_before(GuestRequestBody::Syncfs, deadline)
+            .map(|_| ())
+    }
+
+    pub(crate) fn work_status_before(
+        &mut self,
+        after_sequence: Option<u64>,
+        wait_timeout_ms: u64,
+        deadline: Instant,
+    ) -> Result<GuestWorkStatus> {
+        match self.request_before(
+            GuestRequestBody::WorkStatus {
+                after_sequence,
+                wait_timeout_ms,
+            },
+            deadline,
+        )? {
+            GuestResponseBody::WorkStatus { status } => Ok(status),
+            other => bail!("unexpected work status response: {other:?}"),
+        }
+    }
+
+    pub(crate) fn prepare_suspend_before(
+        &mut self,
+        expected_lease_sequence: u64,
+        deadline: Instant,
+    ) -> Result<(String, u64)> {
+        match self.request_before(
+            GuestRequestBody::PrepareSuspend {
+                expected_lease_sequence,
+            },
+            deadline,
+        )? {
+            GuestResponseBody::SuspendPrepared {
+                source_epoch,
+                lease_sequence,
+            } => Ok((source_epoch, lease_sequence)),
+            other => bail!("unexpected prepare suspend response: {other:?}"),
+        }
     }
 
     /// Issue one RuntimeReady challenge using its independent small request
@@ -264,12 +372,6 @@ impl GuestClient {
             GuestResponseBody::Error { message } => bail!("guest error: {message}"),
             other => bail!("unexpected filesystem control response: {other:?}"),
         }
-    }
-
-    pub(crate) fn try_clone_transport(&self) -> Result<UnixStream> {
-        self.stream
-            .try_clone()
-            .context("clone Guest control transport")
     }
 
     pub fn hybrid_assigned_port(&self) -> Option<u32> {
@@ -399,7 +501,79 @@ impl GuestClient {
     }
 }
 
+struct DeadlineGuestTransport<'a> {
+    stream: &'a mut UnixStream,
+    deadline: Instant,
+}
+
+impl DeadlineGuestTransport<'_> {
+    fn remaining(&self) -> io::Result<Duration> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Guest control deadline elapsed",
+            ));
+        }
+        Ok(remaining)
+    }
+}
+
+impl io::Read for DeadlineGuestTransport<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        io::Read::read(self.stream, buffer)
+    }
+}
+
+impl io::Write for DeadlineGuestTransport<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        io::Write::write(self.stream, buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        io::Write::flush(self.stream)
+    }
+}
+
 const MAX_HYBRID_VSOCK_ACK_BYTES: usize = 32;
+
+#[cfg(target_os = "linux")]
+fn ensure_unix_peer_pid(stream: &UnixStream, expected_pid: u32) -> Result<()> {
+    let mut credentials = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut length = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>())
+        .context("vsock mux peer credential length overflow")?;
+    // SAFETY: both output pointers name initialized writable objects and the
+    // stream retains its live descriptor for the complete getsockopt call.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            std::ptr::addr_of_mut!(credentials).cast(),
+            std::ptr::addr_of_mut!(length),
+        )
+    };
+    anyhow::ensure!(
+        result == 0
+            && usize::try_from(length).ok() == Some(std::mem::size_of::<libc::ucred>())
+            && credentials.pid > 0
+            && u32::try_from(credentials.pid).ok() == Some(expected_pid),
+        "vsock mux Unix peer PID differs from the installed VMM"
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_unix_peer_pid(_stream: &UnixStream, _expected_pid: u32) -> Result<()> {
+    bail!("exact vsock mux peer credentials require Linux")
+}
 
 fn connect_unix_before(path: &Path, deadline: Instant) -> Result<UnixStream> {
     use std::mem::offset_of;
@@ -720,16 +894,14 @@ fn parse_hybrid_vsock_ack(bytes: &[u8]) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use std::os::fd::AsRawFd as _;
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::thread;
-    use std::time::Duration;
-    #[cfg(target_os = "linux")]
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use cats_api::guest::{
         read_frame, read_guest_request_frame, write_frame, write_runtime_ready_response_frame,
-        GuestRequest, GuestRequestBody, GuestResponse, GuestResponseBody, RuntimeReadyRequestV1,
-        RuntimeReadyResponseV1, RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1,
+        GuestRequest, GuestRequestBody, GuestResponse, GuestResponseBody, GuestWorkStatus,
+        RuntimeReadyRequestV1, RuntimeReadyResponseV1, RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1,
     };
     use cats_api::runtime_reconciliation::{GuestBootId, RandomId128};
 
@@ -810,6 +982,111 @@ mod tests {
         peer.join().unwrap();
     }
 
+    #[test]
+    fn lifecycle_guest_request_uses_one_absolute_deadline_across_trickled_reads() {
+        use std::io::Write as _;
+
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let mut client = GuestClient {
+            stream: client_stream,
+            next_id: 1,
+            hybrid_assigned_port: Some(1_073_741_824),
+        };
+        let peer = thread::spawn(move || {
+            let request: GuestRequest = read_frame(&mut server_stream).unwrap();
+            assert!(matches!(request.body, GuestRequestBody::WorkStatus { .. }));
+            let response = GuestResponse {
+                id: request.id,
+                body: GuestResponseBody::WorkStatus {
+                    status: GuestWorkStatus {
+                        source_epoch: "11111111111111111111111111111111".into(),
+                        lease_sequence: 0,
+                        quiescing: true,
+                        leases: Vec::new(),
+                    },
+                },
+            };
+            let mut frame = Vec::new();
+            write_frame(&mut frame, &response).unwrap();
+            for byte in frame {
+                thread::sleep(Duration::from_millis(20));
+                if server_stream.write_all(&[byte]).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let bound = Duration::from_millis(75);
+        let started = Instant::now();
+        let error = client
+            .work_status_before(None, 0, started + bound)
+            .expect_err("a trickled response must not extend the lifecycle deadline");
+        let elapsed = started.elapsed();
+        assert!(
+            format!("{error:#}").contains("deadline-bounded Guest response"),
+            "{error:#}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(40) && elapsed < Duration::from_secs(1),
+            "absolute Guest deadline returned after {elapsed:?}"
+        );
+        drop(client);
+        peer.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_hybrid_vsock_connect_rejects_another_unix_peer_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wrong-vmm-peer.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let peer = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+        });
+        let actual = std::process::id();
+        let wrong = actual.checked_add(1).filter(|pid| *pid > 0).unwrap_or(1);
+        assert_ne!(wrong, actual);
+        let error = GuestClient::connect_hybrid_vsock_bounded_exact_peer(
+            &path,
+            5_000,
+            Duration::from_secs(2),
+            wrong,
+        )
+        .err()
+        .expect("another Unix peer PID must be rejected");
+        assert!(
+            format!("{error:#}").contains("not the exact installed VMM"),
+            "{error:#}"
+        );
+        peer.join().unwrap();
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn exact_hybrid_vsock_connect_fails_closed_without_peer_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unsupported-peer-credentials.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let peer = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+        });
+        let error = GuestClient::connect_hybrid_vsock_bounded_exact_peer(
+            &path,
+            5_000,
+            Duration::from_secs(2),
+            1,
+        )
+        .err()
+        .expect("unsupported exact peer proof must fail closed");
+        assert!(
+            format!("{error:#}").contains("exact vsock mux peer credentials require Linux"),
+            "{error:#}"
+        );
+        peer.join().unwrap();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn bounded_hybrid_connect_expires_while_listener_backlog_is_saturated() {
@@ -855,7 +1132,12 @@ mod tests {
 
         let timeout = Duration::from_millis(50);
         let started = Instant::now();
-        let error = match GuestClient::connect_hybrid_vsock_bounded(&path, 5_000, timeout) {
+        let error = match GuestClient::connect_hybrid_vsock_bounded_exact_peer(
+            &path,
+            5_000,
+            timeout,
+            std::process::id(),
+        ) {
             Ok(_) => panic!("a full listener backlog must not connect"),
             Err(error) => error,
         };

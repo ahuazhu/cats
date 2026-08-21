@@ -30,8 +30,8 @@ use cats_api::runtime_reconciliation::{
     Sha256Digest,
 };
 use cats_storage::authority::{
-    FenceEpoch, Generation, NormalAcquireRequest, RemoteHead, Revision, VolumeAdminState,
-    VolumeDurability, VolumeRecord,
+    FenceEpoch, Generation, NormalAcquireRequest, RemoteHead, VolumeAdminState, VolumeDurability,
+    VolumeRecord,
 };
 
 use super::placement_policy::RuntimeNodeAuthorityApplyStoreOutcome;
@@ -242,7 +242,6 @@ impl Store {
                         .expect("fixture transition ID"),
                     attachment_id: request.attachment_id.clone(),
                     expected_unowned_epoch: FenceEpoch::new(0).expect("unowned fence epoch"),
-                    desired_revision: Revision::new(1).expect("first desired revision"),
                     placement_epoch: policy_revision(),
                     // Registration requires an unexpired lease. Ten minutes
                     // outlives the whole acceptance run without becoming a

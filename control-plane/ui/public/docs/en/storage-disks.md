@@ -17,9 +17,23 @@ The create body explicitly carries `durability`, `name`, and `size_bytes`. The b
 
 Disk item lookup requires the immutable `disk_…` ID returned by create or list. Names are not accepted on item paths.
 
-## Current lifecycle boundary
+## Attach and detach while Cold
 
-PersistentDisk attachment, snapshot, capacity change, and deletion are not exposed by the release product router or shipped CLI. Capacity is immutable. The provider-neutral storage engine and signed Volume Authority still enforce RWO, fencing, durable roots, and stale-writer rejection; those data-plane guarantees do not authorize a product mutation endpoint.
+    cats disk attach disk_... --cat cat_... --mount-path /srv/data
+    cats disk detach disk_... --cat cat_... --mount-path /srv/data
+
+Both actions require the exact immutable Disk and Cat IDs, the exact Guest mount
+path, an idempotency key, a terminal Cold Cat, no unresolved lifecycle command,
+and an unowned PersistentDisk. They synchronously append a new immutable runtime
+config and return its ID and digest. They do not hot-plug a device, create a
+lifecycle Operation, or prove Guest mount readiness; the next Start freezes and
+executes that config.
+
+Snapshot, capacity change, and PersistentDisk deletion are not exposed by the
+release product router or shipped CLI. Capacity is immutable. The
+provider-neutral storage engine and signed Volume Authority still enforce RWO,
+fencing, durable roots, and stale-writer rejection; a product client cannot use
+attach or detach to self-acquire or revoke a writer epoch.
 
 ## Durability
 

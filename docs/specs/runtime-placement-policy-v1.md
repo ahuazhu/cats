@@ -3,7 +3,7 @@
 - 状态：Implemented frozen v1；clean-slate rollout only
 - Authority：[ADR-0043](../decisions/0043-provisioner-owned-runtime-placement-policy.md)
 - Runtime authority：[ADR-0040](../decisions/0040-level-triggered-runtime-reconciliation.md)
-- Admission facts：[Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)
+- Admission facts：[Runtime Inventory and Telemetry v1](runtime-inventory-observation-v1.md)
 - Cat-create atomicity：[Volume Authority §8.1](volume-authority.md#81-disk-create)
 - Local composition：[Runtime Composition Artifacts v1](runtime-composition-artifacts-v1.md)
 

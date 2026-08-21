@@ -42,6 +42,11 @@ sudo CATS_GUEST_RUNTIME_RELEASE_DIR=/path/to/guest-runtime-release.v1 \
 sudoedit /etc/cats/cats.env
 ```
 
+Set `CATS_ROUTE_V2_ROTATION_ORIGIN` to the canonical HTTPS origin of the
+Control rotation listener before starting the Node. The listener hostname
+must match its installed server certificate; the sample uses
+`https://control.internal.example:7444`.
+
 `install.sh` requires the provisioner-owned `/etc/cats/identity` set and
 `CATS_GUEST_RUNTIME_RELEASE_DIR=.../guest-runtime-release.v1`, installs build/runtime dependencies,
 builds release binaries, installs the pinned Cloud Hypervisor and the shared Guest release,
@@ -91,9 +96,11 @@ route-admission registry. Local readiness stays closed with HTTP 503 until a
 complete inventory has been accepted for the current AgentSession; incomplete
 or conflicting evidence is never promoted to a complete observation. Do not
 restore either the shared-bearer heartbeat or
-the legacy NodeJob listener as a transition mechanism. Route v2 machine ingress
-remains independently closed unless the provisioner installs its reviewed
-signing ring, mTLS artifacts and listener configuration. The exact current
+the legacy NodeJob listener as a transition mechanism. Route v2 machine ingress,
+adjacent ring delivery and the Route command runner are mandatory composition:
+the daemon refuses to start before lifecycle/inventory work when the fixed
+signing ring, mTLS artifacts, listener or HTTPS rotation origin is missing.
+The exact current
 evidence endpoint is recorded in
 [`architecture-cross-review.md`](../../docs/architecture-cross-review.md#当前跨组件证据边界).
 

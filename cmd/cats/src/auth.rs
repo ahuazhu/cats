@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use cats_api::auth::{CliAuthConfigResponse, MeResponse, Workspace};
-use cats_api::requests::ListResponse;
+use cats_api::list::ListResponse;
 use reqwest::blocking::Client as HttpClient;
 use workos::resources::user_management::AuthenticateWithRefreshTokenParams;
 

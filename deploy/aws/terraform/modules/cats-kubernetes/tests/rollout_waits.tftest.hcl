@@ -26,16 +26,6 @@ variables {
     CATS_AUTH_TOKEN  = "0000000000000000000000000000000000000000"
     CATS_ADMIN_TOKEN = "1111111111111111111111111111111111111111"
   }
-  route_grant_private_key_pem                = <<-PEM
-    -----BEGIN PRIVATE KEY-----
-    fixture
-    -----END PRIVATE KEY-----
-  PEM
-  route_grant_public_key_pem                 = <<-PEM
-    -----BEGIN PUBLIC KEY-----
-    fixture
-    -----END PUBLIC KEY-----
-  PEM
   production_cutover_operator_trust_bundle_json = "{\"version\":1}"
   runtime_provisioner_trust_bundle_json         = "{\"version\":1}"
   storage_postgres_url                          = "postgres://fixture/cats?sslmode=verify-full&options=-csearch_path%3Dcats_fresh"

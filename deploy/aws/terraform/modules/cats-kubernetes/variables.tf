@@ -233,33 +233,6 @@ variable "runtime_secret_data" {
   }
 }
 
-variable "route_grant_private_key_pem" {
-  description = "PKCS#8 Ed25519 private key mounted only into cats-controld for Endpoint Route Grant signing."
-  type        = string
-  sensitive   = true
-
-  validation {
-    condition = (
-      startswith(trimspace(var.route_grant_private_key_pem), "-----BEGIN PRIVATE KEY-----") &&
-      endswith(trimspace(var.route_grant_private_key_pem), "-----END PRIVATE KEY-----")
-    )
-    error_message = "route_grant_private_key_pem must be a PKCS#8 PEM private key."
-  }
-}
-
-variable "route_grant_public_key_pem" {
-  description = "Ed25519 public key derived from route_grant_private_key_pem and mounted into cats-controld for startup pair verification."
-  type        = string
-
-  validation {
-    condition = (
-      startswith(trimspace(var.route_grant_public_key_pem), "-----BEGIN PUBLIC KEY-----") &&
-      endswith(trimspace(var.route_grant_public_key_pem), "-----END PUBLIC KEY-----")
-    )
-    error_message = "route_grant_public_key_pem must be a PEM public key."
-  }
-}
-
 variable "production_cutover_operator_trust_bundle_json" {
   description = "Release-bound public E13 operator trust bundle. cats-controld loads it at startup and refuses to start without it; it carries no private material."
   type        = string
@@ -494,28 +467,6 @@ variable "rds_ca_pem" {
   validation {
     condition     = strcontains(var.rds_ca_pem, "BEGIN CERTIFICATE")
     error_message = "rds_ca_pem must contain at least one PEM certificate."
-  }
-}
-
-variable "auto_warm_after_seconds" {
-  description = "Seconds before an eligible Suspended Cat becomes Warm; zero disables the transition."
-  type        = number
-  default     = 0
-
-  validation {
-    condition     = var.auto_warm_after_seconds >= 0 && floor(var.auto_warm_after_seconds) == var.auto_warm_after_seconds
-    error_message = "auto_warm_after_seconds must be a non-negative integer."
-  }
-}
-
-variable "auto_cold_after_seconds" {
-  description = "Seconds before an eligible Warm Cat becomes Cold; zero disables the transition."
-  type        = number
-  default     = 86400
-
-  validation {
-    condition     = var.auto_cold_after_seconds >= 0 && floor(var.auto_cold_after_seconds) == var.auto_cold_after_seconds
-    error_message = "auto_cold_after_seconds must be a non-negative integer."
   }
 }
 

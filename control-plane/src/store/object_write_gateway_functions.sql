@@ -2721,7 +2721,7 @@ BEGIN
        OR admission_row.deployment_id IS NULL
        OR admission_row.release_id IS NULL
        OR admission_row.source_commit_sha IS NULL
-       OR admission_row.control_schema_version IS DISTINCT FROM 16
+       OR admission_row.control_schema_version IS DISTINCT FROM 17
        OR admission_row.binding_sha256 IS NULL
        OR admission_row.qualification_expires_at_unix_ms IS NULL
        OR admission_row.qualification_expires_at_unix_ms <= now_ms

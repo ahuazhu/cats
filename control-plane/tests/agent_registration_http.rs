@@ -11,9 +11,9 @@ use cats_api::runtime_reconciliation::{
     AgentRegistrationAttempt, ContractErrorDetail, ContractVersion, CredentialBinding, Id,
     NodeBootId, NodeIdentity, NodeIdentityState, RandomId128,
 };
-use cats_control_plane::controller::AutoTierPolicy;
-use cats_control_plane::server::{spawn, Config, Handle};
+use cats_control_plane::server::{Config, Handle};
 use cats_control_plane::store::DsnSource;
+use cats_control_plane::testsupport::spawn_control_plane_for_test as spawn;
 use cats_metering::SqliteUsageStore;
 use reqwest::{Method, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -78,8 +78,6 @@ impl Context {
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: usage,
-            #[cfg(debug_assertions)]
-            retired_storage_meta_for_tests: None,
             image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
             auth_token: SERVICE_TOKEN.into(),
             guest_runtime_profile_receipt: receipt.clone(),
@@ -87,21 +85,17 @@ impl Context {
                 cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
             production_cutover_operator_trust_bundle:
                 cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
-            route_grant_signer: cats_control_plane::testsupport::route_grant_signer(),
             admin_token: ADMIN_TOKEN.into(),
             workos: None,
             stripe: None,
             billing_enforcement_enabled: false,
-            node_lease_timeout_ms: 30_000,
-            reconcile_interval_ms: 60_000,
-            auto_tier_policy: AutoTierPolicy::default(),
             oci_deploy_sync_wait_ms: 5_000,
         })
         .await
         .unwrap();
         let signer = Ed25519RequestSigner::from_pkcs8_pem(
             Id::new("credential_http_a").unwrap(),
-            include_bytes!("../../tests/fixtures/route_grant_private_ed25519.pem"),
+            include_bytes!("../../tests/fixtures/test_request_private_ed25519.pem"),
         )
         .unwrap();
         cats_control_plane::testsupport::provision_node_identity(
@@ -422,8 +416,8 @@ async fn admission_order_and_proof_mutations_are_closed() {
     for path in [
         "/v1/nodes/register",
         "/v1/nodes/heartbeat",
-        // Inventory is carried by the signed A20 heartbeat/full-observation
-        // spine; there is no standalone compatibility mutation endpoint.
+        // Inventory is carried by the signed clean-slate inventory report;
+        // there is no standalone compatibility mutation endpoint.
         "/v1/nodes/inventory",
         "/v1/nodes/work-status",
         "/v1/internal/work/acquire",

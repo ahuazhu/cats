@@ -355,9 +355,7 @@ def main() -> int:
         assert b"differs from its approved digest" in wrong_manifest_digest.stderr
 
         malformed_member_set = json.loads(raw)
-        del malformed_member_set["artifacts"]["worker"]["members"][
-            "cats-runtime-e3-probe"
-        ]
+        del malformed_member_set["artifacts"]["worker"]["members"]["cats-noded"]
         malformed_member_raw = canonical(malformed_member_set)
         malformed_member_manifest = root / "release-manifest.missing-worker-member.v1.json"
         write_member(malformed_member_manifest, malformed_member_raw)

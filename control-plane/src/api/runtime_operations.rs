@@ -1,24 +1,30 @@
-//! Workspace-qualified read access to canonical runtime Operations.
+//! Workspace-qualified read access to atomic lifecycle Operations.
 
 use axum::body::Body;
 use axum::extract::{OriginalUri, State};
 use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::Response;
-use cats_api::error::ApiError;
-use cats_api::runtime_reconciliation::{encode_operation, Id};
+use cats_api::error::{ApiError, ErrorCode};
+use cats_api::runtime_lifecycle::{
+    LifecycleCommand, LifecycleCommandKind, LifecycleOperation, LifecycleOperationState,
+    StartSource, TerminalResultKind,
+};
+use cats_api::runtime_product_reads::{
+    encode_cat_operation_read_v1, CatOperationAction, CatOperationReadV1, CatOperationState,
+};
+use cats_api::runtime_reconciliation::Id;
 
 use super::{check_workspace_auth, ApiResult};
 use crate::server::AppState;
-use crate::store::runtime_authority::RuntimeOperationRead;
 
 pub(super) async fn get_runtime_operation(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    // Read only the raw workspace slot needed for authorization. In
-    // particular, do not ask Axum to percent-decode the Operation capture
-    // before the caller's workspace authority has been established.
+    // Authorize the raw Workspace slot before parsing the Operation identity.
+    // Percent-decoding an untrusted capture first could let two paths name one
+    // authority object with different byte identities.
     let workspace = raw_workspace_segment(&uri).to_owned();
     let scope = check_workspace_auth(&state, &headers, &workspace).await?;
     let workspace_id = Id::new(scope.workspace.id)
@@ -29,41 +35,46 @@ pub(super) async fn get_runtime_operation(
     let Some(operation_id) = Id::new(operation.to_owned()) else {
         return Err(ApiError::not_found("operation").into());
     };
-    let readiness = state.readiness.clone();
-    let poison_workspace_id = workspace_id.clone();
+
+    let lookup_workspace_id = workspace_id.clone();
     let lookup_operation_id = operation_id.clone();
-    let read = state
+    let operation = match state
         .store
-        .execute(move |store| {
-            let read = store.get_runtime_operation(&workspace_id, &lookup_operation_id);
-            if matches!(read, Ok(RuntimeOperationRead::Corrupt)) {
+        .execute(move |store| store.lifecycle_operation(&lookup_workspace_id, &lookup_operation_id))
+        .await
+    {
+        Ok(Some(operation)) => operation,
+        Ok(None) => return Err(ApiError::not_found("operation").into()),
+        Err(error) => {
+            if error.code == ErrorCode::Internal {
                 tracing::error!(
-                    workspace_id = %poison_workspace_id,
-                    operation_id = %lookup_operation_id,
-                    "runtime Operation query found stored projection corruption"
+                    workspace_id = %workspace_id,
+                    operation_id = %operation_id,
+                    error = %error,
+                    "atomic lifecycle Operation read found stored authority corruption"
                 );
-                // A claimed Store closure outlives cancellation of the HTTP
-                // future. Poison synchronously here so dropping a response
-                // cannot leave this replica ready after deterministic stored
-                // corruption was observed.
-                readiness.poison();
+                state.readiness.poison();
             }
-            read
-        })
-        .await?;
-    let operation = match read {
-        RuntimeOperationRead::Found(operation) => operation,
-        RuntimeOperationRead::NotFound => return Err(ApiError::not_found("operation").into()),
-        RuntimeOperationRead::Corrupt => {
-            return Err(ApiError::internal("stored runtime Operation is corrupt").into());
+            return Err(error.into());
         }
     };
-    let body = match encode_operation(&operation) {
+
+    let Some(operation) = product_operation_projection(&operation)? else {
+        // Internal maintenance commands are deliberately outside the product
+        // Operation namespace even though they share durable storage.
+        return Err(ApiError::not_found("operation").into());
+    };
+    let body = match encode_cat_operation_read_v1(&operation) {
         Ok(body) => body,
         Err(error) => {
-            tracing::error!(error = %error, "stored runtime Operation could not be re-encoded");
+            tracing::error!(
+                workspace_id = %workspace_id,
+                operation_id = %operation_id,
+                error = %error,
+                "stored atomic lifecycle Operation could not be re-encoded"
+            );
             state.readiness.poison();
-            return Err(ApiError::internal("stored runtime Operation is corrupt").into());
+            return Err(ApiError::internal("stored lifecycle Operation is corrupt").into());
         }
     };
 
@@ -73,6 +84,93 @@ pub(super) async fn get_runtime_operation(
         .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from(body))
         .map_err(|_| ApiError::internal("could not construct Operation response").into())
+}
+
+fn product_operation_projection(
+    operation: &LifecycleOperation,
+) -> Result<Option<CatOperationReadV1>, ApiError> {
+    if operation.command_kind != operation.canonical_request.command.kind() {
+        return Err(ApiError::internal(
+            "stored lifecycle Operation command kind is inconsistent",
+        ));
+    }
+    let start_source = match &operation.canonical_request.command {
+        LifecycleCommand::Start(spec) => Some(spec.source),
+        _ => None,
+    };
+    let Some(action) = product_action(operation.command_kind, start_source) else {
+        return Ok(None);
+    };
+    let terminal_kind = match &operation.state {
+        LifecycleOperationState::Unresolved => None,
+        LifecycleOperationState::Terminal { terminal, .. } => Some(terminal.kind()),
+    };
+    let state = product_operation_state(action, terminal_kind);
+    let terminal_at_unix_ms = match state {
+        CatOperationState::InProgress => None,
+        CatOperationState::Succeeded | CatOperationState::Failed => operation.terminal_at_unix_ms,
+    };
+    if matches!(
+        state,
+        CatOperationState::Succeeded | CatOperationState::Failed
+    ) && terminal_at_unix_ms.is_none()
+    {
+        return Err(ApiError::internal(
+            "stored terminal lifecycle Operation is missing its completion time",
+        ));
+    }
+    Ok(Some(CatOperationReadV1 {
+        version: operation.version,
+        operation_id: operation.operation_id.clone(),
+        workspace_id: operation.workspace_id.clone(),
+        cat_id: operation.cat_id.clone(),
+        action,
+        state,
+        created_at_unix_ms: operation.created_at_unix_ms,
+        terminal_at_unix_ms,
+    }))
+}
+
+fn product_action(
+    command_kind: LifecycleCommandKind,
+    start_source: Option<StartSource>,
+) -> Option<CatOperationAction> {
+    match command_kind {
+        LifecycleCommandKind::Start => Some(if start_source == Some(StartSource::Genesis) {
+            CatOperationAction::Create
+        } else {
+            CatOperationAction::Run
+        }),
+        LifecycleCommandKind::Suspend => Some(CatOperationAction::Suspend),
+        LifecycleCommandKind::Warm => Some(CatOperationAction::Warm),
+        LifecycleCommandKind::Cold => Some(CatOperationAction::Cold),
+        LifecycleCommandKind::Delete => Some(CatOperationAction::Destroy),
+        LifecycleCommandKind::Stop => None,
+    }
+}
+
+fn product_operation_state(
+    action: CatOperationAction,
+    terminal_kind: Option<TerminalResultKind>,
+) -> CatOperationState {
+    let Some(terminal_kind) = terminal_kind else {
+        return CatOperationState::InProgress;
+    };
+    let succeeded = matches!(
+        (action, terminal_kind),
+        (
+            CatOperationAction::Create | CatOperationAction::Run,
+            TerminalResultKind::RuntimeReady
+        ) | (CatOperationAction::Suspend, TerminalResultKind::Suspended)
+            | (CatOperationAction::Warm, TerminalResultKind::Warm)
+            | (CatOperationAction::Cold, TerminalResultKind::Cold)
+            | (CatOperationAction::Destroy, TerminalResultKind::Deleted)
+    );
+    if succeeded {
+        CatOperationState::Succeeded
+    } else {
+        CatOperationState::Failed
+    }
 }
 
 fn raw_workspace_segment(uri: &Uri) -> &str {
@@ -105,122 +203,74 @@ fn exact_operation_segment<'a>(uri: &'a Uri, workspace_id: &Id) -> Option<&'a st
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use axum::http::{header, HeaderValue};
-    use cats_metering::SqliteUsageStore;
-
     use super::*;
-    use crate::controller::AutoTierPolicy;
-    use crate::server::{Config, Handle};
-    use crate::store::DsnSource;
 
-    async fn server_with_corrupt_operation() -> (tempfile::TempDir, Handle, String, Id, Id) {
-        let dir = tempfile::tempdir().unwrap();
-        let usage = Arc::new(
-            SqliteUsageStore::open(&dir.path().join("usage.db")).expect("open usage store"),
-        );
-        let dsn = crate::testsupport::isolated_control_store_url();
-        let handle = crate::server::spawn(Config {
-            listen: "127.0.0.1:0".into(),
-            control_store_dsn: DsnSource::Literal(dsn.clone()),
-            control_store_ca_file: None,
-            usage_store: usage.clone(),
-            credit_store: usage,
-            #[cfg(debug_assertions)]
-            retired_storage_meta_for_tests: None,
-            image_blob: crate::testsupport::unavailable_image_blob(),
-            guest_runtime_profile_receipt: crate::testsupport::test_guest_runtime_profile_receipt(),
-            runtime_provisioner_trust_bundle:
-                crate::testsupport::test_runtime_provisioner_trust_bundle(),
-            production_cutover_operator_trust_bundle:
-                crate::testsupport::test_production_cutover_operator_trust_bundle(),
-            auth_token: "service-token".into(),
-            route_grant_signer: crate::testsupport::route_grant_signer(),
-            admin_token: "admin-token".into(),
-            workos: None,
-            stripe: None,
-            billing_enforcement_enabled: false,
-            node_lease_timeout_ms: 30_000,
-            reconcile_interval_ms: 60_000,
-            auto_tier_policy: AutoTierPolicy::default(),
-            oci_deploy_sync_wait_ms: 5_000,
-        })
-        .await
-        .unwrap();
-        let workspace_id = tokio::task::block_in_place(|| {
-            let workspace = handle
-                .state
-                .store
-                .list_all_workspace_views()
-                .unwrap()
-                .into_iter()
-                .find(|workspace| workspace.is_default)
-                .unwrap()
-                .id;
-            Id::new(workspace).unwrap()
-        });
-        let operation_id = tokio::task::block_in_place(|| {
-            crate::testsupport::begin_production_qualification_for_product_test(
-                handle.state.store.as_ref(),
-                &workspace_id,
-            );
-            crate::store::runtime_authority::product_tests::create_runtime_operation_for_api_test(
-                handle.state.store.as_ref(),
-                &workspace_id,
-            )
-        });
-        let corrupt_operation_id = operation_id.clone();
-        handle
-            .state
-            .store
-            .execute(move |store| {
-                store.with(|client| {
-                    client.execute(
-                        "UPDATE runtime_operations SET updated_at=updated_at+1
-                          WHERE operation_id=$1",
-                        &[&corrupt_operation_id.as_str()],
-                    )?;
-                    Ok(())
-                })
-            })
-            .await
-            .unwrap();
-        (dir, handle, dsn, workspace_id, operation_id)
+    #[test]
+    fn operation_path_requires_exact_workspace_and_shape() {
+        let workspace = Id::new("ws_exact").unwrap();
+        let valid: Uri = "/v1/workspaces/ws_exact/operations/op_1".parse().unwrap();
+        assert_eq!(exact_operation_segment(&valid, &workspace), Some("op_1"));
+        assert_eq!(raw_workspace_segment(&valid), "ws_exact");
+
+        for invalid in [
+            "/v1/workspaces/ws_other/operations/op_1",
+            "/v1/workspaces/ws_exact/operations/",
+            "/v1/workspaces/ws_exact/operations/op_1/extra",
+            "/v1/workspaces/ws_exact/operations/op_1/",
+        ] {
+            let uri: Uri = invalid.parse().unwrap();
+            assert_eq!(exact_operation_segment(&uri, &workspace), None, "{invalid}");
+        }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn claimed_corrupt_store_read_poisons_readiness_after_handler_cancellation() {
-        let (_dir, handle, dsn, workspace_id, operation_id) = server_with_corrupt_operation().await;
-        let mut table_lock =
-            crate::testsupport::RuntimeOperationsTableLockForTest::acquire(&dsn).await;
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer admin-token"),
+    #[test]
+    fn product_action_projection_hides_internal_stop_and_renames_run_destroy() {
+        assert_eq!(
+            product_action(LifecycleCommandKind::Start, Some(StartSource::Genesis)),
+            Some(CatOperationAction::Create)
         );
-        let uri = format!("/v1/workspaces/{workspace_id}/operations/{operation_id}")
-            .parse()
-            .unwrap();
-        let handler = tokio::spawn(get_runtime_operation(
-            State(handle.state.clone()),
-            OriginalUri(uri),
-            headers,
-        ));
-        table_lock.wait_until_query_blocked().await;
-        handler.abort();
-        assert!(handler.await.unwrap_err().is_cancelled());
-        table_lock.release();
+        for source in [
+            StartSource::SameNodeSuspended,
+            StartSource::SameNodeWarm,
+            StartSource::SameNodeCold,
+            StartSource::SameNodeRetry,
+            StartSource::ColdHandoff,
+        ] {
+            assert_eq!(
+                product_action(LifecycleCommandKind::Start, Some(source)),
+                Some(CatOperationAction::Run)
+            );
+        }
+        assert_eq!(
+            product_action(LifecycleCommandKind::Delete, None),
+            Some(CatOperationAction::Destroy)
+        );
+        assert_eq!(product_action(LifecycleCommandKind::Stop, None), None);
+    }
 
-        // Pure poll upper bound: the store worker settles the cancelled
-        // read before poisoning, which can take far longer on a saturated
-        // gate host than on an idle one; the poll exits as soon as
-        // readiness closes.
-        cats_test_support::wait_until_async(
-            "claimed corrupt Store closure poisons readiness",
-            || async { !handle.state.readiness.is_ready() },
-        )
-        .await;
-        handle.shutdown().await.unwrap();
+    #[test]
+    fn product_state_exposes_only_progress_success_or_failure() {
+        assert_eq!(
+            product_operation_state(CatOperationAction::Run, None),
+            CatOperationState::InProgress
+        );
+        assert_eq!(
+            product_operation_state(
+                CatOperationAction::Run,
+                Some(TerminalResultKind::RuntimeReady)
+            ),
+            CatOperationState::Succeeded
+        );
+        for internal in [
+            TerminalResultKind::StartFailed,
+            TerminalResultKind::Killed,
+            TerminalResultKind::NeedsIntervention,
+            TerminalResultKind::HostLost,
+        ] {
+            assert_eq!(
+                product_operation_state(CatOperationAction::Run, Some(internal)),
+                CatOperationState::Failed
+            );
+        }
     }
 }

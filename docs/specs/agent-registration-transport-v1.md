@@ -3,7 +3,7 @@
 - 状态：Implemented frozen v1；clean-slate rollout only
 - Authority：[ADR-0040](../decisions/0040-level-triggered-runtime-reconciliation.md)
 - 共享runtime类型：[Runtime Reconciliation v1](runtime-reconciliation-v1.md)
-- Session-bound delivery/acceptance：[Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)
+- Session-bound inventory acceptance：[Runtime Inventory and Telemetry v1](runtime-inventory-observation-v1.md)
 
 本文冻结Node Agent注册的唯一HTTP接口、所有runtime internal请求共用的per-Node machine
 authentication adapter、注册错误映射、session lease policy，以及
@@ -46,11 +46,12 @@ A19 wire和`AgentSession`有意不携带Node transport target。Gateway可达地
 internal runtime handler、Store和Node不得读取`CATS_AUTH_TOKEN`、browser session、admin session、workspace
 token或另一个service bearer。生产请求使用server-authenticated HTTPS和§4的per-Node签名；HTTP只允许显式
 test adapter绑定loopback listener，不能由production配置降级。
-注册之外，Desired/observation两条session-bound delivery route只由
-[Runtime Inventory and Observation Spine §2](runtime-inventory-observation-v1.md#2-http-与-authentication-envelope)冻结；
-卷状态转换的一条session-bound mutation route和一条authorization evidence read route只由
-[Runtime Volume Transitions v1](runtime-volume-transitions-v1.md)冻结。本文的共用prefix/proof adapter不会自动
-创建GET、long-poll、legacy heartbeat或任何未被这两个下位合同逐条冻结的可路由入口。
+注册之外，clean runtime inventory的session-bound route只由
+[Runtime Inventory and Telemetry §2](runtime-inventory-observation-v1.md#2-固定常量与http)冻结；卷状态转换只由
+[Atomic Runtime Lifecycle v1](atomic-runtime-lifecycle-v1.md)的command-scoped
+`/v1/internal/runtime/lifecycle-volume-transitions`冻结。pre-cutover authorization evidence-read route、DTO、
+codec与parser已经删除。本文的共用prefix/proof adapter不会自动创建GET、long-poll、legacy heartbeat或任何
+未被下位合同逐条冻结的可路由入口。
 
 Node的`--control-plane-url`必须是`https://<authority>` origin：除根`/`外没有path，不含userinfo、query或
 fragment；client在它后拼接本规格的exact path。TLS使用部署Host的reviewed WebPKI trust roots并验证URL DNS
@@ -129,7 +130,7 @@ address构造认证身份。retired identity只允许步骤(b)解析此前ambigu
 ## 4. Per-Node request proof adapter
 
 本节是全部`/v1/internal/runtime/*` endpoint共用的唯一V1 machine authentication adapter。registration、
-Desired read和observation不得各自实现签名方言。
+runtime inventory、lifecycle command、Route与Volume endpoint不得各自实现签名方言。
 
 ### 4.1 Header wire
 
@@ -372,28 +373,28 @@ V1 lease duration是server constant 60000 ms；没有request field、environment
 - exact registration attempt replay返回首次提交的immutable `AgentSession` exact bytes，包括initial deadline；即使
   identity后来retired、current deadline已续期或已过期，也只解析该attempt的模糊结果，不恢复eligibility或续期。
 - 新attempt只有在exact `expected_agent_session_epoch` CAS成功时分配下一epoch和新的initial deadline。
-- 唯一续期点是同一current session的**新**`heartbeat_sequence` observation在一个Control Store transaction
-  完整验证并接受时：用同一`db_now`令current deadline单调更新为
-  `max(old_deadline, db_now + 60000)`，并在该accept response返回current `SessionBinding`与更新后的
-  `lease_deadline_unix_ms`；不返回或改写immutable registration result。
-- exact observation replay、stale/conflict/invalid observation、Desired read、registration replay、失败请求和仅有
-  网络连接都不得续期。
+- 续期点只有两类，且都要求exact current、尚未expired的session：**新**`RuntimeInventoryReport`在telemetry
+  transaction完整验证并接受；或`LifecycleCommandPollRequest`在独立lifecycle lane完整验证并返回batch。两者都用
+  同一transaction的`db_now`令current deadline单调更新为
+  `max(old_deadline, db_now + 60000)`；inventory acceptance返回更新后的deadline，poll batch只回显exact
+  `SessionBinding`。两条lane不互相等待，任一malformed/饱和不能阻断另一条续期。
+- exact inventory report replay、stale/conflict/invalid inventory、registration replay、失败的poll/result commit、
+  失败请求和仅有网络连接都不得续期；immutable registration result永不因续期被改写。
 
 immutable attempt result与current session除`lease_deadline_unix_ms`外的全部`AgentSession`字段（包括
 `version`和`registration_attempt_id`）必须逐字段相等；current deadline可以且只能因上一条规则大于等于initial
 deadline。任一非deadline字段不等或current deadline小于initial是fatal Store corruption，当前session
 unready且事务零写入。实现不得要求两个deadline永远相等。
 
-expired session不能签发或exact replay `DesiredReadSnapshot`、首次接受新observation/attestation、参与
+expired session不能首次接受新inventory/attestation、poll lifecycle command、提交lifecycle result、参与
 placement/admission或打开route gate；这些边界必须用同一PG-now重验current exact session和deadline。唯一例外
-是current session对highest
-accepted `heartbeat_sequence`及其exact observation的重放：deadline后仍返回首次success，零写入且不续期，只用于
-解析此前commit的response loss。expiry是Control liveness gate，不替代HostFence、attachment epoch或route
-epoch，不能仅凭expiry宣称旧Host/volume writer已经被fence。
+是current session对highest accepted report sequence及其exact inventory report的重放：deadline后仍返回首次
+success，零写入且不续期，只用于解析此前commit的response loss。expiry是Control liveness gate，不替代
+HostFence、attachment epoch或route epoch，不能仅凭expiry宣称旧Host/volume writer已经被fence。
 
-上述续期点、expired Desired拒绝和deadline后highest exact observation例外的唯一结果映射、
+上述续期点、expired request拒绝和deadline后highest exact inventory replay例外的唯一结果映射、
 事务顺序及response wire见
-[Runtime Inventory and Observation Spine §3–§6](runtime-inventory-observation-v1.md#3-desired-read-position)；
+[Runtime Inventory and Telemetry §7–§9](runtime-inventory-observation-v1.md#7-acceptance-wire)；
 本节不定义第二个observation接受或lease-renewal路径。
 
 ## 8. GuestRuntimeProfileReceipt release path

@@ -27,10 +27,10 @@ use crate::format::{
     self, ChunkRef, LeafRef, PackByteRange, PackEntry, PackHeader, BITMAP_HEADER_LEN,
 };
 use cats_storage::authority::{
-    validate_authorized_serving_attachment, validate_authorized_serving_record, AsciiText,
-    AttachmentLineageIdentity, AuthorityError, AuthorizedServingAttachment, FenceEpoch, Generation,
-    Id, RemoteHead, RenewLeaseRequest, Sha256Digest, VolumeDataAuthority, VolumeDurability,
-    VolumeHeadCasRequest,
+    remote_head_is_same_or_later, validate_authorized_serving_attachment,
+    validate_authorized_serving_record, AsciiText, AttachmentLineageIdentity, AuthorityError,
+    AuthorizedServingAttachment, FenceEpoch, Generation, Id, RemoteHead, RenewLeaseRequest,
+    Sha256Digest, VolumeDataAuthority, VolumeDurability, VolumeHeadCasRequest,
 };
 #[cfg(test)]
 use cats_storage::MetadataStore;
@@ -935,10 +935,11 @@ impl ChunkEngine {
                         "authorized serving attachment disappeared before open".into(),
                     )
                 })?;
+                let current_head = remote_head_from_legacy_projection(&head)?;
                 if head.lease_owner.as_deref() != Some(cfg.attachment_id.as_str())
                     || head.lease_epoch != expected_epoch
                     || head.size_bytes != attachment.size_bytes
-                    || remote_head_from_legacy_projection(&head)? != attachment.head
+                    || !remote_head_is_same_or_later(&current_head, &attachment.head)
                 {
                     return Err(EngineError::Meta(MetaError::Fenced));
                 }

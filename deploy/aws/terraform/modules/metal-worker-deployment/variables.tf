@@ -283,13 +283,12 @@ variable "worker_managed_environment" {
         "CATS_POSTGRES_URL",
         "CATS_POSTGRES_SECRET_ARN",
         "CATS_POSTGRES_SCHEMA",
-        "CATS_METERING_CGROUP_ROOT",
         "CATS_NODE_ID",
         "CATS_NODE_ADVERTISE_URL",
         "CATS_ROUTE_V2_MACHINE_LISTEN",
       ]),
     )) == 0
-    error_message = "CATS_AUTH_TOKEN is forbidden on signed workers; CATS_CHUNKSTORE_PREFIX and CATS_POSTGRES_SCHEMA come only from their reviewed exact inputs; CATS_POSTGRES_SECRET_ARN goes through database_master_user_secret_arn so the matching IAM statement is emitted with it; CATS_METERING_CGROUP_ROOT is discovered on the host; node identity is per worker; the Route v2 listener is fixed by the production unit."
+    error_message = "CATS_AUTH_TOKEN is forbidden on signed workers; CATS_CHUNKSTORE_PREFIX and CATS_POSTGRES_SCHEMA come only from their reviewed exact inputs; CATS_POSTGRES_SECRET_ARN goes through database_master_user_secret_arn so the matching IAM statement is emitted with it; node identity is per worker; the Route v2 listener is fixed by the production unit."
   }
 
   validation {
@@ -333,17 +332,11 @@ variable "worker_base_environment" {
     Non-secret, fleet-shared worker.env entries used only when the host has no
     worker.env yet -- control plane and gateway URLs, region, ChunkStore
     bucket, guest network CIDR. An existing file is never rewritten, so
-    operator edits survive. Secrets belong in worker_runtime_secret_data;
-    CATS_METERING_CGROUP_ROOT is discovered on the host; Node identity is a
-    provisioner-owned artifact and must not be set here.
+    operator edits survive. Secrets belong in worker_runtime_secret_data; Node
+    identity is a provisioner-owned artifact and must not be set here.
   EOT
   type        = map(string)
   default     = {}
-
-  validation {
-    condition     = !contains(keys(var.worker_base_environment), "CATS_METERING_CGROUP_ROOT")
-    error_message = "CATS_METERING_CGROUP_ROOT is discovered from the host's cgroup2 mount and systemd slice; do not pin it."
-  }
 
   validation {
     condition = length(setintersection(

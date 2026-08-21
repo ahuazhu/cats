@@ -1,16 +1,24 @@
 # Route Grant v2
 
-- 状态：Target contract；shared codec、Control独立Gateway machine resolve transport、Node
-  verification/admission core、Gateway到Node machine tunnel、`cats-gatewayd` public proxy composition及
-  revision-1 production artifact/deployment wiring已实现；真实production mTLS E2E与rotation qualification仍开放
-- Authority：[ADR-0041](../decisions/0041-node-verified-route-admission.md)
-- Runtime identity：[Runtime Reconciliation v1](runtime-reconciliation-v1.md)
-- Runtime accepted facts：[Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)
+- 状态：Implemented/Frozen v2 authority；shared codec、Control signer/independent Gateway machine resolve、
+  Node verification/admission、signed per-Endpoint command poll/result lane、Gateway到Node tunnel、
+  `cats-gatewayd` public proxy以及atomic lifecycle AdmissionCell interlock已组成；真实production
+  mTLS E2E与rotation qualification仍开放。ADR-0057 product vocabulary已闭合：resolve rejection使用
+  `run_required`且fixed vector严格拒绝旧`wake_required`，Gateway不得触发隐式lifecycle action
+- Route Authority：[ADR-0041](../decisions/0041-node-verified-route-admission.md)
+- Lifecycle interlock：[ADR-0056](../decisions/0056-atomic-per-cat-runtime-lifecycle.md)
+- Product actions：[ADR-0057](../decisions/0057-product-lifecycle-actions-and-internal-execution-evidence.md)
+- Runtime identity/result：[Atomic Runtime Lifecycle v1](atomic-runtime-lifecycle-v1.md)
+- Full inventory foundation：[Runtime Inventory and Telemetry v1](runtime-inventory-observation-v1.md)
 - Operations：[Operations and HA](../operations-ha.md)
 
 Route Grant 是 Control Plane 为一个当前 Running runtime 签发的短期 capability。Gateway
 只缓存并搬运 token；Node 同时验证签名和本地 gate，并原子取得 active guard。token、Gateway
 cache、hostname lookup index 和 observation 都不是独立 authority。
+
+ADR-0056 已取代本规格旧版对完整 Desired revision、Running/route Observation 与 lifecycle reconciler 的
+依赖。atomic release 的 signer只消费 exact RuntimeReady/Serving receipts、current lifecycle head、current
+AgentSession和fresh full-inventory attestation；Observation只用于监控/drift，绝不授权签发或结算Route。
 
 ## 1. Wire contract
 
@@ -71,77 +79,62 @@ deadline，都必须使用checked arithmetic；任何overflow/underflow都fail c
 不签发，verifier返回`InvalidClaims`），禁止wrapping或saturating替代。signer/verifier不得为上述
 identity或时间字段另定义更宽范围。
 
-## 2. Endpoint authority 与 revision
+## 2. Endpoint authority 与 Route Operation
 
-Endpoint 是完整 `DesiredRuntimeSpec` 的一部分。一次 Endpoint create、unbind、hostname/port/
-protocol change 或 rebind 必须在一个 PostgreSQL transaction 内：
+Endpoint不是runtime lifecycle command的一部分。`EndpointRecord`/current Endpoint binding 是产品
+authority；`HostnameEndpointLookup`只定位current binding，不是第二份可签发authority。一次 Endpoint
+create、unbind、hostname/port/protocol change 或 rebind 必须在一个 PostgreSQL transaction 内：
 
-1. 锁定并校验 Cat 当前 desired revision；
-2. 为变化的 Endpoint 增加 `route_epoch`；
-3. 写入包含全部 Endpoint 的新完整 desired revision；
-4. 更新 canonical hostname lookup index；
-5. 创建或复用精确绑定该 revision 的 Operation。
+1. 锁current Cat与Endpoint identity；
+2. 对changed/new binding分配严格增加的per-Endpoint `route_epoch`；removed binding同样永久burn旧epoch；
+3. 写完整current Endpoint binding；
+4. 更新canonical hostname lookup；
+5. 标记该Endpoint不可继续从旧Serving receipt签发。
 
-transaction任一部分失败就全部回滚。hostname index只把lookup定位到当前
-`workspace_id/cat_id/endpoint_id/desired_revision`；它不保存第二份可签发binding，也不能被
-signer单独读取。`desired_revision`仍是协调与签发snapshot条件，但不进入Grant或serving gate。
+transaction任一部分失败就全部回滚。Route Controller随后从current Endpoint metadata与current lifecycle
+head自动派生per-Endpoint `EnableRoute`/`DisableRoute` Operation；用户不创建Route lifecycle intent。每
+Endpoint最多一个unresolved Route Operation，不同Endpoint可独立推进；它不加入per-Cat lifecycle lane。
 
-`route_epoch`是per-Endpoint serving lineage：binding变化必须递增；任何gate一旦真正Closed或结果
-不明，重开前也必须通过新的完整Desired递增。Node任意时刻只安装一个epoch，不保留双epoch窗口。
-只检查到RequireIdle Busy且cell从未close时可以保留原epoch。
+`route_epoch`是per-Endpoint serving lineage：binding变化、gate实际Closed、close结果不明或Agent replacement
+后重开都必须严格增加。Node任意时刻只安装一个epoch，不保留双epoch窗口。唯一保留epoch的路径是
+`SuspendDeclined(Busy)` 的exact proof证明AdmissionCell从未close。
 
-Node应用仅含Endpoint变化的revision时使用[Runtime Reconciliation v1](runtime-reconciliation-v1.md)
-定义的durable `CloseGate`，不得调用全局`CloseAdmission`。每次gate变化都在`AdmissionCell`内线性化：
-
-- changed/removed Endpoint先持久化只含endpoint ID/old route epoch的`CloseGate`，以checkpoint中同一
-  old entry的完整binding compare-and-close，立即fsync Closed，再只取消并drain它自己的guards；若以后
-  重开必须使用更大route epoch；
-- binding、route epoch、runtime incarnation和platform target都未变化的其他Endpoint不修改
-  serving gate，不关闭、不重绑，也不取消已有guards；
-- new/changed Endpoint 在其 platform target Ready 且 checkpoint 已持久化后才发布 Active。
-
-因此Endpoint A的变化不会中断Endpoint B的active stream或新请求，B的既有Grant继续有效。若
-revision还改变placement、runtime identity、volume、mount、network、platform或lifecycle target，它不是Endpoint-only
-revision，必须走全局close-and-drain；之后重开全部受影响Endpoint时提高各自route epoch。
+Endpoint A的Disable/Enable只compare-and-close/install A，不能修改B的gate、guards、cancellation或active
+stream。生命周期离开Running则由shared AdmissionCell一次关闭全部Endpoint；later Start只到RuntimeReady，
+Route Controller再为intended Endpoint分别生成fresh Enable。
 
 ## 3. Signer snapshot
 
 一次 resolve 必须在同一个 PostgreSQL transaction snapshot 中读取并闭合：
 
-1. canonical hostname index 与当前 Endpoint binding 指向同一 current desired revision；
-2. desired target 为 Running，placement node/epoch 是当前值；
-3. current NodeIdentity是provisioned，且A23 current `NodePlacementPolicy.node_id`与identity、desired placement
+1. canonical hostname index 与current Endpoint binding逐字段相同；
+2. Cat current lifecycle head投影出exact `effective_runtime_ready`，没有任何leaving-Running unresolved
+   lifecycle Operation，placement node/epoch为current值；
+3. current terminal per-Endpoint Route Operation是`Serving`，其receipt逐字段绑定current Endpoint、route
+   epoch、effective RuntimeReady source、runtime incarnation与current AgentSession的
+   `admission_session_epoch`；
+4. current NodeIdentity是provisioned，且A23 current `NodePlacementPolicy.node_id`与identity、placement
    逐字段相同；同一policy给出strict canonical `node_transport_target`。缺policy或JSON/projection不一致是stored
    corruption；registration/observation与legacy `nodes.agent_url`不能提供fallback；
-4. 当前`AgentSession`精确属于该node、Host/boot/agent instance；
-5. 该session有fresh `AdmissionInventoryAttestation {inventory_epoch, inventory_digest,
-   inventory_read_position,
-   accepted_at_unix_ms}`；它来自accepted full scan，完整schema与digest算法以
-   [Runtime Reconciliation v1](runtime-reconciliation-v1.md) §2/§16为准，
+5. 当前`AgentSession`精确属于该node、Host/boot/agent instance，且epoch等于Serving receipt；
+6. 该session有fresh `RuntimeInventoryAttestation {session, inventory_epoch, scan_id,
+   inventory_digest, source_report_id, source_sequence, accepted_at_unix_ms}`；它来自accepted full scan，
+   完整schema与digest算法以
+   [Runtime Inventory Observation v1](runtime-inventory-observation-v1.md) 为准，
    后续partial observation不能覆盖；fresh精确使用
-   [Inventory Spine §7.2](runtime-inventory-observation-v1.md#72-route-signer-freshness)的同一DB-now与
+   [Runtime Inventory and Telemetry v1 §9](runtime-inventory-observation-v1.md#9-store-transaction与schema)的同一DB-now与
    `accepted_at <= db_now < accepted_at + 60000ms`，右边界相等已过期；
-6. 最新per-Cat accepted observation属于该session、引用同一inventory epoch，且其PostgreSQL
-   `accepted_at_unix_ms`满足同一DB-now的
-   `accepted_at <= db_now < accepted_at + 30000ms`，右边界相等已过期；freshness只使用数据库时间，
-   不信Node上报时钟；
-7. observation 的 applied revision、placement、runtime incarnation、Running/Ready condition 与
-   desired 完全一致；
-8. observation 报告同Endpoint gate Active、同route epoch/protocol/port；
-9. observation的ring version/digest均非null、按精确`loaded_kids`重算匹配，且当前signer `kid`出现
-   在该Node原子加载并ACK的`loaded_kids`中；Runtime合同的unavailable或empty-but-valid ring都不签发。
+7. current AgentSession的durable key-ring ACK中，ring version/digest非null、按exact `loaded_kids`重算
+   匹配，且current signer `kid`出现于Node原子加载的`loaded_kids`；unavailable或empty-but-valid ring都不签发。
 
 Signer 以同一 snapshot 的数据库时间生成 `iat/nbf/exp`。任何条件不成立都返回
-Wake/Pending/Unavailable，不签发未来 revision，不从旧 token 复制 authority，也不建立 durable
-route workflow。签发后若 token 已到期就丢弃。
+RunRequired/Pending/Unavailable，不从旧 token、lookup或Observation复制authority。`run_required`只提示调用方
+显式发起product run，不让Gateway创建Operation。签发后若token已到期就丢弃。旧
+`WakeRequired/wake_required`严格decode失败，不是兼容alias。
 
-Conditions可以同时包含`Ready + Degraded`。只要attestation和per-Cat事实仍fresh且上述Ready
-postcondition继续成立，Degraded本身不阻止签发；freshness或安全事实失效时observation必须移除
-Ready，signer也停止签发。
-
-`Ready` 在这里表示平台拥有正确的 VMM、网络、完整磁盘集合、声明的 Guest mounts 和可用的
-Guest transport。它不表示用户应用已经监听 `target_port`。应用 health/readiness 若产品需要，
-必须作为独立策略实现，不能改变 route authority 的含义。
+Observation的Degraded/Ready字段只是telemetry：它不能建立或延长Serving。RuntimeReady证明平台拥有正确
+VMM、network、完整device/mount与Guest transport；Serving证明exact Endpoint gate已安装。两者都不表示用户
+应用已监听`target_port`；应用health若产品需要必须作为独立策略，不能改变route authority。
 
 ## 4. Public ingress 与内部身份
 
@@ -192,7 +185,7 @@ handler在读取body、取得admission permit或访问PostgreSQL前要求该prin
   strict A23 target、expiry range、opaque grant ASCII/4096-byte bound和`SHA-256(opaque_grant)`；不解析
   protected header、claims或签名；
 - authenticated authority outcome精确映射为`200` success，`404 not_found`、`410 gone`、
-  `409 wake_required|pending`、`503 unavailable`。认证失败为`401 authentication_failed`；frame错误为
+  `409 run_required|pending`、`503 unavailable`。认证失败为`401 authentication_failed`；frame错误为
   `400/405/406/413/415 invalid_request`；stored/internal错误为`500 internal`。所有response带
   `Cache-Control: no-store`；`405`带`Allow: POST`，`503`带`Retry-After: 1`；不redirect；
 - per-replica resolve semaphore与body/deadline是资源界，不是authority。handler与其已经启动的Store
@@ -203,7 +196,7 @@ handler在读取body、取得admission permit或访问PostgreSQL前要求该prin
 Gateway到Control的独立identity由[ADR-0045](../decisions/0045-independent-gateway-workload-identity.md)
 与[Gateway Workload Identity Authority v1](gateway-workload-identity-v1.md)冻结：固定CA先验证TLS chain，
 verified leaf canonical SPKI再映射PG current credential；每个keepalive request都重验，Workspace scope只使用
-hostname在同一authority snapshot解出的current Workspace。PG exact revision/current pointer是唯一运行时
+hostname在同一authority snapshot解出的current Workspace。PG exact Endpoint/lifecycle/Serving current pointers是唯一运行时
 authority，filesystem JSON只做install candidate。它不借legacy或HTTP header principal。
 
 [ADR-0044](../decisions/0044-independent-route-v2-signing-authority.md)与
@@ -248,6 +241,11 @@ typed error或触达guard/Guest；只有完整已验证请求对应的Cat absent
 full inventory中的ring version/digest/`loaded_kids`必须从这个listener实际使用的同一进程
 `Arc<RouteGrantV2Verifier>`读取；磁盘ring只是在下次受控启动时可加载的candidate，不能冒充已加载事实。
 listener未组成时inventory必须报告ring unavailable，使§3 signer闭合失败。
+
+production `cats-noded`把fixed signer artifacts、durable rotation origin、installed verifier/listener与
+signed Route command runner视为一个必选composition。listener与mandatory live delivery未完成
+就不启动lifecycle/inventory task；不存在“Route delivery可选、其余runtime继续”的
+production branch。
 
 pre-admission failure为canonical JSON
 `{"version":2,"guard_acquired":false,"reason":"expired"}`及§8闭集；只有已取得guard后的Guest
@@ -312,12 +310,12 @@ admission、Endpoint/Platform guards 和 cancellation handles。HTTP/WebSocket�
 都必须在该 cell 内原子检查 open 并取 guard。cell 内不执行网络、数据库、文件、VMM 或 fsync I/O，
 也不持锁跨 `.await`。
 
-当前Node core实现以同一个mutex同时承载complete `AdmissionSnapshot` compare-and-apply和已验签Grant的
-binding compare/guard increment；snapshot精确包含desired revision、spec digest、placement、runtime
-incarnation、checkpointed Guest IPv4、lifecycle与全部Endpoint bindings。replacement在取得mutex前完整验证；
+atomic release以同一个mutex同时承载exact `AdmissionSnapshot` compare-and-apply和已验签Grant的
+binding compare/guard increment；snapshot精确包含current lifecycle head/effective RuntimeReady、placement、
+runtime incarnation、checkpointed Guest IPv4、AgentSession epoch、lifecycle与全部Endpoint bindings。replacement在取得mutex前完整验证；
 同一cell/incarnation的open、install/close/remove、global close/try-close与RequireIdle open-Busy source都要求
 Guest IPv4完全相等，target变化只能进入new incarnation/new cell。Endpoint-scoped stale
-revision/spec/placement/target compare零副作用，全局compare歧义则fail closed。Endpoint close和新guard不能跨
+lifecycle source/session/placement/target compare零副作用，全局compare歧义则fail closed。Endpoint close和新guard不能跨
 两个锁竞态。guard是不可clone的RAII值，
 普通返回、错误、panic和async task取消都经`Drop`归还。machine transport只从CA-verified TLS leaf构造
 不可由wire生成的typed Gateway principal，并用同一registry执行该core；它不从header构造principal。
@@ -326,91 +324,95 @@ revision/spec/placement/target compare零副作用，全局compare歧义则fail 
 不能再伪装成 pre-admission rejection。一次 Grant 只授权指定 target 上的一次 admission，不授权
 lifecycle、volume、其他 Endpoint 或 Node 管理操作。
 
-## 7. Gate 安装、close 与 RequireIdle
+## 7. Route command、gate close 与 lifecycle interlock
 
-Node 只在当前 revision 的 VMM/Guest、完整磁盘集合、声明 mounts、network 和 Guest transport
-达到 platform Ready 后，把 checkpoint 中的 Endpoint gate 持久化为：
+Node 只接受绑定 exact terminal `RuntimeReady`/effective RuntimeReady 的 `EnableRoute`。production
+transport与lifecycle command lane平行，但不共享per-Cat lane：Node使用current `AgentSession`签名
+`POST /v1/internal/runtime/route-command-polls`并把exact response签名提交到
+`POST /v1/internal/runtime/route-result-commits`。poll可携带durable `RouteNodeRingAck`；ACK只证明
+该session已原子加载一个public ring，不证明RuntimeReady或Serving。
+
+public command contract是：
 
 ```text
-Active {
-  workspace_id, endpoint_id, hostname, cat_id, node_id,
-  runtime_incarnation, route_epoch,
+RouteServingBinding {
+  workspace_id, endpoint_id, hostname, cat_id,
+  placement_identity,
+  effective_runtime_ready,
+  route_epoch,
+  admission_session,
   protocol, target_port
 }
+
+RouteCommandEnvelope {
+  version, operation_id, binding,
+  predecessor: Genesis | Exact {operation_id, terminal_result_kind, terminal_result_digest},
+  command: Enable | Disable,
+  request_fingerprint
+}
+
+RouteNodeResult =
+  Serving {binding, admission_cell_receipt_digest}
+| Closed {binding, admission_cell_receipt_digest}
+| Rejected {binding, reason, no_effect_receipt_digest}
 ```
 
-reconciler先fsync包含current desired依据的Closed prepared checkpoint和同进程effect edge，再fsync
-Active checkpoint。最后一次fsync后，以immutable launch Desired、live gate predecessor Desired和current
-Endpoint successor Desired三层封闭authority重跑Host全局扫描与Guest mounted-set challenge；只有该barrier
-仍绑定durable Active successor时，才短暂进入`AdmissionCell`compare-and-publish Active，随后持久化completed
-postcondition并由observation报告route Active。prepared只可在保留exact effect edge的同进程内重放；Active
-可由该edge继续，或在cell已逐字段等于exact postcondition时只完成持久结算。重启默认Closed，任何已Active或
-结果不明的epoch均烧掉并要求更高epoch。重复安装完全相同值幂等；同route epoch不同binding是
-`SpecDigestConflict`。Agent启动或重启时，先从checkpoint、当前desired和完整物理inventory重建；
-证明闭合前全局lifecycle admission和全部Endpoint entries都保持Closed。进程重启使内存gate实际
-关闭，因此新AgentSession建立后，Control Plane必须提交提高所有原Active Endpoint route epochs的
-系统Desired revision；Node不能直接把checkpoint中的旧epoch重新发布Active。
+`effective_runtime_ready`是完整
+`EffectiveRuntimeReady {source_lifecycle_operation_id,runtime_incarnation,runtime_config_digest,
+runtime_ready_receipt_digest}`，不得只传operation ID或incarnation。`admission_session`是完整
+`SessionBinding`，不得把单一epoch当成session identity。Control只以terminal
+`Serving | Closed | Rejected`结算Node response；Endpoint binding、lifecycle close/ambiguous close或
+AgentSession replacement可用exact `ControlInvalidation`终结已不可执行的unresolved Route
+Operation，但它不伪造Node gate receipt。
 
-Endpoint-only changed/removed A的durable close顺序固定为：
+EnableRoute在first gate effect前fsyncper-Endpoint route command与Closed prepared binding；重新闭合current
+AgentSession、effective RuntimeReady、Endpoint metadata、runtime/Guest target与fresh full inventory
+attestation后，才在AdmissionCell compare-and-publish Active，并在return前fsync exact Serving result。exact
+retry返回原result；same route Operation ID不同binding/fingerprint fail closed。Observation只能随后报告Active，
+不能结算Route Operation。
 
-1. checkpoint top-level先绑定new current Desired的revision/spec/placement/incarnation；
-   `route_gates[A]`仍保存当前实际安装的old完整binding/Active，step写
-   `close_gate {endpoint_id:A, route_epoch:old_epoch}`并fsync。step不复制binding。
-2. effect前重读checkpoint和current Desired，逐字段重验top-level tuple，并由step唯一选择A的old entry；
-   在cell内只允许相同完整binding的`Active -> Closed`，相同binding已Closed是唯一幂等postcondition。
-   任一revision或binding不匹配都零副作用，交给current revision重plan；identity冲突Quarantine。
-3. close成功后立即把A entry fsync为Closed，再只cancel/drain A。响应/进程结果不明时必须以同binding
-   重新compare，或依赖restart默认Closed确认postcondition后持久化；绝不能在Active仍可能服务时只写Closed。
-   一旦实际或不明close，old epoch永久不得重开。
-4. changed A在drain后以一次checkpoint replace把entry替换为new完整binding/Closed并把step改为
-   `InstallGate(A,new_epoch)`，只安装更大epoch；removed A在checkpoint仍保留old Closed binding时，先在
-   cell内compare exact old binding/Closed并删除entry，确认absent后才以一次replace删除checkpoint entry、
-   推进next step且不install。in-process retry可接受该exact absence，但仍重做A的drain；其他missing或
-   binding mismatch不能adopt。new Endpoint没有old entry，直接从new binding/Closed进入InstallGate。
+Agent启动/replacement后内存AdmissionCell默认Closed，不能从checkpoint直接重开。Serving receipt绑定old
+`admission_session_epoch`因current session mismatch立即无效；Route Controller必须burn route epoch并提交fresh
+Enable。Grant不增加session claim，fresh epoch+runtime incarnation已使old Grant无法匹配。
 
-完整binding不变的B，其checkpoint entry、cell gate、guards和cancellation handles都不得修改；已有stream和
-缓存Grant继续。一个Cat的removed/changed/new Endpoint delta按endpoint ID稳定升序，每个Endpoint完整序列
-完成后才处理下一个，不引入batch close token。
-stale CloseGate遇到new revision或new binding只能零副作用，不能按endpoint ID误关新gate。
+Endpoint-only changed/removed A的Disable顺序固定为：
 
-每次full inventory之前，runner还必须执行mandatory serialized pre-scan。process-local session封闭保存由
-accepted Ready effect或complete scan确认的最后一个exact Running gate Desired；它可在StartRuntime/final
-Mount建立，不要求checkpoint已经Stable。strict Endpoint-only successor会在一个cell临界区内立即latch并取消全部
-changed/removed Endpoint tunnel，未变Endpoint保持原gate、guard和stream。该process-local latch可一次覆盖
-多个changed Endpoint，但durable CloseGate/drain/remove仍严格按Endpoint ID逐个完成。pre-scan只在exact
-current Stable/cell、previous exact Stable + strict Endpoint successor的完整latch、exact RequireIdle Busy/Open
-source，或current checkpoint与retained effect edge结算之一成立时，才允许Open gate继续存活；前两类只是
-概念上的exact-retained/endpoint-latched状态。已经Closed/untrusted的session可先fail-close后正常返回。通过
-上述保留条件后scanner Incomplete/deadline按Degraded保留已证明gate；pre-scan
-本身非完成或scanner显式corrupt/conflict/foreign必须全局fail-close并取消tunnel。
+1. fsync exact per-Endpoint command，绑定old完整ServingBinding与route Operation identity；
+2. 在AdmissionCell只compare-and-close A的exact binding；same binding已Closed是幂等postcondition，stale
+   binding/epoch零副作用，不能按endpoint ID关闭new binding；
+3. fsyncClosed result，再只cancel/drain A；changed A以后只以更大epoch Enable，removed A保持absent；
+4. binding不变的B，其gate、guard、cancellation、stream和epoch都不改变。
 
-`CloseAdmission`只用于离开Running、runtime replacement、Node drain、placement、volume、mount、network、
-platform变化以及下面的RequireIdle；它在cell内同时关闭全局lifecycle admission和全部Endpoint gates，
-Endpoint-only revision不得使用。`CancelAndDrain`在cell外持久化close、取消对应
-transport 并有界等待 guards 归零；超时就保持 runtime 和 writer，报告 Blocked，不能继续 pause、
-snapshot、detach 或 teardown。active WebSocket 不因 token TTL 中断，只由显式 cancellation/drain、
-连接端点或 Agent 进程故障结束。
+close结果模糊视为可能已Closed，old epoch永久burn。不同Endpoint各走独立lane；不建立batch command或以A的
+失败阻塞B。
 
-`RequireIdle` 只用于一次自动 Running -> Suspended 条件转换，不使用 proposal、idle-closure proof
-或二次 Control Plane commit：
+每次full inventory前，Node执行serialized admission pre-scan。current AgentSession与exact in-memory
+AdmissionCell仍可信时，complete scan可验证现有binding；partial/incomplete scan不能制造Active或新
+attestation。Agent replacement、foreign/conflicting route evidence或无法闭合session时全局fail-close并取消
+tunnel。
 
-1. Control Plane 以当前 Running revision 为 compare condition，提交一个完整 Suspended desired
-   revision；其中 `RequireIdle {attempt_id, source_revision, source_runtime_incarnation}` 只引用这一次
-   revision transition。
-2. Node先把该attempt写为checkpoint中的`Armed`并fsync，再只执行一次
-   `try_close_all_if_idle`。任一 Endpoint/Platform guard 非零时，
-   cell 和 runtime 完全不变，持久化该 revision 的 terminal `PreconditionFailed(Busy)`。
-3. guard Busy后Controller创建新的完整Running revision，保留原route epochs；不能在guards后来
-   归零时复用失败的Suspended revision。cell从未close，因此旧gate可以继续服务已缓存Grant，
-   但signer在desired恢复Running前停止新签发。
-4. guards为零时，Node在一个cell线性化点关闭全部work admission，持久化`Succeeded/Closed`后在
-   cell外验证watcher fresh+idle并quiesce。任一步失败都terminal Busy且保持Closed，不恢复旧gate。
-   restart看到`Succeeded/Closed`继续后置检查；看到结果不明的`Armed`保守Busy且保持Closed。
-5. 只要gate曾close或结果不明，Controller创建fresh Running revision时提高全部可能关闭的Endpoint
-   route epochs；Node重新验证后只安装新epoch。同一attempt不再次评估，也没有第二个authority
-   handshake或旧epoch恢复路径。
+接受任何离开Running的atomic lifecycle command后，Node的first local effect是在同一AdmissionCell关闭全局
+lifecycle admission与全部Endpoint gates，再在cell外cancel/drain：
 
-手动 stop、drain、migration 和 destroy 一律使用 `CancelAndDrain`，不能用 `RequireIdle` 等待用户流。
+```text
+EnableRoute linearizes first -> install可完成 -> lifecycle close随后关闭
+lifecycle close linearizes first -> late Enable sees stale/Closed -> zero effects
+```
+
+Control在接受suspend/warm/cold/destroy的同一Cat-row transaction中停止fresh signing/Enable generation。
+需要停止旧执行的产品动作不等待所有per-Endpoint RPC；late Serving result只是历史evidence，不能重开
+current runtime。
+
+`RequireIdle`只用于atomic Suspend的`admission_policy=require_idle`。Node durably接受Suspend后在cell内只检查
+一次：任一Endpoint/Platform guard非零时cell/runtime完全不变，返回
+`SuspendDeclined {reason: Busy, effective_runtime_ready, cell_never_closed_receipt}`。Declined成为新lifecycle
+head，但Signer使用该head投影的original effective RuntimeReady，因此old Serving/epoch可继续。guards后来归零
+不重试同Operation。
+
+guards为零时Node原子close；之后任何失败、crash或模糊结果都保持Closed并burn全部可能关闭的Endpoint
+epochs，不能返回Declined或恢复old epoch。`close_and_drain`永不返回Busy：grace deadline前正常drain，
+需要strong stop的action到期后可以force-stop Guest/VMM并断开stream。该规则取代旧“drain timeout必须保留
+runtime/writer”；active WebSocket仍不因Grant TTL单独中断。
 
 ## 8. Typed results 与 refresh
 
@@ -435,7 +437,7 @@ Signer 每一时刻只使用一个 active private key；Node 使用最多8把key
 artifact、secret reference、持久lineage与精确ACK合同由
 [Route v2 Signing Authority v1](route-signing-authority-v1.md)唯一冻结。ring 更新
 必须完整验证后原子 swap；加载失败的 Node 不 Ready并保持 admission Closed。heartbeat/
-observation 报告AgentSession、ring version、按
+observation可以报告ring telemetry，但signer只消费current AgentSession的durable ring ACK：ring version、按
 [Runtime Reconciliation v1 §16](runtime-reconciliation-v1.md)计算的`key_ring_digest`和已排序
 `loaded_kids`。Runtime合同的null/null/empty表示尚无有效ring；non-null/non-null/empty表示已经加载的
 合法空ring。两者都保持admission Closed，只有non-null version/digest、重算匹配且包含active `kid`才
@@ -466,7 +468,7 @@ fence，删除 public key本身只阻止新的 admission。
 | Node Agent 重启 | proxy stream可中断；新session+inventory attestation后先提交更高route epochs，旧token不复活 |
 | VMM replacement | 新 runtime incarnation；旧 token立即 mismatch |
 | Endpoint rebind | changed Endpoint使用新route epoch且旧token立即mismatch；未变Endpoint保持原serving lineage |
-| Node/Host partition | 不自动改投；恢复需Active HostFenceEvent、新完整Desired及逐卷authorization CAS |
+| Node/Host partition | 不自动改投；恢复需Active HostFenceEvent、HostLost predecessor、新placement及逐卷authorization CAS |
 
 更完整的数据库、Host fence、监控和 qualification 合同见
 [Operations and HA](../operations-ha.md)。
@@ -475,26 +477,28 @@ fence，删除 public key本身只阻止新的 admission。
 
 同一 schema 生成并由 signer/verifier 跨 crate 共享：固定测试 key、positive compact token、完整
 expected claims，以及identity/incarnation/route-epoch/port/time、wrong alg、unknown kid、重复/未知
-字段、oversize、tampered signature和rotation overlap的negative vectors。signer另测stale desired/
-observation revision，不能把desired revision塞回Grant vector。
+字段、oversize、tampered signature和rotation overlap的negative vectors。signer另测stale lifecycle head、
+effective RuntimeReady、Serving receipt、AgentSession与attestation；Observation不能授权，lifecycle Operation ID/
+session epoch也不能塞进Grant vector。
 
 还必须证明：
 
 - 四个`Id` claims使用Runtime边界；time claims在0与`i64::MAX`边界解析一致，所有TTL/skew/retention
   checked arithmetic的overflow/underflow都fail closed；
 - admission 与 close 并发时，close 线性化点后没有新 guard；panic/cancel/timeout 不泄漏 guard；
-- changed A先以durable CloseGate关闭/fsync old binding，再以更大epoch安装new binding；remove A关闭/drain
-  后先从cell compare-remove exact old Closed entry，确认absent才删checkpoint entry/advance且不install；
-  unbind A只取消A，B的checkpoint entry、gate、guards、active WebSocket与新
+- changed A先以durable DisableRoute关闭/fsync old binding，再以更大epoch Enable；remove A关闭/drain
+  后从cell compare-remove exact old Closed entry且不install；unbind A只取消A，B的route state、gate、guards、active WebSocket与新
   admission不中断，serving epoch不变；
-- CloseGate在cell close前、close后fsync前、Closed后替换/删除前分别注入不终止Agent的effect/fsync
-  失败；重试只操作A并确认同binding Closed，old epoch不重开；stale token遇new revision/binding零副作用
+- DisableRoute在cell close前、close后fsync前、Closed result前分别注入不终止Agent的effect/fsync
+  失败；重试只操作A并确认同binding Closed，old epoch不重开；stale token遇new lifecycle source/binding零副作用
   且不能关闭new gate；
 - 同Cat removed/changed/new delta按endpoint ID稳定逐个执行；不生成batch close；无进程重启的失败/重试
   当前A不修改B；
 - `RequireIdle` guard Busy不改变cell/epoch；任何实际或不明close后旧epoch不能重开；
+- `SuspendDeclined(Busy)`成为new lifecycle head时，Signer从head投影original effective RuntimeReady并继续匹配
+  old Serving source；若cell-never-closed proof错/缺则不签发；
 - 在上述每个边界另行kill Agent；restart使全部内存gate实际Closed，必须提高全部原Active Endpoint epochs，
-  不能声称只恢复A，也不把CloseGate当作旧epoch恢复依据；
+  old Serving因exact admission session epoch失效，不能声称只恢复A，也不把route checkpoint当作旧epoch恢复依据；
 - app port未监听产生 `UpstreamUnavailable`，不把 platform gate误报为未Ready，不刷新 route；
 - Node machine TLS矩阵覆盖有效Gateway leaf、无client certificate、未知CA、错误EKU、非Ed25519 leaf和
   错误ALPN；有效chain但Grant绑定另一Gateway SPKI时必须在Guest connect前返回`BindingMismatch`；

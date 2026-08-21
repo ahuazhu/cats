@@ -1,7 +1,7 @@
 //! Frozen public DTOs for the signed-runtime Cat-create ingress.
 //!
 //! This module is deliberately separate from the legacy product request
-//! shapes in [`crate::requests`].  Production clients and the production
+//! legacy product-authority shapes. Production clients and the production
 //! ingress share these types so neither side can silently retain retired
 //! fields while the runtime authority is being cut over.
 

@@ -2,7 +2,8 @@
 
 - 状态：Accepted
 - 日期：2026-08-14
-- 依赖：[ADR-0049](0049-trusted-host-fencing-and-batch-recovery.md)、ADR-0052
+- 依赖：[ADR-0042](0042-volume-authority-and-disk-lifecycle.md)、
+  [ADR-0052](0052-bounded-production-qualification-admission.md)
 - 规格：[Volume Authority](../specs/volume-authority.md)
 
 ## 背景

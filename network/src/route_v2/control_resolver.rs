@@ -272,7 +272,7 @@ async fn decode_response(
         }
         (
             StatusCode::CONFLICT,
-            RouteResolveV2RejectionCode::WakeRequired | RouteResolveV2RejectionCode::Pending,
+            RouteResolveV2RejectionCode::RunRequired | RouteResolveV2RejectionCode::Pending,
         )
         | (StatusCode::SERVICE_UNAVAILABLE, RouteResolveV2RejectionCode::Unavailable)
         | (StatusCode::INTERNAL_SERVER_ERROR, RouteResolveV2RejectionCode::Internal) => {

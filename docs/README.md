@@ -18,29 +18,24 @@ artifact与单一Guest release payload见
 
 ## 当前实现与目标
 
-决策状态和实现状态是两回事。2026-08-12 的 clean-slate cutover 边界：
+决策状态、软件组成与production qualification是三个不同边界。当前Rust/SQL的唯一
+rolling inventory维护在[Architecture §3.1](architecture.md#31-当前实现事实)：
 
-| 范围 | 当前 Rust/部署 | 已接受目标 |
-|---|---|---|
-| 存储 | ChunkStore、delta pack、golden root、NBD/vhost-user、S3/PostgreSQL adapters及ADR-0042 attachment/lease转换已实现并测试 | Snapshot/GC与外部Host-fence qualification仍是独立边界 |
-| 生命周期协调 | A19 session、A20 Desired/observation、A23 placement、完整物理inventory、checkpoint-first per-Cat reconciler与真实Cat-create v2已组成 | 完整lifecycle cutover与clean exact release仍开放，且须通过本页所列Linux/metal qualification；不提供legacy fallback |
-| Route | Route Grant v2、Node AdmissionCell/guard、Gateway-to-Node mTLS tunnel、gatewayd、revision-1 deployment、Node durable successor installer及schema 15 rotation state machine已实现 | ADR尚未授予production rotation caller/transport；真实production mTLS/rotation E2E qualification仍开放，跨Node overlay仍deferred |
-| Agent restart | Host lock、per-Cat systemd scopes、union inventory、current-authority receipt/checkpoint恢复与旧boot清理已实现 | superseded pre-acquire publication不在已完成声明内；具体release仍须在systemd 255 + KVM/Cloud Hypervisor上保留exact-SHA证据 |
-| 控制面 HA | PostgreSQL A19/A20/A22/A23、bounded executor、Operation查询与多副本锁序已实现 | 真实RDS failover与外部Host fence仍需独立qualification，不从timeout推断隔离 |
-| PersistentDisk | current-Desired Running路径的多卷Normal/Takeover、NBD/vhost、ext4 UUID、一次性Format、Drain/Commit及private mounted-set gate已实现 | superseded publication、完整lifecycle和Snapshot/GC仍按各自合同/故障矩阵验收 |
-| placement/网络 | A23 provisioner policy、同snapshot planner、exact Desired `/30`与per-Cat tap已实现 | 跨Node Guest overlay仍deferred |
-| privilege | 进程权限仍较集中 | privilege separation尚未实现 |
+- clean-slate schema 17的lifecycle、Volume、Route signed command lanes、Node-private journal/
+  StopFence、installed inventory与exact Control settlement已组成；
+- product route、CLI与Operation read已采用`create/run/suspend/warm/cold/destroy`，并隐藏private
+  `Start/Stop/Delete/Killed`；这些Node-Control执行名称可保留，不增加产品状态。Route resolve使用
+  `run_required`并严格拒绝旧`wake_required`；
+- product语义收口、失败后继、forbidden legacy parser/schema residue、fixed final digest vectors与
+  真实systemd/KVM/RDS/mTLS/HostFence资格验证仍是release gate；
+- 旧Desired/reconcile/NodeObservation settlement、NodeJob与Route-v1 authority不在production composition。
 
 协调面按 [Operations and HA §8](operations-ha.md#8-首次终态部署)一次 clean-slate 切换：离线验证
 exact release，维护窗口内退出旧组件并清空产品状态，轮换 credentials，再启动唯一的空 authority
-schema 15和冻结协议。生产`cats-noded`只启动signed Runtime composition；legacy注册、heartbeat、
+schema和冻结协议。生产`cats-noded`只启动signed atomic Runtime composition；legacy注册、heartbeat、
 work-status和work acquire/release不在生产route map，显式retired harness仅用于历史行为测试。
 
-生产composition及current-Desired Running路径的attach、conditional takeover、checkpoint、ext4 readiness与
-AdmissionCell已有typed recovery和故障回归；这不宣称superseded pre-acquire publication或完整lifecycle已经
-闭合。PG/Linux production-public-spawn测试已组成真实PostgreSQL、installed scanner、systemd PID 1与
-production `SignedRunningEffect`，终点为`ProvisionRootImage`/root-blockd、checkpoint、restart adoption与exact
-退役；它不执行S3数据面、device/TAP/VMM/Guest或稳定Running。精确证据边界见
+精确证据边界和可复现oracle见
 [当前跨组件证据边界](architecture-cross-review.md#当前跨组件证据边界)。任何具体部署仍必须以exact clean SHA
 通过Mac full、Linux full及适用的systemd/KVM资格测试；文档状态不是release准入。
 
@@ -51,7 +46,7 @@ production `SignedRunningEffect`，终点为`ProvisionRootImage`/root-blockd、c
 | [architecture.md](architecture.md) | Target + current boundary | 系统总图、authority matrix、HA合同和路线 |
 | [runtime-lifecycle.md](runtime-lifecycle.md) | Product contract | 四态、work/admission、数据屏障、Host loss |
 | [storage.md](storage.md) | Implemented core + explicit gaps | ChunkStore格式、FLUSH、L/R、lease/fencing、GC |
-| [operations-ha.md](operations-ha.md) | Target operations contract | failure domain、有界DB、Host fence、分层qualification |
+| [operations-ha.md](operations-ha.md) | Operations contract + current qualification boundary | failure domain、有界DB、Host fence、分层qualification |
 | [architecture-cross-review.md](architecture-cross-review.md) | Accepted review + current evidence boundary | 三边界交叉复核、阻断项关闭与可复现证据终点 |
 | [实验总报告](experiments-2026-07-21-storage-lifecycle.md) | Evidence | 2026-07-21方法、样本、结果和失败尝试 |
 
@@ -62,18 +57,18 @@ production `SignedRunningEffect`，终点为`ProvisionRootImage`/root-blockd、c
 | [blockd protocol](specs/blockd-protocol.md) | Implemented data plane + target Volume Authority | Chunk/Map/FLUSH已实现；pack v2/grant adoption未实现 |
 | [Guest Runtime API](specs/guest-runtime-api.md) | Frozen v1 | `/run/cats/runtime.sock`、work lease |
 | [Interactive Shell](specs/interactive-shell-protocol.md) | Implemented v1 | WorkOS鉴权 WebSocket PTY |
-| [Runtime Reconciliation v1](specs/runtime-reconciliation-v1.md) | Production spine + current-Desired Running path implemented | checkpoint/inventory/per-Cat effects及current-authority route/volume barriers；superseded publication、完整lifecycle和外部fence仍开放 |
+| [Atomic Runtime Lifecycle v1](specs/atomic-runtime-lifecycle-v1.md) | Implemented/Frozen internal v1 + product action projection；release gates open | schema 17、signed lane、journal/replay、Route/Volume interlock与六动作product adapter已组成；private Start/Stop/Delete/Killed不外泄，`run_required`与其他release gate见规格§11 |
+| [Runtime Reconciliation v1](specs/runtime-reconciliation-v1.md) | Superseded as lifecycle coordination | 已实现NodeIdentity/AgentSession/Host lock/full inventory foundation保留；Desired/reconcile/Observation settlement不进入atomic release |
 | [Agent Registration and Internal Transport v1](specs/agent-registration-transport-v1.md) | Implemented frozen v1 | per-Node签名、注册wire、lease与Guest receipt部署路径 |
-| [Runtime Inventory and Observation Spine v1](specs/runtime-inventory-observation-v1.md) | Implemented frozen v1 | Desired read-position、inventory/observation接受与freshness |
+| [Runtime Inventory and Telemetry v1](specs/runtime-inventory-observation-v1.md) | Implemented/Frozen v1 | Full/Partial session-bound acceptance与freshness；无Desired delivery或settlement |
 | [Runtime Composition Artifacts v1](specs/runtime-composition-artifacts-v1.md) | Implemented frozen v1 | local NodeIdentity artifact与单一Guest release payload |
 | [Runtime Placement Policy v1](specs/runtime-placement-policy-v1.md) | Implemented frozen v1 | provisioner-owned capacity/capability/CIDR、keyset planner与exact `/30` allocation |
 | [A23 Production Provisioner Tooling v1](specs/a23-production-provisioner-tooling-v1.md) | Implemented operations contract | revision-1 trust与Host initial NodeIdentity prepare/export/official-apply/activate |
 | [Immutable Image Manifest Read v1](specs/immutable-image-manifest-read-v1.md) | Implemented frozen v1 | golden manifest唯一DTO、canonical bytes、有界读取、Control只读组合与Cat-create v2 |
 | [Old Host Positive Stop Evidence v1](specs/old-host-positive-stop-v1.md) | Producer implemented；contract Proposed，未接受 | E13 systemd/process-tree正向停止与EC2 deny-all SG隔离候选receipt；非HostFence authority，production reset仍机械Blocked |
-| [Runtime Volume Transitions v1](specs/runtime-volume-transitions-v1.md) | Implemented frozen v1 | Node签名mutation、Control单事务卷转换与authorization evidence read |
-| [Route Grant v2](specs/route-grant-v2.md) | Core、machine tunnel、gatewayd proxy与production deployment wiring implemented | ADR-0041 AdmissionCell、Grant、public HTTP/WS byte proxy、closed artifact distribution、独立machine listeners与wildcard ingress；真实production mTLS E2E/rotation qualification仍单列 |
-| [Route v2 Signing Authority v1](specs/route-signing-authority-v1.md) | Frozen，schema 15 rotation core implemented | 独立signer/ring、closed初装工件、Node durable successor安装与PG轮换/ACK/retirement；production trigger authority尚未Accepted |
-| [Volume Authority](specs/volume-authority.md) | Current-Desired Running attachment/ext4 path implemented | superseded publication及ADR-0042 Snapshot/GC/Host-fence边界仍按明确qualification矩阵推进 |
+| [Route Grant v2](specs/route-grant-v2.md) | Implemented/Frozen v2 | signed per-Endpoint lane、Serving/Session/RuntimeReady interlock、mandatory Node listener/delivery、Grant/guard/tunnel/gatewayd与`run_required` fixed vector已组成；旧`wake_required`严格拒绝，production mTLS/rotation qualification单列 |
+| [Route v2 Signing Authority v1](specs/route-signing-authority-v1.md) | Frozen，rotation core已组入schema 17 | 独立signer/ring、closed初装工件、Node durable successor安装与PG轮换/ACK/retirement；production trigger authority尚未Accepted |
+| [Volume Authority](specs/volume-authority.md) | Implemented/Frozen atomic authority；release gates open | internal run-grant renewal、Cold/destroy mixed disposition、Cold-only membership与Persistent initialization vertical已组成；product E2E、Snapshot/GC/Host-fence按qualification矩阵验收 |
 
 协议状态必须明确写 `Implemented/Frozen` 或 `Target, not implemented`。不存在“文档写了就算
 代码存在”。
@@ -123,6 +118,8 @@ production `SignedRunningEffect`，终点为`ProvisionRootImage`/root-blockd、c
 - [0038 production cell qualification](decisions/0038-production-account-qualification-cell-boundary.md)
 - [0040 level-triggered runtime reconciliation](decisions/0040-level-triggered-runtime-reconciliation.md)
 - [0041 Node-verified route admission](decisions/0041-node-verified-route-admission.md)
+- [0056 atomic per-Cat runtime lifecycle](decisions/0056-atomic-per-cat-runtime-lifecycle.md)
+- [0057 产品动作与内部执行证据分层](decisions/0057-product-lifecycle-actions-and-internal-execution-evidence.md)
 - [0043 Provisioner-owned runtime placement policy](decisions/0043-provisioner-owned-runtime-placement-policy.md)
 - [0044 独立Route v2 signing authority](decisions/0044-independent-route-v2-signing-authority.md)
 - [0045 独立Gateway workload identity authority](decisions/0045-independent-gateway-workload-identity.md)

@@ -27,6 +27,8 @@ pub(super) enum RejectionKind {
     OciConnection,
     ObservationAdmission,
     ObservationQueue,
+    LifecycleAdmission,
+    LifecycleQueue,
 }
 
 static ADMISSION_REJECTIONS: AtomicU64 = AtomicU64::new(0);
@@ -38,6 +40,8 @@ static SINGLETON_CONNECTION_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 static OCI_CONNECTION_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 static OBSERVATION_ADMISSION_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 static OBSERVATION_QUEUE_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+static LIFECYCLE_ADMISSION_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+static LIFECYCLE_QUEUE_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 static LANE_ACQUIRE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 static POSTGRES_STATEMENT_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 static POSTGRES_IO_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
@@ -89,24 +93,10 @@ pub(super) fn record_rejection(kind: RejectionKind) {
         RejectionKind::OciConnection => &OCI_CONNECTION_REJECTIONS,
         RejectionKind::ObservationAdmission => &OBSERVATION_ADMISSION_REJECTIONS,
         RejectionKind::ObservationQueue => &OBSERVATION_QUEUE_REJECTIONS,
+        RejectionKind::LifecycleAdmission => &LIFECYCLE_ADMISSION_REJECTIONS,
+        RejectionKind::LifecycleQueue => &LIFECYCLE_QUEUE_REJECTIONS,
     };
     counter.fetch_add(1, Ordering::Relaxed);
-}
-
-#[cfg(test)]
-pub(super) fn rejection_count(kind: RejectionKind) -> u64 {
-    let counter = match kind {
-        RejectionKind::Admission => &ADMISSION_REJECTIONS,
-        RejectionKind::NormalQueue => &NORMAL_QUEUE_REJECTIONS,
-        RejectionKind::LeadershipQueue => &LEADERSHIP_QUEUE_REJECTIONS,
-        RejectionKind::NormalCleanup => &NORMAL_CLEANUP_REJECTIONS,
-        RejectionKind::LeadershipCleanup => &LEADERSHIP_CLEANUP_REJECTIONS,
-        RejectionKind::SingletonConnection => &SINGLETON_CONNECTION_REJECTIONS,
-        RejectionKind::OciConnection => &OCI_CONNECTION_REJECTIONS,
-        RejectionKind::ObservationAdmission => &OBSERVATION_ADMISSION_REJECTIONS,
-        RejectionKind::ObservationQueue => &OBSERVATION_QUEUE_REJECTIONS,
-    };
-    counter.load(Ordering::Relaxed)
 }
 
 pub(super) fn record_lane_acquire_timeout() {
@@ -194,6 +184,8 @@ pub(crate) struct StoreMetricsSnapshot {
     pub oci_connection_rejections: u64,
     pub observation_admission_rejections: u64,
     pub observation_queue_rejections: u64,
+    pub lifecycle_admission_rejections: u64,
+    pub lifecycle_queue_rejections: u64,
     pub lane_acquire_timeouts: u64,
     pub postgres_statement_timeouts: u64,
     pub postgres_io_timeouts: u64,
@@ -252,6 +244,8 @@ pub(crate) fn snapshot(store: &Store) -> StoreMetricsSnapshot {
         oci_connection_rejections: OCI_CONNECTION_REJECTIONS.load(Ordering::Relaxed),
         observation_admission_rejections: OBSERVATION_ADMISSION_REJECTIONS.load(Ordering::Relaxed),
         observation_queue_rejections: OBSERVATION_QUEUE_REJECTIONS.load(Ordering::Relaxed),
+        lifecycle_admission_rejections: LIFECYCLE_ADMISSION_REJECTIONS.load(Ordering::Relaxed),
+        lifecycle_queue_rejections: LIFECYCLE_QUEUE_REJECTIONS.load(Ordering::Relaxed),
         lane_acquire_timeouts: LANE_ACQUIRE_TIMEOUTS.load(Ordering::Relaxed),
         postgres_statement_timeouts: POSTGRES_STATEMENT_TIMEOUTS.load(Ordering::Relaxed),
         postgres_io_timeouts: POSTGRES_IO_TIMEOUTS.load(Ordering::Relaxed),
@@ -336,6 +330,8 @@ impl StoreMetricsSnapshot {
                 self.observation_admission_rejections,
             ),
             ("observation_queue", self.observation_queue_rejections),
+            ("lifecycle_admission", self.lifecycle_admission_rejections),
+            ("lifecycle_queue", self.lifecycle_queue_rejections),
         ] {
             let _ = writeln!(
                 body,

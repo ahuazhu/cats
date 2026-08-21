@@ -393,7 +393,7 @@ mod tests {
             reads: AtomicUsize::new(0),
         });
         let release = crate::testsupport::test_guest_runtime_profile_receipt();
-        let handle = crate::server::spawn(crate::server::Config {
+        let handle = crate::testsupport::spawn_control_plane_for_test(crate::server::Config {
             listen: "127.0.0.1:0".into(),
             control_store_dsn: crate::store::DsnSource::Literal(
                 crate::testsupport::isolated_control_store_url(),
@@ -401,8 +401,6 @@ mod tests {
             control_store_ca_file: None,
             usage_store: usage.clone(),
             credit_store: usage,
-            #[cfg(debug_assertions)]
-            retired_storage_meta_for_tests: None,
             image_blob: image_blob.clone(),
             guest_runtime_profile_receipt: release.clone(),
             runtime_provisioner_trust_bundle:
@@ -410,14 +408,10 @@ mod tests {
             production_cutover_operator_trust_bundle:
                 crate::testsupport::test_production_cutover_operator_trust_bundle(),
             auth_token: "service-token".into(),
-            route_grant_signer: crate::testsupport::route_grant_signer(),
             admin_token: "admin-token".into(),
             workos: None,
             stripe: None,
             billing_enforcement_enabled: false,
-            node_lease_timeout_ms: 30_000,
-            reconcile_interval_ms: 60_000,
-            auto_tier_policy: Default::default(),
             oci_deploy_sync_wait_ms: 5_000,
         })
         .await
@@ -519,8 +513,8 @@ mod tests {
 
         // Placement unavailability stores no result. The exact same key must
         // therefore plan a fresh whole candidate batch after admission exists.
-        let admission = tokio::task::block_in_place(|| {
-            crate::store::runtime_authority::runtime_spine_tests::establish_empty_admission(
+        let target = tokio::task::block_in_place(|| {
+            crate::store::runtime_authority::cat_create_service_tests::establish_empty_target(
                 handle.state.store.as_ref(),
                 &release,
             )
@@ -529,7 +523,8 @@ mod tests {
             crate::store::runtime_authority::placement_policy::insert_policy_on_store_for_test(
                 handle.state.store.as_ref(),
                 &crate::store::runtime_authority::cat_create_service_tests::placement_policy(
-                    &admission,
+                    &target.node_identity.node_id,
+                    &target.agent_session.guest_config_digest,
                 ),
             )
             .unwrap();

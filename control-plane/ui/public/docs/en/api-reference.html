@@ -1,11 +1,16 @@
 <h2 id="conventions">Conventions</h2>
 <p>The external API is JSON over HTTP. Product resources are scoped by the immutable Workspace ID in <code>/v1/workspaces/{workspace_id}/…</code>; mutable slugs are not resource keys. Browser requests use the HttpOnly WorkOS session. CLI and automation requests use the corresponding WorkOS or Workspace credential.</p>
-<p>The two create collections require exact <code>Content-Type: application/json</code>, exactly one printable <code>Idempotency-Key</code>, a canonical Workspace path with no query, and the closed request body shown below. A retry after an ambiguous response must replay the same path, body, and key.</p>
+<p>The two create collections require exact <code>Content-Type: application/json</code>, exactly one printable <code>Idempotency-Key</code>, a canonical Workspace path with no query, and the closed request body shown below. Lifecycle actions instead require an empty body and no <code>Content-Type</code>. A retry after an ambiguous response must replay the same path, body, and key.</p>
 
 <h2 id="cats">Current Cat surface</h2>
 <pre><code>POST /v1/workspaces/{workspace_id}/cats
 GET  /v1/workspaces/{workspace_id}/cats
-GET  /v1/workspaces/{workspace_id}/cats/{cat_id}</code></pre>
+GET  /v1/workspaces/{workspace_id}/cats/{cat_id}
+POST /v1/workspaces/{workspace_id}/cats/{cat_id}/actions/run
+POST /v1/workspaces/{workspace_id}/cats/{cat_id}/actions/suspend
+POST /v1/workspaces/{workspace_id}/cats/{cat_id}/actions/warm
+POST /v1/workspaces/{workspace_id}/cats/{cat_id}/actions/cold
+POST /v1/workspaces/{workspace_id}/cats/{cat_id}/actions/destroy</code></pre>
 <pre><code>{
   "name": "dev",
   "boot_image_digest": "sha256:&lt;64-lowercase-hex&gt;",
@@ -14,23 +19,25 @@ GET  /v1/workspaces/{workspace_id}/cats/{cat_id}</code></pre>
   "root_size_bytes": 1073741824,
   "durability": "strict"
 }</code></pre>
-<p>Create returns exact <code>202 application/json</code> with <code>{"cat_id":"…","operation_id":"…"}</code>. Collection reads accept only bounded <code>limit</code> and opaque <code>cursor</code> fields. Item reads accept immutable <code>cat_…</code> IDs only.</p>
-<p>Lifecycle, exec, deployment, Endpoint, expiry, work-policy, and delete routes are not part of the release router during the signed runtime cutover. Clients must fail locally instead of probing those paths.</p>
+<p>Create returns exact <code>202 application/json</code> with <code>{"cat_id":"…","operation_id":"…"}</code>. Collection reads accept only bounded <code>limit</code> and opaque <code>cursor</code> fields. Item reads and lifecycle actions accept immutable <code>cat_…</code> IDs only.</p>
+<p>Each lifecycle action takes exactly one <code>Idempotency-Key</code>, an empty body, and no <code>Content-Type</code>; success is exact <code>202 application/json</code> with <code>{"operation_id":"op_…"}</code>. An ambiguous response remains pending and must be replayed byte-for-byte. The retired <code>start</code>, <code>stop</code>, <code>delete</code>, and <code>resume</code> routes are not aliases. Exec, deployment, Endpoint, expiry, and work-policy mutations remain outside this release router.</p>
 
 <h2 id="disks">Current PersistentDisk surface</h2>
 <pre><code>POST /v1/workspaces/{workspace_id}/disks
 GET  /v1/workspaces/{workspace_id}/disks
-GET  /v1/workspaces/{workspace_id}/disks/{disk_id}</code></pre>
+GET  /v1/workspaces/{workspace_id}/disks/{disk_id}
+POST /v1/workspaces/{workspace_id}/disks/{disk_id}/actions/attach
+POST /v1/workspaces/{workspace_id}/disks/{disk_id}/actions/detach</code></pre>
 <pre><code>{
   "durability": "strict",
   "name": "project-data",
   "size_bytes": 21474836480
 }</code></pre>
-<p>Create returns the exact created Disk projection with <code>201 application/json</code>. Capacity and durability are immutable in this release. Item reads require immutable <code>disk_…</code> IDs. Attachment, snapshot, capacity-change, and delete mutations are unavailable.</p>
+<p>Create returns the exact created Disk projection with <code>201 application/json</code>. Capacity and durability are immutable in this release. Item reads require immutable <code>disk_…</code> IDs. Attach and detach are synchronous, idempotent product transactions for a terminal Cold Cat; both use the closed body <code>{"cat_id":"cat_…","mount_path":"/absolute/guest/path"}</code>. Snapshot, capacity-change, and Disk delete mutations are unavailable.</p>
 
 <h2 id="operations">Operations</h2>
 <pre><code>GET /v1/workspaces/{workspace_id}/operations/{operation_id}</code></pre>
-<p>Only exact Operation lookup is exposed. Authorization precedes lookup, and another Workspace's opaque ID is indistinguishable from an absent ID. No Operation collection or global Operation URL is available.</p>
+<p>Cat create and every lifecycle action return an Operation ID. Only exact Operation lookup is exposed. Its product projection contains only <code>create</code>, <code>run</code>, <code>suspend</code>, <code>warm</code>, <code>cold</code>, or <code>destroy</code> and <code>in_progress</code>, <code>succeeded</code>, or <code>failed</code>; Node execution commands and evidence are not returned. Authorization precedes lookup, and another Workspace's opaque ID is indistinguishable from an absent ID. No Operation collection or global Operation URL is available.</p>
 
 <h2 id="errors">Errors</h2>
 <p>Errors use a stable JSON <code>code</code> plus a human-readable <code>message</code>. Clients should branch on the code. A missing route is not permission to fall back to a legacy body or mutation path.</p>

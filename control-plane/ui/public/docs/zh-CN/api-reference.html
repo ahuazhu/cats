@@ -1,11 +1,16 @@
 <h2 id="conventions">约定</h2>
 <p>外部 API 使用 HTTP JSON。产品资源由 <code>/v1/workspaces/{workspace_id}/…</code> 中不可变的 Workspace ID 隔离；可变 slug 不是资源键。浏览器请求使用 HttpOnly WorkOS Session，CLI 与自动化请求使用对应的 WorkOS 或 Workspace Credential。</p>
-<p>两个 Create Collection 都要求精确的 <code>Content-Type: application/json</code>、且仅出现一次的可打印 <code>Idempotency-Key</code>、无 Query 的 canonical Workspace Path，以及下方 closed request body。响应不明确时只能重放完全相同的 Path、Body 与 Key。</p>
+<p>两个 Create Collection 都要求精确的 <code>Content-Type: application/json</code>、且仅出现一次的可打印 <code>Idempotency-Key</code>、无 Query 的 canonical Workspace Path，以及下方 closed request body。Lifecycle Action 则要求空 Body 且不能发送 <code>Content-Type</code>。响应不明确时只能重放完全相同的 Path、Body 与 Key。</p>
 
 <h2 id="cats">当前 Cat Surface</h2>
 <pre><code>POST /v1/workspaces/{workspace_id}/cats
 GET  /v1/workspaces/{workspace_id}/cats
-GET  /v1/workspaces/{workspace_id}/cats/{cat_id}</code></pre>
+GET  /v1/workspaces/{workspace_id}/cats/{cat_id}
+POST /v1/workspaces/{workspace_id}/cats/{cat_id}/actions/run
+POST /v1/workspaces/{workspace_id}/cats/{cat_id}/actions/suspend
+POST /v1/workspaces/{workspace_id}/cats/{cat_id}/actions/warm
+POST /v1/workspaces/{workspace_id}/cats/{cat_id}/actions/cold
+POST /v1/workspaces/{workspace_id}/cats/{cat_id}/actions/destroy</code></pre>
 <pre><code>{
   "name": "dev",
   "boot_image_digest": "sha256:&lt;64-lowercase-hex&gt;",
@@ -14,23 +19,25 @@ GET  /v1/workspaces/{workspace_id}/cats/{cat_id}</code></pre>
   "root_size_bytes": 1073741824,
   "durability": "strict"
 }</code></pre>
-<p>Create 精确返回 <code>202 application/json</code> 和 <code>{"cat_id":"…","operation_id":"…"}</code>。Collection Read 只接受有界 <code>limit</code> 与 opaque <code>cursor</code>；Item Read 只接受不可变 <code>cat_…</code> ID。</p>
-<p>Signed Runtime Cutover 期间，Lifecycle、Exec、Deployment、Endpoint、Expiry、Work Policy 与 Delete Route 不属于 release router。客户端必须在本地失败，不能探测这些路径。</p>
+<p>Create 精确返回 <code>202 application/json</code> 和 <code>{"cat_id":"…","operation_id":"…"}</code>。Collection Read 只接受有界 <code>limit</code> 与 opaque <code>cursor</code>；Item Read 和 Lifecycle Action 只接受不可变 <code>cat_…</code> ID。</p>
+<p>每个 Lifecycle Action 都要求且只要求一个 <code>Idempotency-Key</code>、空 Body，并且不能发送 <code>Content-Type</code>；成功时精确返回 <code>202 application/json</code> 和 <code>{"operation_id":"op_…"}</code>。不明确响应保持 Pending，必须逐字节重放；已退役的 <code>start</code>、<code>stop</code>、<code>delete</code> 与 <code>resume</code> Route 不是兼容别名。Exec、Deployment、Endpoint、Expiry 与 Work Policy Mutation 仍不属于本 release router。</p>
 
 <h2 id="disks">当前 PersistentDisk Surface</h2>
 <pre><code>POST /v1/workspaces/{workspace_id}/disks
 GET  /v1/workspaces/{workspace_id}/disks
-GET  /v1/workspaces/{workspace_id}/disks/{disk_id}</code></pre>
+GET  /v1/workspaces/{workspace_id}/disks/{disk_id}
+POST /v1/workspaces/{workspace_id}/disks/{disk_id}/actions/attach
+POST /v1/workspaces/{workspace_id}/disks/{disk_id}/actions/detach</code></pre>
 <pre><code>{
   "durability": "strict",
   "name": "project-data",
   "size_bytes": 21474836480
 }</code></pre>
-<p>Create 以精确的 <code>201 application/json</code> 返回已创建 Disk Projection。这个 release 中容量和 Durability 不可变；Item Read 要求不可变 <code>disk_…</code> ID。Attachment、Snapshot、容量变更与 Delete Mutation 均不可用。</p>
+<p>Create 以精确的 <code>201 application/json</code> 返回已创建 Disk Projection。这个 release 中容量和 Durability 不可变；Item Read 要求不可变 <code>disk_…</code> ID。Attach/Detach 是只用于终态 Cold Cat 的同步、幂等产品事务，两者都使用 closed body <code>{"cat_id":"cat_…","mount_path":"/absolute/guest/path"}</code>。Snapshot、容量变更与 Disk Delete Mutation 均不可用。</p>
 
 <h2 id="operations">Operation</h2>
 <pre><code>GET /v1/workspaces/{workspace_id}/operations/{operation_id}</code></pre>
-<p>只提供精确 Operation Lookup。鉴权先于查找，其他 Workspace 的 opaque ID 与不存在的 ID 表现相同。没有 Operation Collection，也没有全局 Operation URL。</p>
+<p>Cat Create 和每个 Lifecycle Action 都返回 Operation ID。只提供精确 Operation Lookup；产品投影只包含 <code>create</code>、<code>run</code>、<code>suspend</code>、<code>warm</code>、<code>cold</code>、<code>destroy</code>，以及 <code>in_progress</code>、<code>succeeded</code>、<code>failed</code>，不会返回 Node 执行命令或证据。鉴权先于查找，其他 Workspace 的 opaque ID 与不存在的 ID 表现相同。没有 Operation Collection，也没有全局 Operation URL。</p>
 
 <h2 id="errors">Error</h2>
 <p>Error 使用稳定 JSON <code>code</code> 与便于阅读的 <code>message</code>。客户端应按 code 分支。Route 不存在不代表可以退回 Legacy Body 或 Mutation Path。</p>

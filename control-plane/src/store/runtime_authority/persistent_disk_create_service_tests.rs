@@ -1,11 +1,12 @@
 //! PostgreSQL acceptance for synchronous PersistentDisk create.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Instant;
 
 use cats_api::error::ErrorCode;
-use cats_api::resources::Disk;
+use cats_api::persistent_disk::Disk;
 use cats_api::runtime_reconciliation::{FenceEpoch, Generation, Id, RandomId128, UnixMillis};
 use cats_storage::authority::{RemoteHead, VolumeAdminState, VolumeDurability, VolumeRecord};
 
@@ -21,6 +22,29 @@ use crate::store::{Result, Store};
 
 fn id(value: impl Into<String>) -> Id {
     Id::new(value).unwrap()
+}
+
+fn bootstrap_workspace(store: &Store, slug: &str) -> Id {
+    store
+        .ensure_configured_accounts(&BTreeMap::from([(slug.to_owned(), format!("org_{slug}"))]))
+        .unwrap();
+    let workspace: String = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT w.id FROM workspaces w JOIN accounts a ON a.id=w.account_id
+                      WHERE a.slug=$1 AND w.is_default",
+                    &[&slug],
+                )
+                .map(|row| row.get(0))
+        })
+        .unwrap();
+    id(workspace)
+}
+
+fn with_application_name(url: &str, application_name: &str) -> String {
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}application_name={application_name}")
 }
 
 fn fields(key: &str) -> PersistentDiskCreateHttpFields {
@@ -106,7 +130,7 @@ fn fixture(
 ) {
     let url = crate::testsupport::isolated_control_store_url();
     let store = Arc::new(Store::connect(&url, None).unwrap());
-    let workspace = super::product_tests::bootstrap_workspace(&store, slug);
+    let workspace = bootstrap_workspace(&store, slug);
     crate::testsupport::begin_production_qualification_for_product_test(&store, &workspace);
     let identities = Arc::new(SequentialIdentities::default());
     let service = PersistentDiskCreateService::new(
@@ -363,7 +387,7 @@ fn create_replay_name_conflict_and_response_loss_preserve_one_atomic_resource() 
         .unwrap();
     assert_eq!(occupied_replay, occupied);
 
-    let (volume, disk, result, operations, legacy_disks): (i64, i64, i64, i64, i64) = store
+    let (volume, disk, result, operations): (i64, i64, i64, i64) = store
         .with(|client| {
             client
                 .query_one(
@@ -371,17 +395,13 @@ fn create_replay_name_conflict_and_response_loss_preserve_one_atomic_resource() 
                         (SELECT count(*) FROM volume_records),
                         (SELECT count(*) FROM disk_records),
                         (SELECT count(*) FROM api_idempotency_results),
-                        (SELECT count(*) FROM runtime_operations),
-                        (SELECT count(*) FROM disks)",
+                        (SELECT count(*) FROM runtime_operations)",
                     &[],
                 )
-                .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)))
+                .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
         })
         .unwrap();
-    assert_eq!(
-        (volume, disk, result, operations, legacy_disks),
-        (1, 1, 2, 0, 0)
-    );
+    assert_eq!((volume, disk, result, operations), (1, 1, 2, 0));
     let (volume_json, disk_json): (String, String) = store
         .with(|client| {
             client
@@ -435,7 +455,7 @@ fn create_replay_name_conflict_and_response_loss_preserve_one_atomic_resource() 
 fn committed_owner_survives_handler_abort_and_shutdown_waits_for_resolution() {
     let url = crate::testsupport::isolated_control_store_url();
     let store = Arc::new(Store::connect(&url, None).unwrap());
-    let workspace = super::product_tests::bootstrap_workspace(&store, "disk-owner-abort");
+    let workspace = bootstrap_workspace(&store, "disk-owner-abort");
     crate::testsupport::begin_production_qualification_for_product_test(&store, &workspace);
     let service = Arc::new(PersistentDiskCreateService::new(
         Arc::clone(&store),
@@ -511,7 +531,7 @@ fn committed_owner_survives_handler_abort_and_shutdown_waits_for_resolution() {
 fn shutdown_between_request_admission_and_owner_registration_rejects_without_writes() {
     let url = crate::testsupport::isolated_control_store_url();
     let store = Arc::new(Store::connect(&url, None).unwrap());
-    let workspace = super::product_tests::bootstrap_workspace(&store, "disk-owner-close-race");
+    let workspace = bootstrap_workspace(&store, "disk-owner-close-race");
     crate::testsupport::begin_production_qualification_for_product_test(&store, &workspace);
     let identities = Arc::new(PausingIdentities::new());
     let service = Arc::new(PersistentDiskCreateService::new(
@@ -558,43 +578,19 @@ fn cat_root_and_persistent_disk_name_race_has_only_closed_typed_outcomes() {
     let url = crate::testsupport::isolated_control_store_url();
     const CAT_APPLICATION: &str = "cats-cat-disk-name-race";
     const PERSISTENT_APPLICATION: &str = "cats-persistent-disk-name-race";
+    let cat_url = with_application_name(&url, CAT_APPLICATION);
+    let (runtime, _cat_store, workspace, cat_service) =
+        super::cat_create_service_tests::disk_name_race_fixture_at(&cat_url, "disk-root-name-race");
     let persistent_store = Arc::new(
-        Store::connect(
-            &super::product_tests::with_application_name(&url, PERSISTENT_APPLICATION),
-            None,
-        )
-        .unwrap(),
+        Store::connect(&with_application_name(&url, PERSISTENT_APPLICATION), None).unwrap(),
     );
-    let cat_store = Store::connect(
-        &super::product_tests::with_application_name(&url, CAT_APPLICATION),
-        None,
-    )
-    .unwrap();
     let observer = Store::connect(&url, None).unwrap();
-    let workspace =
-        super::product_tests::bootstrap_workspace(&persistent_store, "disk-root-name-race");
-    crate::testsupport::begin_production_qualification_for_product_test(
-        &persistent_store,
-        &workspace,
-    );
-    let cat_request = super::product_tests::request(&workspace, "app", 42, "cat-create");
-    let root_disk_name = cat_request.candidate.root_disk.name.clone();
-    let network_id = cat_request
-        .candidate
-        .desired
-        .runtime
-        .network_config
-        .network_id
-        .clone();
+    let root_disk_name = id("disk_00000000000000000000000000000003");
+    let cat_id = id("cat_00000000000000000000000000000001");
     let service = Arc::new(PersistentDiskCreateService::new(
         Arc::clone(&persistent_store),
         Arc::new(SequentialIdentities::starting_after(1_000)),
     ));
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
 
     // Hold a lock that Cat create acquires strictly after DiskNameLock. Seeing
     // the Cat wait here proves it already owns the shared Root/Persistent name
@@ -609,15 +605,16 @@ fn cat_root_and_persistent_disk_name_race_has_only_closed_typed_outcomes() {
     blocker_transaction
         .query_one(
             "SELECT pg_advisory_xact_lock(hashtextextended(
-                current_schema() || ':runtime-authority:network:' || $1,
+                current_schema() || ':atomic-cat-create:cat-id:' || $1 || ':candidate',
                 0::BIGINT
              ))",
-            &[&network_id.as_str()],
+            &[&cat_id.as_str()],
         )
         .unwrap();
 
-    let cat = std::thread::spawn(move || {
-        cat_store.create_cat_covered_without_admission_for_product_test(&cat_request)
+    let cat = runtime.spawn({
+        let request = super::cat_create_service_tests::ingress(&workspace, "app", "cat-create");
+        async move { cat_service.create(request).await }
     });
     let cat_pid = wait_for_backend_blocked_by(&observer, CAT_APPLICATION, blocker_pid);
 
@@ -637,11 +634,11 @@ fn cat_root_and_persistent_disk_name_race_has_only_closed_typed_outcomes() {
     });
     blocker_transaction.commit().unwrap();
 
-    let cat = cat.join().unwrap();
+    let cat = runtime.block_on(cat).unwrap();
     let persistent = runtime.block_on(persistent).unwrap().unwrap();
     assert!(
         cat_pid.is_some(),
-        "Cat never reached its later Network lock"
+        "Cat never reached its later candidate-ID lock"
     );
     assert!(
         persistent_waited_on_cat.is_some(),
@@ -731,7 +728,7 @@ fn concurrent_name_claims_across_store_replicas_publish_one_resource_and_two_res
     let url = crate::testsupport::isolated_control_store_url();
     let first_store = Arc::new(Store::connect(&url, None).unwrap());
     let second_store = Arc::new(Store::connect(&url, None).unwrap());
-    let workspace = super::product_tests::bootstrap_workspace(&first_store, "disk-name-race");
+    let workspace = bootstrap_workspace(&first_store, "disk-name-race");
     crate::testsupport::begin_production_qualification_for_product_test(&first_store, &workspace);
     let first = Arc::new(PersistentDiskCreateService::new(
         Arc::clone(&first_store),

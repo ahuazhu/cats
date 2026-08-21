@@ -1,9 +1,15 @@
 # ADR-0041：短期签名 Route Grant + Node 本地 admission gate
 
-- 状态：Accepted
+- 状态：Accepted；lifecycle interlock 与 drain-timeout 语义已由
+  [ADR-0056](0056-atomic-per-cat-runtime-lifecycle.md) 部分取代
 - 日期：2026-08-08
 - 依赖：[ADR-0040](0040-level-triggered-runtime-reconciliation.md)
 - 规格：[Route Grant v2](../specs/route-grant-v2.md)
+
+> 短期 Grant、per-Endpoint route epoch、Node-local gate/guard、machine transport 与 key rotation
+> 继续有效。ADR-0056 取代 Endpoint/Serving 对 Desired revision/Running observation 的依赖，并取代
+> “CancelAndDrain timeout 必须保留 runtime/writer”：atomic Stop 的 grace deadline 后可以强停；
+> `RequireIdle` Busy 仍只有在 AdmissionCell 从未关闭时保持非破坏性。
 
 ## 背景
 

@@ -13,6 +13,16 @@ Suspended and Warm cannot be merged. Both protect Host-local state; Cold starts 
 
 ## Current release boundary
 
-The signed runtime cutover exposes Cat create and read projections, but no user lifecycle mutation. The per-Cat reconciler is the sole physical-effect executor and `DesiredRuntimeSpec` is the sole lifecycle intent. A browser or CLI cannot invent a transition, steal an attachment, or infer Cold from missing local evidence.
+The signed runtime cutover exposes six exact, idempotent product actions:
+Create, Run, Suspend, Warm, Cold, and Destroy. PostgreSQL admits at most one unresolved
+operation for a Cat; the assigned Node's signed command runner is the sole
+physical-effect executor and returns the exact terminal result. Inventory is
+observation-only and cannot settle an operation. A browser or CLI cannot invent
+a transition, steal an attachment, or infer Cold from missing local evidence.
 
-Missing or corrupt checkpoint/inventory evidence blocks or quarantines reconciliation. An unplanned cross-Node recovery additionally requires trusted Host-fence and exact Volume takeover authority.
+There is no product Stop action or Killed state. The Node may produce private
+execution-stopped evidence while implementing an action, but it is never returned as
+a product Operation or stable state. Cold requires every retained volume to be remotely durable and released. Missing or
+corrupt command journal or inventory evidence blocks or quarantines execution.
+An unplanned cross-Node recovery additionally requires trusted Host-fence and
+exact Volume takeover authority.

@@ -1,24 +1,37 @@
 # Runtime Reconciliation v1
 
-- 状态：production spine与current-Desired Running/route/Persistent路径已实现；superseded pre-acquire publication、完整lifecycle与外部fence仍按显式边界推进
-- Authority：[ADR-0040](../decisions/0040-level-triggered-runtime-reconciliation.md)
+- 状态：Superseded as lifecycle coordination protocol by
+  [Atomic Runtime Lifecycle v1](atomic-runtime-lifecycle-v1.md)；已实现的
+  NodeIdentity/AgentSession/Host lock/complete inventory/attestation内容保留为共享foundation
+- 历史 Authority：[ADR-0040](../decisions/0040-level-triggered-runtime-reconciliation.md)
+- 当前 lifecycle Authority：[ADR-0056](../decisions/0056-atomic-per-cat-runtime-lifecycle.md)
 - 生命周期：[runtime-lifecycle.md](../runtime-lifecycle.md)
-- Internal delivery/acceptance：[Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)
-- Volume transition transport：[Runtime Volume Transitions v1](runtime-volume-transitions-v1.md)
+- 保留的inventory foundation：[Runtime Inventory and Telemetry v1](runtime-inventory-observation-v1.md)
+- Current Volume transition transport：[Atomic Runtime Lifecycle v1](atomic-runtime-lifecycle-v1.md)；
+  pre-cutover Runtime Volume Transitions spec与wire已删除
 
-本文只定义 Control Plane 与 Node Agent 之间最小、可测试的共享domain收敛合同，
+> **Superseded scope:** 本文的 `DesiredRuntimeSpec` lifecycle planner、revision supersede、per-Cat
+> level-triggered effect loop、旧 RuntimeCheckpoint step wire、NodeObservation lifecycle postcondition 与
+> observation-settled Operation 不再是目标协议，也不得在 atomic release 中作为兼容路径或第二 authority。
+> 本文保留其已实现的 NodeIdentity、AgentSession、Host-global lock、complete physical inventory/
+> AdmissionInventoryAttestation、共享scalar/canonical JSON与physical identity分类，供新协议组合引用；不对旧
+> 规格做历史性重写。新命令、journal、result与settlement以
+> [Atomic Runtime Lifecycle v1](atomic-runtime-lifecycle-v1.md) 为唯一目标合同。
+
+本文原先定义 Control Plane 与 Node Agent 之间最小、可测试的共享domain收敛合同，
 不另行定义transport。Agent注册、internal HTTP前缀、全部runtime internal请求共用的
 per-Node request proof、registration public error、session lease和Guest runtime receipt部署路径由
 [Agent Registration and Internal Transport v1](agent-registration-transport-v1.md)冻结。Desired read-position、
 observation acceptance的两条唯一HTTP route、endpoint-local error、原子事务和freshness由
-[Runtime Inventory and Observation Spine v1](runtime-inventory-observation-v1.md)冻结。其他transport不得重新
+[Runtime Inventory and Telemetry v1](runtime-inventory-observation-v1.md)冻结。其他transport不得重新
 解释本文件的共享类型、建立第二个identity/session authority，或把通知必达、连接不断、
 消息只到达一次当作正确性前提。
 
-Node把已经fsync进checkpoint的normal/takeover acquire、exact release与disposable Root authorization
-consume交给Control、或读取authorization response-loss evidence时，只使用
-[Runtime Volume Transitions v1](runtime-volume-transitions-v1.md)冻结的两条signed route；它们不扩展本文件的
-共享类型，不建立effect job/重复receipt，也不把blockd提升为ownership mutation或authorization-read owner。
+本文原设计让Node把checkpoint中的normal/takeover acquire、exact release与disposable Root authorization
+consume交给pre-cutover Runtime Volume Transitions的mutation/evidence routes；这些route、DTO、codec、constant
+与parser现已删除。current atomic release只使用[Atomic Runtime Lifecycle v1](atomic-runtime-lifecycle-v1.md)
+冻结的command-scoped signed mutation与immutable receipt replay，不把blockd提升为ownership mutation或
+authorization-read owner。
 
 文中的 MUST/MUST NOT 是上线条件。
 
@@ -246,31 +259,28 @@ receipt。receipt是部署artifact，不是DB row、catalog、协商列表或第
 唯一release member、installed path、systemd config与fail-closed启动规则见
 [Agent Registration Transport §8](agent-registration-transport-v1.md#8-guestruntimeprofilereceipt-release-path)。
 
-一次成功的全量inventory还为当前session建立独立的签发证明：
+Atomic release中，一次成功的Full inventory为current session建立独立的telemetry attestation：
 
 ```text
-AdmissionInventoryAttestation {
+RuntimeInventoryAttestation {
   version: 1,
-  node_id: Id,
-  agent_session_epoch: Epoch,
+  session: SessionBinding,
   inventory_epoch: Epoch,
+  scan_id: RandomId128,
   inventory_digest: Sha256Digest,
-  inventory_read_position: Sequence,
+  source_report_id: RandomId128,
+  source_sequence: Sequence,
   accepted_at_unix_ms: UnixMillis
 }
 ```
 
 `inventory_epoch`在同一session内从1单调递增，first/next的精确边界见
-[Inventory Spine §5.1](runtime-inventory-observation-v1.md#51-inventory-epoch)。`inventory_read_position`是该
-bounded scan开始时Control Plane完整assigned-spec读取返回的不可复用服务端位置；签发scope、session
-replacement、expiry、replay和bounded GC以
-[Inventory Spine §3](runtime-inventory-observation-v1.md#3-desired-read-position)为准。full scan必须在
-接受事务中重读current assigned set并与该位置保存的完整snapshot逐字段相同后才能提交，不能用Node本地
-时间或目录游标代替。`accepted_at_unix_ms`由PostgreSQL写入。后续
-partial observation只引用该epoch并upsert具体Cat，不能覆盖这条attestation。Route signer同时检查fresh
-attestation与fresh per-Cat observation；精确不等式和窗口见
-[Inventory Spine §7](runtime-inventory-observation-v1.md#7-planner--signer-的同-snapshot读取)，不要求每次
-observation重新做全量scan。
+[Runtime Inventory §4.1](runtime-inventory-observation-v1.md#41-full)。digest绑定exact session、report、scan
+identity和完整sorted physical facts，不再绑定Desired cursor或assigned snapshot；签发事务也不读取或结算
+lifecycle Operation。`accepted_at_unix_ms`由PostgreSQL写入。后续Partial只引用该epoch并upsert Full成员的
+具体Cat，不能覆盖、刷新或扩张attestation。消费方必须在同一DB snapshot重验current SessionBinding、DB-now
+freshness和自己的domain authority；完整边界见
+[Runtime Inventory §7–§8](runtime-inventory-observation-v1.md#7-acceptance-wire)。
 
 注册步骤如下：
 
@@ -422,8 +432,8 @@ FilesystemInitialization =
 [Volume Authority](volume-authority.md) 定义；它是 Runtime acquire/takeover 的硬依赖，Host
 事件本身不授予卷写权限。HostFenceEvent来源的首次消费必须在同一PostgreSQL事务锁event、
 authorization和VolumeRecord，完成卷CAS并写不可变`AuthorizationConsumedReceipt`。
-Node到Control的exact request、current session/inventory/Desired binding、HTTP ambiguity和该事务的完整锁序
-由[Runtime Volume Transitions v1](runtime-volume-transitions-v1.md)冻结。
+本文的Node到Control exact request、Desired binding与evidence-read wire均已退役；current HTTP ambiguity与
+事务锁序由[Atomic Runtime Lifecycle v1](atomic-runtime-lifecycle-v1.md)的command scope冻结。
 
 `target != "deleted"`时所有volume的disposition必须是`retain`。Deleted Desired为每卷显式声明
 `detach_retained`或`delete_disposable_root`。后一种只允许
@@ -651,9 +661,11 @@ Operation`。name lock是transaction-scoped advisory coordination，不是持久
 ## 4. Desired delivery 与 AdmissionCell
 
 Control Plane 必须支持 Node 周期性拉取其全部 assigned specs。push/notify 只能提前触发拉取。
-唯一wire是[Inventory Spine §1](runtime-inventory-observation-v1.md#1-常量与共享-wire)的
+本节的 pre-cutover 唯一wire是
 `DesiredReadRequest -> DesiredReadSnapshot`；封闭snapshot类型本身表示完整集合，不另造boolean proof。
-一次缺项不能触发 orphan 删除。
+一次缺项不能触发 orphan 删除。该wire已随Desired协调协议退役；current command poll以
+[Atomic Runtime Lifecycle v1 §4.0](atomic-runtime-lifecycle-v1.md#40-production-signed-pullresult-commit-transport)
+为准，current inventory不承载lifecycle intent。
 
 Node 处理规则：
 
@@ -901,7 +913,7 @@ unit。Inspect、Verify 和 Quarantine 本身不产生外部 effect。
 |---|---|---|
 | CloseAdmission | desired/cell revision、原gate集合、RequireIdle attempt state | 只用于全局lifecycle/placement/runtime/volume/mount/network/platform变化或RequireIdle；cell内compare-and-close全部gate，Armed模糊结果按Busy且Closed结算，fresh Running只以更高route epochs重开；Endpoint-only禁止使用 |
 | CloseGate | `close_gate {endpoint_id, old route_epoch}`及checkpoint top-level、所选old `route_gates`完整entry | 只compare-and-close该Endpoint；revision或完整binding不匹配零副作用，exact same binding Closed是close postcondition；成功/结果不明后确认Closed才fsync且旧epoch不重开。changed以更高epoch另走InstallGate；removed drain后以old Closed binding compare-remove cell entry，确认absent才删除checkpoint entry/推进step，不install |
-| AcquireVolume | normal时完整`VolumeAcquireRequest`（含positive lease duration），takeover时只有authorization id | 只通过Runtime Volume Transitions签名mutation route交给Control的单一PostgreSQL事务；authorization首次消费还要求Active event并原子写`AuthorizationConsumedReceipt`，结果不明只经同规格signed evidence read闭合；只有完整typed request或同authorization可adopt，或在 `R == L` 后精确release |
+| AcquireVolume | normal时完整`VolumeAcquireRequest`（含positive lease duration），takeover时只有authorization id | 本行描述的pre-cutover Runtime Volume Transitions mutation/evidence routes已删除；current atomic command只经command-scoped signed mutation与immutable receipt replay闭合 |
 | ProvisionRootImage | 完整`provision_root_image` step（包含不与provision transition混用的control-only blockd物理身份）、checkpoint top-level revision/spec/placement和该attachment的现有process/volume evidence | 只允许current non-Deleted Desired的唯一Root；step必须先fsync再spawn/adopt精确blockd实例，并以已持久transition ID发送显式typed request，把exact blank head CAS为纯确定计算的generation-1 target。响应不明只读权威head；closed retryable/conflict按§7.1处理。成功前不得创建Guest device或VMM |
 | PrepareDevice | 完整logical disk IDs/kind、attachment lineage/origin/head/size/durability、closed serving-authority provenance、serving blockd scope/socket/data/executable/process token、closed frontend plan、Guest device及device-only ownership token | 首次Root使用ProvisionRootImage完成的sealed handoff；已有Root及Persistent使用descriptor-stable exact direct authorization，绝不伪造Root handoff。每轮fresh full inventory后只执行该frontend定义的一个bounded effect；晚到资源只按各自独立token和完整物理证据adopt |
 | PrepareNetwork | 完整`NetworkConfig`、Linux IFNAMSIZ内的fresh random tap name、独立network ownership token及全量sorted `PreparedDeviceInput`；top-level stable state null、admission Closed、route gates empty、runtime incarnation null且不得有VMM/Guest transport evidence | checkpoint replace是该轮唯一effect；下一轮accepted fresh full证明exact absent/present后才create/adopt tap，模糊结果再读fresh full。exact tap被新full接受后，后续另一轮才可CAS `StartRuntime`；foreign/duplicate/address collision/ABA零修改并fail closed |
@@ -915,7 +927,7 @@ unit。Inspect、Verify 和 Quarantine 本身不产生外部 effect。
 | SnapshotWarmRuntime | runtime incarnation、snapshot temp id、source root/epoch | 验证VMM postcondition与durable rename；晚到文件不覆盖其他WarmRuntimeSnapshot |
 | StopRuntime | runtime incarnation、process start time、scope id | 只 stop 该 incarnation；晚到 stop 可发生，当前 revision 负责重建 |
 | CleanupRelease | 完整`CleanupRelease`：物理target、inventory session/epoch/read position、Desired/tombstone read position，volume还有release transition/generation/disposition | 只删匹配资源、只 release 精确 owner/epoch；`orphan_scope`重读token/cgroup并证明无live PID/process，`control_socket`重读token并证明无live owner，`checkpoint_file`只由Node单槽重读并重算digest/完整identity且由当前Deleted tombstone证明不再需要；重建或身份变化后的stale cleanup必须拒绝 |
-| DeleteDisposableRoot | authorization ID；payload与direct result只读服务器端AuthorizationRecord | 只用于仍Owned的authorization分支；可达Host要求精确stop且`R < L`，Active HostFenceEvent允许最后`R == L`或L未知。无live DiskSnapshotRecord且Guest/VMM/blockd已停/隔离后，按event/auth/volume/control锁序原子写Consumed receipt及两边Deleting；结果不明只经signed evidence read闭合，Node从closed receipt取得精确lineage，成功后才删该lineage及可能存在的tail。可达R==L normal分支不生成该step |
+| DeleteDisposableRoot | authorization ID；payload与direct result只读服务器端AuthorizationRecord | 本行的pre-cutover signed evidence-read recovery已删除；current atomic command在同一command scope消费authorization并只以原transition replay取得closed receipt，成功后才删exact lineage/tail |
 | OpenAdmission | exact runtime incarnation及原样retained `runtime_launch`; 先持久`stable_state=null`/lifecycle Closed/routes empty的prepared token，再持久完整Stable/Open successor | 只用于current完整Desired的`endpoints=[]`。最后一次checkpoint fsync后，以accepted physical predecessor与durable Stable/Open successor做sealed Host sweep和Guest mounted-set challenge，随后才compare-and-open同一incarnation；cell后无post-CAS。crash在cell前保留Closed并重新barrier，结果不明只确认exact cell postcondition。Desired有任一Endpoint时禁止，改由第一条InstallGate打开lifecycle |
 | InstallGate | desired checkpoint、spec digest、placement、runtime incarnation、endpoint/route epoch；先持久Closed prepared token+同进程edge，再持久Active token | 以immutable launch Desired、live gate predecessor和current Endpoint successor三层authority，在Active fsync后做sealed Host/Guest barrier，随后才compare-and-install cell并持久completed postcondition。prepared只可由同进程exact edge重放；Active可由该edge继续，或在cell已等于exact postcondition时只完成持久结算。重启默认Closed并烧掉Active/结果不明epoch。cell只接受一个serving epoch；任何已close gate必须由更大epoch重开 |
 
@@ -1335,7 +1347,8 @@ executable或socket任一ABA变化时旧effect零signal、零cleanup。
 volume `CleanupRelease`必须先持久化，再以`target.volume_id`、`target.attachment_id`、
 `target.attachment_epoch`和`volume_release.release_transition_id`构造Volume Authority的exact
 release request；`generation`和`disposition`是Runtime的决策/前置绑定，不增加第二个
-MetadataStore authority。Node只通过Runtime Volume Transitions签名route提交该request；若release已提交
+MetadataStore authority。本文的Runtime Volume Transitions签名route已删除；current Node只通过atomic
+command-scoped lifecycle-volume-transitions route提交request。若release已提交
 但响应丢失，重启只能：
 
 1. 逐字段重放同一request/同一`release_transition_id`，并接受原`UnownedGrant`；或
@@ -1522,10 +1535,10 @@ AppliedDesiredEvidence {
 
 `applied_desired=null`只允许full inventory发现了无法关联到有效checkpoint/Desired的orphan；它不能
 携带`Ready`，也不能结算Operation。Running/Suspended必须有`runtime_incarnation`；Warm/Cold/Deleted
-必须为`null`。只有§11完整postcondition成立时`stable_state`才非null。full inventory中cursor assigned
-Cat的nonnull/exact applied binding由
-[Inventory Spine §5.2](runtime-inventory-observation-v1.md#52-full-cursor-与-complete-assigned-set)在接受
-attestation前强制执行，且不以该Cat存在Pending Operation为前提。
+必须为`null`。只有§11完整postcondition成立时`stable_state`才非null。pre-cutover full inventory在接受
+attestation前还会强制cursor assigned Cat的nonnull/exact applied binding，且不以该Cat存在
+Pending Operation为前提。current inventory已删除assigned-set和`applied_desired`权限；其边界以
+[Runtime Inventory and Telemetry §1](runtime-inventory-observation-v1.md#1-authority-boundary)为准。
 
 Control Plane先按§16.4确认当前完整session/instance，再对该session的
 `heartbeat_sequence`执行唯一接收状态机。“相同payload”指两个已通过严格decoder的
@@ -1546,7 +1559,12 @@ Control Plane先按§16.4确认当前完整session/instance，再对该session�
    不再为该旧sequence查找或重放历史成功结果。
 
 exact route、deadline renewal、cursor/epoch检查、服务端`ObservationAcceptance`和同事务Operation settlement
-由[Inventory Spine §4-§6](runtime-inventory-observation-v1.md#4-observation-sessionsequence-gate)补全。
+是本节的pre-cutover组合。current inventory的report replay、acceptance与Store transaction分别由
+[Inventory Spine §4](runtime-inventory-observation-v1.md#4-report-wire)、
+[§7](runtime-inventory-observation-v1.md#7-acceptance-wire)和
+[§9](runtime-inventory-observation-v1.md#9-store-transaction与schema)冻结，它不结算Operation；current terminal settlement只由
+[Atomic Runtime Lifecycle v1 §4.0](atomic-runtime-lifecycle-v1.md#40-production-signed-pullresult-commit-transport)
+的exact signed result commit完成。
 
 Node的`observed_at_unix_ms`不用于sequence比较或freshness。`loaded_kids`按`KeyId`升序且无重复，
 `runtimes`按`cat_id`升序且无重复。
@@ -3379,8 +3397,9 @@ PreconditionFailed PlacementRejected reason的`node_id`、`placement_epoch`和�
 必须接受。stale session与placement_rejected mismatch并存时必须先返回session error，且不读取或结算
 Operation。
 
-Multi-terminal settlement必须逐byte重建
-[Inventory Spine §9](runtime-inventory-observation-v1.md#9-fixed-vectors)的conditions/selected-failure向量。
+Multi-terminal settlement必须逐byte重建本pre-cutover协调协议的conditions/selected-failure向量。
+该observation-settled Operation路径已退役；current inventory conditions只是telemetry，terminal result以
+[Atomic Runtime Lifecycle v1 §6.1](atomic-runtime-lifecycle-v1.md#61-response-wire)为准。
 同一runtime同时有Ready、多个PreconditionFailed和Quarantined时仍只能选canonical第一个
 terminal Condition；反向SQL/迭代顺序不改变terminal bytes，非canonical condition顺序在F0拒绝，
 删除首个terminal才使选择前进。每个后续PlacementRejected仍必须先通过上述placement
@@ -3690,15 +3709,16 @@ ContractName = "node_identity" | "agent_registration_attempt" | "agent_session"
              | "desired_read_request" | "desired_read_snapshot"
              | "runtime_checkpoint" | "node_cleanup_checkpoint" | "node_observation"
              | "observation_acceptance" | "runtime_spine_error"
-             | "runtime_volume_transition_request" | "runtime_volume_transition_success"
-             | "runtime_volume_transition_evidence_request"
-             | "runtime_volume_transition_evidence_success"
-             | "runtime_volume_transition_error" | "operation" | "contract_error"
+             | "operation" | "contract_error"
 ```
 
-Inventory/Desired delivery variants的适用边界、字段不等式和固定选择以
-[Runtime Inventory and Observation Spine §8](runtime-inventory-observation-v1.md#8-closed-context-errors-与固定选择)
-为准；它们不是legacy heartbeat error或可扩展string map。
+pre-cutover `runtime_volume_transition_request|success|evidence_request|evidence_success|error` ContractName
+值已经退役；current decoder必须把它们作为unknown/invalid contract严格拒绝，不保留compatibility alias或parser。
+
+current Inventory variants的适用边界、字段不等式和固定选择以
+[Runtime Inventory and Telemetry §10](runtime-inventory-observation-v1.md#10-closed-errors)
+为准；pre-cutover Desired delivery variants已退役，两者都不是legacy heartbeat error或可扩展
+string map。
 
 `message`只供人读，接收方只能按`error.code`及typed payload分支。所有顶层合同共用下面唯一的
 validation pipeline；实现不得为某个合同类型另排优先级或在serde首次报错处提前返回。
@@ -3804,10 +3824,12 @@ context-free decoder通过后，需要外部状态的边界才进入context-boun
    只读首次成功结果。
 3. **session deadline 与 inventory delivery**：只对首次处理的新observation在sequence之后使用同一
    PostgreSQL `db_now`检查deadline；current session highest exact observation replay在此前返回且
-   不续期，即使deadline已过。full/partial observation随后严格按
-   [Inventory Spine §5](runtime-inventory-observation-v1.md#5-full-与-partial-inventory-接受)检查cursor、assigned
+   不续期，即使deadline已过。pre-cutover full/partial observation随后检查cursor、assigned
    set、inventory epoch、完整assigned Cat集合，以及每个assigned Cat独立于Operation phase的exact
-   `applied_desired` binding。Desired read endpoint不使用该例外；它在session后按
+   `applied_desired` binding。current inventory已删除这些Desired authority；它的Full/Partial、acceptance和Store
+   验证以[Inventory Spine §4](runtime-inventory-observation-v1.md#4-report-wire)、
+   [§7](runtime-inventory-observation-v1.md#7-acceptance-wire)和
+   [§9](runtime-inventory-observation-v1.md#9-store-transaction与schema)为准。Desired read endpoint不使用该例外；它在session后按
    Inventory Spine §3先检查deadline和server-time causality，再执行独立request-sequence/cursor状态机，
    expired session不得返回Desired exact replay。
 4. **revision**：此时才读取current Desired/Operation的revision字段，按边界语义返回`stale_revision`或

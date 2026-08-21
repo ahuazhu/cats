@@ -344,10 +344,11 @@ complete inventory has been accepted for the current AgentSession; incomplete
 or conflicting evidence is never promoted to a complete observation. The
 shared-bearer heartbeat and
 legacy NodeJob listener are not rollout or compatibility options. Route v2
-machine ingress remains independently closed unless the
-provisioner installs its reviewed signing ring and mTLS artifacts through the
-validated revision-1 transaction; the generic direct-metal unit deliberately
-does not opt into this listener. The exact current evidence endpoint is recorded in
+machine ingress, adjacent ring delivery and the Route command runner are
+mandatory. The provisioner must install the reviewed signing ring and mTLS
+artifacts through the validated revision-1 transaction; either unit fails
+before lifecycle/inventory work if those artifacts, its fixed listener or the
+HTTPS rotation origin is missing. The exact current evidence endpoint is recorded in
 [`architecture-cross-review.md`](../../docs/architecture-cross-review.md#当前跨组件证据边界).
 
 The worker builds an optimized Ubuntu 24.04 Guest: direct kernel, a minimal
