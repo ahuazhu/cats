@@ -436,6 +436,35 @@ impl Store {
         }
     }
 
+    /// Runs one non-request authority closure with an explicit commit or
+    /// rollback disposition. Callers use the rejected value only for typed,
+    /// candidate-local outcomes that are safe to isolate after PostgreSQL has
+    /// successfully rolled back the candidate transaction. Infrastructure
+    /// and rollback failures remain outer Store errors.
+    pub(super) fn authority_transaction_disposition<T: Send>(
+        &self,
+        operation: impl FnMut(
+                &mut postgres::Transaction<'_>,
+            ) -> AuthorityTxResult<AuthorityRequestDisposition<T>>
+            + Send,
+    ) -> Result<T> {
+        match self.authority_transaction_outcome_with_hook(
+            operation,
+            AuthorityTransactionMode::ReadWrite,
+            None,
+            || {},
+        ) {
+            Ok(value) => Ok(value),
+            Err(AuthorityExecutionError::Store(error)) => Err(error),
+            Err(AuthorityExecutionError::CandidateCollision) => Err(internal(
+                "unexpected candidate-collision marker in a disposition transaction",
+            )),
+            Err(AuthorityExecutionError::PlacementStale) => Err(internal(
+                "unexpected placement-stale marker in a disposition transaction",
+            )),
+        }
+    }
+
     pub(super) fn authority_request_transaction<T: Send>(
         &self,
         request: &AuthorityRequestContext,
@@ -1025,7 +1054,7 @@ fn authority_retry_is_definite(error: &postgres::Error) -> bool {
     )
 }
 
-fn authority_rejection(error: AuthorityError) -> ApiError {
+pub(super) fn authority_rejection(error: AuthorityError) -> ApiError {
     let message = format!("volume authority rejected the transition: {error}");
     match error {
         AuthorityError::NotFound => ApiError::not_found("volume"),
