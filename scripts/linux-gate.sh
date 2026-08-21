@@ -625,7 +625,7 @@ main() {
     || return $?
   # This compatibility gate exercises SQL and transaction semantics, not a
   # PostgreSQL process/power-loss boundary. Keep its disposable data in memory
-  # and avoid Docker VM sync overhead. Native `quality.sh full` and CI retain
+  # and avoid Docker VM sync overhead. Native `quality.sh full` retains
   # PostgreSQL's default durability settings.
   LINUX_PG_INTENDED=true
   docker_create_cli container "$LINUX_PG" capture 300 \

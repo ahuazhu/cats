@@ -1483,10 +1483,9 @@ fn linux_quality_gate_installs_the_postgres_probe_runtime() {
 }
 
 #[test]
-fn linux_quality_gate_uses_disposable_postgres_without_weakening_other_gates() {
+fn linux_quality_gate_uses_disposable_postgres_without_weakening_native_full() {
     let quality = read_workspace_file("scripts/quality.sh");
     let linux_gate = read_workspace_file("scripts/linux-gate.sh");
-    let ci = read_workspace_file(".github/workflows/ci.yml");
 
     assert!(
         linux_gate.contains("--tmpfs /var/lib/postgresql/data:rw,noexec,nosuid,size=2g"),
@@ -1505,11 +1504,21 @@ fn linux_quality_gate_uses_disposable_postgres_without_weakening_other_gates() {
             !quality.contains(setting),
             "the native full gate must retain PostgreSQL's default durability settings"
         );
-        assert!(
-            !ci.contains(setting),
-            "CI must retain PostgreSQL's default durability settings"
-        );
     }
+}
+
+#[test]
+fn github_ci_jobs_are_retired_and_production_deployment_is_manual_only() {
+    assert!(
+        !workspace_root().join(".github/workflows/ci.yml").exists(),
+        "the retired Rust workspace and Terraform GitHub CI jobs must stay absent"
+    );
+
+    let deployment = read_workspace_file(".github/workflows/deploy-production.yml");
+    assert!(!deployment.contains("workflow_run"));
+    assert!(!deployment.contains("workflows: [\"CI\"]"));
+    assert!(deployment.contains("workflow_dispatch:"));
+    assert!(deployment.contains("RELEASE_SHA: ${{ github.sha }}"));
 }
 
 #[test]
