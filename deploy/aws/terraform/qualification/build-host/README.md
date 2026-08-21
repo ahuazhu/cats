@@ -107,13 +107,16 @@ builds the exporter output:
 ```sh
 /bin/bash /srv/cats-build/source/deploy/aws/terraform/qualification/build-host/tools/manual-release-host.sh \
   prepare "$EXACT_40_HEX_COMMIT" "$MANIFEST_SHA256" "$BUNDLE_SHA256" \
-  "$CONTROL_IMAGE_REFERENCE" "$GATEWAY_IMAGE_REFERENCE"
+  "$CONTROL_IMAGE_REFERENCE" "$CREDENTIAL_REFRESHER_IMAGE_REFERENCE" \
+  "$GATEWAY_IMAGE_REFERENCE"
 /bin/bash /srv/cats-build/source/deploy/aws/terraform/qualification/build-host/tools/manual-release-host.sh \
   verify "$EXACT_40_HEX_COMMIT" "$MANIFEST_SHA256" "$BUNDLE_SHA256" \
-  "$CONTROL_IMAGE_REFERENCE" "$GATEWAY_IMAGE_REFERENCE"
+  "$CONTROL_IMAGE_REFERENCE" "$CREDENTIAL_REFRESHER_IMAGE_REFERENCE" \
+  "$GATEWAY_IMAGE_REFERENCE"
 /bin/bash /srv/cats-build/source/deploy/aws/terraform/qualification/build-host/tools/manual-release-host.sh \
   build "$EXACT_40_HEX_COMMIT" "$MANIFEST_SHA256" "$BUNDLE_SHA256" \
-  "$CONTROL_IMAGE_REFERENCE" "$GATEWAY_IMAGE_REFERENCE"
+  "$CONTROL_IMAGE_REFERENCE" "$CREDENTIAL_REFRESHER_IMAGE_REFERENCE" \
+  "$GATEWAY_IMAGE_REFERENCE"
 ```
 
 `prepare` is the only mutating Host step. It accepts only the existing reviewed Ubuntu snapshot,
@@ -121,7 +124,7 @@ installs exact Guest-builder package versions, and installs digest-pinned Buildx
 exact Rust toolchain and musl target under a lock-digest path in `/opt/cats-manual-release/`. It never
 changes the `cats-build` uid or its frozen toolchain. `verify` is read-only. `build` uses a fresh
 Docker config with no registry credentials, calls `build-manual-release.sh --export-images`, and
-never accepts `--push`. The two explicit references are the reviewed production ECR
+never accepts `--push`. The three explicit references are the reviewed production ECR
 `repository:tag` values frozen into the release manifest; naming an ECR repository does not contact
 it during the OCI export.
 

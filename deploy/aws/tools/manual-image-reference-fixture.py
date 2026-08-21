@@ -57,7 +57,7 @@ def main() -> int:
             check=False,
         )
         assert result.returncode != 0
-        assert "same mutable tag" in result.stderr
+        assert "distinct mutable tags" in result.stderr
         assert not docker_log.exists()
         assert not (root / "release").exists()
     print("manual image reference fixture: PASS")

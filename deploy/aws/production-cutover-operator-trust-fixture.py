@@ -631,7 +631,7 @@ def main() -> int:
                     process.communicate()
         exercise_lock_aba(tool, openssl, root)
         # The current manual-release manifest closes exactly {control_plane,
-        # gateway, worker}; the public trust is not one of its members.
+        # credential_refresher, gateway, worker}; public trust is not a member.
         release_manifest = root / "release-manifest.v1.json"
         fixture_digest = "sha256:" + "5" * 64
         release_manifest_value = {
@@ -643,6 +643,14 @@ def main() -> int:
                     "image_digest": fixture_digest,
                     "image_reference": "registry.example/cats/control:fixture",
                     "registry_verified": True,
+                },
+                "credential_refresher": {
+                    "image_config_digest": fixture_digest,
+                    "image_digest": fixture_digest,
+                    "image_reference": "registry.example/cats/credential-refresher:fixture",
+                    "refresh_program_sha256": fixture_digest,
+                    "registry_verified": True,
+                    "swap_dsn_program_sha256": fixture_digest,
                 },
                 "gateway": {
                     "binary_sha256": fixture_digest,

@@ -240,26 +240,30 @@ deploy/aws/tools/build-manual-release.sh \
   --source-sha "$(git rev-parse HEAD)" \
   --output /approved/private-output/cats-release \
   --image registry.example/cats/control-plane:exact-tag \
+  --credential-refresher-image registry.example/cats/credential-refresher:exact-tag \
   --gateway-image registry.example/cats/gateway:exact-tag \
   --push
 ```
 
 It exports and rechecks the exact Git tree, invokes the Guest-image generator
 once, feeds that one closed payload to the Control and worker Dockerfiles,
-builds the separate Gateway image, extracts the receipt/manifest from the final
-Control image, the `cats-gatewayd` executable from the final Gateway image and
-the complete Guest payload from the worker artifact, and verifies every closed
-set. The
+builds the independent credential-refresher target and Gateway image, extracts
+the receipt/manifest from the final Control image, both credential-refresher
+programs from its final image, the `cats-gatewayd` executable from the final
+Gateway image and the complete Guest payload from the worker artifact, and
+verifies every closed set. The
 canonical `release-manifest.v1.json` binds source commit/tree/fingerprint,
-build-input fingerprints, Guest release ID, Control and Gateway OCI/config
-digests, Gateway binary digest and the worker tar SHA-256. Without `--push`,
-both images remain only in the local Docker store and the manifest records both
-registry verifications as false; that output is useful for dry-run
+build-input fingerprints, Guest release ID, Control, credential-refresher and
+Gateway OCI/config digests, extracted program digests, Gateway binary digest
+and the worker tar SHA-256. Without `--push`, all three images remain only in
+the local Docker store and the manifest records all three registry
+verifications as false; that output is useful for dry-run
 qualification but is not a registry deployment receipt.
 
 To keep AWS credentials off the native build Host, replace `--push` with
 `--export-images`. The output then also contains
-`cats-control-plane-image.tar`, `cats-gateway-image.tar` and `SHA256SUMS`.
+`cats-control-plane-image.tar`, `cats-credential-refresher-image.tar`,
+`cats-gateway-image.tar` and `SHA256SUMS`.
 Those files are transport only: the unchanged manifest and its independently
 recorded SHA-256 remain the authority. On an approved x86_64 operator Host with
 Docker Buildx and existing ECR credentials, publish without rebuilding:
@@ -274,7 +278,7 @@ deploy/aws/tools/publish-manual-release.sh \
 ```
 
 The helper checks the transport sums, verifies each closed OCI archive against
-the existing manifest, loads and inspects linux/amd64 identity, pushes the two
+the existing manifest, loads and inspects linux/amd64 identity, pushes the three
 exact manifest references, verifies the registry digests and asks the existing
 manual-release verifier to produce the registry-verified manifest. It neither
 builds an artifact nor uploads the worker bundle. Pass the same
@@ -282,6 +286,109 @@ builds an artifact nor uploads the worker bundle. Pass the same
 `production-infrastructure` Terraform inputs; that module publishes the bundle
 at `worker/<sha256>/cats-worker.tar.zst` in its existing artifact bucket.
 The builder never invokes Terraform, Kubernetes or a production service.
+
+For the production AWS cell, `tools/package-production-release.py` composes
+that same boundary without giving the native build Host registry credentials.
+It proves the reviewed AWS account and build-Host identity, publishes the exact
+source bundle, submits one SSM build, retains the content-addressed transport,
+downloads it by exact S3 version and SHA-256, then publishes all three OCI
+archives from the operator Host. The output is a new root containing the source
+publication evidence, immutable native build result, transport, unmodified
+release tree, registry-verified manifest and
+`production-package-receipt.v1.json`. It stops before Terraform, Kubernetes,
+Node provisioning or product mutation:
+
+```sh
+deploy/aws/tools/package-production-release.py \
+  --source-repository "$(pwd -P)" \
+  --source-sha "$(git rev-parse HEAD)" \
+  --output /approved/private-output/production-package \
+  --expected-account-id "$AWS_ACCOUNT_ID" \
+  --aws-region us-east-1 \
+  --build-host-instance-id "$BUILD_HOST_INSTANCE_ID" \
+  --source-bucket "$SOURCE_BUCKET" \
+  --source-kms-alias-arn "$SOURCE_KMS_ALIAS_ARN" \
+  --artifact-bucket "$BUILD_ARTIFACT_BUCKET" \
+  --control-image "$ECR_REPOSITORY:control-$CUTOVER_ID" \
+  --credential-refresher-image "$ECR_REPOSITORY:refresher-$CUTOVER_ID" \
+  --gateway-image "$ECR_REPOSITORY:gateway-$CUTOVER_ID"
+```
+
+`tools/deploy-production-release.py` consumes only that completed package. Its
+canonical config names the exact AWS cell, EKS context, separate Terraform
+state keys, Control schema, both ordered tfvars lists and the complete
+worker-name-to-instance map. Secret tfvars remain external root-only files;
+the deployer records their config digest but never copies their bytes into a
+receipt. The application tfvars must already contain the current immutable
+Route/identity artifact names and all provider inputs, while infrastructure
+tfvars contain the worker role, Route Node Secret ARN/version and non-secret
+managed environment. Package-derived image and worker values are appended as
+the final Terraform overrides and cannot be replaced by those files.
+
+The config is canonical JSON with this exact shape (replace every example
+value and use resolved absolute file paths):
+
+```json
+{"application_state_key":"cats/production/application.tfstate","application_tfvars":["/approved/root-only/application.tfvars.json","/approved/root-only/application-secrets.tfvars.json"],"aws_region":"us-east-1","control_postgres_schema":"cats_r26","eks_cluster_name":"cats-production","expected_account_id":"123456789012","expected_aws_partition":"aws","infrastructure_state_key":"cats/production/infrastructure.tfstate","infrastructure_tfvars":["/approved/root-only/infrastructure.tfvars.json"],"kubeconfig_context":"cats-production","kubeconfig_path":"/approved/root-only/kubeconfig","namespace":"cats","schema_version":1,"terraform_state_bucket":"cats-terraform-state-123456789012-us-east-1","worker_instances":{"metal-1":"i-0123456789abcdef0","metal-2":"i-0123456789abcdef1"}}
+```
+
+The controller deliberately separates saved-plan creation from apply. Both
+plan JSON files can contain sensitive Terraform values and therefore stay in
+the mode-0700 plan directory:
+
+```sh
+deploy/aws/tools/deploy-production-release.py plan \
+  --source-repository "$(pwd -P)" \
+  --package /approved/private-output/production-package \
+  --config /approved/root-only/production-deployment-config.v1.json \
+  --output /approved/root-only/production-plan
+
+deploy/aws/tools/deploy-production-release.py apply \
+  --source-repository "$(pwd -P)" \
+  --package /approved/private-output/production-package \
+  --config /approved/root-only/production-deployment-config.v1.json \
+  --plan-directory /approved/root-only/production-plan \
+  --output /approved/evidence/production-apply
+```
+
+`apply` rehashes both saved plans and the exact config/package receipt, applies
+the application first, proves the Control, ObjectWrite Gateway, Route Gateway
+and credential-refresher image pins, then applies the worker bundle. Terraform
+waits for every explicitly named SSM association; a final read-only SSM probe
+requires the installed bundle receipt and active `cats-worker.service` on each
+Host. The deployer does not uncordon a Node, change mutation admission or run a
+product E2E.
+
+After the official signed `qualification-begin` flow has installed a bounded
+Qualification admission for one exact Workspace, use
+`tools/production-cat-lifecycle-e2e.py` to exercise only public product
+actions. The driver requires that unexpired Begin framework receipt, keeps the
+Workspace bearer in a caller-owned mode-0600 file and passes it to the CLI only
+through `CATS_TOKEN`. It retains every canonical product response separately:
+
+```sh
+deploy/aws/tools/production-cat-lifecycle-e2e.py \
+  --cats-cli /approved/bin/cats \
+  --api-url https://cats.run \
+  --token-file /approved/root-only/e2e-workspace-token \
+  --qualification-begin-receipt /approved/evidence/qualification/production-mutation-qualification-begin.receipt.json \
+  --workspace-id <EXACT_WS_ID> \
+  --boot-image-digest sha256:<GOLDEN_ROOT_DIGEST> \
+  --cat-name release-e2e-<CUTOVER_ID> \
+  --sleep-state suspend \
+  --sleep-state warm \
+  --sleep-state cold \
+  --output /approved/evidence/production-cat-e2e
+```
+
+Each sleep action must reach its matching public stable state before `run`.
+Suspended retains the exact runtime incarnation; Warm and Cold clear it before
+the next Running incarnation. Destroy must remove the Cat from the product
+list. If any step fails, the driver leaves the exact Cat and partial evidence
+in place and does not attempt an implicit destructive cleanup. Close and
+terminalize Qualification through `production-mutation-admission.py` after the
+E2E result is retained.
+
 The worker bundle also carries the exact
 [`old-host-positive-stop.py`](old-host-positive-stop.py) bytes bound as a
 manual-build input. That program emits the

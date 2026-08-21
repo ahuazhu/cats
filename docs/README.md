@@ -121,6 +121,7 @@ work-status和work acquire/release不在生产route map，显式retired harness�
 - [0056 atomic per-Cat runtime lifecycle](decisions/0056-atomic-per-cat-runtime-lifecycle.md)
 - [0057 产品动作与内部执行证据分层](decisions/0057-product-lifecycle-actions-and-internal-execution-evidence.md)
 - [0058 Route ring ACK 绑定不可变 AgentSession 历史](decisions/0058-route-ring-acknowledges-immutable-agent-session.md)
+- [0059 完整生产发布清单绑定独立 credential refresher](decisions/0059-complete-production-release-binds-credential-refresher.md)
 - [0043 Provisioner-owned runtime placement policy](decisions/0043-provisioner-owned-runtime-placement-policy.md)
 - [0044 独立Route v2 signing authority](decisions/0044-independent-route-v2-signing-authority.md)
 - [0045 独立Gateway workload identity authority](decisions/0045-independent-gateway-workload-identity.md)
