@@ -1215,15 +1215,38 @@ async fn recover_once(
         if attempts.is_empty() {
             break;
         }
-        for attempt in attempts {
-            after = Some(attempt.descriptor.request_id.clone());
-            let deadline = Instant::now() + OBJECT_WRITE_GATEWAY_REQUEST_DEADLINE;
+        after = attempts
+            .last()
+            .map(|attempt| attempt.descriptor.request_id.clone());
+        drive_recoverable_attempts(attempts, |attempt, deadline| {
             Box::pin(drive_accepted(service, attempt, deadline))
-                .await
-                .map_err(|error| anyhow::anyhow!(error))?;
-        }
+        })
+        .await;
     }
     Ok(())
+}
+
+async fn drive_recoverable_attempts<F, Fut>(attempts: Vec<ObjectPutAttempt>, mut drive: F)
+where
+    F: FnMut(ObjectPutAttempt, Instant) -> Fut,
+    Fut: Future<Output = Result<ObjectPutAttempt, ApiError>>,
+{
+    for attempt in attempts {
+        let key = attempt.descriptor.target.canonical_logical_key.clone();
+        let request_id = attempt.descriptor.request_id.clone();
+        let deadline = Instant::now() + OBJECT_WRITE_GATEWAY_REQUEST_DEADLINE;
+        if let Err(error) = drive(attempt, deadline).await {
+            // The accepted attempt remains durable. A failed drive cannot
+            // revoke it or prevent independent attempts from settling.
+            tracing::warn!(
+                code = ?error.code,
+                detail = %error,
+                key = %key,
+                request_id = %request_id,
+                "recoverable object-write attempt did not settle; leaving it durable"
+            );
+        }
+    }
 }
 
 async fn acquire_until(
@@ -1540,6 +1563,27 @@ mod tests {
                 issued_at_unix_ms: millis(12),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn recovery_continues_after_one_accepted_attempt_does_not_settle() {
+        let attempt = issued_fault_attempt(&authority());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let drive_calls = Arc::clone(&calls);
+
+        drive_recoverable_attempts(vec![attempt.clone(), attempt], move |attempt, _deadline| {
+            let drive_calls = Arc::clone(&drive_calls);
+            async move {
+                if drive_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(ApiError::unavailable("injected recovery failure"))
+                } else {
+                    Ok(attempt)
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     struct VisibleRequestGuard {
