@@ -121,8 +121,15 @@ impl TestLifecycleScope {
             .execute(
                 "INSERT INTO cat_runtime_configs (
                         config_id, workspace_id, cat_id, canonical_config_bytes,
-                        canonical_config_sha256, created_at_unix_ms
-                     ) VALUES ($1, $2, $3, $4, $5, 1)",
+                        canonical_config_sha256, placement_vcpus,
+                        placement_memory_bytes, placement_network_id,
+                        placement_ipv4_pool_base, placement_ipv4_slot, placement_disk_ids,
+                        placement_volume_ids, created_at_unix_ms
+                     ) VALUES (
+                        $1, $2, $3, $4, $5,
+                        1, 1024, $1, 0, 1,
+                        ARRAY[$1]::TEXT[], ARRAY[$1]::TEXT[], 1
+                     )",
                 &config_parameters,
             )
             .unwrap();

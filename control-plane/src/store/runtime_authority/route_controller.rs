@@ -46,10 +46,11 @@ impl RouteController {
                 .await;
             match result {
                 Ok(page) => {
-                    if page.mutations != 0 {
+                    if page.mutations != 0 || page.failures != 0 {
                         tracing::info!(
                             examined = page.examined,
                             mutations = page.mutations,
+                            failures = page.failures,
                             "atomic Route controller page committed"
                         );
                     }

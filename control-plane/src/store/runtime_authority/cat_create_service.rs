@@ -40,8 +40,8 @@ use super::lifecycle_commands::{
     admit_lifecycle_command_in, LifecycleAdmissionRejection, LifecycleCommandAdmission,
 };
 use super::placement_planner::{
-    revalidate_cat_create_placement, runtime_network_id_exists, PlacementCommitLoad,
-    PlacementTargetSnapshot,
+    revalidate_cat_create_placement, runtime_config_placement_claims, runtime_network_id_exists,
+    PlacementCommitLoad, PlacementTargetSnapshot,
 };
 use super::product::{
     api_request_fingerprint, encode_cat_create_accepted_response,
@@ -984,19 +984,30 @@ fn insert_atomic_runtime_config(
 ) -> AuthorityTxResult<()> {
     let canonical = encode_immutable_runtime_config(&candidate.runtime_config)
         .map_err(|_| ApiError::internal("immutable runtime config cannot be encoded"))?;
+    let claims = runtime_config_placement_claims(&candidate.runtime_config)?;
     let now_pg = i64::try_from(now.get())
         .map_err(|_| ApiError::internal("database time exceeds PostgreSQL BIGINT"))?;
     transaction.execute(
         "INSERT INTO cat_runtime_configs (
             config_id, workspace_id, cat_id, canonical_config_bytes,
-            canonical_config_sha256, created_at_unix_ms
-         ) VALUES ($1,$2,$3,$4,$5,$6)",
+            canonical_config_sha256, placement_vcpus,
+            placement_memory_bytes, placement_network_id,
+            placement_ipv4_pool_base, placement_ipv4_slot, placement_disk_ids,
+            placement_volume_ids, created_at_unix_ms
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
         &[
             &candidate.runtime_config.config_id.as_str(),
             &candidate.workspace_id.as_str(),
             &candidate.cat_id.as_str(),
             &canonical,
             &candidate.runtime_config.config_digest.as_str(),
+            &claims.vcpus,
+            &claims.memory_bytes,
+            &claims.network_id.as_str(),
+            &claims.ipv4_pool_base,
+            &claims.isolated_ipv4_slot,
+            &claims.disk_ids,
+            &claims.volume_ids,
             &now_pg,
         ],
     )?;

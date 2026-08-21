@@ -873,7 +873,7 @@ mod tests {
                 session(1),
                 &state_directory,
                 &StartupPhysicalInventory::Incomplete {
-                    reason: "scope scan timed out".into(),
+                    reason: "process/NBD/network namespace enumeration timed out".into(),
                 },
             )
             .unwrap_err();
@@ -884,6 +884,12 @@ mod tests {
                 LifecycleJournalError::IncompletePhysicalInventory { .. }
             )
         ));
+        for cat_id in [id("cat_node_global_a"), id("cat_node_global_b")] {
+            assert!(matches!(
+                registry.lookup(&cat_id),
+                Err(LifecycleAdmissionRegistryError::Uninitialized)
+            ));
+        }
     }
 
     #[test]

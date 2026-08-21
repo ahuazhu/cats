@@ -1374,6 +1374,50 @@ fn verify_authority_catalog(transaction: &mut postgres::Transaction<'_>) -> Resu
             return Err(partial_catalog_object(index));
         }
     }
+    for (table, index, column) in REQUIRED_ARRAY_MEMBERSHIP_INDEXES {
+        let present: bool = transaction
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                      FROM pg_index i
+                      JOIN pg_class source ON source.oid=i.indrelid
+                      JOIN pg_namespace source_namespace
+                        ON source_namespace.oid=source.relnamespace
+                      JOIN pg_class index_relation
+                        ON index_relation.oid=i.indexrelid
+                      JOIN pg_am access_method
+                        ON access_method.oid=index_relation.relam
+                      JOIN pg_attribute attribute
+                        ON attribute.attrelid=source.oid
+                       AND attribute.attname=$3 AND NOT attribute.attisdropped
+                      JOIN pg_opclass operator_class
+                        ON operator_class.oid=i.indclass[0]
+                      JOIN pg_namespace operator_namespace
+                        ON operator_namespace.oid=operator_class.opcnamespace
+                     WHERE source_namespace.nspname=current_schema()
+                       AND source.relname=$1 AND index_relation.relname=$2
+                       AND NOT i.indisunique AND i.indisvalid AND i.indisready
+                       AND i.indnkeyatts=1 AND i.indnatts=1
+                       AND i.indkey[0]=attribute.attnum
+                       AND i.indoption::TEXT='0'
+                       AND i.indpred IS NULL AND i.indexprs IS NULL
+                       AND access_method.amname='gin'
+                       AND operator_namespace.nspname='pg_catalog'
+                       AND operator_class.opcname='array_ops'
+                       AND pg_get_indexdef(i.indexrelid, 1, FALSE)=$3
+                 )",
+                &[table, index, column],
+            )
+            .map_err(|error| {
+                internal(format!(
+                    "verify authority array membership-index catalog: {error:?}"
+                ))
+            })?
+            .get(0);
+        if !present {
+            return Err(partial_catalog_object(index));
+        }
+    }
     for (table, trigger, function, trigger_type, body_sha256) in REQUIRED_IMMUTABILITY_TRIGGERS {
         let body = transaction
             .query_opt(
@@ -1607,6 +1651,41 @@ pub(super) const REQUIRED_CHECK_CONSTRAINTS: &[(&str, &str, &str)] = &[
         "cat_runtime_configs",
         "cat_runtime_configs_digest_check",
         "CHECK ((canonical_config_sha256 ~ '^sha256:[0-9a-f]{64}$'::text))",
+    ),
+    (
+        "cat_runtime_configs",
+        "cat_runtime_configs_placement_vcpus_check",
+        "CHECK (((placement_vcpus >= 1) AND (placement_vcpus <= '4294967295'::bigint)))",
+    ),
+    (
+        "cat_runtime_configs",
+        "cat_runtime_configs_placement_memory_check",
+        "CHECK ((placement_memory_bytes > 0))",
+    ),
+    (
+        "cat_runtime_configs",
+        "cat_runtime_configs_placement_ipv4_pool_base_check",
+        "CHECK (((placement_ipv4_pool_base >= 0) AND (placement_ipv4_pool_base <= '4294901760'::bigint)))",
+    ),
+    (
+        "cat_runtime_configs",
+        "cat_runtime_configs_placement_ipv4_slot_check",
+        "CHECK (((placement_ipv4_slot >= 1) AND (placement_ipv4_slot <= 16383)))",
+    ),
+    (
+        "cat_runtime_configs",
+        "cat_runtime_configs_placement_disk_ids_check",
+        "CHECK ((((cardinality(placement_disk_ids) >= 1) AND (cardinality(placement_disk_ids) <= 64)) AND (array_position(placement_disk_ids, NULL::text) IS NULL)))",
+    ),
+    (
+        "cat_runtime_configs",
+        "cat_runtime_configs_placement_volume_ids_check",
+        "CHECK ((((cardinality(placement_volume_ids) >= 1) AND (cardinality(placement_volume_ids) <= 64)) AND (array_position(placement_volume_ids, NULL::text) IS NULL)))",
+    ),
+    (
+        "cat_runtime_configs",
+        "cat_runtime_configs_placement_volume_cardinality_check",
+        "CHECK ((cardinality(placement_disk_ids) = cardinality(placement_volume_ids)))",
     ),
     (
         "cat_runtime_configs",
@@ -3228,6 +3307,13 @@ type RequiredProductReadLookupIndex = (
 
 const REQUIRED_PRODUCT_READ_LOOKUP_INDEXES: &[RequiredProductReadLookupIndex] = &[
     (
+        "cat_runtime_configs",
+        "cat_runtime_configs_network_history",
+        "placement_network_id",
+        "config_id",
+        None,
+    ),
+    (
         "cat_records",
         "cat_records_lookup_scalar_scalar",
         "workspace_id",
@@ -3294,6 +3380,19 @@ const REQUIRED_PRODUCT_READ_LOOKUP_INDEXES: &[RequiredProductReadLookupIndex] = 
         Some(
             "(((workspace_id COLLATE \"C\") IS DISTINCT FROM ((record ->> 'workspace_id'::text) COLLATE \"C\")) AND ((disk_id COLLATE \"C\") IS DISTINCT FROM ((record ->> 'disk_id'::text) COLLATE \"C\")))",
         ),
+    ),
+];
+
+const REQUIRED_ARRAY_MEMBERSHIP_INDEXES: &[(&str, &str, &str)] = &[
+    (
+        "cat_runtime_configs",
+        "cat_runtime_configs_disk_membership",
+        "placement_disk_ids",
+    ),
+    (
+        "cat_runtime_configs",
+        "cat_runtime_configs_volume_membership",
+        "placement_volume_ids",
     ),
 ];
 
@@ -3738,7 +3837,10 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             head_generation, head_root_hash, head_root_object_id, created_at
        FROM disk_snapshot_records WHERE FALSE",
     "SELECT config_id, workspace_id, cat_id, canonical_config_bytes,
-            canonical_config_sha256, created_at_unix_ms
+            canonical_config_sha256, placement_vcpus,
+            placement_memory_bytes, placement_network_id,
+            placement_ipv4_pool_base, placement_ipv4_slot, placement_disk_ids,
+            placement_volume_ids, created_at_unix_ms
        FROM cat_runtime_configs WHERE FALSE",
     "SELECT hostname, workspace_id, cat_id, endpoint_id
        FROM hostname_endpoint_lookups WHERE FALSE",
@@ -5569,6 +5671,33 @@ CREATE TABLE IF NOT EXISTS cat_runtime_configs (
     canonical_config_sha256 TEXT NOT NULL
         CONSTRAINT cat_runtime_configs_digest_check
         CHECK (canonical_config_sha256 ~ '^sha256:[0-9a-f]{64}$'),
+    placement_vcpus BIGINT NOT NULL
+        CONSTRAINT cat_runtime_configs_placement_vcpus_check
+        CHECK (placement_vcpus BETWEEN 1 AND 4294967295),
+    placement_memory_bytes BIGINT NOT NULL
+        CONSTRAINT cat_runtime_configs_placement_memory_check
+        CHECK (placement_memory_bytes > 0),
+    placement_network_id TEXT NOT NULL,
+    placement_ipv4_pool_base BIGINT NOT NULL
+        CONSTRAINT cat_runtime_configs_placement_ipv4_pool_base_check
+        CHECK (placement_ipv4_pool_base BETWEEN 0 AND 4294901760),
+    placement_ipv4_slot BIGINT NOT NULL
+        CONSTRAINT cat_runtime_configs_placement_ipv4_slot_check
+        CHECK (placement_ipv4_slot BETWEEN 1 AND 16383),
+    placement_disk_ids TEXT[] NOT NULL
+        CONSTRAINT cat_runtime_configs_placement_disk_ids_check
+        CHECK (
+            cardinality(placement_disk_ids) BETWEEN 1 AND 64
+            AND array_position(placement_disk_ids, NULL) IS NULL
+        ),
+    placement_volume_ids TEXT[] NOT NULL
+        CONSTRAINT cat_runtime_configs_placement_volume_ids_check
+        CHECK (
+            cardinality(placement_volume_ids) BETWEEN 1 AND 64
+            AND array_position(placement_volume_ids, NULL) IS NULL
+        ),
+    CONSTRAINT cat_runtime_configs_placement_volume_cardinality_check
+        CHECK (cardinality(placement_disk_ids) = cardinality(placement_volume_ids)),
     created_at_unix_ms BIGINT NOT NULL
         CONSTRAINT cat_runtime_configs_created_at_check
         CHECK (created_at_unix_ms >= 0),
@@ -5592,6 +5721,14 @@ ALTER TABLE cat_records
     DEFERRABLE INITIALLY DEFERRED;
 CREATE INDEX IF NOT EXISTS cat_runtime_configs_cat_history
 ON cat_runtime_configs(workspace_id, cat_id, created_at_unix_ms, config_id);
+CREATE INDEX IF NOT EXISTS cat_runtime_configs_network_history
+ON cat_runtime_configs(
+    placement_network_id COLLATE \"C\", config_id COLLATE \"C\"
+);
+CREATE INDEX IF NOT EXISTS cat_runtime_configs_disk_membership
+ON cat_runtime_configs USING GIN (placement_disk_ids);
+CREATE INDEX IF NOT EXISTS cat_runtime_configs_volume_membership
+ON cat_runtime_configs USING GIN (placement_volume_ids);
 CREATE OR REPLACE FUNCTION control_cat_runtime_config_is_immutable()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN

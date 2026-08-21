@@ -27,6 +27,7 @@ use super::covered_commit::CoveredCommitState;
 use super::lifecycle_commands::{
     load_lifecycle_admission_context_in, LifecycleAdmissionContext, LifecycleStableState,
 };
+use super::placement_planner::runtime_config_placement_claims;
 use super::product::{
     ApiIdempotencyRequest, ApiIdempotencyResult, DiskAdminState, DiskRecord, DiskRole,
     PersistentDiskInitialization,
@@ -318,7 +319,8 @@ fn load_current_disk_bindings(
                 cat.current_runtime_config_id,
                 cat.current_runtime_config_sha256,
                 config.config_id, config.canonical_config_bytes,
-                config.canonical_config_sha256
+                config.canonical_config_sha256,
+                config.placement_disk_ids, config.placement_volume_ids
            FROM cat_records cat
            JOIN cat_runtime_configs config
              ON config.workspace_id=cat.workspace_id
@@ -326,14 +328,8 @@ fn load_current_disk_bindings(
             AND config.config_id=cat.current_runtime_config_id
             AND config.canonical_config_sha256=cat.current_runtime_config_sha256
           WHERE cat.deleted_at IS NULL
-            AND EXISTS (
-                SELECT 1
-                 FROM jsonb_array_elements(
-                    (convert_from(config.canonical_config_bytes, 'UTF8')::jsonb)->'volumes'
-                  ) AS candidate
-                 WHERE candidate->>'disk_id'=$1
-                    OR candidate->>'volume_id'=$2
-            )
+            AND (config.placement_disk_ids @> ARRAY[$1]::TEXT[]
+                 OR config.placement_volume_ids @> ARRAY[$2]::TEXT[])
           ORDER BY cat.cat_id COLLATE \"C\"
           LIMIT 2",
         &[&disk_id.as_str(), &volume_id.as_str()],
@@ -349,10 +345,15 @@ fn load_current_disk_bindings(
         let bytes: Vec<u8> = row.try_get("canonical_config_bytes")?;
         let config = decode_immutable_runtime_config(&bytes)
             .map_err(|_| corrupt("current runtime config bytes are invalid"))?;
+        let claims = runtime_config_placement_claims(&config)?;
+        let projected_disk_ids: Vec<String> = row.try_get("placement_disk_ids")?;
+        let projected_volume_ids: Vec<String> = row.try_get("placement_volume_ids")?;
         if current_config_id != row_config_id
             || current_digest != row_digest
             || config.config_id != row_config_id
             || config.config_digest != row_digest
+            || claims.disk_ids != projected_disk_ids
+            || claims.volume_ids != projected_volume_ids
         {
             return Err(corrupt(
                 "current runtime config pointer disagrees with immutable history",
@@ -527,19 +528,30 @@ fn append_and_advance_runtime_config(
     }
     let canonical = encode_immutable_runtime_config(target)
         .map_err(|_| corrupt("target runtime config cannot be encoded canonically"))?;
+    let claims = runtime_config_placement_claims(target)?;
     let now_pg =
         i64::try_from(now.get()).map_err(|_| corrupt("database time exceeds PostgreSQL BIGINT"))?;
     transaction.execute(
         "INSERT INTO cat_runtime_configs (
             config_id, workspace_id, cat_id, canonical_config_bytes,
-            canonical_config_sha256, created_at_unix_ms
-         ) VALUES ($1,$2,$3,$4,$5,$6)",
+            canonical_config_sha256, placement_vcpus,
+            placement_memory_bytes, placement_network_id,
+            placement_ipv4_pool_base, placement_ipv4_slot, placement_disk_ids,
+            placement_volume_ids, created_at_unix_ms
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
         &[
             &target.config_id.as_str(),
             &workspace_id.as_str(),
             &cat_id.as_str(),
             &canonical,
             &target.config_digest.as_str(),
+            &claims.vcpus,
+            &claims.memory_bytes,
+            &claims.network_id.as_str(),
+            &claims.ipv4_pool_base,
+            &claims.isolated_ipv4_slot,
+            &claims.disk_ids,
+            &claims.volume_ids,
             &now_pg,
         ],
     )?;

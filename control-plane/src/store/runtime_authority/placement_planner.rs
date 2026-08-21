@@ -21,7 +21,7 @@ use cats_api::runtime_inventory::{
     RuntimeInventoryReport,
 };
 use cats_api::runtime_lifecycle::{
-    decode_immutable_runtime_config, ImmutableRuntimeConfig, LifecycleOperationState,
+    validate_immutable_runtime_config, ImmutableRuntimeConfig, LifecycleOperationState,
     LifecycleTerminalResult, NodeResult, PlacementIdentity, RuntimeNetworkConfig,
 };
 use cats_api::runtime_reconciliation::{
@@ -56,7 +56,6 @@ use crate::store::{ApiError, Result, Store};
 const IPV4_SLOT_COUNT: u32 = 16_383;
 const IPV4_SLOT_BYTES: u32 = 4;
 const MAX_CURRENT_CATS_PER_NODE: usize = 1_024;
-const MAX_GLOBAL_RUNTIME_CONFIGS: i64 = 65_536;
 #[cfg(test)]
 const PLACEMENT_PLANNER_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -130,6 +129,46 @@ pub(crate) enum PlacementCandidateRejection {
     InsufficientVcpus,
     InsufficientMemory,
     NetworkExhausted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RuntimeConfigPlacementClaims {
+    pub(super) vcpus: i64,
+    pub(super) memory_bytes: i64,
+    pub(super) network_id: Id,
+    pub(super) ipv4_pool_base: i64,
+    pub(super) isolated_ipv4_slot: i64,
+    pub(super) disk_ids: Vec<String>,
+    pub(super) volume_ids: Vec<String>,
+}
+
+pub(super) fn runtime_config_placement_claims(
+    config: &ImmutableRuntimeConfig,
+) -> AuthorityTxResult<RuntimeConfigPlacementClaims> {
+    validate_immutable_runtime_config(config)
+        .map_err(|_| corrupt("runtime config placement claims are not canonical"))?;
+    let (network_id, pool, slot) = project_network_claims(&config.network_config)?;
+    if slot == 0 {
+        return Err(corrupt("runtime network uses the reserved /16 base slot"));
+    }
+    Ok(RuntimeConfigPlacementClaims {
+        vcpus: i64::from(config.vcpus),
+        memory_bytes: i64::try_from(config.memory_bytes)
+            .map_err(|_| corrupt("runtime config memory exceeds PostgreSQL BIGINT"))?,
+        network_id,
+        ipv4_pool_base: i64::from(pool),
+        isolated_ipv4_slot: i64::from(slot),
+        disk_ids: config
+            .volumes
+            .iter()
+            .map(|volume| volume.disk_id.to_string())
+            .collect(),
+        volume_ids: config
+            .volumes
+            .iter()
+            .map(|volume| volume.volume_id.to_string())
+            .collect(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -720,9 +759,10 @@ fn load_current_node_allocation(
                        AND pending.state='unresolved'
               )
          )
-         SELECT cat.cat_id, config.config_id,
-                config.canonical_config_bytes,
-                config.canonical_config_sha256
+         SELECT cat.cat_id, config.placement_vcpus,
+                config.placement_memory_bytes,
+                config.placement_ipv4_pool_base,
+                config.placement_ipv4_slot
            FROM cat_records cat
            JOIN current_operation operation USING (cat_id)
            JOIN cat_runtime_configs config
@@ -746,6 +786,7 @@ fn load_current_node_allocation(
         total_vcpus: 0,
         total_memory_bytes: 0,
     };
+    let expected_pool = i64::from(policy_pool_base(policy)?);
     for row in rows {
         let cat_id = Id::new(row.try_get::<_, String>("cat_id")?)
             .ok_or_else(|| corrupt("stored Cat ID is invalid"))?;
@@ -755,16 +796,32 @@ fn load_current_node_allocation(
         if excluded_cat_id == Some(&cat_id) {
             continue;
         }
-        let config = decode_projected_config(&row)?;
+        let vcpus: i64 = row.try_get("placement_vcpus")?;
+        let memory_bytes: i64 = row.try_get("placement_memory_bytes")?;
+        let pool: i64 = row.try_get("placement_ipv4_pool_base")?;
+        let slot: i64 = row.try_get("placement_ipv4_slot")?;
+        let vcpus = u128::try_from(vcpus)
+            .map_err(|_| corrupt("stored placement vCPU claim is negative"))?;
+        let memory_bytes = u128::try_from(memory_bytes)
+            .map_err(|_| corrupt("stored placement memory claim is negative"))?;
+        let slot =
+            u32::try_from(slot).map_err(|_| corrupt("stored placement IPv4 slot exceeds u32"))?;
+        if vcpus == 0
+            || memory_bytes == 0
+            || pool != expected_pool
+            || slot == 0
+            || slot > IPV4_SLOT_COUNT
+        {
+            return Err(corrupt("stored placement claims are outside their bounds"));
+        }
         allocation.total_vcpus = allocation
             .total_vcpus
-            .checked_add(u128::from(config.vcpus))
+            .checked_add(vcpus)
             .ok_or_else(|| corrupt("current vCPU allocation overflow"))?;
         allocation.total_memory_bytes = allocation
             .total_memory_bytes
-            .checked_add(u128::from(config.memory_bytes))
+            .checked_add(memory_bytes)
             .ok_or_else(|| corrupt("current memory allocation overflow"))?;
-        let slot = validate_network_config(policy, &config.network_config)?;
         if !allocation.occupied_slots.insert(slot) {
             return Err(corrupt("current runtime configs reuse an IPv4 slot"));
         }
@@ -772,46 +829,20 @@ fn load_current_node_allocation(
     Ok(allocation)
 }
 
-fn decode_projected_config(row: &postgres::Row) -> AuthorityTxResult<ImmutableRuntimeConfig> {
-    let bytes: Vec<u8> = row.try_get("canonical_config_bytes")?;
-    let config = decode_immutable_runtime_config(&bytes)
-        .map_err(|_| corrupt("stored runtime config is not canonical"))?;
-    let projected_id: String = row.try_get("config_id")?;
-    let projected_digest: String = row.try_get("canonical_config_sha256")?;
-    if config.config_id.as_str() != projected_id
-        || config.config_digest.as_str() != projected_digest
-    {
-        return Err(corrupt("stored runtime config projection mismatch"));
-    }
-    Ok(config)
-}
-
 pub(super) fn runtime_network_id_exists(
     transaction: &mut Transaction<'_>,
     network_id: &Id,
 ) -> AuthorityTxResult<bool> {
-    let rows = transaction.query(
-        "SELECT config_id, canonical_config_bytes, canonical_config_sha256
-           FROM cat_runtime_configs
-          ORDER BY config_id COLLATE \"C\"
-          LIMIT $1",
-        &[&(MAX_GLOBAL_RUNTIME_CONFIGS + 1)],
-    )?;
-    if i64::try_from(rows.len())
-        .ok()
-        .is_some_and(|len| len > MAX_GLOBAL_RUNTIME_CONFIGS)
-    {
-        return Err(corrupt(
-            "runtime config history exceeds bounded placement scan",
-        ));
-    }
-    for row in rows {
-        let config = decode_projected_config(&row)?;
-        if runtime_network_id(&config.network_config) == network_id {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    transaction
+        .query_one(
+            "SELECT EXISTS (
+                SELECT 1 FROM cat_runtime_configs
+                 WHERE placement_network_id=$1
+            )",
+            &[&network_id.as_str()],
+        )?
+        .try_get(0)
+        .map_err(Into::into)
 }
 
 fn runtime_network_id(config: &RuntimeNetworkConfig) -> &Id {
@@ -1052,38 +1083,46 @@ fn same_session_with_monotonic_deadline(planned: &AgentSession, current: &AgentS
         && current.lease_deadline_unix_ms >= planned.lease_deadline_unix_ms
 }
 
+#[cfg(test)]
 fn validate_network_config(
     policy: &NodePlacementPolicy,
     config: &RuntimeNetworkConfig,
 ) -> AuthorityTxResult<u32> {
+    let pool = policy_pool_base(policy)?;
+    let (_, config_pool, slot) = project_network_claims(config)?;
+    if config_pool != pool || slot == 0 {
+        return Err(corrupt("runtime network is outside its Node policy /16"));
+    }
+    Ok(slot)
+}
+
+fn project_network_claims(config: &RuntimeNetworkConfig) -> AuthorityTxResult<(Id, u32, u32)> {
     let RuntimeNetworkConfig::IsolatedIpv4 {
+        network_id,
         guest_mac,
         guest_ipv4,
         prefix_length,
         gateway_ipv4,
-        ..
     } = config;
     if *prefix_length != 30 {
         return Err(corrupt("runtime config has an unsupported network prefix"));
     }
-    let pool = policy_pool_base(policy)?;
     let guest = ipv4_u32(guest_ipv4)?;
     let gateway = ipv4_u32(gateway_ipv4)?;
     let subnet = guest & !3;
-    if subnet <= pool
-        || subnet.checked_add(3).is_none()
-        || subnet & 0xffff_0000 != pool
+    let pool = subnet & 0xffff_0000;
+    if subnet.checked_add(3).is_none()
         || guest != subnet + 2
         || gateway != subnet + 1
         || guest_mac.as_str() != expected_mac(guest)
     {
-        return Err(corrupt("runtime network is outside its Node policy /16"));
+        return Err(corrupt("runtime network projection is invalid"));
     }
     let slot = (subnet - pool) / IPV4_SLOT_BYTES;
-    if !(1..=IPV4_SLOT_COUNT).contains(&slot) {
-        return Err(corrupt("runtime network uses a reserved slot"));
+    if slot > IPV4_SLOT_COUNT {
+        return Err(corrupt("runtime network slot is outside one /16"));
     }
-    Ok(slot)
+    Ok((network_id.clone(), pool, slot))
 }
 
 fn allocate_network(

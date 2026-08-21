@@ -18,8 +18,8 @@ use cats_api::runtime_route::{
 
 use super::lifecycle_commands::{LifecycleCommandAdmission, LifecycleResultCommitOutcome};
 use super::lifecycle_commands_tests::{
-    digest, genesis_start, id, random, same_node_suspend, seed_cat, session_binding,
-    settle_genesis_runtime_ready, workspace_id,
+    digest, genesis_start, id, random, register_node, same_node_suspend, seed_cat, session_binding,
+    settle_genesis_runtime_ready, settle_genesis_runtime_ready_in_session, workspace_id,
 };
 use super::placement_policy::insert_policy_on_store_for_test;
 use super::placement_policy_tests::install_initial_signer_for_test;
@@ -237,6 +237,138 @@ fn endpoint_metadata_drives_enable_and_lifecycle_close_burns_every_affected_lane
             .mutations,
         0
     );
+}
+
+#[test]
+fn corrupt_route_operation_isolated_from_sibling_controller_and_poll_lanes() {
+    let store = super::lifecycle_commands_tests::test_store();
+    let workspace = workspace_id(&store, "route-corrupt-sibling");
+    let node = id("node-route-corrupt-sibling");
+    let cat_a = id("cat-a-route-corrupt-sibling");
+    let cat_b = id("cat-b-route-corrupt-sibling");
+    let creation_a = id("creation-a-route-corrupt-sibling");
+    let creation_b = id("creation-b-route-corrupt-sibling");
+    let config_a = seed_cat(&store, &workspace, &cat_a, &creation_a);
+    let config_b = seed_cat(&store, &workspace, &cat_b, &creation_b);
+    let start_a = genesis_start(
+        &workspace,
+        &node,
+        &cat_a,
+        &creation_a,
+        "operation-start-a-route-corrupt-sibling",
+        &config_a,
+    );
+    let start_b = genesis_start(
+        &workspace,
+        &node,
+        &cat_b,
+        &creation_b,
+        "operation-start-b-route-corrupt-sibling",
+        &config_b,
+    );
+    for command in [&start_a, &start_b] {
+        assert!(matches!(
+            store.admit_lifecycle_command(&workspace, command).unwrap(),
+            LifecycleCommandAdmission::Admitted(_)
+        ));
+    }
+    let (authenticated, session) = register_node(&store, &node);
+    settle_genesis_runtime_ready_in_session(&store, &authenticated, &session, &start_a, &config_a);
+    settle_genesis_runtime_ready_in_session(&store, &authenticated, &session, &start_b, &config_b);
+    insert_route_policy(&store, &node);
+    accept_full_inventory(&store, &authenticated, &session);
+    let ring = install_initial_signer_for_test(&store);
+
+    let endpoint_a = id("endpoint-a-route-corrupt-sibling");
+    let endpoint_b = id("endpoint-b-route-corrupt-sibling");
+    let endpoint_c = id("endpoint-c-route-corrupt-sibling");
+    insert_bound_endpoint(
+        &store,
+        &workspace,
+        &cat_a,
+        &endpoint_a,
+        "a.corrupt-sibling.route.test",
+        8080,
+    );
+    insert_bound_endpoint(
+        &store,
+        &workspace,
+        &cat_b,
+        &endpoint_b,
+        "b.corrupt-sibling.route.test",
+        8081,
+    );
+    let first = store
+        .reconcile_route_controller_page(None, ROUTE_CONTROLLER_PAGE_MAX_ENDPOINTS)
+        .unwrap();
+    assert_eq!((first.examined, first.mutations, first.failures), (2, 2, 0));
+    let corrupt_operation_id = store
+        .authority_transaction(|transaction| {
+            transaction
+                .query_one(
+                    "SELECT operation_id FROM route_operations
+                      WHERE endpoint_id=$1 AND state='unresolved'",
+                    &[&endpoint_a.as_str()],
+                )?
+                .try_get::<_, String>(0)
+                .map_err(Into::into)
+        })
+        .unwrap();
+    store
+        .with(|client| {
+            client.batch_execute("ALTER TABLE route_operations DISABLE TRIGGER USER")?;
+            let update = client.execute(
+                "UPDATE route_operations
+                    SET canonical_request_bytes=$1
+                  WHERE operation_id=$2",
+                &[&&b"{not-canonical-route"[..], &corrupt_operation_id],
+            );
+            let enable = client.batch_execute("ALTER TABLE route_operations ENABLE TRIGGER USER");
+            update?;
+            enable?;
+            Ok(())
+        })
+        .unwrap();
+
+    insert_bound_endpoint(
+        &store,
+        &workspace,
+        &cat_b,
+        &endpoint_c,
+        "c.corrupt-sibling.route.test",
+        8082,
+    );
+    let second = store
+        .reconcile_route_controller_page(None, ROUTE_CONTROLLER_PAGE_MAX_ENDPOINTS)
+        .unwrap();
+    assert_eq!(second.examined, 3);
+    assert_eq!(second.failures, 1);
+    assert_eq!(second.mutations, 1);
+
+    let ring_ack = RouteNodeRingAck::new(
+        session_binding(&session),
+        random(109),
+        Sequence::new(1).unwrap(),
+        ring.ring_version,
+        ring.keys.iter().map(|entry| entry.kid.clone()).collect(),
+    )
+    .unwrap();
+    let RouteCommandPollOutcome::Batch(batch) = store
+        .poll_route_commands(
+            &authenticated,
+            &RouteCommandPollRequest::new(&session, Sequence::new(1).unwrap(), Some(ring_ack))
+                .unwrap(),
+        )
+        .unwrap()
+    else {
+        panic!("current session Route poll was rejected")
+    };
+    let polled = batch
+        .commands
+        .iter()
+        .map(|command| command.binding.endpoint_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(polled, vec![endpoint_b, endpoint_c]);
 }
 
 fn command_for_endpoint<'a>(

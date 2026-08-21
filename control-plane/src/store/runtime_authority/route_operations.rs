@@ -98,6 +98,7 @@ pub(crate) const ROUTE_CONTROLLER_PAGE_MAX_ENDPOINTS: usize = 256;
 pub(crate) struct RouteControllerPage {
     pub(crate) examined: usize,
     pub(crate) mutations: usize,
+    pub(crate) failures: usize,
     /// `None` means the ordered scan reached the end and the next pass starts
     /// from the first Endpoint. A full page retains its last exact Endpoint ID.
     pub(crate) next_after_endpoint_id: Option<Id>,
@@ -171,25 +172,59 @@ impl Store {
             .last()
             .map(|candidate| candidate.endpoint_id.clone());
         let mut mutations = 0usize;
+        let mut failures = 0usize;
+        let mut completed = 0usize;
+        let mut first_failure = None;
         for candidate in candidates {
             // Generated outside the retrying transaction closure so an
             // ambiguous PostgreSQL attempt replays one exact operation ID.
             let proposed_operation_id = Id::new(format!("route_{}", uuid::Uuid::new_v4().simple()))
                 .ok_or_else(|| ApiError::internal("cannot construct Route operation identity"))?;
-            let changed = self.authority_transaction(|transaction| {
+            let result = self.authority_transaction(|transaction| {
                 reconcile_route_controller_candidate(
                     transaction,
                     &candidate,
                     &proposed_operation_id,
                 )
-            })?;
-            mutations = mutations
-                .checked_add(usize::from(changed))
-                .ok_or_else(|| ApiError::internal("Route controller mutation count overflow"))?;
+            });
+            match result {
+                Ok(changed) => {
+                    completed = completed.checked_add(1).ok_or_else(|| {
+                        ApiError::internal("Route controller completion count overflow")
+                    })?;
+                    mutations = mutations.checked_add(usize::from(changed)).ok_or_else(|| {
+                        ApiError::internal("Route controller mutation count overflow")
+                    })?;
+                }
+                Err(error) => {
+                    failures = failures.checked_add(1).ok_or_else(|| {
+                        ApiError::internal("Route controller failure count overflow")
+                    })?;
+                    tracing::warn!(
+                        cat_id = %candidate.cat_id,
+                        endpoint_id = %candidate.endpoint_id,
+                        %error,
+                        "one Endpoint Route candidate failed without aborting its sibling page"
+                    );
+                    if first_failure.is_none() {
+                        first_failure = Some(error);
+                    }
+                }
+            }
+        }
+        // A backend-wide failure generally affects every candidate. Preserve
+        // that signal instead of reporting a successful page. As soon as one
+        // independent candidate completed, however, the failed Cat cannot
+        // pin the ordered cursor in front of healthy siblings forever.
+        if completed == 0 {
+            if let Some(error) = first_failure {
+                return Err(error);
+            }
         }
         Ok(RouteControllerPage {
             examined,
             mutations,
+            failures,
             next_after_endpoint_id: (examined == limit).then_some(last).flatten(),
         })
     }
@@ -626,37 +661,74 @@ fn poll_route_commands_in(
         .ok_or_else(|| corrupt("Route poll session lease renewal overflow"))?;
     let renewed_deadline = std::cmp::max(session.lease_deadline_unix_ms, candidate_deadline);
     let session = renew_current_session_deadline(transaction, &session, renewed_deadline)?;
-    let limit = i64::try_from(ROUTE_COMMAND_BATCH_MAX_COMMANDS)
+    let page_limit = i64::try_from(ROUTE_COMMAND_BATCH_MAX_COMMANDS)
         .map_err(|_| corrupt("Route command batch limit exceeds PostgreSQL BIGINT"))?;
     let sql = format!(
         "SELECT {ROUTE_OPERATION_COLUMNS} FROM route_operations
           WHERE node_id=$1 AND node_boot_id=$2 AND agent_instance_id=$3
             AND admission_session_epoch=$4 AND state='unresolved'
-          ORDER BY endpoint_id COLLATE \"C\" LIMIT $5"
+            AND ($5::text IS NULL OR endpoint_id COLLATE \"C\" > $5 COLLATE \"C\")
+          ORDER BY endpoint_id COLLATE \"C\" LIMIT $6"
     );
-    let rows = transaction.query(
-        &sql,
-        &[
-            &session.node_id.as_str(),
-            &session.node_boot_id.as_str(),
-            &session.agent_instance_id.as_str(),
-            &session.agent_session_epoch.to_pg().map_err(corrupt)?,
-            &limit,
-        ],
-    )?;
-    let commands = rows
-        .iter()
-        .map(decode_route_operation_row)
-        .map(|operation| {
-            let operation = operation?;
-            if !matches!(operation.state, RouteOperationState::Unresolved) {
-                return Err(corrupt(
-                    "Route unresolved poll query returned a terminal Operation",
-                ));
+    let session_epoch = session.agent_session_epoch.to_pg().map_err(corrupt)?;
+    let mut commands = Vec::with_capacity(ROUTE_COMMAND_BATCH_MAX_COMMANDS);
+    let mut after_endpoint_id: Option<String> = None;
+    while commands.len() < ROUTE_COMMAND_BATCH_MAX_COMMANDS {
+        let rows = transaction.query(
+            &sql,
+            &[
+                &session.node_id.as_str(),
+                &session.node_boot_id.as_str(),
+                &session.agent_instance_id.as_str(),
+                &session_epoch,
+                &after_endpoint_id.as_deref(),
+                &page_limit,
+            ],
+        )?;
+        let row_count = rows.len();
+        let Some(last_endpoint_id) = rows
+            .last()
+            .map(|row| row.try_get::<_, String>("endpoint_id"))
+            .transpose()?
+        else {
+            break;
+        };
+        for row in &rows {
+            let operation = match decode_route_operation_row(row) {
+                Ok(operation) if matches!(operation.state, RouteOperationState::Unresolved) => {
+                    operation
+                }
+                Ok(_) => {
+                    tracing::error!(
+                        endpoint_id = row
+                            .try_get::<_, String>("endpoint_id")
+                            .unwrap_or_else(|_| "<invalid-endpoint-id>".to_owned()),
+                        "omitting terminal Route Operation returned by unresolved poll query"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    let endpoint_id = row
+                        .try_get::<_, String>("endpoint_id")
+                        .unwrap_or_else(|_| "<invalid-endpoint-id>".to_owned());
+                    tracing::error!(
+                        endpoint_id,
+                        error = ?error,
+                        "omitting corrupt per-Endpoint Route Operation from command poll"
+                    );
+                    continue;
+                }
+            };
+            commands.push(*operation.canonical_request);
+            if commands.len() == ROUTE_COMMAND_BATCH_MAX_COMMANDS {
+                break;
             }
-            Ok(*operation.canonical_request)
-        })
-        .collect::<AuthorityTxResult<Vec<_>>>()?;
+        }
+        after_endpoint_id = Some(last_endpoint_id);
+        if row_count < ROUTE_COMMAND_BATCH_MAX_COMMANDS {
+            break;
+        }
+    }
     let batch = RouteCommandBatch {
         version: ContractVersion::V1,
         session: poll.session.clone(),

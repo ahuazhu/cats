@@ -23,6 +23,7 @@ use postgres::{Row, Transaction};
 
 use super::lifecycle_commands::load_operation_unlocked;
 use super::pg_codec::PgBigInt;
+use super::placement_planner::runtime_config_placement_claims;
 use super::runtime_spine::load_current_cat_telemetry_unlocked;
 use crate::store::transaction::{AuthorityTransactionError, AuthorityTxResult};
 use crate::store::{Result as StoreResult, Store};
@@ -470,22 +471,22 @@ fn current_disk_binding(
     let rows = transaction.query(
         "SELECT c.cat_id, c.deleted_at, c.current_runtime_config_id,
                 c.current_runtime_config_sha256,
-                cfg.canonical_config_bytes
+                cfg.canonical_config_bytes,
+                cfg.placement_disk_ids, cfg.placement_volume_ids
            FROM cat_records c
            JOIN cat_runtime_configs cfg
              ON cfg.workspace_id=c.workspace_id AND cfg.cat_id=c.cat_id
             AND cfg.config_id=c.current_runtime_config_id
             AND cfg.canonical_config_sha256=c.current_runtime_config_sha256
           WHERE c.workspace_id=$1
-            AND EXISTS (
-                SELECT 1
-                  FROM jsonb_array_elements(
-                    convert_from(cfg.canonical_config_bytes, 'UTF8')::jsonb->'volumes'
-                  ) AS volume
-                 WHERE volume->>'disk_id'=$2
-            )
+            AND cfg.placement_disk_ids @> ARRAY[$2]::TEXT[]
+            AND ($3 OR c.deleted_at IS NULL)
           ORDER BY c.cat_id COLLATE \"C\" LIMIT 2",
-        &[&workspace_id.as_str(), &disk_id.as_str()],
+        &[
+            &workspace_id.as_str(),
+            &disk_id.as_str(),
+            &expected_root_cat.is_some(),
+        ],
     )?;
     let mut bindings = Vec::new();
     for candidate in rows {
@@ -499,7 +500,14 @@ fn current_disk_binding(
         let config_digest = parse_digest(candidate.try_get("current_runtime_config_sha256")?)?;
         let bytes: Vec<u8> = candidate.try_get("canonical_config_bytes")?;
         let config = decode_immutable_runtime_config(&bytes).map_err(corrupt)?;
-        if config.config_id != config_id || config.config_digest != config_digest {
+        let claims = runtime_config_placement_claims(&config)?;
+        let projected_disk_ids: Vec<String> = candidate.try_get("placement_disk_ids")?;
+        let projected_volume_ids: Vec<String> = candidate.try_get("placement_volume_ids")?;
+        if config.config_id != config_id
+            || config.config_digest != config_digest
+            || claims.disk_ids != projected_disk_ids
+            || claims.volume_ids != projected_volume_ids
+        {
             return Err(corrupt("current runtime config row projection diverged"));
         }
         let matching = config

@@ -46,6 +46,7 @@ use super::lifecycle_volume_transitions::{
     LifecycleVolumeTransitionRejection, LifecycleVolumeTransitionRequest,
     RequestedVolumeDispositionInput, StoredVolumeDisposition,
 };
+use super::placement_planner::runtime_config_placement_claims;
 use super::product::{
     CatRecord, DiskAdminState, DiskRecord, DiskRole as ProductDiskRole,
     PersistentDiskInitialization,
@@ -189,6 +190,7 @@ fn setup_persistent_initialization_with_lease(
             }),
         },
     };
+    let placement_claims = runtime_config_placement_claims(&config).unwrap();
     store
         .authority_transaction(|transaction| {
             let cat_json = serde_json::to_string(&cat_record).unwrap();
@@ -213,14 +215,24 @@ fn setup_persistent_initialization_with_lease(
             transaction.execute(
                 "INSERT INTO cat_runtime_configs (
                     config_id, workspace_id, cat_id, canonical_config_bytes,
-                    canonical_config_sha256, created_at_unix_ms
-                 ) VALUES ($1,$2,$3,$4,$5,1)",
+                    canonical_config_sha256, placement_vcpus,
+                    placement_memory_bytes, placement_network_id,
+                    placement_ipv4_pool_base, placement_ipv4_slot, placement_disk_ids,
+                    placement_volume_ids, created_at_unix_ms
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1)",
                 &[
                     &config.config_id.as_str(),
                     &workspace.as_str(),
                     &cat.as_str(),
                     &config_bytes,
                     &config.config_digest.as_str(),
+                    &placement_claims.vcpus,
+                    &placement_claims.memory_bytes,
+                    &placement_claims.network_id.as_str(),
+                    &placement_claims.ipv4_pool_base,
+                    &placement_claims.isolated_ipv4_slot,
+                    &placement_claims.disk_ids,
+                    &placement_claims.volume_ids,
                 ],
             )?;
             insert_volume(transaction, &root_volume)?;
