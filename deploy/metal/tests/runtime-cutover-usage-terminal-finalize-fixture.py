@@ -159,7 +159,7 @@ with tempfile.TemporaryDirectory() as temporary:
         "deployment_id": "deployment-a",
         "release_id": "release-a",
         "source_commit_sha": exact_commit,
-        "control_schema_version": 16,
+        "control_schema_version": 18,
         "source_manifest_sha256": digest("1"),
         "source_bundle_sha256": digest("2"),
         "build_receipt_sha256": digest("3"),

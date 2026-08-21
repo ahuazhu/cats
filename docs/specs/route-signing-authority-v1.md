@@ -187,6 +187,12 @@ provider/BMC隔离，不能以TTL或仅删public key替代。fresh ring必须是
 未fence的provisioned Node取得fresh全量ACK且accepted inventory证明全部gate Closed、guard归零后，才允许
 以新revision activate，之后另由既有Desired route-epoch规则重开。
 
+每个持久 ACK 的 exact `SessionBinding` 通过外键绑定签发它的 immutable
+`agent_registration_attempts` 历史行，而不是可被 replacement 更新的 `current_agent_sessions` pointer。
+Agent replacement 后旧 ACK 保留但立即 stale；所有消费方仍须在同一数据库快照中证明 ACK 的 exact
+SessionBinding 等于 current AgentSession。新 session 完成 fresh Full inventory 并提交自己的 forward-only
+ACK 前，Route 签发和 uncordon 都保持关闭。
+
 ## 6. Deployment shape
 
 - Terraform只保存canonical descriptor/public ring、`secret_reference_id`、provider secret resource reference

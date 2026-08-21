@@ -516,7 +516,7 @@ takeover在owner/epoch线性化点同时写入当前Node；release和两种begin
 旧binding的Node等于已锁HostFenceEvent的Node，host-fence disposable consume同理；runtime-stopped release/
 delete要求当前authenticated Node。binding/projection/Volume任一漂移都按stored corruption fail closed。
 
-clean-slate schema 17提供两个partial ordered B-tree：projection arm
+clean-slate schema 18提供两个partial ordered B-tree：projection arm
 `(owner_node_id, volume_id COLLATE "C") WHERE owner_node_id IS NOT NULL`与canonical arm
 `((owner_binding->>'owner_node_id'), volume_id COLLATE "C") WHERE owner_binding IS NOT NULL`。Runtime
 inventory在一个read-only Repeatable Read事务中以两臂各自bounded查询并严格解码，最多返回`65536`
@@ -1242,7 +1242,7 @@ release取得Volume锁后必须fresh读取同一delete ID/Operation的authorizat
 current command。release先commit时derive随后看到Unowned并整笔回滚；derive先commit时release看到auth并
 零副作用拒绝。这个fresh probe必须以projection current scope **或** canonical authorization中的同一
 volume/delete/Operation/placement scope选出至多两个候选，再完整closed decode并交叉验证projection；任一方向
-drift都属于corruption，而旧lineage不进入候选。clean-slate schema 17必须在启动时精确校验
+drift都属于corruption，而旧lineage不进入候选。clean-slate schema 18必须在启动时精确校验
 两个独立index：canonical
 arm由`GIN ((record->'authorization') jsonb_path_ops)`承载，projection arm由partial ordered B-tree
 `(volume_id, lifecycle_operation_id, placement_epoch, authorization_id COLLATE "C") WHERE kind='disposable_root_delete'`
@@ -1465,7 +1465,7 @@ chain，不存在跨Node workflow、desired-state revision或Observation推断�
 
 ## 13. 实现边界
 
-clean-slate schema 17已组成唯一PostgreSQL Volume authority adapter、signed lifecycle-volume
+clean-slate schema 18已组成唯一PostgreSQL Volume authority adapter、signed lifecycle-volume
 transition route、command-scoped receipt ledger、Start grant/renewal、Cold mixed disposition、Delete begin/
 completion、Cold-window config succession、Persistent inspect/commit initialization与snapshot-aware delete sweeper。Node私有journal/
 physical manifest负责effect crash recovery，不是Control protocol或另一storage authority。

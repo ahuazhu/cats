@@ -1117,7 +1117,7 @@ def admission_chain_fixture(context: Any) -> Any:
         "deployment_id": "dep_a",
         "release_id": context.release_id,
         "source_commit_sha": context.release_commit,
-        "control_schema_version": 16,
+        "control_schema_version": 18,
         "source_manifest_sha256": SHA_A,
         "source_bundle_sha256": SHA_B,
         "build_receipt_sha256": SHA_C,

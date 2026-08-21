@@ -2,6 +2,8 @@
 
 - 状态：Accepted
 - 日期：2026-08-20
+- schema组成修正：[ADR-0058](0058-route-ring-acknowledges-immutable-agent-session.md) 将终态推进到
+  schema 18，并让Route ring ACK绑定immutable AgentSession history
 - 部分取代：[ADR-0057](0057-product-lifecycle-actions-and-internal-execution-evidence.md)取代本文的
   公开`Start/Suspend/Warm/Cold/Stop/Delete`动作命名、独立`Stop -> Killed`产品head与直接product
   Operation投影；本文的atomic execution/authority边界继续有效
@@ -18,7 +20,7 @@
 - Volume authority：[ADR-0042](0042-volume-authority-and-disk-lifecycle.md) 与
   [Volume Authority](../specs/volume-authority.md)
 - 冻结规格：[Atomic Runtime Lifecycle v1](../specs/atomic-runtime-lifecycle-v1.md)
-- 实现边界：schema 17 atomic lifecycle/Volume/Route内部软件组成与ADR-0057六动作product adapter已落地；
+- 实现边界：schema 18 atomic lifecycle/Volume/Route内部软件组成与ADR-0057六动作product adapter已落地；
   private Start/Stop/Delete/Killed execution wire/head不进入product projection；Route resolve只接受
   `run_required`并拒绝旧`wake_required`。其他current release gate
   与production qualification由[规格 §11](../specs/atomic-runtime-lifecycle-v1.md#11-acceptance-matrix)

@@ -1,8 +1,9 @@
 # Cats 技术架构
 
-- 状态：目标架构 + 当前实现边界；ADR-0056 atomic lifecycle内部软件组成与
+- 状态：目标架构 + 当前实现边界；ADR-0056 atomic lifecycle内部软件组成、
   [ADR-0057](decisions/0057-product-lifecycle-actions-and-internal-execution-evidence.md)六动作
-  product adapter已落地并隐藏private`Start/Stop/Delete/Killed`；Route resolve使用`run_required`并严格拒绝
+  product adapter与[ADR-0058](decisions/0058-route-ring-acknowledges-immutable-agent-session.md)
+  session/Route ACK约束修正已落地并隐藏private`Start/Stop/Delete/Killed`；Route resolve使用`run_required`并严格拒绝
   旧`wake_required`。clean-slate release gate与production qualification仍未宣称完成
 - 更新：2026-08-21
 - 适用范围：产品资源、控制面、Node、网络入口、microVM 与块存储
@@ -71,13 +72,13 @@ Observation -> monitoring / diagnostics / capacity / drift only
 
 ### 3.1 当前实现事实
 
-仓库当前已组成clean-slate schema 17的signed atomic Runtime production spine；这不等于
+仓库当前已组成clean-slate schema 18的signed atomic Runtime production spine；这不等于
 release qualification已通过。下表把已实现边界与仍开放的边界分开：
 
 | 范围 | 当前事实 | 目标差距 |
 |---|---|---|
 | ChunkStore | Rust engine、delta pack、golden root、NBD/vhost-user-blk、fencing 与 crash tests 已存在 | 保持格式和语义；补齐组合故障验收 |
-| 控制面 | PostgreSQL schema 17、one-unresolved lifecycle/Route lanes、exact result settlement、volume receipt ledger、A23 policy/planner、atomic Cat-create、六动作product adapter与run_required fixed vector已组成 | 禁止终态/schema枚举、legacy parser absence、final digest vectors与真实RDS/HostFence仍是release gate |
+| 控制面 | PostgreSQL schema 18、one-unresolved lifecycle/Route lanes、exact result settlement、volume receipt ledger、A23 policy/planner、atomic Cat-create、六动作product adapter与run_required fixed vector已组成 | 禁止终态/schema枚举、legacy parser absence、final digest vectors与真实RDS/HostFence仍是release gate |
 | Node | production `noded`组成signed lifecycle/volume/Route clients、installed executor、Node-private journal/StopFence、full inventory与admission registry | 全部合法failure successor与retained cleanup链须通过crash matrix；exact release须过Linux/metal门 |
 | inventory/session | Full/Partial `RuntimeInventoryReport`只作telemetry/attestation，accepted report可单调续期current AgentSession；legacy work routes不在production route map | timeout只产生suspicion，不得替代HostFenceEvent |
 | route | v2 Grant、signed per-Endpoint poll/result lane、Node AdmissionCell/guard、mandatory installed listener/delivery、mTLS tunnel与gatewayd proxy已组成 | 真实production mTLS/rotation qualification与跨Node overlay仍分别开放 |
@@ -444,7 +445,7 @@ Host恢复必须同时调用AgentSession、逐卷takeover和route close，不能
 
 ### 12.1 已完成边界与剩余验证顺序
 
-1. schema 17、atomic lifecycle/Volume/Route signed lanes、installed Node executor/journal/inventory/
+1. schema 18、atomic lifecycle/Volume/Route signed lanes、installed Node executor/journal/inventory/
    AdmissionCell、Control exact settlement与六动作product adapter已组成；private Start/Stop/Delete/Killed
    不进入product projection；Route resolve只接受run_required；旧Desired/NodeJob/Observation settlement不在
    production composition。仅供显式回归的retired codec/harness也必须与production parser/export边界隔离。

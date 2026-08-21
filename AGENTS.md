@@ -24,7 +24,7 @@ Route Operation   -> independent per-Endpoint lane sharing the local AdmissionCe
 
 The release is one coherent clean-slate vertical cutover across schema, Control, Node effects, disk
 binding, inventory, Operation settlement and Route admission, following
-[`docs/operations-ha.md` §8](docs/operations-ha.md#8-首次终态部署). It has one empty v17 target
+[`docs/operations-ha.md` §8](docs/operations-ha.md#8-首次终态部署). It has one empty v18 target
 schema and one protocol version; old Desired/reconcile, NodeJob, observation-settlement and
 compatibility paths leave service before it starts. PostgreSQL Operation rows are the sole lifecycle
 intent/result authority, the Node command journal is the sole restart authority for physical effects,

@@ -189,7 +189,7 @@ atomic lifecycle只允许一次one-version clean-slate vertical cutover：
 3. 停止所有旧Controller/Node/Gateway/signer/write path，确认不会再写旧schema、route mirror或volume authority。
 4. rotate/revoke旧service/Node/route credentials；删除旧Desired read、reconcile、Observation settlement、NodeJob、
    heartbeat overwrite、legacy Route parser/mirror和兼容IAM input。
-5. 删除开发product/runtime state，创建唯一empty atomic schema 17。没有Desired/Operation/checkpoint/runtime/
+5. 删除开发product/runtime state，创建唯一empty atomic schema 18。没有Desired/Operation/checkpoint/runtime/
    route migration、translator、dual write/read、fallback或mixed-version window。
 6. provision immutable NodeIdentity/state-path/credential与cordoned NodePlacementPolicy；Node先取得Host lock、fresh
    AgentSession、complete inventory，所有AdmissionCell/gate Closed。

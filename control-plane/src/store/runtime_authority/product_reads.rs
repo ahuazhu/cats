@@ -1,4 +1,4 @@
-//! Repeatable-read public projections over the atomic v17 product catalog.
+//! Repeatable-read public projections over the atomic v18 product catalog.
 //!
 //! Lifecycle state comes only from the Cat's exact terminal Operation
 //! projection. Runtime inventory is optional telemetry and is never used to
