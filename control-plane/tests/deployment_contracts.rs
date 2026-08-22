@@ -3547,9 +3547,14 @@ fn release_artifacts_share_one_canonical_guest_payload() {
     assert!(workflow.contains("RELEASE_OUT=\"$PWD/guest-runtime-release.v1\""));
     let control = workflow
         .split_once("  control-plane-image:\n")
-        .and_then(|(_, rest)| rest.split_once("  gateway-image:\n"))
+        .and_then(|(_, rest)| rest.split_once("  credential-refresher-image:\n"))
         .map(|(section, _)| section)
         .expect("control-plane image job");
+    let credential_refresher = workflow
+        .split_once("  credential-refresher-image:\n")
+        .and_then(|(_, rest)| rest.split_once("  gateway-image:\n"))
+        .map(|(section, _)| section)
+        .expect("credential-refresher image job");
     let gateway = workflow
         .split_once("  gateway-image:\n")
         .and_then(|(_, rest)| rest.split_once("  worker-bundle:\n"))
@@ -3559,10 +3564,10 @@ fn release_artifacts_share_one_canonical_guest_payload() {
         .split_once("  worker-bundle:\n")
         .map(|(_, section)| section)
         .expect("worker bundle job");
-    for consumer in [control, worker] {
+    for consumer in [control, credential_refresher, worker] {
         assert!(
             consumer.contains("needs: [aws-target, guest-runtime-release]"),
-            "Control and Node artifacts must consume the canonical Guest release after the AWS target fence"
+            "Control-derived and Node artifacts must consume the canonical Guest release after the AWS target fence"
         );
         assert!(consumer.contains("uses: actions/download-artifact@v4"));
         assert!(consumer.contains("name: guest-runtime-release-v1"));
@@ -3571,11 +3576,19 @@ fn release_artifacts_share_one_canonical_guest_payload() {
         !gateway.contains("guest-runtime-release-v1"),
         "the Gateway image must not pretend to consume the shared Guest release artifact"
     );
+    for release_image in [control, credential_refresher, gateway] {
+        assert!(release_image.contains("platforms: linux/amd64"));
+    }
+    for release_bound_image in [control, credential_refresher] {
+        assert!(
+            release_bound_image.contains("build-args: CATS_RELEASE_COMMIT_SHA=${{ github.sha }}")
+        );
+    }
     assert!(workflow.contains("build-args: CATS_RELEASE_COMMIT_SHA=${{ github.sha }}"));
     assert_eq!(
         workflow.matches("name: guest-runtime-release-v1").count(),
-        3,
-        "one upload and exactly two consumers must name the same artifact"
+        4,
+        "one upload and exactly three consumers must name the same artifact"
     );
     let production_workflow = read_workspace_file(".github/workflows/deploy-production.yml");
     assert!(
@@ -3618,10 +3631,13 @@ fn manual_release_builder_verifies_all_final_artifacts_and_writes_one_receipt() 
         "--build-arg \"CATS_RELEASE_COMMIT_SHA=$source_sha\"",
         "--file deploy/aws/Dockerfile.worker-artifact",
         "docker create --platform linux/amd64 \"$control_image_id\"",
+        "docker create --platform linux/amd64 \"$credential_refresher_image_id\"",
         "docker create --platform linux/amd64 \"$gateway_image_id\"",
         "verify-manual-release.py",
         "--control-image-registry-verified false",
         "--control-image-registry-verified true",
+        "--credential-refresher-image-registry-verified false",
+        "--credential-refresher-image-registry-verified true",
         "--gateway-image-registry-verified false",
         "--gateway-image-registry-verified true",
         "--input-file \"guest_host_kernel=$guest_kernel\"",
@@ -3630,16 +3646,19 @@ fn manual_release_builder_verifies_all_final_artifacts_and_writes_one_receipt() 
         "--input-file \"production_cutover_proof_set=$source_root/deploy/aws/production_cutover_proof_set.py\"",
         "--export-images",
         "type=oci,dest=$control_archive",
+        "type=oci,dest=$credential_refresher_archive",
         "type=oci,dest=$gateway_archive",
         // Docker loads only its own archive format unless the daemon runs the
         // containerd image store, so the export must also produce the archives
         // the local identity checks and binary extraction load.
         "type=docker,dest=$control_load_archive",
+        "type=docker,dest=$credential_refresher_load_archive",
         "type=docker,dest=$gateway_load_archive",
         "docker image load --input \"$control_load_archive\"",
+        "docker image load --input \"$credential_refresher_load_archive\"",
         "docker image load --input \"$gateway_load_archive\"",
         // Those copies are build scratch and must never reach the handoff.
-        "rm -f -- \"$control_load_archive\" \"$gateway_load_archive\"",
+        "rm -f -- \"$control_load_archive\" \"$credential_refresher_load_archive\" \"$gateway_load_archive\"",
         // Cargo publishes a release binary as a hard link to its deps
         // artifact, so the verifier's single-link rule needs a private copy.
         "cp \"$guest_agent_bin\" \"$guest_agent_fingerprint\"",
@@ -3648,6 +3667,7 @@ fn manual_release_builder_verifies_all_final_artifacts_and_writes_one_receipt() 
         // under a name that cannot be mistaken for a release.
         "incomplete release retained for diagnosis",
         "cats-control-plane-image.tar",
+        "cats-credential-refresher-image.tar",
         "cats-gateway-image.tar",
         "> SHA256SUMS",
     ] {
@@ -3713,6 +3733,63 @@ fn manual_release_builder_verifies_all_final_artifacts_and_writes_one_receipt() 
 }
 
 #[test]
+fn production_release_packager_is_offline_characterized() {
+    let root = workspace_root();
+    let output = Command::new("python3")
+        .arg(root.join("deploy/aws/tools/package-production-release-fixture.py"))
+        .arg("--packager")
+        .arg(root.join("deploy/aws/tools/package-production-release.py"))
+        .output()
+        .expect("run production release packaging fixture");
+    assert!(
+        output.status.success(),
+        "production release packaging fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("production release packaging fixture: PASS"));
+}
+
+#[test]
+fn production_release_deployer_is_offline_characterized() {
+    let root = workspace_root();
+    let output = Command::new("python3")
+        .arg(root.join("deploy/aws/tools/deploy-production-release-fixture.py"))
+        .arg("--deployer")
+        .arg(root.join("deploy/aws/tools/deploy-production-release.py"))
+        .output()
+        .expect("run production release deployment fixture");
+    assert!(
+        output.status.success(),
+        "production release deployment fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("production release deployment fixture: PASS"));
+}
+
+#[test]
+fn production_cat_lifecycle_e2e_is_offline_characterized() {
+    let root = workspace_root();
+    let output = Command::new("python3")
+        .arg(root.join("deploy/aws/tools/production-cat-lifecycle-e2e-fixture.py"))
+        .arg("--driver")
+        .arg(root.join("deploy/aws/tools/production-cat-lifecycle-e2e.py"))
+        .output()
+        .expect("run production Cat lifecycle E2E fixture");
+    assert!(
+        output.status.success(),
+        "production Cat lifecycle E2E fixture failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("production Cat lifecycle E2E fixture: PASS"));
+}
+
+#[test]
 fn production_deployment_builds_the_same_guest_payload_as_release() {
     let release = read_workspace_file(".github/workflows/release.yml");
     let production = read_workspace_file(".github/workflows/deploy-production.yml");
@@ -3746,6 +3823,21 @@ fn production_deployment_builds_the_same_guest_payload_as_release() {
         step(&release),
         "production and release workflows must build the exact same Guest runtime payload before the control-plane Docker build",
     );
+    for packaged_workload in [
+        "-var=\"control_plane_image=$IMAGE_REF\"",
+        "-var=\"object_write_gateway_image=$IMAGE_REF\"",
+        "-var=\"credential_refresher_image=$REFRESHER_REF\"",
+        "-var=\"gateway_image=$GATEWAY_REF\"",
+        "verify_deployment cats-controld \"$IMAGE_REF\"",
+        "verify_deployment cats-object-write-gateway \"$IMAGE_REF\"",
+        "verify_deployment cats-gatewayd \"$GATEWAY_REF\"",
+        "[[ \"$observed_refresher\" == \"$REFRESHER_REF\" ]]",
+    ] {
+        assert!(
+            production.contains(packaged_workload),
+            "production deployment lost packaged workload binding {packaged_workload:?}"
+        );
+    }
 }
 
 #[test]

@@ -134,6 +134,7 @@ AgentSession 或 HostFenceRecovery 协调的段落，都由 ADR-0059 supersede�
 - [0026 OCI deploy outlives request](decisions/0026-oci-deploy-outlives-its-request.md)
 - [0029 Database password authority](decisions/0029-one-authority-for-the-database-password.md)
 - [0034 RDS Proxy](decisions/0034-bound-postgresql-connections-with-rds-proxy.md)
+- [0060 完整生产发布清单绑定独立 credential refresher](decisions/0060-complete-production-release-binds-credential-refresher.md)
 - [0043 Provisioner-owned runtime placement policy](decisions/0043-provisioner-owned-runtime-placement-policy.md)
 - [0044 独立 Route v2 signing authority](decisions/0044-independent-route-v2-signing-authority.md)（历史 Route 组成）
 - [0045 独立 Gateway workload identity authority](decisions/0045-independent-gateway-workload-identity.md)（历史 Route 组成）

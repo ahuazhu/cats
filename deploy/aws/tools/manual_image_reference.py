@@ -60,22 +60,26 @@ def canonical_image_tag(reference: str) -> str:
     return f"{registry}/{'/'.join(path)}:{tag}"
 
 
-def require_distinct_image_tags(control: str, gateway: str) -> tuple[str, str]:
-    canonical_control = canonical_image_tag(control)
-    canonical_gateway = canonical_image_tag(gateway)
-    if canonical_control == canonical_gateway:
+def require_distinct_image_tags(*references: str) -> tuple[str, ...]:
+    if len(references) < 2:
+        raise ImageReferenceError("at least two image references are required")
+    canonical = tuple(canonical_image_tag(reference) for reference in references)
+    if len(set(canonical)) != len(canonical):
         raise ImageReferenceError(
-            "Control and Gateway image references resolve to the same mutable tag"
+            "production image references must resolve to distinct mutable tags"
         )
-    return canonical_control, canonical_gateway
+    return canonical
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
-        print("usage: manual_image_reference.py CONTROL_TAG GATEWAY_TAG", file=sys.stderr)
+    if len(sys.argv) < 3:
+        print(
+            "usage: manual_image_reference.py IMAGE_TAG IMAGE_TAG [IMAGE_TAG ...]",
+            file=sys.stderr,
+        )
         return 2
     try:
-        require_distinct_image_tags(sys.argv[1], sys.argv[2])
+        require_distinct_image_tags(*sys.argv[1:])
     except ImageReferenceError as error:
         print(f"manual image reference validation failed: {error}", file=sys.stderr)
         return 1

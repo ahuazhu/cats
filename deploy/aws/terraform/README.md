@@ -394,9 +394,10 @@ PostgreSQL.
 
 An operator starts `Deploy production` explicitly from a `main` commit after
 the required repository and native Linux gates have passed. The workflow
-builds and pushes separate control-plane and Gateway images, pins both registry
-digests, creates a saved application plan, applies that exact plan and verifies
-each Deployment against its own immutable image reference. A failed build,
+builds and pushes separate control-plane, credential-refresher and Gateway
+images, pins all three registry digests, creates a saved application plan,
+applies that exact plan and verifies each workload against its own immutable
+image reference. A failed build,
 plan, apply or rollout records a failed GitHub deployment.
 
 That workflow updates the Terraform-managed Control and Gateway applications;

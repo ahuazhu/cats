@@ -6,10 +6,10 @@ usage() {
   cat >&2 <<'EOF'
 usage: publish-manual-release.sh --release /absolute/path --manifest-sha256 sha256:HEX --output-manifest /absolute/path
 
-Checks the transport hashes, loads both image archives, verifies their local
+Checks the transport hashes, loads all three image archives, verifies their local
 IDs and OCI manifest digests against release-manifest.v1.json, pushes the exact
-manifest references, verifies both registry digests, then promotes the existing
-manifest by changing only its two registry_verified values to true.
+manifest references, verifies all registry digests, then promotes the existing
+manifest by changing only its three registry_verified values to true.
 EOF
 }
 
@@ -66,8 +66,9 @@ release_verifier="$tool_root/verify-manual-release.py"
 manifest="$release_root/release-manifest.v1.json"
 checksums="$release_root/SHA256SUMS"
 control_archive="$release_root/cats-control-plane-image.tar"
+credential_refresher_archive="$release_root/cats-credential-refresher-image.tar"
 gateway_archive="$release_root/cats-gateway-image.tar"
-for input in "$manifest" "$checksums" "$control_archive" "$gateway_archive"; do
+for input in "$manifest" "$checksums" "$control_archive" "$credential_refresher_archive" "$gateway_archive"; do
   [[ -f $input && ! -L $input ]] || {
     echo "missing regular release input: $input" >&2
     exit 1
@@ -75,16 +76,17 @@ for input in "$manifest" "$checksums" "$control_archive" "$gateway_archive"; do
 done
 (
   cd "$release_root"
-  [[ $(wc -l < SHA256SUMS) -eq 2 ]] || {
-    echo "SHA256SUMS must name exactly the two transport archives" >&2
+  [[ $(wc -l < SHA256SUMS) -eq 3 ]] || {
+    echo "SHA256SUMS must name exactly the three transport archives" >&2
     exit 1
   }
   awk '
     NR == 1 { expected = "cats-control-plane-image.tar" }
-    NR == 2 { expected = "cats-gateway-image.tar" }
+    NR == 2 { expected = "cats-credential-refresher-image.tar" }
+    NR == 3 { expected = "cats-gateway-image.tar" }
     $1 !~ /^[0-9a-f]{64}$/ || $2 != expected { exit 1 }
   ' SHA256SUMS || {
-    echo "SHA256SUMS must contain only the two canonical transport names" >&2
+    echo "SHA256SUMS must contain only the three canonical transport names" >&2
     exit 1
   }
   sha256sum --check --strict SHA256SUMS
@@ -96,6 +98,9 @@ candidate=$(python3 -B "$release_verifier" registry-candidate \
 control_reference=$(jq -er '.control_plane.reference' <<<"$candidate")
 control_digest=$(jq -er '.control_plane.image_digest' <<<"$candidate")
 control_config=$(jq -er '.control_plane.config_digest' <<<"$candidate")
+credential_refresher_reference=$(jq -er '.credential_refresher.reference' <<<"$candidate")
+credential_refresher_digest=$(jq -er '.credential_refresher.image_digest' <<<"$candidate")
+credential_refresher_config=$(jq -er '.credential_refresher.config_digest' <<<"$candidate")
 gateway_reference=$(jq -er '.gateway.reference' <<<"$candidate")
 gateway_digest=$(jq -er '.gateway.image_digest' <<<"$candidate")
 gateway_config=$(jq -er '.gateway.config_digest' <<<"$candidate")
@@ -126,11 +131,22 @@ verify_archive() {
 }
 
 verify_archive "$control_archive" "$control_reference" "$control_digest" "$control_config" Control
+verify_archive \
+  "$credential_refresher_archive" \
+  "$credential_refresher_reference" \
+  "$credential_refresher_digest" \
+  "$credential_refresher_config" \
+  credential-refresher
 verify_archive "$gateway_archive" "$gateway_reference" "$gateway_digest" "$gateway_config" Gateway
 
 docker push "$control_reference"
 [[ $(docker buildx imagetools inspect --raw "$control_reference" | sha256sum | awk '{print "sha256:" $1}') == "$control_digest" ]] || {
   echo "registry Control digest differs from the release manifest" >&2
+  exit 1
+}
+docker push "$credential_refresher_reference"
+[[ $(docker buildx imagetools inspect --raw "$credential_refresher_reference" | sha256sum | awk '{print "sha256:" $1}') == "$credential_refresher_digest" ]] || {
+  echo "registry credential-refresher digest differs from the release manifest" >&2
   exit 1
 }
 docker push "$gateway_reference"
@@ -143,6 +159,7 @@ python3 -B "$release_verifier" registry-candidate \
   --manifest "$manifest" \
   --manifest-sha256 "$manifest_sha256" \
   --control-registry-digest "$control_digest" \
+  --credential-refresher-registry-digest "$credential_refresher_digest" \
   --gateway-registry-digest "$gateway_digest" \
   --output "$output_manifest"
 

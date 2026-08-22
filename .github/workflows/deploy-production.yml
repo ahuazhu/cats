@@ -478,6 +478,7 @@ jobs:
         shell: bash
         env:
           IMAGE_REF: ${{ steps.image.outputs.ref }}
+          REFRESHER_REF: ${{ steps.image.outputs.refresher_ref }}
         run: |
           set -euo pipefail
           verify_deployment() {
@@ -498,6 +499,14 @@ jobs:
             [[ "$observed" == "$expected_image" ]]
           }
           verify_deployment cats-controld "$IMAGE_REF"
+          observed_refresher="$(
+            kubectl \
+              --kubeconfig "$RUNNER_TEMP/kubeconfig" \
+              --namespace cats \
+              get cronjob/cats-credential-refresher \
+              --output jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].image}'
+          )"
+          [[ "$observed_refresher" == "$REFRESHER_REF" ]]
 
       - name: Mark deployment successful
         if: success() && steps.deployment.outputs.id != ''

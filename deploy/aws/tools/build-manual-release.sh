@@ -4,13 +4,13 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: build-manual-release.sh --source-sha SHA --output /absolute/path [--image REPOSITORY:TAG] [--gateway-image REPOSITORY:TAG] [--push | --export-images]
+usage: build-manual-release.sh --source-sha SHA --output /absolute/path [--image REPOSITORY:TAG] [--credential-refresher-image REPOSITORY:TAG] [--gateway-image REPOSITORY:TAG] [--push | --export-images]
 
-Builds the shared Guest runtime once, then the linux/amd64 Control image,
-Route v2 Gateway image and worker bundle. Default images stay local; --push
-requires both explicit repository:tag references and verifies both reported
+Builds the shared Guest runtime once, then the linux/amd64 Control,
+credential-refresher and Route v2 Gateway images plus the worker bundle.
+Default images stay local; --push requires all three explicit repository:tag references and verifies all reported
 digests against the registry before writing release-manifest.v1.json.
---export-images instead writes two transport-only Docker image archives and a
+--export-images instead writes three transport-only OCI image archives and a
 SHA256SUMS file. It does not contact a registry or change manifest authority.
 EOF
 }
@@ -18,6 +18,7 @@ EOF
 source_sha=
 output_root=
 image_reference=
+credential_refresher_image_reference=
 gateway_image_reference=
 push_image=false
 export_images=false
@@ -42,6 +43,11 @@ while [[ $# -gt 0 ]]; do
     --gateway-image)
       [[ $# -ge 2 ]] || { usage; exit 2; }
       gateway_image_reference=$2
+      shift 2
+      ;;
+    --credential-refresher-image)
+      [[ $# -ge 2 ]] || { usage; exit 2; }
+      credential_refresher_image_reference=$2
       shift 2
       ;;
     --push)
@@ -84,8 +90,15 @@ if [[ $push_image == true || $export_images == true ]]; then
     echo "--push/--export-images requires --gateway-image with an explicit repository:tag (not a digest)" >&2
     exit 2
   }
+  [[ -n $credential_refresher_image_reference && $credential_refresher_image_reference != *@* && $credential_refresher_image_reference == */*:* ]] || {
+    echo "--push/--export-images requires --credential-refresher-image with an explicit repository:tag (not a digest)" >&2
+    exit 2
+  }
 elif [[ -z $image_reference ]]; then
   image_reference="cats-control-plane:manual-${source_sha:0:12}"
+fi
+if [[ -z $credential_refresher_image_reference ]]; then
+  credential_refresher_image_reference="cats-credential-refresher:manual-${source_sha:0:12}"
 fi
 if [[ -z $gateway_image_reference ]]; then
   gateway_image_reference="cats-gateway:manual-${source_sha:0:12}"
@@ -98,11 +111,15 @@ fi
   echo "--gateway-image must be a whitespace-free tag reference without @" >&2
   exit 2
 }
+[[ $credential_refresher_image_reference != *@* && $credential_refresher_image_reference != *[[:space:]]* ]] || {
+  echo "--credential-refresher-image must be a whitespace-free tag reference without @" >&2
+  exit 2
+}
 
 # Reject one mutable tag expressed twice (including Docker Hub and default-443
 # aliases) before probing Docker or touching a network/build output.
 python3 "$(dirname "$0")/manual_image_reference.py" \
-  "$image_reference" "$gateway_image_reference"
+  "$image_reference" "$credential_refresher_image_reference" "$gateway_image_reference"
 
 for required in docker git python3 sha256sum stat tar zstd; do
   command -v "$required" >/dev/null 2>&1 || {
@@ -156,6 +173,7 @@ source_fingerprint=$(
 umask 077
 stage_parent=$(mktemp -d "${TMPDIR:-/tmp}/cats-manual-release.XXXXXX")
 control_container=
+credential_refresher_container=
 gateway_container=
 root_touched_stage=false
 output_incomplete=
@@ -166,6 +184,9 @@ cleanup() {
   fi
   if [[ -n $gateway_container ]]; then
     docker rm -f "$gateway_container" >/dev/null 2>&1 || true
+  fi
+  if [[ -n $credential_refresher_container ]]; then
+    docker rm -f "$credential_refresher_container" >/dev/null 2>&1 || true
   fi
   if [[ $root_touched_stage == true ]]; then
     sudo -n chown -Rh "$(id -u):$(id -g)" "$stage_parent" 2>/dev/null || true
@@ -247,21 +268,25 @@ sudo env \
 sudo chown -R "$(id -u):$(id -g)" "$guest_output" "$guest_release"
 
 control_metadata="$output_incomplete/control-image-metadata.json"
+credential_refresher_metadata="$output_incomplete/credential-refresher-image-metadata.json"
 gateway_metadata="$output_incomplete/gateway-image-metadata.json"
 worker_metadata="$output_incomplete/worker-image-metadata.json"
 control_archive="$output_incomplete/cats-control-plane-image.tar"
+credential_refresher_archive="$output_incomplete/cats-credential-refresher-image.tar"
 gateway_archive="$output_incomplete/cats-gateway-image.tar"
 # The OCI archives are the release transport and the verification subject.
 # Docker only loads its own archive format unless the daemon runs the
 # containerd image store, so exporting both lets the local identity checks and
 # binary extraction keep working. These copies never reach the handoff.
 control_load_archive="$output_incomplete/control-load.tar"
+credential_refresher_load_archive="$output_incomplete/credential-refresher-load.tar"
 gateway_load_archive="$output_incomplete/gateway-load.tar"
 control_root="$output_incomplete/control-root"
+credential_refresher_root="$output_incomplete/credential-refresher-root"
 gateway_root="$output_incomplete/gateway-root"
 worker_root="$output_incomplete/worker-root"
 worker_bundle="$output_incomplete/cats-worker.tar.zst"
-mkdir -m 0700 "$control_root" "$gateway_root" "$worker_root"
+mkdir -m 0700 "$control_root" "$credential_refresher_root" "$gateway_root" "$worker_root"
 
 build_arguments=(
   --file deploy/aws/Dockerfile.control-plane
@@ -334,6 +359,79 @@ docker cp \
   "$control_root/opt/cats/release/guest-runtime-release-manifest.v1.json"
 docker rm "$control_container" >/dev/null
 control_container=
+
+credential_refresher_build_arguments=(
+  --file deploy/aws/Dockerfile.control-plane
+  --target credential-refresher
+  --platform linux/amd64
+  --build-arg "CATS_RELEASE_COMMIT_SHA=$source_sha"
+  --provenance=false
+  --metadata-file "$credential_refresher_metadata"
+  --tag "$credential_refresher_image_reference"
+)
+if [[ $export_images == true ]]; then
+  credential_refresher_build_arguments+=(
+    --output "type=oci,dest=$credential_refresher_archive"
+    --output "type=docker,dest=$credential_refresher_load_archive"
+  )
+else
+  credential_refresher_build_arguments+=(--load)
+fi
+docker buildx build \
+  "${buildx_builder[@]}" \
+  "${credential_refresher_build_arguments[@]}" \
+  "$source_root"
+
+credential_refresher_image_digest=$(
+  python3 - "$credential_refresher_metadata" <<'PY'
+import json, re, sys
+with open(sys.argv[1], "rb") as source:
+    metadata = json.load(source)
+digest = metadata.get("containerimage.digest")
+if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+    raise SystemExit("credential-refresher buildx metadata lacks a canonical image digest")
+print(digest)
+PY
+)
+credential_refresher_config_digest=$(
+  python3 - "$credential_refresher_metadata" <<'PY'
+import json, re, sys
+with open(sys.argv[1], "rb") as source:
+    metadata = json.load(source)
+digest = metadata.get("containerimage.config.digest")
+if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+    raise SystemExit("credential-refresher buildx metadata lacks a canonical image config digest")
+print(digest)
+PY
+)
+if [[ $export_images == true ]]; then
+  PYTHONDONTWRITEBYTECODE=1 python3 deploy/aws/tools/verify-image-transport.py \
+    --archive "$credential_refresher_archive" \
+    --reference "$credential_refresher_image_reference" \
+    --image-digest "$credential_refresher_image_digest" \
+    --config-digest "$credential_refresher_config_digest"
+  docker image load --input "$credential_refresher_load_archive" >/dev/null
+fi
+credential_refresher_image_id=$(docker image inspect --format '{{.Id}}' "$credential_refresher_image_reference")
+[[ $credential_refresher_image_id == "$credential_refresher_config_digest" || $credential_refresher_image_id == "$credential_refresher_image_digest" ]] || {
+  echo "loaded credential-refresher image ID differs from both verified image identities" >&2
+  exit 1
+}
+[[ $(docker image inspect --format '{{.Architecture}}/{{.Os}}' "$credential_refresher_image_id") == amd64/linux ]] || {
+  echo "loaded credential-refresher image is not linux/amd64" >&2
+  exit 1
+}
+
+install -d -m 0700 "$credential_refresher_root/usr/local/bin"
+credential_refresher_container=$(docker create --platform linux/amd64 "$credential_refresher_image_id")
+docker cp \
+  "$credential_refresher_container:/usr/local/bin/refresh-database-credential" \
+  "$credential_refresher_root/usr/local/bin/refresh-database-credential"
+docker cp \
+  "$credential_refresher_container:/usr/local/bin/swap-dsn-password.py" \
+  "$credential_refresher_root/usr/local/bin/swap-dsn-password.py"
+docker rm "$credential_refresher_container" >/dev/null
+credential_refresher_container=
 
 gateway_build_arguments=(
   --file deploy/aws/Dockerfile.gateway
@@ -427,6 +525,10 @@ verifier_arguments=(
   --control-image-reference "$image_reference"
   --control-image-digest "$control_image_digest"
   --control-image-config-digest "$control_config_digest"
+  --credential-refresher-root "$credential_refresher_root"
+  --credential-refresher-image-reference "$credential_refresher_image_reference"
+  --credential-refresher-image-digest "$credential_refresher_image_digest"
+  --credential-refresher-image-config-digest "$credential_refresher_config_digest"
   --gateway-image-reference "$gateway_image_reference"
   --gateway-image-digest "$gateway_image_digest"
   --gateway-image-config-digest "$gateway_config_digest"
@@ -439,6 +541,8 @@ verifier_arguments=(
   --input-file "gateway_dockerfile=$source_root/deploy/aws/Dockerfile.gateway"
   --input-file "worker_dockerfile=$source_root/deploy/aws/Dockerfile.worker-artifact"
   --input-file "old_host_positive_stop=$source_root/deploy/aws/old-host-positive-stop.py"
+  --input-file "credential_refresher_program=$source_root/deploy/aws/refresh-database-credential.sh"
+  --input-file "swap_dsn_program=$source_root/deploy/aws/swap-dsn-password.py"
   --input-file "production_mutation_admission_operator=$source_root/deploy/aws/production-mutation-admission.py"
   --input-file "production_cutover_proof_set=$source_root/deploy/aws/production_cutover_proof_set.py"
   --input-file "guest_builder=$source_root/deploy/metal/build-guest-image.sh"
@@ -448,6 +552,7 @@ verifier_arguments=(
   --input-file "guest_rootfs_manifest=$guest_output/rootfs.manifest"
   --input-file "guest_agent_binary=$guest_agent_fingerprint"
   --input-file "control_build_metadata=$control_metadata"
+  --input-file "credential_refresher_build_metadata=$credential_refresher_metadata"
   --input-file "worker_build_metadata=$worker_metadata"
   --input-file "release_verifier=$source_root/deploy/aws/tools/verify-manual-release.py"
   --input-file "release_builder=$source_root/deploy/aws/tools/build-manual-release.sh"
@@ -458,6 +563,7 @@ preflight_manifest="$output_incomplete/release-manifest.preflight.v1.json"
 PYTHONDONTWRITEBYTECODE=1 python3 deploy/aws/tools/verify-manual-release.py \
   "${verifier_arguments[@]}" \
   --control-image-registry-verified false \
+  --credential-refresher-image-registry-verified false \
   --gateway-image-registry-verified false \
   --output "$preflight_manifest"
 
@@ -466,6 +572,12 @@ if [[ $push_image == true ]]; then
   control_registry_digest=$(docker buildx imagetools inspect --raw "$image_reference" | sha256sum | awk '{print "sha256:" $1}')
   [[ $control_registry_digest == "$control_image_digest" ]] || {
     echo "registry Control digest differs from the verified local digest" >&2
+    exit 1
+  }
+  docker push "$credential_refresher_image_reference"
+  credential_refresher_registry_digest=$(docker buildx imagetools inspect --raw "$credential_refresher_image_reference" | sha256sum | awk '{print "sha256:" $1}')
+  [[ $credential_refresher_registry_digest == "$credential_refresher_image_digest" ]] || {
+    echo "registry credential-refresher digest differs from the verified local digest" >&2
     exit 1
   }
   docker push "$gateway_image_reference"
@@ -477,6 +589,7 @@ if [[ $push_image == true ]]; then
   PYTHONDONTWRITEBYTECODE=1 python3 deploy/aws/tools/verify-manual-release.py \
     "${verifier_arguments[@]}" \
     --control-image-registry-verified true \
+    --credential-refresher-image-registry-verified true \
     --gateway-image-registry-verified true \
     --output "$output_incomplete/release-manifest.v1.json"
   rm -f -- "$preflight_manifest"
@@ -489,6 +602,7 @@ if [[ $export_images == true ]]; then
     cd "$output_incomplete"
     sha256sum \
       cats-control-plane-image.tar \
+      cats-credential-refresher-image.tar \
       cats-gateway-image.tar \
       > SHA256SUMS
   )
@@ -496,15 +610,16 @@ fi
 
 # The final handoff deliberately contains only immutable deployment inputs and
 # their canonical manifest, not mutable build caches or extraction scratch.
-rm -rf -- "$control_root" "$gateway_root" "$worker_root" "$guest_output"
-rm -f -- "$control_metadata" "$gateway_metadata" "$worker_metadata"
-rm -f -- "$control_load_archive" "$gateway_load_archive"
+rm -rf -- "$control_root" "$credential_refresher_root" "$gateway_root" "$worker_root" "$guest_output"
+rm -f -- "$control_metadata" "$credential_refresher_metadata" "$gateway_metadata" "$worker_metadata"
+rm -f -- "$control_load_archive" "$credential_refresher_load_archive" "$gateway_load_archive"
 cp -R "$guest_release" "$output_incomplete/guest-runtime-release.v1"
 chmod -R a-w "$output_incomplete/guest-runtime-release.v1"
 chmod a-w "$output_incomplete/cats-worker.tar.zst" "$output_incomplete/release-manifest.v1.json"
 if [[ $export_images == true ]]; then
   chmod a-w \
     "$output_incomplete/cats-control-plane-image.tar" \
+    "$output_incomplete/cats-credential-refresher-image.tar" \
     "$output_incomplete/cats-gateway-image.tar" \
     "$output_incomplete/SHA256SUMS"
 fi

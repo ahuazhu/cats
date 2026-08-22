@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the three production artifacts and write one canonical release receipt."""
+"""Verify the complete production artifact set and write one canonical receipt."""
 
 from __future__ import annotations
 
@@ -575,6 +575,15 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--control-image-digest", required=True)
     parser.add_argument("--control-image-config-digest", required=True)
     parser.add_argument("--control-image-registry-verified", choices=("true", "false"), required=True)
+    parser.add_argument("--credential-refresher-root", required=True, type=Path)
+    parser.add_argument("--credential-refresher-image-reference", required=True)
+    parser.add_argument("--credential-refresher-image-digest", required=True)
+    parser.add_argument("--credential-refresher-image-config-digest", required=True)
+    parser.add_argument(
+        "--credential-refresher-image-registry-verified",
+        choices=("true", "false"),
+        required=True,
+    )
     parser.add_argument("--gateway-image-reference", required=True)
     parser.add_argument("--gateway-image-digest", required=True)
     parser.add_argument("--gateway-image-config-digest", required=True)
@@ -596,18 +605,20 @@ def parse_registry_candidate_arguments(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--manifest-sha256", required=True)
     parser.add_argument("--control-registry-digest")
+    parser.add_argument("--credential-refresher-registry-digest")
     parser.add_argument("--gateway-registry-digest")
     parser.add_argument("--output", type=Path)
     arguments = parser.parse_args(argv)
     promotion = (
         arguments.control_registry_digest,
+        arguments.credential_refresher_registry_digest,
         arguments.gateway_registry_digest,
         arguments.output,
     )
     if any(value is not None for value in promotion) and not all(
         value is not None for value in promotion
     ):
-        parser.error("registry promotion requires both registry digests and --output")
+        parser.error("registry promotion requires all registry digests and --output")
     return arguments
 
 
@@ -619,6 +630,7 @@ def validate_existing_release_manifest(value: dict[str, Any]) -> dict[str, dict[
     artifacts = value["artifacts"]
     if not isinstance(artifacts, dict) or set(artifacts) != {
         "control_plane",
+        "credential_refresher",
         "gateway",
         "worker",
     }:
@@ -631,6 +643,14 @@ def validate_existing_release_manifest(value: dict[str, Any]) -> dict[str, dict[
             "image_digest",
             "image_reference",
             "registry_verified",
+        },
+        "credential_refresher": {
+            "image_config_digest",
+            "image_digest",
+            "image_reference",
+            "refresh_program_sha256",
+            "registry_verified",
+            "swap_dsn_program_sha256",
         },
         "gateway": {
             "binary_sha256",
@@ -670,7 +690,9 @@ def validate_existing_release_manifest(value: dict[str, Any]) -> dict[str, dict[
         }
     try:
         require_distinct_image_tags(
-            identity["control_plane"]["reference"], identity["gateway"]["reference"]
+            identity["control_plane"]["reference"],
+            identity["credential_refresher"]["reference"],
+            identity["gateway"]["reference"],
         )
     except ImageReferenceError as error:
         raise VerificationError(str(error)) from error
@@ -776,6 +798,10 @@ def registry_candidate(arguments: argparse.Namespace) -> int:
         "control_plane": require_sha256(
             arguments.control_registry_digest, name="observed Control registry digest"
         ),
+        "credential_refresher": require_sha256(
+            arguments.credential_refresher_registry_digest,
+            name="observed credential-refresher registry digest",
+        ),
         "gateway": require_sha256(
             arguments.gateway_registry_digest, name="observed Gateway registry digest"
         ),
@@ -802,28 +828,35 @@ def validate_identifier_arguments(arguments: argparse.Namespace) -> None:
     require_sha256(arguments.source_fingerprint, name="source fingerprint")
     require_sha256(arguments.control_image_digest, name="Control OCI digest")
     require_sha256(arguments.control_image_config_digest, name="Control image config digest")
+    require_sha256(
+        arguments.credential_refresher_image_digest,
+        name="credential-refresher OCI digest",
+    )
+    require_sha256(
+        arguments.credential_refresher_image_config_digest,
+        name="credential-refresher image config digest",
+    )
     require_sha256(arguments.gateway_image_digest, name="Gateway OCI digest")
     require_sha256(arguments.gateway_image_config_digest, name="Gateway image config digest")
-    if (
-        not arguments.control_image_reference
-        or len(arguments.control_image_reference) > 1024
-        or "@" in arguments.control_image_reference
-        or any(character.isspace() or ord(character) < 0x20 for character in arguments.control_image_reference)
+    for label, reference in (
+        ("Control", arguments.control_image_reference),
+        ("credential-refresher", arguments.credential_refresher_image_reference),
+        ("Gateway", arguments.gateway_image_reference),
     ):
-        raise VerificationError("Control image reference must be a bounded tag reference without @")
-    if (
-        not arguments.gateway_image_reference
-        or len(arguments.gateway_image_reference) > 1024
-        or "@" in arguments.gateway_image_reference
-        or any(
-            character.isspace() or ord(character) < 0x20
-            for character in arguments.gateway_image_reference
-        )
-    ):
-        raise VerificationError("Gateway image reference must be a bounded tag reference without @")
+        if (
+            not reference
+            or len(reference) > 1024
+            or "@" in reference
+            or any(character.isspace() or ord(character) < 0x20 for character in reference)
+        ):
+            raise VerificationError(
+                f"{label} image reference must be a bounded tag reference without @"
+            )
     try:
         require_distinct_image_tags(
-            arguments.control_image_reference, arguments.gateway_image_reference
+            arguments.control_image_reference,
+            arguments.credential_refresher_image_reference,
+            arguments.gateway_image_reference,
         )
     except ImageReferenceError as error:
         raise VerificationError(str(error)) from error
@@ -913,10 +946,76 @@ def verify_gateway_image_root(root: Path) -> tuple[str, int]:
     return sha256_bytes(binary), len(binary)
 
 
+def verify_credential_refresher_root(
+    root: Path, refresh_program: bytes, swap_dsn_program: bytes
+) -> tuple[str, str]:
+    expected_directories = {".", "usr", "usr/local", "usr/local/bin"}
+    expected_files = {
+        "usr/local/bin/refresh-database-credential",
+        "usr/local/bin/swap-dsn-password.py",
+    }
+    actual_directories: set[str] = {"."}
+    actual_files: set[str] = set()
+    root_metadata = root.lstat()
+    if not stat.S_ISDIR(root_metadata.st_mode) or stat.S_ISLNK(root_metadata.st_mode):
+        raise VerificationError("credential-refresher image root is not a real directory")
+    for directory, names, filenames in os.walk(root, followlinks=False):
+        directory_path = Path(directory)
+        for name in names:
+            path = directory_path / name
+            metadata = path.lstat()
+            relative = path.relative_to(root).as_posix()
+            if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                raise VerificationError(
+                    f"credential-refresher image root contains a non-directory: {relative}"
+                )
+            actual_directories.add(relative)
+        for name in filenames:
+            path = directory_path / name
+            metadata = path.lstat()
+            relative = path.relative_to(root).as_posix()
+            if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                raise VerificationError(
+                    f"credential-refresher image root contains a non-file: {relative}"
+                )
+            actual_files.add(relative)
+    if actual_directories != expected_directories:
+        raise VerificationError(
+            "credential-refresher image directory set differs: "
+            f"{sorted(actual_directories ^ expected_directories)}"
+        )
+    if actual_files != expected_files:
+        raise VerificationError(
+            "credential-refresher image file set differs: "
+            f"{sorted(actual_files ^ expected_files)}"
+        )
+    observed_refresh = read_regular(
+        root / "usr/local/bin/refresh-database-credential",
+        cap=MAX_WORKER_MEMBER_BYTES,
+        mode=0o755,
+    )
+    observed_swap = read_regular(
+        root / "usr/local/bin/swap-dsn-password.py",
+        cap=MAX_WORKER_MEMBER_BYTES,
+        mode=0o755,
+    )
+    if observed_refresh != refresh_program:
+        raise VerificationError(
+            "credential-refresher program is not byte-identical to reviewed input"
+        )
+    if observed_swap != swap_dsn_program:
+        raise VerificationError(
+            "credential-refresher DSN composer is not byte-identical to reviewed input"
+        )
+    return sha256_bytes(observed_refresh), sha256_bytes(observed_swap)
+
+
 def verify(arguments: argparse.Namespace) -> tuple[dict[str, Any], bytes]:
     validate_identifier_arguments(arguments)
     input_files: dict[str, dict[str, Any]] = {}
     reviewed_old_host_positive_stop: bytes | None = None
+    reviewed_refresh_program: bytes | None = None
+    reviewed_swap_dsn_program: bytes | None = None
     for label, path in arguments.input_file:
         if label in input_files:
             raise VerificationError(f"duplicate fingerprinted input label: {label}")
@@ -924,10 +1023,18 @@ def verify(arguments: argparse.Namespace) -> tuple[dict[str, Any], bytes]:
         input_files[label] = {"sha256": digest, "size_bytes": size}
         if label == "old_host_positive_stop":
             reviewed_old_host_positive_stop = read_regular(path, cap=MAX_WORKER_MEMBER_BYTES)
+        elif label == "credential_refresher_program":
+            reviewed_refresh_program = read_regular(path, cap=MAX_WORKER_MEMBER_BYTES)
+        elif label == "swap_dsn_program":
+            reviewed_swap_dsn_program = read_regular(path, cap=MAX_WORKER_MEMBER_BYTES)
     if not input_files:
         raise VerificationError("at least one exact build input file must be fingerprinted")
     if reviewed_old_host_positive_stop is None:
         raise VerificationError("reviewed input old_host_positive_stop is required")
+    if reviewed_refresh_program is None or reviewed_swap_dsn_program is None:
+        raise VerificationError(
+            "reviewed credential_refresher_program and swap_dsn_program inputs are required"
+        )
 
     shared = verify_guest_release(arguments.shared_guest_runtime)
     worker_binary_members: dict[str, dict[str, Any]] = {}
@@ -985,6 +1092,11 @@ def verify(arguments: argparse.Namespace) -> tuple[dict[str, Any], bytes]:
     gateway_binary_sha, gateway_binary_size = verify_gateway_image_root(
         arguments.gateway_image_root
     )
+    refresh_program_sha, swap_dsn_program_sha = verify_credential_refresher_root(
+        arguments.credential_refresher_root,
+        reviewed_refresh_program,
+        reviewed_swap_dsn_program,
+    )
 
     worker_bundle_sha, worker_bundle_size = hash_regular(
         arguments.worker_bundle, cap=MAX_WORKER_BUNDLE_BYTES
@@ -1016,6 +1128,16 @@ def verify(arguments: argparse.Namespace) -> tuple[dict[str, Any], bytes]:
                 "image_digest": arguments.control_image_digest,
                 "image_reference": arguments.control_image_reference,
                 "registry_verified": arguments.control_image_registry_verified == "true",
+            },
+            "credential_refresher": {
+                "image_config_digest": arguments.credential_refresher_image_config_digest,
+                "image_digest": arguments.credential_refresher_image_digest,
+                "image_reference": arguments.credential_refresher_image_reference,
+                "refresh_program_sha256": refresh_program_sha,
+                "registry_verified": (
+                    arguments.credential_refresher_image_registry_verified == "true"
+                ),
+                "swap_dsn_program_sha256": swap_dsn_program_sha,
             },
             "gateway": {
                 "binary_sha256": gateway_binary_sha,
@@ -1073,6 +1195,11 @@ def main() -> int:
         "control_image="
         f"{release_manifest['artifacts']['control_plane']['image_reference']}@"
         f"{release_manifest['artifacts']['control_plane']['image_digest']}"
+    )
+    print(
+        "credential_refresher_image="
+        f"{release_manifest['artifacts']['credential_refresher']['image_reference']}@"
+        f"{release_manifest['artifacts']['credential_refresher']['image_digest']}"
     )
     print(
         "gateway_image="

@@ -2180,7 +2180,9 @@ def _validate_release_manifest(
     commit(source["tree"], "release source tree")
     digest(source["fingerprint"], "release source fingerprint")
     artifacts = fields(
-        value["artifacts"], {"control_plane", "gateway", "worker"}, "release artifacts"
+        value["artifacts"],
+        {"control_plane", "credential_refresher", "gateway", "worker"},
+        "release artifacts",
     )
     worker = artifacts["worker"]
     if not isinstance(worker, dict) or worker.get("bundle_name") != "cats-worker.tar.zst":
