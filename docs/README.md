@@ -50,6 +50,10 @@ work-status和work acquire/release不在生产route map，显式retired harness�
 | [architecture-cross-review.md](architecture-cross-review.md) | Accepted review + current evidence boundary | 三边界交叉复核、阻断项关闭与可复现证据终点 |
 | [实验总报告](experiments-2026-07-21-storage-lifecycle.md) | Evidence | 2026-07-21方法、样本、结果和失败尝试 |
 
+## Discussion drafts
+
+- [Control Plane 与 noded 同步协议设计](control-node-semantic-protocol.md)：以资源身份和目标结果提供场景语义幂等的简化同步协议讨论稿。它尚未接受、尚未实现，也不取代当前 Active architecture。
+
 ## Active specs
 
 | 规格 | 状态 | 实现 |
