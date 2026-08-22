@@ -20,6 +20,7 @@ mod oci;
 mod rows;
 pub(crate) mod runtime_authority;
 mod schema;
+pub mod semantic;
 mod transaction;
 
 pub(crate) use agent_sessions::{

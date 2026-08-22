@@ -1,6 +1,5 @@
 use super::*;
 
-use cats_storage::authority::AUTHORITY_RELEASE_SCHEMA_VERSION;
 use native_tls::{Certificate, TlsConnector};
 use postgres_native_tls::MakeTlsConnector;
 use sha2::{Digest as _, Sha256};
@@ -1457,14 +1456,19 @@ fn partial_catalog_object(name: &str) -> ApiError {
     ))
 }
 
-/// The Control Store owns the exact clean-slate release stamp. Version 18 has
+/// The Control Store owns the exact clean-slate release stamp. Version 19 has
 /// no migration or compatibility reader/writer for an earlier authority shape.
-pub(super) const SCHEMA_VERSION: i64 = AUTHORITY_RELEASE_SCHEMA_VERSION;
+pub(super) const SCHEMA_VERSION: i64 = 19;
 
 const CONTROL_TABLES: &[&str] = &[
     "control_schema_version",
     "accounts",
     "workspaces",
+    "nodes",
+    "node_heartbeats",
+    "cats",
+    "persistent_disks",
+    "disk_bindings",
     "account_membership_shadow",
     "workspace_grants",
     "workspace_tokens",
@@ -1521,15 +1525,13 @@ const CONTROL_TABLES: &[&str] = &[
     "route_v2_public_ring_deliveries",
 ];
 
-// Version 18 is an empty-database cutover, not an additive migration. A
+// Version 19 is an empty-database cutover, not an additive migration. A
 // manually stamped database that still exposes any former product or Desired
 // authority must fail closed instead of letting old and atomic writers coexist.
 const FORBIDDEN_LEGACY_CONTROL_TABLES: &[&str] = &[
     "route_grant_rollout_state",
-    "cats",
     "disks",
     "mount_bindings",
-    "nodes",
     "operations",
     "idempotency",
     "endpoints",
@@ -4935,6 +4937,129 @@ CREATE TABLE IF NOT EXISTS workspaces (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS workspaces_one_default
 ON workspaces(account_id) WHERE is_default;
+-- The semantic Control/Node protocol is a clean product model.  These tables
+-- are intentionally independent from the former runtime Operation and
+-- inventory projections below; new protocol code reads and writes only this
+-- set while the remaining release components are cut over.
+CREATE TABLE IF NOT EXISTS nodes (
+    node_id TEXT PRIMARY KEY,
+    node_name TEXT NOT NULL CHECK (length(node_name) BETWEEN 1 AND 255),
+    control_endpoint TEXT NOT NULL CHECK (length(control_endpoint) BETWEEN 1 AND 2048),
+    vendor TEXT NOT NULL CHECK (length(vendor) BETWEEN 1 AND 63),
+    region TEXT NOT NULL CHECK (length(region) BETWEEN 1 AND 127),
+    zone TEXT NOT NULL CHECK (length(zone) BETWEEN 1 AND 127),
+    instance_id TEXT NOT NULL CHECK (length(instance_id) BETWEEN 1 AND 255),
+    machine_type TEXT NOT NULL CHECK (length(machine_type) BETWEEN 1 AND 127),
+    node_version TEXT NOT NULL CHECK (length(node_version) BETWEEN 1 AND 127),
+    status TEXT NOT NULL
+        CHECK (status IN ('running','draining','offline','reset_required','deleted')),
+    created_at BIGINT NOT NULL CHECK (created_at >= 0),
+    updated_at BIGINT NOT NULL CHECK (updated_at >= created_at),
+    CONSTRAINT nodes_cloud_instance_unique UNIQUE (vendor, instance_id)
+);
+CREATE TABLE IF NOT EXISTS node_heartbeats (
+    node_id TEXT PRIMARY KEY REFERENCES nodes(node_id),
+    -- Written from clock_timestamp() by the heartbeat upsert.  Node time is
+    -- retained separately and must never decide liveness.
+    last_heartbeat_at BIGINT NOT NULL CHECK (last_heartbeat_at >= 0),
+    node_reported_at BIGINT CHECK (node_reported_at >= 0),
+    reported_status TEXT NOT NULL
+        CHECK (reported_status IN ('running','draining','offline','reset_required','deleted')),
+    total_cpu BIGINT NOT NULL CHECK (total_cpu > 0),
+    cpu_utilized DOUBLE PRECISION NOT NULL
+        CHECK (cpu_utilized >= 0 AND cpu_utilized <= total_cpu),
+    total_memory BIGINT NOT NULL CHECK (total_memory > 0),
+    memory_utilized BIGINT NOT NULL
+        CHECK (memory_utilized >= 0 AND memory_utilized <= total_memory),
+    running_cat_count BIGINT NOT NULL CHECK (running_cat_count >= 0),
+    suspended_cat_count BIGINT NOT NULL CHECK (suspended_cat_count >= 0),
+    warm_cat_count BIGINT NOT NULL CHECK (warm_cat_count >= 0)
+);
+CREATE TABLE IF NOT EXISTS cats (
+    cat_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+    cat_slug TEXT NOT NULL
+        CHECK (cat_slug ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'),
+    state TEXT CHECK (state IN ('running','suspended','warm','cold','failure','destroyed')),
+    current_action TEXT
+        CHECK (current_action IN ('create','run','suspend','warm','cold','destroy')),
+    current_action_started_at BIGINT CHECK (current_action_started_at >= 0),
+    current_action_node_id TEXT REFERENCES nodes(node_id),
+    node_id TEXT REFERENCES nodes(node_id),
+    cpu_count BIGINT NOT NULL CHECK (cpu_count > 0),
+    memory_bytes BIGINT NOT NULL CHECK (memory_bytes > 0),
+    boot_image TEXT NOT NULL CHECK (length(boot_image) > 0),
+    last_error_code TEXT,
+    last_error_message TEXT,
+    created_at BIGINT NOT NULL CHECK (created_at >= 0),
+    updated_at BIGINT NOT NULL CHECK (updated_at >= created_at),
+    destroyed_at BIGINT CHECK (destroyed_at >= created_at),
+    CONSTRAINT cats_workspace_identity_unique UNIQUE (workspace_id, cat_id),
+    CONSTRAINT cats_destroyed_shape_check CHECK (
+        ((state = 'destroyed') IS TRUE) = (destroyed_at IS NOT NULL)
+    ),
+    CONSTRAINT cats_initial_create_shape_check CHECK (
+        state IS NOT NULL OR current_action = 'create'
+    ),
+    CONSTRAINT cats_current_action_shape_check CHECK (
+        (current_action IS NULL
+            AND current_action_started_at IS NULL
+            AND current_action_node_id IS NULL) OR
+        (current_action IS NOT NULL
+            AND current_action_started_at IS NOT NULL
+            AND (current_action_node_id IS NOT NULL OR
+                 (current_action = 'destroy' AND node_id IS NULL))
+            AND state IS DISTINCT FROM 'destroyed')
+    ),
+    CONSTRAINT cats_placement_shape_check CHECK (
+        (state IN ('running','suspended','warm') AND node_id IS NOT NULL) OR
+        (state IN ('cold','destroyed') AND node_id IS NULL) OR
+        state IN ('failure') OR
+        state IS NULL
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS cats_current_slug_unique
+ON cats(workspace_id, cat_slug) WHERE destroyed_at IS NULL;
+CREATE INDEX IF NOT EXISTS cats_current_action_scan
+ON cats(current_action_started_at) WHERE current_action IS NOT NULL;
+CREATE INDEX IF NOT EXISTS cats_node_placement
+ON cats(node_id) WHERE node_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS persistent_disks (
+    disk_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+    disk_slug TEXT NOT NULL
+        CHECK (disk_slug ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'),
+    size_bytes BIGINT NOT NULL CHECK (size_bytes > 0),
+    status TEXT NOT NULL CHECK (status IN ('normal','deleted')),
+    created_at BIGINT NOT NULL CHECK (created_at >= 0),
+    deleted_at BIGINT CHECK (deleted_at >= created_at),
+    CONSTRAINT persistent_disks_workspace_identity_unique
+        UNIQUE (workspace_id, disk_id),
+    CONSTRAINT persistent_disks_deleted_shape_check CHECK (
+        (status = 'deleted') IS NOT DISTINCT FROM (deleted_at IS NOT NULL)
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS disks_current_slug_unique
+ON persistent_disks(workspace_id, disk_slug) WHERE deleted_at IS NULL;
+CREATE TABLE IF NOT EXISTS disk_bindings (
+    binding_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+    disk_id TEXT NOT NULL,
+    cat_id TEXT NOT NULL,
+    mount_path TEXT NOT NULL CHECK (
+        mount_path LIKE '/%' AND
+        mount_path NOT IN ('/','/boot','/proc','/sys','/dev','/run')
+    ),
+    created_at BIGINT NOT NULL CHECK (created_at >= 0),
+    CONSTRAINT disk_bindings_disk_unique UNIQUE (disk_id),
+    CONSTRAINT disk_bindings_cat_mount_unique UNIQUE (cat_id, mount_path),
+    CONSTRAINT disk_bindings_disk_workspace_fkey
+        FOREIGN KEY (workspace_id, disk_id)
+        REFERENCES persistent_disks(workspace_id, disk_id),
+    CONSTRAINT disk_bindings_cat_workspace_fkey
+        FOREIGN KEY (workspace_id, cat_id)
+        REFERENCES cats(workspace_id, cat_id)
+);
 CREATE TABLE IF NOT EXISTS account_membership_shadow (
     workos_membership_id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL REFERENCES accounts(id),
@@ -6186,7 +6311,7 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission_commands (
         CHECK (source_commit_sha ~ '^[0-9a-f]{40}$'),
     control_schema_version BIGINT NOT NULL
         CONSTRAINT production_mutation_admission_commands_schema_ck
-        CHECK (control_schema_version = 18),
+        CHECK (control_schema_version = 19),
     source_manifest_sha256 TEXT NOT NULL
         CONSTRAINT production_mutation_admission_commands_source_manifest_ck
         CHECK (source_manifest_sha256 ~ '^sha256:[0-9a-f]{64}$'),
@@ -6378,7 +6503,7 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission (
         CHECK (source_commit_sha ~ '^[0-9a-f]{40}$'),
     control_schema_version BIGINT NULL
         CONSTRAINT production_mutation_admission_schema_ck
-        CHECK (control_schema_version = 18),
+        CHECK (control_schema_version = 19),
     source_manifest_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_source_manifest_ck
         CHECK (source_manifest_sha256 ~ '^sha256:[0-9a-f]{64}$'),
@@ -9330,8 +9455,8 @@ mod atomic_lifecycle_schema_tests {
     };
 
     #[test]
-    fn v18_manifest_has_no_parallel_v1_or_desired_authority() {
-        assert_eq!(SCHEMA_VERSION, 18);
+    fn v19_manifest_has_no_forbidden_legacy_authority() {
+        assert_eq!(SCHEMA_VERSION, 19);
         for table in FORBIDDEN_LEGACY_CONTROL_TABLES {
             assert!(!CONTROL_TABLES.contains(table));
             assert!(
@@ -9422,5 +9547,34 @@ mod atomic_lifecycle_schema_tests {
         for retained in ["'cold'::text", "'killed'::text", "'deleted'::text"] {
             assert!(terminal_set.contains(retained));
         }
+    }
+}
+
+#[cfg(test)]
+mod semantic_protocol_schema_tests {
+    use super::{CONTROL_TABLES, SCHEMA, SCHEMA_VERSION};
+
+    #[test]
+    fn v19_contains_only_current_slug_uniqueness_and_rwo_binding_constraints() {
+        assert_eq!(SCHEMA_VERSION, 19);
+        for table in [
+            "cats",
+            "nodes",
+            "node_heartbeats",
+            "persistent_disks",
+            "disk_bindings",
+        ] {
+            assert!(CONTROL_TABLES.contains(&table));
+            assert!(SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {table} (")));
+        }
+        assert!(SCHEMA.contains(
+            "CREATE UNIQUE INDEX IF NOT EXISTS cats_current_slug_unique\nON cats(workspace_id, cat_slug) WHERE destroyed_at IS NULL"
+        ));
+        assert!(SCHEMA.contains(
+            "CREATE UNIQUE INDEX IF NOT EXISTS disks_current_slug_unique\nON persistent_disks(workspace_id, disk_slug) WHERE deleted_at IS NULL"
+        ));
+        assert!(SCHEMA.contains("CONSTRAINT disk_bindings_disk_unique UNIQUE (disk_id)"));
+        assert!(SCHEMA.contains("control_endpoint TEXT NOT NULL"));
+        assert!(SCHEMA.contains("last_heartbeat_at BIGINT NOT NULL"));
     }
 }
