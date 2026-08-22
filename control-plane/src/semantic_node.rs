@@ -66,6 +66,8 @@ pub trait NodeRepository: Send + Sync {
         &self,
         candidate: StaleNodeCandidate,
     ) -> NodeFuture<bool>;
+
+    fn offline_recovery_candidates(&self) -> NodeFuture<Vec<String>>;
 }
 
 pub trait NodeHealthProbe: Send + Sync {
@@ -216,15 +218,23 @@ impl NodeManagementService {
                 .mark_offline_if_heartbeat_unchanged(candidate.clone())
                 .await?
             {
-                changed.push(candidate.node_id.clone());
-                if let Some(recover) = &self.offline_recovery {
-                    if let Err(error) = recover(candidate.node_id).await {
-                        tracing::warn!(%error, "offline Node Cat recovery failed; retrying after the next liveness pass");
-                    }
-                }
+                changed.push(candidate.node_id);
             }
         }
+        self.recover_offline_nodes().await?;
         Ok(changed)
+    }
+
+    async fn recover_offline_nodes(&self) -> Result<(), ApiError> {
+        let Some(recover) = &self.offline_recovery else {
+            return Ok(());
+        };
+        for node_id in self.repository.offline_recovery_candidates().await? {
+            if let Err(error) = recover(node_id.clone()).await {
+                tracing::warn!(%node_id, %error, "offline Node Cat recovery failed; retrying after the next liveness pass");
+            }
+        }
+        Ok(())
     }
 
     /// Runs the fleet liveness pass at the same 10-second cadence as Node
@@ -376,6 +386,11 @@ mod tests {
                 .push(candidate.node_id);
             Box::pin(async { Ok(true) })
         }
+
+        fn offline_recovery_candidates(&self) -> NodeFuture<Vec<String>> {
+            let nodes = self.marked.lock().expect("lock marks").clone();
+            Box::pin(async move { Ok(nodes) })
+        }
     }
 
     struct MockProbe {
@@ -435,6 +450,17 @@ mod tests {
         assert_eq!(
             *recovered.lock().expect("lock recoveries"),
             vec!["node_failed"]
+        );
+
+        repository.stale.lock().expect("lock stale").clear();
+        assert!(service
+            .detect_offline_nodes()
+            .await
+            .expect("retry offline recovery")
+            .is_empty());
+        assert_eq!(
+            *recovered.lock().expect("lock recoveries"),
+            vec!["node_failed", "node_failed"]
         );
     }
 

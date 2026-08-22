@@ -1164,6 +1164,26 @@ impl Store {
         })
     }
 
+    /// Level-triggered recovery discovery. An offline Node remains here while
+    /// any current Cat still names it, so transient Control/noded failures are
+    /// retried after restart and on every liveness pass without a job table.
+    pub fn list_semantic_offline_nodes_with_cats(&self) -> Result<Vec<String>> {
+        self.with(|client| {
+            client
+                .query(
+                    "SELECT n.node_id FROM nodes n
+                      WHERE n.status IN ('offline','reset_required')
+                        AND EXISTS (
+                            SELECT 1 FROM cats c
+                             WHERE c.node_id=n.node_id AND c.destroyed_at IS NULL
+                        )
+                      ORDER BY n.node_id",
+                    &[],
+                )
+                .map(|rows| rows.into_iter().map(|row| row.get(0)).collect())
+        })
+    }
+
     /// Mark a stale Node offline only if its heartbeat DB timestamp is still
     /// exactly the one observed before the active health probe.
     pub fn mark_semantic_node_offline_if_heartbeat_unchanged(
