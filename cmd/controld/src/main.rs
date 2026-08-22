@@ -212,15 +212,6 @@ struct Args {
         hide = true
     )]
     workos_api_base_url: String,
-    /// Milliseconds an OCI deploy may hold its request open before answering
-    /// `202` with an operation to poll. Must stay below the idle timeout of the
-    /// proxy in front of Cats, or that proxy answers 504 first.
-    #[arg(
-        long,
-        env = "CATS_OCI_DEPLOY_SYNC_WAIT_MS",
-        default_value_t = cats_control_plane::server::DEFAULT_OCI_DEPLOY_SYNC_WAIT_MS
-    )]
-    oci_deploy_sync_wait_ms: u64,
 }
 
 #[cfg(unix)]
@@ -497,7 +488,6 @@ async fn main() -> anyhow::Result<()> {
         workos,
         stripe,
         billing_enforcement_enabled: args.billing_enforcement_enabled,
-        oci_deploy_sync_wait_ms: args.oci_deploy_sync_wait_ms,
     };
     let handle = cats_control_plane::server::spawn(server_config).await?;
     let usage_projector_task = usage_projector.map(|projector| {

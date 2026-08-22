@@ -1769,10 +1769,9 @@ CREATE TABLE IF NOT EXISTS workspaces (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS workspaces_one_default
 ON workspaces(account_id) WHERE is_default;
--- The semantic Control/Node protocol is a clean product model.  These tables
--- are intentionally independent from the former runtime Operation and
--- inventory projections below; new protocol code reads and writes only this
--- set while the remaining release components are cut over.
+-- The semantic Control/Node protocol is the only lifecycle product model.
+-- The former runtime Operation, AgentSession, Route and inventory settlement
+-- projections are deliberately absent from this clean schema.
 CREATE TABLE IF NOT EXISTS nodes (
     node_id TEXT PRIMARY KEY,
     node_name TEXT NOT NULL CHECK (length(node_name) BETWEEN 1 AND 255),

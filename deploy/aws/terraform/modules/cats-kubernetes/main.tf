@@ -88,13 +88,6 @@ check "public_target_drain_fits_termination_grace" {
   }
 }
 
-check "oci_deploy_sync_wait_fits_under_the_edge" {
-  assert {
-    condition     = var.oci_deploy_sync_wait_ms < var.public_ingress_idle_timeout_seconds * 1000
-    error_message = "oci_deploy_sync_wait_ms must be below the ALB idle timeout, or the ALB answers 504 before the control plane can answer 202."
-  }
-}
-
 check "usage_delivery_configuration" {
   assert {
     condition = var.usage_delivery_adapter != "aws-kinesis" || alltrue([
@@ -461,11 +454,6 @@ resource "kubernetes_deployment_v1" "control_plane" {
             "--object-store-option",
             "prefix=${var.chunkstore_prefix}",
           ]
-
-          env {
-            name  = "CATS_OCI_DEPLOY_SYNC_WAIT_MS"
-            value = tostring(var.oci_deploy_sync_wait_ms)
-          }
 
           # All PostgreSQL clients verify RDS TLS with this CA. Their DSNs are
           # mounted as files below so reconnects observe credential rotation.

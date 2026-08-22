@@ -41,10 +41,7 @@ pub struct Config {
     pub workos: Option<Arc<crate::auth::WorkOsConfig>>,
     pub stripe: Option<Arc<crate::billing::StripeClient>>,
     pub billing_enforcement_enabled: bool,
-    pub oci_deploy_sync_wait_ms: u64,
 }
-
-pub const DEFAULT_OCI_DEPLOY_SYNC_WAIT_MS: u64 = 240_000;
 
 #[derive(Clone)]
 pub struct AppState {

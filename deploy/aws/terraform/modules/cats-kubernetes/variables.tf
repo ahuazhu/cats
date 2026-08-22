@@ -482,16 +482,6 @@ variable "ingress_class_name" {
   default     = "cats-public"
 }
 
-variable "oci_deploy_sync_wait_ms" {
-  description = <<-EOT
-    How long POST /oci-deployments holds a request open before answering 202
-    with an operation to poll. A transition affordance for callers written
-    against the older synchronous response; lower it as callers adopt polling.
-  EOT
-  type        = number
-  default     = 240000
-}
-
 variable "public_ingress_idle_timeout_seconds" {
   description = <<-EOT
     ALB idle timeout for the public ingress.
@@ -503,8 +493,6 @@ variable "public_ingress_idle_timeout_seconds" {
     work succeeded -- it did keep running -- so callers retried operations that
     were already in flight.
 
-    This must stay above the control plane's `--oci-deploy-sync-wait-ms`, or
-    the ALB answers 504 before the control plane can answer 202.
   EOT
   type        = number
   default     = 300

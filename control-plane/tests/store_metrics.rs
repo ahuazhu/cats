@@ -46,7 +46,6 @@ impl MetricsContext {
             workos: None,
             stripe: None,
             billing_enforcement_enabled: false,
-            oci_deploy_sync_wait_ms: 5_000,
         };
         let control_plane = spawn(config).await.unwrap();
         Self {
