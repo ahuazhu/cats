@@ -51,6 +51,11 @@ impl SemanticActionCancellation {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Self {
+        Self::new()
+    }
+
     fn cancel(&self) {
         self.signal.send_replace(true);
     }

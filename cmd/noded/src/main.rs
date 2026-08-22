@@ -8,6 +8,7 @@ use cats_api::semantic_control::{
     CatAction, CatState, NodeHeartbeatRequest, NodeName, NodeRegistrationRequest, NodeStatus,
     NodedControlEndpoint, NodedServiceToken,
 };
+use cats_node_agent::semantic_installed::InstalledSemanticCatEffects;
 use cats_node_agent::semantic_lifecycle::{
     semantic_node_router, SemanticActionCancellation, SemanticCatEffects, SemanticEffectError,
     SemanticEffectFuture, SemanticEffectRequest, SemanticNodeService,
@@ -50,9 +51,9 @@ struct Args {
     total_cpu: u32,
     #[arg(long, default_value_t = 8 * 1024 * 1024 * 1024_u64)]
     total_memory: u64,
-    /// VMM effects adapter. The clean-slate integration cut currently exposes
-    /// only `fake`; `ch` fails startup until the installed effect adapter is
-    /// connected to the semantic action trait.
+    /// VMM effects adapter. `fake` is for integration; `ch` selects the
+    /// installed bridge, which fails each action closed until all physical
+    /// authority inputs are available.
     #[arg(long, default_value = "fake")]
     vmm: String,
 }
@@ -98,6 +99,14 @@ impl SemanticCatEffects for FakeSemanticEffects {
             }
             Ok(())
         })
+    }
+}
+
+fn semantic_effects(vmm: &str) -> anyhow::Result<Arc<dyn SemanticCatEffects>> {
+    match vmm {
+        "fake" => Ok(Arc::new(FakeSemanticEffects::default())),
+        "ch" => Ok(Arc::new(InstalledSemanticCatEffects::new())),
+        unsupported => anyhow::bail!("unsupported --vmm {unsupported}; expected fake or ch"),
     }
 }
 
@@ -170,14 +179,16 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     anyhow::ensure!(
-        args.vmm == "fake",
-        "--vmm {} is not connected to the semantic lifecycle yet; use --vmm fake",
-        args.vmm
-    );
-    anyhow::ensure!(
         args.total_cpu > 0 && args.total_memory > 0,
         "Node heartbeat capacity must be positive"
     );
+    let vmm_mode = args.vmm.clone();
+    let effects = semantic_effects(&vmm_mode)?;
+    if vmm_mode == "ch" {
+        tracing::warn!(
+            "installed semantic effects are fail-closed until physical authority inputs are available"
+        );
+    }
 
     let token = NodedServiceToken::new(args.service_token)
         .context("service token must satisfy the shared noded token contract")?;
@@ -200,7 +211,6 @@ async fn main() -> anyhow::Result<()> {
         .context("validate Node registration")?;
 
     let placement_gate = Arc::new(NodePlacementGate::default());
-    let effects: Arc<dyn SemanticCatEffects> = Arc::new(FakeSemanticEffects::default());
     let service = SemanticNodeService::with_placement_gate(effects, Arc::clone(&placement_gate));
     let reset: Arc<dyn cats_node_agent::semantic_node_client::NodeResetExecutor> =
         Arc::new(service.clone());
@@ -236,7 +246,7 @@ async fn main() -> anyhow::Result<()> {
     });
     let mut supervisor_task =
         tokio::spawn(async move { supervisor.run(heartbeat_source, shutdown_rx).await });
-    tracing::info!(%addr, "semantic noded fake listener is ready; placement opens after registration");
+    tracing::info!(%addr, vmm = %vmm_mode, "semantic noded listener is ready; placement opens after registration");
 
     enum Stop {
         Signal(anyhow::Result<()>),
@@ -321,5 +331,16 @@ mod tests {
                 .expect("semantic argument exists");
             assert!(argument.is_required_set(), "{required} must be required");
         }
+    }
+
+    #[test]
+    fn semantic_effect_selection_is_explicit_and_fail_closed_for_installed_mode() {
+        assert!(super::semantic_effects("fake").is_ok());
+        assert!(super::semantic_effects("ch").is_ok());
+        let error = match super::semantic_effects("other") {
+            Ok(_) => panic!("unknown VMM must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("expected fake or ch"));
     }
 }

@@ -21,6 +21,7 @@ pub mod route_signing_rotation;
 pub mod route_v2_machine;
 pub mod runtime_cutover;
 pub mod runtime_inventory;
+pub mod semantic_installed;
 pub mod semantic_lifecycle;
 pub mod semantic_mounts;
 pub mod semantic_node_client;
