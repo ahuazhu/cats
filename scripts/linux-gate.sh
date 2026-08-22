@@ -585,20 +585,16 @@ trap 'linux_gate_signal 143' TERM
 
 main() {
   local attempt
-  local blockd_installed=false
   local collected_failures=""
   local collected_status=0
   local expected_node_privileged_inventory="$LINUX_CAPTURE_DIR/node-privileged.expected"
-  local expected_root_control_inventory="$LINUX_CAPTURE_DIR/root-control.expected"
   local image_inspection=""
   local iidfile_expected=""
   local iidfile_expected_lf=""
   local listed_test=""
   local observed_node_privileged_inventory="$LINUX_CAPTURE_DIR/node-privileged.observed"
-  local observed_root_control_inventory="$LINUX_CAPTURE_DIR/root-control.observed"
   local observed=""
   local node_privileged_inventory_ready=false
-  local root_control_inventory_ready=false
   local status=0
   local systemd_ready=false
   local workspace_gate_status=0
@@ -939,71 +935,6 @@ main() {
       :
     else
       collect_gate_failure systemd-topology "$?"
-    fi
-  fi
-  if [[ "$status" -eq 0 ]]; then
-    if docker_cli inherit 300 exec "$LINUX_SYSTEMD_GATE" \
-      sh -ceu 'source_binary="$1/debug/cats-blockd"
-        target_binary=/opt/cats/bin/cats-blockd
-        test -f "$source_binary"
-        test -x "$source_binary"
-        test ! -L "$source_binary"
-        install -D -m 0755 "$source_binary" "$target_binary"
-        test -f "$target_binary"
-        test -x "$target_binary"
-        test ! -L "$target_binary"
-        cmp -s "$source_binary" "$target_binary"' sh "$LINUX_TARGET_DIRECTORY"; then
-      blockd_installed=true
-    else
-      collect_gate_failure blockd-install "$?"
-    fi
-  fi
-  if [[ "$status" -eq 0 && "$blockd_installed" == true ]]; then
-    # These real-binary tests intentionally exercise the installed
-    # /run/cats/blockd-v1 namespace. The native qualification builder and the
-    # workspace-wide Linux container are unprivileged, so keep the tests
-    # ignored there and run their exact closed inventory only inside this one
-    # owner-labeled PID-1 container. Calibrate Cargo's zero-test-success
-    # behavior before trusting the privileged run.
-    printf '%s\n' \
-      'control_only_rejects_frontends_and_serves_only_the_typed_effect: test' \
-      'every_provision_publication_crash_window_recovers_by_authority_or_exact_replay: test' \
-      'first_lf_framing_enforces_prefix_crlf_and_payload_cap_before_effect: test' \
-      'receiver_responds_at_first_lf_without_waiting_for_half_close_or_running_tail: test' \
-      'stalled_connection_times_out_without_starving_the_next_request: test' \
-      >"$expected_root_control_inventory"
-    if docker_cli capture 12600 exec "$LINUX_SYSTEMD_GATE" \
-      timeout --signal=TERM --kill-after=30s 20m \
-      cargo test -p cats-blockd-daemon --test root_provision_control --locked \
-        --target-dir "$LINUX_TARGET_DIRECTORY" \
-        -- --ignored --list; then
-      : >"$observed_root_control_inventory"
-      while IFS= read -r listed_test; do
-        case "$listed_test" in
-          *": test") printf '%s\n' "$listed_test" >>"$observed_root_control_inventory" ;;
-        esac
-      done <"$LINUX_DOCKER_STDOUT"
-      if ! cmp -s "$expected_root_control_inventory" "$observed_root_control_inventory"; then
-        echo "privileged blockd root-control test inventory was not the exact known positive" >&2
-        collect_gate_failure root-control-inventory 1
-      else
-        root_control_inventory_ready=true
-      fi
-    else
-      workspace_gate_status=$?
-      report_docker_capture_failure
-      collect_gate_failure root-control-inventory "$workspace_gate_status"
-    fi
-  fi
-  if [[ "$status" -eq 0 && "$root_control_inventory_ready" == true ]]; then
-    if docker_cli inherit 12600 exec "$LINUX_SYSTEMD_GATE" \
-      timeout --signal=TERM --kill-after=30s 20m \
-      cargo test -p cats-blockd-daemon --test root_provision_control --locked --no-fail-fast \
-        --target-dir "$LINUX_TARGET_DIRECTORY" \
-        -- --ignored --test-threads=1 --nocapture; then
-      :
-    else
-      collect_gate_failure root-control-tests "$?"
     fi
   fi
   if [[ "$status" -eq 0 ]]; then

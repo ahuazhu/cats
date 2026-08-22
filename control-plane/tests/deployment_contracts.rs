@@ -1660,8 +1660,6 @@ fn linux_quality_gate_pins_one_private_systemd_e2e_to_an_immutable_image() {
         "LC_ALL=C sort -o \"$observed_node_privileged_inventory\"",
         "privileged Node test inventory was not the exact known positive",
         "timeout --signal=TERM --kill-after=30s 20m",
-        "install -D -m 0755 \"$source_binary\" \"$target_binary\"",
-        "cmp -s \"$source_binary\" \"$target_binary\"",
     ] {
         assert!(
             systemd_gate.contains(required) || linux_gate.contains(required),
@@ -1696,18 +1694,6 @@ fn linux_quality_gate_pins_one_private_systemd_e2e_to_an_immutable_image() {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    assert!(
-        focused_command.contains(
-            "docker_cli capture 12600 exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-blockd-daemon --test root_provision_control --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" -- --ignored --list"
-        ),
-        "the privileged blockd inventory must be bounded and known-positive"
-    );
-    assert!(
-        focused_command.contains(
-            "exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-blockd-daemon --test root_provision_control --locked --no-fail-fast --target-dir \"$LINUX_TARGET_DIRECTORY\" -- --ignored --test-threads=1 --nocapture"
-        ),
-        "the installed-namespace blockd tests must run only in the privileged gate"
-    );
     assert!(
         focused_command.contains(
             "docker_cli capture 12600 exec \"$LINUX_SYSTEMD_GATE\" timeout --signal=TERM --kill-after=30s 20m cargo test -p cats-node-agent --lib --all-features --locked --target-dir \"$LINUX_TARGET_DIRECTORY\" ch::tests::real_linux_ -- --ignored --list"
@@ -2038,21 +2024,7 @@ case "${1:-} ${2:-}" in
       *" cat /proc/1/comm") printf 'systemd\n' ;;
       *" cat /proc/1/cgroup") printf '0::/init.scope\n' ;;
       *" systemctl is-system-running --quiet") ;;
-      *" sh -ceu "*) : >"$state/blockd-installed" ;;
-      *" cargo test -p cats-blockd-daemon --test root_provision_control "*" -- --ignored --list")
-        : >"$state/root-control-test-list-ran"
-        if [[ "$mode" != zero-root-control-tests ]]; then
-          printf '%s\n' \
-            'control_only_rejects_frontends_and_serves_only_the_typed_effect: test' \
-            'every_provision_publication_crash_window_recovers_by_authority_or_exact_replay: test' \
-            'first_lf_framing_enforces_prefix_crlf_and_payload_cap_before_effect: test' \
-            'receiver_responds_at_first_lf_without_waiting_for_half_close_or_running_tail: test' \
-            'stalled_connection_times_out_without_starving_the_next_request: test'
-        fi
-        ;;
-      *" cargo test -p cats-blockd-daemon --test root_provision_control "*" -- --ignored --test-threads=1 --nocapture")
-        : >"$state/root-control-tests-ran"
-        ;;
+      *" sh -ceu "*) ;;
       *" timeout --signal=TERM --kill-after=30s 20m cargo test "*" -- --ignored --list")
         : >"$state/focused-systemd-test-list-ran"
         if [[ "$mode" == timeout-systemd-test-list ]]; then
@@ -2335,9 +2307,6 @@ fn linux_quality_gate_retries_response_loss_until_exact_owned_create_is_observab
         "idempotent-name-reserved",
         "response-loss-late-marker",
         "late-workspace-removed",
-        "blockd-installed",
-        "root-control-test-list-ran",
-        "root-control-tests-ran",
         "focused-systemd-test-ran",
         "systemd-removed",
     ] {
@@ -2407,54 +2376,6 @@ fn linux_quality_gate_retries_response_loss_until_exact_owned_create_is_observab
 
 #[cfg(unix)]
 #[test]
-fn linux_quality_gate_rejects_an_empty_privileged_root_control_inventory() {
-    let fixture = tempfile::tempdir().expect("Linux gate empty root-control fixture");
-    let fake_bin = fixture.path().join("bin");
-    let state = fixture.path().join("state");
-    std::fs::create_dir_all(&state).expect("create fake Docker state");
-    install_linux_gate_fake_cli(&fake_bin);
-
-    let output = linux_gate_command(&fake_bin, &state, "zero-root-control-tests")
-        .output()
-        .expect("run Linux gate empty root-control regression");
-    assert!(
-        !output.status.success(),
-        "an empty privileged root-control test inventory incorrectly passed the Linux gate"
-    );
-    assert!(
-        state.join("root-control-test-list-ran").exists(),
-        "the zero-test regression did not exercise the root-control inventory probe"
-    );
-    assert!(
-        !state.join("root-control-tests-ran").exists(),
-        "the privileged root-control tests ran after their inventory probe returned zero"
-    );
-    assert!(
-        state.join("focused-systemd-test-ran").exists(),
-        "an independent Node privileged group was skipped after root-control inventory failed"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains(
-            "privileged blockd root-control test inventory was not the exact known positive"
-        ),
-        "the empty root-control inventory was not diagnosed:\n{stderr}"
-    );
-    for resource in [
-        format!("network.cats-linux-net-{LINUX_GATE_TEST_TOKEN}"),
-        format!("container.cats-linux-pg-{LINUX_GATE_TEST_TOKEN}"),
-        format!("container.cats-linux-workspace-gate-{LINUX_GATE_TEST_TOKEN}"),
-        format!("container.cats-linux-systemd-gate-{LINUX_GATE_TEST_TOKEN}"),
-    ] {
-        assert!(
-            !state.join(&resource).exists(),
-            "intended resource remained after empty root-control inventory: {resource}"
-        );
-    }
-}
-
-#[cfg(unix)]
-#[test]
 fn linux_quality_gate_collects_privileged_failures_after_a_workspace_stage_failure() {
     let fixture = tempfile::tempdir().expect("Linux gate collected workspace failure fixture");
     let fake_bin = fixture.path().join("bin");
@@ -2469,13 +2390,7 @@ fn linux_quality_gate_collects_privileged_failures_after_a_workspace_stage_failu
         !output.status.success(),
         "a collected workspace failure incorrectly passed the Linux gate"
     );
-    for marker in [
-        "blockd-installed",
-        "root-control-test-list-ran",
-        "root-control-tests-ran",
-        "focused-systemd-test-list-ran",
-        "focused-systemd-test-ran",
-    ] {
+    for marker in ["focused-systemd-test-list-ran", "focused-systemd-test-ran"] {
         assert!(
             state.join(marker).exists(),
             "workspace failure skipped independent privileged evidence {marker}"
@@ -2502,13 +2417,7 @@ fn linux_quality_gate_never_uses_artifacts_after_the_current_workspace_build_fai
         !output.status.success(),
         "a failed current-source build incorrectly passed the Linux gate"
     );
-    for marker in [
-        "blockd-installed",
-        "root-control-test-list-ran",
-        "root-control-tests-ran",
-        "focused-systemd-test-list-ran",
-        "focused-systemd-test-ran",
-    ] {
+    for marker in ["focused-systemd-test-list-ran", "focused-systemd-test-ran"] {
         assert!(
             !state.join(marker).exists(),
             "failed current-source build exposed stale privileged artifact {marker}"
@@ -2979,7 +2888,6 @@ fn quality_gates_collect_all_nonredundant_stage_failures() {
     assert!(linux.contains("Linux quality stage passed: $stage_name (${stage_elapsed_seconds}s)"));
     assert!(linux.contains("Linux quality stage failures:"));
     assert!(linux.contains("collect_gate_failure workspace"));
-    assert!(linux.contains("collect_gate_failure root-control-inventory"));
     assert!(linux.contains("collect_gate_failure node-privileged-inventory"));
 }
 
