@@ -312,7 +312,7 @@ fn atomic_create_persists_full_mount_config_and_retries_by_semantics() {
 
     let mounts = [NewCatMount {
         binding_id: "binding-atomic",
-        disk_slug: "data",
+        disk_id: "disk-atomic",
         mount_path: "/data",
     }];
     let request = AtomicCatCreate {
@@ -336,7 +336,7 @@ fn atomic_create_persists_full_mount_config_and_retries_by_semantics() {
 
     let retry_mounts = [NewCatMount {
         binding_id: "binding-retry-is-ignored",
-        disk_slug: "data",
+        disk_id: "disk-atomic",
         mount_path: "/data",
     }];
     assert!(matches!(
@@ -369,7 +369,7 @@ fn rejected_atomic_mount_rolls_back_cat_and_binding_together() {
     register_node(&store);
     let missing = [NewCatMount {
         binding_id: "binding-missing",
-        disk_slug: "missing",
+        disk_id: "disk-missing",
         mount_path: "/data",
     }];
     assert!(matches!(

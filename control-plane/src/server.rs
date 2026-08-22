@@ -115,6 +115,9 @@ pub struct Config {
     pub image_blob: Arc<dyn BlobStore>,
     /// Service credential used by node agents, gateways and controller jobs.
     pub auth_token: String,
+    /// Shared Bearer credential for semantic Node registration, heartbeat and
+    /// synchronous Control -> noded calls.
+    pub noded_service_token: String,
     /// Exact, startup-validated release receipt from the active qualified
     /// Guest runtime. It binds both new Agent sessions and Cat placement.
     /// Production loads it from the one canonical installed path.
@@ -268,6 +271,8 @@ pub const DEFAULT_OCI_DEPLOY_SYNC_WAIT_MS: u64 = 240_000;
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
+    pub(crate) semantic_resources: Arc<dyn crate::api::semantic_resources::SemanticResourceApi>,
+    pub(crate) semantic_node_http: crate::api::semantic_nodes::SemanticNodeHttpState,
     pub(crate) observation_store: Arc<ObservationStoreLane>,
     pub(crate) lifecycle_store: Arc<LifecycleStoreLane>,
     pub(crate) route_store: Arc<RouteStoreLane>,
@@ -309,6 +314,8 @@ pub struct Handle {
     pub route_rotation_machine_addr: Option<std::net::SocketAddr>,
     pub state: AppState,
     server_task: tokio::task::JoinHandle<()>,
+    semantic_node_liveness_shutdown: tokio::sync::watch::Sender<bool>,
+    semantic_node_liveness_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     volume_delete_sweeper_task: Option<ManagedSingletonTask>,
     route_controller_task: ManagedSingletonTask,
     image_manifest_resolver: Arc<
@@ -396,6 +403,7 @@ impl Handle {
         {
             let _ = shutdown.send(());
         }
+        self.semantic_node_liveness_shutdown.send_replace(true);
         if let Some(task) = &self.volume_delete_sweeper_task {
             task.begin_shutdown();
         }
@@ -438,6 +446,13 @@ impl Handle {
             }
         };
         let route_controller = self.route_controller_task.shutdown();
+        let semantic_node_liveness = async {
+            let mut task = self.semantic_node_liveness_task.lock().await;
+            match task.take() {
+                Some(task) => task.await.context("semantic Node liveness task failed"),
+                None => Ok(()),
+            }
+        };
         let gateway_machine = async {
             if let Some(listener) = &self.gateway_machine_listener {
                 listener.shutdown().await
@@ -467,6 +482,7 @@ impl Handle {
             route_rotation_machine_result,
             volume_delete_sweeper_result,
             route_controller_result,
+            semantic_node_liveness_result,
         ) = tokio::join!(
             observation_store,
             lifecycle_store,
@@ -481,7 +497,8 @@ impl Handle {
             gateway_machine,
             route_rotation_machine,
             volume_delete_sweeper,
-            route_controller
+            route_controller,
+            semantic_node_liveness
         );
         if !manifest_result {
             tracing::warn!("image manifest reads exceeded the shutdown deadline");
@@ -494,6 +511,7 @@ impl Handle {
         route_rotation_machine_result?;
         volume_delete_sweeper_result?;
         route_controller_result?;
+        semantic_node_liveness_result?;
         commit_result.map_err(anyhow::Error::from)?;
         persistent_disk_commit_result.map_err(anyhow::Error::from)?;
         product_mutation_commit_result.map_err(anyhow::Error::from)?;
@@ -934,6 +952,49 @@ pub async fn spawn_with_gateway_machine(
         (None, None) => None,
         _ => anyhow::bail!("incomplete Route v2 rotation operator composition"),
     };
+    let noded_service_token =
+        cats_api::semantic_control::NodedServiceToken::new(cfg.noded_service_token.clone())
+            .context("CATS_NODED_SERVICE_TOKEN must satisfy the semantic noded token contract")?;
+    let semantic_node_repository: Arc<dyn crate::semantic_node::NodeRepository> =
+        Arc::new(crate::semantic_adapters::SemanticNodeRepositoryAdapter::new(Arc::clone(&store)));
+    let semantic_node_probe: Arc<dyn crate::semantic_node::NodeHealthProbe> = Arc::new(
+        crate::semantic_node::HttpNodeHealthProbe::new(noded_service_token.clone())?,
+    );
+    let semantic_node_service = Arc::new(
+        crate::semantic_node::NodeManagementService::with_default_heartbeat_policy(
+            semantic_node_repository,
+            semantic_node_probe,
+        ),
+    );
+    let semantic_node_http = crate::api::semantic_nodes::SemanticNodeHttpState::new(
+        Arc::clone(&semantic_node_service),
+        noded_service_token.clone(),
+    );
+    let semantic_noded_client = crate::semantic_noded_client::SemanticNodedClient::new(
+        noded_service_token,
+        crate::semantic_noded_client::SemanticNodedClientConfig::default(),
+    )?;
+    let semantic_lifecycle = crate::semantic_lifecycle::SemanticLifecycleService::new(
+        crate::semantic_adapters::SemanticStoreAdapter::new(Arc::clone(&store)),
+        crate::semantic_adapters::SemanticNodedLifecycleAdapter::new(semantic_noded_client),
+        crate::semantic_adapters::UnavailableIngressPort,
+        crate::semantic_lifecycle::LifecycleTimeouts::default(),
+    );
+    let semantic_resources: Arc<dyn crate::api::semantic_resources::SemanticResourceApi> = Arc::new(
+        crate::semantic_resource_service::ProductionSemanticResourceApi::new(
+            semantic_lifecycle,
+            crate::semantic_resource_service::PostgresSemanticResourceStore::new(Arc::clone(
+                &store,
+            )),
+        ),
+    );
+    let (semantic_node_liveness_shutdown, semantic_node_liveness_rx) =
+        tokio::sync::watch::channel(false);
+    let semantic_node_liveness_task = tokio::spawn(async move {
+        semantic_node_service
+            .run_liveness_monitor(semantic_node_liveness_rx)
+            .await;
+    });
     let state = AppState {
         runtime_node_authority: Arc::new(
             crate::api::runtime_node_authority::RuntimeNodeAuthorityService::new(
@@ -944,6 +1005,8 @@ pub async fn spawn_with_gateway_machine(
             ),
         ),
         route_v2_signing_operator,
+        semantic_resources,
+        semantic_node_http,
         store,
         observation_store,
         lifecycle_store,
@@ -1119,6 +1182,8 @@ pub async fn spawn_with_gateway_machine(
         route_rotation_machine_addr,
         state,
         server_task,
+        semantic_node_liveness_shutdown,
+        semantic_node_liveness_task: tokio::sync::Mutex::new(Some(semantic_node_liveness_task)),
         volume_delete_sweeper_task,
         route_controller_task,
         image_manifest_resolver: image_manifests,

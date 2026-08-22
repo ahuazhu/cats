@@ -82,20 +82,6 @@ async fn billing_projection(state: &AppState, workspace: &str) -> ApiResult<Bill
     })
 }
 
-pub(super) async fn require_funded(state: &AppState, workspace: &str) -> ApiResult<()> {
-    if !state.cfg.billing_enforcement_enabled {
-        return Ok(());
-    }
-    let projection = billing_projection(state, workspace).await?;
-    if projection.available_nanos <= 0 {
-        return Err(ApiError::payment_required(
-            "prepaid balance is exhausted; add funds in Billing before starting paid work",
-        )
-        .into());
-    }
-    Ok(())
-}
-
 pub(super) async fn workspace_billing_balance(
     State(state): State<AppState>,
     Path(workspace): Path<String>,

@@ -105,6 +105,8 @@ struct Args {
     object_store_options: Vec<String>,
     #[arg(long, env = "CATS_AUTH_TOKEN", default_value = "dev-service-token")]
     auth_token: String,
+    #[arg(long, env = "CATS_NODED_SERVICE_TOKEN", hide_env_values = true)]
+    noded_service_token: String,
     /// Exact qualified Guest runtime release receipt. Production has one
     /// immutable install path shared with Node registration and Cat placement.
     #[arg(
@@ -535,6 +537,7 @@ async fn main() -> anyhow::Result<()> {
         credit_store,
         image_blob,
         auth_token: args.auth_token,
+        noded_service_token: args.noded_service_token,
         guest_runtime_profile_receipt: guest_runtime_profile_receipt.receipt().clone(),
         runtime_provisioner_trust_bundle: runtime_provisioner_trust.bundle().clone(),
         production_cutover_operator_trust_bundle: production_cutover_operator_trust

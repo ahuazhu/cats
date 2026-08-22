@@ -408,6 +408,7 @@ mod tests {
             production_cutover_operator_trust_bundle:
                 crate::testsupport::test_production_cutover_operator_trust_bundle(),
             auth_token: "service-token".into(),
+            noded_service_token: "semantic-node-test-token-00000000".into(),
             admin_token: "admin-token".into(),
             workos: None,
             stripe: None,

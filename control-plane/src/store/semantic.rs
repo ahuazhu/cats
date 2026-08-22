@@ -1078,10 +1078,7 @@ impl Store {
         })
     }
 
-    pub fn find_semantic_disk_by_id(
-        &self,
-        disk_id: &str,
-    ) -> Result<Option<PersistentDiskRecord>> {
+    pub fn find_semantic_disk_by_id(&self, disk_id: &str) -> Result<Option<PersistentDiskRecord>> {
         self.with(|client| {
             client
                 .query_opt(
@@ -1092,10 +1089,7 @@ impl Store {
         })
     }
 
-    pub fn find_semantic_disk_binding(
-        &self,
-        disk_id: &str,
-    ) -> Result<Option<DiskBindingWithCat>> {
+    pub fn find_semantic_disk_binding(&self, disk_id: &str) -> Result<Option<DiskBindingWithCat>> {
         self.with(|client| {
             client
                 .query_opt(

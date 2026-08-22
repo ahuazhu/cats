@@ -4,8 +4,6 @@
 //! lifecycle and binding mutations use immutable internal IDs. No request ID,
 //! lifecycle Operation, or compatibility protocol enters this adapter.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use cats_api::runtime_reconciliation::Id;
@@ -22,19 +20,13 @@ pub trait LifecycleResourcePort: Send + Sync {
     fn create<'a>(
         &'a self,
         request: lifecycle::CreateCatRequest,
-    ) -> SemanticResourceFuture<
-        'a,
-        Result<lifecycle::LifecycleOutcome, lifecycle::LifecycleError>,
-    >;
+    ) -> SemanticResourceFuture<'a, Result<lifecycle::LifecycleOutcome, lifecycle::LifecycleError>>;
 
     fn action<'a>(
         &'a self,
         selector: lifecycle::CatSelector,
         action: lifecycle::CatAction,
-    ) -> SemanticResourceFuture<
-        'a,
-        Result<lifecycle::LifecycleOutcome, lifecycle::LifecycleError>,
-    >;
+    ) -> SemanticResourceFuture<'a, Result<lifecycle::LifecycleOutcome, lifecycle::LifecycleError>>;
 }
 
 impl<S, N, I> LifecycleResourcePort for lifecycle::SemanticLifecycleService<S, N, I>
@@ -46,10 +38,8 @@ where
     fn create<'a>(
         &'a self,
         request: lifecycle::CreateCatRequest,
-    ) -> SemanticResourceFuture<
-        'a,
-        Result<lifecycle::LifecycleOutcome, lifecycle::LifecycleError>,
-    > {
+    ) -> SemanticResourceFuture<'a, Result<lifecycle::LifecycleOutcome, lifecycle::LifecycleError>>
+    {
         Box::pin(async move { self.create(request).await })
     }
 
@@ -57,10 +47,8 @@ where
         &'a self,
         selector: lifecycle::CatSelector,
         action: lifecycle::CatAction,
-    ) -> SemanticResourceFuture<
-        'a,
-        Result<lifecycle::LifecycleOutcome, lifecycle::LifecycleError>,
-    > {
+    ) -> SemanticResourceFuture<'a, Result<lifecycle::LifecycleOutcome, lifecycle::LifecycleError>>
+    {
         Box::pin(async move {
             match action {
                 lifecycle::CatAction::Create => Err(lifecycle::LifecycleError::Rejected {
@@ -158,15 +146,14 @@ impl SemanticResourceStore for PostgresSemanticResourceStore {
         &'a self,
         workspace_id: &'a str,
         disk_slug: &'a str,
-    ) -> SemanticResourceFuture<'a, Result<Option<db::PersistentDiskRecord>, ResourceStoreError>> {
+    ) -> SemanticResourceFuture<'a, Result<Option<db::PersistentDiskRecord>, ResourceStoreError>>
+    {
         let store = Arc::clone(&self.store);
         let workspace_id = workspace_id.to_owned();
         let disk_slug = disk_slug.to_owned();
         Box::pin(async move {
             store
-                .execute(move |store| {
-                    store.find_current_semantic_disk(&workspace_id, &disk_slug)
-                })
+                .execute(move |store| store.find_current_semantic_disk(&workspace_id, &disk_slug))
                 .await
                 .map_err(resource_store_error)
         })
@@ -321,9 +308,12 @@ impl lifecycle::SemanticLifecycleStore for PostgresSemanticLifecycleStore {
                         })
                         .collect::<Vec<_>>();
                     let cpu_count = i64::from(request.config.cpu_count);
-                    let memory_bytes = i64::try_from(request.config.memory_bytes).map_err(|_| {
-                        cats_api::error::ApiError::invalid("Cat memory exceeds PostgreSQL BIGINT")
-                    })?;
+                    let memory_bytes =
+                        i64::try_from(request.config.memory_bytes).map_err(|_| {
+                            cats_api::error::ApiError::invalid(
+                                "Cat memory exceeds PostgreSQL BIGINT",
+                            )
+                        })?;
                     store.admit_semantic_cat_create(db::AtomicCatCreate {
                         cat_id: &cat_id,
                         workspace_id: &request.workspace_id,
@@ -361,9 +351,7 @@ impl lifecycle::SemanticLifecycleStore for PostgresSemanticLifecycleStore {
                         None
                     };
                     let selector = match &selector {
-                        lifecycle::CatSelector::Id(cat_id) => {
-                            db::SemanticCatSelector::Id(cat_id)
-                        }
+                        lifecycle::CatSelector::Id(cat_id) => db::SemanticCatSelector::Id(cat_id),
                         lifecycle::CatSelector::Slug {
                             workspace_id,
                             cat_slug,
@@ -387,10 +375,8 @@ impl lifecycle::SemanticLifecycleStore for PostgresSemanticLifecycleStore {
     fn node_control_endpoint<'a>(
         &'a self,
         node_id: &'a str,
-    ) -> lifecycle::SemanticFuture<
-        'a,
-        Result<lifecycle::NodeControlEndpoint, lifecycle::StoreError>,
-    > {
+    ) -> lifecycle::SemanticFuture<'a, Result<lifecycle::NodeControlEndpoint, lifecycle::StoreError>>
+    {
         let store = Arc::clone(&self.store);
         let node_id = node_id.to_owned();
         Box::pin(async move {
@@ -477,13 +463,12 @@ fn map_create_admission(
     outcome: db::AdmitCatCreateOutcome,
 ) -> Result<lifecycle::Admission, lifecycle::StoreError> {
     Ok(match outcome {
-        db::AdmitCatCreateOutcome::Created(cat) => lifecycle::Admission::Claimed(action_claim(
-            cat,
-            lifecycle::CatAction::Create,
-        )?),
-        db::AdmitCatCreateOutcome::SameAction(cat) => lifecycle::Admission::SameAction(
-            action_claim(cat, lifecycle::CatAction::Create)?,
-        ),
+        db::AdmitCatCreateOutcome::Created(cat) => {
+            lifecycle::Admission::Claimed(action_claim(cat, lifecycle::CatAction::Create)?)
+        }
+        db::AdmitCatCreateOutcome::SameAction(cat) => {
+            lifecycle::Admission::SameAction(action_claim(cat, lifecycle::CatAction::Create)?)
+        }
         db::AdmitCatCreateOutcome::AlreadyExists(cat) => lifecycle::Admission::Already {
             cat: db_aggregate_to_lifecycle(cat)?,
             code: "already_exists",
@@ -686,7 +671,12 @@ where
                     .current_disk(workspace_id, mount.disk_slug.as_str())
                     .await
                     .map_err(internal_resource_error)?
-                    .ok_or_else(|| semantic_error(wire::SemanticErrorCode::DiskNotFound, "PersistentDisk was not found"))?;
+                    .ok_or_else(|| {
+                        semantic_error(
+                            wire::SemanticErrorCode::DiskNotFound,
+                            "PersistentDisk was not found",
+                        )
+                    })?;
                 mounts.push(lifecycle::CatMount {
                     disk_id: disk.disk_id,
                     mount_path: mount.mount_path.to_string(),
@@ -833,7 +823,12 @@ where
                 .disk_projection(&disk.disk_id)
                 .await
                 .map_err(internal_resource_error)?
-                .ok_or_else(|| semantic_error(wire::SemanticErrorCode::DiskNotFound, "PersistentDisk was not found"))?;
+                .ok_or_else(|| {
+                    semantic_error(
+                        wire::SemanticErrorCode::DiskNotFound,
+                        "PersistentDisk was not found",
+                    )
+                })?;
             if projection.binding.is_some() {
                 return Err(semantic_error(
                     wire::SemanticErrorCode::DiskInUse,
@@ -881,29 +876,30 @@ where
             })
     }
 
-    async fn project_cat(
-        &self,
-        cat_id: &str,
-    ) -> Result<wire::CatView, wire::SemanticErrorBody> {
+    async fn project_cat(&self, cat_id: &str) -> Result<wire::CatView, wire::SemanticErrorBody> {
         let projection = self
             .resources
             .cat_projection(cat_id)
             .await
             .map_err(internal_resource_error)?
-            .ok_or_else(|| semantic_error(wire::SemanticErrorCode::CatNotFound, "Cat was not found"))?;
+            .ok_or_else(|| {
+                semantic_error(wire::SemanticErrorCode::CatNotFound, "Cat was not found")
+            })?;
         cat_view(projection).map_err(internal_resource_error)
     }
 
-    async fn project_disk(
-        &self,
-        disk_id: &str,
-    ) -> Result<wire::DiskView, wire::SemanticErrorBody> {
+    async fn project_disk(&self, disk_id: &str) -> Result<wire::DiskView, wire::SemanticErrorBody> {
         let projection = self
             .resources
             .disk_projection(disk_id)
             .await
             .map_err(internal_resource_error)?
-            .ok_or_else(|| semantic_error(wire::SemanticErrorCode::DiskNotFound, "PersistentDisk was not found"))?;
+            .ok_or_else(|| {
+                semantic_error(
+                    wire::SemanticErrorCode::DiskNotFound,
+                    "PersistentDisk was not found",
+                )
+            })?;
         disk_view(projection).map_err(internal_resource_error)
     }
 }
@@ -913,7 +909,10 @@ fn cat_view(projection: CatProjection) -> Result<wire::CatView, ResourceStoreErr
     let node_id = cat.node_id.as_deref().map(parse_id).transpose()?;
     let node_name = projection
         .node_name
-        .map(|name| wire::NodeName::new(name).ok_or_else(|| ResourceStoreError::new("stored Node name is invalid")))
+        .map(|name| {
+            wire::NodeName::new(name)
+                .ok_or_else(|| ResourceStoreError::new("stored Node name is invalid"))
+        })
         .transpose()?;
     let last_error = cat.last_error_code.map(|code| wire::SemanticErrorBody {
         code: semantic_error_code(&code),
@@ -1082,9 +1081,10 @@ fn map_lifecycle_error(error: lifecycle::LifecycleError) -> wire::SemanticErrorB
         lifecycle::LifecycleError::NotFound => {
             semantic_error(wire::SemanticErrorCode::CatNotFound, "Cat was not found")
         }
-        lifecycle::LifecycleError::Busy(_) => {
-            semantic_error(wire::SemanticErrorCode::Busy, "another Cat action is running")
-        }
+        lifecycle::LifecycleError::Busy(_) => semantic_error(
+            wire::SemanticErrorCode::Busy,
+            "another Cat action is running",
+        ),
         lifecycle::LifecycleError::Conflict { code, .. } => {
             semantic_error(semantic_error_code(code), code)
         }
@@ -1186,4 +1186,3 @@ fn semantic_error(
         message: message.into(),
     }
 }
-

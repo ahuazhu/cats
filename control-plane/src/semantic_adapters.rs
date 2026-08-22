@@ -85,9 +85,9 @@ impl SemanticLifecycleStore for SemanticStoreAdapter {
                         .collect::<Vec<_>>();
                     let mounts = owned_mounts
                         .iter()
-                        .map(|(binding_id, disk_slug, mount_path)| NewCatMount {
+                        .map(|(binding_id, disk_id, mount_path)| NewCatMount {
                             binding_id,
-                            disk_slug,
+                            disk_id,
                             mount_path,
                         })
                         .collect::<Vec<_>>();

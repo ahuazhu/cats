@@ -80,6 +80,7 @@ impl Context {
             credit_store: usage,
             image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
             auth_token: SERVICE_TOKEN.into(),
+            noded_service_token: "semantic-node-test-token-00000000".into(),
             guest_runtime_profile_receipt: receipt.clone(),
             runtime_provisioner_trust_bundle:
                 cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
