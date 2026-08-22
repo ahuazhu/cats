@@ -89,7 +89,7 @@
 - [x] Control 响应丢失后查询 noded 恢复。
 - [x] offline Node 下一次心跳触发 reset，关闭 placement、清理本地 Cat 后重新注册。
 - [x] `cargo test`/Clippy 的相关定向回归全部通过；本轮 `quality.sh fast` 已通过。
-- [ ] 运行当前切换提交的 `./scripts/quality.sh full`。（基线已通过，本轮待冻结 clean commit 后执行。）
+- [x] 运行当前切换提交的 `./scripts/quality.sh full`。（clean commit `5ea86c3e` 全阶段通过。）
 - [ ] 运行当前切换提交适用的 Linux Node/Cloud Hypervisor 门禁。（基线已通过，本轮待发布 Host 执行。）
 
 ## 4. 已合入提交
@@ -174,3 +174,4 @@
 - `./scripts/quality.sh fast` 已在 dirty fingerprint `1c6a292a2672d7b2f66064951e6be623e236041f` 上通过 fmt、共享 skill/release image 检查和全 workspace Clippy。生产 AWS 探针已校准为“本机 AWS session 过期”，不是生产资源为空；发布前需刷新既有 AWS 登录。
 - 已删除退役 Node lifecycle command、runtime inventory、AgentSession/Route、launcher 等 authority 实现及其专属测试；保留的同 Cat 并发、reset 清理和双 Node 恢复均已迁移到新 semantic HTTP 测试。`cargo check -p cats-node-agent -p cats-node-agent-daemon --all-targets`、Node deployment contracts 20/20、双 Node semantic HTTP 2/2 和 `cargo machete --with-metadata` 通过。
 - 生产 worker bundle 不再构建、安装或校验旧 Route validator/launcher；Kubernetes application 不再向 controld 传入旧 Route 监听，也不再部署旧 Route Gateway、ObjectWrite Gateway、rotation Service、旧 PVC/NLB/DNS 或 Endpoint wildcard ingress，Control 镜像也不再携带旧 gateway binary。相关 Terraform module/production application 测试共 8/8、Control deployment contracts 61/61 通过；当前生产公网只把 Control host 路由到新同步 API。
+- 当前 clean commit `5ea86c3e` 的 `./scripts/quality.sh full` 通过全部阶段：fmt、共享 skills、release image contract、deny/machete、workspace build、Clippy、workspace/PostgreSQL tests 与 rustdoc。首轮门禁发现并修正一处新 noded wire 测试缺少 `workspace_id`；第二轮按切换规则删除 3 个只验证已退役 ObjectWrite Gateway/PVC/NLB 生产编排的测试，Host fence 与 worker direct-S3 最小权限测试保留并通过 3/3。
