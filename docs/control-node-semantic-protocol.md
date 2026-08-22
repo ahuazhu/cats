@@ -157,7 +157,7 @@ nodes
 
 - `node_name` 必填，在 Node 列表、详情、Cat placement 和运维日志中优先展示；数据库关联和内部调用仍使用 `node_id`；
 - `control_endpoint` 必须是 Control Plane 可访问的绝对 `http` 或 `https` URL；Control Plane 使用内部共享凭证调用；
-- 同一个 `node_id` 的 `node_name` 和 `control_endpoint` 创建后不可由注册或心跳隐式修改；
+- 同一个 `node_id` 的 `node_name` 创建后不可由注册或心跳隐式修改；`control_endpoint` 由 noded 在显式注册或 reset 完成后重新注册时更新，普通心跳不能修改；
 - 同一云环境中的 `instance_id` 必须唯一；
 - `deleted` Node 不能重新变为 `running`；重新提供机器时创建新的 `node_id`；
 - `draining`、`offline`、`reset_required` 和 `deleted` Node 不接受新的 Cat placement。
@@ -748,6 +748,8 @@ Disk 只有未绑定时才能 destroy。删除成功后可以保留 `deleted` �
 POST /v1/internal/nodes/register
 ```
 
+`noded` 必须在注册请求中显式填写自己对 Control Plane 可达的 `control_endpoint`；Control Plane 不根据注册连接的来源地址猜测回连地址。
+
 请求：
 
 ```json
@@ -767,8 +769,9 @@ POST /v1/internal/nodes/register
 语义判断：
 
 - `node_id + instance_id` 不存在：创建并返回 `registered`；
-- 完全相同且状态为 `running`：返回 `already_registered`；
-- `node_id` 相同但 `node_name`、`control_endpoint` 或云实例信息不同：返回 `node_identity_conflict`；
+- 身份和 `control_endpoint` 都相同且状态为 `running`：返回 `already_registered`；
+- `node_id` 和云实例身份相同、仅 `control_endpoint` 改变：更新地址并返回 `registered`；
+- `node_id` 相同但 `node_name` 或云实例信息不同：返回 `node_identity_conflict`；
 - Node 为 `offline/reset_required`：返回 `reset_required`；
 - Node 为 `deleted`：拒绝注册，必须提供新的 `node_id`。
 
