@@ -738,3 +738,104 @@ fn registration_starts_liveness_clock_and_offline_cas_rejects_racing_heartbeat()
         NodeStatus::Offline
     );
 }
+
+#[test]
+fn offline_recovery_claim_replaces_old_lane_and_exactly_moves_placement() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    assert!(matches!(
+        store
+            .register_semantic_node(NodeRegistration {
+                node_id: "node-b",
+                node_name: "worker-b",
+                control_endpoint: "http://10.0.0.2:8443",
+                vendor: "aws",
+                region: "us-east-1",
+                zone: "us-east-1b",
+                instance_id: "i-semantic-b",
+                machine_type: "m7i.large",
+                node_version: "1.0.0",
+                reset_completed: false,
+            })
+            .unwrap(),
+        RegisterNodeOutcome::Registered(_)
+    ));
+    create_running_cat(&store, "cat-recovery", "recovery");
+
+    assert!(matches!(
+        store
+            .try_begin_semantic_cat_action("cat-recovery", CatAction::Cold, Some("node-a"))
+            .unwrap(),
+        BeginCatActionOutcome::Acquired(_)
+    ));
+    assert!(store
+        .transition_semantic_node_status("node-a", &[NodeStatus::Running], NodeStatus::Offline,)
+        .unwrap()
+        .is_some());
+
+    let ClaimSemanticCatRecoveryOutcome::Claimed(claim) = store
+        .claim_semantic_cat_recovery("node-a", "cat-recovery")
+        .unwrap()
+    else {
+        panic!("offline Cat must receive one recovery claim")
+    };
+    assert_eq!(claim.target_state, CatState::Running);
+    assert_eq!(claim.target_node_id, "node-b");
+    assert_eq!(claim.cat.cat.node_id.as_deref(), Some("node-a"));
+    assert_eq!(claim.cat.cat.current_action, Some(CatAction::Run));
+    assert_eq!(
+        claim.cat.cat.current_action_node_id.as_deref(),
+        Some("node-b")
+    );
+
+    assert!(matches!(
+        store
+            .claim_semantic_cat_recovery("node-a", "cat-recovery")
+            .unwrap(),
+        ClaimSemanticCatRecoveryOutcome::AlreadyClaimed(retry)
+            if retry.target_node_id == "node-b"
+    ));
+    assert!(store
+        .finish_semantic_cat_action(
+            "cat-recovery",
+            FinishCatAction {
+                expected_action: CatAction::Cold,
+                expected_node_id: Some("node-a"),
+                final_state: CatState::Cold,
+                final_node_id: None,
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .unwrap()
+        .is_none());
+
+    let recovered = store
+        .finish_semantic_cat_recovery(
+            SemanticCatRecoverySettlement {
+                cat_id: "cat-recovery",
+                source_node_id: "node-a",
+                target_node_id: "node-b",
+                target_state: CatState::Running,
+            },
+            SemanticCatRecoveryResult::Recovered,
+        )
+        .unwrap()
+        .expect("exact recovery claim must settle");
+    assert_eq!(recovered.cat.state, Some(CatState::Running));
+    assert_eq!(recovered.cat.node_id.as_deref(), Some("node-b"));
+    assert_eq!(recovered.cat.current_action, None);
+
+    assert!(store
+        .finish_semantic_cat_recovery(
+            SemanticCatRecoverySettlement {
+                cat_id: "cat-recovery",
+                source_node_id: "node-a",
+                target_node_id: "node-b",
+                target_state: CatState::Running,
+            },
+            SemanticCatRecoveryResult::Recovered,
+        )
+        .unwrap()
+        .is_none());
+}

@@ -342,6 +342,43 @@ pub struct NodeHeartbeatRecord {
     pub warm_cat_count: i64,
 }
 
+/// One Cat recovery claim after its source Node was marked offline. The Cat's
+/// stable product state and source placement remain unchanged until the new
+/// Node has reached `target_state`; `current_action_node_id` is the committed
+/// target placement and fences late settlement from the old Node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SemanticCatRecoveryClaim {
+    pub cat: CatWithMounts,
+    pub source_node_id: String,
+    pub target_node_id: String,
+    pub target_state: CatState,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClaimSemanticCatRecoveryOutcome {
+    Claimed(SemanticCatRecoveryClaim),
+    AlreadyClaimed(SemanticCatRecoveryClaim),
+    ColdNoAction(CatWithMounts),
+    UnsupportedState(CatWithMounts),
+    NoRunningTarget(CatWithMounts),
+    SourceNotOffline,
+    Stale,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticCatRecoveryResult<'a> {
+    Recovered,
+    Failed { code: &'a str, message: &'a str },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticCatRecoverySettlement<'a> {
+    pub cat_id: &'a str,
+    pub source_node_id: &'a str,
+    pub target_node_id: &'a str,
+    pub target_state: CatState,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistentDiskRecord {
     pub disk_id: String,
@@ -1148,6 +1185,198 @@ impl Store {
                     &[&candidate.node_id, &candidate.last_heartbeat_at],
                 )
                 .map(|changed| changed == 1)
+        })
+    }
+
+    /// Snapshot the current non-destroyed Cats whose stable placement still
+    /// names this Node. Every Cat is rechecked under row lock by
+    /// `claim_semantic_cat_recovery`; this list is discovery, not authority.
+    pub fn list_semantic_node_cats(&self, node_id: &str) -> Result<Vec<CatWithMounts>> {
+        self.with(|client| {
+            let mut transaction = client.transaction()?;
+            let rows = transaction.query(
+                &format!(
+                    "SELECT {CAT_COLUMNS} FROM cats
+                      WHERE node_id=$1 AND destroyed_at IS NULL
+                      ORDER BY cat_id FOR SHARE"
+                ),
+                &[&node_id],
+            )?;
+            let mut cats = Vec::with_capacity(rows.len());
+            for row in rows {
+                cats.push(cat_with_mounts(&mut transaction, row_to_cat(&row))?);
+            }
+            transaction.commit()?;
+            Ok(cats)
+        })
+    }
+
+    /// Atomically replaces any old-Node action lane with one recovery `run`
+    /// claim and selects another currently running Node. The source placement
+    /// stays on the Cat until terminal recovery, so a Control restart can
+    /// rediscover and resume this exact scenario without an Operation row.
+    pub fn claim_semantic_cat_recovery(
+        &self,
+        source_node_id: &str,
+        cat_id: &str,
+    ) -> Result<ClaimSemanticCatRecoveryOutcome> {
+        self.with(|client| {
+            let mut transaction = client.transaction()?;
+            let source = transaction.query_opt(
+                "SELECT status FROM nodes WHERE node_id=$1 FOR SHARE",
+                &[&source_node_id],
+            )?;
+            let Some(source) = source else {
+                transaction.rollback()?;
+                return Ok(ClaimSemanticCatRecoveryOutcome::SourceNotOffline);
+            };
+            if !matches!(source.get::<_, &str>(0), "offline" | "reset_required") {
+                transaction.rollback()?;
+                return Ok(ClaimSemanticCatRecoveryOutcome::SourceNotOffline);
+            }
+
+            let row = transaction.query_opt(
+                &format!("SELECT {CAT_COLUMNS} FROM cats WHERE cat_id=$1 FOR UPDATE"),
+                &[&cat_id],
+            )?;
+            let Some(row) = row else {
+                transaction.rollback()?;
+                return Ok(ClaimSemanticCatRecoveryOutcome::Stale);
+            };
+            let cat = row_to_cat(&row);
+            if cat.destroyed_at.is_some() || cat.node_id.as_deref() != Some(source_node_id) {
+                transaction.rollback()?;
+                return Ok(ClaimSemanticCatRecoveryOutcome::Stale);
+            }
+            let aggregate = cat_with_mounts(&mut transaction, cat)?;
+            let Some(target_state) = aggregate.cat.state else {
+                transaction.commit()?;
+                return Ok(ClaimSemanticCatRecoveryOutcome::UnsupportedState(aggregate));
+            };
+            match target_state {
+                CatState::Cold => {
+                    transaction.commit()?;
+                    return Ok(ClaimSemanticCatRecoveryOutcome::ColdNoAction(aggregate));
+                }
+                CatState::Failure | CatState::Destroyed => {
+                    transaction.commit()?;
+                    return Ok(ClaimSemanticCatRecoveryOutcome::UnsupportedState(aggregate));
+                }
+                CatState::Running | CatState::Suspended | CatState::Warm => {}
+            }
+
+            // A previous recovery claim is recognizable without another
+            // resource: the stable placement is still the source while the
+            // run lane names a distinct running target.
+            if aggregate.cat.current_action == Some(CatAction::Run) {
+                if let Some(target_node_id) = aggregate.cat.current_action_node_id.clone() {
+                    if target_node_id != source_node_id
+                        && transaction
+                            .query_opt(
+                                "SELECT node_id FROM nodes
+                                  WHERE node_id=$1 AND status='running' FOR SHARE",
+                                &[&target_node_id],
+                            )?
+                            .is_some()
+                    {
+                        let claim = SemanticCatRecoveryClaim {
+                            cat: aggregate,
+                            source_node_id: source_node_id.to_owned(),
+                            target_node_id,
+                            target_state,
+                        };
+                        transaction.commit()?;
+                        return Ok(ClaimSemanticCatRecoveryOutcome::AlreadyClaimed(claim));
+                    }
+                }
+            }
+
+            let target = transaction.query_opt(
+                "SELECT node_id FROM nodes
+                  WHERE status='running' AND node_id<>$1
+                  ORDER BY node_id LIMIT 1 FOR SHARE",
+                &[&source_node_id],
+            )?;
+            let Some(target) = target else {
+                transaction.commit()?;
+                return Ok(ClaimSemanticCatRecoveryOutcome::NoRunningTarget(aggregate));
+            };
+            let target_node_id: String = target.get(0);
+            let row = transaction.query_one(
+                &format!(
+                    "UPDATE cats
+                        SET current_action='run',
+                            current_action_started_at={DB_NOW_MS},
+                            current_action_node_id=$3,
+                            last_error_code=NULL,last_error_message=NULL,
+                            updated_at={DB_NOW_MS}
+                      WHERE cat_id=$1 AND node_id=$2 AND destroyed_at IS NULL
+                      RETURNING {CAT_COLUMNS}"
+                ),
+                &[&cat_id, &source_node_id, &target_node_id],
+            )?;
+            let claimed = cat_with_mounts(&mut transaction, row_to_cat(&row))?;
+            let claim = SemanticCatRecoveryClaim {
+                cat: claimed,
+                source_node_id: source_node_id.to_owned(),
+                target_node_id,
+                target_state,
+            };
+            transaction.commit()?;
+            Ok(ClaimSemanticCatRecoveryOutcome::Claimed(claim))
+        })
+    }
+
+    /// Settle only the exact recovery lane and source placement. Success
+    /// publishes the new placement while retaining the pre-failure product
+    /// state; failure records a cleanup-required Cat on the target Node.
+    pub fn finish_semantic_cat_recovery(
+        &self,
+        settlement: SemanticCatRecoverySettlement<'_>,
+        result: SemanticCatRecoveryResult<'_>,
+    ) -> Result<Option<CatWithMounts>> {
+        self.with(|client| {
+            let mut transaction = client.transaction()?;
+            let (state, error_code, error_message) = match result {
+                SemanticCatRecoveryResult::Recovered => {
+                    (settlement.target_state.as_str(), None, None)
+                }
+                SemanticCatRecoveryResult::Failed { code, message } => {
+                    (CatState::Failure.as_str(), Some(code), Some(message))
+                }
+            };
+            let row = transaction.query_opt(
+                &format!(
+                    "UPDATE cats
+                        SET state=$5,node_id=$3,
+                            current_action=NULL,current_action_started_at=NULL,
+                            current_action_node_id=NULL,
+                            last_error_code=$6,last_error_message=$7,
+                            updated_at={DB_NOW_MS}
+                      WHERE cat_id=$1
+                        AND node_id=$2
+                        AND current_action='run'
+                        AND current_action_node_id=$3
+                        AND state=$4
+                        AND destroyed_at IS NULL
+                      RETURNING {CAT_COLUMNS}"
+                ),
+                &[
+                    &settlement.cat_id,
+                    &settlement.source_node_id,
+                    &settlement.target_node_id,
+                    &settlement.target_state.as_str(),
+                    &state,
+                    &error_code,
+                    &error_message,
+                ],
+            )?;
+            let aggregate = match row {
+                Some(row) => Some(cat_with_mounts(&mut transaction, row_to_cat(&row))?),
+                None => None,
+            };
+            transaction.commit()?;
+            Ok(aggregate)
         })
     }
 

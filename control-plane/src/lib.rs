@@ -11,6 +11,7 @@ pub mod semantic_adapters;
 pub mod semantic_disk;
 pub mod semantic_lifecycle;
 pub mod semantic_node;
+pub mod semantic_node_recovery;
 pub mod semantic_noded_client;
 pub mod semantic_resource_service;
 pub mod server;
