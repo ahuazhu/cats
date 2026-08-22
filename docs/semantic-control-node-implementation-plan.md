@@ -30,7 +30,7 @@
 | CLI | `cmd/cats/` | slug 命令、同步 REST、`--mount`、GiB 解析、`node_name` 展示 | 已完成并合入 |
 | noded 执行 | `node-agent/`、`cmd/noded/` | 同步 HTTP server、每 Cat 串行、destroy 清理、实际 effects 接入 | FakeVmm 已完成并合入；Cloud Hypervisor effects 待接入 |
 | Node 管理 | Control API、Node heartbeat client | 注册、`node_name`、`control_endpoint`、offline/reset/drain | 已完成并合入；Store/进程接线待后续项 |
-| Production adapters | Control adapter | Store/placement/noded/入口实现与公共 DTO 映射 | Store/Node/noded 已完成；Resource API 与真实入口待接入 |
+| Production adapters | Control adapter | Store/placement/noded/入口实现与公共 DTO 映射 | Store/Node/noded 已完成；Resource API 进行中；入口需独立 Route 切片 |
 | HTTP composition | Control router、AppState、controld/noded main | 新路由和服务接线，旧路由退出 | Cat/Disk handlers 已合入；AppState/router 待接线 |
 | 切换清理 | schema、router、旧模块和测试 | 删除旧表、旧入口、旧 runner 和只验证旧协议的测试 | 待开始 |
 | 纵向联调 | FakeVmm/PostgreSQL | Disk→Cat→状态动作→跨 Node→destroy→slug 复用 | 待开始 |
@@ -116,5 +116,6 @@
 - noded 同步执行、per-Cat lane、destroy 清理、reset gate 和 FakeVmm main 已完成并合入；真实 Cloud Hypervisor effects 仍待接入。
 - Store 的原子 create/bindings、placement 复核和 stale Node/offline CAS 已完成；生命周期、Node 管理和 noded HTTP production adapters 已合入。
 - `SemanticResourceApi` 聚合与真实唯一入口 adapter 仍在并行实现；当前入口 placeholder 明确失败，不伪装成功。
+- 已确认旧 Route authority 不能安全充当新 `IngressPort`：它要求旧 lifecycle Operation、AgentSession、RuntimeReady 和 Route receipt；只改数据库目标也不能撤销已缓存 Grant 或关闭旧 Node admission。真实入口接入必须同时补 Gateway resolve、Node close/open+drain 和 semantic Ready 发布三个边界，完成前保持 fail-closed。
 - 公开 Cat/Disk 同步 HTTP handlers 已完成并合入；AppState 和主 router composition 待接线。
 - 切换合同的 noded 静态断言已按实际 `lane_if_open` 命名校准；production composition 仍待接线。
