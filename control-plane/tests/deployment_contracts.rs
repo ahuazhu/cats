@@ -4161,13 +4161,12 @@ fn manual_worker_bootstrap_installs_route_v2_revision_one_without_rotation() {
 fn release_artifacts_share_one_canonical_guest_payload() {
     let receipt_argument =
         "--guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json";
-    for unit in ["deploy/metal/systemd/cats-controld.service"] {
-        let source = read_workspace_file(unit);
-        assert!(
-            source.contains(receipt_argument),
-            "{unit} lost the exact installed release receipt"
-        );
-    }
+    let unit = "deploy/metal/systemd/cats-controld.service";
+    let source = read_workspace_file(unit);
+    assert!(
+        source.contains(receipt_argument),
+        "{unit} lost the exact installed release receipt"
+    );
 
     let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
     assert!(kubernetes.contains("\"--guest-runtime-profile-receipt-file\","));
