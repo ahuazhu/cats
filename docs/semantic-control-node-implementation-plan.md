@@ -26,8 +26,8 @@
 | 数据库 | `control-plane/src/store/` | v19 表、slug 部分唯一索引、Disk RWO、动作 CAS、数据库心跳时间 | 已合入；PG 行为测试待最终环境 |
 | Control 核心 | `control-plane/src/semantic_lifecycle.rs` | 同步动作、语义幂等、超时查询恢复、入口先撤后发 | 已完成并合入 |
 | noded HTTP client | `control-plane/src/semantic_noded_client.rs` | Control 同步调用 noded、Bearer、deadline、严格响应校验 | 已完成并合入 |
-| PersistentDisk | `control-plane/src/semantic_disk.rs`、`node-agent/src/semantic_mounts.rs` | create/binding/destroy 语义与 Guest 完整挂载确认 | 语义目录和校验器已合入；物理 provision/delete backend 进行中 |
-| CLI | `cmd/cats/` | slug 命令、同步 REST、`--mount`、GiB 解析、`node_name` 展示 | 已完成并合入 |
+| PersistentDisk | `control-plane/src/semantic_disk.rs`、`node-agent/src/semantic_mounts.rs` | create/binding/destroy 语义与 Guest 完整挂载确认 | 精确身份/进行态/完成 CAS 已合入；物理 provision/delete backend 进行中 |
+| CLI | `cmd/cats/` | slug 命令、同步 REST、`--mount`、GiB 解析、`node_name` 展示 | 已完成单协议切换，旧 Operation/pending/replay 已删除 |
 | noded 执行 | `node-agent/`、`cmd/noded/` | 同步 HTTP server、每 Cat 串行、destroy 清理、实际 effects 接入 | FakeVmm 已完成；CH bridge 可启动并 fail-closed，物理 effects 待接入 |
 | Node 管理 | Control API、Node heartbeat client | 注册、`node_name`、`control_endpoint`、offline/reset/drain/恢复 | 已完成并接入生产进程 |
 | Production adapters | Control adapter | Store/placement/noded/入口实现与公共 DTO 映射 | 已完成；公网 Gateway 细节按设计不在本协议范围 |
@@ -49,7 +49,8 @@
 
 - [x] 实现 CLI 同步 slug API。
 - [x] 实现 Disk 目录/绑定语义与 Guest mount-ready 校验器。
-- [ ] 接入 Disk 的物理 provision/delete 和精确挂载身份。
+- [x] 将 `disk_id`、`volume_id`、filesystem UUID 和 ext4 格式贯穿 Control、noded 与 Guest 确认。
+- [ ] 接入 Disk 的物理 provision/delete backend。
 - [x] 合入 noded 同步执行服务并接入 FakeVmm。
 - [ ] 接入 Cloud Hypervisor 和持久卷的真实 `SemanticCatEffects`。
 - [x] 合入 Node 注册、心跳、主动探测、reset 和 drain 的服务与 HTTP client。
@@ -75,6 +76,7 @@
 - [x] 删除 AgentSession、lifecycle command poll/result、observation settlement 路由。
 - [x] 删除旧 noded runner/journal 的 production composition。
 - [x] 删除旧 lifecycle/AgentSession/observation/Route/product HTTP 模块和 Gateway/rotation 监听接线。
+- [x] 删除 CLI 的 Operation get/wait、Idempotency-Key pending/replay 和旧 Disk mutation client。
 - [ ] 从 v19 schema 删除旧 lifecycle/route settlement 表和 catalog probes。
 - [ ] 删除旧协议专属测试；把仍适用的并发、清理和恢复场景迁到新测试。
 
@@ -111,6 +113,8 @@
 | `5ca7a6fe` | production Control 只保留 semantic resource/Node 主监听与独立 runtime node fence；删除旧 lifecycle/AgentSession/observation/Route/product HTTP 与 Gateway/rotation 接线 | Control/controld check、semantic tests 45/45 |
 | `a46e1cf4` | liveness 精确标记 offline 后自动触发 Cat 恢复，并复用同一 noded/入口实现 | Node liveness/recovery tests 14/14、controld check |
 | `cc8b885d` | 每个 liveness 周期重新发现仍有 Cat 的 offline Node，Control 重启或临时失败后继续恢复 | level-triggered recovery test、Control/controld check |
+| `b87e9bc6`、`f476573b` | Disk 精确物理/文件系统身份、provisioning/deleting、完成 CAS、响应丢失恢复和 Node/Guest 三方挂载核对 | Resource 5、mount 4、recovery 6、installed 4、API 13 tests；Control/noded check |
+| `01e3713d` | CLI 删除旧 Operation、Idempotency-Key pending/replay 与退役 mutation 测试 | CLI 69 passed、3 ignored；Clippy `-D warnings` |
 
 ## 5. 进度更新规则
 
@@ -135,5 +139,7 @@
 - production Control 已收敛到一个 semantic 主监听；旧 lifecycle、AgentSession、observation、Route Operation、旧 product handler 以及独立 Gateway/rotation 监听不再进入生产进程。Store/schema 中的退役实现和表正在下一切片删除。
 - 公开 Cat/Disk 同步 HTTP handlers、AppState 和主 router composition 已完成；切换合同 6/6 通过。
 - Resource 聚合新增 4 个定向回归，覆盖 slug 解析、Disk 语义重试和 strict backend 未安装时的明确失败。
+- Disk 创建先持久化不可变物理身份，再调用后端；后端明确完成后才从 provisioning 进入 normal。删除同样先进入 deleting，明确完成后才释放 slug；响应丢失重试沿用同一身份。严格物理 backend 仍未接入，当前保持 fail-closed。
+- CLI 已删除 `operation get/wait`、隐藏 `--no-wait`、Idempotency-Key pending/replay 文件和旧 mutation client，只保留同步场景语义命令。
 - `--vmm ch` 已有明确的 installed effects 桥和单点 preflight；缺少精确 volume/runtime/route 输入时在任何物理副作用前失败，Fake 联调不受影响。
 - 切换合同的 noded 静态断言已按实际 `lane_if_open` 命名校准；production composition 已完成，旧 Store/schema 清理仍在进行。
