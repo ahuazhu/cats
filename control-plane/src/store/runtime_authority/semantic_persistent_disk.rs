@@ -1,30 +1,36 @@
 //! Scenario-idempotent Strict PersistentDisk authority for the semantic API.
 //!
-//! The semantic row is admitted first and supplies one immutable candidate.
-//! This module discovers or creates exactly that candidate in the existing
-//! Volume Authority catalog. It deliberately has no caller request token and
-//! no lifecycle Operation.
+//! The semantic resource row supplies one immutable candidate. This module
+//! owns only the PostgreSQL seam needed to create, discover and remove that
+//! exact Strict volume; it does not restore retired Operation/product stores.
 
 use cats_api::error::ApiError;
 use cats_api::runtime_reconciliation::{FenceEpoch, Generation, Id, RandomId128};
 use cats_storage::authority::{
-    begin_delete, BeginDeleteRequest, LastVolumeTransition, RemoteHead, VolumeAdminState,
-    VolumeDurability, VolumeRecord, VolumeTransitionSource,
+    begin_delete, project_volume_record, BeginDeleteRequest, RemoteHead, VolumeAdminState,
+    VolumeDurability, VolumeRecord,
 };
+use postgres::{Row, Transaction};
+use serde_json::{json, Value};
 
-use super::product::{
-    lock_candidate_id, lock_candidate_text, lock_disk_name, DiskAdminState, DiskRecord, DiskRole,
-    PersistentDiskInitialization,
-};
-use super::product_rows::{
-    insert_disk, load_any_disk_by_filesystem_uuid_for_update, load_any_disk_by_id_for_update,
-    load_any_disk_by_initialization_token_for_update, load_any_disk_by_name_unlocked,
-    load_any_disk_snapshot_for_update, update_disk,
-};
-use super::rows::{
-    insert_volume, load_any_volume_by_id_for_update, load_volume_unlocked, update_volume,
-};
+use super::rows::database_now;
+use crate::store::transaction::{AuthorityTransactionError, AuthorityTxResult};
 use crate::store::{Result, Store};
+
+const DISK_COLUMNS: &str = "
+    disk_id, record::text AS record_json, workspace_id, name, volume_id,
+    size_bytes, durability, created_at, admin_state, delete_id, role_kind,
+    initialization_kind, initialization_token, filesystem_uuid,
+    expected_blank_generation, expected_blank_root_hash,
+    expected_blank_root_object_id";
+
+const VOLUME_COLUMNS: &str = "
+    volume_id, record::text AS record_json, size_bytes, durability,
+    admin_state, delete_id, head_generation, head_root_hash,
+    head_root_object_id, lease_owner, lease_epoch, lease_expires_at,
+    last_transition_kind, last_transition_id, transition_source_kind,
+    transition_operation_id, transition_request_fingerprint,
+    transition_placement_epoch, transition_lease_duration_ms";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SemanticStrictPersistentDisk {
@@ -44,266 +50,620 @@ pub(crate) enum SemanticStrictDeleteState {
     Deleting,
 }
 
+#[derive(Debug)]
+struct StoredDisk {
+    disk_id: String,
+    record: Value,
+    workspace_id: String,
+    name: String,
+    volume_id: String,
+    size_bytes: i64,
+    durability: String,
+    created_at: i64,
+    admin_state: String,
+    delete_id: Option<String>,
+    role_kind: String,
+    initialization_kind: Option<String>,
+    initialization_token: Option<String>,
+    filesystem_uuid: Option<String>,
+    expected_blank_generation: Option<i64>,
+    expected_blank_root_hash: Option<String>,
+    expected_blank_root_object_id: Option<String>,
+}
+
+impl StoredDisk {
+    fn from_row(row: &Row) -> AuthorityTxResult<Self> {
+        let record_json: String = row.try_get("record_json")?;
+        let record = serde_json::from_str(&record_json).map_err(|_| corrupt_tx())?;
+        Ok(Self {
+            disk_id: row.try_get("disk_id")?,
+            record,
+            workspace_id: row.try_get("workspace_id")?,
+            name: row.try_get("name")?,
+            volume_id: row.try_get("volume_id")?,
+            size_bytes: row.try_get("size_bytes")?,
+            durability: row.try_get("durability")?,
+            created_at: row.try_get("created_at")?,
+            admin_state: row.try_get("admin_state")?,
+            delete_id: row.try_get("delete_id")?,
+            role_kind: row.try_get("role_kind")?,
+            initialization_kind: row.try_get("initialization_kind")?,
+            initialization_token: row.try_get("initialization_token")?,
+            filesystem_uuid: row.try_get("filesystem_uuid")?,
+            expected_blank_generation: row.try_get("expected_blank_generation")?,
+            expected_blank_root_hash: row.try_get("expected_blank_root_hash")?,
+            expected_blank_root_object_id: row.try_get("expected_blank_root_object_id")?,
+        })
+    }
+
+    fn exact_identity(&self, candidate: &SemanticStrictPersistentDisk) -> bool {
+        self.disk_id == candidate.disk_id.as_str()
+            && self.workspace_id == candidate.workspace_id.as_str()
+            && self.name == candidate.name.as_str()
+            && self.volume_id == candidate.volume_id.as_str()
+            && u64::try_from(self.size_bytes).ok() == Some(candidate.size_bytes)
+            && self.durability == "strict"
+            && self.created_at >= 0
+            && self.role_kind == "persistent"
+            && matches!(
+                self.initialization_kind.as_deref(),
+                Some("uninitialized" | "initialized")
+            )
+            && self.initialization_token.as_deref() == Some(candidate.initialization_token.as_str())
+            && self.filesystem_uuid.as_deref() == Some(candidate.filesystem_uuid.as_str())
+            && self.expected_blank_generation == Some(0)
+            && self.expected_blank_root_hash.is_none()
+            && self.expected_blank_root_object_id.is_none()
+            && json_text(&self.record, &["disk_id"]) == Some(candidate.disk_id.as_str())
+            && json_text(&self.record, &["workspace_id"]) == Some(candidate.workspace_id.as_str())
+            && json_text(&self.record, &["name"]) == Some(candidate.name.as_str())
+            && json_text(&self.record, &["volume_id"]) == Some(candidate.volume_id.as_str())
+            && self.record.get("size_bytes").and_then(Value::as_u64) == Some(candidate.size_bytes)
+            && json_text(&self.record, &["durability"]) == Some("strict")
+            && json_text(&self.record, &["role", "kind"]) == Some("persistent")
+            && json_text(&self.record, &["role", "initialization", "kind"])
+                == self.initialization_kind.as_deref()
+            && json_text(
+                &self.record,
+                &["role", "initialization", "initialization_token"],
+            ) == Some(candidate.initialization_token.as_str())
+            && json_text(&self.record, &["role", "initialization", "filesystem_uuid"])
+                == Some(candidate.filesystem_uuid.as_str())
+    }
+
+    fn exact_state(&self, candidate: &SemanticStrictPersistentDisk, deleting: bool) -> bool {
+        let expected_state = if deleting { "deleting" } else { "active" };
+        let expected_delete = deleting.then_some(candidate.delete_id.as_str());
+        self.exact_identity(candidate)
+            && self.admin_state == expected_state
+            && self.delete_id.as_deref() == expected_delete
+            && json_text(&self.record, &["admin_state", "kind"]) == Some(expected_state)
+            && json_text(&self.record, &["admin_state", "delete_id"]) == expected_delete
+    }
+}
+
 impl Store {
-    /// Creates or discovers one exact blank Strict Volume and its persistent
-    /// Disk identity. PostgreSQL commit is the provision terminal for an empty
-    /// remotely durable Volume: there are no BlobStore objects to publish.
+    /// Create or discover one exact blank Strict Volume and Disk identity.
     pub(crate) fn ensure_semantic_strict_disk_created(
         &self,
         candidate: &SemanticStrictPersistentDisk,
     ) -> Result<()> {
         validate_candidate(candidate)?;
         self.authority_transaction(|transaction| {
-            lock_disk_name(transaction, &candidate.workspace_id, &candidate.name)?;
-            lock_candidate_id(transaction, "volume", &candidate.volume_id)?;
-            lock_candidate_id(transaction, "disk", &candidate.disk_id)?;
-            lock_candidate_text(
-                transaction,
-                "disk-initialization-token",
-                candidate.initialization_token.as_str(),
-            )?;
-            lock_candidate_text(
-                transaction,
-                "disk-filesystem-uuid",
-                candidate.filesystem_uuid.as_str(),
-            )?;
-
-            let by_name = load_any_disk_by_name_unlocked(
-                transaction,
-                &candidate.workspace_id,
-                &candidate.name,
-            )?;
-            let by_id = load_any_disk_by_id_for_update(transaction, &candidate.disk_id)?;
-            let volume = load_any_volume_by_id_for_update(transaction, &candidate.volume_id)?;
-            let by_initialization = load_any_disk_by_initialization_token_for_update(
-                transaction,
-                &candidate.initialization_token,
-            )?;
-            let by_filesystem = load_any_disk_by_filesystem_uuid_for_update(
-                transaction,
-                &candidate.filesystem_uuid,
-            )?;
-
-            match (by_id, volume) {
-                (Some(disk), Some(volume)) => {
-                    if by_name.as_ref() != Some(&disk)
-                        || by_initialization.as_ref() != Some(&disk)
-                        || by_filesystem.as_ref() != Some(&disk)
-                        || !exact_blank_candidate(candidate, &disk, &volume)
-                    {
-                        return Err(inconsistent("stored provision identity differs").into());
-                    }
+            lock_candidate(transaction, candidate)?;
+            let disk = load_candidate_disk(transaction, candidate)?;
+            let volume = load_candidate_volume(transaction, candidate)?;
+            match (disk, volume) {
+                (Some(disk), Some(volume))
+                    if disk.exact_state(candidate, false)
+                        && exact_volume(candidate, &volume, false) =>
+                {
                     Ok(())
                 }
-                (None, None)
-                    if by_name.is_none()
-                        && by_initialization.is_none()
-                        && by_filesystem.is_none() =>
-                {
-                    let blank_head = blank_head();
-                    let volume = VolumeRecord {
-                        volume_id: candidate.volume_id.clone(),
-                        size_bytes: candidate.size_bytes,
-                        durability: VolumeDurability::Strict,
-                        admin_state: VolumeAdminState::Active,
-                        head: blank_head.clone(),
-                        lease_owner: None,
-                        lease_epoch: FenceEpoch::new(0)
-                            .expect("zero is a valid initial Volume epoch"),
-                        lease_expires_at: None,
-                        last_transition: None,
-                    };
-                    let disk = DiskRecord {
-                        disk_id: candidate.disk_id.clone(),
-                        workspace_id: candidate.workspace_id.clone(),
-                        name: candidate.name.clone(),
-                        volume_id: candidate.volume_id.clone(),
-                        size_bytes: candidate.size_bytes,
-                        durability: VolumeDurability::Strict,
-                        created_at: super::rows::database_now(transaction)?,
-                        admin_state: DiskAdminState::Active,
-                        role: DiskRole::Persistent {
-                            initialization: Box::new(PersistentDiskInitialization::Uninitialized {
-                                initialization_token: candidate.initialization_token.clone(),
-                                filesystem_uuid: candidate.filesystem_uuid.clone(),
-                                expected_blank_head: blank_head,
-                            }),
-                        },
-                    };
-                    insert_volume(transaction, &volume)?;
-                    insert_disk(transaction, &disk)
+                (None, None) => {
+                    insert_volume(transaction, &blank_volume(candidate))?;
+                    let created_at = database_now(transaction)?.get();
+                    insert_disk(transaction, candidate, created_at)
                 }
-                _ => Err(inconsistent("partially occupied provision identity").into()),
+                _ => Err(corrupt_tx()),
             }
         })
     }
 
-    /// Starts or discovers the exact independent normal-delete transition.
-    /// The caller must subsequently drive [`super::delete_sweeper::DeleteSweeper`]
-    /// and publish semantic deletion only after both authority rows disappear.
+    /// Start or discover the exact independent normal-delete transition.
     pub(crate) fn begin_semantic_strict_disk_delete(
         &self,
         candidate: &SemanticStrictPersistentDisk,
     ) -> Result<SemanticStrictDeleteState> {
         validate_candidate(candidate)?;
         self.authority_transaction(|transaction| {
-            lock_candidate_id(transaction, "volume", &candidate.volume_id)?;
-            lock_candidate_id(transaction, "disk", &candidate.disk_id)?;
-            let volume = load_any_volume_by_id_for_update(transaction, &candidate.volume_id)?;
-            let disk = load_any_disk_by_id_for_update(transaction, &candidate.disk_id)?;
-            let (volume, mut disk) = match (volume, disk) {
-                (Some(volume), Some(disk)) => (volume, disk),
+            lock_candidate(transaction, candidate)?;
+            let disk = load_candidate_disk(transaction, candidate)?;
+            let volume = load_candidate_volume(transaction, candidate)?;
+            let (mut disk, volume) = match (disk, volume) {
                 (None, None) => return Ok(SemanticStrictDeleteState::Absent),
-                _ => {
-                    return Err(inconsistent("only one authority row remains during delete").into());
-                }
+                (Some(disk), Some(volume)) => (disk, volume),
+                _ => return Err(corrupt_tx()),
             };
-            if !exact_persistent_identity(candidate, &disk, &volume) {
-                return Err(inconsistent("delete identity differs from authority").into());
+            if !disk.exact_identity(candidate) || !exact_volume_identity(candidate, &volume) {
+                return Err(corrupt_tx());
             }
-            if load_any_disk_snapshot_for_update(
-                transaction,
-                &disk.disk_id,
-                &volume.volume_id,
-                disk.size_bytes,
-            )?
-            .is_some()
+            ensure_no_snapshot(transaction, candidate)?;
+            if disk.exact_state(candidate, true) && exact_volume(candidate, &volume, true) {
+                return Ok(SemanticStrictDeleteState::Deleting);
+            }
+            if !disk.exact_state(candidate, false)
+                || !matches!(volume.admin_state, VolumeAdminState::Active)
             {
-                return Err(ApiError::failed_precondition(
-                    "PersistentDisk has a live DiskSnapshot",
-                )
-                .into());
+                return Err(corrupt_tx());
             }
-            match (&disk.admin_state, &volume.admin_state) {
-                (DiskAdminState::Active, VolumeAdminState::Active) => {
-                    let request = BeginDeleteRequest {
-                        delete_id: candidate.delete_id.clone(),
-                        disk_id: candidate.disk_id.clone(),
-                        volume_id: candidate.volume_id.clone(),
-                        expected_unowned_epoch: volume.lease_epoch,
-                        expected_head: volume.head.clone(),
-                    };
-                    let (deleting, _) = begin_delete(&volume, &request)?;
-                    disk.admin_state = DiskAdminState::Deleting {
-                        delete_id: candidate.delete_id.clone(),
-                    };
-                    update_volume(transaction, &deleting)?;
-                    update_disk(transaction, &disk)?;
-                }
-                (
-                    DiskAdminState::Deleting {
-                        delete_id: disk_delete_id,
-                    },
-                    VolumeAdminState::Deleting {
-                        delete_id: volume_delete_id,
-                    },
-                ) if disk_delete_id == &candidate.delete_id
-                    && volume_delete_id == &candidate.delete_id
-                    && matches!(
-                        volume.last_transition.as_ref(),
-                        Some(LastVolumeTransition::BeginDelete {
-                            source: VolumeTransitionSource::Independent,
-                            request,
-                            result,
-                        }) if request.delete_id == candidate.delete_id
-                            && request.disk_id == candidate.disk_id
-                            && request.volume_id == candidate.volume_id
-                            && result.delete_id == candidate.delete_id
-                            && result.disk_id == candidate.disk_id
-                            && result.volume_id == candidate.volume_id
-                            && result.resulting_epoch == volume.lease_epoch
-                            && result.resulting_head == volume.head
-                    ) => {}
-                _ => {
-                    return Err(inconsistent("delete transition identity differs").into());
-                }
-            }
+            let request = BeginDeleteRequest {
+                delete_id: candidate.delete_id.clone(),
+                disk_id: candidate.disk_id.clone(),
+                volume_id: candidate.volume_id.clone(),
+                expected_unowned_epoch: volume.lease_epoch,
+                expected_head: volume.head.clone(),
+            };
+            let (deleting, _) = begin_delete(&volume, &request).map_err(|_| corrupt_tx())?;
+            disk.admin_state = "deleting".to_owned();
+            disk.delete_id = Some(candidate.delete_id.to_string());
+            disk.record["admin_state"] = json!({
+                "kind": "deleting",
+                "delete_id": candidate.delete_id.as_str(),
+            });
+            update_volume(transaction, &deleting)?;
+            update_disk(transaction, &disk)?;
             Ok(SemanticStrictDeleteState::Deleting)
         })
     }
 
-    /// Exact postcondition discovery used after an ambiguous delete sweep.
+    /// Remove authority metadata after the BlobStore prefix was re-listed empty.
+    pub(crate) fn complete_semantic_strict_disk_delete(
+        &self,
+        candidate: &SemanticStrictPersistentDisk,
+    ) -> Result<()> {
+        validate_candidate(candidate)?;
+        self.authority_transaction(|transaction| {
+            lock_candidate(transaction, candidate)?;
+            let disk = load_candidate_disk(transaction, candidate)?;
+            let volume = load_candidate_volume(transaction, candidate)?;
+            let (disk, volume) = match (disk, volume) {
+                (None, None) => return Ok(()),
+                (Some(disk), Some(volume)) => (disk, volume),
+                _ => return Err(corrupt_tx()),
+            };
+            if !disk.exact_state(candidate, true) || !exact_volume(candidate, &volume, true) {
+                return Err(corrupt_tx());
+            }
+            ensure_no_snapshot(transaction, candidate)?;
+            exactly_one(transaction.execute(
+                "DELETE FROM disk_records
+                  WHERE disk_id=$1 AND volume_id=$2
+                    AND admin_state='deleting' AND delete_id=$3",
+                &[
+                    &candidate.disk_id.as_str(),
+                    &candidate.volume_id.as_str(),
+                    &candidate.delete_id.as_str(),
+                ],
+            )?)?;
+            exactly_one(transaction.execute(
+                "DELETE FROM volume_records
+                  WHERE volume_id=$1 AND admin_state='deleting' AND delete_id=$2
+                    AND lease_owner IS NULL AND owner_binding IS NULL",
+                &[&candidate.volume_id.as_str(), &candidate.delete_id.as_str()],
+            )?)
+        })
+    }
+
     pub(crate) fn semantic_strict_disk_is_absent(
         &self,
         candidate: &SemanticStrictPersistentDisk,
     ) -> Result<bool> {
         validate_candidate(candidate)?;
         self.authority_read_snapshot(|transaction| {
-            let disk =
-                super::product_rows::load_disk_by_id_unlocked(transaction, &candidate.disk_id)?;
-            let volume = load_volume_unlocked(transaction, &candidate.volume_id)?;
-            match (disk, volume) {
-                (None, None) => Ok(true),
-                (Some(disk), Some(volume))
-                    if exact_persistent_identity(candidate, &disk, &volume) =>
-                {
-                    Ok(false)
-                }
-                _ => Err(inconsistent("delete discovery found a mismatched authority").into()),
+            let disk = transaction.query_opt(
+                "SELECT disk_id FROM disk_records
+                  WHERE disk_id=$1 OR record->>'disk_id'=$1 LIMIT 1",
+                &[&candidate.disk_id.as_str()],
+            )?;
+            let volume = transaction.query_opt(
+                "SELECT volume_id FROM volume_records
+                  WHERE volume_id=$1 OR record->>'volume_id'=$1 LIMIT 1",
+                &[&candidate.volume_id.as_str()],
+            )?;
+            match (disk.is_some(), volume.is_some()) {
+                (false, false) => Ok(true),
+                (true, true) => Ok(false),
+                _ => Err(corrupt_tx()),
             }
         })
     }
 }
 
-fn exact_blank_candidate(
+fn load_candidate_disk(
+    transaction: &mut Transaction<'_>,
     candidate: &SemanticStrictPersistentDisk,
-    disk: &DiskRecord,
-    volume: &VolumeRecord,
-) -> bool {
-    exact_persistent_identity(candidate, disk, volume)
-        && matches!(disk.admin_state, DiskAdminState::Active)
-        && matches!(volume.admin_state, VolumeAdminState::Active)
-        && volume.head == blank_head()
-        && volume.lease_owner.is_none()
-        && volume.lease_epoch.get() == 0
-        && volume.lease_expires_at.is_none()
-        && volume.last_transition.is_none()
-        && matches!(
-            disk.role,
-            DiskRole::Persistent {
-                initialization: ref value
-            } if matches!(
-                value.as_ref(),
-                PersistentDiskInitialization::Uninitialized { .. }
-            )
-        )
+) -> AuthorityTxResult<Option<StoredDisk>> {
+    let sql = format!(
+        "SELECT {DISK_COLUMNS} FROM disk_records
+          WHERE disk_id=$1 OR record->>'disk_id'=$1
+             OR (workspace_id=$2 AND name=$3)
+             OR (record->>'workspace_id'=$2 AND record->>'name'=$3)
+             OR initialization_token=$4
+             OR record #>> '{{role,initialization,initialization_token}}'=$4
+             OR filesystem_uuid=$5
+             OR record #>> '{{role,initialization,filesystem_uuid}}'=$5
+          ORDER BY disk_id LIMIT 2 FOR UPDATE"
+    );
+    let rows = transaction.query(
+        &sql,
+        &[
+            &candidate.disk_id.as_str(),
+            &candidate.workspace_id.as_str(),
+            &candidate.name.as_str(),
+            &candidate.initialization_token.as_str(),
+            &candidate.filesystem_uuid.as_str(),
+        ],
+    )?;
+    if rows.len() > 1 {
+        return Err(corrupt_tx());
+    }
+    rows.first().map(StoredDisk::from_row).transpose()
 }
 
-fn exact_persistent_identity(
+fn load_candidate_volume(
+    transaction: &mut Transaction<'_>,
     candidate: &SemanticStrictPersistentDisk,
-    disk: &DiskRecord,
-    volume: &VolumeRecord,
-) -> bool {
-    let initialization_matches = match &disk.role {
-        DiskRole::Persistent { initialization } => match initialization.as_ref() {
-            PersistentDiskInitialization::Uninitialized {
-                initialization_token,
-                filesystem_uuid,
-                expected_blank_head,
-            }
-            | PersistentDiskInitialization::Initialized {
-                initialization_token,
-                filesystem_uuid,
-                expected_blank_head,
-                ..
-            } => {
-                initialization_token == &candidate.initialization_token
-                    && filesystem_uuid == &candidate.filesystem_uuid
-                    && expected_blank_head == &blank_head()
-            }
-        },
-        DiskRole::Root { .. } => false,
+) -> AuthorityTxResult<Option<VolumeRecord>> {
+    let sql = format!(
+        "SELECT {VOLUME_COLUMNS} FROM volume_records
+          WHERE volume_id=$1 OR record->>'volume_id'=$1
+          ORDER BY volume_id LIMIT 2 FOR UPDATE"
+    );
+    let rows = transaction.query(&sql, &[&candidate.volume_id.as_str()])?;
+    if rows.len() > 1 {
+        return Err(corrupt_tx());
+    }
+    let Some(row) = rows.first() else {
+        return Ok(None);
     };
-    disk.disk_id == candidate.disk_id
-        && disk.workspace_id == candidate.workspace_id
-        && disk.name == candidate.name
-        && disk.volume_id == candidate.volume_id
-        && disk.size_bytes == candidate.size_bytes
-        && disk.durability == VolumeDurability::Strict
-        && volume.volume_id == candidate.volume_id
+    let record_json: String = row.try_get("record_json")?;
+    let record: VolumeRecord = serde_json::from_str(&record_json).map_err(|_| corrupt_tx())?;
+    volume_projection_matches(row, &record)
+        .then_some(record)
+        .ok_or_else(corrupt_tx)
+        .map(Some)
+}
+
+fn volume_projection_matches(row: &Row, record: &VolumeRecord) -> bool {
+    let Ok(projection) = project_volume_record(record) else {
+        return false;
+    };
+    row.try_get::<_, String>("volume_id").ok().as_deref() == Some(&projection.volume_id)
+        && row
+            .try_get::<_, i64>("size_bytes")
+            .ok()
+            .and_then(|value| u64::try_from(value).ok())
+            == Some(projection.size_bytes)
+        && row.try_get::<_, String>("durability").ok().as_deref() == Some(projection.durability)
+        && row.try_get::<_, String>("admin_state").ok().as_deref() == Some(projection.admin_state)
+        && row.try_get::<_, Option<String>>("delete_id").ok().flatten() == projection.delete_id
+        && row.try_get::<_, i64>("head_generation").ok()
+            == i64::try_from(projection.head_generation.get()).ok()
+        && row
+            .try_get::<_, Option<String>>("head_root_hash")
+            .ok()
+            .flatten()
+            == projection.head_root_hash
+        && row
+            .try_get::<_, Option<String>>("head_root_object_id")
+            .ok()
+            .flatten()
+            == projection.head_root_object_id
+        && row
+            .try_get::<_, Option<String>>("lease_owner")
+            .ok()
+            .flatten()
+            == projection.lease_owner
+        && row.try_get::<_, i64>("lease_epoch").ok()
+            == i64::try_from(projection.lease_epoch.get()).ok()
+        && row
+            .try_get::<_, Option<i64>>("lease_expires_at")
+            .ok()
+            .flatten()
+            == projection
+                .lease_expires_at
+                .and_then(|value| i64::try_from(value.get()).ok())
+        && row
+            .try_get::<_, Option<String>>("last_transition_kind")
+            .ok()
+            .flatten()
+            .as_deref()
+            == projection.last_transition_kind
+        && row
+            .try_get::<_, Option<String>>("last_transition_id")
+            .ok()
+            .flatten()
+            == projection.last_transition_id
+        && row
+            .try_get::<_, Option<String>>("transition_source_kind")
+            .ok()
+            .flatten()
+            .as_deref()
+            == projection.transition_source_kind
+        && row
+            .try_get::<_, Option<String>>("transition_operation_id")
+            .ok()
+            .flatten()
+            == projection.transition_operation_id
+        && row
+            .try_get::<_, Option<String>>("transition_request_fingerprint")
+            .ok()
+            .flatten()
+            == projection.transition_request_fingerprint
+        && row
+            .try_get::<_, Option<i64>>("transition_placement_epoch")
+            .ok()
+            .flatten()
+            == projection
+                .transition_placement_epoch
+                .and_then(|value| i64::try_from(value.get()).ok())
+        && row
+            .try_get::<_, Option<i64>>("transition_lease_duration_ms")
+            .ok()
+            .flatten()
+            == projection
+                .transition_lease_duration_ms
+                .and_then(|value| i64::try_from(value).ok())
+}
+
+fn insert_volume(
+    transaction: &mut Transaction<'_>,
+    record: &VolumeRecord,
+) -> AuthorityTxResult<()> {
+    let projection = project_volume_record(record).map_err(|_| corrupt_tx())?;
+    let record_json = serde_json::to_string(record).map_err(|_| corrupt_tx())?;
+    exactly_one(transaction.execute(
+        "INSERT INTO volume_records (
+            volume_id, record, size_bytes, durability, admin_state, delete_id,
+            head_generation, head_root_hash, head_root_object_id, lease_owner,
+            lease_epoch, lease_expires_at, last_transition_kind,
+            last_transition_id, transition_source_kind, transition_operation_id,
+            transition_request_fingerprint, transition_placement_epoch,
+            transition_lease_duration_ms, owner_binding, owner_node_id
+         ) VALUES (
+            $1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9, NULL,
+            $10, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+         )",
+        &[
+            &projection.volume_id,
+            &record_json,
+            &to_i64(projection.size_bytes)?,
+            &projection.durability,
+            &projection.admin_state,
+            &projection.delete_id,
+            &to_i64(projection.head_generation.get())?,
+            &projection.head_root_hash,
+            &projection.head_root_object_id,
+            &to_i64(projection.lease_epoch.get())?,
+        ],
+    )?)
+}
+
+fn insert_disk(
+    transaction: &mut Transaction<'_>,
+    candidate: &SemanticStrictPersistentDisk,
+    created_at: u64,
+) -> AuthorityTxResult<()> {
+    let record = json!({
+        "disk_id": candidate.disk_id.as_str(),
+        "workspace_id": candidate.workspace_id.as_str(),
+        "name": candidate.name.as_str(),
+        "volume_id": candidate.volume_id.as_str(),
+        "size_bytes": candidate.size_bytes,
+        "durability": "strict",
+        "created_at": created_at,
+        "admin_state": { "kind": "active" },
+        "role": {
+            "kind": "persistent",
+            "initialization": {
+                "kind": "uninitialized",
+                "initialization_token": candidate.initialization_token.as_str(),
+                "filesystem_uuid": candidate.filesystem_uuid.as_str(),
+                "expected_blank_head": {
+                    "generation": 0,
+                    "root_hash": null,
+                    "root_object_id": null
+                }
+            }
+        }
+    });
+    let record_json = serde_json::to_string(&record).map_err(|_| corrupt_tx())?;
+    exactly_one(transaction.execute(
+        "INSERT INTO disk_records (
+            disk_id, record, workspace_id, name, volume_id, size_bytes,
+            durability, created_at, admin_state, delete_id, role_kind,
+            root_cat_id, initialization_kind, initialization_token,
+            filesystem_uuid, expected_blank_generation,
+            expected_blank_root_hash, expected_blank_root_object_id,
+            initialized_generation, initialized_root_hash,
+            initialized_root_object_id, initialized_at,
+            initialization_commit_receipt_bytes,
+            initialization_commit_receipt_digest
+         ) VALUES (
+            $1, $2::TEXT::jsonb, $3, $4, $5, $6, 'strict', $7, 'active',
+            NULL, 'persistent', NULL, 'uninitialized', $8, $9, 0,
+            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+         )",
+        &[
+            &candidate.disk_id.as_str(),
+            &record_json,
+            &candidate.workspace_id.as_str(),
+            &candidate.name.as_str(),
+            &candidate.volume_id.as_str(),
+            &to_i64(candidate.size_bytes)?,
+            &to_i64(created_at)?,
+            &candidate.initialization_token.as_str(),
+            &candidate.filesystem_uuid.as_str(),
+        ],
+    )?)
+}
+
+fn update_volume(
+    transaction: &mut Transaction<'_>,
+    record: &VolumeRecord,
+) -> AuthorityTxResult<()> {
+    let projection = project_volume_record(record).map_err(|_| corrupt_tx())?;
+    let record_json = serde_json::to_string(record).map_err(|_| corrupt_tx())?;
+    let lease_expires_at = projection
+        .lease_expires_at
+        .map(|value| to_i64(value.get()))
+        .transpose()?;
+    let transition_placement = projection
+        .transition_placement_epoch
+        .map(|value| to_i64(value.get()))
+        .transpose()?;
+    let transition_duration = projection
+        .transition_lease_duration_ms
+        .map(to_i64)
+        .transpose()?;
+    exactly_one(transaction.execute(
+        "UPDATE volume_records SET
+            record=$2::TEXT::jsonb, size_bytes=$3, durability=$4,
+            admin_state=$5, delete_id=$6, head_generation=$7,
+            head_root_hash=$8, head_root_object_id=$9, lease_owner=$10,
+            lease_epoch=$11, lease_expires_at=$12,
+            last_transition_kind=$13, last_transition_id=$14,
+            transition_source_kind=$15, transition_operation_id=$16,
+            transition_request_fingerprint=$17,
+            transition_placement_epoch=$18,
+            transition_lease_duration_ms=$19
+          WHERE volume_id=$1 AND owner_binding IS NULL AND owner_node_id IS NULL",
+        &[
+            &projection.volume_id,
+            &record_json,
+            &to_i64(projection.size_bytes)?,
+            &projection.durability,
+            &projection.admin_state,
+            &projection.delete_id,
+            &to_i64(projection.head_generation.get())?,
+            &projection.head_root_hash,
+            &projection.head_root_object_id,
+            &projection.lease_owner,
+            &to_i64(projection.lease_epoch.get())?,
+            &lease_expires_at,
+            &projection.last_transition_kind,
+            &projection.last_transition_id,
+            &projection.transition_source_kind,
+            &projection.transition_operation_id,
+            &projection.transition_request_fingerprint,
+            &transition_placement,
+            &transition_duration,
+        ],
+    )?)
+}
+
+fn update_disk(transaction: &mut Transaction<'_>, disk: &StoredDisk) -> AuthorityTxResult<()> {
+    let record_json = serde_json::to_string(&disk.record).map_err(|_| corrupt_tx())?;
+    exactly_one(transaction.execute(
+        "UPDATE disk_records SET record=$2::TEXT::jsonb,
+            admin_state=$3, delete_id=$4
+          WHERE disk_id=$1 AND volume_id=$5",
+        &[
+            &disk.disk_id,
+            &record_json,
+            &disk.admin_state,
+            &disk.delete_id,
+            &disk.volume_id,
+        ],
+    )?)
+}
+
+fn ensure_no_snapshot(
+    transaction: &mut Transaction<'_>,
+    candidate: &SemanticStrictPersistentDisk,
+) -> AuthorityTxResult<()> {
+    let snapshot = transaction.query_opt(
+        "SELECT snapshot_id FROM disk_snapshot_records
+          WHERE disk_id=$1 OR volume_id=$2
+             OR record->>'disk_id'=$1 OR record->>'volume_id'=$2
+          LIMIT 1 FOR UPDATE",
+        &[&candidate.disk_id.as_str(), &candidate.volume_id.as_str()],
+    )?;
+    if snapshot.is_some() {
+        return Err(AuthorityTransactionError::Application(
+            ApiError::failed_precondition("PersistentDisk has a live DiskSnapshot"),
+        ));
+    }
+    Ok(())
+}
+
+fn lock_candidate(
+    transaction: &mut Transaction<'_>,
+    candidate: &SemanticStrictPersistentDisk,
+) -> AuthorityTxResult<()> {
+    for (kind, value) in [
+        (
+            "disk-name",
+            format!("{}:{}", candidate.workspace_id, candidate.name),
+        ),
+        ("disk", candidate.disk_id.to_string()),
+        ("volume", candidate.volume_id.to_string()),
+        (
+            "disk-initialization-token",
+            candidate.initialization_token.to_string(),
+        ),
+        (
+            "disk-filesystem-uuid",
+            candidate.filesystem_uuid.to_string(),
+        ),
+    ] {
+        transaction.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended(
+                current_schema() || ':semantic-disk:' || $1 || ':' || $2,
+                0::BIGINT
+             ))",
+            &[&kind, &value],
+        )?;
+    }
+    Ok(())
+}
+
+fn exact_volume_identity(candidate: &SemanticStrictPersistentDisk, volume: &VolumeRecord) -> bool {
+    volume.volume_id == candidate.volume_id
         && volume.size_bytes == candidate.size_bytes
         && volume.durability == VolumeDurability::Strict
-        && initialization_matches
+}
+
+fn exact_volume(
+    candidate: &SemanticStrictPersistentDisk,
+    volume: &VolumeRecord,
+    deleting: bool,
+) -> bool {
+    exact_volume_identity(candidate, volume)
+        && volume.lease_owner.is_none()
+        && if deleting {
+            matches!(
+                &volume.admin_state,
+                VolumeAdminState::Deleting { delete_id } if delete_id == &candidate.delete_id
+            )
+        } else {
+            matches!(volume.admin_state, VolumeAdminState::Active)
+        }
+}
+
+fn blank_volume(candidate: &SemanticStrictPersistentDisk) -> VolumeRecord {
+    VolumeRecord {
+        volume_id: candidate.volume_id.clone(),
+        size_bytes: candidate.size_bytes,
+        durability: VolumeDurability::Strict,
+        admin_state: VolumeAdminState::Active,
+        head: blank_head(),
+        lease_owner: None,
+        lease_epoch: FenceEpoch::new(0).expect("zero is a valid initial Volume epoch"),
+        lease_expires_at: None,
+        last_transition: None,
+    }
 }
 
 fn blank_head() -> RemoteHead {
@@ -312,6 +672,12 @@ fn blank_head() -> RemoteHead {
         root_hash: None,
         root_object_id: None,
     }
+}
+
+fn json_text<'a>(record: &'a Value, path: &[&str]) -> Option<&'a str> {
+    path.iter()
+        .try_fold(record, |value, key| value.get(*key))
+        .and_then(Value::as_str)
 }
 
 fn validate_candidate(candidate: &SemanticStrictPersistentDisk) -> Result<()> {
@@ -342,65 +708,21 @@ fn validate_prefixed_random_id(value: &Id, prefix: &str) -> Result<()> {
     Ok(())
 }
 
+fn to_i64(value: u64) -> AuthorityTxResult<i64> {
+    i64::try_from(value).map_err(|_| corrupt_tx())
+}
+
+fn exactly_one(changed: u64) -> AuthorityTxResult<()> {
+    (changed == 1).then_some(()).ok_or_else(corrupt_tx)
+}
+
+fn corrupt_tx() -> AuthorityTransactionError {
+    AuthorityTransactionError::Application(inconsistent("stored identity or projection differs"))
+}
+
 fn inconsistent(message: impl Into<String>) -> ApiError {
     ApiError::internal(format!(
         "semantic Strict PersistentDisk authority is inconsistent: {}",
         message.into()
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::store::runtime_authority::lifecycle_commands_tests::{test_store, workspace_id};
-
-    fn candidate(store: &Store) -> SemanticStrictPersistentDisk {
-        SemanticStrictPersistentDisk {
-            disk_id: Id::new("disk_11111111111111111111111111111111").unwrap(),
-            workspace_id: workspace_id(store, "semantic-strict-disk"),
-            name: Id::new("data").unwrap(),
-            volume_id: Id::new("vol_22222222222222222222222222222222").unwrap(),
-            size_bytes: 4 * 1024 * 1024,
-            initialization_token: RandomId128::new("33333333333333333333333333333333").unwrap(),
-            filesystem_uuid: RandomId128::new("44444444444444444444444444444444").unwrap(),
-            delete_id: Id::new("delete_55555555555555555555555555555555").unwrap(),
-        }
-    }
-
-    #[test]
-    fn exact_create_and_delete_begin_replay_without_request_identity() {
-        let store = test_store();
-        let candidate = candidate(&store);
-
-        store
-            .ensure_semantic_strict_disk_created(&candidate)
-            .unwrap();
-        store
-            .ensure_semantic_strict_disk_created(&candidate)
-            .unwrap();
-        assert_eq!(
-            store.begin_semantic_strict_disk_delete(&candidate).unwrap(),
-            SemanticStrictDeleteState::Deleting
-        );
-        assert_eq!(
-            store.begin_semantic_strict_disk_delete(&candidate).unwrap(),
-            SemanticStrictDeleteState::Deleting
-        );
-        assert!(!store.semantic_strict_disk_is_absent(&candidate).unwrap());
-    }
-
-    #[test]
-    fn create_discovery_rejects_an_identity_mismatch() {
-        let store = test_store();
-        let candidate = candidate(&store);
-        store
-            .ensure_semantic_strict_disk_created(&candidate)
-            .unwrap();
-
-        let mut mismatch = candidate.clone();
-        mismatch.size_bytes += 1;
-        assert!(store
-            .ensure_semantic_strict_disk_created(&mismatch)
-            .is_err());
-    }
 }

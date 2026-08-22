@@ -4,12 +4,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cats_api::runtime_reconciliation::{Id, RandomId128};
-use cats_storage::BlobStore;
+use cats_storage::{delete_volume_objects_page, BlobStore, DeletePrefixPage};
 use sha2::{Digest, Sha256};
 
 use crate::api::semantic_resources::SemanticResourceFuture;
 use crate::semantic_resource_service::{ResourceStoreError, SemanticPersistentDiskBackend};
-use crate::store::runtime_authority::delete_sweeper::{DeleteSweepBudget, DeleteSweeper};
 use crate::store::runtime_authority::semantic_persistent_disk::{
     SemanticStrictDeleteState, SemanticStrictPersistentDisk,
 };
@@ -22,15 +21,12 @@ const DELETE_DEADLINE: Duration = Duration::from_secs(10);
 /// postcondition. It owns no compatibility MetadataStore path.
 pub struct AuthorityPersistentDiskBackend {
     store: Arc<Store>,
-    sweeper: Arc<DeleteSweeper>,
+    blob: Arc<dyn BlobStore>,
 }
 
 impl AuthorityPersistentDiskBackend {
     pub fn new(store: Arc<Store>, blob: Arc<dyn BlobStore>) -> Self {
-        Self {
-            sweeper: Arc::new(DeleteSweeper::new(Arc::clone(&store), blob)),
-            store,
-        }
+        Self { store, blob }
     }
 }
 
@@ -61,7 +57,7 @@ impl SemanticPersistentDiskBackend for AuthorityPersistentDiskBackend {
             Err(error) => return Box::pin(async move { Err(error) }),
         };
         let store = Arc::clone(&self.store);
-        let sweeper = Arc::clone(&self.sweeper);
+        let blob = Arc::clone(&self.blob);
         Box::pin(async move {
             let begin_candidate = candidate.clone();
             let state = store
@@ -73,7 +69,6 @@ impl SemanticPersistentDiskBackend for AuthorityPersistentDiskBackend {
             }
 
             let deadline = Instant::now() + DELETE_DEADLINE;
-            let budget = DeleteSweepBudget::default();
             loop {
                 if Instant::now() >= deadline {
                     return Err(ResourceStoreError {
@@ -81,21 +76,48 @@ impl SemanticPersistentDiskBackend for AuthorityPersistentDiskBackend {
                             .to_owned(),
                     });
                 }
-                sweeper
-                    .run_once(budget, deadline)
-                    .await
-                    .map_err(|error| ResourceStoreError {
-                        message: format!("strict PersistentDisk delete sweep failed: {error:#}"),
-                    })?;
-                let discovery_candidate = candidate.clone();
-                if store
-                    .execute(move |store| {
-                        store.semantic_strict_disk_is_absent(&discovery_candidate)
-                    })
-                    .await
-                    .map_err(resource_error)?
-                {
-                    return Ok(());
+                let page_blob = Arc::clone(&blob);
+                let volume_id = candidate.volume_id.clone();
+                let page = tokio::task::spawn_blocking(move || {
+                    delete_volume_objects_page(
+                        page_blob.as_ref(),
+                        &volume_id,
+                        cats_storage::BLOB_LIST_PAGE_MAX_KEYS,
+                        deadline,
+                    )
+                })
+                .await
+                .map_err(|error| ResourceStoreError {
+                    message: format!("strict PersistentDisk delete worker failed: {error}"),
+                })?
+                .map_err(|error| ResourceStoreError {
+                    message: format!("strict PersistentDisk delete sweep failed: {error}"),
+                })?;
+                if matches!(
+                    page,
+                    DeletePrefixPage::Empty
+                        | DeletePrefixPage::Progress {
+                            now_empty: true,
+                            ..
+                        }
+                ) {
+                    let completion_candidate = candidate.clone();
+                    store
+                        .execute(move |store| {
+                            store.complete_semantic_strict_disk_delete(&completion_candidate)
+                        })
+                        .await
+                        .map_err(resource_error)?;
+                    let discovery_candidate = candidate.clone();
+                    if store
+                        .execute(move |store| {
+                            store.semantic_strict_disk_is_absent(&discovery_candidate)
+                        })
+                        .await
+                        .map_err(resource_error)?
+                    {
+                        return Ok(());
+                    }
                 }
                 tokio::task::yield_now().await;
             }

@@ -244,11 +244,15 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         crate::semantic_lifecycle::LifecycleTimeouts::default(),
     );
     let semantic_resources: Arc<dyn crate::api::semantic_resources::SemanticResourceApi> = Arc::new(
-        crate::semantic_resource_service::ProductionSemanticResourceApi::new(
+        crate::semantic_resource_service::ProductionSemanticResourceApi::with_disk_backend(
             semantic_lifecycle,
             crate::semantic_resource_service::PostgresSemanticResourceStore::new(Arc::clone(
                 &store,
             )),
+            crate::semantic_strict_disk_backend::AuthorityPersistentDiskBackend::new(
+                Arc::clone(&store),
+                Arc::clone(&cfg.image_blob),
+            ),
         ),
     );
     let (semantic_node_liveness_shutdown, semantic_node_liveness_rx) =
