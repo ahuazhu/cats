@@ -29,7 +29,7 @@
 | PersistentDisk | `control-plane/src/semantic_disk.rs`、`node-agent/src/semantic_mounts.rs` | create/binding/destroy 语义与 Guest 完整挂载确认 | 已完成并合入 |
 | CLI | `cmd/cats/` | slug 命令、同步 REST、`--mount`、GiB 解析、`node_name` 展示 | 已完成并合入 |
 | noded 执行 | `node-agent/`、`cmd/noded/` | 同步 HTTP server、每 Cat 串行、destroy 清理、实际 effects 接入 | FakeVmm 已完成；CH bridge 可启动并 fail-closed，物理 effects 待接入 |
-| Node 管理 | Control API、Node heartbeat client | 注册、`node_name`、`control_endpoint`、offline/reset/drain | 已完成并接入生产进程 |
+| Node 管理 | Control API、Node heartbeat client | 注册、`node_name`、`control_endpoint`、offline/reset/drain/恢复 | 注册心跳与恢复核心已完成；liveness→恢复触发待接线 |
 | Production adapters | Control adapter | Store/placement/noded/入口实现与公共 DTO 映射 | Store/Node/noded/Resource API 和当前入口 adapter 已完成；Gateway 消费仍待接入 |
 | HTTP composition | Control router、AppState、controld/noded main | 新路由和服务接线，旧路由退出 | Control 当前入口已接线；Gateway resolve/CH effects 为独立剩余项 |
 | 切换清理 | schema、router、旧模块和测试 | 删除旧表、旧入口、旧 runner 和只验证旧协议的测试 | 待开始 |
@@ -52,6 +52,8 @@
 - [x] 合入 noded 同步执行服务并接入 FakeVmm。
 - [ ] 接入 Cloud Hypervisor、volume 和 route 的真实 `SemanticCatEffects`。
 - [x] 合入 Node 注册、心跳、主动探测、reset 和 drain 的服务与 HTTP client。
+- [x] 合入 offline Node 的 Cat 恢复核心和精确状态结算。
+- [ ] 将 liveness 标记 offline 的结果接到恢复服务。
 - [x] Store 完成 create 原子建立 Cat/初始 bindings、placement 复核和 stale Node 查询。
 - [x] 完成生命周期、Node 管理和 noded HTTP 的 production adapter。
 - [x] 完成 `SemanticResourceApi` 聚合。
@@ -105,6 +107,7 @@
 | `b77b41e9` | Resource 聚合回归：slug→内部 ID、Disk 重试/冲突/绑定保护、backend fail-closed | Resource service 4 tests |
 | `f8b24854` | Installed/CH semantic effects 启动桥与单点 typed fail-closed | Node 4 tests、noded 3 tests |
 | `bea5dd59`、`2ff26b21` | 当前 Cat/Node 唯一入口表、严格场景语义、Store/production adapter 和 lifecycle 接线 | Store PG 10 tests（来源分支）、adapter 5 tests、API 1 test、Control check |
+| `0dea4a2a` | offline Node 的 Cat 发现、目标 claim、完整配置恢复和精确终态结算 | Recovery 6 tests、semantic ingress adapter 1 test；来源分支 semantic PG 46 tests、Clippy |
 
 ## 5. 进度更新规则
 
@@ -124,6 +127,7 @@
 - Store 的原子 create/bindings、placement 复核和 stale Node/offline CAS 已完成；生命周期、Node 管理和 noded HTTP production adapters 已合入。
 - `SemanticResourceApi` 聚合和生产 composition 已完成；当前入口只保存 `cat_id → node_id`，无 generation、epoch 或 Operation，并已经替换生产 placeholder。
 - Control 已按 `withdraw → Node effect → Ready 后 publish` 切流；同一目标重试返回成功，未先撤流时禁止直接换 Node，旧 Node 的迟到 withdraw 不能删除新目标。Gateway 对该当前目标的直接解析仍待接入，因此尚不宣称流量纵向闭环。
+- offline Node 恢复核心已合入：恢复 claim 期间保留旧 placement 作为重启后的发现线索，只把动作目标切到新 Node；目标终态确认后才切 placement。Running Ready 后发布入口，Suspended/Warm 从完整配置 Cold boot 后恢复原状态且不发布入口。liveness monitor 自动触发恢复仍待生产接线。
 - 公开 Cat/Disk 同步 HTTP handlers、AppState 和主 router composition 已完成；切换合同 6/6 通过。
 - Resource 聚合新增 4 个定向回归，覆盖 slug 解析、Disk 语义重试和 strict backend 未安装时的明确失败。
 - `--vmm ch` 已有明确的 installed effects 桥和单点 preflight；缺少精确 volume/runtime/route 输入时在任何物理副作用前失败，Fake 联调不受影响。
