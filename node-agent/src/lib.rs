@@ -22,5 +22,6 @@ pub mod route_v2_machine;
 pub mod runtime_cutover;
 pub mod runtime_inventory;
 pub mod semantic_mounts;
+pub mod semantic_node_client;
 pub mod state_directory;
 pub mod vmm_launcher;

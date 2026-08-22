@@ -47,6 +47,7 @@ mod runtime_product_reads;
 mod runtime_route;
 mod runtime_spine;
 mod runtime_usage;
+pub mod semantic_nodes;
 mod sessions;
 mod usage;
 

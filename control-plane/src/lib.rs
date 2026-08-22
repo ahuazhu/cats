@@ -10,6 +10,7 @@ pub(crate) mod route_rotation_machine;
 pub mod semantic_disk;
 pub mod semantic_lifecycle;
 pub mod semantic_noded_client;
+pub mod semantic_node;
 pub mod server;
 pub mod store;
 #[doc(hidden)]
