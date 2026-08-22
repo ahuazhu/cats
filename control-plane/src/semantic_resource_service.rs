@@ -1186,3 +1186,338 @@ fn semantic_error(
         message: message.into(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    struct MockLifecycle {
+        creates: Mutex<Vec<lifecycle::CreateCatRequest>>,
+    }
+
+    impl MockLifecycle {
+        fn new() -> Self {
+            Self {
+                creates: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl LifecycleResourcePort for MockLifecycle {
+        fn create<'a>(
+            &'a self,
+            request: lifecycle::CreateCatRequest,
+        ) -> SemanticResourceFuture<
+            'a,
+            Result<lifecycle::LifecycleOutcome, lifecycle::LifecycleError>,
+        > {
+            self.creates.lock().unwrap().push(request.clone());
+            Box::pin(async move {
+                Ok(lifecycle::LifecycleOutcome {
+                    status: lifecycle::OutcomeStatus::Ok,
+                    code: "cat_created",
+                    cat: lifecycle_cat(&request, "cat_current"),
+                })
+            })
+        }
+
+        fn action<'a>(
+            &'a self,
+            _selector: lifecycle::CatSelector,
+            _action: lifecycle::CatAction,
+        ) -> SemanticResourceFuture<
+            'a,
+            Result<lifecycle::LifecycleOutcome, lifecycle::LifecycleError>,
+        > {
+            Box::pin(async {
+                Err(lifecycle::LifecycleError::Rejected {
+                    code: "unused".to_owned(),
+                    message: "unused test path".to_owned(),
+                })
+            })
+        }
+    }
+
+    struct MockResources {
+        disk: Option<db::PersistentDiskRecord>,
+        cat: Option<db::CatRecord>,
+        binding: Option<db::DiskBindingWithCat>,
+        attaches: Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl MockResources {
+        fn populated() -> Self {
+            Self {
+                disk: Some(disk_record("disk_current", "data", 100)),
+                cat: Some(cat_record("cat_current", "worker")),
+                binding: None,
+                attaches: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl SemanticResourceStore for MockResources {
+        fn current_disk<'a>(
+            &'a self,
+            workspace_id: &'a str,
+            disk_slug: &'a str,
+        ) -> SemanticResourceFuture<'a, Result<Option<db::PersistentDiskRecord>, ResourceStoreError>>
+        {
+            let disk = self
+                .disk
+                .clone()
+                .filter(|disk| disk.workspace_id == workspace_id && disk.disk_slug == disk_slug);
+            Box::pin(async move { Ok(disk) })
+        }
+
+        fn current_cat<'a>(
+            &'a self,
+            workspace_id: &'a str,
+            cat_slug: &'a str,
+        ) -> SemanticResourceFuture<'a, Result<Option<db::CatRecord>, ResourceStoreError>> {
+            let cat = self
+                .cat
+                .clone()
+                .filter(|cat| cat.workspace_id == workspace_id && cat.cat_slug == cat_slug);
+            Box::pin(async move { Ok(cat) })
+        }
+
+        fn cat_projection<'a>(
+            &'a self,
+            cat_id: &'a str,
+        ) -> SemanticResourceFuture<'a, Result<Option<CatProjection>, ResourceStoreError>> {
+            let cat = self.cat.clone().filter(|cat| cat.cat_id == cat_id);
+            let disk = self.disk.clone();
+            Box::pin(async move {
+                Ok(cat.map(|cat| CatProjection {
+                    cat: db::CatWithMounts {
+                        cat,
+                        mounts: disk
+                            .map(|disk| db::CatMountRecord {
+                                disk_id: disk.disk_id,
+                                disk_slug: disk.disk_slug,
+                                mount_path: "/data".to_owned(),
+                            })
+                            .into_iter()
+                            .collect(),
+                    },
+                    node_name: None,
+                }))
+            })
+        }
+
+        fn disk_projection<'a>(
+            &'a self,
+            disk_id: &'a str,
+        ) -> SemanticResourceFuture<'a, Result<Option<DiskProjection>, ResourceStoreError>>
+        {
+            let disk = self.disk.clone().filter(|disk| disk.disk_id == disk_id);
+            let binding = self.binding.clone();
+            Box::pin(async move { Ok(disk.map(|disk| DiskProjection { disk, binding })) })
+        }
+
+        fn attach<'a>(
+            &'a self,
+            binding_id: String,
+            cat_id: String,
+            disk_id: String,
+            mount_path: String,
+        ) -> SemanticResourceFuture<'a, Result<db::AttachDiskOutcome, ResourceStoreError>> {
+            self.attaches.lock().unwrap().push((
+                cat_id.clone(),
+                disk_id.clone(),
+                mount_path.clone(),
+            ));
+            Box::pin(async move {
+                Ok(db::AttachDiskOutcome::Attached(db::DiskBindingRecord {
+                    binding_id,
+                    workspace_id: "ws_test".to_owned(),
+                    disk_id,
+                    cat_id,
+                    mount_path,
+                    created_at: 1,
+                }))
+            })
+        }
+
+        fn detach<'a>(
+            &'a self,
+            _cat_id: String,
+            _disk_id: String,
+        ) -> SemanticResourceFuture<'a, Result<db::DetachDiskOutcome, ResourceStoreError>> {
+            Box::pin(async { Ok(db::DetachDiskOutcome::AlreadyDetached) })
+        }
+    }
+
+    fn lifecycle_cat(request: &lifecycle::CreateCatRequest, cat_id: &str) -> lifecycle::CatRecord {
+        lifecycle::CatRecord {
+            cat_id: cat_id.to_owned(),
+            workspace_id: request.workspace_id.clone(),
+            cat_slug: request.cat_slug.clone(),
+            state: Some(lifecycle::CatState::Cold),
+            current_action: None,
+            current_action_node_id: None,
+            node_id: None,
+            config: request.config.clone(),
+        }
+    }
+
+    fn cat_record(cat_id: &str, cat_slug: &str) -> db::CatRecord {
+        db::CatRecord {
+            cat_id: cat_id.to_owned(),
+            workspace_id: "ws_test".to_owned(),
+            cat_slug: cat_slug.to_owned(),
+            state: Some(db::CatState::Cold),
+            current_action: None,
+            current_action_started_at: None,
+            current_action_node_id: None,
+            node_id: None,
+            cpu_count: 2,
+            memory_bytes: 1024,
+            boot_image: "image".to_owned(),
+            last_error_code: None,
+            last_error_message: None,
+            created_at: 1,
+            updated_at: 1,
+            destroyed_at: None,
+        }
+    }
+
+    fn disk_record(disk_id: &str, disk_slug: &str, size_bytes: i64) -> db::PersistentDiskRecord {
+        db::PersistentDiskRecord {
+            disk_id: disk_id.to_owned(),
+            workspace_id: "ws_test".to_owned(),
+            disk_slug: disk_slug.to_owned(),
+            size_bytes,
+            status: "normal".to_owned(),
+            created_at: 1,
+            deleted_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_cat_resolves_mount_slug_to_immutable_disk_id() {
+        let api =
+            ProductionSemanticResourceApi::new(MockLifecycle::new(), MockResources::populated());
+
+        let response = api
+            .create_cat(
+                "ws_test",
+                wire::CreateCatRequest {
+                    cat_slug: wire::ResourceSlug::new("worker").unwrap(),
+                    cpu: 2,
+                    memory_bytes: 1024,
+                    boot_image: "image".to_owned(),
+                    mounts: vec![wire::CatMountRequest {
+                        disk_slug: wire::ResourceSlug::new("data").unwrap(),
+                        mount_path: wire::PersistentMountPath::new("/data").unwrap(),
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+
+        let creates = api.lifecycle.creates.lock().unwrap();
+        assert_eq!(creates[0].config.mounts[0].disk_id, "disk_current");
+        assert_eq!(response.status, wire::SemanticStatus::Ok);
+        assert_eq!(response.cat.mounts[0].disk_id.as_str(), "disk_current");
+    }
+
+    #[tokio::test]
+    async fn disk_create_retries_by_current_slug_and_fails_closed_without_backend() {
+        let api =
+            ProductionSemanticResourceApi::new(MockLifecycle::new(), MockResources::populated());
+
+        let existing = api
+            .create_disk(
+                "ws_test",
+                wire::CreateDiskRequest {
+                    disk_slug: wire::ResourceSlug::new("data").unwrap(),
+                    size_bytes: 100,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(existing.status, wire::SemanticStatus::AlreadyExists);
+
+        let conflict = api
+            .create_disk(
+                "ws_test",
+                wire::CreateDiskRequest {
+                    disk_slug: wire::ResourceSlug::new("data").unwrap(),
+                    size_bytes: 101,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.code, wire::SemanticErrorCode::DiskSizeConflict);
+
+        let unavailable = api
+            .create_disk(
+                "ws_test",
+                wire::CreateDiskRequest {
+                    disk_slug: wire::ResourceSlug::new("new-data").unwrap(),
+                    size_bytes: 100,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(unavailable.code, wire::SemanticErrorCode::InternalError);
+        assert!(unavailable
+            .message
+            .contains("exact volume/filesystem identity"));
+    }
+
+    #[tokio::test]
+    async fn attach_resolves_both_slugs_before_mutation() {
+        let api =
+            ProductionSemanticResourceApi::new(MockLifecycle::new(), MockResources::populated());
+
+        let response = api
+            .attach_disk(
+                "ws_test",
+                wire::ResourceSlug::new("data").unwrap(),
+                wire::AttachDiskRequest {
+                    cat_slug: wire::ResourceSlug::new("worker").unwrap(),
+                    mount_path: wire::PersistentMountPath::new("/data").unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.code, wire::SemanticSuccessCode::DiskAttached);
+        assert_eq!(
+            api.resources.attaches.lock().unwrap().as_slice(),
+            &[(
+                "cat_current".to_owned(),
+                "disk_current".to_owned(),
+                "/data".to_owned()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_disk_checks_binding_before_fail_closed_backend() {
+        let mut resources = MockResources::populated();
+        resources.binding = Some(db::DiskBindingWithCat {
+            binding: db::DiskBindingRecord {
+                binding_id: "binding_current".to_owned(),
+                workspace_id: "ws_test".to_owned(),
+                disk_id: "disk_current".to_owned(),
+                cat_id: "cat_current".to_owned(),
+                mount_path: "/data".to_owned(),
+                created_at: 1,
+            },
+            cat_slug: "worker".to_owned(),
+        });
+        let api = ProductionSemanticResourceApi::new(MockLifecycle::new(), resources);
+
+        let in_use = api
+            .destroy_disk("ws_test", wire::ResourceSlug::new("data").unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(in_use.code, wire::SemanticErrorCode::DiskInUse);
+    }
+}
