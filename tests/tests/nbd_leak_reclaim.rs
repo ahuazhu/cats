@@ -50,7 +50,6 @@ fn nbd_client_bin() -> PathBuf {
 fn config() -> Result<ChConfig> {
     Ok(ChConfig {
         block_direct: false,
-        vmm_launcher_bin: PathBuf::from("/nonexistent"),
         ch_bin: PathBuf::from("/nonexistent"),
         kernel: PathBuf::from("/nonexistent"),
         initramfs: None,
