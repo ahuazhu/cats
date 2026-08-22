@@ -642,6 +642,9 @@ fn stored_cat_to_core(cat: CatWithMounts) -> crate::store::Result<CatRecord> {
                 .into_iter()
                 .map(|mount| CatMount {
                     disk_id: mount.disk_id,
+                    volume_id: mount.volume_id,
+                    filesystem_uuid: mount.filesystem_uuid,
+                    disk_format: mount.disk_format,
                     mount_path: mount.mount_path,
                 })
                 .collect(),
@@ -876,6 +879,9 @@ mod tests {
             boot_image: "sha256:recovery-image".to_owned(),
             mounts: vec![CatMount {
                 disk_id: "disk-data".to_owned(),
+                volume_id: "vol-data".to_owned(),
+                filesystem_uuid: "11111111111111111111111111111111".to_owned(),
+                disk_format: "ext4".to_owned(),
                 mount_path: "/data".to_owned(),
             }],
         }

@@ -175,9 +175,9 @@ mod tests {
     use crate::semantic_lifecycle::{
         SemanticCatState, SemanticNodeService, SemanticResponseStatus,
     };
-    use cats_api::runtime_reconciliation::Id;
+    use cats_api::runtime_reconciliation::{Id, RandomId128};
     use cats_api::semantic_control::{
-        CatAction, NodedCatConfig, NodedDiskMount, PersistentMountPath,
+        CatAction, NodedCatConfig, NodedDiskMount, PersistentDiskFormat, PersistentMountPath,
     };
 
     use super::*;
@@ -192,6 +192,9 @@ mod tests {
                 boot_image: "ubuntu-24.04".to_owned(),
                 mounts: vec![NodedDiskMount {
                     disk_id: Id::new("disk_01").expect("disk ID"),
+                    volume_id: Id::new("vol_01").expect("volume ID"),
+                    filesystem_uuid: RandomId128::new("1".repeat(32)).expect("filesystem UUID"),
+                    format: PersistentDiskFormat::Ext4,
                     mount_path: PersistentMountPath::new("/data").expect("mount path"),
                 }],
             },
