@@ -1317,14 +1317,14 @@ fn detach_disk_transaction(
 ) -> std::result::Result<DetachDiskOutcome, postgres::Error> {
     let mut transaction = client.transaction()?;
     let Some(cat) = transaction.query_opt(
-        "SELECT state FROM cats WHERE cat_id=$1 FOR UPDATE",
+        "SELECT state,current_action FROM cats WHERE cat_id=$1 FOR UPDATE",
         &[&cat_id],
     )?
     else {
         transaction.rollback()?;
         return Ok(DetachDiskOutcome::CatNotFound);
     };
-    if cat.get::<_, Option<&str>>(0) != Some("cold") {
+    if cat.get::<_, Option<&str>>(0) != Some("cold") || cat.get::<_, Option<&str>>(1).is_some() {
         transaction.rollback()?;
         return Ok(DetachDiskOutcome::CatMustBeCold);
     }

@@ -293,3 +293,156 @@ fn persistent_disk_is_rwo_and_slug_is_reusable_after_delete() {
             if disk_id == "disk-new"
     ));
 }
+
+#[test]
+fn atomic_create_persists_full_mount_config_and_retries_by_semantics() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    assert!(matches!(
+        store
+            .create_semantic_persistent_disk(NewPersistentDisk {
+                disk_id: "disk-atomic",
+                workspace_id: "ws_semantic",
+                disk_slug: "data",
+                size_bytes: 100 << 30,
+            })
+            .unwrap(),
+        CreatePersistentDiskOutcome::Created(_)
+    ));
+
+    let mounts = [NewCatMount {
+        binding_id: "binding-atomic",
+        disk_slug: "data",
+        mount_path: "/data",
+    }];
+    let request = AtomicCatCreate {
+        cat_id: "cat-atomic",
+        workspace_id: "ws_semantic",
+        cat_slug: "atomic",
+        node_id: Some("node-a"),
+        cpu_count: 2,
+        memory_bytes: 1 << 30,
+        boot_image: "sha256:image",
+        mounts: &mounts,
+    };
+    let AdmitCatCreateOutcome::Created(created) =
+        store.admit_semantic_cat_create(request.clone()).unwrap()
+    else {
+        panic!("first atomic create must win")
+    };
+    assert_eq!(created.mounts.len(), 1);
+    assert_eq!(created.mounts[0].disk_id, "disk-atomic");
+    assert_eq!(created.mounts[0].disk_slug, "data");
+
+    let retry_mounts = [NewCatMount {
+        binding_id: "binding-retry-is-ignored",
+        disk_slug: "data",
+        mount_path: "/data",
+    }];
+    assert!(matches!(
+        store
+            .admit_semantic_cat_create(AtomicCatCreate {
+                cat_id: "cat-retry-is-ignored",
+                mounts: &retry_mounts,
+                ..request.clone()
+            })
+            .unwrap(),
+        AdmitCatCreateOutcome::SameAction(CatWithMounts { cat, .. })
+            if cat.cat_id == "cat-atomic"
+    ));
+    assert!(matches!(
+        store
+            .admit_semantic_cat_create(AtomicCatCreate {
+                cat_id: "cat-conflict",
+                cpu_count: 4,
+                mounts: &retry_mounts,
+                ..request
+            })
+            .unwrap(),
+        AdmitCatCreateOutcome::ConfigurationConflict(_)
+    ));
+}
+
+#[test]
+fn rejected_atomic_mount_rolls_back_cat_and_binding_together() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    let missing = [NewCatMount {
+        binding_id: "binding-missing",
+        disk_slug: "missing",
+        mount_path: "/data",
+    }];
+    assert!(matches!(
+        store
+            .admit_semantic_cat_create(AtomicCatCreate {
+                cat_id: "cat-rollback",
+                workspace_id: "ws_semantic",
+                cat_slug: "rollback",
+                node_id: Some("node-a"),
+                cpu_count: 2,
+                memory_bytes: 1 << 30,
+                boot_image: "sha256:image",
+                mounts: &missing,
+            })
+            .unwrap(),
+        AdmitCatCreateOutcome::MountRejected { code, .. } if code == "disk_not_found"
+    ));
+    assert!(store
+        .find_current_semantic_cat("ws_semantic", "rollback")
+        .unwrap()
+        .is_none());
+    assert!(store
+        .list_semantic_disk_bindings("cat-rollback")
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn registration_starts_liveness_clock_and_offline_cas_rejects_racing_heartbeat() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let candidate = store
+        .list_stale_semantic_nodes(1)
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.node_id == "node-a")
+        .expect("registration heartbeat must age into stale detection");
+
+    store
+        .record_semantic_node_heartbeat(NodeHeartbeat {
+            node_id: "node-a",
+            node_reported_at: Some(1),
+            reported_status: NodeStatus::Running,
+            total_cpu: 8,
+            cpu_utilized: 1.0,
+            total_memory: 16 << 30,
+            memory_utilized: 2 << 30,
+            running_cat_count: 0,
+            suspended_cat_count: 0,
+            warm_cat_count: 0,
+        })
+        .unwrap();
+    assert!(!store
+        .mark_semantic_node_offline_if_heartbeat_unchanged(&candidate)
+        .unwrap());
+    assert_eq!(
+        store.find_semantic_node("node-a").unwrap().unwrap().status,
+        NodeStatus::Running
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let fresh = store
+        .list_stale_semantic_nodes(1)
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.node_id == "node-a")
+        .expect("fresh heartbeat eventually becomes stale");
+    assert!(store
+        .mark_semantic_node_offline_if_heartbeat_unchanged(&fresh)
+        .unwrap());
+    assert_eq!(
+        store.find_semantic_node("node-a").unwrap().unwrap().status,
+        NodeStatus::Offline
+    );
+}
