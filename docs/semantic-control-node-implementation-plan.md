@@ -26,7 +26,7 @@
 | 数据库 | `control-plane/src/store/` | v19 表、slug 部分唯一索引、Disk RWO、动作 CAS、数据库心跳时间 | 已合入；PG 行为测试待最终环境 |
 | Control 核心 | `control-plane/src/semantic_lifecycle.rs` | 同步动作、语义幂等、超时查询恢复、入口先撤后发 | 已完成并合入 |
 | noded HTTP client | `control-plane/src/semantic_noded_client.rs` | Control 同步调用 noded、Bearer、deadline、严格响应校验 | 已完成并合入 |
-| PersistentDisk | `control-plane/src/semantic_disk.rs`、`node-agent/src/semantic_mounts.rs` | create/binding/destroy 语义与 Guest 完整挂载确认 | 已完成并合入 |
+| PersistentDisk | `control-plane/src/semantic_disk.rs`、`node-agent/src/semantic_mounts.rs` | create/binding/destroy 语义与 Guest 完整挂载确认 | 语义目录和校验器已合入；物理 provision/delete backend 进行中 |
 | CLI | `cmd/cats/` | slug 命令、同步 REST、`--mount`、GiB 解析、`node_name` 展示 | 已完成并合入 |
 | noded 执行 | `node-agent/`、`cmd/noded/` | 同步 HTTP server、每 Cat 串行、destroy 清理、实际 effects 接入 | FakeVmm 已完成；CH bridge 可启动并 fail-closed，物理 effects 待接入 |
 | Node 管理 | Control API、Node heartbeat client | 注册、`node_name`、`control_endpoint`、offline/reset/drain/恢复 | 已完成并接入生产进程 |
@@ -48,9 +48,10 @@
 ### 阶段 B：并行组件
 
 - [x] 实现 CLI 同步 slug API。
-- [x] 实现 Disk 语义与 Guest mount-ready 校验。
+- [x] 实现 Disk 目录/绑定语义与 Guest mount-ready 校验器。
+- [ ] 接入 Disk 的物理 provision/delete 和精确挂载身份。
 - [x] 合入 noded 同步执行服务并接入 FakeVmm。
-- [ ] 接入 Cloud Hypervisor、volume 和 route 的真实 `SemanticCatEffects`。
+- [ ] 接入 Cloud Hypervisor 和持久卷的真实 `SemanticCatEffects`。
 - [x] 合入 Node 注册、心跳、主动探测、reset 和 drain 的服务与 HTTP client。
 - [x] 合入 offline Node 的 Cat 恢复核心和精确状态结算。
 - [x] 将 liveness 标记 offline 的结果接到恢复服务。
@@ -133,4 +134,4 @@
 - 公开 Cat/Disk 同步 HTTP handlers、AppState 和主 router composition 已完成；切换合同 6/6 通过。
 - Resource 聚合新增 4 个定向回归，覆盖 slug 解析、Disk 语义重试和 strict backend 未安装时的明确失败。
 - `--vmm ch` 已有明确的 installed effects 桥和单点 preflight；缺少精确 volume/runtime/route 输入时在任何物理副作用前失败，Fake 联调不受影响。
-- 切换合同的 noded 静态断言已按实际 `lane_if_open` 命名校准；production composition 仍待接线。
+- 切换合同的 noded 静态断言已按实际 `lane_if_open` 命名校准；production composition 已完成，旧 Store/schema 清理仍在进行。
