@@ -26,14 +26,14 @@
 | 数据库 | `control-plane/src/store/` | v19 表、slug 部分唯一索引、Disk RWO、动作 CAS、数据库心跳时间 | 已合入；PG 行为测试待最终环境 |
 | Control 核心 | `control-plane/src/semantic_lifecycle.rs` | 同步动作、语义幂等、超时查询恢复、入口先撤后发 | 已完成并合入 |
 | noded HTTP client | `control-plane/src/semantic_noded_client.rs` | Control 同步调用 noded、Bearer、deadline、严格响应校验 | 已完成并合入 |
-| PersistentDisk | `control-plane/src/semantic_disk.rs`、`node-agent/src/semantic_mounts.rs` | create/binding/destroy 语义与 Guest 完整挂载确认 | 精确身份/进行态/完成 CAS 已合入；物理 provision/delete backend 进行中 |
+| PersistentDisk | `control-plane/src/semantic_disk.rs`、`node-agent/src/semantic_mounts.rs` | create/binding/destroy 语义与 Guest 完整挂载确认 | Strict provision/delete backend 和 production composition 已完成；CH/Guest 物理挂载 E2E 待完成 |
 | CLI | `cmd/cats/` | slug 命令、同步 REST、`--mount`、GiB 解析、`node_name` 展示 | 已完成单协议切换，旧 Operation/pending/replay 已删除 |
 | noded 执行 | `node-agent/`、`cmd/noded/` | 同步 HTTP server、每 Cat 串行、destroy 清理、实际 effects 接入 | FakeVmm 已完成；CH bridge 可启动并 fail-closed，物理 effects 待接入 |
 | Node 管理 | Control API、Node heartbeat client | 注册、`node_name`、`control_endpoint`、offline/reset/drain/恢复 | 已完成并接入生产进程 |
 | Production adapters | Control adapter | Store/placement/noded/入口实现与公共 DTO 映射 | 已完成；公网 Gateway 细节按设计不在本协议范围 |
 | HTTP composition | Control router、AppState、controld/noded main | 新路由和服务接线，旧路由退出 | Control/noded 已完成；CH effects 为独立剩余项 |
-| 切换清理 | schema、router、旧模块和测试 | 删除旧表、旧入口、旧 runner 和只验证旧协议的测试 | 旧 HTTP/production composition 和旧 Store 模块已删除；schema catalog/旧集成测试清理进行中 |
-| 纵向联调 | FakeVmm/PostgreSQL | Disk→Cat→状态动作→跨 Node→destroy→slug 复用 | 真实 HTTP Cat 全状态机已完成；Disk backend、跨 Node 与 PostgreSQL 纵向场景待完成 |
+| 切换清理 | schema、router、旧模块和测试 | 删除旧表、旧入口、旧 runner 和只验证旧协议的测试 | 旧 HTTP/Store/schema/测试已删除；旧 Route v2 部署合同待随新入口传输实现退出 |
+| 纵向联调 | FakeVmm/PostgreSQL | Disk→Cat→状态动作→跨 Node→destroy→slug 复用 | HTTP Cat 全状态机和 PostgreSQL Disk/Store 场景已完成；真实双 Node 与 CH/Guest E2E 待完成 |
 | 最终门禁 | 全仓库与 Linux | 完整门禁、Linux Node/真实 VMM 冒烟 | 待开始 |
 
 ## 3. 集成顺序
@@ -50,7 +50,7 @@
 - [x] 实现 CLI 同步 slug API。
 - [x] 实现 Disk 目录/绑定语义与 Guest mount-ready 校验器。
 - [x] 将 `disk_id`、`volume_id`、filesystem UUID 和 ext4 格式贯穿 Control、noded 与 Guest 确认。
-- [ ] 接入 Disk 的物理 provision/delete backend。
+- [x] 接入 Disk 的 Strict volume/disk authority provision/delete backend 和 BlobStore 空前缀后置条件。
 - [x] 合入 noded 同步执行服务并接入 FakeVmm。
 - [ ] 接入 Cloud Hypervisor 和持久卷的真实 `SemanticCatEffects`。
 - [x] 合入 Node 注册、心跳、主动探测、reset 和 drain 的服务与 HTTP client。
@@ -69,7 +69,8 @@
 - [x] 用同一个 placement gate 阻止 reset 期间的新 Cat 动作。
 - [x] 接入 Control 的 `withdraw → Node Ready → publish` 顺序。
 - [x] 通过真实 Control→noded HTTP 跑通 FakeVmm Cat 全状态机及每个动作的语义重试。
-- [ ] 跑通 Disk backend、跨 Node 恢复和 PostgreSQL 纵向场景。
+- [x] 跑通 PostgreSQL Disk authority create/delete/retry/slug 复用和 semantic Store 并发场景。
+- [ ] 跑通真实双 Node 恢复和 CH/Guest 物理挂载 E2E。
 
 ### 阶段 D：单协议切换
 
@@ -79,12 +80,12 @@
 - [x] 删除旧 lifecycle/AgentSession/observation/Route/product HTTP 模块和 Gateway/rotation 监听接线。
 - [x] 删除 CLI 的 Operation get/wait、Idempotency-Key pending/replay 和旧 Disk mutation client。
 - [x] 删除旧 Operation/AgentSession/Route/NodeJob/observation Store 模块和退役导出。
-- [ ] 从 v19 schema 删除旧 lifecycle/route settlement 表和 catalog probes。
+- [x] 从 v19 schema 删除旧 lifecycle/route settlement 表和 catalog probes。
 - [ ] 删除旧协议专属测试；把仍适用的并发、清理和恢复场景迁到新测试。
 
 ### 阶段 E：最终验证
 
-- [ ] PostgreSQL 并发 create、slug 复用、Disk RWO、动作 CAS。
+- [x] PostgreSQL 并发 create、slug 复用、Disk RWO、动作 CAS。
 - [ ] Control 响应丢失后查询 noded 恢复。
 - [ ] offline Node 下一次心跳触发 reset 并最终单实例。
 - [ ] `cargo test`/Clippy 的相关定向回归全部通过。
@@ -119,6 +120,9 @@
 | `01e3713d` | CLI 删除旧 Operation、Idempotency-Key pending/replay 与退役 mutation 测试 | CLI 69 passed、3 ignored；Clippy `-D warnings` |
 | `769a4625` | 删除旧 lifecycle Operation、AgentSession、Route、NodeJob、observation settlement 等 Store 实现和退役导出 | semantic Store 46/46、cutover contract 6/6；Control/controld check |
 | `c601c7b0`、`0b96550d` | 真实 HTTP 纵向 Cat 生命周期：Control client→noded router→per-Cat lane→Fake effects，覆盖全状态和重复调用 | 纵向测试通过；Node workspace Clippy `-D warnings` 通过 |
+| `e54c3084`、`4fa9f4a6`、`c03f26a8` | Strict PersistentDisk authority backend、最小独立 Store seam、production composition 和 PostgreSQL 回归 | backend 2、resource 5、Strict authority PG 1/1、semantic Store PG 11/11；Control/controld check |
+| `a4eb99cf`、`32145634`、`4b891105`、`e905980a`、`e762ce8d` | 删除旧协议 schema/catalog、HTTP 测试、request queue owner、OCI wait 配置和退役测试夹具 | schema PG 1/1、semantic schema 2/2、Control all-target Clippy `-D warnings` |
+| `2a7f4956` | 四份主架构文档统一到 ADR-0059，并明确双跑和未完成物理边界 | Markdown links 110/110、旧协议正向声明 0 |
 
 ## 5. 进度更新规则
 
@@ -143,9 +147,11 @@
 - production Control 已收敛到一个 semantic 主监听；旧 lifecycle、AgentSession、observation、Route Operation、旧 product handler 以及独立 Gateway/rotation 监听不再进入生产进程。Store/schema 中的退役实现和表正在下一切片删除。
 - 公开 Cat/Disk 同步 HTTP handlers、AppState 和主 router composition 已完成；切换合同 6/6 通过。
 - Resource 聚合新增 4 个定向回归，覆盖 slug 解析、Disk 语义重试和 strict backend 未安装时的明确失败。
-- Disk 创建先持久化不可变物理身份，再调用后端；后端明确完成后才从 provisioning 进入 normal。删除同样先进入 deleting，明确完成后才释放 slug；响应丢失重试沿用同一身份。严格物理 backend 仍未接入，当前保持 fail-closed。
+- Disk 创建先持久化不可变物理身份，再由 production Strict backend 原子创建/发现 volume/disk authority；后端明确完成后才从 provisioning 进入 normal。删除先进入 deleting，BlobStore 精确卷前缀重查为空且 authority rows 删除后才释放 slug；响应丢失重试沿用同一身份。
 - CLI 已删除 `operation get/wait`、隐藏 `--no-wait`、Idempotency-Key pending/replay 文件和旧 mutation client，只保留同步场景语义命令。
 - 旧 Operation、AgentSession、Route、NodeJob 和 observation settlement 的 Store 模块与导出已删除；schema catalog 和引用旧表的集成测试仍在并行清理。
 - 已用真实 HTTP composition 跑通 `create → suspend → run → warm → cold → run → destroy`，每个调用重复一次且只产生一次物理 effect；测试同时验证 Running 的入口发布和离开 Running 前撤流。
+- fresh v19 已删除 Operation、NodeJob、AgentSession、旧 Route/inventory settlement 表及 catalog probes；严格 volume/disk/snapshot authority 与 Host fence 保留。对应旧 HTTP 测试和退役夹具已经删除。
+- PostgreSQL 已验证 Strict Disk authority 的重复 create/delete、同 slug 新身份复用，以及 semantic Store 的 11 个并发、RWO、心跳数据库时间、入口和恢复场景。
 - `--vmm ch` 已有明确的 installed effects 桥和单点 preflight；缺少精确 volume/runtime/route 输入时在任何物理副作用前失败，Fake 联调不受影响。
 - 切换合同的 noded 静态断言已按实际 `lane_if_open` 命名校准；production composition 已完成，旧 Store/schema 清理仍在进行。

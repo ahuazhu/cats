@@ -60,10 +60,10 @@ HostFenceRecovery 组织生命周期。幂等身份直接来自业务场景：
 | 范围 | 当前事实 | 仍未完成或未验证 |
 |---|---|---|
 | 公共协议 | Cat/Disk/Node 同步 DTO、稳定错误码、内部 Bearer 认证已组成；严格拒绝旧幂等和 Operation 字段 | 最终全仓协议残留检查待门禁 |
-| PostgreSQL | v19 当前资源表、可复用 slug 的部分唯一索引、Disk binding RWO、Cat 动作 CAS、数据库接收时间心跳和当前入口目标已组成 | 旧 schema/Store 残留仍在清理；最终 PostgreSQL 组合门待跑 |
+| PostgreSQL | v19 当前资源表、可复用 slug 的部分唯一索引、Disk binding RWO、Cat 动作 CAS、数据库接收时间心跳和当前入口目标已组成；旧 lifecycle/Route settlement schema 已删除 | 最终 PostgreSQL 全仓门待跑 |
 | Control | 同步 lifecycle、超时后 Node 查询、资源 API、入口先撤后发、Node 注册/心跳/reset/drain 和失联恢复已接入生产进程；真实 Control→noded HTTP 的 Cat 全状态机与重复语义已通过 | PersistentDisk/CH 完整纵向联调和最终门禁待完成 |
 | noded | 同步 HTTP server、按 Cat 串行、destroy 清理、reset gate、注册和 heartbeat supervisor已组成 | Cloud Hypervisor 的完整实际 effects 尚未接入；当前 CH bridge 在缺少精确输入时会在物理副作用前失败 |
-| PersistentDisk | slug、目录、binding 语义和 Guest mount-ready 校验器已组成；Strict provision/delete backend 已完成，包含 volume/disk authority 和 BlobStore delete postcondition | production composition 正在合入；精确 Guest/CH 物理挂载链和产品 E2E 尚未完成 |
+| PersistentDisk | slug、目录、binding 语义、精确卷/文件系统身份、Guest mount-ready 校验器和 Strict provision/delete backend 已组成；backend 已接入 production composition | Guest/CH 物理挂载链和产品 E2E 尚未完成 |
 | Node 失联恢复 | offline 后按数据库当前事实反复发现未迁走 Cat，先撤入口、在其他 running Node 恢复、Ready 后发布；旧 Node 回来要求 reset | 双跑窗口的真实两 Node 验证待完成；协议本身不承诺严格物理单实例 |
 | 入口 | 当前 `cat_id -> node_id` 目标和 withdraw/publish 顺序已组成 | 公网 Gateway/Endpoint 传输协议不在本次 Control/Node 合同范围 |
 | 底层存储 | ChunkStore、delta、golden root、NBD/vhost-user-blk、MetadataStore owner/epoch 和相关测试已存在 | 本次同步 lifecycle 只允许远端持久模式；磁盘产品 E2E、Snapshot/GC 和真实 Host-loss 资格仍开放 |
@@ -199,8 +199,8 @@ RWO 数据安全没有因为 lifecycle 简化而转移到 heartbeat 或 binding�
 不承诺窗口内物理单实例、旧连接停止或绝对物理单写。这是明确风险；不能把入口切换或心跳称为 fence。
 
 PersistentDisk 只有在 Guest 按稳定设备身份找到设备、验证预期文件系统并确认目标路径已经 mount 后，
-create/run 才能成功。Strict provision/delete backend 已完成并正在合入 production composition，但精确
-Guest/Cloud Hypervisor 物理挂载链仍未闭合，不能从 backend 完成推断完整物理路径已经上线。
+create/run 才能成功。Strict provision/delete backend 已接入 production composition，精确身份也已贯穿
+Control/noded wire，但 Guest/Cloud Hypervisor 物理挂载链仍未闭合，不能从 backend 完成推断完整物理路径已经上线。
 
 ## 9. Node 注册、失联与恢复
 
@@ -268,9 +268,9 @@ binding 和 signed poll/result lane 不是当前 Control/Node 生命周期协议
 
 1. 当前资源 schema、共享 DTO 和场景语义规则；
 2. Control 同步 lifecycle、noded 每 Cat 串行与 Node 注册/heartbeat/reset；
-3. 合入 PersistentDisk Strict backend，并闭合精确挂载身份和 Cloud Hypervisor effects；
-4. 在已通过的真实 Control→noded HTTP Cat 状态机基础上跑 PersistentDisk/PostgreSQL 纵向联调；
-5. 旧 schema/Store/测试清理和最终全仓、Linux 门禁。
+3. 闭合 PersistentDisk 的 Guest 物理挂载链和 Cloud Hypervisor effects；
+4. 在已通过的 HTTP/PostgreSQL 场景基础上跑真实双 Node 纵向联调；
+5. 旧 Route v2 部署合同清理和最终全仓、Linux 门禁。
 
 并行进度、提交和验证只在
 [实施计划](semantic-control-node-implementation-plan.md)维护，本文不复制滚动提交表。
@@ -300,7 +300,7 @@ binding 和 signed poll/result lane 不是当前 Control/Node 生命周期协议
 - offline 前必须经过连续 heartbeat 超时和主动探测失败；旧 Node 下一次通信收到
   `reset_required`，reset 完成前不能接受 placement。
 - 跨 Node 恢复先撤旧入口，Running Ready 后才发布新入口；允许窗口内的双跑被真实测试并最终收敛。
-- PersistentDisk Strict backend 已完成但仍须通过 production composition、文件系统身份、Guest
+- PersistentDisk Strict backend 和精确身份已进入 production composition，但仍须通过 Guest
   mount-ready 和 Cloud Hypervisor 纵向测试；真实 Control→noded HTTP/FakeVmm 结果不能替代物理上线证据。
 - production route map 不包含 lifecycle Operation GET、Node command poll/result、AgentSession 或
   observation settlement。

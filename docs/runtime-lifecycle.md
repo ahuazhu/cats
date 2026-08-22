@@ -102,8 +102,8 @@ run 从 Suspended、Warm 或 Cold 进入 Running；Cold run 可以重新选择 N
 - 新流量入口只在上述条件完成后发布。
 
 真实 Control→noded HTTP 的 Cat 全状态机和重复语义已经通过。Strict PersistentDisk provision/delete
-backend 也已完成并正在合入 production composition；Cloud Hypervisor 的完整实际 effects、精确 Guest
-卷/文件系统身份和物理挂载 E2E 尚未闭合。这些仍是上线前置，不能把 HTTP/FakeVmm 或 backend 单层通过
+backend 已接入 production composition，精确卷/文件系统身份已贯穿 Control/noded wire；Cloud Hypervisor
+的完整实际 effects 和 Guest 物理挂载 E2E 尚未闭合。这些仍是上线前置，不能把 HTTP/FakeVmm 或 backend 单层通过
 写成完整物理路径完成。
 
 create 最终失败或超时时，Control 可以对同一 `cat_id` 调用一次 noded DELETE 清理尝试残留；产品 Cat

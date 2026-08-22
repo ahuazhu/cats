@@ -28,15 +28,15 @@
 - noded 按 Cat 串行、destroy 清理、Node registration/heartbeat/reset/drain；
 - offline Node 的 level-triggered Cat 恢复，以及 `withdraw old -> Ready -> publish new`；
 - 真实 Control→noded HTTP 的 Cat 全状态机和重复调用语义；
-- Strict PersistentDisk provision/delete backend，包括 volume/disk authority 和 BlobStore delete postcondition；
+- 已接入 production composition 的 Strict PersistentDisk provision/delete backend，包括 volume/disk authority 和 BlobStore delete postcondition；
 - production Control 只挂载 semantic resource/Node 主监听，旧 lifecycle Operation、AgentSession、
   observation settlement 和 Route Operation 不再进入生产 composition；
 - 独立 `runtime_node_authority` 管理入口继续组成，但不承担 Cat lifecycle authority。
 
 仍开放：
 
-- 旧 v19 schema/Store 残留及旧协议专属测试清理；
-- PersistentDisk backend 的 production composition、精确卷/文件系统身份和 Guest 物理挂载链 E2E；
+- 旧 Route v2 部署合同随新入口传输实现一起清理；
+- PersistentDisk/Cloud Hypervisor 的 Guest 物理挂载链 E2E；
 - Cloud Hypervisor 的完整 `SemanticCatEffects`；当前 bridge 缺少输入时在物理副作用前失败；
 - 两 Node 双跑窗口/reset 收敛、Linux/Cloud Hypervisor 和最终全仓门禁。
 

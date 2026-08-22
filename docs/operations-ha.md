@@ -235,7 +235,7 @@ Git 保留。
 ## 11. 明确不宣称
 
 - 同步 semantic production composition和真实 Control→noded HTTP Cat 状态机已组成；Strict PersistentDisk
-  backend 已完成并正在合入。这不表示完整 PersistentDisk/Cloud Hypervisor 物理链或 production
+  backend 已接入 production composition。这不表示完整 PersistentDisk/Cloud Hypervisor 物理链或 production
   qualification 已通过。
 - heartbeat/reset 的最终收敛不表示恢复窗口内严格物理单实例、严格物理单写或旧连接立即停止。
 - heartbeat timeout、入口撤销、数据库 binding 和 audit log 都不是可信 Host fence。

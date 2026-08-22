@@ -20,14 +20,14 @@ Guest Runtime API使用它。S3、PostgreSQL、NVMe cache、VMM和fencing都属�
 场景语义协议：Control 以 Cat 当前行和 `current_action` 串行化，transaction 外同步调用 noded；
 幂等来自 Workspace、slug、完整参数和目标状态，不使用 request ID、Operation、Node poll/result、
 per-Cat journal 或 AgentSession。旧 Desired/NodeJob 和 ADR-0056 atomic command 是已被取代的历史协议。
-真实 Control→noded HTTP 的 Cat 全状态机和重复语义已通过；Strict PersistentDisk backend 已完成并正在
-合入 composition。Cloud Hypervisor 的完整实际 effects 仍在缺少精确输入时 fail closed。
+真实 Control→noded HTTP 的 Cat 全状态机和重复语义已通过；Strict PersistentDisk backend 已接入
+production composition。Cloud Hypervisor 的完整实际 effects 仍在缺少精确输入时 fail closed。
 
 尚未实现/验收的主要边界：
 
-- 清理旧 schema/Store/test 残留，并补齐 PersistentDisk/PostgreSQL 完整纵向联调；
-- Strict PersistentDisk backend 已完成并正在合入；仍需 production composition、精确卷/文件系统身份和
-  Guest 物理 mount readiness；
+- 清理旧 Route v2 部署合同，并补齐真实双 Node/Cloud Hypervisor 纵向联调；
+- Strict PersistentDisk backend 和精确卷/文件系统身份已接入；仍需 Guest/Cloud Hypervisor 物理
+  mount readiness E2E；
 - Cloud Hypervisor 的完整 semantic effects 和真实 Linux/KVM 资格；
 - offline Node 允许双跑窗口、旧 Node reset 和最终单实例的两 Node 组合验收；
 - 自动 EC2/BMC Host fence、长期不对称网络和真实 RDS failover仍是独立边界；
