@@ -922,12 +922,10 @@ where
                 }
                 (disk, false)
             } else {
-                let disk_id = new_id("disk_");
                 let candidate = disk_create_candidate(
                     workspace_id,
                     request.disk_slug.as_str(),
                     request.size_bytes,
-                    disk_id,
                 )?;
                 match self
                     .resources
@@ -1258,17 +1256,9 @@ fn disk_create_candidate(
     workspace_id: &str,
     disk_slug: &str,
     size_bytes: u64,
-    disk_id: String,
 ) -> Result<DiskCreateCandidate, wire::SemanticErrorBody> {
-    let suffix = disk_id
-        .strip_prefix("disk_")
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            semantic_error(
-                wire::SemanticErrorCode::InternalError,
-                "allocated PersistentDisk ID is invalid",
-            )
-        })?;
+    let disk_id = format!("disk_{}", uuid::Uuid::new_v4().simple());
+    let volume_id = format!("vol_{}", uuid::Uuid::new_v4().simple());
     let size_bytes = i64::try_from(size_bytes).map_err(|_| {
         semantic_error(
             wire::SemanticErrorCode::InvalidRequest,
@@ -1284,7 +1274,7 @@ fn disk_create_candidate(
         workspace_id: workspace_id.to_owned(),
         disk_slug: disk_slug.to_owned(),
         size_bytes,
-        volume_id: format!("vol_{suffix}"),
+        volume_id,
         filesystem_uuid,
     })
 }

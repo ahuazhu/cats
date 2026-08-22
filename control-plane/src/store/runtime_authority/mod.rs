@@ -13,3 +13,4 @@ pub(super) mod pg_codec;
 pub(crate) mod placement_policy;
 pub(crate) mod production_mutation_admission;
 pub(super) mod rows;
+pub(crate) mod semantic_persistent_disk;
