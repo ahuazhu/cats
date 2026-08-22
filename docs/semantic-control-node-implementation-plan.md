@@ -30,8 +30,8 @@
 | CLI | `cmd/cats/` | slug 命令、同步 REST、`--mount`、GiB 解析、`node_name` 展示 | 已完成并合入 |
 | noded 执行 | `node-agent/`、`cmd/noded/` | 同步 HTTP server、每 Cat 串行、destroy 清理、实际 effects 接入 | FakeVmm 已完成；CH bridge 可启动并 fail-closed，物理 effects 待接入 |
 | Node 管理 | Control API、Node heartbeat client | 注册、`node_name`、`control_endpoint`、offline/reset/drain | 已完成并接入生产进程 |
-| Production adapters | Control adapter | Store/placement/noded/入口实现与公共 DTO 映射 | Store/Node/noded/Resource API 已完成；入口需独立 Route 切片 |
-| HTTP composition | Control router、AppState、controld/noded main | 新路由和服务接线，旧路由退出 | 已完成并合入；真实 ingress/CH effects 为独立剩余项 |
+| Production adapters | Control adapter | Store/placement/noded/入口实现与公共 DTO 映射 | Store/Node/noded/Resource API 和当前入口 adapter 已完成；Gateway 消费仍待接入 |
+| HTTP composition | Control router、AppState、controld/noded main | 新路由和服务接线，旧路由退出 | Control 当前入口已接线；Gateway resolve/CH effects 为独立剩余项 |
 | 切换清理 | schema、router、旧模块和测试 | 删除旧表、旧入口、旧 runner 和只验证旧协议的测试 | 待开始 |
 | 纵向联调 | FakeVmm/PostgreSQL | Disk→Cat→状态动作→跨 Node→destroy→slug 复用 | 待开始 |
 | 最终门禁 | 全仓库与 Linux | 完整门禁、Linux Node/真实 VMM 冒烟 | 待开始 |
@@ -55,7 +55,8 @@
 - [x] Store 完成 create 原子建立 Cat/初始 bindings、placement 复核和 stale Node 查询。
 - [x] 完成生命周期、Node 管理和 noded HTTP 的 production adapter。
 - [x] 完成 `SemanticResourceApi` 聚合。
-- [ ] 完成真实唯一入口 adapter。
+- [x] 完成基于当前 Cat/Node 的唯一入口 Store 和 production adapter。
+- [ ] 让 Gateway 在新请求到达时直接解析当前入口目标。
 
 ### 阶段 C：纵向接线
 
@@ -63,7 +64,8 @@
 - [x] 将新服务加入 Control `AppState` 和 router。
 - [x] 将 FakeVmm noded main 切换为同步 server、注册和 heartbeat supervisor。
 - [x] 用同一个 placement gate 阻止 reset 期间的新 Cat 动作。
-- [ ] 接入唯一入口的 `withdraw → Node Ready → publish` 顺序。
+- [x] 接入 Control 的 `withdraw → Node Ready → publish` 顺序。
+- [ ] 接入 Gateway 对当前已发布目标的直接消费。
 - [ ] 跑通 FakeVmm 的 Cat/Disk 完整状态机。
 
 ### 阶段 D：单协议切换
@@ -102,6 +104,7 @@
 | `3b247458`、`6499b6a6` | Resource API 聚合、Control AppState/router、Node liveness 与旧入口退出 | Resource 5 tests、cutover contract 6/6、Control/controld check |
 | `b77b41e9` | Resource 聚合回归：slug→内部 ID、Disk 重试/冲突/绑定保护、backend fail-closed | Resource service 4 tests |
 | `f8b24854` | Installed/CH semantic effects 启动桥与单点 typed fail-closed | Node 4 tests、noded 3 tests |
+| `bea5dd59`、`2ff26b21` | 当前 Cat/Node 唯一入口表、严格场景语义、Store/production adapter 和 lifecycle 接线 | Store PG 10 tests（来源分支）、adapter 5 tests、API 1 test、Control check |
 
 ## 5. 进度更新规则
 
@@ -119,8 +122,8 @@
 - 完成并合入 Node 管理服务、Control 注册/心跳路由和 noded heartbeat/reset client。
 - noded 同步执行、per-Cat lane、destroy 清理、reset gate 和 FakeVmm main 已完成并合入；真实 Cloud Hypervisor effects 仍待接入。
 - Store 的原子 create/bindings、placement 复核和 stale Node/offline CAS 已完成；生命周期、Node 管理和 noded HTTP production adapters 已合入。
-- `SemanticResourceApi` 聚合和生产 composition 已完成；真实唯一入口 adapter 仍在并行实现，当前入口 placeholder 明确失败，不伪装成功。
-- 已确认旧 Route authority 不能安全充当新 `IngressPort`：它要求旧 lifecycle Operation、AgentSession、RuntimeReady 和 Route receipt；只改数据库目标也不能撤销已缓存 Grant 或关闭旧 Node admission。真实入口接入必须同时补 Gateway resolve、Node close/open+drain 和 semantic Ready 发布三个边界，完成前保持 fail-closed。
+- `SemanticResourceApi` 聚合和生产 composition 已完成；当前入口只保存 `cat_id → node_id`，无 generation、epoch 或 Operation，并已经替换生产 placeholder。
+- Control 已按 `withdraw → Node effect → Ready 后 publish` 切流；同一目标重试返回成功，未先撤流时禁止直接换 Node，旧 Node 的迟到 withdraw 不能删除新目标。Gateway 对该当前目标的直接解析仍待接入，因此尚不宣称流量纵向闭环。
 - 公开 Cat/Disk 同步 HTTP handlers、AppState 和主 router composition 已完成；切换合同 6/6 通过。
 - Resource 聚合新增 4 个定向回归，覆盖 slug 解析、Disk 语义重试和 strict backend 未安装时的明确失败。
 - `--vmm ch` 已有明确的 installed effects 桥和单点 preflight；缺少精确 volume/runtime/route 输入时在任何物理副作用前失败，Fake 联调不受影响。
