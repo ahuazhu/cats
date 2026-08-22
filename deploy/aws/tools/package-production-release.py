@@ -430,7 +430,7 @@ def extract_transport(transport: Path, release: Path) -> None:
                 if len(members) >= MAX_ARCHIVE_MEMBERS:
                     raise PackagingError("release transport has too many members")
                 path = PurePosixPath(member.name)
-                if member.name.startswith("/") or ".." in path.parts:
+                if not path.parts or path.is_absolute() or ".." in path.parts:
                     raise PackagingError("release transport has an unsafe path")
                 if not (member.isdir() or member.isreg()):
                     raise PackagingError("release transport contains a link or special member")
@@ -441,7 +441,39 @@ def extract_transport(transport: Path, release: Path) -> None:
                     raise PackagingError("release transport exceeds the 15 GiB extraction boundary")
                 extracted_bytes += member.size
                 members.append(member)
-                archive.extract(member, release, filter="data")
+                target = release.joinpath(*path.parts)
+                if member.isdir():
+                    target.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    if target.is_symlink() or not target.is_dir():
+                        raise PackagingError("release transport directory is not safe")
+                    continue
+
+                target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                source = archive.extractfile(member)
+                if source is None:
+                    raise PackagingError("release transport regular member has no body")
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                try:
+                    descriptor = os.open(target, flags, 0o600)
+                except OSError as error:
+                    raise PackagingError(
+                        "release transport target could not be created safely"
+                    ) from error
+                try:
+                    remaining = member.size
+                    while remaining > 0:
+                        chunk = source.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            raise PackagingError("release transport member is truncated")
+                        offset = 0
+                        while offset < len(chunk):
+                            offset += os.write(descriptor, chunk[offset:])
+                        remaining -= len(chunk)
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                    source.close()
     except BaseException:
         decoder.stdout.close()
         decoder.terminate()
