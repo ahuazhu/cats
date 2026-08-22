@@ -8,7 +8,9 @@
 
 ## 背景
 
-生产 application 实际运行三个独立 OCI image：Control、数据库 credential refresher 和 Gateway。
+ADR 接受时 production application 运行三个独立 OCI image：Control、数据库 credential refresher 和
+Gateway；ADR-0059 clean-slate 切换已经让 Gateway 退出 production composition。当前仍适用的问题是
+Control 与数据库 credential refresher 是两个独立 OCI image。
 credential refresher 虽然与 Control 共用 Dockerfile source tree，却是独立 target、独立 tag、独立
 registry digest 和独立 Kubernetes workload。原 manual release manifest 只关闭 Control、Gateway 与
 worker 三个 artifact，部署因此可以引用一个未被同一 source fingerprint、final image extraction 和
@@ -17,7 +19,7 @@ registry digest 证明的 refresher。Control 与 refresher 的 tag 或构建来
 
 ## 决策
 
-当前 clean-slate production release 的 canonical `release-manifest.v1.json` artifact set 精确为：
+过渡期 production release 的 canonical `release-manifest.v1.json` artifact set 仍精确为：
 
 ```text
 control_plane
@@ -34,6 +36,10 @@ worker
 三个 mutable tags 必须互不相同。原始 build Host 只导出 OCI transport，不持有 registry credential；
 operator Host 逐 archive 验证 manifest identity 后发布，并只在三个 registry digest 全部精确匹配时
 产生 registry-verified manifest。worker bundle 仍由独立 content-addressed S3/Terraform 边界发布。
+
+Gateway artifact 只保留在这一版 transport/manifest contract 中，不再由 Terraform 部署，也不作为
+运行时兼容入口。后续删除该 transport 成员需要独立修改 release manifest contract，不能让部署器
+重新部署 Gateway。
 
 这是一次单版本 clean-slate release-contract 替换。旧的三-artifact manual manifest 被当前 verifier、
 operator-trust generator 和 proof-set validator 精确拒绝；不提供兼容 reader、补写或把旧 manifest

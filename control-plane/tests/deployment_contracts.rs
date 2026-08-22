@@ -3825,17 +3825,24 @@ fn production_deployment_builds_the_same_guest_payload_as_release() {
     );
     for packaged_workload in [
         "-var=\"control_plane_image=$IMAGE_REF\"",
-        "-var=\"object_write_gateway_image=$IMAGE_REF\"",
         "-var=\"credential_refresher_image=$REFRESHER_REF\"",
-        "-var=\"gateway_image=$GATEWAY_REF\"",
         "verify_deployment cats-controld \"$IMAGE_REF\"",
-        "verify_deployment cats-object-write-gateway \"$IMAGE_REF\"",
-        "verify_deployment cats-gatewayd \"$GATEWAY_REF\"",
         "[[ \"$observed_refresher\" == \"$REFRESHER_REF\" ]]",
     ] {
         assert!(
             production.contains(packaged_workload),
             "production deployment lost packaged workload binding {packaged_workload:?}"
+        );
+    }
+    for retired_workload in [
+        "object_write_gateway_image",
+        "gateway_image",
+        "cats-object-write-gateway",
+        "cats-gatewayd",
+    ] {
+        assert!(
+            !production.contains(retired_workload),
+            "production deployment retained retired workload {retired_workload:?}"
         );
     }
 }

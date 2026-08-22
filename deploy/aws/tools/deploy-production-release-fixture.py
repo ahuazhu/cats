@@ -167,10 +167,10 @@ def main() -> int:
         for required in (
             f"-var=control_plane_image={images['control_plane']}",
             f"-var=credential_refresher_image={images['credential_refresher']}",
-            f"-var=gateway_image={images['gateway']}",
-            f"-var=object_write_gateway_image={images['control_plane']}",
         ):
             assert required in joined
+        assert "gateway_image" not in joined
+        assert "object_write_gateway_image" not in joined
         worker_plan = deployer.terraform_plan_command(
             repository,
             config,
@@ -195,8 +195,6 @@ def main() -> int:
 
         expected_images = {
             "cats-controld": images["control_plane"],
-            "cats-gatewayd": images["gateway"],
-            "cats-object-write-gateway": images["control_plane"],
         }
 
         def workload(_config, kind, name):
@@ -228,10 +226,8 @@ def main() -> int:
         assert set(observed) == {
             "cats-controld",
             "cats-credential-refresher",
-            "cats-gatewayd",
-            "cats-object-write-gateway",
         }
-        assert len(rollout_commands) == 3
+        assert len(rollout_commands) == 1
 
         observed_aws: list[tuple[str, ...]] = []
         original_aws_json = deployer.aws_json
