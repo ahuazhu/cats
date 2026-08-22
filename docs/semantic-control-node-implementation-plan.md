@@ -32,7 +32,7 @@
 | Node 管理 | Control API、Node heartbeat client | 注册、`node_name`、`control_endpoint`、offline/reset/drain/恢复 | 注册心跳与恢复核心已完成；liveness→恢复触发待接线 |
 | Production adapters | Control adapter | Store/placement/noded/入口实现与公共 DTO 映射 | Store/Node/noded/Resource API 和当前入口 adapter 已完成；Gateway 消费仍待接入 |
 | HTTP composition | Control router、AppState、controld/noded main | 新路由和服务接线，旧路由退出 | Control 当前入口已接线；Gateway resolve/CH effects 为独立剩余项 |
-| 切换清理 | schema、router、旧模块和测试 | 删除旧表、旧入口、旧 runner 和只验证旧协议的测试 | 待开始 |
+| 切换清理 | schema、router、旧模块和测试 | 删除旧表、旧入口、旧 runner 和只验证旧协议的测试 | 旧 HTTP/production composition 已删除；Store/schema 清理进行中 |
 | 纵向联调 | FakeVmm/PostgreSQL | Disk→Cat→状态动作→跨 Node→destroy→slug 复用 | 待开始 |
 | 最终门禁 | 全仓库与 Linux | 完整门禁、Linux Node/真实 VMM 冒烟 | 待开始 |
 
@@ -75,6 +75,7 @@
 - [x] 删除 product Operation GET。
 - [x] 删除 AgentSession、lifecycle command poll/result、observation settlement 路由。
 - [x] 删除旧 noded runner/journal 的 production composition。
+- [x] 删除旧 lifecycle/AgentSession/observation/Route/product HTTP 模块和 Gateway/rotation 监听接线。
 - [ ] 从 v19 schema 删除旧 lifecycle/route settlement 表和 catalog probes。
 - [ ] 删除旧协议专属测试；把仍适用的并发、清理和恢复场景迁到新测试。
 
@@ -108,6 +109,7 @@
 | `f8b24854` | Installed/CH semantic effects 启动桥与单点 typed fail-closed | Node 4 tests、noded 3 tests |
 | `bea5dd59`、`2ff26b21` | 当前 Cat/Node 唯一入口表、严格场景语义、Store/production adapter 和 lifecycle 接线 | Store PG 10 tests（来源分支）、adapter 5 tests、API 1 test、Control check |
 | `0dea4a2a` | offline Node 的 Cat 发现、目标 claim、完整配置恢复和精确终态结算 | Recovery 6 tests、semantic ingress adapter 1 test；来源分支 semantic PG 46 tests、Clippy |
+| `5ca7a6fe` | production Control 只保留 semantic resource/Node 主监听与独立 runtime node fence；删除旧 lifecycle/AgentSession/observation/Route/product HTTP 与 Gateway/rotation 接线 | Control/controld check、semantic tests 45/45 |
 
 ## 5. 进度更新规则
 
@@ -128,6 +130,7 @@
 - `SemanticResourceApi` 聚合和生产 composition 已完成；当前入口只保存 `cat_id → node_id`，无 generation、epoch 或 Operation，并已经替换生产 placeholder。
 - Control 已按 `withdraw → Node effect → Ready 后 publish` 切流；同一目标重试返回成功，未先撤流时禁止直接换 Node，旧 Node 的迟到 withdraw 不能删除新目标。Gateway 对该当前目标的直接解析仍待接入，因此尚不宣称流量纵向闭环。
 - offline Node 恢复核心已合入：恢复 claim 期间保留旧 placement 作为重启后的发现线索，只把动作目标切到新 Node；目标终态确认后才切 placement。Running Ready 后发布入口，Suspended/Warm 从完整配置 Cold boot 后恢复原状态且不发布入口。liveness monitor 自动触发恢复仍待生产接线。
+- production Control 已收敛到一个 semantic 主监听；旧 lifecycle、AgentSession、observation、Route Operation、旧 product handler 以及独立 Gateway/rotation 监听不再进入生产进程。Store/schema 中的退役实现和表正在下一切片删除。
 - 公开 Cat/Disk 同步 HTTP handlers、AppState 和主 router composition 已完成；切换合同 6/6 通过。
 - Resource 聚合新增 4 个定向回归，覆盖 slug 解析、Disk 语义重试和 strict backend 未安装时的明确失败。
 - `--vmm ch` 已有明确的 installed effects 桥和单点 preflight；缺少精确 volume/runtime/route 输入时在任何物理副作用前失败，Fake 联调不受影响。
