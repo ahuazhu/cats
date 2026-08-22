@@ -144,6 +144,72 @@ pub struct NewCat<'a> {
     pub boot_image: &'a str,
 }
 
+/// One mount requested as part of an atomic Cat create. The public create
+/// protocol names a disk by its current workspace-scoped slug; the Store
+/// resolves that slug to the immutable disk ID while holding the disk row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewCatMount<'a> {
+    pub binding_id: &'a str,
+    pub disk_slug: &'a str,
+    pub mount_path: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatMountRecord {
+    pub disk_id: String,
+    pub disk_slug: String,
+    pub mount_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatWithMounts {
+    pub cat: CatRecord,
+    pub mounts: Vec<CatMountRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtomicCatCreate<'a> {
+    pub cat_id: &'a str,
+    pub workspace_id: &'a str,
+    pub cat_slug: &'a str,
+    pub node_id: Option<&'a str>,
+    pub cpu_count: i64,
+    pub memory_bytes: i64,
+    pub boot_image: &'a str,
+    pub mounts: &'a [NewCatMount<'a>],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AdmitCatCreateOutcome {
+    Created(CatWithMounts),
+    SameAction(CatWithMounts),
+    AlreadyExists(CatWithMounts),
+    Busy(CatWithMounts),
+    ConfigurationConflict(CatWithMounts),
+    NodeNotSchedulable,
+    MountRejected { code: String, message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticCatSelector<'a> {
+    Id(&'a str),
+    Slug {
+        workspace_id: &'a str,
+        cat_slug: &'a str,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AdmitCatActionOutcome {
+    Acquired(CatWithMounts),
+    SameAction(CatWithMounts),
+    AlreadyDone(CatWithMounts),
+    Busy(CatWithMounts),
+    InvalidState(CatWithMounts),
+    NotFound,
+    NodeNotSchedulable(CatWithMounts),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum CreateCatOutcome {
     Created(CatRecord),
@@ -183,6 +249,15 @@ pub struct NodeRecord {
     pub status: NodeStatus,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// A DB-time heartbeat observation used as the exact optimistic token for an
+/// offline transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleNodeRecord {
+    pub node_id: String,
+    pub control_endpoint: String,
+    pub last_heartbeat_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,6 +379,280 @@ pub enum DetachDiskOutcome {
 }
 
 impl Store {
+    /// Atomically decides a semantic create and, for a new Cat, records the
+    /// complete immutable configuration and all initial disk bindings.
+    ///
+    /// The caller may pass no selected Node when placement currently has no
+    /// candidate. An already-existing slug is still classified from its full
+    /// configuration; only a genuinely new create returns
+    /// `NodeNotSchedulable`.
+    pub fn admit_semantic_cat_create(
+        &self,
+        request: AtomicCatCreate<'_>,
+    ) -> Result<AdmitCatCreateOutcome> {
+        let mut disk_slugs = std::collections::BTreeSet::new();
+        let mut mount_paths = std::collections::BTreeSet::new();
+        for mount in request.mounts {
+            if !disk_slugs.insert(mount.disk_slug) {
+                return Ok(AdmitCatCreateOutcome::MountRejected {
+                    code: "duplicate_disk_mount".to_owned(),
+                    message: format!("disk slug {} is mounted more than once", mount.disk_slug),
+                });
+            }
+            if !mount_paths.insert(mount.mount_path) {
+                return Ok(AdmitCatCreateOutcome::MountRejected {
+                    code: "duplicate_mount_path".to_owned(),
+                    message: format!("mount path {} is used more than once", mount.mount_path),
+                });
+            }
+        }
+
+        self.with(|client| {
+            let mut transaction = client.transaction()?;
+            if let Some(row) = transaction.query_opt(
+                &format!(
+                    "SELECT {CAT_COLUMNS} FROM cats
+                      WHERE workspace_id=$1 AND cat_slug=$2 AND destroyed_at IS NULL
+                      FOR UPDATE"
+                ),
+                &[&request.workspace_id, &request.cat_slug],
+            )? {
+                let cat = row_to_cat(&row);
+                let aggregate = cat_with_mounts(&mut transaction, cat)?;
+                let configuration_matches = cat_create_configuration_matches(&aggregate, &request);
+                transaction.commit()?;
+                return Ok(if !configuration_matches {
+                    AdmitCatCreateOutcome::ConfigurationConflict(aggregate)
+                } else {
+                    match aggregate.cat.current_action {
+                        Some(CatAction::Create) => AdmitCatCreateOutcome::SameAction(aggregate),
+                        Some(_) => AdmitCatCreateOutcome::Busy(aggregate),
+                        None => AdmitCatCreateOutcome::AlreadyExists(aggregate),
+                    }
+                });
+            }
+
+            let Some(node_id) = request.node_id else {
+                transaction.rollback()?;
+                return Ok(AdmitCatCreateOutcome::NodeNotSchedulable);
+            };
+            if transaction
+                .query_opt(
+                    "SELECT node_id FROM nodes
+                      WHERE node_id=$1 AND status='running' FOR SHARE",
+                    &[&node_id],
+                )?
+                .is_none()
+            {
+                transaction.rollback()?;
+                return Ok(AdmitCatCreateOutcome::NodeNotSchedulable);
+            }
+
+            let inserted = transaction.query_opt(
+                &format!(
+                    "INSERT INTO cats (
+                        cat_id,workspace_id,cat_slug,state,current_action,
+                        current_action_started_at,current_action_node_id,node_id,
+                        cpu_count,memory_bytes,boot_image,created_at,updated_at
+                     ) VALUES ($1,$2,$3,NULL,'create',{DB_NOW_MS},$4,NULL,$5,$6,$7,
+                               {DB_NOW_MS},{DB_NOW_MS})
+                     ON CONFLICT (workspace_id,cat_slug) WHERE destroyed_at IS NULL
+                     DO NOTHING
+                     RETURNING {CAT_COLUMNS}"
+                ),
+                &[
+                    &request.cat_id,
+                    &request.workspace_id,
+                    &request.cat_slug,
+                    &node_id,
+                    &request.cpu_count,
+                    &request.memory_bytes,
+                    &request.boot_image,
+                ],
+            )?;
+            let Some(row) = inserted else {
+                // A concurrent creator won the partial unique index after the
+                // first lookup. Classify its committed full configuration in
+                // this same transaction.
+                let row = transaction.query_one(
+                    &format!(
+                        "SELECT {CAT_COLUMNS} FROM cats
+                          WHERE workspace_id=$1 AND cat_slug=$2 AND destroyed_at IS NULL
+                          FOR UPDATE"
+                    ),
+                    &[&request.workspace_id, &request.cat_slug],
+                )?;
+                let aggregate = cat_with_mounts(&mut transaction, row_to_cat(&row))?;
+                let configuration_matches = cat_create_configuration_matches(&aggregate, &request);
+                transaction.commit()?;
+                return Ok(if !configuration_matches {
+                    AdmitCatCreateOutcome::ConfigurationConflict(aggregate)
+                } else {
+                    match aggregate.cat.current_action {
+                        Some(CatAction::Create) => AdmitCatCreateOutcome::SameAction(aggregate),
+                        Some(_) => AdmitCatCreateOutcome::Busy(aggregate),
+                        None => AdmitCatCreateOutcome::AlreadyExists(aggregate),
+                    }
+                });
+            };
+            let cat = row_to_cat(&row);
+
+            // Lock disks in slug order so two multi-disk creates cannot
+            // deadlock merely because clients supplied mounts in a different
+            // order.
+            let mut mounts = request.mounts.iter().collect::<Vec<_>>();
+            mounts.sort_unstable_by_key(|mount| mount.disk_slug);
+            for mount in mounts {
+                let disk = transaction.query_opt(
+                    "SELECT disk_id,status FROM persistent_disks
+                      WHERE workspace_id=$1 AND disk_slug=$2 AND deleted_at IS NULL
+                      FOR UPDATE",
+                    &[&request.workspace_id, &mount.disk_slug],
+                )?;
+                let Some(disk) = disk else {
+                    transaction.rollback()?;
+                    return Ok(AdmitCatCreateOutcome::MountRejected {
+                        code: "disk_not_found".to_owned(),
+                        message: format!("disk slug {} was not found", mount.disk_slug),
+                    });
+                };
+                let disk_id: String = disk.get(0);
+                let status: &str = disk.get(1);
+                if status != "normal" {
+                    transaction.rollback()?;
+                    return Ok(AdmitCatCreateOutcome::MountRejected {
+                        code: "disk_deleted".to_owned(),
+                        message: format!("disk slug {} is deleted", mount.disk_slug),
+                    });
+                }
+                if transaction
+                    .query_opt(
+                        "SELECT binding_id FROM disk_bindings WHERE disk_id=$1 FOR UPDATE",
+                        &[&disk_id],
+                    )?
+                    .is_some()
+                {
+                    transaction.rollback()?;
+                    return Ok(AdmitCatCreateOutcome::MountRejected {
+                        code: "disk_already_attached".to_owned(),
+                        message: format!("disk slug {} is already attached", mount.disk_slug),
+                    });
+                }
+                transaction.execute(
+                    &format!(
+                        "INSERT INTO disk_bindings (
+                            binding_id,workspace_id,disk_id,cat_id,mount_path,created_at
+                         ) VALUES ($1,$2,$3,$4,$5,{DB_NOW_MS})"
+                    ),
+                    &[
+                        &mount.binding_id,
+                        &request.workspace_id,
+                        &disk_id,
+                        &request.cat_id,
+                        &mount.mount_path,
+                    ],
+                )?;
+            }
+            let aggregate = cat_with_mounts(&mut transaction, cat)?;
+            transaction.commit()?;
+            Ok(AdmitCatCreateOutcome::Created(aggregate))
+        })
+    }
+
+    /// Atomically classifies and claims one action while returning the exact
+    /// mount set that is immutable for the duration of the action.
+    pub fn admit_semantic_cat_action(
+        &self,
+        selector: SemanticCatSelector<'_>,
+        action: CatAction,
+        selected_node_id: Option<&str>,
+    ) -> Result<AdmitCatActionOutcome> {
+        self.with(|client| {
+            let mut transaction = client.transaction()?;
+            let row = match selector {
+                SemanticCatSelector::Id(cat_id) => transaction.query_opt(
+                    &format!("SELECT {CAT_COLUMNS} FROM cats WHERE cat_id=$1 FOR UPDATE"),
+                    &[&cat_id],
+                )?,
+                SemanticCatSelector::Slug {
+                    workspace_id,
+                    cat_slug,
+                } => transaction.query_opt(
+                    &format!(
+                        "SELECT {CAT_COLUMNS} FROM cats
+                          WHERE workspace_id=$1 AND cat_slug=$2 AND destroyed_at IS NULL
+                          FOR UPDATE"
+                    ),
+                    &[&workspace_id, &cat_slug],
+                )?,
+            };
+            let Some(row) = row else {
+                transaction.rollback()?;
+                return Ok(AdmitCatActionOutcome::NotFound);
+            };
+            let cat = row_to_cat(&row);
+            let aggregate = cat_with_mounts(&mut transaction, cat)?;
+            if aggregate.cat.state == Some(action_target(action)) {
+                transaction.commit()?;
+                return Ok(AdmitCatActionOutcome::AlreadyDone(aggregate));
+            }
+            match aggregate.cat.current_action {
+                Some(current) if current == action => {
+                    transaction.commit()?;
+                    return Ok(AdmitCatActionOutcome::SameAction(aggregate));
+                }
+                Some(_) => {
+                    transaction.commit()?;
+                    return Ok(AdmitCatActionOutcome::Busy(aggregate));
+                }
+                None => {}
+            }
+            if !semantic_action_allowed(action, aggregate.cat.state) {
+                transaction.commit()?;
+                return Ok(AdmitCatActionOutcome::InvalidState(aggregate));
+            }
+
+            let action_node_id = match (action, aggregate.cat.state) {
+                (CatAction::Run, Some(CatState::Cold)) => selected_node_id,
+                _ => aggregate.cat.node_id.as_deref(),
+            };
+            if action == CatAction::Run {
+                let Some(node_id) = action_node_id else {
+                    transaction.commit()?;
+                    return Ok(AdmitCatActionOutcome::NodeNotSchedulable(aggregate));
+                };
+                if transaction
+                    .query_opt(
+                        "SELECT node_id FROM nodes
+                          WHERE node_id=$1 AND status='running' FOR SHARE",
+                        &[&node_id],
+                    )?
+                    .is_none()
+                {
+                    transaction.commit()?;
+                    return Ok(AdmitCatActionOutcome::NodeNotSchedulable(aggregate));
+                }
+            }
+            let row = transaction.query_one(
+                &format!(
+                    "UPDATE cats
+                        SET current_action=$2,current_action_started_at={DB_NOW_MS},
+                            current_action_node_id=$3,updated_at={DB_NOW_MS},
+                            last_error_code=NULL,last_error_message=NULL
+                      WHERE cat_id=$1
+                      RETURNING {CAT_COLUMNS}"
+                ),
+                &[&aggregate.cat.cat_id, &action.as_str(), &action_node_id],
+            )?;
+            let acquired = CatWithMounts {
+                cat: row_to_cat(&row),
+                mounts: aggregate.mounts,
+            };
+            transaction.commit()?;
+            Ok(AdmitCatActionOutcome::Acquired(acquired))
+        })
+    }
+
     pub fn create_semantic_cat(&self, request: NewCat<'_>) -> Result<CreateCatOutcome> {
         let row = self.with(|client| {
             let mut transaction = client.transaction()?;
@@ -496,6 +845,81 @@ impl Store {
                     &[&node_id],
                 )
                 .map(|row| row.map(|row| row_to_node(&row)))
+        })
+    }
+
+    /// Deterministic placement snapshot. The caller may apply capacity policy,
+    /// and `admit_semantic_cat_create` rechecks the selected row under the
+    /// create transaction before committing authority.
+    pub fn list_running_semantic_nodes(&self) -> Result<Vec<NodeRecord>> {
+        self.with(|client| {
+            client
+                .query(
+                    &format!(
+                        "SELECT {NODE_COLUMNS} FROM nodes
+                          WHERE status='running' ORDER BY node_id"
+                    ),
+                    &[],
+                )
+                .map(|rows| rows.iter().map(row_to_node).collect())
+        })
+    }
+
+    /// Return Nodes whose DB-receipt heartbeat is older than the requested
+    /// window. Every registered Node has an initial heartbeat row, so a Node
+    /// that never sends its first heartbeat is still discovered here.
+    pub fn list_stale_semantic_nodes(&self, missed_for_ms: i64) -> Result<Vec<StaleNodeRecord>> {
+        if missed_for_ms <= 0 {
+            return Err(cats_api::error::ApiError::invalid(
+                "missed heartbeat window must be positive",
+            ));
+        }
+        self.with(|client| {
+            client
+                .query(
+                    &format!(
+                        "SELECT n.node_id,n.control_endpoint,h.last_heartbeat_at
+                           FROM nodes n
+                           JOIN node_heartbeats h ON h.node_id=n.node_id
+                          WHERE n.status IN ('running','draining')
+                            AND h.last_heartbeat_at <= {DB_NOW_MS} - $1
+                          ORDER BY n.node_id"
+                    ),
+                    &[&missed_for_ms],
+                )
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|row| StaleNodeRecord {
+                            node_id: row.get(0),
+                            control_endpoint: row.get(1),
+                            last_heartbeat_at: row.get(2),
+                        })
+                        .collect()
+                })
+        })
+    }
+
+    /// Mark a stale Node offline only if its heartbeat DB timestamp is still
+    /// exactly the one observed before the active health probe.
+    pub fn mark_semantic_node_offline_if_heartbeat_unchanged(
+        &self,
+        candidate: &StaleNodeRecord,
+    ) -> Result<bool> {
+        self.with(|client| {
+            client
+                .execute(
+                    &format!(
+                        "UPDATE nodes n
+                            SET status='offline',updated_at={DB_NOW_MS}
+                           FROM node_heartbeats h
+                          WHERE n.node_id=$1
+                            AND n.status IN ('running','draining')
+                            AND h.node_id=n.node_id
+                            AND h.last_heartbeat_at=$2"
+                    ),
+                    &[&candidate.node_id, &candidate.last_heartbeat_at],
+                )
+                .map(|changed| changed == 1)
         })
     }
 
@@ -733,6 +1157,16 @@ fn register_node_transaction(
             ],
         )?;
         let record = row_to_node(&row);
+        transaction.execute(
+            &format!(
+                "INSERT INTO node_heartbeats (
+                    node_id,last_heartbeat_at,node_reported_at,reported_status,
+                    total_cpu,cpu_utilized,total_memory,memory_utilized,
+                    running_cat_count,suspended_cat_count,warm_cat_count
+                 ) VALUES ($1,{DB_NOW_MS},NULL,'running',0,0,0,0,0,0,0)"
+            ),
+            &[&request.node_id],
+        )?;
         transaction.commit()?;
         return Ok(RegisterNodeOutcome::Registered(record));
     };
@@ -848,7 +1282,9 @@ fn attach_disk_transaction(
         transaction.rollback()?;
         return Ok(AttachDiskOutcome::WorkspaceMismatch);
     }
-    if cat_state != Some("cold") && !(cat_state.is_none() && current_action == Some("create")) {
+    let mutable_cold = cat_state == Some("cold") && current_action.is_none();
+    let initial_create = cat_state.is_none() && current_action == Some("create");
+    if !mutable_cold && !initial_create {
         transaction.rollback()?;
         return Ok(AttachDiskOutcome::CatMustBeCold);
     }
@@ -908,6 +1344,77 @@ fn detach_disk_transaction(
     transaction.execute("DELETE FROM disk_bindings WHERE disk_id=$1", &[&disk_id])?;
     transaction.commit()?;
     Ok(DetachDiskOutcome::Detached)
+}
+
+fn cat_with_mounts(
+    client: &mut impl postgres::GenericClient,
+    cat: CatRecord,
+) -> std::result::Result<CatWithMounts, postgres::Error> {
+    let rows = client.query(
+        "SELECT b.disk_id,d.disk_slug,b.mount_path
+           FROM disk_bindings b
+           JOIN persistent_disks d ON d.disk_id=b.disk_id
+          WHERE b.cat_id=$1
+          ORDER BY d.disk_slug,b.mount_path",
+        &[&cat.cat_id],
+    )?;
+    Ok(CatWithMounts {
+        cat,
+        mounts: rows
+            .into_iter()
+            .map(|row| CatMountRecord {
+                disk_id: row.get(0),
+                disk_slug: row.get(1),
+                mount_path: row.get(2),
+            })
+            .collect(),
+    })
+}
+
+fn cat_create_configuration_matches(
+    existing: &CatWithMounts,
+    request: &AtomicCatCreate<'_>,
+) -> bool {
+    if existing.cat.cpu_count != request.cpu_count
+        || existing.cat.memory_bytes != request.memory_bytes
+        || existing.cat.boot_image != request.boot_image
+    {
+        return false;
+    }
+    let mut existing_mounts = existing
+        .mounts
+        .iter()
+        .map(|mount| (mount.disk_slug.as_str(), mount.mount_path.as_str()))
+        .collect::<Vec<_>>();
+    existing_mounts.sort_unstable();
+    let mut requested_mounts = request
+        .mounts
+        .iter()
+        .map(|mount| (mount.disk_slug, mount.mount_path))
+        .collect::<Vec<_>>();
+    requested_mounts.sort_unstable();
+    existing_mounts == requested_mounts
+}
+
+const fn action_target(action: CatAction) -> CatState {
+    match action {
+        CatAction::Create | CatAction::Run => CatState::Running,
+        CatAction::Suspend => CatState::Suspended,
+        CatAction::Warm => CatState::Warm,
+        CatAction::Cold => CatState::Cold,
+        CatAction::Destroy => CatState::Destroyed,
+    }
+}
+
+const fn semantic_action_allowed(action: CatAction, state: Option<CatState>) -> bool {
+    match (action, state) {
+        (CatAction::Run, Some(CatState::Suspended | CatState::Warm | CatState::Cold)) => true,
+        (CatAction::Suspend, Some(CatState::Running)) => true,
+        (CatAction::Warm, Some(CatState::Running | CatState::Suspended)) => true,
+        (CatAction::Cold, Some(CatState::Running | CatState::Suspended | CatState::Warm)) => true,
+        (CatAction::Destroy, Some(state)) => !matches!(state, CatState::Destroyed),
+        _ => false,
+    }
 }
 
 const CAT_COLUMNS: &str = "cat_id,workspace_id,cat_slug,state,current_action,

@@ -334,7 +334,9 @@ pub enum NodeCommandResult {
 pub enum NodeCatStatus {
     Absent,
     Present {
-        state: CatState,
+        /// `None` is valid while the first Create effect is still in
+        /// progress. It is not a terminal state and cannot satisfy recovery.
+        state: Option<CatState>,
         active_action: Option<CatAction>,
     },
     Failed {
@@ -717,8 +719,10 @@ where
                     return Ok(Discovery::Complete(CatState::Destroyed));
                 }
                 Ok(NodeCatStatus::Absent) => return Ok(Discovery::Execute),
-                Ok(NodeCatStatus::Present { state, .. }) if state == claim.action.target() => {
-                    return Ok(Discovery::Complete(state));
+                Ok(NodeCatStatus::Present { state, .. })
+                    if state == Some(claim.action.target()) =>
+                {
+                    return Ok(Discovery::Complete(claim.action.target()));
                 }
                 Ok(NodeCatStatus::Present {
                     active_action: Some(action),
@@ -1240,7 +1244,7 @@ mod tests {
             store.clone(),
             [],
             [Ok(NodeCatStatus::Present {
-                state: CatState::Running,
+                state: Some(CatState::Running),
                 active_action: None,
             })],
         );
@@ -1267,7 +1271,7 @@ mod tests {
             store.clone(),
             [Err(NodeClientError::Timeout), Err(NodeClientError::Timeout)],
             [Ok(NodeCatStatus::Present {
-                state: CatState::Running,
+                state: Some(CatState::Running),
                 active_action: None,
             })],
         );

@@ -4965,10 +4965,13 @@ CREATE TABLE IF NOT EXISTS node_heartbeats (
     node_reported_at BIGINT CHECK (node_reported_at >= 0),
     reported_status TEXT NOT NULL
         CHECK (reported_status IN ('running','draining','offline','reset_required','deleted')),
-    total_cpu BIGINT NOT NULL CHECK (total_cpu > 0),
+    -- Zero means the Node has registered but has not delivered its first
+    -- telemetry heartbeat yet. Registration still creates the DB-time row so
+    -- a never-heartbeating Node participates in stale detection.
+    total_cpu BIGINT NOT NULL CHECK (total_cpu >= 0),
     cpu_utilized DOUBLE PRECISION NOT NULL
         CHECK (cpu_utilized >= 0 AND cpu_utilized <= total_cpu),
-    total_memory BIGINT NOT NULL CHECK (total_memory > 0),
+    total_memory BIGINT NOT NULL CHECK (total_memory >= 0),
     memory_utilized BIGINT NOT NULL
         CHECK (memory_utilized >= 0 AND memory_utilized <= total_memory),
     running_cat_count BIGINT NOT NULL CHECK (running_cat_count >= 0),
