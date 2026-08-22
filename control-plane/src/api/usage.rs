@@ -1,8 +1,6 @@
 use super::*;
 use std::collections::BTreeMap;
 
-use crate::store::runtime_authority::product_reads::ProductRead;
-
 #[derive(Debug, Deserialize)]
 pub(super) struct ProjectUsageQuery {
     from_ms: i64,
@@ -231,8 +229,7 @@ pub(super) async fn workspace_usage(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let workspace_scope = check_workspace_auth(&state, &headers, &workspace).await?;
-    let workspace_id = cats_api::runtime_reconciliation::Id::new(workspace_scope.workspace.id)
-        .ok_or_else(|| ApiError::internal("stored workspace ID is invalid"))?;
+    let workspace_id = workspace_scope.workspace.id;
     if query.cat.is_some() && query.cat_id.is_some() {
         return Err(ApiError::invalid("cat and cat_id are mutually exclusive").into());
     }
@@ -244,26 +241,18 @@ pub(super) async fn workspace_usage(
         Some(cat_id)
     } else {
         if let Some(cat) = query.cat {
-            let name_or_id = cats_api::runtime_reconciliation::Id::new(cat)
-                .ok_or_else(|| ApiError::invalid("cat must be a valid Cat name or ID"))?;
-            let readiness = state.readiness.clone();
-            match state
+            let lookup = cat.clone();
+            let found = state
                 .store
                 .execute(move |store| {
-                    let read = store.resolve_runtime_cat_id(&workspace_id, &name_or_id);
-                    if matches!(read, Ok(ProductRead::Corrupt)) {
-                        readiness.poison();
+                    if lookup.starts_with("cat_") {
+                        store.find_semantic_cat_by_id(&lookup)
+                    } else {
+                        store.find_current_semantic_cat(&workspace_id, &lookup)
                     }
-                    read
                 })
-                .await?
-            {
-                ProductRead::Found(cat_id) => Some(cat_id.as_str().to_owned()),
-                ProductRead::NotFound => return Err(ApiError::not_found("cat").into()),
-                ProductRead::Corrupt => {
-                    return Err(ApiError::internal("Cat product state is corrupt").into())
-                }
-            }
+                .await?;
+            Some(found.ok_or_else(|| ApiError::not_found("cat"))?.cat_id)
         } else {
             None
         }
