@@ -441,6 +441,9 @@ fn create_request() -> CreateCatRequest {
             boot_image: "ubuntu-24.04".to_owned(),
             mounts: vec![CatMount {
                 disk_id: "disk_01".to_owned(),
+                volume_id: "vol_01".to_owned(),
+                filesystem_uuid: "11111111111111111111111111111111".to_owned(),
+                disk_format: "ext4".to_owned(),
                 mount_path: "/data".to_owned(),
             }],
         },
