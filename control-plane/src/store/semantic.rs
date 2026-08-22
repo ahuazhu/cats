@@ -133,6 +133,35 @@ pub struct CatRecord {
     pub destroyed_at: Option<i64>,
 }
 
+/// The only Node selected for new traffic to a Cat. No row means that new
+/// traffic is withdrawn. This projection deliberately carries no lifecycle
+/// Operation, request identity or heartbeat state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatIngressTargetRecord {
+    pub cat_id: String,
+    pub node_id: String,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishCatIngressOutcome {
+    Published(CatIngressTargetRecord),
+    AlreadyPublished(CatIngressTargetRecord),
+    Conflict(CatIngressTargetRecord),
+    CatNotReady,
+    NodeNotRunning,
+    CatNotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WithdrawCatIngressOutcome {
+    Withdrawn,
+    AlreadyWithdrawn,
+    Conflict(CatIngressTargetRecord),
+    CatNotWithdrawing,
+    CatNotFound,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewCat<'a> {
     pub cat_id: &'a str,
@@ -385,6 +414,177 @@ pub enum DetachDiskOutcome {
 }
 
 impl Store {
+    /// Publish one current Node for new traffic after noded has reported the
+    /// Cat Ready. The lifecycle claim is the scenario condition proving that
+    /// this Node is the current create/run target; a stable Running Cat may
+    /// replay the same publication after Control has settled the action.
+    ///
+    /// Publication never switches directly from one Node to another. The old
+    /// target must first be withdrawn with its exact Node identity.
+    pub fn publish_semantic_cat_ingress(
+        &self,
+        cat_id: &str,
+        node_id: &str,
+    ) -> Result<PublishCatIngressOutcome> {
+        self.with(|client| {
+            let mut transaction = client.transaction()?;
+            let Some(cat) = transaction.query_opt(
+                "SELECT state,current_action,current_action_node_id,node_id
+                   FROM cats WHERE cat_id=$1 FOR UPDATE",
+                &[&cat_id],
+            )?
+            else {
+                transaction.rollback()?;
+                return Ok(PublishCatIngressOutcome::CatNotFound);
+            };
+
+            if let Some(row) = transaction.query_opt(
+                &format!(
+                    "SELECT {INGRESS_TARGET_COLUMNS} FROM cat_ingress_targets
+                      WHERE cat_id=$1 FOR UPDATE"
+                ),
+                &[&cat_id],
+            )? {
+                let current = row_to_ingress_target(&row);
+                transaction.commit()?;
+                return Ok(if current.node_id == node_id {
+                    PublishCatIngressOutcome::AlreadyPublished(current)
+                } else {
+                    PublishCatIngressOutcome::Conflict(current)
+                });
+            }
+
+            let state: Option<&str> = cat.get(0);
+            let current_action: Option<&str> = cat.get(1);
+            let current_action_node_id: Option<&str> = cat.get(2);
+            let placed_node_id: Option<&str> = cat.get(3);
+            let ready_target = matches!(current_action, Some("create" | "run"))
+                && current_action_node_id == Some(node_id);
+            let settled_target = current_action.is_none()
+                && state == Some("running")
+                && placed_node_id == Some(node_id);
+            if !ready_target && !settled_target {
+                transaction.rollback()?;
+                return Ok(PublishCatIngressOutcome::CatNotReady);
+            }
+
+            if transaction
+                .query_opt(
+                    "SELECT node_id FROM nodes WHERE node_id=$1 AND status='running' FOR SHARE",
+                    &[&node_id],
+                )?
+                .is_none()
+            {
+                transaction.rollback()?;
+                return Ok(PublishCatIngressOutcome::NodeNotRunning);
+            }
+
+            let row = transaction.query_one(
+                &format!(
+                    "INSERT INTO cat_ingress_targets (cat_id,node_id,updated_at)
+                     VALUES ($1,$2,{DB_NOW_MS})
+                     RETURNING {INGRESS_TARGET_COLUMNS}"
+                ),
+                &[&cat_id, &node_id],
+            )?;
+            let target = row_to_ingress_target(&row);
+            transaction.commit()?;
+            Ok(PublishCatIngressOutcome::Published(target))
+        })
+    }
+
+    /// Withdraw new traffic only when the caller still names the published
+    /// Node. A delayed withdrawal for an older Node cannot clear a newer
+    /// target. Repeating an exact successful withdrawal is already done.
+    pub fn withdraw_semantic_cat_ingress(
+        &self,
+        cat_id: &str,
+        old_node_id: &str,
+    ) -> Result<WithdrawCatIngressOutcome> {
+        self.with(|client| {
+            let mut transaction = client.transaction()?;
+            let Some(cat) = transaction.query_opt(
+                "SELECT state,current_action,current_action_node_id,node_id
+                   FROM cats WHERE cat_id=$1 FOR UPDATE",
+                &[&cat_id],
+            )?
+            else {
+                transaction.rollback()?;
+                return Ok(WithdrawCatIngressOutcome::CatNotFound);
+            };
+            let Some(row) = transaction.query_opt(
+                &format!(
+                    "SELECT {INGRESS_TARGET_COLUMNS} FROM cat_ingress_targets
+                      WHERE cat_id=$1 FOR UPDATE"
+                ),
+                &[&cat_id],
+            )?
+            else {
+                transaction.commit()?;
+                return Ok(WithdrawCatIngressOutcome::AlreadyWithdrawn);
+            };
+            let target = row_to_ingress_target(&row);
+            if target.node_id != old_node_id {
+                transaction.commit()?;
+                return Ok(WithdrawCatIngressOutcome::Conflict(target));
+            }
+
+            let state: Option<&str> = cat.get(0);
+            let current_action: Option<&str> = cat.get(1);
+            let current_action_node_id: Option<&str> = cat.get(2);
+            let placed_node_id: Option<&str> = cat.get(3);
+            let leaves_running = state == Some("running")
+                && matches!(
+                    current_action,
+                    Some("suspend" | "warm" | "cold" | "destroy")
+                )
+                && current_action_node_id == Some(old_node_id)
+                && placed_node_id == Some(old_node_id);
+            let moves_running = state == Some("running")
+                && current_action == Some("run")
+                && placed_node_id == Some(old_node_id)
+                && current_action_node_id.is_some_and(|node_id| node_id != old_node_id);
+            let old_node_is_offline = placed_node_id == Some(old_node_id)
+                && transaction
+                    .query_opt(
+                        "SELECT node_id FROM nodes
+                          WHERE node_id=$1 AND status IN ('offline','reset_required','deleted')
+                          FOR SHARE",
+                        &[&old_node_id],
+                    )?
+                    .is_some();
+            if !leaves_running && !moves_running && !old_node_is_offline {
+                transaction.commit()?;
+                return Ok(WithdrawCatIngressOutcome::CatNotWithdrawing);
+            }
+            transaction.execute(
+                "DELETE FROM cat_ingress_targets WHERE cat_id=$1",
+                &[&cat_id],
+            )?;
+            transaction.commit()?;
+            Ok(WithdrawCatIngressOutcome::Withdrawn)
+        })
+    }
+
+    /// Resolve the current target for one new ingress request. The projection
+    /// row is the complete answer; lifecycle state and heartbeat do not become
+    /// a second serving authority here.
+    pub fn resolve_semantic_cat_ingress(
+        &self,
+        cat_id: &str,
+    ) -> Result<Option<CatIngressTargetRecord>> {
+        self.with(|client| {
+            client
+                .query_opt(
+                    &format!(
+                        "SELECT {INGRESS_TARGET_COLUMNS} FROM cat_ingress_targets WHERE cat_id=$1"
+                    ),
+                    &[&cat_id],
+                )
+                .map(|row| row.map(|row| row_to_ingress_target(&row)))
+        })
+    }
+
     /// Atomically decides a semantic create and, for a new Cat, records the
     /// complete immutable configuration and all initial disk bindings.
     ///
@@ -1486,6 +1686,7 @@ const HEARTBEAT_COLUMNS: &str = "node_id,last_heartbeat_at,node_reported_at,repo
     suspended_cat_count,warm_cat_count";
 const DISK_COLUMNS: &str = "disk_id,workspace_id,disk_slug,size_bytes,status,created_at,deleted_at";
 const BINDING_COLUMNS: &str = "binding_id,workspace_id,disk_id,cat_id,mount_path,created_at";
+const INGRESS_TARGET_COLUMNS: &str = "cat_id,node_id,updated_at";
 
 fn row_to_cat(row: &Row) -> CatRecord {
     CatRecord {
@@ -1561,6 +1762,14 @@ fn row_to_binding(row: &Row) -> DiskBindingRecord {
         cat_id: row.get(3),
         mount_path: row.get(4),
         created_at: row.get(5),
+    }
+}
+
+fn row_to_ingress_target(row: &Row) -> CatIngressTargetRecord {
+    CatIngressTargetRecord {
+        cat_id: row.get(0),
+        node_id: row.get(1),
+        updated_at: row.get(2),
     }
 }
 

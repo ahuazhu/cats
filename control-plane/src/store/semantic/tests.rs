@@ -28,14 +28,23 @@ fn seed_workspace(store: &Store) {
 }
 
 fn registration<'a>(node_id: &'a str, endpoint: &'a str) -> NodeRegistration<'a> {
+    registration_with_identity(node_id, endpoint, "worker-a", "i-semantic-a")
+}
+
+fn registration_with_identity<'a>(
+    node_id: &'a str,
+    endpoint: &'a str,
+    node_name: &'a str,
+    instance_id: &'a str,
+) -> NodeRegistration<'a> {
     NodeRegistration {
         node_id,
-        node_name: "worker-a",
+        node_name,
         control_endpoint: endpoint,
         vendor: "aws",
         region: "us-east-1",
         zone: "us-east-1a",
-        instance_id: "i-semantic-a",
+        instance_id,
         machine_type: "m7i.large",
         node_version: "1.0.0",
         reset_completed: false,
@@ -79,6 +88,289 @@ fn register_node(store: &Store) {
             .unwrap(),
         RegisterNodeOutcome::Registered(_)
     ));
+}
+
+fn register_second_node(store: &Store) {
+    assert!(matches!(
+        store
+            .register_semantic_node(registration_with_identity(
+                "node-b",
+                "http://10.0.0.2:8443",
+                "worker-b",
+                "i-semantic-b",
+            ))
+            .unwrap(),
+        RegisterNodeOutcome::Registered(_)
+    ));
+}
+
+#[test]
+fn ingress_publish_and_withdraw_are_scenario_idempotent() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    register_second_node(&store);
+
+    let CreateCatOutcome::Created(created) = store
+        .create_semantic_cat(NewCat {
+            cat_id: "cat-ingress",
+            workspace_id: "ws_semantic",
+            cat_slug: "ingress",
+            node_id: "node-a",
+            cpu_count: 2,
+            memory_bytes: 1 << 30,
+            boot_image: "sha256:image",
+        })
+        .unwrap()
+    else {
+        panic!("new semantic Cat must be created")
+    };
+    assert_eq!(created.current_action, Some(CatAction::Create));
+
+    let PublishCatIngressOutcome::Published(target) = store
+        .publish_semantic_cat_ingress("cat-ingress", "node-a")
+        .unwrap()
+    else {
+        panic!("Ready create target must publish")
+    };
+    assert_eq!(target.node_id, "node-a");
+    assert!(matches!(
+        store
+            .publish_semantic_cat_ingress("cat-ingress", "node-a")
+            .unwrap(),
+        PublishCatIngressOutcome::AlreadyPublished(CatIngressTargetRecord { node_id, .. })
+            if node_id == "node-a"
+    ));
+    assert!(matches!(
+        store
+            .publish_semantic_cat_ingress("cat-ingress", "node-b")
+            .unwrap(),
+        PublishCatIngressOutcome::Conflict(CatIngressTargetRecord { node_id, .. })
+            if node_id == "node-a"
+    ));
+    assert!(matches!(
+        store
+            .withdraw_semantic_cat_ingress("cat-ingress", "node-b")
+            .unwrap(),
+        WithdrawCatIngressOutcome::Conflict(CatIngressTargetRecord { node_id, .. })
+            if node_id == "node-a"
+    ));
+    assert_eq!(
+        store
+            .resolve_semantic_cat_ingress("cat-ingress")
+            .unwrap()
+            .unwrap()
+            .node_id,
+        "node-a"
+    );
+
+    store
+        .finish_semantic_cat_action(
+            "cat-ingress",
+            FinishCatAction {
+                expected_action: CatAction::Create,
+                expected_node_id: Some("node-a"),
+                final_state: CatState::Running,
+                final_node_id: Some("node-a"),
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .withdraw_semantic_cat_ingress("cat-ingress", "node-a")
+            .unwrap(),
+        WithdrawCatIngressOutcome::CatNotWithdrawing
+    );
+    assert!(matches!(
+        store
+            .try_begin_semantic_cat_action("cat-ingress", CatAction::Suspend, Some("node-a"),)
+            .unwrap(),
+        BeginCatActionOutcome::Acquired(_)
+    ));
+    assert_eq!(
+        store
+            .withdraw_semantic_cat_ingress("cat-ingress", "node-a")
+            .unwrap(),
+        WithdrawCatIngressOutcome::Withdrawn
+    );
+    assert_eq!(
+        store
+            .withdraw_semantic_cat_ingress("cat-ingress", "node-a")
+            .unwrap(),
+        WithdrawCatIngressOutcome::AlreadyWithdrawn
+    );
+    assert!(store
+        .resolve_semantic_cat_ingress("cat-ingress")
+        .unwrap()
+        .is_none());
+
+    store
+        .finish_semantic_cat_action(
+            "cat-ingress",
+            FinishCatAction {
+                expected_action: CatAction::Suspend,
+                expected_node_id: Some("node-a"),
+                final_state: CatState::Suspended,
+                final_node_id: Some("node-a"),
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        store
+            .try_begin_semantic_cat_action("cat-ingress", CatAction::Run, Some("node-a"))
+            .unwrap(),
+        BeginCatActionOutcome::Acquired(_)
+    ));
+    store
+        .finish_semantic_cat_action(
+            "cat-ingress",
+            FinishCatAction {
+                expected_action: CatAction::Run,
+                expected_node_id: Some("node-a"),
+                final_state: CatState::Running,
+                final_node_id: Some("node-a"),
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+    // A response-loss retry may publish after the Running settlement.
+    assert!(matches!(
+        store
+            .publish_semantic_cat_ingress("cat-ingress", "node-a")
+            .unwrap(),
+        PublishCatIngressOutcome::Published(_)
+    ));
+}
+
+#[test]
+fn ingress_publish_rejects_a_cat_that_is_not_ready_for_that_node() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    register_second_node(&store);
+    create_running_cat(&store, "cat-ready-ingress", "ready-ingress");
+
+    assert!(matches!(
+        store
+            .publish_semantic_cat_ingress("cat-ready-ingress", "node-b")
+            .unwrap(),
+        PublishCatIngressOutcome::CatNotReady
+    ));
+    assert!(matches!(
+        store
+            .publish_semantic_cat_ingress("cat-missing", "node-a")
+            .unwrap(),
+        PublishCatIngressOutcome::CatNotFound
+    ));
+    assert!(matches!(
+        store
+            .withdraw_semantic_cat_ingress("cat-missing", "node-a")
+            .unwrap(),
+        WithdrawCatIngressOutcome::CatNotFound
+    ));
+
+    let CreateCatOutcome::Created(_) = store
+        .create_semantic_cat(NewCat {
+            cat_id: "cat-offline-target",
+            workspace_id: "ws_semantic",
+            cat_slug: "offline-target",
+            node_id: "node-b",
+            cpu_count: 2,
+            memory_bytes: 1 << 30,
+            boot_image: "sha256:image",
+        })
+        .unwrap()
+    else {
+        panic!("new semantic Cat must be created")
+    };
+    store
+        .transition_semantic_node_status("node-b", &[NodeStatus::Running], NodeStatus::Offline)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        store
+            .publish_semantic_cat_ingress("cat-offline-target", "node-b")
+            .unwrap(),
+        PublishCatIngressOutcome::NodeNotRunning
+    ));
+
+    assert!(matches!(
+        store
+            .publish_semantic_cat_ingress("cat-ready-ingress", "node-a")
+            .unwrap(),
+        PublishCatIngressOutcome::Published(_)
+    ));
+    store
+        .transition_semantic_node_status("node-a", &[NodeStatus::Running], NodeStatus::Offline)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .withdraw_semantic_cat_ingress("cat-ready-ingress", "node-a")
+            .unwrap(),
+        WithdrawCatIngressOutcome::Withdrawn
+    );
+}
+
+#[test]
+fn concurrent_ingress_publication_has_one_current_target() {
+    let (store, url) = store_and_url();
+    register_node(&store);
+    register_second_node(&store);
+    let CreateCatOutcome::Created(_) = store
+        .create_semantic_cat(NewCat {
+            cat_id: "cat-ingress-race",
+            workspace_id: "ws_semantic",
+            cat_slug: "ingress-race",
+            node_id: "node-a",
+            cpu_count: 2,
+            memory_bytes: 1 << 30,
+            boot_image: "sha256:image",
+        })
+        .unwrap()
+    else {
+        panic!("new semantic Cat must be created")
+    };
+
+    let start = Arc::new(Barrier::new(3));
+    let mut threads = Vec::new();
+    for node_id in ["node-a", "node-b"] {
+        let url = url.clone();
+        let start = Arc::clone(&start);
+        threads.push(std::thread::spawn(move || {
+            let store = Store::connect(&url, None).unwrap();
+            start.wait();
+            store
+                .publish_semantic_cat_ingress("cat-ingress-race", node_id)
+                .unwrap()
+        }));
+    }
+    start.wait();
+    let outcomes = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, PublishCatIngressOutcome::Published(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        store
+            .resolve_semantic_cat_ingress("cat-ingress-race")
+            .unwrap()
+            .unwrap()
+            .node_id,
+        "node-a"
+    );
 }
 
 #[test]

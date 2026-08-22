@@ -613,6 +613,22 @@ pub struct NodeResponse {
     pub node: NodeView,
 }
 
+/// The current Node selected for new traffic to one Cat. Absence of this DTO
+/// from a resolve result means that traffic has been withdrawn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatIngressTarget {
+    pub cat_id: Id,
+    pub node_id: Id,
+}
+
+impl CatIngressTarget {
+    pub fn validate(&self) -> Result<(), SemanticValidationError> {
+        validate_prefixed_id(&self.cat_id, "cat_")?;
+        validate_prefixed_id(&self.node_id, "node_")
+    }
+}
+
 /// Complete, immutable Cat configuration sent to noded on create and run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1139,6 +1155,24 @@ mod tests {
             br#"{"node_id":"node_01","node_name":"worker","control_endpoint":"10.0.0.12:8443","vendor":"aws","region":"r","zone":"z","instance_id":"i","machine_type":"m","node_version":"1"}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn ingress_target_is_only_the_current_cat_and_node() {
+        let target: CatIngressTarget =
+            serde_json::from_slice(br#"{"cat_id":"cat_01","node_id":"node_01"}"#).unwrap();
+        target.validate().unwrap();
+        assert_eq!(
+            serde_json::to_string(&target).unwrap(),
+            r#"{"cat_id":"cat_01","node_id":"node_01"}"#
+        );
+        for retired in [
+            br#"{"cat_id":"cat_01","node_id":"node_01","request_id":"req_01"}"#.as_slice(),
+            br#"{"cat_id":"cat_01","node_id":"node_01","operation_id":"op_01"}"#.as_slice(),
+            br#"{"cat_id":"cat_01","node_id":"node_01","generation":2}"#.as_slice(),
+        ] {
+            assert!(serde_json::from_slice::<CatIngressTarget>(retired).is_err());
+        }
     }
 
     #[test]

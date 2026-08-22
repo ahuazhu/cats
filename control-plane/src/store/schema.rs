@@ -1467,6 +1467,7 @@ const CONTROL_TABLES: &[&str] = &[
     "nodes",
     "node_heartbeats",
     "cats",
+    "cat_ingress_targets",
     "persistent_disks",
     "disk_bindings",
     "account_membership_shadow",
@@ -5027,6 +5028,15 @@ CREATE INDEX IF NOT EXISTS cats_current_action_scan
 ON cats(current_action_started_at) WHERE current_action IS NOT NULL;
 CREATE INDEX IF NOT EXISTS cats_node_placement
 ON cats(node_id) WHERE node_id IS NOT NULL;
+-- One row is the complete serving target for new traffic to a Cat. Absence
+-- means withdrawn. Lifecycle state and heartbeat remain separate concerns.
+CREATE TABLE IF NOT EXISTS cat_ingress_targets (
+    cat_id TEXT PRIMARY KEY REFERENCES cats(cat_id),
+    node_id TEXT NOT NULL REFERENCES nodes(node_id),
+    updated_at BIGINT NOT NULL CHECK (updated_at >= 0)
+);
+CREATE INDEX IF NOT EXISTS cat_ingress_targets_node
+ON cat_ingress_targets(node_id);
 CREATE TABLE IF NOT EXISTS persistent_disks (
     disk_id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
@@ -9564,6 +9574,7 @@ mod semantic_protocol_schema_tests {
             "cats",
             "nodes",
             "node_heartbeats",
+            "cat_ingress_targets",
             "persistent_disks",
             "disk_bindings",
         ] {
@@ -9579,5 +9590,6 @@ mod semantic_protocol_schema_tests {
         assert!(SCHEMA.contains("CONSTRAINT disk_bindings_disk_unique UNIQUE (disk_id)"));
         assert!(SCHEMA.contains("control_endpoint TEXT NOT NULL"));
         assert!(SCHEMA.contains("last_heartbeat_at BIGINT NOT NULL"));
+        assert!(SCHEMA.contains("cat_id TEXT PRIMARY KEY REFERENCES cats(cat_id)"));
     }
 }

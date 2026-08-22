@@ -11,7 +11,7 @@ use std::time::Duration;
 use cats_api::error::ApiError;
 use cats_api::runtime_reconciliation::Id;
 use cats_api::semantic_control::{
-    CatAction as WireCatAction, CatState as WireCatState, NodeHeartbeatRequest,
+    CatAction as WireCatAction, CatIngressTarget, CatState as WireCatState, NodeHeartbeatRequest,
     NodeHeartbeatResponse, NodeHeartbeatStatus, NodeName, NodeRegistrationRequest,
     NodeRegistrationResponse, NodeRegistrationStatus, NodeStatus as WireNodeStatus, NodeView,
     NodedCatActionRequest, NodedCatConfig, NodedControlEndpoint, NodedDiskMount, NodedResultStatus,
@@ -33,9 +33,10 @@ use crate::semantic_noded_client::{
 };
 use crate::store::semantic::{
     AdmitCatActionOutcome, AdmitCatCreateOutcome, AtomicCatCreate, CatAction as StoredCatAction,
-    CatRecord as StoredCatRecord, CatState as StoredCatState, CatWithMounts, FinishCatAction,
-    NewCatMount, NodeHeartbeat, NodeRecord as StoredNodeRecord, NodeRegistration,
-    NodeStatus as StoredNodeStatus, RegisterNodeOutcome, SemanticCatSelector, StaleNodeRecord,
+    CatIngressTargetRecord, CatRecord as StoredCatRecord, CatState as StoredCatState,
+    CatWithMounts, FinishCatAction, NewCatMount, NodeHeartbeat, NodeRecord as StoredNodeRecord,
+    NodeRegistration, NodeStatus as StoredNodeStatus, PublishCatIngressOutcome,
+    RegisterNodeOutcome, SemanticCatSelector, StaleNodeRecord, WithdrawCatIngressOutcome,
 };
 use crate::store::{new_id, Store};
 
@@ -376,6 +377,117 @@ impl IngressPort for UnavailableIngressPort {
             ))
         })
     }
+}
+
+/// PostgreSQL-backed current target used by the semantic lifecycle and by a
+/// Gateway path resolving each new request. It is independent from the
+/// retired Route Operation signer.
+#[derive(Clone)]
+pub struct SemanticIngressAdapter {
+    store: Arc<Store>,
+}
+
+impl SemanticIngressAdapter {
+    pub fn new(store: Arc<Store>) -> Self {
+        Self { store }
+    }
+
+    /// Read the one current target for a Cat. `None` means new traffic is
+    /// withdrawn; callers must not fall back to lifecycle placement or a
+    /// cached retired Route grant.
+    pub async fn resolve(&self, cat_id: &str) -> Result<Option<CatIngressTarget>, IngressError> {
+        let store = Arc::clone(&self.store);
+        let cat_id = cat_id.to_owned();
+        let target = store
+            .execute(move |store| store.resolve_semantic_cat_ingress(&cat_id))
+            .await
+            .map_err(|error| IngressError::new(error.to_string()))?;
+        target.map(wire_ingress_target).transpose()
+    }
+}
+
+impl IngressPort for SemanticIngressAdapter {
+    fn withdraw<'a>(
+        &'a self,
+        cat_id: &'a str,
+        old_node_id: &'a str,
+    ) -> SemanticFuture<'a, Result<(), IngressError>> {
+        let store = Arc::clone(&self.store);
+        let cat_id = cat_id.to_owned();
+        let old_node_id = old_node_id.to_owned();
+        Box::pin(async move {
+            let outcome = store
+                .execute(move |store| store.withdraw_semantic_cat_ingress(&cat_id, &old_node_id))
+                .await
+                .map_err(|error| IngressError::new(error.to_string()))?;
+            map_withdraw_ingress_outcome(outcome)
+        })
+    }
+
+    fn publish<'a>(
+        &'a self,
+        cat_id: &'a str,
+        new_node_id: &'a str,
+    ) -> SemanticFuture<'a, Result<(), IngressError>> {
+        let store = Arc::clone(&self.store);
+        let cat_id = cat_id.to_owned();
+        let new_node_id = new_node_id.to_owned();
+        Box::pin(async move {
+            let outcome = store
+                .execute(move |store| store.publish_semantic_cat_ingress(&cat_id, &new_node_id))
+                .await
+                .map_err(|error| IngressError::new(error.to_string()))?;
+            map_publish_ingress_outcome(outcome)
+        })
+    }
+}
+
+fn map_publish_ingress_outcome(outcome: PublishCatIngressOutcome) -> Result<(), IngressError> {
+    match outcome {
+        PublishCatIngressOutcome::Published(_) | PublishCatIngressOutcome::AlreadyPublished(_) => {
+            Ok(())
+        }
+        PublishCatIngressOutcome::Conflict(current) => Err(IngressError::new(format!(
+            "Cat ingress already targets Node {}",
+            current.node_id
+        ))),
+        PublishCatIngressOutcome::CatNotReady => {
+            Err(IngressError::new("Cat is not Ready on the requested Node"))
+        }
+        PublishCatIngressOutcome::NodeNotRunning => {
+            Err(IngressError::new("requested Node is not running"))
+        }
+        PublishCatIngressOutcome::CatNotFound => Err(IngressError::new("Cat does not exist")),
+    }
+}
+
+fn map_withdraw_ingress_outcome(outcome: WithdrawCatIngressOutcome) -> Result<(), IngressError> {
+    match outcome {
+        WithdrawCatIngressOutcome::Withdrawn | WithdrawCatIngressOutcome::AlreadyWithdrawn => {
+            Ok(())
+        }
+        WithdrawCatIngressOutcome::Conflict(current) => Err(IngressError::new(format!(
+            "Cat ingress now targets Node {}",
+            current.node_id
+        ))),
+        WithdrawCatIngressOutcome::CatNotWithdrawing => {
+            Err(IngressError::new("Cat is not withdrawing from this Node"))
+        }
+        WithdrawCatIngressOutcome::CatNotFound => Err(IngressError::new("Cat does not exist")),
+    }
+}
+
+fn wire_ingress_target(target: CatIngressTargetRecord) -> Result<CatIngressTarget, IngressError> {
+    let target = CatIngressTarget {
+        cat_id: Id::new(target.cat_id)
+            .ok_or_else(|| IngressError::new("stored Cat ID is invalid"))?,
+        node_id: Id::new(target.node_id)
+            .ok_or_else(|| IngressError::new("stored Node ID is invalid"))?,
+    };
+    target
+        .validate()
+        .map_err(|error| IngressError::new(error.to_string()))?;
+    Ok(target)
 }
 
 /// PostgreSQL implementation of semantic Node registration and liveness.
@@ -1025,6 +1137,40 @@ mod tests {
         let ingress = UnavailableIngressPort;
         assert!(ingress.withdraw("cat_01", "node_01").await.is_err());
         assert!(ingress.publish("cat_01", "node_02").await.is_err());
+    }
+
+    #[test]
+    fn semantic_ingress_adapter_preserves_scenario_outcomes() {
+        let target = CatIngressTargetRecord {
+            cat_id: "cat_01".to_owned(),
+            node_id: "node_01".to_owned(),
+            updated_at: 1,
+        };
+        assert!(
+            map_publish_ingress_outcome(PublishCatIngressOutcome::Published(target.clone()))
+                .is_ok()
+        );
+        assert!(
+            map_publish_ingress_outcome(PublishCatIngressOutcome::AlreadyPublished(target.clone()))
+                .is_ok()
+        );
+        assert!(
+            map_publish_ingress_outcome(PublishCatIngressOutcome::Conflict(target.clone()))
+                .is_err()
+        );
+        assert!(map_withdraw_ingress_outcome(WithdrawCatIngressOutcome::Withdrawn).is_ok());
+        assert!(map_withdraw_ingress_outcome(WithdrawCatIngressOutcome::AlreadyWithdrawn).is_ok());
+        assert!(
+            map_withdraw_ingress_outcome(WithdrawCatIngressOutcome::Conflict(target.clone()))
+                .is_err()
+        );
+        assert!(
+            map_withdraw_ingress_outcome(WithdrawCatIngressOutcome::CatNotWithdrawing).is_err()
+        );
+
+        let wire = wire_ingress_target(target).unwrap();
+        assert_eq!(wire.cat_id.as_str(), "cat_01");
+        assert_eq!(wire.node_id.as_str(), "node_01");
     }
 
     #[test]
