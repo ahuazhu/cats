@@ -1,213 +1,247 @@
 # Operations and HA
 
-- 状态：运维合同；atomic lifecycle内部软件组成与六动作product adapter已落地，private
-  `Start/Stop/Delete/Killed`不进入product projection；Route resolve使用`run_required`并拒绝旧
-  `wake_required`；clean-slate release gate、
-  外部HostFence与真实production qualification均未宣称完成
+- 状态：ADR-0059 运维合同；同步 Control/Node 生产 composition 已组成，完整纵向和物理资格仍开放
 - 决策：[ADR-0031](decisions/0031-control-store-on-postgresql.md)、
   [ADR-0032](decisions/0032-control-plane-multi-replica-and-postgresql-leadership.md)、
   [ADR-0038](decisions/0038-production-account-qualification-cell-boundary.md)、
-  [ADR-0056](decisions/0056-atomic-per-cat-runtime-lifecycle.md)、
-  [ADR-0057](decisions/0057-product-lifecycle-actions-and-internal-execution-evidence.md)
-- Runtime：[Atomic Runtime Lifecycle v1](specs/atomic-runtime-lifecycle-v1.md)
-- Host/Agent/inventory foundation：[Runtime Reconciliation v1](specs/runtime-reconciliation-v1.md)、
-  [Runtime Inventory and Telemetry v1](specs/runtime-inventory-observation-v1.md)
-- Route：[Route Grant v2](specs/route-grant-v2.md)
-- Volume：[Volume Authority](specs/volume-authority.md)
+  [ADR-0059](decisions/0059-semantic-control-node-synchronous-protocol.md)
+- 协议：[Control Plane 与 noded 同步协议设计](control-node-semantic-protocol.md)
+- 数据：[storage.md](storage.md)、[Volume Authority](specs/volume-authority.md)
 
-本文定义运行拓扑、故障域、PostgreSQL/Controller边界、Host fence、监控、qualification与首次clean-slate
-部署。旧Desired/reconcile/Observation-settled Operation不是目标运维路径；Observation只做telemetry。
+本文定义运行拓扑、PostgreSQL/Control 边界、Node heartbeat/reset、失联恢复、独立 Host fence 和
+qualification。旧 lifecycle Operation、Node command poll/result、per-Cat command journal、AgentSession、
+inventory settlement 和 HostFenceRecovery 不是当前运维路径。
 
-## 1. 终态拓扑
+## 1. 运行拓扑
 
-- **Control Plane API**：至少两个stateless replica，共享PostgreSQL；不持有correctness-critical内存queue。
-- **Controller/Route Controller**：可与API co-deploy；lifecycle intent只写PG。Node签名poll本Node已admit的
-  unresolved exact command并签名commit result；Route按Endpoint独立派生Enable/Disable。LISTEN/NOTIFY只降latency。
-- **Gateway**：至少两个replica；无共享route mirror，只有bounded per-replica Grant cache。
-- **Node Agent**：每Host一个executor，固定state path kernel lock + provisioned NodeIdentity + current
-  AgentSession；每Cat一个command journal/worker与shared AdmissionCell。
-- **PostgreSQL**：Cat/runtime config/Operation/result、Endpoint/Serving、Node/session/fence、Volume Authority、
-  product/API idempotency与usage projection的唯一事务域。
-- **Object Store**：immutable Chunk/Map/Delta/Base/Snapshot objects；不决定current root/writer。
+- **Control Plane API**：可以运行多个 stateless replica，共享 PostgreSQL。每个请求先在数据库取得
+  `current_action`，transaction 提交后同步调用目标 noded。
+- **Node liveness monitor**：与 Control co-deploy；用数据库 heartbeat 接收时间、连续丢失窗口和一次主动
+  health probe 判定 offline，并反复发现未恢复的 Cat。
+- **Gateway/入口层**：每个 Cat 只消费一个当前 `cat_id -> node_id` 目标；本次协议不定义公网 TLS、hostname
+  或缓存细节。
+- **noded**：每台机器一个有效进程；注册 `node_id/node_name/control_endpoint`，按 `cat_id` 串行动作，
+  reset 时停止并清理本机全部 Cat。
+- **PostgreSQL**：Cat/Disk/Node 当前资源、`current_action`、bindings、heartbeat 和当前入口目标的事务域；
+  也是底层 storage MetadataStore 的部署载体，但两类 authority 不混用。
+- **Object Store**：保存 immutable Chunk/Map/Delta/Base/Snapshot objects，不决定当前 Cat、placement 或 writer。
+- **独立 fleet authority**：`runtime_node_authority` 继续管理 provisioner-owned Node policy/credential，不进入
+  Cat 生命周期、heartbeat 或 offline 恢复判断。
 
-Route private key只在independent signer/secret boundary；Node只持versioned public ring，Gateway只搬运opaque
-Grant。Guest没有S3、MetadataStore、Control或WorkOS credential。
-
-已经Running的数据面不依赖Controller heartbeat继续执行。Node/Host loss恢复是external fence后从remote `R`
-启动的新runtime，不是live failover；Suspended/Warm是Host-bound optimization，不是HA replica。
+Guest 不持有 S3、MetadataStore、Control 或 WorkOS 凭据。已经 Running 的计算不依赖 Control heartbeat
+继续执行；Control 全断会停止新动作和新入口更新，但不会主动终止已运行 VMM。
 
 ## 2. 故障合同
 
-| 故障 | 继续 | 停止/降级 |
+| 故障 | 继续 | 停止或降级 |
 |---|---|---|
-| 单个API/Controller退出 | 其他replica从PG Operation继续；exact retry安全 | 该进程内未提交response丢失 |
-| Control Plane全断 | 已Running compute与existing stream；warm Gateway cache在Grant expiry前可新admit | 新mutation、command settlement、Grant续签、cold Gateway cache |
-| PostgreSQL暂不可用 | Running compute；Relaxed可在local quota内推进L | command admission/result commit、Strict metadata CAS、route resolve |
-| Object Store暂不可用 | cache-hit read、允许的Relaxed local commit | cache miss、Strict commit、warm/cold/Persistent destroy convergence |
-| Node Agent crash/replacement | Host lock/session/inventory下resume exact command；systemd scope维持或StopFence保护 | proxy stream可能断；AdmissionCell默认Closed，old Serving失效 |
-| Node network partition | source保持；不自动启动另一writer | heartbeat timeout只suspicion，unresolved lane保持 |
-| Host永久丢失 | trusted HostFenceEvent终结exact op为HostLost，逐卷takeover后从R恢复 | Relaxed local tail可能丢失；报告DataLossPossible |
-| Gateway退出 | 其他Gateway在Control健康时resolve | CP全断时cold replica不能接新流 |
+| 单个 Control replica 退出 | 其他 replica 从 PostgreSQL 当前行继续，并查询动作目标 Node | 该进程尚未返回的 HTTP response 可能丢失 |
+| Control 全断 | 已 Running compute 和已有连接继续 | 新 mutation、状态转换、placement 和入口切换 |
+| PostgreSQL 暂不可用 | 已 Running compute；底层缓存读按存储合同继续 | 新动作 claim、状态写回、入口更新、需要 metadata CAS 的 FLUSH |
+| Object Store 暂不可用 | cache-hit read | 远端持久 FLUSH、Warm/Cold、迁移和 offline 恢复完成 |
+| Control→noded response 丢失 | 重试相同动作或查询相同 `cat_id` | 任意延迟旧请求的 exactly-once |
+| noded 进程重启 | 重新注册/reset 后从 Control 当前事实恢复服务 | 保留本地 Suspended/Warm 的进程级无损续跑 |
+| Node 失联 | 先撤入口，在其他 Node 从远端恢复，旧 Node 回来 reset | 恢复窗口内严格物理单实例、旧连接立即停止 |
+| Host 永久丢失 | 只恢复已经远端持久的数据 | 用 heartbeat timeout 证明 Host 已停止 |
+| Gateway 退出 | 其他 Gateway 在 Control 健康时读取当前目标 | Control 全断时冷缓存 replica 的新流量 |
 
-所有timeout、queue、retry、grace drain与data convergence都有硬界。超界结果是typed backpressure、
-Unavailable、unknown或NeedsIntervention；绝不自动变成fence、Cold、execution-stopped proof、release、discard或成功。
+所有 connect/request/retry、heartbeat、health probe、drain 和 reset 都必须有界。超时产生明确
+`timeout/node_unavailable/failure`，不能自动变成动作成功、Cold、writer release 或 Host fence。
 
-## 3. PostgreSQL、Controller与command lane
+## 3. PostgreSQL 与同步动作
 
-同步PostgreSQL driver只在bounded blocking executor/connection pool运行；不得占用async worker。每类request有
-独立queue/running/deadline指标和容量预算。runtime command、volume transition、product mutation与telemetry
-不能共享一个可被长query饥饿的single mutex/worker。
+同步 PostgreSQL driver 只在有界 blocking executor/connection pool 中运行，不能占住 async worker。
+每类请求有独立 queue/running/deadline 指标和容量预算。
 
-每Cat最多一个unresolved lifecycle Operation由Cat row lock + database constraint共同保证。accept transaction
-验证current terminal chain head、typed predecessor、canonical request/fingerprint与legal successor；存在unresolved
-时在Operation insert、使命令可被poll前拒绝。external network I/O不在DB transaction内。
-
-Node response只有在authenticated identity、Operation/fingerprint/placement与terminal result digest完全匹配时，
-才和Cat product projection同一commit settlement。一个Controller收到response但commit失败，lane仍unresolved；
-Node可向任何replica重poll/repost same Operation。Observation/capacity/read model不参与settlement。
-
-production runtime transport只允许Node→Control两条current-AgentSession signed POST：command poll只返回已在
-PG commit、仍unresolved且目标为该Node的canonical command；result commit把exact response/digest与product
-projection同事务保存并返回exact ACK。poll不admit/claim/renew Operation，Node不能创造intent；重复poll
-join/resume本地journal，result或ACK丢失只repost同一result。没有Control→Node lifecycle client或legacy
-`agent_url`旁路。
-
-全局锁DAG的共同前缀是：
+每个 Cat 当前行保存：
 
 ```text
-ApiIdempotencyResult key / product name lock (where applicable)
-  -> NodeIdentity
-  -> current credential lineage
-  -> AgentSession
-  -> lifecycle Operation + Cat chain head
-  -> HostFenceEvent
-  -> per-volume AuthorizationRecord
-  -> VolumeRecord
-  -> Disk / CatRuntimeConfig / Endpoint
-  -> DiskSnapshotRecord
+state
+current_action
+current_action_started_at
+current_action_node_id
+node_id
+last_error
 ```
 
-事务跳过不相关节点，同类多row按stable ID排序；不得先锁Volume/Operation后反向取NodeIdentity/session。
-ordinary normal acquire只锁其exact Volume domain row，但signed runtime transport在进入domain前必须闭合current
-Node/session/Operation。API idempotency result与covered product mutation同commit；hit只replay saved status/
-content-type/body，不从resource当前存在性重建结果。
+Control 通过条件更新取得空闲 `current_action`；多 replica 同时竞争时只有一个成功。网络调用发生在
+transaction 之外：
 
-Node command内部effect journal不是第二Control workflow。first effect前fsync accepted/effect token，return前fsync
-terminal result；response unknown只repoll/repost exact identity。successor accepted后poll中晚到old command返回
-SupersededOperation，历史API replay仍从PG返回original terminal result。
+```text
+检查当前资源和参数
+-> claim current_action + target node
+-> commit
+-> sync call noded
+-> compare/update stable result
+-> clear current_action
+```
 
-## 4. Host fence与HostLost
+相同动作的重复请求查询/等待同一目标；不同动作返回 `busy`。如果 noded 已完成而 Control 在写回前
+退出，新 replica 读取 `current_action_node_id` 并查询 `GET /v1/cats/{cat_id}`。heartbeat、日志和 runtime
+inventory 不能结算动作。
 
-heartbeat timeout、lease expiry、route TTL、AgentSession replacement和Controller cancel都不是fence。Host recovery
-顺序固定：
+Create Cat 和 Create Disk 依靠当前 slug 的部分唯一索引串行化。destroy/delete 后历史行退出索引，slug
+可立即创建新的内部 ID。Disk attach/detach/destroy 在同一 transaction 锁定目标 Disk 和 Cat；
+`UNIQUE(disk_id)` 保证产品 binding RWO。
 
-1. provider/BMC adapter对immutable Host/boot/session/fence-attempt执行外部隔离；
-2. 保存并验证trusted `HostFenceEvent {state: Active}`；network suspicion或power API request本身不够；
-3. 在一个PG transaction锁exact Cat unresolved Operation与event，把它terminalize为
-   `HostLost {host_fence_event_id, interrupted_operation_id}`；不制造Cold或execution-stopped proof；
-4. 为target placement创建HostFenceRecovery EnsureRunning execution，typed predecessor绑定HostLost digest、old Node identity、
-   event与完整per-volume takeover authorization IDs；
-5. 每卷在event -> authorization -> VolumeRecord锁序下CAS owner/epoch并写immutable consumed receipt；
-6. target只从remote `R`启动，old epoch/route/session永久fail closed。
+## 4. Node 注册、heartbeat 与 reset
 
-HostLost是normal command result rule的唯一external exception。HostLost wire与per-volume takeover
-primitives已组成，但current Control仍明确拒绝`HostFenceRecovery` admission。production
-HostFence producer、exact successor composition与physical qualification是同一独立上线门；
-在它们完成前unreachable unresolved lane宁可保持blocked，也不能用timeout解锁。
+noded 首次注册必须显式提供：
 
-Root destroy的HostFence authorization arm只绑定event、interrupted Operation与HostLost digest，不伪造
-strong-stop/absence。可达Node disposable Root arm才绑定current AgentSession、strong-stop result/proof与complete
-inventory。两者都还须绑定destroy Operation/fingerprint、Node/Cat/placement、Root attachment/epoch/head、
-`discard_with_cat`和Persistent completion；Persistent任何`R < L`都使destroy NeedsIntervention。
+```text
+node_id
+node_name
+control_endpoint
+vendor / region / zone / instance_id / machine_type / version
+```
 
-## 5. Route与Agent replacement
+Control 不根据请求来源地址猜 `control_endpoint`。`node_name` 和云实例身份创建后不能由 heartbeat
+隐式修改；地址只允许在显式注册或 reset 完成后的重新注册更新。
 
-每Cat lifecycle lane与每Endpoint Route lane只在shared AdmissionCell线性化。接受leaving-Running Operation的
-Cat-row transaction同时停止new signing/Enable generation；Node accepted后的first local effect关闭lifecycle与
-全部Endpoint gate。
+每台 Node 在 `node_heartbeats` 只有一行最新值。Control 使用 PostgreSQL 接收时间写
+`last_heartbeat_at` 并据此判断失联；`node_reported_at` 只用于诊断。
 
-Serving receipt/installed binding绑定effective RuntimeReady source、runtime incarnation、route epoch与exact
-`admission_session_epoch`。Agent replacement后memory cell默认Closed，old Serving自动失效；Route Controller
-burn epoch后fresh Enable。Grant不增加session claim。
+默认建议每 10 秒 heartbeat，连续 3 次未收到后进入 suspected 判断，再由 Control 调用一次
+`GET /v1/health`。探测成功则保持 running，失败才标记 offline。
 
-SuspendDeclined(Busy)成为new lifecycle head，但只有cell-never-closed proof可保留original
-effective_runtime_ready；Signer比较head projection而非`Serving.source == head op`。actual/ambiguous close、Agent
-replacement或incarnation change都burn epoch。
+offline/reset_required Node 不能接受 placement。旧 Node 下一次 heartbeat 或 register收到
+`reset_required` 后必须立即：
 
-需要停止旧执行的产品动作在bounded guard drain后可internal strong stop Guest/VMM并drop connection；active
-stream不是无限execution lease。该proof嵌入原动作result，不创建产品Stop/Killed head；RequireIdle Busy仍是
-non-destructive例外。
+1. 停止接受新的 Cat 动作；
+2. 停止本机所有 Cat 进程和设备；
+3. 删除本地 Running/Suspended/Warm 状态；
+4. 不删除 PersistentDisk 产品行、远端对象或 Control binding；
+5. reset 完成后重新注册，得到 running 后才恢复 placement。
 
-## 6. 运行监控
+`deleted` Node 不得复活；同一机器重新提供服务时使用新的 `node_id`。
+
+## 5. Node 失联恢复
+
+恢复顺序固定为：
+
+```text
+heartbeat window exceeded
+-> active health probe fails
+-> mark node offline
+-> withdraw each affected Cat's old ingress target
+-> claim recovery target on another running Node
+-> sync create/run from remote durable state
+-> if original target was Suspended/Warm, convert back after Cold boot
+-> publish only a Ready Running target
+-> old Node later receives reset_required and cleans residues
+```
+
+恢复是 level-triggered，不依赖一次性内存事件。每个 liveness 周期重新查询 offline Node 上仍有 placement
+或未结束动作的 Cat；Control 重启、目标 Node 临时不可达或一次恢复失败后，后续周期继续从数据库当前事实
+尝试。
+
+恢复前 withdraw，Ready 后 publish。旧 Node 的迟到 withdraw 不能删除新目标。Suspended/Warm 目标在新 Node
+最终不发布入口；Running 只有 Guest 和全部 mounts Ready 后才发布。
+
+这个流程有意不等待旧 Host fence。入口切换只约束新流量，旧连接、后台任务、出站请求和旧实例写盘
+仍可能继续。ADR-0059 假设旧 Node 会在允许的 heartbeat 窗口内重新联系 Control，因此双跑通常不超过
+heartbeat 窗口加停止清理时间。长期不对称网络不在当前保证范围。
+
+## 6. Host fence 与数据 authority 的独立边界
+
+heartbeat timeout、Node offline、入口撤销、reset 要求、lease expiry 和日志都不是 Host fence。可信的云/BMC
+隔离证据仍是“旧 Host 已经停止”的独立 authority，`runtime_node_authority` 仍是受信 Node
+provisioning/credential 的独立管理边界。
+
+ADR-0059 只是不再把 HostFenceRecovery、AgentSession 或 fence predecessor 作为 Cat lifecycle 协调协议；
+它没有把 Host fence 的含义转移给 heartbeat，也没有把 volume writer 权限转移给 Cat row。
+
+底层存储仍要求：
+
+- MetadataStore owner/attachment epoch 决定谁能发布远端 root；
+- `disk_bindings` 只保证 Control 产品模型的 RWO，不能证明旧物理 writer 已停止；
+- 成功 FLUSH 必须远端持久，当前简化恢复不能接纳 `R < L` 的 Node-local-only 成功数据；
+- 未知磁盘、未知 writer、无法验证的 mount 或未持久数据 fail closed，不因 reset 被删除。
+
+Automatic cloud/BMC fencing、真实 provider 资格和长期不对称分区处理仍是后续独立工作。不能把当前允许
+的双跑窗口描述为已经获得严格 fencing 或完整生产 HA。
+
+## 7. 正常维护与 drain
+
+正常 Node 退出时：
+
+1. 将 Node 置为 `draining`，停止新 placement；
+2. 记录每个 Cat 原状态；
+3. 将每个 Cat 转成 Cold，确认数据已经远端持久并关闭本地 writer；
+4. 在其他 running Node run；
+5. 原状态为 Suspended/Warm 时，在目标 Node 再转换到对应状态；
+6. 全部成功后关闭旧 Node。
+
+任一 Cat 无法 Cold 时，drain 失败并保留该 Cat，不强制关机。入口依然遵守先撤旧、Ready 后发新。
+
+## 8. 运行监控
 
 至少监控：
 
-- Control：PG pool/queue/running/deadline、transaction retry/serialization、per-Cat unresolved age、signed poll
-  空/重复/拒绝、result repost/ACK unknown、commit conflict、LifecycleOperationInProgress、HostLost transition；
-- Node：Host lock/session conflict、command phase/age/replay、StopFence、complete inventory/attestation freshness、
-  missing/corrupt journal、artifact classification/GC、scope resurrection、effect ambiguity；
-- Route：effective RuntimeReady/Serving mismatch、admission session mismatch、route epoch burn、Active/Closed gates、
-  guards/drain/force stop、Grant cache/resolve/ring ACK；
-- Storage：owner/epoch、R/L gap、Strict FLUSH latency/error、pending pack quota、normal release、takeover/disposable
-  authorization、Persistent destroy blockers、Snapshot live roots与sweeper progress；
-- Fleet：heartbeat suspicion、provider fence attempt/event、old Host return、capacity/cordon、RDS/Object Store health；
-- Usage：spool backlog、counter gap/reset、projection/rating lag。
+- Control：PG pool/queue/running/deadline、动作 CAS 冲突、`current_action` age、noded 调用耗时/重试/
+  timeout、Node 查询恢复结果；
+- Node：register/heartbeat 结果、reset_required、reset duration、per-Cat action age、busy/already/failure、
+  本地清理失败；
+- Fleet：last heartbeat DB age、连续丢失、active probe、running/draining/offline/reset_required 数量、
+  recovery retry 和 Cat backlog；
+- Ingress：withdraw/publish/resolve、旧 Node 迟到 withdraw、Ready 前 publish 拒绝；
+- Storage：owner/epoch、远端 FLUSH latency/error、未远端持久数据、PersistentDisk provision/delete、
+  UUID/mount readiness 和 delete blocker；
+- Runtime：FakeVmm/Cloud Hypervisor effects、Guest readiness、mount readiness、Cold/restore/cleanup failure；
+- Usage：counter gap/reset、projection/rating lag。
 
-RuntimeInventoryReport staleness/rejection是telemetry incident，不得改变command terminal result。Full
-inventory attestation与Partial subset分别监控；Partial不能刷新complete scan freshness。
+heartbeat、日志和监控事件都不是产品状态或磁盘 writer authority。
 
-## 7. 分层qualification
+## 9. 分层 qualification
 
-每一层使用exact clean commit与可重复oracle：
+每一层使用 exact clean commit 和可重复 oracle：
 
-1. **Pure/domain**：ADR-0057六动作product projection与旧名absence、action-specific ExecutionStopped evidence、
-   command successor table、fingerprint/digest vectors、one-unresolved DB constraint、Volume owner/epoch state
-   machine、authorization sum type、Route binding compare。
-2. **PostgreSQL integration**：多replica admission race、response-received/result-commit crash、HostLost transaction、
-   lock DAG、API replay、Cat create全有或全无、Persistent initialization signed command CAS、Snapshot/delete。
-3. **Node local Linux**：real systemd scopes/cgroups、Host lock/double Agent、journal fsync crash points、StopFence/
-   force stop/resurrection、complete inventory、per-Cat GC、kernel-NBD与vhost-user-blk。
-4. **Runtime integration**：Cloud Hypervisor/Guest readiness、四态、Warm snapshot、R/L convergence、exact release、
-   destroy Persistent-first/Root discard、Route race/active HTTP/WebSocket。
-5. **Two-Node/failure**：normal Cold handoff、Agent/Control/PG response loss、network partition、external HostFence/
-   per-volume takeover、old Host return。
-6. **Production cell**：real RDS/Object Store/KMS/secret/mTLS/Gateway/provisioner artifacts、monitoring/rollback/open
-   evidence，exact immutable build receipt。
+1. **Pure/domain**：slug、配置比较、状态转换、错误闭集、Disk binding、Node registration/heartbeat 和
+   入口目标规则。
+2. **PostgreSQL integration**：并发 create、slug 复用、动作 CAS、Disk RWO、数据库时间 heartbeat、
+   Control 写回前 crash-query、level-triggered offline recovery。
+3. **HTTP/FakeVmm vertical**：真实 Control→noded HTTP Cat 全状态机和重复语义已通过；仍需补齐
+   PersistentDisk→Cat→入口→offline/reset→destroy→slug 复用的完整链。
+4. **Node local Linux**：真实 process/device cleanup、reset gate、Guest mount-ready、kernel-NBD 与
+   vhost-user-blk。
+5. **Cloud Hypervisor/Guest**：真实启动、pause、Warm/Cold、PersistentDisk provision/delete、文件系统身份、
+   mount 和失败清理。
+6. **Two-Node/failure**：heartbeat/probe、旧入口撤销、新实例 Ready、允许双跑窗口、旧 Node reset 和最终
+   单实例；单列 Host fence provider 证据，不把它写进同步 lifecycle。
+7. **Production cell**：真实 RDS/Object Store/secret/internal network、监控、rollback 和 exact immutable
+   build receipt。
 
-`./scripts/quality.sh full`是handoff门；Node/Linux-only change还要configured native x86_64 build host的full gate。
-本机迭代可用`./scripts/quality.sh linux`，但不能替代final native receipt。已知与改动无关的门禁flakiness需记录
-provenance并隔离，不在同一失败上无限重试。
+最终 handoff 运行 `./scripts/quality.sh full`。Node/Linux-only 变更还需要适用的 Linux/Cloud Hypervisor
+门禁；若环境不可用，必须记录 exact commit 和阻塞，不能把 FakeVmm 结果冒充物理资格。
 
-## 8. 首次终态部署
+## 10. 首次单协议部署
 
-atomic lifecycle只允许一次one-version clean-slate vertical cutover：
+本次只允许一次空数据 v19 cutover：
 
-1. 离线构建exact Controller/Node/Gateway/Volume/provisioner bundle；验证schema/wire/version、migration absence、
-   credential inventory与全部qualification receipts。
-2. 进入维护窗口，关闭公网ingress与mutation；可达runtime用atomic target之外的现有安全runbook drain，
-   不可达Host必须完成external fence或明确阻断cutover，不能由timeout猜隔离。
-3. 停止所有旧Controller/Node/Gateway/signer/write path，确认不会再写旧schema、route mirror或volume authority。
-4. rotate/revoke旧service/Node/route credentials；删除旧Desired read、reconcile、Observation settlement、NodeJob、
-   heartbeat overwrite、legacy Route parser/mirror和兼容IAM input。
-5. 删除开发product/runtime state，创建唯一empty atomic schema 18。没有Desired/Operation/checkpoint/runtime/
-   route migration、translator、dual write/read、fallback或mixed-version window。
-6. provision immutable NodeIdentity/state-path/credential与cordoned NodePlacementPolicy；Node先取得Host lock、fresh
-   AgentSession、complete inventory，所有AdmissionCell/gate Closed。
-7. 启动PostgreSQL/control authority，再启动Node/Route signer ring；全部compatible version、inventory attestation、
-   public key ring与machine mTLS ACK后才启动Gateway/API mutation。
-8. 在exact deployed SHA上执行smoke + Linux/runtime/route/storage crash oracle；保存immutable build/deploy/test
-   receipt。任何old parser/credential、schema drift、unknown checkpoint或qualification failure保持Closed。
-9. 只有all-green receipt与operator review后才打开mutation和public ingress。
+1. 离线构建相同版本的 Control、noded 和 CLI，验证 schema/wire 版本及旧入口 absence。
+2. 进入维护窗口，关闭公网 ingress 和 mutation。
+3. 停止旧 Control、Node、Gateway 和其他 write path，确认不会再写旧 schema。
+4. 轮换或撤销旧 service/Node credential。
+5. 删除旧产品/runtime 数据，创建唯一空 v19 schema；不迁移 Desired、Operation、journal、AgentSession、
+   inventory settlement 或 Route lane。
+6. 启动 Control；Node 清空本地 Cat 状态后，以 `node_id/node_name/control_endpoint` 注册。
+7. 先验证 register/heartbeat/reset、资源 API 和 FakeVmm/PostgreSQL smoke，再执行适用的真实磁盘和
+   Cloud Hypervisor qualification。
+8. 只有 exact commit 的最终门禁和 operator review通过后才开放 mutation 和入口。
 
-production reset/open的更细artifact流程继续由
-[production clean-slate reset](../deploy/aws/production-clean-slate-reset.md)及accepted production qualification
-ADRs维护；它们不得重新引入legacy lifecycle authority。
+旧 schema、wire、parser、runner 和测试不提供双读、双写、转换器或 mixed-version fallback。历史实现由
+Git 保留。
 
-## 9. 明确不宣称
+## 11. 明确不宣称
 
-- atomic lifecycle内部软件组成与current product adapter不表示clean-slate release gate、
-  automatic HostFence、real RDS failover或production Route qualification已通过。
-- heartbeat timeout、last Observation、audit record和“目录不存在”都不是fence/result/delete authority。
-- Warm/Suspended不是跨Host HA副本；Relaxed Host loss可能丢失`R-L` local tail。
-- test machine/prototype样本不自动成为production SLA；报告必须保留environment、sample count、boundary与oracle。
-- privilege separation、cross-Node Guest overlay与automatic cloud/BMC Host fencing仍是独立后续边界。
+- 同步 semantic production composition和真实 Control→noded HTTP Cat 状态机已组成；Strict PersistentDisk
+  backend 已完成并正在合入。这不表示完整 PersistentDisk/Cloud Hypervisor 物理链或 production
+  qualification 已通过。
+- heartbeat/reset 的最终收敛不表示恢复窗口内严格物理单实例、严格物理单写或旧连接立即停止。
+- heartbeat timeout、入口撤销、数据库 binding 和 audit log 都不是可信 Host fence。
+- 当前协议不支持 Node-local-only 的成功持久数据；底层 Relaxed 能力不能直接用于此恢复流程。
+- Warm/Suspended 不是跨 Host HA 副本。
+- prototype 或单台测试机结果不自动成为 production SLA；报告必须保留 environment、sample count、
+  boundary 和 oracle。
+- privilege separation、cross-Node Guest overlay、automatic cloud/BMC fencing 和长期不对称网络处理仍是
+  独立后续边界。
