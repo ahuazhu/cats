@@ -30,7 +30,7 @@
 | CLI | `cmd/cats/` | slug 命令、同步 REST、`--mount`、GiB 解析、`node_name` 展示 | 已完成并合入 |
 | noded 执行 | `node-agent/`、`cmd/noded/` | 同步 HTTP server、每 Cat 串行、destroy 清理、实际 effects 接入 | FakeVmm 已完成并合入；Cloud Hypervisor effects 待接入 |
 | Node 管理 | Control API、Node heartbeat client | 注册、`node_name`、`control_endpoint`、offline/reset/drain | 已完成并合入；Store/进程接线待后续项 |
-| Production adapters | Control adapter | Store/placement/noded/入口实现与公共 DTO 映射 | 实施中 |
+| Production adapters | Control adapter | Store/placement/noded/入口实现与公共 DTO 映射 | Store/Node/noded 已完成；Resource API 与真实入口待接入 |
 | HTTP composition | Control router、AppState、controld/noded main | 新路由和服务接线，旧路由退出 | Cat/Disk handlers 已合入；AppState/router 待接线 |
 | 切换清理 | schema、router、旧模块和测试 | 删除旧表、旧入口、旧 runner 和只验证旧协议的测试 | 待开始 |
 | 纵向联调 | FakeVmm/PostgreSQL | Disk→Cat→状态动作→跨 Node→destroy→slug 复用 | 待开始 |
@@ -53,7 +53,8 @@
 - [ ] 接入 Cloud Hypervisor、volume 和 route 的真实 `SemanticCatEffects`。
 - [x] 合入 Node 注册、心跳、主动探测、reset 和 drain 的服务与 HTTP client。
 - [x] Store 完成 create 原子建立 Cat/初始 bindings、placement 复核和 stale Node 查询。
-- [ ] 完成生命周期与 Node 管理 trait 的 production Store adapter。
+- [x] 完成生命周期、Node 管理和 noded HTTP 的 production adapter。
+- [ ] 完成 `SemanticResourceApi` 聚合与真实唯一入口 adapter。
 
 ### 阶段 C：纵向接线
 
@@ -96,6 +97,7 @@
 | `854a1668` | 原子 Cat create/binding、placement 复核、数据库时间 heartbeat/offline CAS | semantic Store 单测编译；PG 行为待最终环境 |
 | `9c29e348`、`ff2bde49`、`1429c0ab` | noded 同步每 Cat lane、reset gate、FakeVmm production main | Node 9 tests、client 2 tests、noded 2 tests |
 | `65dab394` | 公开 Cat/Disk 同步 HTTP handlers 与语义请求解析 | Control 5 tests |
+| `4c880d8d` | 生命周期 Store、NodeRepository、noded HTTP production adapters | Adapter 4 tests；PG Store 7 tests（来源分支） |
 
 ## 5. 进度更新规则
 
@@ -112,6 +114,7 @@
 - 完成并合入公共 wire、v19 schema/Store、Control coordinator、noded HTTP client、CLI 和 Disk/mount-ready 切片。
 - 完成并合入 Node 管理服务、Control 注册/心跳路由和 noded heartbeat/reset client。
 - noded 同步执行、per-Cat lane、destroy 清理、reset gate 和 FakeVmm main 已完成并合入；真实 Cloud Hypervisor effects 仍待接入。
-- Store 的原子 create/bindings、placement 复核和 stale Node/offline CAS 已完成；production trait adapter 正在实现。
+- Store 的原子 create/bindings、placement 复核和 stale Node/offline CAS 已完成；生命周期、Node 管理和 noded HTTP production adapters 已合入。
+- `SemanticResourceApi` 聚合与真实唯一入口 adapter 仍在并行实现；当前入口 placeholder 明确失败，不伪装成功。
 - 公开 Cat/Disk 同步 HTTP handlers 已完成并合入；AppState 和主 router composition 待接线。
 - 切换合同的 noded 静态断言已按实际 `lane_if_open` 命名校准；production composition 仍待接线。
