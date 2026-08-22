@@ -977,7 +977,7 @@ pub async fn spawn_with_gateway_machine(
     let semantic_lifecycle = crate::semantic_lifecycle::SemanticLifecycleService::new(
         crate::semantic_adapters::SemanticStoreAdapter::new(Arc::clone(&store)),
         crate::semantic_adapters::SemanticNodedLifecycleAdapter::new(semantic_noded_client),
-        crate::semantic_adapters::UnavailableIngressPort,
+        crate::semantic_adapters::SemanticIngressAdapter::new(Arc::clone(&store)),
         crate::semantic_lifecycle::LifecycleTimeouts::default(),
     );
     let semantic_resources: Arc<dyn crate::api::semantic_resources::SemanticResourceApi> = Arc::new(
