@@ -28,7 +28,7 @@
 | noded HTTP client | `control-plane/src/semantic_noded_client.rs` | Control 同步调用 noded、Bearer、deadline、严格响应校验 | 已完成并合入 |
 | PersistentDisk | `control-plane/src/semantic_disk.rs`、`node-agent/src/semantic_mounts.rs` | create/binding/destroy 语义与 Guest 完整挂载确认 | 已完成并合入 |
 | CLI | `cmd/cats/` | slug 命令、同步 REST、`--mount`、GiB 解析、`node_name` 展示 | 已完成并合入 |
-| noded 执行 | `node-agent/`、`cmd/noded/` | 同步 HTTP server、每 Cat 串行、destroy 清理、实际 effects 接入 | 实施中 |
+| noded 执行 | `node-agent/`、`cmd/noded/` | 同步 HTTP server、每 Cat 串行、destroy 清理、实际 effects 接入 | FakeVmm 已完成并合入；Cloud Hypervisor effects 待接入 |
 | Node 管理 | Control API、Node heartbeat client | 注册、`node_name`、`control_endpoint`、offline/reset/drain | 已完成并合入；Store/进程接线待后续项 |
 | Production adapters | Control adapter | Store/placement/noded/入口实现与公共 DTO 映射 | 实施中 |
 | HTTP composition | Control router、AppState、controld/noded main | 新路由和服务接线，旧路由退出 | 待开始 |
@@ -49,14 +49,16 @@
 
 - [x] 实现 CLI 同步 slug API。
 - [x] 实现 Disk 语义与 Guest mount-ready 校验。
-- [ ] 合入 noded 同步执行服务，并接现有 FakeVmm/真实物理效果。
+- [x] 合入 noded 同步执行服务并接入 FakeVmm。
+- [ ] 接入 Cloud Hypervisor、volume 和 route 的真实 `SemanticCatEffects`。
 - [x] 合入 Node 注册、心跳、主动探测、reset 和 drain 的服务与 HTTP client。
-- [ ] 完成 Store adapter：create 时原子建立 Cat 与初始 bindings；补 placement 和 stale Node 查询。
+- [x] Store 完成 create 原子建立 Cat/初始 bindings、placement 复核和 stale Node 查询。
+- [ ] 完成生命周期与 Node 管理 trait 的 production Store adapter。
 
 ### 阶段 C：纵向接线
 
 - [ ] 将新服务加入 Control `AppState` 和 router。
-- [ ] 将 noded main 切换为同步 server、注册和 heartbeat supervisor。
+- [x] 将 FakeVmm noded main 切换为同步 server、注册和 heartbeat supervisor。
 - [ ] 用同一个 placement gate 阻止 reset 期间的新 Cat 动作。
 - [ ] 接入唯一入口的 `withdraw → Node Ready → publish` 顺序。
 - [ ] 跑通 FakeVmm 的 Cat/Disk 完整状态机。
@@ -82,7 +84,7 @@
 
 | 提交 | 内容 | 定向验证 |
 |---|---|---|
-| `73659d66`、`4a80df0b` | ADR-0059 与切换合同 | 当前 4/6 通过；noded 与 production composition 待接线 |
+| `73659d66`、`4a80df0b` | ADR-0059 与切换合同 | noded 断言随实现校准；production composition 待接线 |
 | `f7cc7dc1` | 公共 semantic wire | API tests、Clippy |
 | `b845b381` | v19 schema 与 semantic Store | Control check、schema tests；PG tests 待环境 |
 | `ad88cc2e` | Control lifecycle coordinator | 10 tests、Clippy |
@@ -90,6 +92,8 @@
 | `996739b7` | 同步 slug CLI | 91 tests、Clippy |
 | `d4370e5a` | Disk 语义与 Guest mount-ready | Control 6 tests、Node 4 tests、Clippy |
 | `0444cf16` | Node 注册、心跳、offline/reset/drain 服务与 noded client | Control 3 tests、Node 2 tests、Clippy |
+| `854a1668` | 原子 Cat create/binding、placement 复核、数据库时间 heartbeat/offline CAS | semantic Store 单测编译；PG 行为待最终环境 |
+| `9c29e348`、`ff2bde49`、`1429c0ab` | noded 同步每 Cat lane、reset gate、FakeVmm production main | Node 9 tests、client 2 tests、noded 2 tests |
 
 ## 5. 进度更新规则
 
@@ -105,5 +109,6 @@
 - 建立并行工作树和空数据单协议基线。
 - 完成并合入公共 wire、v19 schema/Store、Control coordinator、noded HTTP client、CLI 和 Disk/mount-ready 切片。
 - 完成并合入 Node 管理服务、Control 注册/心跳路由和 noded heartbeat/reset client。
-- 切换合同当前 4/6 通过，只剩 noded 同步服务和 production composition 两项未完成。
-- noded 同步执行分支正在收尾；Production Store adapter 正在实现。
+- noded 同步执行、per-Cat lane、destroy 清理、reset gate 和 FakeVmm main 已完成并合入；真实 Cloud Hypervisor effects 仍待接入。
+- Store 的原子 create/bindings、placement 复核和 stale Node/offline CAS 已完成；production trait adapter 正在实现。
+- 切换合同的 noded 静态断言已按实际 `lane_if_open` 命名校准；production composition 仍待接线。

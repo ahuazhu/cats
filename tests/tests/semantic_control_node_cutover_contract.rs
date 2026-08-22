@@ -153,7 +153,7 @@ fn noded_exposes_synchronous_semantic_routes_and_one_lane_per_cat() {
             "/v1/cats/{cat_id}/actions/warm",
             "/v1/cats/{cat_id}/actions/cold",
             "struct CatLane",
-            "fn lane(&self, cat_id",
+            "fn lane_if_open(&self, cat_id",
         ],
         "semantic noded lifecycle",
     );
