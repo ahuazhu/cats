@@ -37,3 +37,4 @@ pub mod runtime_node_authority;
 pub mod runtime_product_reads;
 pub mod runtime_reconciliation;
 pub mod runtime_route;
+pub mod semantic_control;
