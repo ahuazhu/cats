@@ -20,6 +20,7 @@ pub const MISSED_HEARTBEAT_WINDOW: Duration =
     Duration::from_secs(HEARTBEAT_INTERVAL.as_secs() * MISSED_HEARTBEATS_BEFORE_PROBE as u64);
 
 pub type NodeFuture<T> = Pin<Box<dyn Future<Output = Result<T, ApiError>> + Send>>;
+pub type OfflineNodeRecovery = Arc<dyn Fn(String) -> NodeFuture<()> + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeRecord {
@@ -118,6 +119,7 @@ pub struct NodeManagementService {
     repository: Arc<dyn NodeRepository>,
     health_probe: Arc<dyn NodeHealthProbe>,
     missed_heartbeat_window: Duration,
+    offline_recovery: Option<OfflineNodeRecovery>,
 }
 
 impl NodeManagementService {
@@ -129,6 +131,7 @@ impl NodeManagementService {
             repository,
             health_probe,
             missed_heartbeat_window: MISSED_HEARTBEAT_WINDOW,
+            offline_recovery: None,
         }
     }
 
@@ -146,7 +149,13 @@ impl NodeManagementService {
             repository,
             health_probe,
             missed_heartbeat_window,
+            offline_recovery: None,
         })
+    }
+
+    pub fn with_offline_recovery(mut self, recovery: OfflineNodeRecovery) -> Self {
+        self.offline_recovery = Some(recovery);
+        self
     }
 
     pub async fn register(
@@ -207,7 +216,12 @@ impl NodeManagementService {
                 .mark_offline_if_heartbeat_unchanged(candidate.clone())
                 .await?
             {
-                changed.push(candidate.node_id);
+                changed.push(candidate.node_id.clone());
+                if let Some(recover) = &self.offline_recovery {
+                    if let Err(error) = recover(candidate.node_id).await {
+                        tracing::warn!(%error, "offline Node Cat recovery failed; retrying after the next liveness pass");
+                    }
+                }
             }
         }
         Ok(changed)
@@ -392,6 +406,14 @@ mod tests {
             ]),
             ..MockRepository::default()
         });
+        let recovered = Arc::new(Mutex::new(Vec::new()));
+        let recovery: OfflineNodeRecovery = {
+            let recovered = Arc::clone(&recovered);
+            Arc::new(move |node_id| {
+                recovered.lock().expect("lock recoveries").push(node_id);
+                Box::pin(async { Ok(()) })
+            })
+        };
         let service = NodeManagementService::new(
             repository.clone(),
             Arc::new(MockProbe {
@@ -399,7 +421,8 @@ mod tests {
             }),
             Duration::from_secs(30),
         )
-        .expect("service");
+        .expect("service")
+        .with_offline_recovery(recovery);
 
         assert_eq!(
             service.detect_offline_nodes().await.expect("detect"),
@@ -407,6 +430,10 @@ mod tests {
         );
         assert_eq!(
             *repository.marked.lock().expect("lock marks"),
+            vec!["node_failed"]
+        );
+        assert_eq!(
+            *recovered.lock().expect("lock recoveries"),
             vec!["node_failed"]
         );
     }

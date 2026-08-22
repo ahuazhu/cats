@@ -185,6 +185,42 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
     let noded_service_token =
         cats_api::semantic_control::NodedServiceToken::new(cfg.noded_service_token.clone())
             .context("CATS_NODED_SERVICE_TOKEN must satisfy the semantic noded token contract")?;
+    let semantic_noded_client = crate::semantic_noded_client::SemanticNodedClient::new(
+        noded_service_token.clone(),
+        crate::semantic_noded_client::SemanticNodedClientConfig::default(),
+    )?;
+    let semantic_noded =
+        crate::semantic_adapters::SemanticNodedLifecycleAdapter::new(semantic_noded_client);
+    let semantic_ingress =
+        crate::semantic_adapters::SemanticIngressAdapter::new(Arc::clone(&store));
+    let recovery = Arc::new(
+        crate::semantic_node_recovery::SemanticNodeRecoveryService::new(
+            crate::semantic_node_recovery::PostgresSemanticNodeRecoveryStore::new(Arc::clone(
+                &store,
+            )),
+            semantic_noded.clone(),
+            semantic_ingress.clone(),
+            crate::semantic_node_recovery::RecoveryTimeouts::default(),
+        ),
+    );
+    let offline_recovery: crate::semantic_node::OfflineNodeRecovery = Arc::new(move |node_id| {
+        let recovery = Arc::clone(&recovery);
+        Box::pin(async move {
+            let report = recovery
+                .recover_offline_node(&node_id)
+                .await
+                .map_err(|error| cats_api::error::ApiError::internal(error.message))?;
+            for cat in report.cats {
+                tracing::info!(
+                    source_node_id = %report.source_node_id,
+                    cat_id = %cat.cat_id,
+                    status = ?cat.status,
+                    "offline Node Cat recovery settled"
+                );
+            }
+            Ok(())
+        })
+    });
     let semantic_node_repository: Arc<dyn crate::semantic_node::NodeRepository> =
         Arc::new(crate::semantic_adapters::SemanticNodeRepositoryAdapter::new(Arc::clone(&store)));
     let semantic_node_probe: Arc<dyn crate::semantic_node::NodeHealthProbe> = Arc::new(
@@ -194,20 +230,17 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         crate::semantic_node::NodeManagementService::with_default_heartbeat_policy(
             semantic_node_repository,
             semantic_node_probe,
-        ),
+        )
+        .with_offline_recovery(offline_recovery),
     );
     let semantic_node_http = crate::api::semantic_nodes::SemanticNodeHttpState::new(
         Arc::clone(&semantic_node_service),
         noded_service_token.clone(),
     );
-    let semantic_noded_client = crate::semantic_noded_client::SemanticNodedClient::new(
-        noded_service_token,
-        crate::semantic_noded_client::SemanticNodedClientConfig::default(),
-    )?;
     let semantic_lifecycle = crate::semantic_lifecycle::SemanticLifecycleService::new(
         crate::semantic_adapters::SemanticStoreAdapter::new(Arc::clone(&store)),
-        crate::semantic_adapters::SemanticNodedLifecycleAdapter::new(semantic_noded_client),
-        crate::semantic_adapters::SemanticIngressAdapter::new(Arc::clone(&store)),
+        semantic_noded,
+        semantic_ingress,
         crate::semantic_lifecycle::LifecycleTimeouts::default(),
     );
     let semantic_resources: Arc<dyn crate::api::semantic_resources::SemanticResourceApi> = Arc::new(
