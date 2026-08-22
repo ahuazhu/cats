@@ -145,12 +145,12 @@ pub struct NewCat<'a> {
 }
 
 /// One mount requested as part of an atomic Cat create. The public create
-/// protocol names a disk by its current workspace-scoped slug; the Store
-/// resolves that slug to the immutable disk ID while holding the disk row.
+/// protocol resolves a current workspace-scoped slug before admission. The
+/// Store only accepts and locks the resulting immutable disk ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewCatMount<'a> {
     pub binding_id: &'a str,
-    pub disk_slug: &'a str,
+    pub disk_id: &'a str,
     pub mount_path: &'a str,
 }
 
@@ -357,6 +357,12 @@ pub struct DiskBindingRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskBindingWithCat {
+    pub binding: DiskBindingRecord,
+    pub cat_slug: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttachDiskOutcome {
     Attached(DiskBindingRecord),
     AlreadyAttached(DiskBindingRecord),
@@ -390,13 +396,13 @@ impl Store {
         &self,
         request: AtomicCatCreate<'_>,
     ) -> Result<AdmitCatCreateOutcome> {
-        let mut disk_slugs = std::collections::BTreeSet::new();
+        let mut disk_ids = std::collections::BTreeSet::new();
         let mut mount_paths = std::collections::BTreeSet::new();
         for mount in request.mounts {
-            if !disk_slugs.insert(mount.disk_slug) {
+            if !disk_ids.insert(mount.disk_id) {
                 return Ok(AdmitCatCreateOutcome::MountRejected {
                     code: "duplicate_disk_mount".to_owned(),
-                    message: format!("disk slug {} is mounted more than once", mount.disk_slug),
+                    message: format!("disk {} is mounted more than once", mount.disk_id),
                 });
             }
             if !mount_paths.insert(mount.mount_path) {
@@ -497,45 +503,51 @@ impl Store {
             };
             let cat = row_to_cat(&row);
 
-            // Lock disks in slug order so two multi-disk creates cannot
+            // Lock disks in immutable-ID order so two multi-disk creates cannot
             // deadlock merely because clients supplied mounts in a different
             // order.
             let mut mounts = request.mounts.iter().collect::<Vec<_>>();
-            mounts.sort_unstable_by_key(|mount| mount.disk_slug);
+            mounts.sort_unstable_by_key(|mount| mount.disk_id);
             for mount in mounts {
                 let disk = transaction.query_opt(
-                    "SELECT disk_id,status FROM persistent_disks
-                      WHERE workspace_id=$1 AND disk_slug=$2 AND deleted_at IS NULL
-                      FOR UPDATE",
-                    &[&request.workspace_id, &mount.disk_slug],
+                    "SELECT workspace_id,status FROM persistent_disks
+                      WHERE disk_id=$1 FOR UPDATE",
+                    &[&mount.disk_id],
                 )?;
                 let Some(disk) = disk else {
                     transaction.rollback()?;
                     return Ok(AdmitCatCreateOutcome::MountRejected {
                         code: "disk_not_found".to_owned(),
-                        message: format!("disk slug {} was not found", mount.disk_slug),
+                        message: format!("disk {} was not found", mount.disk_id),
                     });
                 };
-                let disk_id: String = disk.get(0);
+                let disk_workspace: &str = disk.get(0);
                 let status: &str = disk.get(1);
+                if disk_workspace != request.workspace_id {
+                    transaction.rollback()?;
+                    return Ok(AdmitCatCreateOutcome::MountRejected {
+                        code: "disk_not_found".to_owned(),
+                        message: format!("disk {} was not found", mount.disk_id),
+                    });
+                }
                 if status != "normal" {
                     transaction.rollback()?;
                     return Ok(AdmitCatCreateOutcome::MountRejected {
                         code: "disk_deleted".to_owned(),
-                        message: format!("disk slug {} is deleted", mount.disk_slug),
+                        message: format!("disk {} is deleted", mount.disk_id),
                     });
                 }
                 if transaction
                     .query_opt(
                         "SELECT binding_id FROM disk_bindings WHERE disk_id=$1 FOR UPDATE",
-                        &[&disk_id],
+                        &[&mount.disk_id],
                     )?
                     .is_some()
                 {
                     transaction.rollback()?;
                     return Ok(AdmitCatCreateOutcome::MountRejected {
                         code: "disk_already_attached".to_owned(),
-                        message: format!("disk slug {} is already attached", mount.disk_slug),
+                        message: format!("disk {} is already attached", mount.disk_id),
                     });
                 }
                 transaction.execute(
@@ -547,7 +559,7 @@ impl Store {
                     &[
                         &mount.binding_id,
                         &request.workspace_id,
-                        &disk_id,
+                        &mount.disk_id,
                         &request.cat_id,
                         &mount.mount_path,
                     ],
@@ -747,6 +759,22 @@ impl Store {
                     &[&cat_id],
                 )
                 .map(|row| row.map(|row| row_to_cat(&row)))
+        })
+    }
+
+    pub fn find_semantic_cat_with_mounts_by_id(
+        &self,
+        cat_id: &str,
+    ) -> Result<Option<CatWithMounts>> {
+        self.with(|client| {
+            let Some(row) = client.query_opt(
+                &format!("SELECT {CAT_COLUMNS} FROM cats WHERE cat_id=$1"),
+                &[&cat_id],
+            )?
+            else {
+                return Ok(None);
+            };
+            cat_with_mounts(client, row_to_cat(&row)).map(Some)
         })
     }
 
@@ -1047,6 +1075,43 @@ impl Store {
                     &[&workspace_id, &disk_slug],
                 )
                 .map(|row| row.map(|row| row_to_disk(&row)))
+        })
+    }
+
+    pub fn find_semantic_disk_by_id(
+        &self,
+        disk_id: &str,
+    ) -> Result<Option<PersistentDiskRecord>> {
+        self.with(|client| {
+            client
+                .query_opt(
+                    &format!("SELECT {DISK_COLUMNS} FROM persistent_disks WHERE disk_id=$1"),
+                    &[&disk_id],
+                )
+                .map(|row| row.map(|row| row_to_disk(&row)))
+        })
+    }
+
+    pub fn find_semantic_disk_binding(
+        &self,
+        disk_id: &str,
+    ) -> Result<Option<DiskBindingWithCat>> {
+        self.with(|client| {
+            client
+                .query_opt(
+                    "SELECT b.binding_id,b.workspace_id,b.disk_id,b.cat_id,
+                            b.mount_path,b.created_at,c.cat_slug
+                           FROM disk_bindings b
+                           JOIN cats c ON c.cat_id=b.cat_id
+                          WHERE b.disk_id=$1",
+                    &[&disk_id],
+                )
+                .map(|row| {
+                    row.map(|row| DiskBindingWithCat {
+                        binding: row_to_binding(&row),
+                        cat_slug: row.get(6),
+                    })
+                })
         })
     }
 
@@ -1384,13 +1449,13 @@ fn cat_create_configuration_matches(
     let mut existing_mounts = existing
         .mounts
         .iter()
-        .map(|mount| (mount.disk_slug.as_str(), mount.mount_path.as_str()))
+        .map(|mount| (mount.disk_id.as_str(), mount.mount_path.as_str()))
         .collect::<Vec<_>>();
     existing_mounts.sort_unstable();
     let mut requested_mounts = request
         .mounts
         .iter()
-        .map(|mount| (mount.disk_slug, mount.mount_path))
+        .map(|mount| (mount.disk_id, mount.mount_path))
         .collect::<Vec<_>>();
     requested_mounts.sort_unstable();
     existing_mounts == requested_mounts

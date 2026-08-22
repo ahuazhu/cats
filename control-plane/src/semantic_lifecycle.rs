@@ -225,6 +225,7 @@ pub enum Admission {
     Conflict { cat: CatRecord, code: &'static str },
     InvalidState(CatRecord),
     NotFound,
+    Rejected { code: String, message: String },
 }
 
 /// Store integration failure.
@@ -464,6 +465,10 @@ pub enum LifecycleError {
     Timeout {
         cat: CatRecord,
     },
+    Rejected {
+        code: String,
+        message: String,
+    },
 }
 
 impl From<StoreError> for LifecycleError {
@@ -559,6 +564,9 @@ where
             Admission::Conflict { cat, code } => Err(LifecycleError::Conflict { cat, code }),
             Admission::InvalidState(cat) => Err(LifecycleError::InvalidState(cat)),
             Admission::NotFound => Err(LifecycleError::NotFound),
+            Admission::Rejected { code, message } => {
+                Err(LifecycleError::Rejected { code, message })
+            }
         }
     }
 
