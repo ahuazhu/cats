@@ -9,10 +9,6 @@ pub mod guest_client;
 pub mod lifecycle_command;
 pub mod lifecycle_volume_client;
 pub mod object_write_credential;
-/// End-to-end acceptance for the Node -> ObjectWrite Gateway -> object-store
-/// publish chain. This crate is the only one that can see all of it.
-#[cfg(test)]
-mod object_write_end_to_end;
 pub(crate) mod physical_read;
 pub(crate) mod proc;
 pub mod route_command;
