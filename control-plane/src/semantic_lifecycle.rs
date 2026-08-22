@@ -78,6 +78,9 @@ impl CatAction {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct CatMount {
     pub disk_id: String,
+    pub volume_id: String,
+    pub filesystem_uuid: String,
+    pub disk_format: String,
     pub mount_path: String,
 }
 
@@ -1112,6 +1115,9 @@ mod tests {
             boot_image: "ubuntu-24.04".to_owned(),
             mounts: vec![CatMount {
                 disk_id: "disk-1".to_owned(),
+                volume_id: "vol-1".to_owned(),
+                filesystem_uuid: "11111111111111111111111111111111".to_owned(),
+                disk_format: "ext4".to_owned(),
                 mount_path: "/data".to_owned(),
             }],
         }
@@ -1158,10 +1164,16 @@ mod tests {
                 mounts: vec![
                     CatMount {
                         disk_id: "disk-2".to_owned(),
+                        volume_id: "vol-2".to_owned(),
+                        filesystem_uuid: "22222222222222222222222222222222".to_owned(),
+                        disk_format: "ext4".to_owned(),
                         mount_path: "/cache".to_owned(),
                     },
                     CatMount {
                         disk_id: "disk-1".to_owned(),
+                        volume_id: "vol-1".to_owned(),
+                        filesystem_uuid: "11111111111111111111111111111111".to_owned(),
+                        disk_format: "ext4".to_owned(),
                         mount_path: "/data".to_owned(),
                     },
                 ],

@@ -8,13 +8,15 @@ use std::sync::Arc;
 
 use cats_api::runtime_reconciliation::Id;
 use cats_api::semantic_control as wire;
+use sha2::{Digest, Sha256};
 
 use crate::api::semantic_resources::{SemanticResourceApi, SemanticResourceFuture};
 use crate::semantic_lifecycle as lifecycle;
 use crate::store::semantic as db;
 use crate::store::{new_id, Store};
 
-const STRICT_DISK_BACKEND_GAP: &str = "strict PersistentDisk backend is unavailable: the semantic schema does not persist the exact volume/filesystem identity, create has no atomic strict-volume provision boundary, delete has no backend completion boundary, and noded receives only disk_id plus mount_path";
+const STRICT_DISK_BACKEND_GAP: &str =
+    "strict PersistentDisk backend is not installed in this Control composition";
 
 pub trait LifecycleResourcePort: Send + Sync {
     fn create<'a>(
@@ -126,6 +128,36 @@ pub trait SemanticResourceStore: Send + Sync {
         cat_id: String,
         disk_id: String,
     ) -> SemanticResourceFuture<'a, Result<db::DetachDiskOutcome, ResourceStoreError>>;
+
+    fn admit_disk_create<'a>(
+        &'a self,
+        candidate: DiskCreateCandidate,
+    ) -> SemanticResourceFuture<'a, Result<db::CreatePersistentDiskOutcome, ResourceStoreError>>;
+
+    fn complete_disk_create<'a>(
+        &'a self,
+        disk: db::PersistentDiskRecord,
+    ) -> SemanticResourceFuture<'a, Result<db::PersistentDiskRecord, ResourceStoreError>>;
+
+    fn begin_disk_destroy<'a>(
+        &'a self,
+        disk_id: String,
+    ) -> SemanticResourceFuture<'a, Result<db::DeletePersistentDiskOutcome, ResourceStoreError>>;
+
+    fn complete_disk_destroy<'a>(
+        &'a self,
+        disk: db::PersistentDiskRecord,
+    ) -> SemanticResourceFuture<'a, Result<db::PersistentDiskRecord, ResourceStoreError>>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskCreateCandidate {
+    pub disk_id: String,
+    pub workspace_id: String,
+    pub disk_slug: String,
+    pub size_bytes: i64,
+    pub volume_id: String,
+    pub filesystem_uuid: String,
 }
 
 /// Async-safe PostgreSQL adapter. Every synchronous Store call runs on the
@@ -259,10 +291,129 @@ impl SemanticResourceStore for PostgresSemanticResourceStore {
                 .map_err(resource_store_error)
         })
     }
+
+    fn admit_disk_create<'a>(
+        &'a self,
+        candidate: DiskCreateCandidate,
+    ) -> SemanticResourceFuture<'a, Result<db::CreatePersistentDiskOutcome, ResourceStoreError>>
+    {
+        let store = Arc::clone(&self.store);
+        Box::pin(async move {
+            store
+                .execute(move |store| {
+                    store.create_semantic_persistent_disk(db::NewPersistentDisk {
+                        disk_id: &candidate.disk_id,
+                        workspace_id: &candidate.workspace_id,
+                        disk_slug: &candidate.disk_slug,
+                        size_bytes: candidate.size_bytes,
+                        volume_id: &candidate.volume_id,
+                        filesystem_uuid: &candidate.filesystem_uuid,
+                        disk_format: "ext4",
+                    })
+                })
+                .await
+                .map_err(resource_store_error)
+        })
+    }
+
+    fn complete_disk_create<'a>(
+        &'a self,
+        disk: db::PersistentDiskRecord,
+    ) -> SemanticResourceFuture<'a, Result<db::PersistentDiskRecord, ResourceStoreError>> {
+        let store = Arc::clone(&self.store);
+        Box::pin(async move {
+            let disk_id = disk.disk_id.clone();
+            store
+                .execute(move |store| {
+                    store.complete_semantic_persistent_disk_create(
+                        &disk.disk_id,
+                        &disk.volume_id,
+                        &disk.filesystem_uuid,
+                        disk.size_bytes,
+                    )
+                })
+                .await
+                .map_err(resource_store_error)?
+                .ok_or_else(|| {
+                    ResourceStoreError::new(format!(
+                        "strict create completion no longer matches disk {disk_id}"
+                    ))
+                })
+        })
+    }
+
+    fn begin_disk_destroy<'a>(
+        &'a self,
+        disk_id: String,
+    ) -> SemanticResourceFuture<'a, Result<db::DeletePersistentDiskOutcome, ResourceStoreError>>
+    {
+        let store = Arc::clone(&self.store);
+        Box::pin(async move {
+            store
+                .execute(move |store| store.delete_semantic_persistent_disk(&disk_id))
+                .await
+                .map_err(resource_store_error)
+        })
+    }
+
+    fn complete_disk_destroy<'a>(
+        &'a self,
+        disk: db::PersistentDiskRecord,
+    ) -> SemanticResourceFuture<'a, Result<db::PersistentDiskRecord, ResourceStoreError>> {
+        let store = Arc::clone(&self.store);
+        Box::pin(async move {
+            let disk_id = disk.disk_id.clone();
+            store
+                .execute(move |store| {
+                    store.complete_semantic_persistent_disk_delete(&disk.disk_id, &disk.volume_id)
+                })
+                .await
+                .map_err(resource_store_error)?
+                .ok_or_else(|| {
+                    ResourceStoreError::new(format!(
+                        "strict delete completion no longer matches disk {disk_id}"
+                    ))
+                })
+        })
+    }
 }
 
 fn resource_store_error(error: cats_api::error::ApiError) -> ResourceStoreError {
     ResourceStoreError::new(error.message)
+}
+
+/// Strict, remotely durable Volume boundary. The immutable identity is
+/// allocated and persisted before either method is invoked, so discovery
+/// after an ambiguous response always uses the same `volume_id`.
+pub trait SemanticPersistentDiskBackend: Send + Sync {
+    fn ensure_created<'a>(
+        &'a self,
+        disk: &'a db::PersistentDiskRecord,
+    ) -> SemanticResourceFuture<'a, Result<(), ResourceStoreError>>;
+
+    fn ensure_destroyed<'a>(
+        &'a self,
+        disk: &'a db::PersistentDiskRecord,
+    ) -> SemanticResourceFuture<'a, Result<(), ResourceStoreError>>;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnavailablePersistentDiskBackend;
+
+impl SemanticPersistentDiskBackend for UnavailablePersistentDiskBackend {
+    fn ensure_created<'a>(
+        &'a self,
+        _disk: &'a db::PersistentDiskRecord,
+    ) -> SemanticResourceFuture<'a, Result<(), ResourceStoreError>> {
+        Box::pin(async { Err(ResourceStoreError::new(STRICT_DISK_BACKEND_GAP)) })
+    }
+
+    fn ensure_destroyed<'a>(
+        &'a self,
+        _disk: &'a db::PersistentDiskRecord,
+    ) -> SemanticResourceFuture<'a, Result<(), ResourceStoreError>> {
+        Box::pin(async { Err(ResourceStoreError::new(STRICT_DISK_BACKEND_GAP)) })
+    }
 }
 
 /// Store adapter used by [`lifecycle::SemanticLifecycleService`].
@@ -284,12 +435,12 @@ impl lifecycle::SemanticLifecycleStore for PostgresSemanticLifecycleStore {
     ) -> lifecycle::SemanticFuture<'a, Result<lifecycle::Admission, lifecycle::StoreError>> {
         let store = Arc::clone(&self.store);
         let request = request.clone();
-        let cat_id = new_id("cat");
+        let cat_id = new_id("cat_");
         let mounts = request
             .config
             .mounts
             .iter()
-            .map(|mount| (new_id("binding"), mount.clone()))
+            .map(|mount| (new_id("mnt_"), mount.clone()))
             .collect::<Vec<_>>();
         Box::pin(async move {
             store
@@ -435,7 +586,7 @@ impl PostgresSemanticLifecycleStore {
             .map(str::to_owned);
             store
                 .execute(move |store| {
-                    store.finish_semantic_cat_action(
+                    let row = store.finish_semantic_cat_action(
                         &claim.cat.cat_id,
                         db::FinishCatAction {
                             expected_action: lifecycle_action_to_db(claim.action),
@@ -445,12 +596,16 @@ impl PostgresSemanticLifecycleStore {
                             error_code: error_code.as_deref(),
                             error_message: error_message.as_deref(),
                         },
-                    )
+                    )?;
+                    let Some(row) = row else {
+                        return Ok(None);
+                    };
+                    store.find_semantic_cat_with_mounts_by_id(&row.cat_id)
                 })
                 .await
                 .map_err(lifecycle_store_error)?
                 .ok_or_else(|| lifecycle::StoreError::new("Cat action claim became stale"))
-                .and_then(db_cat_to_lifecycle)
+                .and_then(db_aggregate_to_lifecycle)
         })
     }
 }
@@ -549,14 +704,13 @@ fn db_aggregate_to_lifecycle(
         .into_iter()
         .map(|mount| lifecycle::CatMount {
             disk_id: mount.disk_id,
+            volume_id: mount.volume_id,
+            filesystem_uuid: mount.filesystem_uuid,
+            disk_format: mount.disk_format,
             mount_path: mount.mount_path,
         })
         .collect();
     db_cat_to_lifecycle_with_mounts(aggregate.cat, mounts)
-}
-
-fn db_cat_to_lifecycle(cat: db::CatRecord) -> Result<lifecycle::CatRecord, lifecycle::StoreError> {
-    db_cat_to_lifecycle_with_mounts(cat, Vec::new())
 }
 
 fn db_cat_to_lifecycle_with_mounts(
@@ -639,24 +793,37 @@ fn already_code(state: db::CatState) -> &'static str {
 
 /// Aggregate supplied to `semantic_resources::routes` by production
 /// composition. The router itself remains independent of this type.
-pub struct ProductionSemanticResourceApi<L, R> {
+pub struct ProductionSemanticResourceApi<L, R, B = UnavailablePersistentDiskBackend> {
     lifecycle: L,
     resources: R,
+    disk_backend: B,
 }
 
-impl<L, R> ProductionSemanticResourceApi<L, R> {
+impl<L, R> ProductionSemanticResourceApi<L, R, UnavailablePersistentDiskBackend> {
     pub fn new(lifecycle: L, resources: R) -> Self {
         Self {
             lifecycle,
             resources,
+            disk_backend: UnavailablePersistentDiskBackend,
         }
     }
 }
 
-impl<L, R> SemanticResourceApi for ProductionSemanticResourceApi<L, R>
+impl<L, R, B> ProductionSemanticResourceApi<L, R, B> {
+    pub fn with_disk_backend(lifecycle: L, resources: R, disk_backend: B) -> Self {
+        Self {
+            lifecycle,
+            resources,
+            disk_backend,
+        }
+    }
+}
+
+impl<L, R, B> SemanticResourceApi for ProductionSemanticResourceApi<L, R, B>
 where
     L: LifecycleResourcePort,
     R: SemanticResourceStore,
+    B: SemanticPersistentDiskBackend,
 {
     fn create_cat<'a>(
         &'a self,
@@ -679,6 +846,9 @@ where
                     })?;
                 mounts.push(lifecycle::CatMount {
                     disk_id: disk.disk_id,
+                    volume_id: disk.volume_id,
+                    filesystem_uuid: disk.filesystem_uuid,
+                    disk_format: disk.disk_format,
                     mount_path: mount.mount_path.to_string(),
                 });
             }
@@ -738,7 +908,7 @@ where
         request: wire::CreateDiskRequest,
     ) -> SemanticResourceFuture<'a, Result<wire::DiskResponse, wire::SemanticErrorBody>> {
         Box::pin(async move {
-            if let Some(disk) = self
+            let (disk, created) = if let Some(disk) = self
                 .resources
                 .current_disk(workspace_id, request.disk_slug.as_str())
                 .await
@@ -750,13 +920,65 @@ where
                         "current PersistentDisk has a different size",
                     ));
                 }
-                return Ok(wire::DiskResponse {
-                    status: wire::SemanticStatus::AlreadyExists,
-                    code: wire::SemanticSuccessCode::AlreadyExists,
-                    disk: self.project_disk(&disk.disk_id).await?,
-                });
-            }
-            Err(strict_disk_backend_gap())
+                (disk, false)
+            } else {
+                let disk_id = new_id("disk_");
+                let candidate = disk_create_candidate(
+                    workspace_id,
+                    request.disk_slug.as_str(),
+                    request.size_bytes,
+                    disk_id,
+                )?;
+                match self
+                    .resources
+                    .admit_disk_create(candidate)
+                    .await
+                    .map_err(internal_resource_error)?
+                {
+                    db::CreatePersistentDiskOutcome::Created(disk) => (disk, true),
+                    db::CreatePersistentDiskOutcome::Existing(disk) => {
+                        if u64::try_from(disk.size_bytes).ok() != Some(request.size_bytes) {
+                            return Err(semantic_error(
+                                wire::SemanticErrorCode::DiskSizeConflict,
+                                "current PersistentDisk has a different size",
+                            ));
+                        }
+                        (disk, false)
+                    }
+                }
+            };
+            let disk = match disk.status.as_str() {
+                "normal" => disk,
+                "provisioning" => {
+                    self.disk_backend
+                        .ensure_created(&disk)
+                        .await
+                        .map_err(internal_resource_error)?;
+                    self.resources
+                        .complete_disk_create(disk)
+                        .await
+                        .map_err(internal_resource_error)?
+                }
+                _ => {
+                    return Err(semantic_error(
+                        wire::SemanticErrorCode::DiskDeleted,
+                        "PersistentDisk is being deleted",
+                    ));
+                }
+            };
+            Ok(wire::DiskResponse {
+                status: if created {
+                    wire::SemanticStatus::Ok
+                } else {
+                    wire::SemanticStatus::AlreadyExists
+                },
+                code: if created {
+                    wire::SemanticSuccessCode::DiskCreated
+                } else {
+                    wire::SemanticSuccessCode::AlreadyExists
+                },
+                disk: self.project_disk(&disk.disk_id).await?,
+            })
         })
     }
 
@@ -772,7 +994,7 @@ where
             let outcome = self
                 .resources
                 .attach(
-                    new_id("binding"),
+                    new_id("mnt_"),
                     cat.cat_id,
                     disk.disk_id.clone(),
                     request.mount_path.to_string(),
@@ -835,15 +1057,55 @@ where
                     "PersistentDisk is still bound to a Cat",
                 ));
             }
-            Err(strict_disk_backend_gap())
+            let deleting = match self
+                .resources
+                .begin_disk_destroy(disk.disk_id.clone())
+                .await
+                .map_err(internal_resource_error)?
+            {
+                db::DeletePersistentDiskOutcome::Deleting(disk)
+                | db::DeletePersistentDiskOutcome::AlreadyDeleted(disk) => disk,
+                db::DeletePersistentDiskOutcome::Attached => {
+                    return Err(semantic_error(
+                        wire::SemanticErrorCode::DiskInUse,
+                        "PersistentDisk is still bound to a Cat",
+                    ));
+                }
+                db::DeletePersistentDiskOutcome::NotFound => {
+                    return Err(semantic_error(
+                        wire::SemanticErrorCode::DiskNotFound,
+                        "PersistentDisk was not found",
+                    ));
+                }
+            };
+            if deleting.status != "deleted" {
+                self.disk_backend
+                    .ensure_destroyed(&deleting)
+                    .await
+                    .map_err(internal_resource_error)?;
+            }
+            let deleted = if deleting.status == "deleted" {
+                deleting
+            } else {
+                self.resources
+                    .complete_disk_destroy(deleting)
+                    .await
+                    .map_err(internal_resource_error)?
+            };
+            Ok(wire::DiskResponse {
+                status: wire::SemanticStatus::Ok,
+                code: wire::SemanticSuccessCode::DiskDeleted,
+                disk: self.project_disk(&deleted.disk_id).await?,
+            })
         })
     }
 }
 
-impl<L, R> ProductionSemanticResourceApi<L, R>
+impl<L, R, B> ProductionSemanticResourceApi<L, R, B>
 where
     L: LifecycleResourcePort,
     R: SemanticResourceStore,
+    B: SemanticPersistentDiskBackend,
 {
     async fn current_disk(
         &self,
@@ -990,6 +1252,41 @@ fn parse_id(value: &str) -> Result<Id, ResourceStoreError> {
 
 fn nonnegative_time(value: i64) -> Result<u64, ResourceStoreError> {
     u64::try_from(value).map_err(|_| ResourceStoreError::new("stored timestamp is negative"))
+}
+
+fn disk_create_candidate(
+    workspace_id: &str,
+    disk_slug: &str,
+    size_bytes: u64,
+    disk_id: String,
+) -> Result<DiskCreateCandidate, wire::SemanticErrorBody> {
+    let suffix = disk_id
+        .strip_prefix("disk_")
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            semantic_error(
+                wire::SemanticErrorCode::InternalError,
+                "allocated PersistentDisk ID is invalid",
+            )
+        })?;
+    let size_bytes = i64::try_from(size_bytes).map_err(|_| {
+        semantic_error(
+            wire::SemanticErrorCode::InvalidRequest,
+            "PersistentDisk size is too large",
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"cats.semantic-persistent-disk-filesystem.v1\0");
+    hasher.update(disk_id.as_bytes());
+    let filesystem_uuid = hex::encode(&hasher.finalize()[..16]);
+    Ok(DiskCreateCandidate {
+        disk_id,
+        workspace_id: workspace_id.to_owned(),
+        disk_slug: disk_slug.to_owned(),
+        size_bytes,
+        volume_id: format!("vol_{suffix}"),
+        filesystem_uuid,
+    })
 }
 
 fn map_outcome_status(status: lifecycle::OutcomeStatus) -> wire::SemanticStatus {
@@ -1166,13 +1463,6 @@ fn map_detach_outcome(
     }
 }
 
-fn strict_disk_backend_gap() -> wire::SemanticErrorBody {
-    semantic_error(
-        wire::SemanticErrorCode::InternalError,
-        STRICT_DISK_BACKEND_GAP,
-    )
-}
-
 fn internal_resource_error(error: ResourceStoreError) -> wire::SemanticErrorBody {
     semantic_error(wire::SemanticErrorCode::InternalError, error.message)
 }
@@ -1241,7 +1531,7 @@ mod tests {
     }
 
     struct MockResources {
-        disk: Option<db::PersistentDiskRecord>,
+        disk: Mutex<Option<db::PersistentDiskRecord>>,
         cat: Option<db::CatRecord>,
         binding: Option<db::DiskBindingWithCat>,
         attaches: Mutex<Vec<(String, String, String)>>,
@@ -1250,7 +1540,7 @@ mod tests {
     impl MockResources {
         fn populated() -> Self {
             Self {
-                disk: Some(disk_record("disk_current", "data", 100)),
+                disk: Mutex::new(Some(disk_record("disk_current", "data", 100))),
                 cat: Some(cat_record("cat_current", "worker")),
                 binding: None,
                 attaches: Mutex::new(Vec::new()),
@@ -1265,10 +1555,10 @@ mod tests {
             disk_slug: &'a str,
         ) -> SemanticResourceFuture<'a, Result<Option<db::PersistentDiskRecord>, ResourceStoreError>>
         {
-            let disk = self
-                .disk
-                .clone()
-                .filter(|disk| disk.workspace_id == workspace_id && disk.disk_slug == disk_slug);
+            let disk =
+                self.disk.lock().unwrap().clone().filter(|disk| {
+                    disk.workspace_id == workspace_id && disk.disk_slug == disk_slug
+                });
             Box::pin(async move { Ok(disk) })
         }
 
@@ -1289,7 +1579,7 @@ mod tests {
             cat_id: &'a str,
         ) -> SemanticResourceFuture<'a, Result<Option<CatProjection>, ResourceStoreError>> {
             let cat = self.cat.clone().filter(|cat| cat.cat_id == cat_id);
-            let disk = self.disk.clone();
+            let disk = self.disk.lock().unwrap().clone();
             Box::pin(async move {
                 Ok(cat.map(|cat| CatProjection {
                     cat: db::CatWithMounts {
@@ -1298,6 +1588,9 @@ mod tests {
                             .map(|disk| db::CatMountRecord {
                                 disk_id: disk.disk_id,
                                 disk_slug: disk.disk_slug,
+                                volume_id: disk.volume_id,
+                                filesystem_uuid: disk.filesystem_uuid,
+                                disk_format: disk.disk_format,
                                 mount_path: "/data".to_owned(),
                             })
                             .into_iter()
@@ -1313,7 +1606,12 @@ mod tests {
             disk_id: &'a str,
         ) -> SemanticResourceFuture<'a, Result<Option<DiskProjection>, ResourceStoreError>>
         {
-            let disk = self.disk.clone().filter(|disk| disk.disk_id == disk_id);
+            let disk = self
+                .disk
+                .lock()
+                .unwrap()
+                .clone()
+                .filter(|disk| disk.disk_id == disk_id);
             let binding = self.binding.clone();
             Box::pin(async move { Ok(disk.map(|disk| DiskProjection { disk, binding })) })
         }
@@ -1348,6 +1646,94 @@ mod tests {
             _disk_id: String,
         ) -> SemanticResourceFuture<'a, Result<db::DetachDiskOutcome, ResourceStoreError>> {
             Box::pin(async { Ok(db::DetachDiskOutcome::AlreadyDetached) })
+        }
+
+        fn admit_disk_create<'a>(
+            &'a self,
+            candidate: DiskCreateCandidate,
+        ) -> SemanticResourceFuture<'a, Result<db::CreatePersistentDiskOutcome, ResourceStoreError>>
+        {
+            let disk = candidate_disk(candidate, "provisioning");
+            *self.disk.lock().unwrap() = Some(disk.clone());
+            Box::pin(async move { Ok(db::CreatePersistentDiskOutcome::Created(disk)) })
+        }
+
+        fn complete_disk_create<'a>(
+            &'a self,
+            mut disk: db::PersistentDiskRecord,
+        ) -> SemanticResourceFuture<'a, Result<db::PersistentDiskRecord, ResourceStoreError>>
+        {
+            disk.status = "normal".to_owned();
+            *self.disk.lock().unwrap() = Some(disk.clone());
+            Box::pin(async move { Ok(disk) })
+        }
+
+        fn begin_disk_destroy<'a>(
+            &'a self,
+            _disk_id: String,
+        ) -> SemanticResourceFuture<'a, Result<db::DeletePersistentDiskOutcome, ResourceStoreError>>
+        {
+            let mut disk = self.disk.lock().unwrap().clone().unwrap();
+            disk.status = "deleting".to_owned();
+            *self.disk.lock().unwrap() = Some(disk.clone());
+            Box::pin(async move { Ok(db::DeletePersistentDiskOutcome::Deleting(disk)) })
+        }
+
+        fn complete_disk_destroy<'a>(
+            &'a self,
+            mut disk: db::PersistentDiskRecord,
+        ) -> SemanticResourceFuture<'a, Result<db::PersistentDiskRecord, ResourceStoreError>>
+        {
+            disk.status = "deleted".to_owned();
+            disk.deleted_at = Some(2);
+            *self.disk.lock().unwrap() = Some(disk.clone());
+            Box::pin(async move { Ok(disk) })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingDiskBackend {
+        creates: Mutex<Vec<db::PersistentDiskRecord>>,
+        lose_first_create_response: Mutex<bool>,
+    }
+
+    impl SemanticPersistentDiskBackend for RecordingDiskBackend {
+        fn ensure_created<'a>(
+            &'a self,
+            disk: &'a db::PersistentDiskRecord,
+        ) -> SemanticResourceFuture<'a, Result<(), ResourceStoreError>> {
+            self.creates.lock().unwrap().push(disk.clone());
+            let lose_response =
+                std::mem::take(&mut *self.lose_first_create_response.lock().unwrap());
+            Box::pin(async move {
+                if lose_response {
+                    Err(ResourceStoreError::new("strict create response was lost"))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn ensure_destroyed<'a>(
+            &'a self,
+            _disk: &'a db::PersistentDiskRecord,
+        ) -> SemanticResourceFuture<'a, Result<(), ResourceStoreError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn candidate_disk(candidate: DiskCreateCandidate, status: &str) -> db::PersistentDiskRecord {
+        db::PersistentDiskRecord {
+            disk_id: candidate.disk_id,
+            workspace_id: candidate.workspace_id,
+            disk_slug: candidate.disk_slug,
+            size_bytes: candidate.size_bytes,
+            volume_id: candidate.volume_id,
+            filesystem_uuid: candidate.filesystem_uuid,
+            disk_format: "ext4".to_owned(),
+            status: status.to_owned(),
+            created_at: 1,
+            deleted_at: None,
         }
     }
 
@@ -1391,6 +1777,9 @@ mod tests {
             workspace_id: "ws_test".to_owned(),
             disk_slug: disk_slug.to_owned(),
             size_bytes,
+            volume_id: "vol_current".to_owned(),
+            filesystem_uuid: "11111111111111111111111111111111".to_owned(),
+            disk_format: "ext4".to_owned(),
             status: "normal".to_owned(),
             created_at: 1,
             deleted_at: None,
@@ -1465,9 +1854,41 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(unavailable.code, wire::SemanticErrorCode::InternalError);
-        assert!(unavailable
-            .message
-            .contains("exact volume/filesystem identity"));
+        assert!(unavailable.message.contains("backend is not installed"));
+    }
+
+    #[tokio::test]
+    async fn lost_backend_response_resumes_the_persisted_immutable_disk_identity() {
+        let resources = MockResources::populated();
+        *resources.disk.lock().unwrap() = None;
+        let backend = RecordingDiskBackend {
+            lose_first_create_response: Mutex::new(true),
+            ..RecordingDiskBackend::default()
+        };
+        let api = ProductionSemanticResourceApi::with_disk_backend(
+            MockLifecycle::new(),
+            resources,
+            backend,
+        );
+        let request = || wire::CreateDiskRequest {
+            disk_slug: wire::ResourceSlug::new("recoverable-data").unwrap(),
+            size_bytes: 4096,
+        };
+
+        let lost = api.create_disk("ws_test", request()).await.unwrap_err();
+        assert_eq!(lost.code, wire::SemanticErrorCode::InternalError);
+
+        let response = api.create_disk("ws_test", request()).await.unwrap();
+        assert_eq!(response.status, wire::SemanticStatus::AlreadyExists);
+        assert_eq!(response.disk.status, wire::DiskStatus::Normal);
+
+        let attempts = api.disk_backend.creates.lock().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].disk_id, attempts[1].disk_id);
+        assert_eq!(attempts[0].volume_id, attempts[1].volume_id);
+        assert_eq!(attempts[0].filesystem_uuid, attempts[1].filesystem_uuid);
+        assert_eq!(attempts[0].size_bytes, attempts[1].size_bytes);
+        assert_eq!(attempts[0].status, "provisioning");
     }
 
     #[tokio::test]

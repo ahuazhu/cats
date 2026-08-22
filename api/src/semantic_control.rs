@@ -10,7 +10,7 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::runtime_reconciliation::Id;
+use crate::runtime_reconciliation::{Id, RandomId128};
 
 pub const NODED_AUTHORIZATION_HEADER: &str = "authorization";
 pub const NODED_BEARER_SCHEME: &str = "Bearer";
@@ -240,6 +240,13 @@ impl CatAction {
 pub enum DiskStatus {
     Normal,
     Deleted,
+}
+
+/// Filesystem authority fixed when a PersistentDisk identity is allocated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistentDiskFormat {
+    Ext4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -662,6 +669,9 @@ impl NodedCatConfig {
 #[serde(deny_unknown_fields)]
 pub struct NodedDiskMount {
     pub disk_id: Id,
+    pub volume_id: Id,
+    pub filesystem_uuid: RandomId128,
+    pub format: PersistentDiskFormat,
     pub mount_path: PersistentMountPath,
 }
 
@@ -981,10 +991,18 @@ fn validate_mounts_by_slug(mounts: &[CatMountRequest]) -> Result<(), SemanticVal
 
 fn validate_noded_mounts(mounts: &[NodedDiskMount]) -> Result<(), SemanticValidationError> {
     let mut disks = HashSet::with_capacity(mounts.len());
+    let mut volumes = HashSet::with_capacity(mounts.len());
+    let mut filesystem_uuids = HashSet::with_capacity(mounts.len());
     let mut paths = HashSet::with_capacity(mounts.len());
     for mount in mounts {
         validate_prefixed_id(&mount.disk_id, "disk_")?;
+        validate_prefixed_id(&mount.volume_id, "vol_")?;
         if !disks.insert(mount.disk_id.as_str()) {
+            return Err(SemanticValidationError::DuplicateDisk);
+        }
+        if !volumes.insert(mount.volume_id.as_str())
+            || !filesystem_uuids.insert(mount.filesystem_uuid.as_str())
+        {
             return Err(SemanticValidationError::DuplicateDisk);
         }
         if !paths.insert(mount.mount_path.as_str()) {
@@ -1197,7 +1215,7 @@ mod tests {
             "cpu":2,
             "memory_bytes":4294967296,
             "boot_image":"ubuntu-24.04",
-            "mounts":[{"disk_id":"disk_01","mount_path":"/data"}]
+            "mounts":[{"disk_id":"disk_01","volume_id":"vol_01","filesystem_uuid":"11111111111111111111111111111111","format":"ext4","mount_path":"/data"}]
         }"#;
         let request: NodedCreateCatRequest = serde_json::from_slice(body).unwrap();
         request.validate().unwrap();

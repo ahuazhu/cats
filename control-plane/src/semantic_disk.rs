@@ -12,7 +12,7 @@ use cats_api::chunk::MAX_VOLUME_BYTES;
 use cats_api::runtime_reconciliation::{Id, RandomId128};
 use cats_api::semantic_control::{
     AttachDiskRequest, CreateDiskRequest, DetachDiskRequest, DiskStatus, NodedDiskMount,
-    PersistentMountPath, ResourceSlug,
+    PersistentDiskFormat, PersistentMountPath, ResourceSlug,
 };
 use serde::{Deserialize, Serialize};
 
@@ -361,6 +361,9 @@ impl SemanticDiskCatalog {
             }
             mounts.push(NodedDiskMount {
                 disk_id: disk.disk_id.clone(),
+                volume_id: disk.strict_volume.volume_id.clone(),
+                filesystem_uuid: disk.strict_volume.filesystem_uuid.clone(),
+                format: PersistentDiskFormat::Ext4,
                 mount_path: binding.mount_path.clone(),
             });
         }

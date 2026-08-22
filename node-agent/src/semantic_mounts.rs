@@ -11,6 +11,7 @@ use cats_api::semantic_control::NodedDiskMount;
 pub struct ExpectedPersistentMount {
     /// Exact element received in the complete Control -> Node mount set.
     pub requested: NodedDiskMount,
+    /// Identity reported by the installed strict-volume/device path.
     pub volume_id: Id,
     pub filesystem_uuid: RandomId128,
     pub size_bytes: u64,
@@ -62,7 +63,7 @@ pub fn confirm_complete_mount_set(
             .collect::<Vec<_>>();
         if devices.len() != 1
             || devices[0].size_bytes != expected_mount.size_bytes
-            || devices[0].filesystem_uuid != expected_mount.filesystem_uuid
+            || devices[0].filesystem_uuid != expected_mount.requested.filesystem_uuid
         {
             return Err(MountReadinessError::DeviceMismatch);
         }
@@ -74,7 +75,7 @@ pub fn confirm_complete_mount_set(
                 mount.device_major == device.device_major
                     && mount.device_minor == device.device_minor
                     && mount.source_path == device.device_path
-                    && mount.filesystem_uuid == expected_mount.filesystem_uuid
+                    && mount.filesystem_uuid == expected_mount.requested.filesystem_uuid
                     && mount.mount_root.as_str() == "/"
                     && mount.mount_path.as_str() == expected_mount.requested.mount_path.as_str()
                     && mount.filesystem_type.as_str() == "ext4"
@@ -119,6 +120,8 @@ fn validate_expected(expected: &ExpectedPersistentMountSet) -> Result<(), MountR
     for mount in &expected.mounts {
         if previous_disk.is_some_and(|previous| previous >= &mount.requested.disk_id)
             || mount.size_bytes == 0
+            || mount.requested.volume_id != mount.volume_id
+            || mount.requested.filesystem_uuid != mount.filesystem_uuid
             || !volume_ids.insert(mount.volume_id.as_str())
             || !filesystem_uuids.insert(mount.filesystem_uuid.as_str())
             || !mount_paths.insert(mount.requested.mount_path.as_str())
@@ -140,7 +143,7 @@ mod tests {
         GUEST_HOST_CONTROL_VSOCK_PORT_V1,
     };
     use cats_api::runtime_reconciliation::{GuestBootId, HostPath};
-    use cats_api::semantic_control::PersistentMountPath;
+    use cats_api::semantic_control::{PersistentDiskFormat, PersistentMountPath};
 
     fn id(value: &str) -> Id {
         Id::new(value).unwrap()
@@ -178,6 +181,9 @@ mod tests {
                 ExpectedPersistentMount {
                     requested: NodedDiskMount {
                         disk_id: id("disk_1"),
+                        volume_id: id("vol_1"),
+                        filesystem_uuid: random('4'),
+                        format: PersistentDiskFormat::Ext4,
                         mount_path: PersistentMountPath::new("/data").unwrap(),
                     },
                     volume_id: id("vol_1"),
@@ -188,6 +194,9 @@ mod tests {
                 ExpectedPersistentMount {
                     requested: NodedDiskMount {
                         disk_id: id("disk_2"),
+                        volume_id: id("vol_2"),
+                        filesystem_uuid: random('5'),
+                        format: PersistentDiskFormat::Ext4,
                         mount_path: PersistentMountPath::new("/logs").unwrap(),
                     },
                     volume_id: id("vol_2"),
@@ -312,10 +321,24 @@ mod tests {
     fn expected_mount_set_must_be_sorted_and_unique() {
         let request = request();
         let response = response(&request);
-        let mut expected = expected();
-        expected.mounts.swap(0, 1);
+        let mut unsorted = expected();
+        unsorted.mounts.swap(0, 1);
         assert_eq!(
-            confirm_complete_mount_set(&request, &response, &expected),
+            confirm_complete_mount_set(&request, &response, &unsorted),
+            Err(MountReadinessError::InvalidExpectedSet)
+        );
+
+        let mut wrong_volume = expected();
+        wrong_volume.mounts[0].requested.volume_id = id("vol_other");
+        assert_eq!(
+            confirm_complete_mount_set(&request, &response, &wrong_volume),
+            Err(MountReadinessError::InvalidExpectedSet)
+        );
+
+        let mut wrong_filesystem = expected();
+        wrong_filesystem.mounts[0].requested.filesystem_uuid = random('9');
+        assert_eq!(
+            confirm_complete_mount_set(&request, &response, &wrong_filesystem),
             Err(MountReadinessError::InvalidExpectedSet)
         );
     }

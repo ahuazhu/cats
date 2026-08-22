@@ -9,13 +9,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cats_api::error::ApiError;
-use cats_api::runtime_reconciliation::Id;
+use cats_api::runtime_reconciliation::{Id, RandomId128};
 use cats_api::semantic_control::{
     CatAction as WireCatAction, CatIngressTarget, CatState as WireCatState, NodeHeartbeatRequest,
     NodeHeartbeatResponse, NodeHeartbeatStatus, NodeName, NodeRegistrationRequest,
     NodeRegistrationResponse, NodeRegistrationStatus, NodeStatus as WireNodeStatus, NodeView,
     NodedCatActionRequest, NodedCatConfig, NodedControlEndpoint, NodedDiskMount, NodedResultStatus,
-    PersistentMountPath, SemanticErrorCode,
+    PersistentDiskFormat, PersistentMountPath, SemanticErrorCode,
 };
 use tokio::time::Instant;
 
@@ -71,14 +71,14 @@ impl SemanticLifecycleStore for SemanticStoreAdapter {
                         .into_iter()
                         .next()
                         .map(|node| node.node_id);
-                    let cat_id = new_id("cat");
+                    let cat_id = new_id("cat_");
                     let owned_mounts = request
                         .config
                         .mounts
                         .iter()
                         .map(|mount| {
                             (
-                                new_id("binding"),
+                                new_id("mnt_"),
                                 mount.disk_id.clone(),
                                 mount.mount_path.clone(),
                             )
@@ -227,17 +227,10 @@ fn settle_action<'a>(
                 let row = row.ok_or_else(|| {
                     ApiError::conflict("semantic Cat action claim is no longer current")
                 })?;
-                let mounts = store.list_semantic_disk_bindings(&row.cat_id)?;
-                stored_cat_to_core(
-                    row,
-                    mounts
-                        .into_iter()
-                        .map(|mount| CatMount {
-                            disk_id: mount.disk_id,
-                            mount_path: mount.mount_path,
-                        })
-                        .collect(),
-                )
+                let aggregate = store
+                    .find_semantic_cat_with_mounts_by_id(&row.cat_id)?
+                    .ok_or_else(|| ApiError::internal("settled Cat projection disappeared"))?;
+                aggregate_to_core(aggregate)
             })
             .await
             .map_err(store_error)
@@ -315,6 +308,9 @@ fn aggregate_to_core(cat: CatWithMounts) -> crate::store::Result<CatRecord> {
         .into_iter()
         .map(|mount| CatMount {
             disk_id: mount.disk_id,
+            volume_id: mount.volume_id,
+            filesystem_uuid: mount.filesystem_uuid,
+            disk_format: mount.disk_format,
             mount_path: mount.mount_path,
         })
         .collect();
@@ -918,6 +914,18 @@ fn core_config_to_wire(config: &CatCreateConfig) -> Result<NodedCatConfig, NodeC
         .map(|mount| {
             Ok(NodedDiskMount {
                 disk_id: wire_id(&mount.disk_id, "disk")?,
+                volume_id: wire_id(&mount.volume_id, "volume")?,
+                filesystem_uuid: RandomId128::new(mount.filesystem_uuid.clone()).ok_or_else(
+                    || NodeClientError::Protocol("stored filesystem UUID is invalid".to_owned()),
+                )?,
+                format: match mount.disk_format.as_str() {
+                    "ext4" => PersistentDiskFormat::Ext4,
+                    _ => {
+                        return Err(NodeClientError::Protocol(
+                            "stored PersistentDisk format is invalid".to_owned(),
+                        ));
+                    }
+                },
                 mount_path: PersistentMountPath::new(mount.mount_path.clone()).ok_or_else(
                     || NodeClientError::Protocol("stored mount path is invalid".to_owned()),
                 )?,
@@ -1098,6 +1106,9 @@ mod tests {
             mounts: vec![crate::store::semantic::CatMountRecord {
                 disk_id: "disk_01".to_owned(),
                 disk_slug: "data".to_owned(),
+                volume_id: "vol_01".to_owned(),
+                filesystem_uuid: "11111111111111111111111111111111".to_owned(),
+                disk_format: "ext4".to_owned(),
                 mount_path: "/data".to_owned(),
             }],
         }

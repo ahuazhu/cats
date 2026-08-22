@@ -187,6 +187,9 @@ pub struct NewCatMount<'a> {
 pub struct CatMountRecord {
     pub disk_id: String,
     pub disk_slug: String,
+    pub volume_id: String,
+    pub filesystem_uuid: String,
+    pub disk_format: String,
     pub mount_path: String,
 }
 
@@ -385,6 +388,9 @@ pub struct PersistentDiskRecord {
     pub workspace_id: String,
     pub disk_slug: String,
     pub size_bytes: i64,
+    pub volume_id: String,
+    pub filesystem_uuid: String,
+    pub disk_format: String,
     pub status: String,
     pub created_at: i64,
     pub deleted_at: Option<i64>,
@@ -396,6 +402,9 @@ pub struct NewPersistentDisk<'a> {
     pub workspace_id: &'a str,
     pub disk_slug: &'a str,
     pub size_bytes: i64,
+    pub volume_id: &'a str,
+    pub filesystem_uuid: &'a str,
+    pub disk_format: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -406,7 +415,7 @@ pub enum CreatePersistentDiskOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeletePersistentDiskOutcome {
-    Deleted(PersistentDiskRecord),
+    Deleting(PersistentDiskRecord),
     AlreadyDeleted(PersistentDiskRecord),
     Attached,
     NotFound,
@@ -1482,8 +1491,9 @@ impl Store {
             let inserted = client.query_opt(
                 &format!(
                     "INSERT INTO persistent_disks (
-                        disk_id,workspace_id,disk_slug,size_bytes,status,created_at,deleted_at
-                     ) VALUES ($1,$2,$3,$4,'normal',{DB_NOW_MS},NULL)
+                        disk_id,workspace_id,disk_slug,size_bytes,volume_id,
+                        filesystem_uuid,disk_format,status,created_at,deleted_at
+                     ) VALUES ($1,$2,$3,$4,$5,$6,$7,'provisioning',{DB_NOW_MS},NULL)
                      ON CONFLICT (workspace_id,disk_slug) WHERE deleted_at IS NULL
                      DO NOTHING
                      RETURNING {DISK_COLUMNS}"
@@ -1493,6 +1503,9 @@ impl Store {
                     &request.workspace_id,
                     &request.disk_slug,
                     &request.size_bytes,
+                    &request.volume_id,
+                    &request.filesystem_uuid,
+                    &request.disk_format,
                 ],
             )?;
             if let Some(row) = inserted {
@@ -1506,6 +1519,31 @@ impl Store {
                 &[&request.workspace_id, &request.disk_slug],
             )?;
             Ok(CreatePersistentDiskOutcome::Existing(row_to_disk(&row)))
+        })
+    }
+
+    /// Publishes `normal` only after the strict backend confirms the exact
+    /// immutable Volume identity and capacity. Repeating the same completion
+    /// after a response loss returns the stored row.
+    pub fn complete_semantic_persistent_disk_create(
+        &self,
+        disk_id: &str,
+        volume_id: &str,
+        filesystem_uuid: &str,
+        size_bytes: i64,
+    ) -> Result<Option<PersistentDiskRecord>> {
+        self.with(|client| {
+            let row = client.query_opt(
+                &format!(
+                    "UPDATE persistent_disks
+                        SET status='normal'
+                      WHERE disk_id=$1 AND volume_id=$2 AND filesystem_uuid=$3
+                        AND size_bytes=$4 AND status IN ('provisioning','normal')
+                      RETURNING {DISK_COLUMNS}"
+                ),
+                &[&disk_id, &volume_id, &filesystem_uuid, &size_bytes],
+            )?;
+            Ok(row.map(|row| row_to_disk(&row)))
         })
     }
 
@@ -1590,14 +1628,36 @@ impl Store {
             let row = transaction.query_one(
                 &format!(
                     "UPDATE persistent_disks
-                        SET status='deleted', deleted_at={DB_NOW_MS}
+                        SET status='deleting'
                       WHERE disk_id=$1
                       RETURNING {DISK_COLUMNS}"
                 ),
                 &[&disk_id],
             )?;
             transaction.commit()?;
-            Ok(DeletePersistentDiskOutcome::Deleted(row_to_disk(&row)))
+            Ok(DeletePersistentDiskOutcome::Deleting(row_to_disk(&row)))
+        })
+    }
+
+    /// Marks the product row deleted only after the strict backend confirms
+    /// that the exact immutable Volume is absent.
+    pub fn complete_semantic_persistent_disk_delete(
+        &self,
+        disk_id: &str,
+        volume_id: &str,
+    ) -> Result<Option<PersistentDiskRecord>> {
+        self.with(|client| {
+            let row = client.query_opt(
+                &format!(
+                    "UPDATE persistent_disks
+                        SET status='deleted', deleted_at=COALESCE(deleted_at,{DB_NOW_MS})
+                      WHERE disk_id=$1 AND volume_id=$2
+                        AND status IN ('deleting','deleted')
+                      RETURNING {DISK_COLUMNS}"
+                ),
+                &[&disk_id, &volume_id],
+            )?;
+            Ok(row.map(|row| row_to_disk(&row)))
         })
     }
 
@@ -1755,7 +1815,7 @@ fn attach_disk_transaction(
     };
     let disk_workspace: &str = disk.get(0);
     let disk_status: &str = disk.get(1);
-    if disk_status == "deleted" {
+    if disk_status != "normal" {
         transaction.rollback()?;
         return Ok(AttachDiskOutcome::DiskDeleted);
     }
@@ -1859,7 +1919,7 @@ fn cat_with_mounts(
     cat: CatRecord,
 ) -> std::result::Result<CatWithMounts, postgres::Error> {
     let rows = client.query(
-        "SELECT b.disk_id,d.disk_slug,b.mount_path
+        "SELECT b.disk_id,d.disk_slug,d.volume_id,d.filesystem_uuid,d.disk_format,b.mount_path
            FROM disk_bindings b
            JOIN persistent_disks d ON d.disk_id=b.disk_id
           WHERE b.cat_id=$1
@@ -1873,7 +1933,10 @@ fn cat_with_mounts(
             .map(|row| CatMountRecord {
                 disk_id: row.get(0),
                 disk_slug: row.get(1),
-                mount_path: row.get(2),
+                volume_id: row.get(2),
+                filesystem_uuid: row.get(3),
+                disk_format: row.get(4),
+                mount_path: row.get(5),
             })
             .collect(),
     })
@@ -1933,7 +1996,7 @@ const NODE_COLUMNS: &str = "node_id,node_name,control_endpoint,vendor,region,zon
 const HEARTBEAT_COLUMNS: &str = "node_id,last_heartbeat_at,node_reported_at,reported_status,
     total_cpu,cpu_utilized,total_memory,memory_utilized,running_cat_count,
     suspended_cat_count,warm_cat_count";
-const DISK_COLUMNS: &str = "disk_id,workspace_id,disk_slug,size_bytes,status,created_at,deleted_at";
+const DISK_COLUMNS: &str = "disk_id,workspace_id,disk_slug,size_bytes,volume_id,filesystem_uuid,disk_format,status,created_at,deleted_at";
 const BINDING_COLUMNS: &str = "binding_id,workspace_id,disk_id,cat_id,mount_path,created_at";
 const INGRESS_TARGET_COLUMNS: &str = "cat_id,node_id,updated_at";
 
@@ -1997,9 +2060,12 @@ fn row_to_disk(row: &Row) -> PersistentDiskRecord {
         workspace_id: row.get(1),
         disk_slug: row.get(2),
         size_bytes: row.get(3),
-        status: row.get(4),
-        created_at: row.get(5),
-        deleted_at: row.get(6),
+        volume_id: row.get(4),
+        filesystem_uuid: row.get(5),
+        disk_format: row.get(6),
+        status: row.get(7),
+        created_at: row.get(8),
+        deleted_at: row.get(9),
     }
 }
 

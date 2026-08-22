@@ -441,9 +441,10 @@ mod tests {
     use axum::http::{header, Response};
     use axum::routing::any;
     use axum::Router;
+    use cats_api::runtime_reconciliation::RandomId128;
     use cats_api::semantic_control::{
-        CatState, NodedCatConfig, NodedDiskMount, PersistentMountPath, SemanticErrorCode,
-        NODED_BEARER_SCHEME,
+        CatState, NodedCatConfig, NodedDiskMount, PersistentDiskFormat, PersistentMountPath,
+        SemanticErrorCode, NODED_BEARER_SCHEME,
     };
 
     use super::*;
@@ -561,6 +562,9 @@ mod tests {
             boot_image: "image".to_owned(),
             mounts: vec![NodedDiskMount {
                 disk_id: Id::new("disk_01").unwrap(),
+                volume_id: Id::new("vol_01").unwrap(),
+                filesystem_uuid: RandomId128::new("1".repeat(32)).unwrap(),
+                format: PersistentDiskFormat::Ext4,
                 mount_path: PersistentMountPath::new("/data").unwrap(),
             }],
         }
@@ -623,7 +627,7 @@ mod tests {
         assert_eq!(seen[3].path, "/v1/cats/cat_01");
         assert_eq!(
             seen[3].body,
-            br#"{"cpu":2,"memory_bytes":4096,"boot_image":"image","mounts":[{"disk_id":"disk_01","mount_path":"/data"}]}"#
+            br#"{"cpu":2,"memory_bytes":4096,"boot_image":"image","mounts":[{"disk_id":"disk_01","volume_id":"vol_01","filesystem_uuid":"11111111111111111111111111111111","format":"ext4","mount_path":"/data"}]}"#
         );
         assert_eq!(seen[4].method, Method::POST);
         assert_eq!(seen[4].path, "/v1/cats/cat_01/actions/run");

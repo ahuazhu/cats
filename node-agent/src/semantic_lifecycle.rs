@@ -1237,6 +1237,10 @@ mod tests {
             boot_image: "ubuntu-24.04".to_owned(),
             mounts: vec![SemanticMount {
                 disk_id: Id::new("disk_01").expect("valid disk ID"),
+                volume_id: Id::new("vol_01").expect("valid volume ID"),
+                filesystem_uuid: cats_api::runtime_reconciliation::RandomId128::new("1".repeat(32))
+                    .expect("valid filesystem UUID"),
+                format: cats_api::semantic_control::PersistentDiskFormat::Ext4,
                 mount_path: cats_api::semantic_control::PersistentMountPath::new("/data")
                     .expect("valid mount path"),
             }],
@@ -1396,6 +1400,10 @@ mod tests {
         let mut latest = config();
         latest.mounts.push(SemanticMount {
             disk_id: Id::new("disk_02").expect("valid disk ID"),
+            volume_id: Id::new("vol_02").expect("valid volume ID"),
+            filesystem_uuid: cats_api::runtime_reconciliation::RandomId128::new("2".repeat(32))
+                .expect("valid filesystem UUID"),
+            format: cats_api::semantic_control::PersistentDiskFormat::Ext4,
             mount_path: cats_api::semantic_control::PersistentMountPath::new("/cache")
                 .expect("valid mount path"),
         });

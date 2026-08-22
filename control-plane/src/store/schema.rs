@@ -5043,7 +5043,12 @@ CREATE TABLE IF NOT EXISTS persistent_disks (
     disk_slug TEXT NOT NULL
         CHECK (disk_slug ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'),
     size_bytes BIGINT NOT NULL CHECK (size_bytes > 0),
-    status TEXT NOT NULL CHECK (status IN ('normal','deleted')),
+    volume_id TEXT NOT NULL UNIQUE,
+    filesystem_uuid TEXT NOT NULL UNIQUE
+        CHECK (filesystem_uuid ~ '^[0-9a-f]{32}$'),
+    disk_format TEXT NOT NULL CHECK (disk_format = 'ext4'),
+    status TEXT NOT NULL
+        CHECK (status IN ('provisioning','normal','deleting','deleted')),
     created_at BIGINT NOT NULL CHECK (created_at >= 0),
     deleted_at BIGINT CHECK (deleted_at >= created_at),
     CONSTRAINT persistent_disks_workspace_identity_unique

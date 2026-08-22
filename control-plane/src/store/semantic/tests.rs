@@ -550,11 +550,23 @@ fn persistent_disk_is_rwo_and_slug_is_reusable_after_delete() {
         workspace_id: "ws_semantic",
         disk_slug: "data",
         size_bytes: 100 << 30,
+        volume_id: "vol-old",
+        filesystem_uuid: "11111111111111111111111111111111",
+        disk_format: "ext4",
     };
     assert!(matches!(
         store.create_semantic_persistent_disk(disk).unwrap(),
         CreatePersistentDiskOutcome::Created(_)
     ));
+    store
+        .complete_semantic_persistent_disk_create(
+            "disk-old",
+            "vol-old",
+            "11111111111111111111111111111111",
+            100 << 30,
+        )
+        .unwrap()
+        .unwrap();
     assert!(matches!(
         store
             .attach_semantic_disk("binding-a", "cat-disk", "disk-old", "/data")
@@ -571,13 +583,20 @@ fn persistent_disk_is_rwo_and_slug_is_reusable_after_delete() {
     );
     assert!(matches!(
         store.delete_semantic_persistent_disk("disk-old").unwrap(),
-        DeletePersistentDiskOutcome::Deleted(_)
+        DeletePersistentDiskOutcome::Deleting(_)
     ));
+    store
+        .complete_semantic_persistent_disk_delete("disk-old", "vol-old")
+        .unwrap()
+        .unwrap();
     let replacement = NewPersistentDisk {
         disk_id: "disk-new",
         workspace_id: "ws_semantic",
         disk_slug: "data",
         size_bytes: 200 << 30,
+        volume_id: "vol-new",
+        filesystem_uuid: "22222222222222222222222222222222",
+        disk_format: "ext4",
     };
     assert!(matches!(
         store.create_semantic_persistent_disk(replacement).unwrap(),
@@ -597,10 +616,22 @@ fn atomic_create_persists_full_mount_config_and_retries_by_semantics() {
                 workspace_id: "ws_semantic",
                 disk_slug: "data",
                 size_bytes: 100 << 30,
+                volume_id: "vol-atomic",
+                filesystem_uuid: "33333333333333333333333333333333",
+                disk_format: "ext4",
             })
             .unwrap(),
         CreatePersistentDiskOutcome::Created(_)
     ));
+    store
+        .complete_semantic_persistent_disk_create(
+            "disk-atomic",
+            "vol-atomic",
+            "33333333333333333333333333333333",
+            100 << 30,
+        )
+        .unwrap()
+        .unwrap();
 
     let mounts = [NewCatMount {
         binding_id: "binding-atomic",
