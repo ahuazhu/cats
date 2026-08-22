@@ -28,7 +28,6 @@ static RETRY_JITTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub(crate) struct AuthorityRequestContext {
     deadline: Instant,
     phase: Arc<AtomicU8>,
-    cancelled: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     before_commit_claim: Arc<std::sync::Mutex<Option<CommitClaimBarrier>>>,
     #[cfg(test)]
@@ -182,7 +181,6 @@ impl AuthorityRequestContext {
         Self {
             deadline,
             phase: Arc::new(AtomicU8::new(AuthorityRequestPhase::Open.raw())),
-            cancelled: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             before_commit_claim: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -194,27 +192,6 @@ impl AuthorityRequestContext {
 
     pub(crate) fn cancel(&self) {
         request_cancel(self.phase.as_ref());
-        self.cancelled.notify_waiters();
-    }
-
-    pub(crate) async fn cancelled(&self) {
-        loop {
-            let notified = self.cancelled.notified();
-            if self.is_cancelled_or_expired() {
-                return;
-            }
-            tokio::select! {
-                biased;
-                () = notified => {}
-                () = tokio::time::sleep_until(tokio::time::Instant::from_std(self.deadline)) => {
-                    return;
-                }
-            }
-        }
-    }
-
-    pub(crate) fn is_cancelled_or_expired(&self) -> bool {
-        self.must_rollback()
     }
 
     fn must_rollback(&self) -> bool {
@@ -330,7 +307,15 @@ pub(super) enum AuthorityRequestDisposition<T> {
 pub(super) enum AuthorityTransactionError {
     Domain(AuthorityError),
     Application(ApiError),
+    #[allow(
+        dead_code,
+        reason = "retained strict disk mutation source awaits the semantic storage adapter"
+    )]
     CandidateCollision,
+    #[allow(
+        dead_code,
+        reason = "retained strict disk mutation source awaits the semantic storage adapter"
+    )]
     PlacementStale,
     Postgres(postgres::Error),
 }
@@ -374,6 +359,10 @@ enum AttemptFailure {
 enum AuthorityTransactionMode {
     ReadWrite,
     RepeatableRead,
+    #[allow(
+        dead_code,
+        reason = "retained strict storage reads await the semantic storage adapter"
+    )]
     RepeatableReadOnly,
 }
 
@@ -436,6 +425,10 @@ impl Store {
     /// candidate-local outcomes that are safe to isolate after PostgreSQL has
     /// successfully rolled back the candidate transaction. Infrastructure
     /// and rollback failures remain outer Store errors.
+    #[allow(
+        dead_code,
+        reason = "retained strict storage source awaits the semantic storage adapter"
+    )]
     pub(super) fn authority_transaction_disposition<T: Send>(
         &self,
         operation: impl FnMut(
@@ -489,6 +482,10 @@ impl Store {
     /// Consumers must receive either the complete mutually-consistent fact set
     /// or no fact set at all, so this deliberately shares the retry and
     /// fail-closed error policy of mutation transactions.
+    #[allow(
+        dead_code,
+        reason = "retained strict storage source awaits the semantic storage adapter"
+    )]
     pub(super) fn authority_read_snapshot<T: Send>(
         &self,
         operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
@@ -513,6 +510,10 @@ impl Store {
     /// repeatable-read snapshot. The explicit rollback disposition prevents a
     /// read from entering commit ambiguity, while the request context applies
     /// one absolute deadline to queue admission and PostgreSQL statements.
+    #[allow(
+        dead_code,
+        reason = "retained strict storage source awaits the semantic storage adapter"
+    )]
     pub(super) fn authority_request_read_snapshot<T: Send>(
         &self,
         request: &AuthorityRequestContext,
@@ -603,6 +604,10 @@ impl Store {
     /// non-commit and therefore permits that owner to reset its per-attempt
     /// phase before the closed transaction is replayed. Connection failures
     /// stay ambiguous and deliberately do not invoke this hook.
+    #[allow(
+        dead_code,
+        reason = "retained strict storage source awaits the semantic storage adapter"
+    )]
     pub(super) fn authority_transaction_outcome_with_definite_retry<T: Send>(
         &self,
         mut operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
@@ -1028,15 +1033,6 @@ fn retry_delay(attempt: usize) -> Duration {
 #[cfg(test)]
 mod request_context_tests {
     use super::*;
-
-    #[tokio::test]
-    async fn cancellation_waiter_wakes_at_the_absolute_request_deadline() {
-        let context = AuthorityRequestContext::new(Instant::now() + Duration::from_millis(20));
-        tokio::time::timeout(cats_test_support::poll_bound(), context.cancelled())
-            .await
-            .expect("request deadline did not wake its cancellation waiter");
-        assert!(context.is_cancelled_or_expired());
-    }
 
     #[test]
     fn commit_attempt_stays_visible_to_a_racing_http_deadline() {

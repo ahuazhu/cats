@@ -11,6 +11,10 @@ use cats_api::runtime_reconciliation::{
     Epoch, FenceEpoch, Generation, Revision, Sequence, UnixMillis,
 };
 
+#[allow(
+    dead_code,
+    reason = "retained strict disk codecs await the semantic storage adapter"
+)]
 const POSTGRES_BIGINT_MAX: u64 = i64::MAX.unsigned_abs();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,8 +119,16 @@ contract_integer!(UnixMillis, "UnixMillis", 0);
 macro_rules! positive_integer {
     ($name:ident, $semantic_type:literal) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[allow(
+            dead_code,
+            reason = "retained strict disk codecs await the semantic storage adapter"
+        )]
         pub(super) struct $name(u64);
 
+        #[allow(
+            dead_code,
+            reason = "retained strict disk codecs await the semantic storage adapter"
+        )]
         impl $name {
             pub(super) fn new(value: u64) -> Result<Self, PgIntegerError> {
                 if value == 0 {

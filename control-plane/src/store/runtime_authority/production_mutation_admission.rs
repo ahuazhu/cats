@@ -315,6 +315,10 @@ fn semantic_product_inventory_counts(
 
 /// Gate a new product mutation in the same transaction as its business write.
 /// Exact API replays call this only after finding no stored result.
+#[allow(
+    dead_code,
+    reason = "the semantic resource adapter has not yet composed the release mutation gate"
+)]
 pub(in crate::store) fn require_production_product_mutation_admitted(
     transaction: &mut Transaction<'_>,
     authenticated_workspace_id: &cats_api::runtime_reconciliation::Id,
@@ -1033,6 +1037,10 @@ fn exactly_one(changed: u64) -> AuthorityTxResult<()> {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "used by the retained release mutation gate for semantic resources"
+)]
 fn closed() -> AuthorityTransactionError {
     AuthorityTransactionError::Application(ApiError::unavailable(
         "production product mutations are Closed",

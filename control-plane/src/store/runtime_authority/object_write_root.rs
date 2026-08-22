@@ -56,6 +56,10 @@ fn load_authority_for_update(
         .transpose()
 }
 
+#[allow(
+    dead_code,
+    reason = "retained for the semantic storage adapter's exact Host-fence cutoff"
+)]
 fn load_authority_credentials_for_update(
     transaction: &mut Transaction<'_>,
     writer_authority_id: &Id,
@@ -187,6 +191,10 @@ fn insert_authority(
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "retained for the semantic storage adapter's exact Host-fence cutoff"
+)]
 pub(super) fn begin_object_writer_cutoff_in(
     transaction: &mut Transaction<'_>,
     writer_authority_id: &Id,
@@ -218,6 +226,10 @@ pub(super) fn begin_object_writer_cutoff_in(
     Ok(updated)
 }
 
+#[allow(
+    dead_code,
+    reason = "retained for the semantic storage adapter's exact Host-fence cutoff"
+)]
 fn persist_authority(
     transaction: &mut Transaction<'_>,
     authority: &ObjectWriteAuthority,
@@ -273,6 +285,10 @@ fn persist_authority(
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "retained for the semantic storage adapter's exact Host-fence cutoff"
+)]
 fn persist_retired_credential(
     transaction: &mut Transaction<'_>,
     binding: &ObjectWriteCredentialBinding,

@@ -546,64 +546,6 @@ impl Store {
         .await
     }
 
-    /// Own one request-scoped Store job through settlement.
-    ///
-    /// Cancellation can withdraw the job while it is still waiting for a
-    /// connection lane. Once submitted to the blocking executor, this future
-    /// deliberately keeps awaiting it: the transaction's
-    /// `AuthorityRequestContext` checkpoints cancel queued/page work, while
-    /// the async owner prevents a claimed closure from becoming detached.
-    pub(crate) async fn execute_authority_request_owned<T: Send + 'static>(
-        self: &Arc<Self>,
-        request: &transaction::AuthorityRequestContext,
-        operation: impl FnOnce(&Arc<Store>) -> Result<T> + Send + 'static,
-    ) -> Result<T> {
-        let _latency = metrics::RequestTimer::new(metrics::ExecutorKind::Normal);
-        let admission = try_admit_control_store_work()?;
-        let lane = control_store_lane(self);
-        let lane_permit = {
-            let acquire = lane.acquire_owned();
-            let timeout = tokio::time::sleep(CONTROL_STORE_LANE_ACQUIRE_TIMEOUT);
-            tokio::pin!(acquire);
-            tokio::pin!(timeout);
-            tokio::select! {
-                biased;
-                () = request.cancelled() => {
-                    return Err(ApiError::unavailable(
-                        "control-store request was cancelled before lane ownership",
-                    ));
-                }
-                () = &mut timeout => {
-                    metrics::record_lane_acquire_timeout();
-                    return Err(ApiError::unavailable(format!(
-                        "control-store connection lane was unavailable for {} seconds",
-                        CONTROL_STORE_LANE_ACQUIRE_TIMEOUT.as_secs()
-                    )));
-                }
-                result = &mut acquire => result.map_err(|_| {
-                    ApiError::unavailable("control-store connection lane is shutting down")
-                })?,
-            }
-        };
-        if request.is_cancelled_or_expired() {
-            return Err(ApiError::unavailable(
-                "control-store request was cancelled before executor submission",
-            ));
-        }
-        let store = Arc::clone(self);
-        execute_on(
-            control_store_executor()?,
-            CONTROL_STORE_QUEUE_CAPACITY,
-            metrics::ExecutorKind::Normal,
-            move || {
-                let _admission = admission;
-                let _lane = lane_permit;
-                operation(&store)
-            },
-        )
-        .await
-    }
-
     /// Lock the connection and run `f` off-runtime. The server closing the
     /// connection (restart, failover, idle timeout) must cost one reconnect,
     /// not a wedged store, so `f` receives the reconnect outcome instead of a
