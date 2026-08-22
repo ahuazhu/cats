@@ -1,8 +1,8 @@
 # Control Plane 与 noded 同步协议设计
 
-- 状态：讨论稿，尚未接受，尚未实现
+- 状态：ADR-0059 已接受，正在实施
 - 范围：Cat、Node、PersistentDisk 的控制面数据模型、同步接口、状态转换与场景语义幂等
-- 不取代当前已接受的 lifecycle、Volume 或 Route 协议；若本设计被接受，必须另写 ADR 并一次性修改相关实现与文档
+- 切换方式：空数据、单协议直接替换旧 lifecycle 协调；不提供兼容层或数据迁移，实施进度见[执行计划](semantic-control-node-implementation-plan.md)
 
 ## 1. 设计目标
 
