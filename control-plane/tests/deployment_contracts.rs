@@ -1223,14 +1223,22 @@ const LINUX_GATE_TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
 #[cfg(unix)]
 fn write_executable(path: &Path, source: &str) {
-    std::fs::write(path, source)
-        .unwrap_or_else(|error| panic!("write executable {}: {error}", path.display()));
-    let mut permissions = std::fs::metadata(path)
-        .unwrap_or_else(|error| panic!("read executable metadata {}: {error}", path.display()))
+    let temporary = path.with_extension("installing");
+    std::fs::write(&temporary, source)
+        .unwrap_or_else(|error| panic!("write executable {}: {error}", temporary.display()));
+    let mut permissions = std::fs::metadata(&temporary)
+        .unwrap_or_else(|error| panic!("read executable metadata {}: {error}", temporary.display()))
         .permissions();
     permissions.set_mode(0o755);
-    std::fs::set_permissions(path, permissions)
-        .unwrap_or_else(|error| panic!("make {} executable: {error}", path.display()));
+    std::fs::set_permissions(&temporary, permissions)
+        .unwrap_or_else(|error| panic!("make {} executable: {error}", temporary.display()));
+    std::fs::rename(&temporary, path).unwrap_or_else(|error| {
+        panic!(
+            "publish executable {} as {}: {error}",
+            temporary.display(),
+            path.display()
+        )
+    });
 }
 
 #[cfg(unix)]
@@ -1544,14 +1552,17 @@ fn linux_gate_command(fake_bin: &Path, state: &Path, mode: &str) -> Command {
     std::fs::create_dir_all(&scripts).expect("create linked-worktree scripts fixture");
     for name in ["quality.sh", "linux-gate.sh"] {
         let destination = scripts.join(name);
-        std::fs::copy(workspace_root().join("scripts").join(name), &destination)
+        let temporary = scripts.join(format!(".{name}.installing"));
+        std::fs::copy(workspace_root().join("scripts").join(name), &temporary)
             .unwrap_or_else(|error| panic!("copy {name} into linked-worktree fixture: {error}"));
-        let mut permissions = std::fs::metadata(&destination)
+        let mut permissions = std::fs::metadata(&temporary)
             .unwrap_or_else(|error| panic!("read {name} fixture metadata: {error}"))
             .permissions();
         permissions.set_mode(0o755);
-        std::fs::set_permissions(&destination, permissions)
+        std::fs::set_permissions(&temporary, permissions)
             .unwrap_or_else(|error| panic!("make {name} fixture executable: {error}"));
+        std::fs::rename(&temporary, &destination)
+            .unwrap_or_else(|error| panic!("publish {name} fixture executable: {error}"));
     }
     std::fs::write(
         linked_worktree.join(".git"),
