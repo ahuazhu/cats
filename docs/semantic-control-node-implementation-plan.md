@@ -29,7 +29,7 @@
 | PersistentDisk | `control-plane/src/semantic_disk.rs`、`node-agent/src/semantic_mounts.rs` | create/binding/destroy 语义与 Guest 完整挂载确认 | 已完成并合入 |
 | CLI | `cmd/cats/` | slug 命令、同步 REST、`--mount`、GiB 解析、`node_name` 展示 | 已完成并合入 |
 | noded 执行 | `node-agent/`、`cmd/noded/` | 同步 HTTP server、每 Cat 串行、destroy 清理、实际 effects 接入 | 实施中 |
-| Node 管理 | Control API、Node heartbeat client | 注册、`node_name`、`control_endpoint`、offline/reset/drain | 分支完成，待合入和 Store 接线 |
+| Node 管理 | Control API、Node heartbeat client | 注册、`node_name`、`control_endpoint`、offline/reset/drain | 已完成并合入；Store/进程接线待后续项 |
 | Production adapters | Control adapter | Store/placement/noded/入口实现与公共 DTO 映射 | 实施中 |
 | HTTP composition | Control router、AppState、controld/noded main | 新路由和服务接线，旧路由退出 | 待开始 |
 | 切换清理 | schema、router、旧模块和测试 | 删除旧表、旧入口、旧 runner 和只验证旧协议的测试 | 待开始 |
@@ -50,7 +50,7 @@
 - [x] 实现 CLI 同步 slug API。
 - [x] 实现 Disk 语义与 Guest mount-ready 校验。
 - [ ] 合入 noded 同步执行服务，并接现有 FakeVmm/真实物理效果。
-- [ ] 合入 Node 注册、心跳、主动探测、reset 和 drain。
+- [x] 合入 Node 注册、心跳、主动探测、reset 和 drain 的服务与 HTTP client。
 - [ ] 完成 Store adapter：create 时原子建立 Cat 与初始 bindings；补 placement 和 stale Node 查询。
 
 ### 阶段 C：纵向接线
@@ -89,6 +89,7 @@
 | `217b4101` | 实际 noded HTTP client | 5 HTTP tests、API tests、Clippy |
 | `996739b7` | 同步 slug CLI | 91 tests、Clippy |
 | `d4370e5a` | Disk 语义与 Guest mount-ready | Control 6 tests、Node 4 tests、Clippy |
+| `0444cf16` | Node 注册、心跳、offline/reset/drain 服务与 noded client | Control 3 tests、Node 2 tests、Clippy |
 
 ## 5. 进度更新规则
 
@@ -103,4 +104,5 @@
 
 - 建立并行工作树和空数据单协议基线。
 - 完成并合入公共 wire、v19 schema/Store、Control coordinator、noded HTTP client、CLI 和 Disk/mount-ready 切片。
-- Node 管理和 noded 同步执行分支正在收尾；Production Store adapter 正在实现。
+- 完成并合入 Node 管理服务、Control 注册/心跳路由和 noded heartbeat/reset client。
+- noded 同步执行分支正在收尾；Production Store adapter 正在实现。
