@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap};
 use axum::response::{IntoResponse, Response};
@@ -35,7 +34,6 @@ const NODE_AUTHORITY_UPDATE: &str = r#"{"apply_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaa
 enum MembershipFault {
     Healthy,
     Status500,
-    Disconnect,
 }
 
 #[derive(Clone)]
@@ -204,19 +202,6 @@ async fn list_memberships(
                 "injected WorkOS membership failure",
             )
                 .into_response();
-        }
-        MembershipFault::Disconnect => {
-            let body = Body::from_stream(futures_util::stream::once(async {
-                Err::<String, std::io::Error>(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionReset,
-                    "injected WorkOS membership connection reset",
-                ))
-            }));
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(body)
-                .unwrap();
         }
     }
     let membership =
@@ -617,6 +602,7 @@ impl Ctx {
             credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
             image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
             auth_token: "service-token".into(),
+            noded_service_token: "semantic-node-test-token-00000000".into(),
             guest_runtime_profile_receipt:
                 cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
             runtime_provisioner_trust_bundle:
@@ -627,7 +613,6 @@ impl Ctx {
             workos: Some(Arc::new(workos)),
             stripe: None,
             billing_enforcement_enabled: false,
-            oci_deploy_sync_wait_ms: 5_000,
         })
         .await
         .unwrap();
@@ -678,13 +663,6 @@ impl Ctx {
             .find(|workspace| workspace.locator == locator)
             .unwrap_or_else(|| panic!("no workspace {locator}"))
             .id
-    }
-
-    fn cats_url(&self, locator: &str) -> String {
-        self.url(&format!(
-            "/v1/workspaces/{}/cats",
-            self.workspace_id(locator)
-        ))
     }
 
     fn set_membership_fault(&self, fault: MembershipFault) {
@@ -845,14 +823,14 @@ fn cookie_pair(response: &reqwest::Response, name: &str) -> String {
         .to_string()
 }
 
-async fn assert_membership_unavailable(response: reqwest::Response) {
+async fn assert_workspace_memberships_unavailable(response: reqwest::Response) {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["code"], "unavailable");
     assert_eq!(
         body["message"],
-        "WorkOS membership is temporarily unavailable"
+        "WorkOS workspace memberships are temporarily unavailable"
     );
 }
 
@@ -1020,7 +998,7 @@ async fn node_authority_workos_contract_uses_only_current_admin_org_permission()
 }
 
 #[tokio::test]
-async fn workos_user_and_admin_sessions_enforce_their_scopes() {
+async fn workos_user_and_admin_sessions_keep_current_auth_surfaces() {
     let ctx = Ctx::new().await;
 
     let public_config: Value = ctx
@@ -1052,22 +1030,6 @@ async fn workos_user_and_admin_sessions_enforce_their_scopes() {
     );
     assert_eq!(user_session["user"]["email"], "user@example.com");
 
-    let own_workspace = ctx
-        .http
-        .get(ctx.cats_url("default/default"))
-        .header("Cookie", &user_cookie)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(own_workspace.status(), StatusCode::OK);
-    let other_account = ctx
-        .http
-        .get(ctx.cats_url("second/default"))
-        .header("Cookie", &user_cookie)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(other_account.status(), StatusCode::FORBIDDEN);
     let user_cannot_admin = ctx
         .http
         .get(ctx.url("/v1/admin/workspaces"))
@@ -1086,19 +1048,11 @@ async fn workos_user_and_admin_sessions_enforce_their_scopes() {
         .await
         .unwrap();
     assert_eq!(fleet.status(), StatusCode::OK);
-    let admin_can_read_any_workspace = ctx
-        .http
-        .get(ctx.cats_url("default/default"))
-        .header("Cookie", &admin_cookie)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(admin_can_read_any_workspace.status(), StatusCode::OK);
     assert_eq!(ctx.exchanges.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
-async fn cli_jwt_lists_and_enforces_multiple_workspaces() {
+async fn cli_jwt_lists_current_workspaces_and_rejects_invalid_tokens() {
     let ctx = Ctx::new().await;
     let default_token = ctx.cli_token("org_default");
 
@@ -1118,52 +1072,9 @@ async fn cli_jwt_lists_and_enforces_multiple_workspaces() {
     assert_eq!(me["workspaces"][2]["locator"], "second/default");
     assert!(!me.to_string().contains("org_unmapped"));
 
-    let own = ctx
-        .http
-        .get(ctx.cats_url("default/default"))
-        .bearer_auth(&default_token)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(own.status(), StatusCode::OK);
-    let sibling_in_same_account = ctx
-        .http
-        .get(ctx.cats_url("default/sibling"))
-        .bearer_auth(&default_token)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(sibling_in_same_account.status(), StatusCode::OK);
-    let other = ctx
-        .http
-        .get(ctx.cats_url("second/default"))
-        .bearer_auth(&default_token)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(other.status(), StatusCode::FORBIDDEN);
-
-    let second_token = ctx.cli_token("org_second");
-    let selected = ctx
-        .http
-        .get(ctx.cats_url("second/default"))
-        .bearer_auth(&second_token)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(selected.status(), StatusCode::OK);
-    let wrong = ctx
-        .http
-        .get(ctx.cats_url("default/default"))
-        .bearer_auth(&second_token)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
-
     let tampered = ctx
         .http
-        .get(ctx.cats_url("default/default"))
+        .get(ctx.url("/v1/me"))
         .bearer_auth(format!("{default_token}x"))
         .send()
         .await
@@ -1173,7 +1084,7 @@ async fn cli_jwt_lists_and_enforces_multiple_workspaces() {
     let wrong_issuer = ctx.cli_token_with_issuer("org_default", "https://api.workos.com");
     let rejected = ctx
         .http
-        .get(ctx.cats_url("default/default"))
+        .get(ctx.url("/v1/me"))
         .bearer_auth(wrong_issuer)
         .send()
         .await
@@ -1191,7 +1102,7 @@ async fn cli_jwt_membership_5xx_fails_closed_and_recovers() {
     // authorization membership dependency, not signing-key discovery.
     let healthy = ctx
         .http
-        .get(ctx.cats_url("default/default"))
+        .get(ctx.url("/v1/me"))
         .bearer_auth(&token)
         .send()
         .await
@@ -1202,85 +1113,20 @@ async fn cli_jwt_membership_5xx_fails_closed_and_recovers() {
     ctx.set_membership_fault(MembershipFault::Status500);
     let unavailable = tokio::time::timeout(
         cats_test_support::poll_bound(),
-        ctx.http
-            .get(ctx.cats_url("default/default"))
-            .bearer_auth(&token)
-            .send(),
+        ctx.http.get(ctx.url("/v1/me")).bearer_auth(&token).send(),
     )
     .await
     .expect("membership 5xx must produce a bounded API response")
     .unwrap();
-    assert_membership_unavailable(unavailable).await;
+    assert_workspace_memberships_unavailable(unavailable).await;
     let after_failure = ctx.membership_request_count();
     assert!(after_failure > before_failure);
-
-    let other_account = ctx
-        .http
-        .get(ctx.cats_url("second/default"))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(other_account.status(), StatusCode::FORBIDDEN);
-    assert_eq!(ctx.membership_request_count(), after_failure);
 
     ctx.set_membership_fault(MembershipFault::Healthy);
     let recovered = ctx
         .http
-        .get(ctx.cats_url("default/default"))
+        .get(ctx.url("/v1/me"))
         .bearer_auth(&token)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(recovered.status(), StatusCode::OK);
-    assert!(ctx.membership_request_count() > after_failure);
-}
-
-#[tokio::test]
-async fn web_session_membership_disconnect_fails_closed_and_recovers() {
-    let ctx = Ctx::new().await;
-    let user_cookie = ctx.login("user", "user-code").await;
-
-    let healthy = ctx
-        .http
-        .get(ctx.cats_url("default/default"))
-        .header("Cookie", &user_cookie)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(healthy.status(), StatusCode::OK);
-    let before_failure = ctx.membership_request_count();
-
-    ctx.set_membership_fault(MembershipFault::Disconnect);
-    let unavailable = tokio::time::timeout(
-        cats_test_support::poll_bound(),
-        ctx.http
-            .get(ctx.cats_url("default/default"))
-            .header("Cookie", &user_cookie)
-            .send(),
-    )
-    .await
-    .expect("membership disconnect must produce a bounded API response")
-    .unwrap();
-    assert_membership_unavailable(unavailable).await;
-    let after_failure = ctx.membership_request_count();
-    assert!(after_failure > before_failure);
-
-    let other_account = ctx
-        .http
-        .get(ctx.cats_url("second/default"))
-        .header("Cookie", &user_cookie)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(other_account.status(), StatusCode::FORBIDDEN);
-    assert_eq!(ctx.membership_request_count(), after_failure);
-
-    ctx.set_membership_fault(MembershipFault::Healthy);
-    let recovered = ctx
-        .http
-        .get(ctx.cats_url("default/default"))
-        .header("Cookie", &user_cookie)
         .send()
         .await
         .unwrap();
@@ -1373,23 +1219,6 @@ async fn organizationless_workos_user_receives_an_isolated_personal_account() {
     assert_eq!(active["kind"], "personal");
     assert_eq!(active["slug"], "default");
     assert!(active["is_default"].as_bool().unwrap());
-
-    let own_workspace = ctx
-        .http
-        .get(ctx.url(&format!("/v1/workspaces/{personal_workspace_id}/cats")))
-        .header("Cookie", &user_cookie)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(own_workspace.status(), StatusCode::OK);
-    let shared_workspace = ctx
-        .http
-        .get(ctx.cats_url("default/default"))
-        .header("Cookie", &user_cookie)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(shared_workspace.status(), StatusCode::FORBIDDEN);
 
     let personal_login = ctx
         .http

@@ -6,7 +6,7 @@
 //! is treated as disposable; schemas are created and never dropped.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use postgres::NoTls;
 
@@ -28,161 +28,6 @@ fn poll_bound() -> Duration {
         },
         Err(std::env::VarError::NotPresent) => Duration::from_secs(180),
         Err(err) => panic!("{ENV} is not readable: {err}"),
-    }
-}
-
-/// Hold an isolated test schema's runtime_operations table at an
-/// ACCESS-EXCLUSIVE barrier and report when one production Store query is
-/// waiting behind it. This is shared by unit and cross-router cancellation
-/// tests so both prove that the blocking Store closure has been claimed.
-pub struct RuntimeOperationsTableLockForTest {
-    blocked: tokio::sync::oneshot::Receiver<Result<(), String>>,
-    release: Option<std::sync::mpsc::Sender<()>>,
-    worker: Option<std::thread::JoinHandle<()>>,
-}
-
-impl RuntimeOperationsTableLockForTest {
-    pub async fn acquire(dsn: &str) -> Self {
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let dsn = dsn.to_owned();
-        let worker = std::thread::spawn(move || {
-            let mut client = postgres::Client::connect(&dsn, postgres::NoTls).unwrap();
-            client
-                .batch_execute(
-                    "BEGIN;
-                     SET LOCAL lock_timeout='5s';
-                     LOCK TABLE runtime_operations IN ACCESS EXCLUSIVE MODE",
-                )
-                .unwrap();
-            let own_pid: i32 = client
-                .query_one("SELECT pg_backend_pid()", &[])
-                .unwrap()
-                .get(0);
-            ready_tx.send(()).unwrap();
-
-            // Pure poll upper bound; a saturated gate host (late in the
-            // full suite, with a bloated shared PostgreSQL catalog) can take
-            // far longer than an idle one to schedule the handler onto the
-            // lock. The poll exits as soon as the handler blocks.
-            let deadline = Instant::now() + poll_bound();
-            loop {
-                if release_rx.try_recv().is_ok() {
-                    client.batch_execute("ROLLBACK").unwrap();
-                    return;
-                }
-                // Background sweepers also scan runtime_operations; only the
-                // handler's by-id Operation read proves the claimed request
-                // reached the lock barrier, so bind the waiter to its query.
-                let blocked: bool = client
-                    .query_one(
-                        "SELECT EXISTS (
-                            SELECT 1
-                              FROM pg_locks waiting
-                              JOIN pg_class relation ON relation.oid=waiting.relation
-                              JOIN pg_namespace namespace
-                                ON namespace.oid=relation.relnamespace
-                              JOIN pg_stat_activity activity
-                                ON activity.pid=waiting.pid
-                             WHERE waiting.pid<>$1 AND NOT waiting.granted
-                               AND waiting.locktype='relation'
-                               AND namespace.nspname=current_schema()
-                               AND relation.relname='runtime_operations'
-                               AND (activity.query LIKE
-                                   '%workspace_id COLLATE \"C\"=$1 AND operation_id COLLATE \"C\"=$2%'
-                                 OR activity.query LIKE
-                                   '%FROM runtime_operations WHERE operation_id=$1%')
-                         )",
-                        &[&own_pid],
-                    )
-                    .unwrap()
-                    .get(0);
-                if blocked {
-                    let _ = blocked_tx.send(Ok(()));
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    // Do not guess between "nothing ever queued" and "another
-                    // session (for example a background sweeper on the shared
-                    // Store lane) starved the by-id read": report the exact
-                    // waiter set and session activity for this schema.
-                    let diagnostic = client
-                        .query(
-                            "SELECT activity.pid::text, activity.state,
-                                    coalesce(activity.wait_event_type, ''),
-                                    activity.query
-                               FROM pg_stat_activity activity
-                              WHERE activity.datname=current_database()
-                                AND activity.pid<>$1
-                                AND activity.query LIKE '%runtime_operations%'",
-                            &[&own_pid],
-                        )
-                        .map(|rows| {
-                            rows.into_iter()
-                                .map(|row| {
-                                    format!(
-                                        "pid={} state={} wait={} query={}",
-                                        row.get::<_, String>(0),
-                                        row.get::<_, String>(1),
-                                        row.get::<_, String>(2),
-                                        row.get::<_, String>(3)
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                                .join(" | ")
-                        })
-                        .unwrap_or_else(|error| format!("diagnostic query failed: {error}"));
-                    let _ = blocked_tx.send(Err(diagnostic));
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            let _ = release_rx.recv_timeout(poll_bound());
-            client.batch_execute("ROLLBACK").unwrap();
-        });
-        tokio::time::timeout(poll_bound(), ready_rx)
-            .await
-            .expect("runtime_operations table lock was not acquired")
-            .expect("runtime_operations table-lock worker stopped");
-        Self {
-            blocked: blocked_rx,
-            release: Some(release_tx),
-            worker: Some(worker),
-        }
-    }
-
-    pub async fn wait_until_query_blocked(&mut self) {
-        // Strictly wider than the worker's own poll bound so the worker's
-        // diagnostic report arrives instead of this timeout.
-        if let Err(diagnostic) =
-            tokio::time::timeout(poll_bound() + Duration::from_secs(10), &mut self.blocked)
-                .await
-                .expect("runtime Operation query did not reach the PostgreSQL lock barrier")
-                .expect("runtime_operations table-lock worker stopped")
-        {
-            panic!("runtime Operation query never blocked on runtime_operations: {diagnostic}");
-        }
-    }
-
-    pub fn release(mut self) {
-        if let Some(release) = self.release.take() {
-            let _ = release.send(());
-        }
-        if let Some(worker) = self.worker.take() {
-            worker.join().unwrap();
-        }
-    }
-}
-
-impl Drop for RuntimeOperationsTableLockForTest {
-    fn drop(&mut self) {
-        if let Some(release) = self.release.take() {
-            let _ = release.send(());
-        }
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
     }
 }
 
@@ -564,36 +409,6 @@ pub async fn install_runtime_provisioner_trust_bundle(
         .expect("install test runtime provisioner trust bundle");
 }
 
-#[cfg(any(debug_assertions, feature = "test-support"))]
-const TEST_ROUTE_V2_SIGNER_REFERENCE: &[u8] = br#"{"version":1,"deployment_id":"route_deployment_a","signer_revision":1,"expected_previous":null,"signer":{"state":"active","active_kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","secret_reference_id":"route_secret_a"},"public_key_ring_version":1,"public_key_ring_digest":"sha256:7c7e324d7be6c6ee71735c900ce1041de63af7cc08fb39b6800853f966e81e34"}"#;
-#[cfg(any(debug_assertions, feature = "test-support"))]
-const TEST_ROUTE_V2_PUBLIC_KEY_RING: &[u8] = br#"{"version":1,"ring_version":1,"expected_previous":null,"keys":[{"kid":"2281a02a7f42d92fa9caa5b7907b29c2f060cb00196be280af33fb7bc8e27e99","public_key_spki":"MCowBQYDK2VwAyEAsz3X-kqrYHysotqiQjIuGgGom4LK9bK8tonhiWAQ0To"}]}"#;
-
-#[cfg(any(debug_assertions, feature = "test-support"))]
-fn route_v2_signing_authority_fixture() -> anyhow::Result<(
-    Arc<crate::route_grant_v2::InstalledRouteGrantV2SigningAuthority>,
-    cats_api::route_grant_v2::RouteGrantV2PublicKeyRingArtifact,
-)> {
-    use cats_api::route_grant_v2::{
-        decode_route_grant_v2_public_key_ring, decode_route_grant_v2_signer_reference,
-    };
-
-    let signer_reference = decode_route_grant_v2_signer_reference(TEST_ROUTE_V2_SIGNER_REFERENCE)?;
-    let public_key_ring = decode_route_grant_v2_public_key_ring(TEST_ROUTE_V2_PUBLIC_KEY_RING)?;
-    let signing_authority = Arc::new(
-        crate::route_grant_v2::InstalledRouteGrantV2SigningAuthority::from_authority_artifacts(
-            &signer_reference,
-            TEST_ROUTE_V2_SIGNER_REFERENCE,
-            &public_key_ring,
-            Some(include_bytes!(
-                "../../tests/fixtures/route_grant_v2_private_ed25519.pem"
-            )),
-            120,
-        )?,
-    );
-    Ok((signing_authority, public_key_ring))
-}
-
 /// PostgreSQL backend PID for the ordinary single-connection control Store.
 /// Integration concurrency tests use it only to distinguish one claimed
 /// production request from unrelated sessions in the same disposable server.
@@ -610,117 +425,12 @@ pub async fn control_store_backend_pid(store: &Arc<crate::store::Store>) -> i32 
         .expect("read test control Store backend PID")
 }
 
-#[cfg(any(debug_assertions, feature = "test-support"))]
-fn route_v2_gateway_machine_fixture_inner(
-    listen: impl Into<String>,
-) -> anyhow::Result<(
-    crate::server::GatewayMachineConfig,
-    cats_api::route_grant_v2::RouteGrantV2PublicKeyRingArtifact,
-)> {
-    use cats_api::gateway_workload_identity::{
-        GatewayWorkloadCredentialPolicy, GatewayWorkloadCredentialScope,
-        GatewayWorkloadIdentityAuthority,
-    };
-    use cats_api::runtime_reconciliation::{Base64UrlNoPad, ContractVersion, Epoch, Id};
-    let (signing_authority, public_key_ring) = route_v2_signing_authority_fixture()?;
-    let gateway_authority = GatewayWorkloadIdentityAuthority {
-        version: ContractVersion::V1,
-        authority_id: Id::new("gateway_authority_route_e2e")
-            .expect("test Gateway authority ID is valid"),
-        fleet_id: Id::new("fleet_route_e2e").expect("test Gateway fleet ID is valid"),
-        policy_revision: Epoch::new(1).expect("test Gateway policy revision is positive"),
-        expected_previous: None,
-        credentials: vec![GatewayWorkloadCredentialPolicy {
-            credential_id: Id::new("gateway_credential_route_e2e")
-                .expect("test Gateway credential ID is valid"),
-            public_key_spki: Base64UrlNoPad::new(
-                "MCowBQYDK2VwAyEAFqokynUVEeIXMF7pBwDCDQn6N97Q4hJUz7DUbPlbJu8",
-            )
-            .expect("test Gateway credential SPKI is canonical"),
-            scope: GatewayWorkloadCredentialScope::Fleet,
-        }],
-    };
-    let tls_config = crate::gateway_machine::GatewayMachineTlsConfig::from_pem_for_test(
-        include_bytes!("../tests/fixtures/gateway_machine_ca_certificate.pem"),
-        include_bytes!("../tests/fixtures/gateway_machine_server_certificate.pem"),
-        include_bytes!("../tests/fixtures/gateway_machine_server_private_key.pem"),
-    )?;
-    let config = crate::server::GatewayMachineConfig::from_test_composition(
-        listen,
-        gateway_authority,
-        tls_config,
-        signing_authority,
-    )?;
-    Ok((config, public_key_ring))
-}
-
-/// Compose the real isolated Control Route v2 listener with the shared r1
-/// signer and mTLS fixtures, and return the exact ring a Node must ACK. This
-/// debug-only surface cannot become a production signer-install authority.
-#[cfg(debug_assertions)]
-pub fn route_v2_gateway_machine_fixture(
-    listen: impl Into<String>,
-) -> anyhow::Result<(
-    crate::server::GatewayMachineConfig,
-    cats_api::route_grant_v2::RouteGrantV2PublicKeyRingArtifact,
-)> {
-    route_v2_gateway_machine_fixture_inner(listen)
-}
-
-/// Compose the real isolated Control Route v2 listener with the shared r1
-/// signer and mTLS fixtures. This test-only feature avoids adding any
-/// caller-selected artifact path or credential input to production startup.
-#[cfg(feature = "test-support")]
-pub fn route_v2_gateway_machine_config(
-    listen: impl Into<String>,
-) -> anyhow::Result<crate::server::GatewayMachineConfig> {
-    route_v2_gateway_machine_fixture_inner(listen).map(|(config, _)| config)
-}
-
-/// Start a test Control process through the same mandatory Route v2 entrypoint
-/// as production. The reduced fixed fixture omits only the operator rotation
-/// transport, whose production artifact composition has separate tests.
+/// Start a test semantic Control process through the production composition.
 #[cfg(any(debug_assertions, feature = "test-support"))]
 pub async fn spawn_control_plane_for_test(
     config: crate::server::Config,
 ) -> anyhow::Result<crate::server::Handle> {
-    let machine = route_v2_gateway_machine_fixture_inner("127.0.0.1:0")?.0;
-    crate::server::spawn_with_gateway_machine(config, machine).await
-}
-
-#[cfg(feature = "test-support")]
-pub use crate::store::runtime_authority::object_write_e2e_fixture::{
-    ObjectWriteNodeFixture, ObjectWriteNodeRequest,
-};
-
-/// Provision one Node identity, current Agent session, Active Volume and Owned
-/// attachment epoch through the production Store transactions.
-///
-/// The object-write writer authority is deliberately left closed; open it with
-/// [`provision_object_write_authority`] so a caller can first measure the
-/// gateway's refusal while every other precondition already holds.
-#[cfg(feature = "test-support")]
-pub async fn provision_object_write_node(
-    store: &Arc<crate::store::Store>,
-    request: ObjectWriteNodeRequest,
-) -> ObjectWriteNodeFixture {
-    store
-        .execute(move |store| Ok(store.provision_object_write_node(&request)))
-        .await
-        .expect("provision object-write Node fixture")
-}
-
-/// Open exactly one object-write writer authority for the fixture Host through
-/// the production `ProvisionObjectWriteAuthority` mutation.
-#[cfg(feature = "test-support")]
-pub async fn provision_object_write_authority(
-    store: &Arc<crate::store::Store>,
-    request: ObjectWriteNodeRequest,
-) -> cats_api::runtime_reconciliation::Id {
-    store
-        .execute(move |store| Ok(store.provision_object_write_authority(&request)))
-        .await
-        .expect("provision object-write writer authority")
+    crate::server::spawn(config).await
 }
 
 /// Base DSN of the disposable test server.

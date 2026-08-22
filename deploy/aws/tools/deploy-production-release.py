@@ -329,7 +329,7 @@ def verify_live_target(config: dict[str, Any]) -> None:
 def image_refs(manifest: dict[str, Any]) -> dict[str, str]:
     return {
         name: f"{manifest['artifacts'][name]['image_reference']}@{manifest['artifacts'][name]['image_digest']}"
-        for name in ("control_plane", "credential_refresher", "gateway")
+        for name in ("control_plane", "credential_refresher")
     }
 
 
@@ -383,8 +383,6 @@ def terraform_plan_command(
                 f"-var=kubeconfig_context={config['kubeconfig_context']}",
                 f"-var=control_plane_image={images['control_plane']}",
                 f"-var=credential_refresher_image={images['credential_refresher']}",
-                f"-var=gateway_image={images['gateway']}",
-                f"-var=object_write_gateway_image={images['control_plane']}",
             ]
         )
     else:
@@ -481,8 +479,6 @@ def verify_application(config: dict[str, Any], manifest: dict[str, Any]) -> dict
     images = image_refs(manifest)
     expected = {
         "cats-controld": images["control_plane"],
-        "cats-gatewayd": images["gateway"],
-        "cats-object-write-gateway": images["control_plane"],
     }
     observed: dict[str, Any] = {}
     for deployment, expected_image in expected.items():

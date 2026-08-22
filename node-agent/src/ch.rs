@@ -90,10 +90,6 @@ pub struct ChConfig {
     /// cache. Only meaningful on [`BlockPath::KernelNbd`]; the vhost-user path
     /// never had a host-side cache to bypass.
     pub block_direct: bool,
-    /// Fixed launcher selected by the installed Node configuration. The
-    /// StartRuntime checkpoint records and hashes this exact executable; it is
-    /// never inferred from the Agent executable or from PATH.
-    pub vmm_launcher_bin: PathBuf,
     pub ch_bin: PathBuf,
     pub kernel: PathBuf,
     pub initramfs: Option<PathBuf>,
@@ -209,7 +205,7 @@ fn bind_desired_network(
 /// state. The signed Desired adapter calls this immediately after every
 /// descriptor-relative checkpoint read, before the tuple can reach `ip` or a
 /// VMM launch.
-pub(crate) fn validate_network_plan(network: &ChNetwork) -> Result<()> {
+pub fn validate_network_plan(network: &ChNetwork) -> Result<()> {
     let checked = bind_desired_network(
         &network.config,
         network.tap.clone(),
@@ -227,7 +223,7 @@ pub(crate) fn validate_network_plan(network: &ChNetwork) -> Result<()> {
 /// Until `publish` succeeds, dropping this value is the only cleanup action:
 /// Linux removes the non-persistent interface when the descriptor closes, so
 /// an error path never has to guess ownership from a reusable name or ifindex.
-pub(crate) trait PendingTap: Send {
+pub trait PendingTap: Send {
     /// Configure the exact unpublished interface retained by this object.
     ///
     /// Production binds every mutation to the TUN descriptor's stable
@@ -247,11 +243,11 @@ pub(crate) trait PendingTap: Send {
 /// The narrow physical TAP creation seam used by the network state machine.
 /// Tests inject a descriptor-lifetime fake; production has no command-line
 /// fallback for this security-sensitive create/publish transition.
-pub(crate) trait TapCreatePort: Send + Sync + 'static {
+pub trait TapCreatePort: Send + Sync + 'static {
     fn create_nonpersistent(&self, tap_name: &str) -> Result<Box<dyn PendingTap>>;
 }
 
-pub(crate) struct PlatformTapCreatePort;
+pub struct PlatformTapCreatePort;
 
 #[cfg(target_os = "linux")]
 struct LinuxPendingTap {
@@ -1118,21 +1114,21 @@ struct HostNetworkLinkSnapshot {
 /// cannot turn a link name or an alias string into provider evidence without
 /// applying the validation methods below.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HostNetworkSnapshot {
+pub struct HostNetworkSnapshot {
     links: BTreeMap<String, HostNetworkLinkSnapshot>,
 }
 
 /// Stable Cats TAP identity which is not backed by a durable reservation.
 /// This is inventory evidence only; it carries no removal authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HostNetworkResidue {
+pub struct HostNetworkResidue {
     pub(crate) network_id: Id,
     pub(crate) tap_name: Id,
     pub(crate) ownership_token: RandomId128,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReservedHostNetworkState {
+pub enum ReservedHostNetworkState {
     Absent,
     Exact,
 }
@@ -1253,7 +1249,7 @@ impl HostNetworkSnapshot {
     /// Classify every well-formed, stable Cats TAP outside the durable
     /// reservation set. A partial identity or a collision with any retained
     /// identity is uncertainty, not residue.
-    pub(crate) fn unreserved_managed_networks<'a>(
+    pub fn unreserved_managed_networks<'a>(
         &self,
         reserved: impl IntoIterator<Item = &'a RuntimeNetworkIdentity>,
     ) -> Result<Vec<HostNetworkResidue>> {
@@ -1306,7 +1302,7 @@ impl HostNetworkSnapshot {
     /// network identity, ownership token, or overlapping IPv4 range. Existing
     /// managed links must themselves be well-formed TAPs so a foreign alias
     /// cannot be ignored merely because the candidate chose another name.
-    pub(crate) fn ensure_candidate_available(&self, network: &ChNetwork) -> Result<()> {
+    pub fn ensure_candidate_available(&self, network: &ChNetwork) -> Result<()> {
         validate_network_plan(network)?;
         let desired = Ipv4Cidr::parse(&host_cidr(network))?;
         let managed = self.managed_networks()?;
@@ -1341,7 +1337,7 @@ impl HostNetworkSnapshot {
     /// present name is exact only when TAP kind, link state, alias authority,
     /// ifindex/address join and IPv4 tuple all match.  Partial or foreign
     /// state is an error, never an adoptable absence.
-    pub(crate) fn reserved_network_state(
+    pub fn reserved_network_state(
         &self,
         identity: &RuntimeNetworkIdentity,
     ) -> Result<ReservedHostNetworkState> {
@@ -1364,7 +1360,7 @@ impl HostNetworkSnapshot {
         Ok(ReservedHostNetworkState::Exact)
     }
 
-    pub(crate) fn unchanged_except_reserved_tap(
+    pub fn unchanged_except_reserved_tap(
         &self,
         after: &Self,
         identity: &RuntimeNetworkIdentity,
@@ -1534,7 +1530,7 @@ fn host_network_snapshot_once(
 /// not claim atomicity against arbitrary root mutation; it detects the
 /// ordinary rename/recreate/address windows and is always bracketed by the
 /// Node-global network allocation lock for checkpoint/effect use.
-pub(crate) fn inspect_host_network_snapshot(
+pub fn inspect_host_network_snapshot(
     ip_bin: &Path,
     context: &dyn RuntimePhysicalReadContext,
 ) -> Result<HostNetworkSnapshot> {
@@ -1674,7 +1670,7 @@ fn ensure_host_cidr_available(
 /// Create or adopt only the exact tuple that the caller already checkpointed.
 /// An existing same-token tap is completed idempotently; a same-name tap with
 /// any other token or address is rejected without mutation.
-pub(crate) fn prepare_network(
+pub fn prepare_network(
     cfg: &ChConfig,
     network: &ChNetwork,
     effect_context: &dyn RuntimePhysicalEffectContext,
@@ -1682,7 +1678,7 @@ pub(crate) fn prepare_network(
     prepare_network_with_tap_port(cfg, network, effect_context, &PlatformTapCreatePort)
 }
 
-pub(crate) fn prepare_network_with_tap_port(
+pub fn prepare_network_with_tap_port(
     cfg: &ChConfig,
     network: &ChNetwork,
     effect_context: &dyn RuntimePhysicalEffectContext,
@@ -1747,7 +1743,7 @@ pub(crate) fn prepare_network_with_tap_port(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg(test)]
-pub(crate) enum NetworkCreateAttempt {
+pub enum NetworkCreateAttempt {
     Published,
     DefinitelyNotPublished,
     PublicationOutcomeUnknown,
@@ -1759,7 +1755,7 @@ pub(crate) enum NetworkCreateAttempt {
 /// Once creation is attempted, the closed outcome deliberately contains no
 /// retry instruction; the reconciler must Refresh and obtain a new scan.
 #[cfg(test)]
-pub(crate) fn create_network_from_sealed_absence_with_tap_port(
+pub fn create_network_from_sealed_absence_with_tap_port(
     ip_bin: &Path,
     network: &ChNetwork,
     effect_context: &dyn RuntimePhysicalEffectContext,
@@ -2969,7 +2965,7 @@ pub fn pause(api_sock: &Path) -> Result<()> {
 /// Exact Cloud Hypervisor state returned only by a fresh `vm.info` read from
 /// the Unix peer whose PID is the installed VMM identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExactVmState {
+pub enum ExactVmState {
     Executing,
     Paused,
 }
@@ -2978,7 +2974,7 @@ pub(crate) enum ExactVmState {
 /// success oracle; callers retain their journaled step or select its typed
 /// fail-closed terminal path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExactVmEffectOutcome {
+pub enum ExactVmEffectOutcome {
     Exact,
     DefiniteFailure,
     Ambiguous,
@@ -3001,7 +2997,7 @@ fn exact_vm_state_from_payload(payload: &str) -> Result<ExactVmState> {
 /// connection to the exact installed VMM PID. This function never converts a
 /// missing socket, malformed response, wrong peer, or unknown state into an
 /// absence proof.
-pub(crate) fn inspect_exact_vm_state_until(
+pub fn inspect_exact_vm_state_until(
     api_sock: &Path,
     expected_vmm_pid: u32,
     deadline: Instant,
@@ -3026,7 +3022,7 @@ pub(crate) fn inspect_exact_vm_state_until(
 /// Inspect-or-pause the exact installed VMM. A successful PUT is followed by
 /// a separate fresh `vm.info`; a lost response is also followed by that same
 /// postcondition read when the frozen deadline still permits it.
-pub(crate) fn pause_exact_vmm_until(
+pub fn pause_exact_vmm_until(
     api_sock: &Path,
     expected_vmm_pid: u32,
     deadline: Instant,
@@ -3061,7 +3057,7 @@ pub(crate) fn pause_exact_vmm_until(
 /// Inspect-or-resume the exact installed VMM. A successful PUT is followed by
 /// a separate fresh `vm.info`; a lost response is also followed by that same
 /// postcondition read when the frozen deadline still permits it.
-pub(crate) fn resume_exact_vmm_until(
+pub fn resume_exact_vmm_until(
     api_sock: &Path,
     expected_vmm_pid: u32,
     deadline: Instant,
@@ -3097,7 +3093,7 @@ pub(crate) fn resume_exact_vmm_until(
 /// deadline. Snapshot bytes are not a postcondition here: the installed Warm
 /// owner must fsync, hash, atomically publish, and reopen its own manifest
 /// before treating this exact response as durable completion.
-pub(crate) fn snapshot_exact_vmm_until(
+pub fn snapshot_exact_vmm_until(
     api_sock: &Path,
     expected_vmm_pid: u32,
     destination: &Path,
@@ -3328,7 +3324,6 @@ mod tests {
     fn probe_config(nbd_client_bin: PathBuf, nbd_devices: u32) -> ChConfig {
         ChConfig {
             block_direct: false,
-            vmm_launcher_bin: PathBuf::from("cats-vmm-launcher"),
             ch_bin: PathBuf::from("ch"),
             kernel: PathBuf::from("vmlinuz"),
             initramfs: None,
@@ -3500,7 +3495,6 @@ mod tests {
     fn queue_count_never_exceeds_the_cats_vcpus() {
         let mut cfg = ChConfig {
             block_direct: false,
-            vmm_launcher_bin: PathBuf::from("cats-vmm-launcher"),
             ch_bin: PathBuf::from("ch"),
             kernel: PathBuf::from("vmlinuz"),
             initramfs: None,
@@ -4373,7 +4367,6 @@ exit 0\n",
         prepare_memory_backing(&memory_file, 256).unwrap();
         let cfg = ChConfig {
             block_direct: false,
-            vmm_launcher_bin: dir.path().join("cats-vmm-launcher"),
             ch_bin: fake_ch,
             kernel,
             initramfs: None,

@@ -11,32 +11,25 @@
 //! `options=-csearch_path=...` parameter.
 
 mod accounts;
-mod agent_sessions;
 mod executor;
 mod leadership;
 mod metrics;
+mod node_identities;
 mod object_write_gateway_client;
-mod oci;
 mod rows;
 pub(crate) mod runtime_authority;
 mod schema;
+pub mod semantic;
 mod transaction;
 
-pub(crate) use agent_sessions::{
-    AgentRegistrationOutcome, AgentRegistrationRejection, AgentSessionRegistrationPolicy,
-};
 pub(crate) use transaction::AuthorityRequestContext;
 
-#[cfg(test)]
-mod agent_session_tests;
-
+pub use leadership::SingletonRole;
 pub(crate) use leadership::SingletonSession;
-pub use leadership::{OciDeploymentLease, SingletonRole};
 pub use object_write_gateway_client::{
     ObjectWriteGatewayClient, OBJECT_WRITE_GATEWAY_POSTGRES_ROLE,
     OBJECT_WRITE_GATEWAY_PROTOCOL_VERSION_V1,
 };
-pub use oci::{OciDeploymentClaim, OciRuntimeTarget};
 use rows::{row_to_account, row_to_workspace};
 pub use runtime_authority::host_fence_provider_queue::{
     HostFenceProviderClaimV1, HostFenceProviderObjectCutoffV1, HostFenceProviderQueueClient,
@@ -125,21 +118,8 @@ pub const CONTROL_STORE_LEADERSHIP_QUEUE_CAPACITY: usize = 8;
 // hard ceiling also supports several in-process replicas in contract tests
 // without making the persistent session count unbounded.
 pub const CONTROL_STORE_SINGLETON_CONNECTIONS: usize = 16;
-pub const CONTROL_STORE_OCI_CONNECTIONS: usize = 8;
 pub const CONTROL_STORE_LEADERSHIP_CLEANUP_QUEUE_CAPACITY: usize =
-    CONTROL_STORE_SINGLETON_CONNECTIONS + CONTROL_STORE_OCI_CONNECTIONS;
-pub const OBSERVATION_STORE_BLOCKING_WORKERS: usize = 1;
-pub const OBSERVATION_STORE_QUEUE_CAPACITY: usize = 1;
-pub const OBSERVATION_STORE_IN_FLIGHT_CAPACITY: usize =
-    OBSERVATION_STORE_BLOCKING_WORKERS + OBSERVATION_STORE_QUEUE_CAPACITY;
-/// The lifecycle command lane owns a PostgreSQL connection and blocking
-/// worker independently from product work and inventory telemetry. A stuck
-/// full-inventory write therefore cannot starve command poll/result commit,
-/// and lifecycle traffic cannot consume the telemetry renewal lane.
-pub const LIFECYCLE_STORE_BLOCKING_WORKERS: usize = 1;
-pub const LIFECYCLE_STORE_QUEUE_CAPACITY: usize = 1;
-pub const LIFECYCLE_STORE_IN_FLIGHT_CAPACITY: usize =
-    LIFECYCLE_STORE_BLOCKING_WORKERS + LIFECYCLE_STORE_QUEUE_CAPACITY;
+    CONTROL_STORE_SINGLETON_CONNECTIONS;
 
 /// Client-side connection deadlines complement PostgreSQL's server-side
 /// statement and lock timeouts. `TCP_USER_TIMEOUT` bounds unacknowledged data;
@@ -155,12 +135,10 @@ pub const CONTROL_STORE_ESTABLISHED_IO_FAILURE_BOUND: Duration = Duration::from_
 pub const CONTROL_STORE_LANE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
 static CONTROL_STORE_SINGLETON_CONNECTIONS_IN_USE: AtomicUsize = AtomicUsize::new(0);
-static CONTROL_STORE_OCI_CONNECTIONS_IN_USE: AtomicUsize = AtomicUsize::new(0);
 
 /// Permit for a PostgreSQL session that intentionally outlives one executor
-/// job. Ordinary Store work has one connection; singleton and OCI advisory
-/// locks have separate process-wide budgets so persistent sessions cannot
-/// silently make the connection/FD count unbounded.
+/// job. Ordinary Store work has one connection; singleton advisory locks have
+/// a separate process-wide budget so persistent sessions remain bounded.
 pub(super) struct ConnectionBudgetPermit {
     in_use: &'static AtomicUsize,
 }
@@ -199,15 +177,6 @@ pub(super) fn acquire_singleton_connection_budget() -> Result<ConnectionBudgetPe
     )
 }
 
-pub(super) fn acquire_oci_connection_budget() -> Result<ConnectionBudgetPermit> {
-    acquire_connection_budget(
-        &CONTROL_STORE_OCI_CONNECTIONS_IN_USE,
-        CONTROL_STORE_OCI_CONNECTIONS,
-        "OCI ownership",
-        metrics::RejectionKind::OciConnection,
-    )
-}
-
 const CONTROL_STORE_EXECUTOR_LIMITS: executor::Limits = executor::Limits {
     workers: CONTROL_STORE_BLOCKING_WORKERS,
     queue_capacity: CONTROL_STORE_QUEUE_CAPACITY,
@@ -217,19 +186,6 @@ const CONTROL_STORE_LEADERSHIP_EXECUTOR_LIMITS: executor::Limits = executor::Lim
     workers: CONTROL_STORE_LEADERSHIP_WORKERS,
     queue_capacity: CONTROL_STORE_LEADERSHIP_QUEUE_CAPACITY,
     cleanup_capacity: CONTROL_STORE_LEADERSHIP_CLEANUP_QUEUE_CAPACITY,
-};
-const OBSERVATION_STORE_EXECUTOR_LIMITS: executor::Limits = executor::Limits {
-    workers: OBSERVATION_STORE_BLOCKING_WORKERS,
-    // The separate admission semaphore below is the exact active + queued
-    // bound. The executor needs room for both admitted jobs during the short
-    // interval before its sole worker claims the first one.
-    queue_capacity: OBSERVATION_STORE_IN_FLIGHT_CAPACITY,
-    cleanup_capacity: 1,
-};
-const LIFECYCLE_STORE_EXECUTOR_LIMITS: executor::Limits = executor::Limits {
-    workers: LIFECYCLE_STORE_BLOCKING_WORKERS,
-    queue_capacity: LIFECYCLE_STORE_IN_FLIGHT_CAPACITY,
-    cleanup_capacity: 1,
 };
 
 static CONTROL_STORE_EXECUTOR: OnceLock<std::result::Result<executor::BlockingExecutor, String>> =
@@ -590,64 +546,6 @@ impl Store {
         .await
     }
 
-    /// Own one request-scoped Store job through settlement.
-    ///
-    /// Cancellation can withdraw the job while it is still waiting for a
-    /// connection lane. Once submitted to the blocking executor, this future
-    /// deliberately keeps awaiting it: the transaction's
-    /// `AuthorityRequestContext` checkpoints cancel queued/page work, while
-    /// the async owner prevents a claimed closure from becoming detached.
-    pub(crate) async fn execute_authority_request_owned<T: Send + 'static>(
-        self: &Arc<Self>,
-        request: &transaction::AuthorityRequestContext,
-        operation: impl FnOnce(&Arc<Store>) -> Result<T> + Send + 'static,
-    ) -> Result<T> {
-        let _latency = metrics::RequestTimer::new(metrics::ExecutorKind::Normal);
-        let admission = try_admit_control_store_work()?;
-        let lane = control_store_lane(self);
-        let lane_permit = {
-            let acquire = lane.acquire_owned();
-            let timeout = tokio::time::sleep(CONTROL_STORE_LANE_ACQUIRE_TIMEOUT);
-            tokio::pin!(acquire);
-            tokio::pin!(timeout);
-            tokio::select! {
-                biased;
-                () = request.cancelled() => {
-                    return Err(ApiError::unavailable(
-                        "control-store request was cancelled before lane ownership",
-                    ));
-                }
-                () = &mut timeout => {
-                    metrics::record_lane_acquire_timeout();
-                    return Err(ApiError::unavailable(format!(
-                        "control-store connection lane was unavailable for {} seconds",
-                        CONTROL_STORE_LANE_ACQUIRE_TIMEOUT.as_secs()
-                    )));
-                }
-                result = &mut acquire => result.map_err(|_| {
-                    ApiError::unavailable("control-store connection lane is shutting down")
-                })?,
-            }
-        };
-        if request.is_cancelled_or_expired() {
-            return Err(ApiError::unavailable(
-                "control-store request was cancelled before executor submission",
-            ));
-        }
-        let store = Arc::clone(self);
-        execute_on(
-            control_store_executor()?,
-            CONTROL_STORE_QUEUE_CAPACITY,
-            metrics::ExecutorKind::Normal,
-            move || {
-                let _admission = admission;
-                let _lane = lane_permit;
-                operation(&store)
-            },
-        )
-        .await
-    }
-
     /// Lock the connection and run `f` off-runtime. The server closing the
     /// connection (restart, failover, idle timeout) must cost one reconnect,
     /// not a wedged store, so `f` receives the reconnect outcome instead of a
@@ -730,468 +628,6 @@ impl Store {
                 }
             })
         })
-    }
-
-    /// Close the synchronous client on a thread that may destroy its private
-    /// runtime. Used only after a dedicated lane has stopped and joined its
-    /// worker, so no operation can still hold the client mutex.
-    fn close_connection_now(&self) {
-        let client = match self.client.lock() {
-            Ok(mut client) => client.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
-        };
-        drop(client);
-    }
-}
-
-/// A20's renewal-critical Store lane.
-///
-/// This deliberately owns a second `Store` rather than borrowing the normal
-/// one: one worker, one bounded waiter and one PostgreSQL connection stay
-/// unavailable to Desired reads, product work, controllers and transitions.
-pub(crate) struct ObservationStoreLane {
-    store: Arc<Store>,
-    executor: Mutex<Option<executor::BlockingExecutor>>,
-    admission: Arc<tokio::sync::Semaphore>,
-}
-
-impl ObservationStoreLane {
-    /// Open the reserved PostgreSQL session on the reserved worker. Returning
-    /// from server startup therefore proves the connection and schema stamp
-    /// are usable instead of deferring the first dial to a lease renewal.
-    pub(crate) async fn connect_from_async(
-        dsn: DsnSource,
-        ca_file: Option<String>,
-    ) -> Result<Arc<Self>> {
-        let executor = executor::BlockingExecutor::new(
-            "cats-control-pg-observation",
-            OBSERVATION_STORE_EXECUTOR_LIMITS,
-        )
-        .map_err(|error| {
-            ApiError::unavailable(format!(
-                "start observation Store blocking executor: {error}"
-            ))
-        })?;
-        let execution = executor
-            .try_execute(move || Store::connect_from(&dsn, ca_file.as_deref()))
-            .map_err(|error| match error {
-                executor::SubmitError::Full => {
-                    internal("observation Store startup queue unexpectedly full")
-                }
-                executor::SubmitError::Shutdown => {
-                    internal("observation Store executor stopped during startup")
-                }
-            })?;
-        let store = execution.await.map_err(|error| match error {
-            executor::ExecutionError::Panicked => {
-                internal("observation Store startup job panicked")
-            }
-            executor::ExecutionError::Shutdown => {
-                internal("observation Store executor stopped during startup")
-            }
-        })??;
-        Ok(Arc::new(Self {
-            store: Arc::new(store),
-            executor: Mutex::new(Some(executor)),
-            admission: Arc::new(tokio::sync::Semaphore::new(
-                OBSERVATION_STORE_IN_FLIGHT_CAPACITY,
-            )),
-        }))
-    }
-
-    /// Submit one complete observation Store call without waiting for a
-    /// capacity slot. Dropping the returned future while queued removes its
-    /// closure; a claimed request relies on `AuthorityRequestContext` for the
-    /// transaction's final cancel/deadline check.
-    pub(crate) async fn execute<T: Send + 'static>(
-        self: &Arc<Self>,
-        operation: impl FnOnce(&Arc<Store>) -> Result<T> + Send + 'static,
-    ) -> Result<T> {
-        let admission = self.admission.clone().try_acquire_owned().map_err(|_| {
-            metrics::record_rejection(metrics::RejectionKind::ObservationAdmission);
-            ApiError::unavailable("observation Store lane is full")
-        })?;
-        let store = Arc::clone(&self.store);
-        let execution = {
-            let executor = match self.executor.lock() {
-                Ok(executor) => executor,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            let executor = executor
-                .as_ref()
-                .ok_or_else(|| ApiError::unavailable("observation Store lane is shutting down"))?;
-            executor
-                .try_execute(move || {
-                    let _admission = admission;
-                    operation(&store)
-                })
-                .map_err(|error| match error {
-                    executor::SubmitError::Full => {
-                        metrics::record_rejection(metrics::RejectionKind::ObservationQueue);
-                        ApiError::unavailable("observation Store queue is full")
-                    }
-                    executor::SubmitError::Shutdown => {
-                        ApiError::unavailable("observation Store lane is shutting down")
-                    }
-                })?
-        };
-        execution.await.map_err(|error| match error {
-            executor::ExecutionError::Panicked => {
-                internal("observation Store executor job panicked")
-            }
-            executor::ExecutionError::Shutdown => {
-                ApiError::unavailable("observation Store lane stopped before completing work")
-            }
-        })?
-    }
-
-    pub(crate) fn begin_shutdown(&self) {
-        self.admission.close();
-        let executor = match self.executor.lock() {
-            Ok(executor) => executor,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(executor) = executor.as_ref() {
-            executor.begin_shutdown();
-        }
-    }
-
-    /// Join the sole worker before closing its PostgreSQL connection. This is
-    /// intentionally not timeout-detached: a successful Control shutdown
-    /// means no observation transaction can commit afterward.
-    pub(crate) async fn shutdown(&self) {
-        self.begin_shutdown();
-        let executor = match self.executor.lock() {
-            Ok(mut executor) => executor.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
-        };
-        let Some(executor) = executor else {
-            return;
-        };
-        let store = Arc::clone(&self.store);
-        if let Err(error) = tokio::task::spawn_blocking(move || {
-            drop(executor);
-            store.close_connection_now();
-        })
-        .await
-        {
-            tracing::error!(%error, "join observation Store shutdown worker");
-        }
-    }
-
-    pub(crate) fn snapshot(&self) -> ObservationStoreLaneSnapshot {
-        let executor = match self.executor.lock() {
-            Ok(executor) => executor,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let work = executor.as_ref().map(executor::BlockingExecutor::snapshot);
-        ObservationStoreLaneSnapshot {
-            active: work.map_or(0, |snapshot| snapshot.active),
-            queued: work.map_or(0, |snapshot| snapshot.queued),
-            admitted: OBSERVATION_STORE_IN_FLIGHT_CAPACITY - self.admission.available_permits(),
-            connected: match self.store.client.try_lock() {
-                Ok(client) => usize::from(client.is_some()),
-                Err(std::sync::TryLockError::WouldBlock) => 1,
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                    usize::from(poisoned.into_inner().is_some())
-                }
-            },
-        }
-    }
-}
-
-impl Drop for ObservationStoreLane {
-    fn drop(&mut self) {
-        self.admission.close();
-        let executor = match self.executor.get_mut() {
-            Ok(executor) => executor.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
-        };
-        let Some(executor) = executor else {
-            return;
-        };
-        executor.begin_shutdown();
-        let store = Arc::clone(&self.store);
-        // The signal path calls async `shutdown` and never reaches this
-        // fallback. A dropped test/server handle still must not join a sync
-        // PostgreSQL runtime on a Tokio worker, so one bounded helper owns the
-        // final join and connection destruction.
-        if std::thread::Builder::new()
-            .name("cats-control-pg-observation-shutdown".to_string())
-            .spawn(move || {
-                drop(executor);
-                store.close_connection_now();
-            })
-            .is_err()
-        {
-            tracing::error!("could not start observation Store shutdown helper");
-        }
-    }
-}
-
-/// Dedicated PostgreSQL lane for atomic lifecycle command delivery and
-/// terminal-result settlement.
-///
-/// This is deliberately a distinct `Store`, worker, queue and connection from
-/// both ordinary product work and runtime inventory telemetry. Poll and commit
-/// are the command protocol's liveness path; sharing either serialized lane
-/// would let an unrelated slow request prevent an Agent from learning or
-/// acknowledging the exact current command.
-pub(crate) struct LifecycleStoreLane {
-    store: Arc<Store>,
-    executor: Mutex<Option<executor::BlockingExecutor>>,
-    admission: Arc<tokio::sync::Semaphore>,
-}
-
-/// Independent PostgreSQL connection/worker for per-Endpoint Route command
-/// delivery and settlement. The implementation reuses the lifecycle lane's
-/// bounded executor mechanics, but `connect_from_async` always constructs a
-/// distinct owned lane so lifecycle and Route transport cannot starve each
-/// other.
-pub(crate) struct RouteStoreLane {
-    lane: Arc<LifecycleStoreLane>,
-}
-
-impl RouteStoreLane {
-    pub(crate) async fn connect_from_async(
-        dsn: DsnSource,
-        ca_file: Option<String>,
-    ) -> Result<Arc<Self>> {
-        Ok(Arc::new(Self {
-            lane: LifecycleStoreLane::connect_from_async(dsn, ca_file).await?,
-        }))
-    }
-
-    pub(crate) async fn execute<T: Send + 'static>(
-        self: &Arc<Self>,
-        operation: impl FnOnce(&Arc<Store>) -> Result<T> + Send + 'static,
-    ) -> Result<T> {
-        self.lane.execute(operation).await
-    }
-
-    pub(crate) fn begin_shutdown(&self) {
-        self.lane.begin_shutdown();
-    }
-
-    pub(crate) async fn shutdown(&self) {
-        self.lane.shutdown().await;
-    }
-}
-
-impl LifecycleStoreLane {
-    pub(crate) async fn connect_from_async(
-        dsn: DsnSource,
-        ca_file: Option<String>,
-    ) -> Result<Arc<Self>> {
-        let executor = executor::BlockingExecutor::new(
-            "cats-control-pg-lifecycle",
-            LIFECYCLE_STORE_EXECUTOR_LIMITS,
-        )
-        .map_err(|error| {
-            ApiError::unavailable(format!("start lifecycle Store blocking executor: {error}"))
-        })?;
-        let execution = executor
-            .try_execute(move || Store::connect_from(&dsn, ca_file.as_deref()))
-            .map_err(|error| match error {
-                executor::SubmitError::Full => {
-                    internal("lifecycle Store startup queue unexpectedly full")
-                }
-                executor::SubmitError::Shutdown => {
-                    internal("lifecycle Store executor stopped during startup")
-                }
-            })?;
-        let store = execution.await.map_err(|error| match error {
-            executor::ExecutionError::Panicked => internal("lifecycle Store startup job panicked"),
-            executor::ExecutionError::Shutdown => {
-                internal("lifecycle Store executor stopped during startup")
-            }
-        })??;
-        Ok(Arc::new(Self {
-            store: Arc::new(store),
-            executor: Mutex::new(Some(executor)),
-            admission: Arc::new(tokio::sync::Semaphore::new(
-                LIFECYCLE_STORE_IN_FLIGHT_CAPACITY,
-            )),
-        }))
-    }
-
-    /// Submit one complete lifecycle Store call without waiting outside the
-    /// hard active+queued bound. Dropping a queued future removes its closure;
-    /// a claimed synchronous transaction finishes on this owned lane.
-    pub(crate) async fn execute<T: Send + 'static>(
-        self: &Arc<Self>,
-        operation: impl FnOnce(&Arc<Store>) -> Result<T> + Send + 'static,
-    ) -> Result<T> {
-        let admission = self.admission.clone().try_acquire_owned().map_err(|_| {
-            metrics::record_rejection(metrics::RejectionKind::LifecycleAdmission);
-            ApiError::unavailable("lifecycle Store lane is full")
-        })?;
-        let store = Arc::clone(&self.store);
-        let execution = {
-            let executor = match self.executor.lock() {
-                Ok(executor) => executor,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            let executor = executor
-                .as_ref()
-                .ok_or_else(|| ApiError::unavailable("lifecycle Store lane is shutting down"))?;
-            executor
-                .try_execute(move || {
-                    let _admission = admission;
-                    operation(&store)
-                })
-                .map_err(|error| match error {
-                    executor::SubmitError::Full => {
-                        metrics::record_rejection(metrics::RejectionKind::LifecycleQueue);
-                        ApiError::unavailable("lifecycle Store queue is full")
-                    }
-                    executor::SubmitError::Shutdown => {
-                        ApiError::unavailable("lifecycle Store lane is shutting down")
-                    }
-                })?
-        };
-        execution.await.map_err(|error| match error {
-            executor::ExecutionError::Panicked => internal("lifecycle Store executor job panicked"),
-            executor::ExecutionError::Shutdown => {
-                ApiError::unavailable("lifecycle Store lane stopped before completing work")
-            }
-        })?
-    }
-
-    pub(crate) fn begin_shutdown(&self) {
-        self.admission.close();
-        let executor = match self.executor.lock() {
-            Ok(executor) => executor,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(executor) = executor.as_ref() {
-            executor.begin_shutdown();
-        }
-    }
-
-    /// Join the worker before closing the connection. A successful server
-    /// shutdown means no lifecycle result can commit afterward.
-    pub(crate) async fn shutdown(&self) {
-        self.begin_shutdown();
-        let executor = match self.executor.lock() {
-            Ok(mut executor) => executor.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
-        };
-        let Some(executor) = executor else {
-            return;
-        };
-        let store = Arc::clone(&self.store);
-        if let Err(error) = tokio::task::spawn_blocking(move || {
-            drop(executor);
-            store.close_connection_now();
-        })
-        .await
-        {
-            tracing::error!(%error, "join lifecycle Store shutdown worker");
-        }
-    }
-
-    pub(crate) fn snapshot(&self) -> LifecycleStoreLaneSnapshot {
-        let executor = match self.executor.lock() {
-            Ok(executor) => executor,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let work = executor.as_ref().map(executor::BlockingExecutor::snapshot);
-        LifecycleStoreLaneSnapshot {
-            active: work.map_or(0, |snapshot| snapshot.active),
-            queued: work.map_or(0, |snapshot| snapshot.queued),
-            admitted: LIFECYCLE_STORE_IN_FLIGHT_CAPACITY - self.admission.available_permits(),
-            connected: match self.store.client.try_lock() {
-                Ok(client) => usize::from(client.is_some()),
-                Err(std::sync::TryLockError::WouldBlock) => 1,
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                    usize::from(poisoned.into_inner().is_some())
-                }
-            },
-        }
-    }
-}
-
-impl Drop for LifecycleStoreLane {
-    fn drop(&mut self) {
-        self.admission.close();
-        let executor = match self.executor.get_mut() {
-            Ok(executor) => executor.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
-        };
-        let Some(executor) = executor else {
-            return;
-        };
-        executor.begin_shutdown();
-        let store = Arc::clone(&self.store);
-        if std::thread::Builder::new()
-            .name("cats-control-pg-lifecycle-shutdown".to_string())
-            .spawn(move || {
-                drop(executor);
-                store.close_connection_now();
-            })
-            .is_err()
-        {
-            tracing::error!("could not start lifecycle Store shutdown helper");
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct LifecycleStoreLaneSnapshot {
-    pub(crate) active: usize,
-    pub(crate) queued: usize,
-    pub(crate) admitted: usize,
-    pub(crate) connected: usize,
-}
-
-impl LifecycleStoreLaneSnapshot {
-    pub(crate) fn append_prometheus(self, body: &mut String) {
-        use std::fmt::Write as _;
-
-        for (name, value) in [
-            ("active", self.active),
-            ("queued", self.queued),
-            ("admitted", self.admitted),
-            ("connections", self.connected),
-        ] {
-            let _ = writeln!(body, "cats_control_lifecycle_store_{name} {value}");
-        }
-        let _ = writeln!(
-            body,
-            "cats_control_lifecycle_store_capacity {}",
-            LIFECYCLE_STORE_IN_FLIGHT_CAPACITY
-        );
-        let _ = writeln!(body, "cats_control_lifecycle_store_connection_limit 1");
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ObservationStoreLaneSnapshot {
-    pub(crate) active: usize,
-    pub(crate) queued: usize,
-    pub(crate) admitted: usize,
-    pub(crate) connected: usize,
-}
-
-impl ObservationStoreLaneSnapshot {
-    pub(crate) fn append_prometheus(self, body: &mut String) {
-        use std::fmt::Write as _;
-
-        for (name, value) in [
-            ("active", self.active),
-            ("queued", self.queued),
-            ("admitted", self.admitted),
-            ("connections", self.connected),
-        ] {
-            let _ = writeln!(body, "cats_control_observation_store_{name} {value}");
-        }
-        let _ = writeln!(
-            body,
-            "cats_control_observation_store_capacity {}",
-            OBSERVATION_STORE_IN_FLIGHT_CAPACITY
-        );
-        let _ = writeln!(body, "cats_control_observation_store_connection_limit 1");
     }
 }
 

@@ -246,7 +246,14 @@ fn authorized_serving_input_binds_identity_receipt_and_exact_authority_record() 
 #[test]
 fn authorized_serving_renewal_retains_original_acquire_and_binds_current_grant() {
     let (initial, initial_record) = authorized_serving_attachment();
-    let initial_grant = initial.current_lease.grant.as_ref();
+    let AuthorizedServingCurrentLeaseProof::Lifecycle {
+        grant: initial_grant,
+        ..
+    } = &initial.current_lease
+    else {
+        unreachable!()
+    };
+    let initial_grant = initial_grant.as_ref();
     let AuthorizedServingAcquire::Normal {
         request: acquire_request,
         result: acquire_result,
@@ -327,22 +334,38 @@ fn authorized_serving_renewal_retains_original_acquire_and_binds_current_grant()
     );
 
     let mut changed_digest = renewed.clone();
-    changed_digest.current_lease.grant_receipt_digest = Sha256Digest::from_bytes([99; 32]);
+    let AuthorizedServingCurrentLeaseProof::Lifecycle {
+        grant_receipt_digest,
+        ..
+    } = &mut changed_digest.current_lease
+    else {
+        unreachable!()
+    };
+    *grant_receipt_digest = Sha256Digest::from_bytes([99; 32]);
     assert_eq!(
         validate_authorized_serving_attachment(&changed_digest),
         Err(AuthorityError::BackendUnknown)
     );
 
     let mut changed_sequence = renewed.clone();
-    changed_sequence.current_lease.grant.grant_sequence = WireU64::new(0).unwrap();
+    let AuthorizedServingCurrentLeaseProof::Lifecycle { grant, .. } =
+        &mut changed_sequence.current_lease
+    else {
+        unreachable!()
+    };
+    grant.grant_sequence = WireU64::new(0).unwrap();
     assert_eq!(
         validate_authorized_serving_attachment(&changed_sequence),
         Err(AuthorityError::BackendUnknown)
     );
 
     let mut changed_result = renewed.clone();
-    let LifecycleStartVolumeGrantAuthority::RenewSameNode { result, .. } =
-        &mut changed_result.current_lease.grant.authority
+    let AuthorizedServingCurrentLeaseProof::Lifecycle { grant, .. } =
+        &mut changed_result.current_lease
+    else {
+        unreachable!()
+    };
+    let LifecycleStartVolumeGrantAuthority::RenewSameNode { result, .. } = &mut grant.authority
     else {
         unreachable!()
     };

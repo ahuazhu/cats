@@ -19,102 +19,6 @@ variable "control_plane_image" {
   }
 }
 
-variable "gateway_image" {
-  description = "Immutable cats-gatewayd container image, including its sha256 digest."
-  type        = string
-
-  validation {
-    condition     = can(regex("@sha256:[0-9a-f]{64}$", var.gateway_image))
-    error_message = "gateway_image must be pinned by sha256 digest."
-  }
-}
-
-variable "object_write_gateway_image" {
-  description = "Immutable image containing /usr/local/bin/cats-object-write-gatewayd, pinned by sha256 digest."
-  type        = string
-
-  validation {
-    condition     = can(regex("@sha256:[0-9a-f]{64}$", var.object_write_gateway_image))
-    error_message = "object_write_gateway_image must be pinned by sha256 digest."
-  }
-}
-
-variable "object_write_gateway_replicas" {
-  description = "Active-active ObjectWrite Gateway replica count sharing PostgreSQL and one EFS access point."
-  type        = number
-  default     = 2
-
-  validation {
-    condition     = var.object_write_gateway_replicas >= 2 && floor(var.object_write_gateway_replicas) == var.object_write_gateway_replicas
-    error_message = "object_write_gateway_replicas must be an integer of at least 2."
-  }
-}
-
-variable "object_write_gateway_tls_secret_name" {
-  description = "Pre-created immutable two-file Secret containing the release-bound internal server certificate and private key."
-  type        = string
-
-  validation {
-    condition = (
-      can(regex("^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$", var.object_write_gateway_tls_secret_name)) &&
-      endswith(var.object_write_gateway_tls_secret_name, "-r1")
-    )
-    error_message = "object_write_gateway_tls_secret_name must be a Kubernetes DNS-subdomain ending in -r1."
-  }
-}
-
-variable "object_write_gateway_nlb_security_group_id" {
-  description = "Platform-owned internal NLB SG with ingress from only the exact metal worker SG."
-  type        = string
-
-  validation {
-    condition     = can(regex("^sg-[0-9a-f]{8,17}$", var.object_write_gateway_nlb_security_group_id))
-    error_message = "object_write_gateway_nlb_security_group_id must be one explicit AWS security group ID."
-  }
-}
-
-variable "object_write_gateway_private_subnet_ids" {
-  description = "Exact private subnets in which EKS Auto Mode creates the internal ObjectWrite NLB."
-  type        = list(string)
-
-  validation {
-    condition = (
-      length(var.object_write_gateway_private_subnet_ids) >= 2 &&
-      alltrue([for subnet_id in var.object_write_gateway_private_subnet_ids : can(regex("^subnet-[0-9a-f]{8,17}$", subnet_id))])
-    )
-    error_message = "object_write_gateway_private_subnet_ids must contain at least two explicit AWS subnet IDs."
-  }
-}
-
-variable "object_write_spool_file_system_id" {
-  description = "Platform-owned encrypted EFS file system for durable pre-accept and accepted spools."
-  type        = string
-
-  validation {
-    condition     = can(regex("^fs-[0-9a-f]{8,17}$", var.object_write_spool_file_system_id))
-    error_message = "object_write_spool_file_system_id must be one explicit EFS file system ID."
-  }
-}
-
-variable "object_write_spool_access_point_id" {
-  description = "Platform-owned EFS access point rooted at /object-write-spools as uid/gid 10001."
-  type        = string
-
-  validation {
-    condition     = can(regex("^fsap-[0-9a-f]{8,17}$", var.object_write_spool_access_point_id))
-    error_message = "object_write_spool_access_point_id must be one explicit EFS access point ID."
-  }
-}
-
-variable "object_write_provider_partition" {
-  description = "Provisioned AWS partition bound into every ObjectWrite authority."
-  type        = string
-}
-
-variable "object_write_provider_account_id" {
-  description = "Provisioned AWS account bound into every ObjectWrite authority."
-  type        = string
-}
 
 variable "control_plane_replicas" {
   description = "Number of active-active control-plane API replicas; singleton loops elect independently through PostgreSQL."
@@ -127,62 +31,10 @@ variable "control_plane_replicas" {
   }
 }
 
-variable "gateway_replicas" {
-  description = "Number of active-active public Route v2 Gateway replicas."
-  type        = number
-  default     = 2
 
-  validation {
-    condition     = var.gateway_replicas >= 2 && floor(var.gateway_replicas) == var.gateway_replicas
-    error_message = "gateway_replicas must be an integer of at least 2."
-  }
-}
 
-variable "route_v2_control_artifact_secret_name" {
-  description = "Name of a pre-created immutable Kubernetes Secret containing the exact eight-file Control Route v2 artifact set. Terraform never receives its bytes."
-  type        = string
 
-  validation {
-    condition = (
-      can(regex("^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$", var.route_v2_control_artifact_secret_name)) &&
-      endswith(var.route_v2_control_artifact_secret_name, "-r${var.route_v2_control_artifact_signer_revision}")
-    )
-    error_message = "route_v2_control_artifact_secret_name must be a Kubernetes DNS-subdomain name ending in the exact positive -r<route_v2_control_artifact_signer_revision> suffix."
-  }
-}
 
-variable "route_v2_control_artifact_signer_revision" {
-  description = "Positive signer revision encoded by the staged Control descriptor and immutable Secret name."
-  type        = number
-
-  validation {
-    condition     = var.route_v2_control_artifact_signer_revision > 0 && floor(var.route_v2_control_artifact_signer_revision) == var.route_v2_control_artifact_signer_revision
-    error_message = "route_v2_control_artifact_signer_revision must be a positive integer."
-  }
-}
-
-variable "route_v2_control_artifact_secret_sha256" {
-  description = "Canonical sha256:<64-lowerhex> digest of the reviewed immutable Control Secret manifest; never secret bytes."
-  type        = string
-
-  validation {
-    condition     = can(regex("^sha256:[0-9a-f]{64}$", var.route_v2_control_artifact_secret_sha256))
-    error_message = "route_v2_control_artifact_secret_sha256 must be canonical sha256:<64-lowerhex>."
-  }
-}
-
-variable "route_v2_gateway_artifact_secret_name" {
-  description = "Name of a pre-created immutable Kubernetes Secret containing exactly the fixed three Gateway Route v2 artifacts. Its one server CA bundle must validate both Control and Node chains."
-  type        = string
-
-  validation {
-    condition = (
-      can(regex("^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$", var.route_v2_gateway_artifact_secret_name)) &&
-      endswith(var.route_v2_gateway_artifact_secret_name, "-r1")
-    )
-    error_message = "route_v2_gateway_artifact_secret_name must be a Kubernetes DNS-subdomain name ending in -r1; rotation is outside the initial G2 deployment contract."
-  }
-}
 
 variable "maintenance_mode" {
   description = "Close public ingress and keep cats-controld at zero replicas during a reviewed destructive maintenance window."
@@ -482,16 +334,6 @@ variable "ingress_class_name" {
   default     = "cats-public"
 }
 
-variable "oci_deploy_sync_wait_ms" {
-  description = <<-EOT
-    How long POST /oci-deployments holds a request open before answering 202
-    with an operation to poll. A transition affordance for callers written
-    against the older synchronous response; lower it as callers adopt polling.
-  EOT
-  type        = number
-  default     = 240000
-}
-
 variable "public_ingress_idle_timeout_seconds" {
   description = <<-EOT
     ALB idle timeout for the public ingress.
@@ -503,8 +345,6 @@ variable "public_ingress_idle_timeout_seconds" {
     work succeeded -- it did keep running -- so callers retried operations that
     were already in flight.
 
-    This must stay above the control plane's `--oci-deploy-sync-wait-ms`, or
-    the ALB answers 504 before the control plane can answer 202.
   EOT
   type        = number
   default     = 300
@@ -549,20 +389,6 @@ variable "control_plane_hosts" {
   }
 }
 
-variable "endpoint_wildcard_host" {
-  description = "Wildcard public hostname routed only to cats-gatewayd."
-  type        = string
-  default     = "*.cats.run"
-
-  validation {
-    condition = (
-      startswith(var.endpoint_wildcard_host, "*.") &&
-      length(trimprefix(var.endpoint_wildcard_host, "*.")) > 0 &&
-      !contains(var.control_plane_hosts, var.endpoint_wildcard_host)
-    )
-    error_message = "endpoint_wildcard_host must be a wildcard hostname distinct from control_plane_hosts."
-  }
-}
 
 variable "credential_refresher_image" {
   description = <<-EOT
@@ -615,19 +441,5 @@ variable "database_master_user_secret_arn" {
       can(regex("^arn:[^:]+:secretsmanager:", var.database_master_user_secret_arn))
     )
     error_message = "database_master_user_secret_arn must be a Secrets Manager ARN."
-  }
-}
-
-variable "route_rotation_nlb_security_group_id" {
-  description = "Security group for the internal NLB that makes the Route v2 rotation Service reachable from the VPC's bare-metal Node Agents. Null keeps the Service ClusterIP-only."
-  type        = string
-  default     = null
-
-  validation {
-    condition = (
-      var.route_rotation_nlb_security_group_id == null ||
-      can(regex("^sg-[0-9a-f]{8,}$", var.route_rotation_nlb_security_group_id))
-    )
-    error_message = "route_rotation_nlb_security_group_id must be null or one sg-<hex> identifier."
   }
 }

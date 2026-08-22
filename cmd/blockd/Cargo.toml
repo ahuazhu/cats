@@ -36,10 +36,7 @@ vhost = { workspace = true }
 
 [dev-dependencies]
 cats-metadata-store-sqlite = { workspace = true }
-cats-control-plane = { workspace = true }
 cats-test-support = { workspace = true }
-cats-block-client = { workspace = true }
-postgres = { workspace = true }
 tempfile = { workspace = true }
 # Object-write credential fixtures mint one real Ed25519 key and encode the
 # exact canonical PKCS#8 v2 PEM and SPKI the Node publishes.

@@ -15,22 +15,22 @@ Guest Runtime API使用它。S3、PostgreSQL、NVMe cache、VMM和fencing都属�
 - S3/PostgreSQL provider adapters、usage/billing pipeline、Terraform/AWS部署；
 - adapter contracts、crash injection、fencing、鉴权、drain、Cold restore和bare-metal实验。
 
-这不等于已经完成生产 HA。当前 lifecycle仍是 V1
-`desired/observed/generation -> NodeJob`，存在attach模糊响应、旧generation ABA、
-无条件lease takeover、Agent session/adoption、PersistentDisk mount readiness和Route撤销边界等
-已确认风险。接受的生产路径是
-[ADR-0040](docs/decisions/0040-level-triggered-runtime-reconciliation.md) 的 level-triggered
-reconciliation和 [ADR-0041](docs/decisions/0041-node-verified-route-admission.md) 的 Node本地
-route gate，以及[ADR-0042](docs/decisions/0042-volume-authority-and-disk-lifecycle.md)的条件式
-Volume Authority。
+这不等于已经完成生产 HA。当前 Control/Node lifecycle 按
+[ADR-0059](docs/decisions/0059-semantic-control-node-synchronous-protocol.md) 直接切换为同步、
+场景语义协议：Control 以 Cat 当前行和 `current_action` 串行化，transaction 外同步调用 noded；
+幂等来自 Workspace、slug、完整参数和目标状态，不使用 request ID、Operation、Node poll/result、
+per-Cat journal 或 AgentSession。旧 Desired/NodeJob 和 ADR-0056 atomic command 是已被取代的历史协议。
+真实 Control→noded HTTP 的 Cat 全状态机和重复语义已通过；Strict PersistentDisk backend 已接入
+production composition。Cloud Hypervisor 的完整实际 effects 仍在缺少精确输入时 fail closed。
 
 尚未实现/验收的主要边界：
 
-- Runtime Reconciliation v1与Route Grant v2切换；
-- Host lock、可跨 Agent存活的 per-Cat scopes和完整 restart qualification；
-- conditional volume acquire/release/takeover、attachment lineage、AgentSession和ext4 mount readiness；
-- 自动跨 Node恢复所需的外部 EC2/BMC Host fence；
-- 真实双控制面 takeover与RDS failover组合验收；
+- 清理旧 Route v2 部署合同，并补齐真实双 Node/Cloud Hypervisor 纵向联调；
+- Strict PersistentDisk backend 和精确卷/文件系统身份已接入；仍需 Guest/Cloud Hypervisor 物理
+  mount readiness E2E；
+- Cloud Hypervisor 的完整 semantic effects 和真实 Linux/KVM 资格；
+- offline Node 允许双跑窗口、旧 Node reset 和最终单实例的两 Node 组合验收；
+- 自动 EC2/BMC Host fence、长期不对称网络和真实 RDS failover仍是独立边界；
 - 产品DiskSnapshot Root的同盘restore与GC保护闭环；第一版不做clone；
 - 跨Node Guest overlay和privilege separation；现有WebSocket入站dev路径仍缺真实
   Cloud Hypervisor/生产资格证据。
@@ -45,9 +45,11 @@ Volume Authority。
 - Relaxed成功FLUSH可能只有本地 `L`；`R < L` pending data是唯一数据，不是可删除cache。
 - Warm/Cold/Snapshot/detach/计划迁移前，所有保留卷必须 `R == L`。
 - 生命周期只有 Running / Suspended / Warm / Cold；Suspended和Warm都Host-bound且不能合并。
-- heartbeat timeout只是suspicion；计划handoff先release再normal acquire，非计划跨Node接管必须先
-  取得HostFenceEvent及精确逐卷takeover authorization。
-- 离开Running先关闭route admission并drain active guards，再触碰Guest/VMM/blockd。
+- heartbeat timeout只是失联判断输入，不是Host fence。当前跨Node恢复先撤旧入口、Ready后发布新入口，
+  允许旧Node在心跳窗口内短暂双跑，并依靠其返回后`reset_required`最终收敛。
+- MetadataStore owner/epoch和可信Host fence仍是独立的数据/物理隔离边界；Cat行、binding和入口切换
+  不能冒充它们。
+- 离开Running先撤掉新流量入口，再暂停或停止Guest/VMM/blockd。
 - RootDisk跟随Cat；PersistentDisk独立。只有显式disposable Root destroy可放弃本地tail。
 - Workspace是资源唯一owner；Guest runtime capability通过 `/run/cats/runtime.sock` HTTP提供。
 
@@ -71,7 +73,7 @@ FakeVmm Node和Gateway：
 
 export CATS_API_URL=http://127.0.0.1:7300
 export CATS_TOKEN=dev-admin-token
-target/debug/cats create dev --root-size 64MiB
+target/debug/cats create dev --boot-image ubuntu-24.04 --cpu 2 --memory 2GiB
 target/debug/cats exec dev -- echo hello
 
 ./scripts/dev.sh status

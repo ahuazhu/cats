@@ -21,6 +21,7 @@ use native_tls::{Certificate, TlsConnector};
 use postgres::{Client, Row};
 use postgres_native_tls::MakeTlsConnector;
 
+mod cat_volume_store;
 mod target_authority;
 
 pub use target_authority::PostgresVolumeDataAuthority;

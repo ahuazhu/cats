@@ -16,66 +16,8 @@ GUEST_RUNTIME_RELEASE_SOURCE=${CATS_GUEST_RUNTIME_RELEASE_DIR:-}
   exit 1
 }
 
-# Validate every required operator input before apt, build, installed-file or
-# systemd mutation. Staging closes the validate/use race if the supplied path
-# is replaced while this long-running bootstrap builds the Guest image.
-ROUTE_V2_NODE_ARTIFACT_SOURCE=${CATS_ROUTE_V2_NODE_ARTIFACT_DIR:-}
-[[ -n $ROUTE_V2_NODE_ARTIFACT_SOURCE ]] || {
-  echo "CATS_ROUTE_V2_NODE_ARTIFACT_DIR is required" >&2
-  exit 1
-}
-[[ $ROUTE_V2_NODE_ARTIFACT_SOURCE == /* && -d $ROUTE_V2_NODE_ARTIFACT_SOURCE && ! -L $ROUTE_V2_NODE_ARTIFACT_SOURCE ]] || {
-  echo "CATS_ROUTE_V2_NODE_ARTIFACT_DIR must be an absolute real directory" >&2
-  exit 1
-}
-for required in cmp find install stat wc; do
-  command -v "$required" >/dev/null 2>&1 || {
-    echo "worker deployment needs $required before Route v2 artifact validation" >&2
-    exit 1
-  }
-done
-# Keep transient private material on the boot-scoped tmpfs. The final fixed
-# private key is durable root-only state; staging copies must not survive a
-# Host reboot if the installer is killed before its EXIT trap runs.
-ROUTE_V2_NODE_ARTIFACT_STAGE=$(mktemp -d /run/cats-route-v2-stage.XXXXXX)
-chmod 0700 "$ROUTE_V2_NODE_ARTIFACT_STAGE"
-cleanup_route_v2_artifacts() {
-  rm -rf -- "$ROUTE_V2_NODE_ARTIFACT_STAGE"
-}
-trap cleanup_route_v2_artifacts EXIT
-route_v2_expected=(
-  public-key-ring.v1.json
-  rotation-operator-trust.v1.json
-  gateway-client-ca-bundle.pem
-  node-machine-server-certificate.pem
-  node-machine-server-private-key.pem
-  node-server-ca-bundle.pem
-)
-[[ $(find "$ROUTE_V2_NODE_ARTIFACT_SOURCE" -mindepth 1 -maxdepth 1 | wc -l) -eq 6 ]] || {
-  echo "Node Route v2 artifact source contains an unexpected entry" >&2
-  exit 1
-}
-[[ $(find "$ROUTE_V2_NODE_ARTIFACT_SOURCE" -mindepth 1 -maxdepth 1 -type f -links 1 | wc -l) -eq 6 ]] || {
-  echo "Node Route v2 artifact source must contain exactly six single-link regular files" >&2
-  exit 1
-}
-for name in "${route_v2_expected[@]}"; do
-  [[ -f $ROUTE_V2_NODE_ARTIFACT_SOURCE/$name && ! -L $ROUTE_V2_NODE_ARTIFACT_SOURCE/$name ]] || {
-    echo "missing Node Route v2 artifact: $name" >&2
-    exit 1
-  }
-  mode=0644
-  [[ $name != node-machine-server-private-key.pem ]] || mode=0600
-  install -o root -g root -m "$mode" \
-    "$ROUTE_V2_NODE_ARTIFACT_SOURCE/$name" "$ROUTE_V2_NODE_ARTIFACT_STAGE/$name"
-  [[ -s $ROUTE_V2_NODE_ARTIFACT_STAGE/$name ]] || {
-    echo "empty Node Route v2 artifact: $name" >&2
-    exit 1
-  }
-done
 "$CATS_REPO/deploy/aws/metal/validate-node-identity-installation.sh"
 . "$CATS_REPO/deploy/aws/metal/worker-deployment-transaction.sh"
-. "$CATS_REPO/deploy/aws/metal/install-route-v2-node-r1.sh"
 for required in flock stat curl openssl cmp wc findmnt systemd-run systemd-tmpfiles; do
   command -v "$required" >/dev/null 2>&1 || {
     echo "worker deployment needs $required" >&2
@@ -102,9 +44,6 @@ fi
 
 (cd "$CATS_REPO" && cargo build --locked --release \
   -p cats-cli -p cats-node-agent-daemon -p cats-blockd-daemon -p cats-guest-agent)
-"$CATS_REPO/target/release/cats-route-v2-node-r1-validator" \
-  --directory "$ROUTE_V2_NODE_ARTIFACT_STAGE"
-
 release_installer="$CATS_REPO/deploy/aws/metal/install-guest-runtime-release.sh"
 "$release_installer" verify "$GUEST_RUNTIME_RELEASE_SOURCE"
 release_transaction_active=0
@@ -116,21 +55,12 @@ deployment_cleanup() {
     cats_stop_node_service cats-worker >/dev/null 2>&1 || true
     "$release_installer" rollback >/dev/null 2>&1 || true
   fi
-  cleanup_route_v2_artifacts
   exit "$status"
 }
 trap deployment_cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 cats_acquire_worker_deployment_lock
-# Classify only while holding the Host-global lock, immediately before any
-# systemctl or installed-file mutation. A second installer that won the lock
-# while this bootstrap built can therefore yield only exact replay or a
-# fail-closed conflict.
-ROUTE_V2_INSTALL_STATE=$(cats_classify_route_v2_node_r1 \
-  "$CATS_REPO/target/release/cats-route-v2-node-r1-validator" \
-  "$ROUTE_V2_NODE_ARTIFACT_STAGE" /etc/cats/route-v2)
-[[ $ROUTE_V2_INSTALL_STATE == absent || $ROUTE_V2_INSTALL_STATE == exact ]]
 # Only after the artifact state is classified under the Host lock may systemd
 # be queried. Prove physical idle immediately before masking/stopping so a
 # worker deployment cannot race a runtime child.
@@ -139,13 +69,6 @@ cgroup_v2_root=$(cats_worker_cgroup_v2_root)
   "$cgroup_v2_root" "$CATS_PREFIX/bin" "$CATS_PREFIX/bin/cloud-hypervisor"
 cats_gate_node_service cats-worker
 cats_worker_deployment_crash_probe after-mask-worker
-
-if [[ $ROUTE_V2_INSTALL_STATE == absent ]]; then
-  cats_publish_route_v2_node_r1 \
-    "$CATS_REPO/target/release/cats-route-v2-node-r1-validator" \
-    "$ROUTE_V2_NODE_ARTIFACT_STAGE" /etc/cats/route-v2
-  cats_worker_deployment_crash_probe after-install-route-v2-artifacts
-fi
 
 # Establish the reboot recovery gate before the release journal or any state
 # filesystem mutation. The runtime mask covers this boot; fsynced installed
@@ -231,10 +154,6 @@ install -m 0755 "$CATS_REPO/target/release/cats" "$CATS_PREFIX/bin/cats"
 cats_worker_deployment_crash_probe after-install-cats-cli
 install -m 0755 "$CATS_REPO/target/release/cats-noded" "$CATS_PREFIX/bin/cats-noded"
 cats_worker_deployment_crash_probe after-install-cats-noded
-install -m 0755 "$CATS_REPO/target/release/cats-route-v2-node-r1-validator" "$CATS_PREFIX/bin/cats-route-v2-node-r1-validator"
-cats_worker_deployment_crash_probe after-install-cats-route-v2-node-r1-validator
-install -m 0755 "$CATS_REPO/target/release/cats-vmm-launcher" "$CATS_PREFIX/bin/cats-vmm-launcher"
-cats_worker_deployment_crash_probe after-install-cats-vmm-launcher
 install -m 0755 "$CATS_REPO/target/release/cats-usage-schema-v16-verifier" "$CATS_PREFIX/bin/cats-usage-schema-v16-verifier"
 cats_worker_deployment_crash_probe after-install-cats-usage-schema-v16-verifier
 install -m 0755 "$CATS_REPO/target/release/cats-usage-terminal-receipt-verifier" "$CATS_PREFIX/bin/cats-usage-terminal-receipt-verifier"
@@ -285,17 +204,17 @@ cats_worker_deployment_crash_probe after-daemon-reload
 # leaves the mid-run rotation window unbounded until the next boot fires
 # OnBootSec. It can only start once worker.env exists, since the unit reads it.
 if [[ -f /etc/cats/worker.env ]]; then
-  # Signed Agent registration replaced the Host-wide shared Control bearer.
-  # Remove a value retained by an older install before the candidate can run.
+  # Remove only the retired Route listener override. The direct Control/Node
+  # protocol uses CATS_AUTH_TOKEN from this root-only environment file.
   worker_env_temp=$(mktemp /etc/cats/.worker.env.XXXXXX)
-  awk -F= '$1 != "CATS_AUTH_TOKEN" && $1 != "CATS_ROUTE_V2_MACHINE_LISTEN"' \
+  awk -F= '$1 != "CATS_ROUTE_V2_MACHINE_LISTEN"' \
     /etc/cats/worker.env > "$worker_env_temp"
   chown root:root "$worker_env_temp"
   chmod 0600 "$worker_env_temp"
   mv -f -- "$worker_env_temp" /etc/cats/worker.env
   sync -f /etc/cats/worker.env
   sync -f /etc/cats
-  cats_worker_deployment_crash_probe after-remove-worker-shared-bearer
+  cats_worker_deployment_crash_probe after-remove-retired-route-listener
   systemctl enable --now cats-postgres-url.timer
   cats_worker_deployment_crash_probe after-enable-postgres-timer
   cats_begin_candidate_lifetime cats-worker "$release_installer"

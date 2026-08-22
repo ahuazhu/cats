@@ -45,10 +45,6 @@ jobs:
       CHUNKSTORE_BUCKET_NAME: ${{ vars.CHUNKSTORE_BUCKET_NAME }}
       CHUNKSTORE_PREFIX: ${{ vars.CHUNKSTORE_PREFIX }}
       CONTROL_POSTGRES_SCHEMA: ${{ vars.CONTROL_POSTGRES_SCHEMA }}
-      # Opaque names only. The Secrets are created by the root-only Route v2
-      # credential workflow and must be immutable with closed key sets.
-      ROUTE_V2_CONTROL_ARTIFACT_SECRET_NAME: ${{ vars.ROUTE_V2_CONTROL_ARTIFACT_SECRET_NAME }}
-      ROUTE_V2_GATEWAY_ARTIFACT_SECRET_NAME: ${{ vars.ROUTE_V2_GATEWAY_ARTIFACT_SECRET_NAME }}
       # Canonical A23 public trust bundle emitted by the central provisioner.
       # Base64 preserves its exact JSON bytes through GitHub configuration.
       RUNTIME_PROVISIONER_TRUST_BUNDLE_B64: ${{ secrets.RUNTIME_PROVISIONER_TRUST_BUNDLE_B64 }}
@@ -148,38 +144,21 @@ jobs:
           cache-from: type=gha,scope=credential-refresher
           cache-to: type=gha,mode=max,scope=credential-refresher
 
-      - name: Build and push Route v2 Gateway image
-        id: build_gateway
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: deploy/aws/Dockerfile.gateway
-          target: runtime
-          platforms: linux/amd64
-          push: true
-          tags: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:gateway-${{ steps.meta.outputs.tag }}
-          provenance: false
-          cache-from: type=gha,scope=gateway
-          cache-to: type=gha,mode=max,scope=gateway
-
       - name: Pin image digest
         id: image
         shell: bash
         env:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
           REFRESHER_DIGEST: ${{ steps.build_refresher.outputs.digest }}
-          GATEWAY_DIGEST: ${{ steps.build_gateway.outputs.digest }}
           ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
           ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
         run: |
           set -euo pipefail
           [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$REFRESHER_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
-          [[ "$GATEWAY_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           image_ref="${ECR_REGISTRY}/${ECR_REPOSITORY}@${IMAGE_DIGEST}"
           echo "ref=$image_ref" >> "$GITHUB_OUTPUT"
           echo "refresher_ref=${ECR_REGISTRY}/${ECR_REPOSITORY}@${REFRESHER_DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "gateway_ref=${ECR_REGISTRY}/${ECR_REPOSITORY}@${GATEWAY_DIGEST}" >> "$GITHUB_OUTPUT"
 
       - uses: hashicorp/setup-terraform@v3
         with:
@@ -203,8 +182,6 @@ jobs:
             CHUNKSTORE_PREFIX \
             CONTROL_POSTGRES_SCHEMA \
             RDS_MASTER_USER_SECRET_ARN \
-            ROUTE_V2_CONTROL_ARTIFACT_SECRET_NAME \
-            ROUTE_V2_GATEWAY_ARTIFACT_SECRET_NAME \
             RUNTIME_PROVISIONER_TRUST_BUNDLE_B64
           do
             if [[ -z "${!name:-}" ]]; then
@@ -230,41 +207,6 @@ jobs:
             --region "$AWS_REGION" \
             --alias "$EKS_CLUSTER_NAME" \
             --kubeconfig "$RUNNER_TEMP/kubeconfig"
-
-          # Inspect only object shape and immutable metadata. Secret data stays
-          # in the kubectl-to-jq pipe and is never printed, persisted in
-          # Terraform state, or copied into an environment variable.
-          kubectl \
-            --kubeconfig "$RUNNER_TEMP/kubeconfig" \
-            --namespace cats \
-            get secret "$ROUTE_V2_CONTROL_ARTIFACT_SECRET_NAME" \
-            --output json \
-            | jq -e '
-                .immutable == true and
-                (.data | keys) == [
-                  "control-machine-server-certificate.pem",
-                  "control-machine-server-private-key.pem",
-                  "gateway-client-ca-bundle.pem",
-                  "gateway-workload-authority.v1.json",
-                  "public-key-ring.v1.json",
-                  "rotation-operator-trust.v1.json",
-                  "signer-private-key.pem",
-                  "signer.v1.json"
-                ]
-              ' >/dev/null
-          kubectl \
-            --kubeconfig "$RUNNER_TEMP/kubeconfig" \
-            --namespace cats \
-            get secret "$ROUTE_V2_GATEWAY_ARTIFACT_SECRET_NAME" \
-            --output json \
-            | jq -e '
-                .immutable == true and
-                (.data | keys) == [
-                  "gateway-machine-client-certificate.pem",
-                  "gateway-machine-client-private-key.pem",
-                  "node-server-ca-bundle.pem"
-                ]
-              ' >/dev/null
 
           kubectl \
             --kubeconfig "$RUNNER_TEMP/kubeconfig" \
@@ -499,7 +441,6 @@ jobs:
         env:
           IMAGE_REF: ${{ steps.image.outputs.ref }}
           REFRESHER_REF: ${{ steps.image.outputs.refresher_ref }}
-          GATEWAY_REF: ${{ steps.image.outputs.gateway_ref }}
         run: |
           set -euo pipefail
           terraform \
@@ -516,10 +457,6 @@ jobs:
             -var="expected_aws_partition=$EXPECTED_AWS_PARTITION" \
             -var="aws_region=$EXPECTED_AWS_REGION" \
             -var="control_plane_image=$IMAGE_REF" \
-            -var="object_write_gateway_image=$IMAGE_REF" \
-            -var="gateway_image=$GATEWAY_REF" \
-            -var="route_v2_control_artifact_secret_name=$ROUTE_V2_CONTROL_ARTIFACT_SECRET_NAME" \
-            -var="route_v2_gateway_artifact_secret_name=$ROUTE_V2_GATEWAY_ARTIFACT_SECRET_NAME" \
             -var="chunkstore_bucket_name=$CHUNKSTORE_BUCKET_NAME" \
             -var="chunkstore_prefix=$CHUNKSTORE_PREFIX" \
             -var="control_postgres_schema=$CONTROL_POSTGRES_SCHEMA" \
@@ -542,7 +479,6 @@ jobs:
         env:
           IMAGE_REF: ${{ steps.image.outputs.ref }}
           REFRESHER_REF: ${{ steps.image.outputs.refresher_ref }}
-          GATEWAY_REF: ${{ steps.image.outputs.gateway_ref }}
         run: |
           set -euo pipefail
           verify_deployment() {
@@ -563,8 +499,6 @@ jobs:
             [[ "$observed" == "$expected_image" ]]
           }
           verify_deployment cats-controld "$IMAGE_REF"
-          verify_deployment cats-object-write-gateway "$IMAGE_REF"
-          verify_deployment cats-gatewayd "$GATEWAY_REF"
           observed_refresher="$(
             kubectl \
               --kubeconfig "$RUNNER_TEMP/kubeconfig" \
@@ -608,7 +542,6 @@ jobs:
         shell: bash
         env:
           IMAGE_REF: ${{ steps.image.outputs.ref }}
-          GATEWAY_REF: ${{ steps.image.outputs.gateway_ref }}
         run: |
           {
             echo "### Production deployment"
@@ -617,6 +550,5 @@ jobs:
             echo "|---|---|"
             echo "| commit | \`$RELEASE_SHA\` |"
             echo "| image | \`$IMAGE_REF\` |"
-            echo "| gateway image | \`$GATEWAY_REF\` |"
             echo "| method | Terraform saved plan + apply |"
           } >> "$GITHUB_STEP_SUMMARY"

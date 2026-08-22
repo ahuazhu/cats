@@ -1,7 +1,9 @@
-//! Versioned HTTP API (arch doc §17). Lifecycle mutations return
-//! `202 + Operation`; synchronous product mutations return their exact
-//! committed identity. `Idempotency-Key` retries replay the original bytes;
-//! actions live under `/actions/<verb>`.
+//! Versioned HTTP API. Cat and PersistentDisk lifecycle mutations use the
+//! synchronous semantic protocol; their identity comes from current resource
+//! state and target state, not a caller request token or a separate result
+//! resource.
+
+use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -31,32 +33,17 @@ use cats_metering::{UsageInterval, UsageView};
 use crate::server::AppState;
 
 mod accounts;
-mod agent_registration;
 mod billing;
-mod cat_create_v2;
 mod nodes;
-mod persistent_disk_create_v1;
-mod product_mutations_v2;
-pub(crate) mod route_resolve_v2;
-pub(crate) mod route_signing_operator;
-mod runtime_lifecycle;
 pub(crate) mod runtime_node_authority;
-mod runtime_object_write_authority;
-mod runtime_operations;
-mod runtime_product_reads;
-mod runtime_route;
-mod runtime_spine;
 mod runtime_usage;
-mod sessions;
+pub mod semantic_nodes;
+pub mod semantic_resources;
 mod usage;
 
 use accounts::*;
 use billing::*;
-use cat_create_v2::*;
 use nodes::*;
-use persistent_disk_create_v1::*;
-use product_mutations_v2::*;
-use sessions::*;
 use usage::*;
 
 #[derive(Debug)]
@@ -365,60 +352,8 @@ fn metering_failure(error: cats_metering::MeteringError) -> Failure {
 }
 
 pub fn router(state: AppState) -> Router {
-    let cat_collection_route = post(create_cat_v2).get(runtime_product_reads::list_runtime_cats);
-    let disk_collection_route =
-        post(create_persistent_disk_v1).get(runtime_product_reads::list_runtime_disks);
-    let cat_item_route = get(runtime_product_reads::get_runtime_cat);
-    let endpoint_collection_route = get(runtime_product_reads::list_runtime_endpoints);
-    let disk_item_route = get(runtime_product_reads::get_runtime_disk);
-    let product_mutations_v2 = Router::new()
-        .route(
-            "/v1/workspaces/{workspace}/cats/{cat}/actions/run",
-            post(run_cat_v2),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/cats/{cat}/actions/suspend",
-            post(suspend_cat_v2),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/cats/{cat}/actions/warm",
-            post(warm_cat_v2),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/cats/{cat}/actions/cold",
-            post(cold_cat_v2),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/cats/{cat}/actions/destroy",
-            post(destroy_cat_v2),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/disks/{disk}/actions/attach",
-            post(attach_persistent_disk_v2),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/disks/{disk}/actions/detach",
-            post(detach_persistent_disk_v2),
-        );
-    let runtime_operation_read = Router::new().route(
-        "/v1/workspaces/{workspace}/operations/{operation}",
-        get(runtime_operations::get_runtime_operation),
-    );
-    let runtime_product_read = Router::new()
-        .route("/v1/workspaces/{workspace}/cats/{cat}", cat_item_route)
-        .route(
-            "/v1/workspaces/{workspace}/cats/{cat}/endpoints",
-            endpoint_collection_route,
-        )
-        .route("/v1/workspaces/{workspace}/disks/{disk}", disk_item_route);
-    let route_resolve_v2 = Router::<AppState>::new()
-        .route(
-            "/v1/internal/routes/resolve",
-            post(route_resolve_v2::resolve).fallback(route_resolve_v2::resolve),
-        )
-        .layer(axum::Extension(std::sync::Arc::new(
-            route_resolve_v2::RouteResolveV2Service::from_app_state(&state),
-        )));
+    let semantic_resources = semantic_resources::routes(Arc::clone(&state.semantic_resources));
+    let semantic_nodes = semantic_nodes::routes(state.semantic_node_http.clone());
     Router::new()
         .route("/", get(crate::ui::portal))
         .route("/zh-CN", get(crate::ui::zh_home_redirect))
@@ -453,18 +388,6 @@ pub fn router(state: AppState) -> Router {
         .route("/ui/common.js", get(crate::ui::common_script))
         .route("/ui/user.js", get(crate::ui::user_script))
         .route("/ui/admin.js", get(crate::ui::admin_script))
-        .route(
-            "/ui/cat-create-v2.mjs",
-            get(crate::ui::cat_create_v2_script),
-        )
-        .route(
-            "/ui/persistent-disk-create-v1.mjs",
-            get(crate::ui::persistent_disk_create_v1_script),
-        )
-        .route(
-            "/ui/runtime-product-load.mjs",
-            get(crate::ui::runtime_product_load_script),
-        )
         .route("/auth/config", get(crate::auth::config))
         .route("/auth/login", get(crate::auth::login))
         .route("/auth/callback", get(crate::auth::callback))
@@ -497,8 +420,6 @@ pub fn router(state: AppState) -> Router {
             "/v1/accounts/{account}/members/{membership}",
             axum::routing::patch(update_account_member).delete(deactivate_account_member),
         )
-        .route("/v1/workspaces/{workspace}/cats", cat_collection_route)
-        .route("/v1/workspaces/{workspace}/disks", disk_collection_route)
         .route(
             "/v1/workspaces/{workspace}/tokens",
             post(create_workspace_token).get(list_workspace_tokens),
@@ -506,44 +427,6 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/workspaces/{workspace}/tokens/{token}",
             axum::routing::delete(revoke_workspace_token),
-        )
-        .route(
-            "/v1/internal/runtime/agent-sessions",
-            post(agent_registration::register_agent_session)
-                .fallback(agent_registration::register_agent_session),
-        )
-        .route(
-            "/v1/internal/runtime/lifecycle-command-polls",
-            post(runtime_lifecycle::command_poll).fallback(runtime_lifecycle::command_poll),
-        )
-        .route(
-            "/v1/internal/runtime/lifecycle-result-commits",
-            post(runtime_lifecycle::result_commit).fallback(runtime_lifecycle::result_commit),
-        )
-        .route(
-            "/v1/internal/runtime/lifecycle-volume-transitions",
-            post(runtime_lifecycle::volume_transition)
-                .fallback(runtime_lifecycle::volume_transition),
-        )
-        .route(
-            "/v1/internal/runtime/route-command-polls",
-            post(runtime_route::command_poll).fallback(runtime_route::command_poll),
-        )
-        .route(
-            "/v1/internal/runtime/route-result-commits",
-            post(runtime_route::result_commit).fallback(runtime_route::result_commit),
-        )
-        .route(
-            "/v1/internal/runtime/observations",
-            post(runtime_spine::inventory).fallback(runtime_spine::inventory),
-        )
-        // The literal keeps this route visible to the router snapshot test;
-        // `runtime_object_write_authority` asserts at compile time that it is
-        // exactly the frozen contract path.
-        .route(
-            "/v1/internal/runtime/object-write-authority-reads",
-            post(runtime_object_write_authority::writer_authority_read)
-                .fallback(runtime_object_write_authority::writer_authority_read),
         )
         .route(
             "/v1/admin/usage/source-terminal/discover",
@@ -591,123 +474,10 @@ pub fn router(state: AppState) -> Router {
             "/v1/workspaces/{workspace}/billing/usage",
             get(workspace_usage),
         )
-        .route(
-            "/v1/workspaces/{workspace}/cats/{cat}/oci-deployments",
-            post(deploy_oci).get(list_oci_deployments),
-        )
-        .route(
-            "/v1/workspaces/{workspace}/cats/{cat}/oci-deployment-attempts/{attempt}",
-            get(get_oci_deployment_attempt),
-        )
         .route("/v1/billing/stripe/webhook", post(stripe_webhook))
         .route("/v1/admin/workspaces", get(admin_list_workspaces))
-        .merge(runtime_operation_read)
-        .merge(runtime_product_read)
-        .merge(route_resolve_v2)
-        .merge(product_mutations_v2)
+        .merge(semantic_resources)
+        .merge(semantic_nodes)
         .fallback(crate::ui::not_found)
         .with_state(state)
-}
-
-/// Closed router for the independent server-authenticated Route v2 rotation
-/// transport. It is deliberately absent from the public management listener
-/// and from the mandatory-client-certificate Gateway listener.
-pub(crate) fn route_v2_rotation_machine_router(state: AppState) -> Router {
-    Router::<AppState>::new()
-        .route(
-            "/v1/internal/route-v2/signing-authority-commands",
-            post(route_signing_operator::apply).fallback(route_signing_operator::apply),
-        )
-        .route(
-            "/v1/internal/route-v2/public-ring-successors",
-            get(route_signing_operator::discover_successor)
-                .fallback(route_signing_operator::discover_successor),
-        )
-        .route(
-            "/v1/internal/route-v2/signing-authority-current",
-            get(route_signing_operator::discover_current)
-                .fallback(route_signing_operator::discover_current),
-        )
-        .with_state(state)
-}
-
-#[cfg(test)]
-mod clean_slate_route_tests {
-    #[test]
-    fn retired_v1_authority_routes_are_absent() {
-        let source = include_str!("mod.rs")
-            .split_once("#[cfg(test)]\nmod clean_slate_route_tests")
-            .expect("production router boundary")
-            .0;
-        for path in [
-            "/v1/internal/usage/checkpoints",
-            "/v1/internal/runtime/volume-transitions",
-            "/v1/internal/runtime/volume-transition-evidence",
-            "/v1/internal/runtime/residue-decisions",
-            "/v1/admin/runtime/fleet-verification-snapshots",
-            "/v1/admin/monitoring",
-            "/v1/admin/nodes/{id}/actions/{verb}",
-            "/v1/nodes/{id}/work",
-            "/v1/routes/wake",
-            "/v1/workspaces/{workspace}/cats/{cat}/actions/{verb}",
-            "/v1/workspaces/{workspace}/cats/{cat}/actions/start",
-            "/v1/workspaces/{workspace}/cats/{cat}/actions/stop",
-            "/v1/workspaces/{workspace}/cats/{cat}/actions/delete",
-        ] {
-            assert!(!source.contains(path), "retired route remains: {path}");
-        }
-    }
-
-    #[test]
-    fn atomic_lifecycle_and_product_reads_remain_registered() {
-        let source = include_str!("mod.rs")
-            .split_once("#[cfg(test)]\nmod clean_slate_route_tests")
-            .expect("production router boundary")
-            .0;
-        for path in [
-            "/v1/workspaces/{workspace}/cats",
-            "/v1/workspaces/{workspace}/disks",
-            "/v1/workspaces/{workspace}/cats/{cat}",
-            "/v1/workspaces/{workspace}/cats/{cat}/endpoints",
-            "/v1/workspaces/{workspace}/disks/{disk}",
-            "/v1/workspaces/{workspace}/operations/{operation}",
-            "/v1/workspaces/{workspace}/cats/{cat}/actions/run",
-            "/v1/workspaces/{workspace}/cats/{cat}/actions/suspend",
-            "/v1/workspaces/{workspace}/cats/{cat}/actions/warm",
-            "/v1/workspaces/{workspace}/cats/{cat}/actions/cold",
-            "/v1/workspaces/{workspace}/cats/{cat}/actions/destroy",
-            "/v1/workspaces/{workspace}/disks/{disk}/actions/attach",
-            "/v1/workspaces/{workspace}/disks/{disk}/actions/detach",
-        ] {
-            assert!(source.contains(path), "atomic route is missing: {path}");
-        }
-    }
-
-    #[test]
-    fn route_v2_rotation_routes_are_exclusive_to_machine_listener() {
-        let source = include_str!("mod.rs");
-        let main_router = source
-            .split_once("pub fn router")
-            .expect("main router declaration")
-            .1
-            .split_once(".fallback(crate::ui::not_found)")
-            .expect("main router fallback")
-            .0;
-        let rotation_router = source
-            .split_once("pub(crate) fn route_v2_rotation_machine_router")
-            .expect("rotation machine router declaration")
-            .1
-            .split_once("#[cfg(test)]\nmod clean_slate_route_tests")
-            .expect("rotation machine router boundary")
-            .0;
-
-        for path in [
-            "/v1/internal/route-v2/signing-authority-commands",
-            "/v1/internal/route-v2/public-ring-successors",
-            "/v1/internal/route-v2/signing-authority-current",
-        ] {
-            assert!(!main_router.contains(path), "{path} leaked onto port 7300");
-            assert_eq!(rotation_router.matches(path).count(), 1);
-        }
-    }
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise public Cat create, sleep, wake and destroy in one exact Workspace."""
+"""Exercise the synchronous Cat and PersistentDisk protocol in production."""
 
 from __future__ import annotations
 
@@ -19,8 +19,13 @@ from urllib.parse import urlsplit
 
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 WORKSPACE = re.compile(r"ws_[A-Za-z0-9_-]{1,124}\Z")
-CAT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}\Z")
+RESOURCE_SLUG = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 SLEEP_STATES = {"suspend": "suspended", "warm": "warm", "cold": "cold"}
+ACTION_CODES = {
+    "suspend": ("cat_suspended", "already_suspended"),
+    "warm": ("cat_warm", "already_warm"),
+    "cold": ("cat_cold", "already_cold"),
+}
 QUALIFICATION_CLASSES = [
     "cat_create",
     "disk_create",
@@ -150,12 +155,23 @@ def validate_arguments(arguments: argparse.Namespace) -> tuple[str, dict[str, An
         raise E2eError("--workspace-id must be one immutable ws_ ID")
     if DIGEST.fullmatch(arguments.boot_image_digest) is None:
         raise E2eError("--boot-image-digest is invalid")
-    if CAT_NAME.fullmatch(arguments.cat_name) is None:
+    if RESOURCE_SLUG.fullmatch(arguments.cat_name) is None:
         raise E2eError("--cat-name is invalid")
+    if RESOURCE_SLUG.fullmatch(arguments.disk_name) is None:
+        raise E2eError("--disk-name is invalid")
+    if re.fullmatch(r"[1-9][0-9]*GiB", arguments.disk_size) is None:
+        raise E2eError("--disk-size must be a positive whole number of GiB")
+    if (
+        not arguments.mount_path.startswith("/")
+        or arguments.mount_path == "/"
+        or arguments.mount_path.endswith("/")
+        or any(part in ("", ".", "..") for part in arguments.mount_path[1:].split("/"))
+    ):
+        raise E2eError("--mount-path must be one normalized non-root absolute path")
     if arguments.cpus < 1 or arguments.cpus > 64:
         raise E2eError("--cpus must be between 1 and 64")
     if not arguments.sleep_state:
-        arguments.sleep_state = ["suspend"]
+        arguments.sleep_state = ["suspend", "warm", "cold"]
     if len(set(arguments.sleep_state)) != len(arguments.sleep_state):
         raise E2eError("--sleep-state contains a duplicate action")
     if (
@@ -221,38 +237,92 @@ def run_cli(
         raise E2eError(f"Cats CLI command {command[0]} returned invalid JSON") from error
 
 
-def require_operation(value: Any, action: str, cat_id: str) -> dict[str, Any]:
+def require_cat(value: Any, cat_id: str, cat_slug: str, state: str) -> dict[str, Any]:
     if (
         not isinstance(value, dict)
-        or value.get("version") != 1
-        or value.get("action") != action
-        or value.get("state") != "succeeded"
         or value.get("cat_id") != cat_id
-        or not isinstance(value.get("operation_id"), str)
-        or not value["operation_id"].startswith("op_")
-        or not isinstance(value.get("terminal_at_unix_ms"), int)
+        or value.get("cat_slug") != cat_slug
+        or value.get("state") != state
+        or value.get("current_action") is not None
     ):
-        raise E2eError(f"{action} did not return one exact succeeded product Operation")
+        raise E2eError(f"Cat did not reach synchronous state {state}")
+    node_id = value.get("node_id")
+    node_name = value.get("node_name")
+    if state in {"running", "suspended", "warm"}:
+        if not isinstance(node_id, str) or not node_id.startswith("node_") or not node_name:
+            raise E2eError(f"{state} Cat lacks exact Node placement")
+    elif node_id is not None or node_name is not None:
+        raise E2eError(f"{state} Cat unexpectedly retains Node placement")
     return value
 
 
-def require_cat(value: Any, cat_id: str, stable_state: str) -> dict[str, Any]:
-    lifecycle = value.get("lifecycle") if isinstance(value, dict) else None
+def require_cat_response(
+    value: Any,
+    cat_id: str,
+    cat_slug: str,
+    state: str,
+    status: str,
+    code: str,
+) -> dict[str, Any]:
     if (
-        not isinstance(lifecycle, dict)
-        or value.get("version") != 1
-        or value.get("id") != cat_id
-        or lifecycle.get("stable_state") != stable_state
-        or lifecycle.get("deleted_at_unix_ms") is not None
+        not isinstance(value, dict)
+        or value.get("status") != status
+        or value.get("code") != code
+        or not isinstance(value.get("cat"), dict)
     ):
-        raise E2eError(f"Cat did not reach product state {stable_state}")
-    runtime_incarnation = lifecycle.get("runtime_incarnation")
-    if stable_state in {"running", "suspended"}:
-        if not isinstance(runtime_incarnation, str) or not runtime_incarnation:
-            raise E2eError(f"{stable_state} Cat lacks a runtime incarnation")
-    elif runtime_incarnation is not None:
-        raise E2eError(f"{stable_state} Cat retained a runtime incarnation")
+        raise E2eError(f"Cat response is not exact {status}/{code}")
+    require_cat(value["cat"], cat_id, cat_slug, state)
+    return value["cat"]
+
+
+def require_disk(
+    value: Any,
+    disk_id: str,
+    disk_slug: str,
+    status: str,
+    binding_cat_id: str | None,
+    mount_path: str | None,
+) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or value.get("disk_id") != disk_id
+        or value.get("disk_slug") != disk_slug
+        or value.get("status") != status
+    ):
+        raise E2eError(f"PersistentDisk did not reach state {status}")
+    binding = value.get("binding")
+    if binding_cat_id is None:
+        if binding is not None:
+            raise E2eError("PersistentDisk unexpectedly remains bound")
+    elif (
+        not isinstance(binding, dict)
+        or binding.get("cat_id") != binding_cat_id
+        or binding.get("mount_path") != mount_path
+    ):
+        raise E2eError("PersistentDisk binding differs from the exact Cat/mount")
     return value
+
+
+def require_disk_response(
+    value: Any,
+    disk_id: str,
+    disk_slug: str,
+    disk_status: str,
+    response_status: str,
+    code: str,
+    binding_cat_id: str | None,
+    mount_path: str | None,
+) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or value.get("status") != response_status
+        or value.get("code") != code
+        or not isinstance(value.get("disk"), dict)
+    ):
+        raise E2eError(f"PersistentDisk response is not exact {response_status}/{code}")
+    return require_disk(
+        value["disk"], disk_id, disk_slug, disk_status, binding_cat_id, mount_path
+    )
 
 
 def record_step(output: Path, sequence: int, label: str, value: Any) -> str:
@@ -284,74 +354,318 @@ def run_e2e(
 
     before = invoke("cats-before", "ls")
     if not isinstance(before, list) or any(
-        isinstance(cat, dict) and cat.get("name") == arguments.cat_name for cat in before
+        isinstance(cat, dict) and cat.get("cat_slug") == arguments.cat_name for cat in before
     ):
-        raise E2eError("preflight Cat list is invalid or test name already exists")
-    accepted = invoke(
-        "create-accepted",
+        raise E2eError("preflight Cat list is invalid or test slug already exists")
+    disks_before = invoke("disks-before", "disk", "ls")
+    if not isinstance(disks_before, list) or any(
+        isinstance(disk, dict) and disk.get("disk_slug") == arguments.disk_name
+        for disk in disks_before
+    ):
+        raise E2eError("preflight PersistentDisk list is invalid or test slug already exists")
+
+    disk_created = invoke(
+        "disk-created", "disk", "create", arguments.disk_name, "--size", arguments.disk_size
+    )
+    if not isinstance(disk_created, dict) or not isinstance(disk_created.get("disk"), dict):
+        raise E2eError("PersistentDisk create returned no exact resource")
+    disk_id = disk_created["disk"].get("disk_id")
+    if not isinstance(disk_id, str) or not disk_id.startswith("disk_"):
+        raise E2eError("PersistentDisk create returned an invalid identity")
+    require_disk_response(
+        disk_created,
+        disk_id,
+        arguments.disk_name,
+        "normal",
+        "ok",
+        "disk_created",
+        None,
+        None,
+    )
+    require_disk_response(
+        invoke(
+            "disk-create-replay",
+            "disk",
+            "create",
+            arguments.disk_name,
+            "--size",
+            arguments.disk_size,
+        ),
+        disk_id,
+        arguments.disk_name,
+        "normal",
+        "already_exists",
+        "already_exists",
+        None,
+        None,
+    )
+
+    created = invoke(
+        "cat-created",
         "create",
         arguments.cat_name,
-        "--boot-image-digest",
+        "--boot-image",
         arguments.boot_image_digest,
-        "--cpus",
+        "--cpu",
         str(arguments.cpus),
         "--memory",
         arguments.memory,
-        "--root-size",
-        arguments.root_size,
-        "--durability",
-        "strict",
+        "--mount",
+        f"{arguments.disk_name}:{arguments.mount_path}",
     )
     if (
-        not isinstance(accepted, dict)
-        or set(accepted) != {"cat_id", "operation_id"}
-        or not isinstance(accepted.get("cat_id"), str)
-        or not accepted["cat_id"].startswith("cat_")
-        or not isinstance(accepted.get("operation_id"), str)
-        or not accepted["operation_id"].startswith("op_")
+        not isinstance(created, dict)
+        or not isinstance(created.get("cat"), dict)
+        or not isinstance(created["cat"].get("cat_id"), str)
+        or not created["cat"]["cat_id"].startswith("cat_")
     ):
-        raise E2eError("create did not return one exact accepted Cat/Operation identity")
-    cat_id = accepted["cat_id"]
-    create = invoke("create-terminal", "operation", "wait", accepted["operation_id"])
-    require_operation(create, "create", cat_id)
-    running = require_cat(invoke("create-running", "get", cat_id), cat_id, "running")
-    current_incarnation = running["lifecycle"]["runtime_incarnation"]
+        raise E2eError("Cat create did not return one exact synchronous resource identity")
+    cat_id = created["cat"]["cat_id"]
+    running = require_cat_response(
+        created, cat_id, arguments.cat_name, "running", "ok", "cat_created"
+    )
+    if running.get("mounts") != [
+        {
+            "disk_id": disk_id,
+            "disk_slug": arguments.disk_name,
+            "mount_path": arguments.mount_path,
+        }
+    ]:
+        raise E2eError("Running Cat lacks the exact PersistentDisk mount")
+    first_node_id = running["node_id"]
+    require_cat_response(
+        invoke(
+            "cat-create-replay",
+            "create",
+            arguments.cat_name,
+            "--boot-image",
+            arguments.boot_image_digest,
+            "--cpu",
+            str(arguments.cpus),
+            "--memory",
+            arguments.memory,
+            "--mount",
+            f"{arguments.disk_name}:{arguments.mount_path}",
+        ),
+        cat_id,
+        arguments.cat_name,
+        "running",
+        "already_exists",
+        "already_exists",
+    )
+    require_cat(invoke("create-running", "get", arguments.cat_name), cat_id, arguments.cat_name, "running")
 
     for sleep_action in arguments.sleep_state:
-        terminal = invoke(f"{sleep_action}-terminal", sleep_action, cat_id)
-        require_operation(terminal, sleep_action, cat_id)
-        sleeping = require_cat(
-            invoke(f"{sleep_action}-state", "get", cat_id),
+        success_code, replay_code = ACTION_CODES[sleep_action]
+        sleeping = require_cat_response(
+            invoke(f"{sleep_action}-terminal", sleep_action, arguments.cat_name),
             cat_id,
+            arguments.cat_name,
+            SLEEP_STATES[sleep_action],
+            "ok",
+            success_code,
+        )
+        require_cat_response(
+            invoke(f"{sleep_action}-replay", sleep_action, arguments.cat_name),
+            cat_id,
+            arguments.cat_name,
+            SLEEP_STATES[sleep_action],
+            "already_done",
+            replay_code,
+        )
+        if sleep_action != "cold" and sleeping["node_id"] != first_node_id:
+            raise E2eError(f"{sleep_action} unexpectedly changed Host-bound placement")
+        require_cat(
+            invoke(f"{sleep_action}-state", "get", arguments.cat_name),
+            cat_id,
+            arguments.cat_name,
             SLEEP_STATES[sleep_action],
         )
-        if sleep_action == "suspend" and (
-            sleeping["lifecycle"]["runtime_incarnation"] != current_incarnation
-        ):
-            raise E2eError("suspend changed the retained runtime incarnation")
-        wake = invoke(f"run-after-{sleep_action}-terminal", "run", cat_id)
-        require_operation(wake, "run", cat_id)
-        running = require_cat(
-            invoke(f"running-after-{sleep_action}", "get", cat_id), cat_id, "running"
+        running = require_cat_response(
+            invoke(f"run-after-{sleep_action}-terminal", "run", arguments.cat_name),
+            cat_id,
+            arguments.cat_name,
+            "running",
+            "ok",
+            "cat_running",
         )
-        if sleep_action == "suspend" and (
-            running["lifecycle"]["runtime_incarnation"] != current_incarnation
-        ):
-            raise E2eError("run after suspend replaced the retained runtime incarnation")
-        current_incarnation = running["lifecycle"]["runtime_incarnation"]
+        require_cat_response(
+            invoke(f"run-after-{sleep_action}-replay", "run", arguments.cat_name),
+            cat_id,
+            arguments.cat_name,
+            "running",
+            "already_done",
+            "already_running",
+        )
+        first_node_id = running["node_id"]
 
-    destroy = invoke("destroy-terminal", "destroy", cat_id)
-    require_operation(destroy, "destroy", cat_id)
+    require_cat_response(
+        invoke("cold-for-binding", "cold", arguments.cat_name),
+        cat_id,
+        arguments.cat_name,
+        "cold",
+        "ok",
+        "cat_cold",
+    )
+    require_disk_response(
+        invoke("disk-detached", "disk", "detach", arguments.disk_name, "--cat", arguments.cat_name),
+        disk_id,
+        arguments.disk_name,
+        "normal",
+        "ok",
+        "disk_detached",
+        None,
+        None,
+    )
+    require_disk_response(
+        invoke("disk-detach-replay", "disk", "detach", arguments.disk_name, "--cat", arguments.cat_name),
+        disk_id,
+        arguments.disk_name,
+        "normal",
+        "already_done",
+        "already_detached",
+        None,
+        None,
+    )
+    require_disk_response(
+        invoke(
+            "disk-attached",
+            "disk",
+            "attach",
+            arguments.disk_name,
+            "--cat",
+            arguments.cat_name,
+            "--mount",
+            arguments.mount_path,
+        ),
+        disk_id,
+        arguments.disk_name,
+        "normal",
+        "ok",
+        "disk_attached",
+        cat_id,
+        arguments.mount_path,
+    )
+    require_disk_response(
+        invoke(
+            "disk-attach-replay",
+            "disk",
+            "attach",
+            arguments.disk_name,
+            "--cat",
+            arguments.cat_name,
+            "--mount",
+            arguments.mount_path,
+        ),
+        disk_id,
+        arguments.disk_name,
+        "normal",
+        "already_done",
+        "already_attached",
+        cat_id,
+        arguments.mount_path,
+    )
+    require_cat_response(
+        invoke("run-after-binding", "run", arguments.cat_name),
+        cat_id,
+        arguments.cat_name,
+        "running",
+        "ok",
+        "cat_running",
+    )
+
+    require_cat_response(
+        invoke("destroy-terminal", "destroy", arguments.cat_name),
+        cat_id,
+        arguments.cat_name,
+        "destroyed",
+        "ok",
+        "cat_destroyed",
+    )
+    require_disk_response(
+        invoke("disk-destroyed", "disk", "destroy", arguments.disk_name),
+        disk_id,
+        arguments.disk_name,
+        "deleted",
+        "ok",
+        "disk_deleted",
+        None,
+        None,
+    )
     after = invoke("cats-after", "ls")
     if not isinstance(after, list) or any(
-        isinstance(cat, dict) and cat.get("id") == cat_id for cat in after
+        isinstance(cat, dict) and cat.get("cat_id") == cat_id for cat in after
     ):
         raise E2eError("destroyed Cat remains in the product list")
+    disks_after = invoke("disks-after", "disk", "ls")
+    if not isinstance(disks_after, list) or any(
+        isinstance(disk, dict) and disk.get("disk_id") == disk_id for disk in disks_after
+    ):
+        raise E2eError("deleted PersistentDisk remains in the product list")
+
+    replacement_disk = invoke(
+        "disk-slug-reused", "disk", "create", arguments.disk_name, "--size", arguments.disk_size
+    )
+    replacement_disk_id = replacement_disk.get("disk", {}).get("disk_id")
+    if not isinstance(replacement_disk_id, str) or replacement_disk_id == disk_id:
+        raise E2eError("PersistentDisk slug reuse did not allocate a new immutable identity")
+    require_disk_response(
+        replacement_disk,
+        replacement_disk_id,
+        arguments.disk_name,
+        "normal",
+        "ok",
+        "disk_created",
+        None,
+        None,
+    )
+    replacement_cat = invoke(
+        "cat-slug-reused",
+        "create",
+        arguments.cat_name,
+        "--boot-image",
+        arguments.boot_image_digest,
+        "--cpu",
+        str(arguments.cpus),
+        "--memory",
+        arguments.memory,
+    )
+    replacement_cat_id = replacement_cat.get("cat", {}).get("cat_id")
+    if not isinstance(replacement_cat_id, str) or replacement_cat_id == cat_id:
+        raise E2eError("Cat slug reuse did not allocate a new immutable identity")
+    require_cat_response(
+        replacement_cat,
+        replacement_cat_id,
+        arguments.cat_name,
+        "running",
+        "ok",
+        "cat_created",
+    )
+    require_cat_response(
+        invoke("replacement-cat-destroyed", "destroy", arguments.cat_name),
+        replacement_cat_id,
+        arguments.cat_name,
+        "destroyed",
+        "ok",
+        "cat_destroyed",
+    )
+    require_disk_response(
+        invoke("replacement-disk-destroyed", "disk", "destroy", arguments.disk_name),
+        replacement_disk_id,
+        arguments.disk_name,
+        "deleted",
+        "ok",
+        "disk_deleted",
+        None,
+        None,
+    )
     return {
         "api_url": arguments.api_url,
         "boot_image_digest": arguments.boot_image_digest,
         "cat_id": cat_id,
         "cat_name": arguments.cat_name,
+        "disk_id": disk_id,
+        "disk_name": arguments.disk_name,
         "evidence": evidence,
         "qualification_begin_receipt_sha256": sha256_bytes(qualification_raw),
         "qualification_id": qualification["qualification_id"],
@@ -372,15 +686,17 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--workspace-id", required=True)
     parser.add_argument("--boot-image-digest", required=True)
     parser.add_argument("--cat-name", required=True)
+    parser.add_argument("--disk-name", required=True)
+    parser.add_argument("--disk-size", default="1GiB")
+    parser.add_argument("--mount-path", default="/data")
     parser.add_argument(
         "--sleep-state",
         action="append",
         choices=sorted(SLEEP_STATES),
-        help="repeat to exercise multiple public sleep states; default: suspend",
+        help="repeat to select public sleep states; default: suspend, warm and cold",
     )
     parser.add_argument("--cpus", type=int, default=2)
     parser.add_argument("--memory", default="2GiB")
-    parser.add_argument("--root-size", default="4GiB")
     parser.add_argument("--output", required=True, type=Path)
     return parser.parse_args()
 

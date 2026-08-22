@@ -29,35 +29,12 @@ reqwest = { workspace = true, features = ["blocking"] }
 uuid = { workspace = true }
 libc = { workspace = true }
 tracing = { workspace = true }
-base64 = { workspace = true }
-bytes = { workspace = true }
-hyper = { workspace = true }
-hyper-util = { workspace = true }
-http-body-util = { workspace = true }
-rustls = { workspace = true }
-tokio-rustls = { workspace = true }
-# The Node mints its own attachment-scoped object-write Ed25519 keypairs. `ring`
-# is already the workspace's only Ed25519 implementation (it backs
-# `cats_api::agent_registration::Ed25519RequestSigner`), so generating the key
-# with anything else would introduce a second signature stack for one keypair.
-ring = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
-cats-object-store-gateway = { workspace = true }
 cats-test-support = { workspace = true }
 cats-control-plane = { workspace = true, features = ["test-support"] }
-# `object_write_end_to_end` installs the reviewed gateway PostgreSQL role and
-# reads the settled `object_write_attempts` projection back. Both are operator
-# and assertion work outside the typed control Store surface.
-postgres = { workspace = true }
-# The same end-to-end chain runs against the production AWS object-write
-# downstream when a disposable bucket is named. `cmd/object-write-gatewayd`
-# already builds both crates, so this adds no new workspace dependency.
-cats-host-fence-aws = { workspace = true }
-aws-config = { workspace = true }
-cats-object-store-file = { workspace = true }
 tempfile = { workspace = true }
-hex = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 cats-blockd = { workspace = true, features = ["test-vhost-user-frontend"] }

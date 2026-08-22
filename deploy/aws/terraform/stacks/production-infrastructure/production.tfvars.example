@@ -42,25 +42,18 @@ metal_worker_instances = {
 }
 metal_worker_instance_role_name = "REPLACE_WITH_INSTANCE_ROLE_NAME"
 # Pre-create this secret through the root-only credential channel. Its
-# SecretString is a closed JSON object with exactly four non-empty base64
-# fields: public_key_ring_v1_json_b64, gateway_client_ca_bundle_pem_b64,
-# node_machine_server_certificate_pem_b64 and
-# node_machine_server_private_key_pem_b64. Terraform receives only the ARN.
-route_v2_node_artifact_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:cats-production-route-v2-node-r1-ABC123"
-route_v2_node_artifact_secret_version_id = "REPLACE_WITH_EXACT_32_TO_64_CHARACTER_VERSION_ID"
-
 # Rolling release across a serving fleet: drain one worker, apply with only it
 # listed here, undrain, then move to the next. Omit to deploy every worker.
 # Never subset while removing a retired worker_runtime_secret_data value: roll
 # the cleanup through every drained worker.
 # metal_worker_deploy_instances = ["metal-1"]
 
-# Signed workers need no shared bearer. Leave worker_runtime_secret_data empty;
-# the only accepted key is a transitional CATS_POSTGRES_URL that is no longer
-# read once the managed DSN renderer is configured.
-# Route v2 trust and the Node machine private key come only from the scoped
-# pre-created secret above; do not put their bytes in this file or TF_VAR_*.
-
+# The direct Control/Node protocol uses the same internal service token as
+# Control. Supply it only through the approved sensitive tfvars channel; the
+# deployment stores it in Secrets Manager and a root-only worker.env.
+worker_runtime_secret_data = {
+  CATS_AUTH_TOKEN = "REPLACE_WITH_CONTROL_INTERNAL_SERVICE_TOKEN"
+}
 # After the platform RDS Proxy target is AVAILABLE, supply these through an
 # approved non-secret tfvars source and roll one drained worker at a time:
 # worker_managed_environment = {

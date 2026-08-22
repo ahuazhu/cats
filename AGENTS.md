@@ -156,18 +156,18 @@ git worktree add -b fix/<slug> .worktrees/<slug>
 Never stash or reset the primary checkout to make room. Remove a worktree only after its branch has
 merged. Preserve unrelated dirty files in every checkout.
 
-## Quality gates
+## Quality checks
 
-Use:
+Available repository checks:
 
 ```bash
 ./scripts/quality.sh fast
 ./scripts/quality.sh full
 ```
 
-`full` is required before handoff. It checks formatting and shared skill links; dependency security,
-licenses, sources, version splits and workspace inheritance; build-before-test; Clippy with warnings
-denied; workspace tests and rustdoc.
+`full` checks formatting and shared skill links; dependency security, licenses, sources, version
+splits and workspace inheritance; build-before-test; Clippy with warnings denied; workspace tests
+and rustdoc.
 
 The control-store tests require disposable PostgreSQL. `quality.sh` starts Docker PostgreSQL, CI has
 a service container, and `CATS_TEST_POSTGRES_URL` can provide one. Tests fail rather than skip when
@@ -180,9 +180,8 @@ cargo install --locked cargo-deny --version 0.19.4
 cargo install --locked cargo-machete --version 0.9.2
 ```
 
-Changes touching Linux-only vhost-user-blk or Node code also require a Linux gate. The final gate is
-native `quality.sh full` on the configured x86_64 build host. When that host is unavailable during
-iteration, use the Docker compatibility gate:
+For changes touching Linux-only vhost-user-blk or Node code, the Docker compatibility check is
+available when the configured native x86_64 Linux build host is unavailable:
 
 ```bash
 ./scripts/quality.sh linux
@@ -193,10 +192,10 @@ Report exact commands and results, and separate pre-existing failures from regre
 
 Every `quality.sh` run prints the absolute repository root, HEAD, dirty flag and a fingerprint covering
 the tracked diff plus untracked files. A result without this provenance is not evidence for a worktree.
-Use the configured native x86_64 Linux test host for final Linux build/test and real integration work;
-deliver an exact clean commit through the existing content-addressed source bundle and retain its
-immutable build receipt. Do not rebuild an ad-hoc test environment when that host and the repository
-scripts already cover the gate.
+The configured native x86_64 Linux test host can be used for Linux build/test and real integration
+work. Exact clean commits can be delivered through the existing content-addressed source bundle so
+the immutable build receipt is retained. Avoid rebuilding an ad-hoc test environment when that host
+and the repository scripts already cover the check.
 
 If the same environment or tool failure recurs, stop retrying the same manual steps. Fix or add the
 repository script first. Promote the workflow to a shared skill only when it recurs across tasks and

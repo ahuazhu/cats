@@ -23,12 +23,9 @@ override_data {
 override_module {
   target = module.cats_kubernetes
   outputs = {
-    namespace                                   = "cats"
-    control_plane_service                       = "cats-controld"
-    control_plane_route_v2_service              = "cats-controld-route-v2"
-    gateway_service                             = "cats-gatewayd"
-    object_write_gateway_load_balancer_hostname = "internal-object-write-fixture.elb.amazonaws.com"
-    ingress_name                                = "cats-public"
+    namespace             = "cats"
+    control_plane_service = "cats-controld"
+    ingress_name          = "cats-public"
   }
 }
 
@@ -39,18 +36,6 @@ variables {
   expected_aws_partition                        = "aws"
   aws_region                                    = "us-east-1"
   control_plane_image                           = "123456789012.dkr.ecr.us-east-1.amazonaws.com/cats/control@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-  gateway_image                                 = "123456789012.dkr.ecr.us-east-1.amazonaws.com/cats/gateway@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-  object_write_gateway_image                    = "123456789012.dkr.ecr.us-east-1.amazonaws.com/cats/object-write-gateway@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-  object_write_gateway_tls_secret_name          = "cats-object-write-gateway-tls-r1"
-  object_write_gateway_nlb_security_group_id    = "sg-0123456789abcdef0"
-  object_write_gateway_private_zone_id          = "Z0123456789ABCDEFGHIJ"
-  object_write_gateway_private_dns_name         = "gateway.object-write.production.cats.internal"
-  object_write_spool_file_system_id             = "fs-0123456789abcdef0"
-  object_write_spool_access_point_id            = "fsap-0123456789abcdef0"
-  route_v2_control_artifact_secret_name         = "cats-route-v2-control-r1"
-  route_v2_control_artifact_signer_revision     = 1
-  route_v2_control_artifact_secret_sha256       = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
-  route_v2_gateway_artifact_secret_name         = "cats-route-v2-gateway-r1"
   runtime_secret_data                           = {}
   production_cutover_operator_trust_bundle_json = "{}"
   runtime_provisioner_trust_bundle_json         = "{}"
@@ -63,7 +48,6 @@ variables {
   rds_ca_pem                                    = "fixture-ca"
   acm_certificate_arn                           = "arn:aws:acm:us-east-1:123456789012:certificate/11111111-2222-3333-4444-555555555555"
   public_subnet_ids                             = ["subnet-00000000000000001", "subnet-00000000000000002"]
-  private_subnet_ids                            = ["subnet-10000000000000001", "subnet-10000000000000002"]
 }
 
 run "accepts_the_exact_aws_target" {

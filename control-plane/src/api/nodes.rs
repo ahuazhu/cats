@@ -16,8 +16,7 @@ pub(super) async fn admin_list_workspaces(
     Ok(Json(ListResponse { items }))
 }
 
-/// Export executor and observation telemetry without consulting retired V1
-/// Cat, Node, Job, or Operation projections.
+/// Export the surviving control-store executor telemetry.
 pub(super) async fn prometheus_metrics(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -25,14 +24,6 @@ pub(super) async fn prometheus_metrics(
     check_metrics_auth(&state, &headers).await?;
     let mut body = String::new();
     crate::store::metrics_snapshot(&state.store).append_prometheus(&mut body);
-    state
-        .lifecycle_store
-        .snapshot()
-        .append_prometheus(&mut body);
-    state
-        .observation_store
-        .snapshot()
-        .append_prometheus(&mut body);
     Ok((
         [(
             header::CONTENT_TYPE,

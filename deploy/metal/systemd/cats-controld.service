@@ -8,8 +8,6 @@ Environment=CATS_CONTROLD_LISTEN=127.0.0.1:7300
 EnvironmentFile=/etc/cats/cats.env
 ExecStart=/opt/cats/bin/cats-controld \
   --listen ${CATS_CONTROLD_LISTEN} \
-  --route-v2-machine-listen 127.0.0.1:7443 \
-  --route-v2-rotation-listen 127.0.0.1:7444 \
   --guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json \
   --runtime-provisioner-trust-file /etc/cats/identity/runtime-provisioner-trust.v1.json \
   --db-path /var/lib/cats/control.db

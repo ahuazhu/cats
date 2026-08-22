@@ -1651,6 +1651,7 @@ mod tests {
             credit_store: usage,
             image_blob: crate::testsupport::unavailable_image_blob(),
             auth_token: "runtime-node-authority-unit-service-token".into(),
+            noded_service_token: "semantic-node-test-token-00000000".into(),
             guest_runtime_profile_receipt: crate::testsupport::test_guest_runtime_profile_receipt(),
             runtime_provisioner_trust_bundle:
                 crate::testsupport::test_runtime_provisioner_trust_bundle(),
@@ -1660,7 +1661,6 @@ mod tests {
             workos: None,
             stripe: None,
             billing_enforcement_enabled: false,
-            oci_deploy_sync_wait_ms: 5_000,
         })
         .await
         .unwrap();

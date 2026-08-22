@@ -1,189 +1,201 @@
 #!/usr/bin/env bash
-# Real-microVM acceptance run on a metal host (run after install.sh).
-# Drives the cats CLI against the local stack and asserts the ADR-0002
-# lifecycle oracles with a REAL kernel boot id.
+# Real Cloud Hypervisor + PersistentDisk acceptance run on a deployed Host.
+# Uses only the clean-slate synchronous slug protocol. A successful Running
+# response is also the physical oracle: noded returns it only after blockd,
+# Cloud Hypervisor and the Guest have confirmed the exact ext4 mount ready.
 set -uo pipefail
 
 CATS=${CATS:-/opt/cats/bin/cats}
 export CATS_API_URL=${CATS_API_URL:-http://127.0.0.1:7300}
-# The CLI requires a bearer token (ADR-0008). Reuse the fleet admin token from
-# the deployment config so an acceptance run needs no interactive `cats login`.
 if [[ -z ${CATS_TOKEN:-} ]]; then
-  # cats.env is root-only 0600. Reading it needs sudo, and testing [[ -r ]] first
-  # makes the whole thing a no-op for a normal user, which leaves CATS_TOKEN empty
-  # and fails every step with "not logged in".
   CATS_TOKEN=$(sudo sed -n 's/^CATS_ADMIN_TOKEN=//p' /etc/cats/cats.env 2>/dev/null | tail -1)
   export CATS_TOKEN
 fi
-[[ -n ${CATS_TOKEN:-} ]] || { echo "set CATS_TOKEN (or CATS_ADMIN_TOKEN in /etc/cats/cats.env)" >&2; exit 1; }
-CAT=metal-e2e
 
-pass=0; fail=0
-ok()   { pass=$((pass+1)); echo "  PASS  $1"; }
-bad()  { fail=$((fail+1)); echo "  FAIL  $1" >&2; }
-check() { # check <desc> <expected-substr> <actual>
-  case "$3" in *"$2"*) ok "$1";; *) bad "$1 (wanted '$2', got '$3')";; esac
+die() { echo "metal semantic e2e: $*" >&2; exit 1; }
+[[ -x $CATS ]] || die "cats CLI is not executable: $CATS"
+command -v jq >/dev/null 2>&1 || die "jq is required"
+[[ -n ${CATS_TOKEN:-} ]] || die "set CATS_TOKEN (or CATS_ADMIN_TOKEN in /etc/cats/cats.env)"
+[[ ${CATS_BOOT_IMAGE:-} =~ ^sha256:[0-9a-f]{64}$ ]] || \
+  die "set CATS_BOOT_IMAGE to the exact sha256 digest of an installed Root image manifest"
+
+suffix=${CATS_E2E_SUFFIX:-$(date +%s)-$$}
+CAT=${CATS_E2E_CAT_SLUG:-e2e-cat-$suffix}
+DISK=${CATS_E2E_DISK_SLUG:-e2e-disk-$suffix}
+MOUNT=${CATS_E2E_MOUNT_PATH:-/data}
+[[ $CAT =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || die "invalid Cat slug: $CAT"
+[[ $DISK =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || die "invalid Disk slug: $DISK"
+
+pass=0
+fail=0
+CAT_CREATED=0
+DISK_CREATED=0
+
+ok() { pass=$((pass + 1)); echo "  PASS  $1"; }
+bad() { fail=$((fail + 1)); echo "  FAIL  $1" >&2; }
+expect_json() { # description, jq expression, expected, document
+  local description=$1 expression=$2 expected=$3 document=$4 actual
+  actual=$(jq -er "$expression" <<<"$document" 2>/dev/null) || actual='<invalid-json>'
+  if [[ $actual == "$expected" ]]; then
+    ok "$description"
+  else
+    bad "$description (wanted '$expected', got '$actual')"
+  fi
 }
-
-boot_id() { $CATS exec $CAT -- cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -d ' \n'; }
-service_pid() {
-  $CATS exec $CAT -- systemctl show --property MainPID --value cats-e2e.service \
-    2>/dev/null | tr -d ' \n'
+cats_json() { "$CATS" --json "$@" 2>&1; }
+cat_vmm_count() {
+  local cat_id=$1 process executable count=0
+  for process in /proc/[0-9]*; do
+    executable=$(readlink "$process/exe" 2>/dev/null) || continue
+    [[ ${executable##*/} == cloud-hypervisor ]] || continue
+    if tr '\0' ' ' < "$process/cmdline" 2>/dev/null | grep -Fq -- "$cat_id"; then
+      count=$((count + 1))
+    fi
+  done
+  echo "$count"
 }
-service_count() {
-  $CATS exec $CAT -- cat /var/lib/cats-e2e-service/start-count \
-    2>/dev/null | tr -d ' \n'
+cleanup() {
+  local status=$?
+  trap - EXIT INT TERM
+  if [[ $CAT_CREATED -eq 1 ]]; then
+    cats_json destroy "$CAT" >/dev/null 2>&1 || true
+  fi
+  if [[ $DISK_CREATED -eq 1 ]]; then
+    cats_json disk destroy "$DISK" >/dev/null 2>&1 || true
+  fi
+  exit "$status"
 }
-service_boot_id() {
-  $CATS exec $CAT -- cat /var/lib/cats-e2e-service/boot-id \
-    2>/dev/null | tr -d ' \n'
-}
-wait_service() {
-  $CATS exec $CAT -- sh -c '
-    attempt=0
-    while ! systemctl is-active --quiet cats-e2e.service; do
-      attempt=$((attempt + 1))
-      [ "$attempt" -lt 100 ] || exit 1
-      sleep 0.05
-    done
-  ' >/dev/null 2>&1
-}
+trap cleanup EXIT INT TERM
 
-echo "== cleanup from previous runs =="
-$CATS destroy $CAT >/dev/null 2>&1
+echo "== 1. PersistentDisk create and semantic replay =="
+out=$(cats_json disk create "$DISK" --size 1GiB) || die "disk create failed: $out"
+DISK_CREATED=1
+DISK_ID=$(jq -er '.disk.disk_id' <<<"$out") || die "disk create returned invalid JSON: $out"
+expect_json "disk created" '.code' disk_created "$out"
+retry=$(cats_json disk create "$DISK" --size 1GiB) || die "disk create replay failed: $retry"
+expect_json "same disk create is already_exists" '.code' already_exists "$retry"
+expect_json "same disk create preserves ID" '.disk.disk_id' "$DISK_ID" "$retry"
 
-echo "== 1. cold create -> real VM boots =="
-cold_create_started_ms=$(date +%s%3N)
-# This suite drives every lifecycle transition explicitly. Automatic suspend
-# races those assertions as soon as the create/exec lease is released.
-out=$($CATS create "$CAT" \
-  --root-size 1GiB \
-  --cpus 1 \
-  --memory 512MiB \
-  --no-auto-suspend \
-  ${CATS_CREATE_ARGS:-} 2>&1)
-cold_create_ms=$(( $(date +%s%3N) - cold_create_started_ms ))
-check "create converges to running" "observed=running" "$out"
-echo "  INFO  create-to-running ${cold_create_ms} ms (single sample; includes scheduling and root seeding)"
-
-guest_kver=$($CATS exec $CAT -- uname -r 2>/dev/null | tr -d ' \n')
-host_kver=$(uname -r)
-check "guest runs the direct-boot kernel" "$host_kver" "$guest_kver"
-
-guest_os=$($CATS exec $CAT -- sh -c '. /etc/os-release && echo "$PRETTY_NAME"' 2>/dev/null)
-check "guest userland is Ubuntu 24.04" "Ubuntu 24.04" "$guest_os"
-
-# The Guest's /bin/sh is dash, whose `command -v` resolves only its FIRST operand
-# -- `command -v apt-get curl git` prints just /usr/bin/apt-get. That is why this
-# check had failed since it was written, against an image that has all three all
-# along. Ask about one tool per call.
-guest_tools=$($CATS exec $CAT -- sh -c 'for t in apt-get curl git; do command -v $t; done' 2>/dev/null |
-  tr -d '\r' | sort | tr '\n' ' ' | sed 's/ $//')
-check "guest includes apt, curl and git" "/usr/bin/apt-get /usr/bin/curl /usr/bin/git" "$guest_tools"
-
-guest_pid1=$($CATS exec $CAT -- cat /proc/1/comm 2>/dev/null | tr -d ' \n')
-check "guest uses systemd as PID 1" "systemd" "$guest_pid1"
-guest_agent=$($CATS exec $CAT -- pgrep -f '^/usr/bin/cats-guest-agent( |$)' 2>/dev/null)
-[ -n "$guest_agent" ] && ok "Guest Agent is running" || bad "Guest Agent is not running"
-guest_agent_unit=$($CATS exec $CAT -- systemctl is-active cats-guest-agent.service 2>/dev/null)
-check "Guest Agent is managed by systemd" "active" "$guest_agent_unit"
-
-guest_network=$($CATS exec $CAT -- sh -c \
-  'getent ahostsv4 github.com >/dev/null && curl -fsSI --max-time 10 https://github.com | head -n 1' \
-  2>/dev/null)
-check "guest DNS and HTTPS egress work" "200" "$guest_network"
-
-root_bytes=$($CATS exec $CAT -- sh -c "df -B1 --output=size / | tail -1" 2>/dev/null | tr -d ' ')
-if [ "${root_bytes:-0}" -ge 900000000 ]; then
-  ok "guest ext4 root grew to the requested size"
+echo "== 2. Cat create performs real Root/Persistent attach and Guest mount =="
+out=$(cats_json create "$CAT" \
+  --boot-image "$CATS_BOOT_IMAGE" --cpu 1 --memory 512MiB --mount "$DISK:$MOUNT") \
+  || die "Cat create failed: $out"
+CAT_CREATED=1
+CAT_ID=$(jq -er '.cat.cat_id' <<<"$out") || die "Cat create returned invalid JSON: $out"
+FIRST_NODE=$(jq -er '.cat.node_id' <<<"$out") || die "Cat create did not return placement: $out"
+expect_json "Cat create reaches Running" '.cat.state' running "$out"
+expect_json "Cat create returns cat_created" '.code' cat_created "$out"
+expect_json "Cat reports exact PersistentDisk" '.cat.mounts[0].disk_id' "$DISK_ID" "$out"
+expect_json "Cat reports exact Guest mount path" '.cat.mounts[0].mount_path' "$MOUNT" "$out"
+if [[ $(cat_vmm_count "$CAT_ID") -eq 1 ]]; then
+  ok "one Cloud Hypervisor process owns the Running Cat"
 else
-  bad "guest ext4 root did not grow (reported ${root_bytes:-unknown} bytes)"
+  bad "expected exactly one Cloud Hypervisor process for $CAT_ID"
+fi
+retry=$(cats_json create "$CAT" \
+  --boot-image "$CATS_BOOT_IMAGE" --cpu 1 --memory 512MiB --mount "$DISK:$MOUNT") \
+  || die "Cat create replay failed: $retry"
+expect_json "same Cat create is already_exists" '.code' already_exists "$retry"
+expect_json "same Cat create preserves ID" '.cat.cat_id' "$CAT_ID" "$retry"
+shown=$(cats_json get "$CAT") || die "Cat get failed: $shown"
+expect_json "Cat get resolves the current slug" '.cat_id' "$CAT_ID" "$shown"
+listed=$(cats_json ls) || die "Cat ls failed: $listed"
+expect_json "Cat ls contains the current entity" \
+  "[.[] | select(.cat_id == \"$CAT_ID\")] | length" 1 "$listed"
+shown=$(cats_json disk get "$DISK") || die "disk get failed: $shown"
+expect_json "Disk get resolves the current slug" '.disk_id' "$DISK_ID" "$shown"
+listed=$(cats_json disk ls) || die "disk ls failed: $listed"
+expect_json "Disk ls contains the current entity" \
+  "[.[] | select(.disk_id == \"$DISK_ID\")] | length" 1 "$listed"
+
+echo "== 3. Suspended is Host-bound and Run is idempotent =="
+out=$(cats_json suspend "$CAT") || die "suspend failed: $out"
+expect_json "suspend reaches Suspended" '.cat.state' suspended "$out"
+retry=$(cats_json suspend "$CAT") || die "suspend replay failed: $retry"
+expect_json "same suspend is already_suspended" '.code' already_suspended "$retry"
+out=$(cats_json run "$CAT") || die "run from Suspended failed: $out"
+expect_json "run from Suspended reaches Running" '.cat.state' running "$out"
+retry=$(cats_json run "$CAT") || die "run replay failed: $retry"
+expect_json "same run is already_running" '.code' already_running "$retry"
+
+echo "== 4. Warm exits CH; Run restores the Host-bound snapshot =="
+out=$(cats_json warm "$CAT") || die "warm failed: $out"
+expect_json "warm reaches Warm" '.cat.state' warm "$out"
+if [[ $(cat_vmm_count "$CAT_ID") -eq 0 ]]; then
+  ok "Warm has no Cloud Hypervisor process"
+else
+  bad "Cloud Hypervisor remains for Warm Cat $CAT_ID"
+fi
+retry=$(cats_json warm "$CAT") || die "warm replay failed: $retry"
+expect_json "same warm is already_warm" '.code' already_warm "$retry"
+out=$(cats_json run "$CAT") || die "run from Warm failed: $out"
+expect_json "run from Warm reaches Running" '.cat.state' running "$out"
+
+echo "== 5. Cold releases placement; binding changes are semantic and replayable =="
+out=$(cats_json cold "$CAT") || die "cold failed: $out"
+expect_json "cold reaches Cold" '.cat.state' cold "$out"
+expect_json "Cold has no placement" 'if .cat.node_id == null then "null" else .cat.node_id end' null "$out"
+retry=$(cats_json cold "$CAT") || die "cold replay failed: $retry"
+expect_json "same cold is already_cold" '.code' already_cold "$retry"
+out=$(cats_json disk detach "$DISK" --cat "$CAT") || die "disk detach failed: $out"
+expect_json "disk detached" '.code' disk_detached "$out"
+expect_json "detached disk has no binding" 'if .disk.binding == null then "null" else "bound" end' null "$out"
+retry=$(cats_json disk detach "$DISK" --cat "$CAT") || die "disk detach replay failed: $retry"
+expect_json "same detach is already_detached" '.code' already_detached "$retry"
+out=$(cats_json disk attach "$DISK" --cat "$CAT" --mount "$MOUNT") || die "disk attach failed: $out"
+expect_json "disk attached" '.code' disk_attached "$out"
+expect_json "binding points to exact Cat" '.disk.binding.cat_id' "$CAT_ID" "$out"
+retry=$(cats_json disk attach "$DISK" --cat "$CAT" --mount "$MOUNT") || die "disk attach replay failed: $retry"
+expect_json "same attach is already_attached" '.code' already_attached "$retry"
+
+echo "== 6. Cold Run remounts the same ext4 PersistentDisk =="
+out=$(cats_json run "$CAT") || die "run from Cold failed: $out"
+expect_json "Cold run reaches Running after Guest mount-ready" '.cat.state' running "$out"
+SECOND_NODE=$(jq -er '.cat.node_id' <<<"$out") || die "Cold run did not return placement: $out"
+echo "  INFO  first_node=$FIRST_NODE cold_run_node=$SECOND_NODE cat_id=$CAT_ID disk_id=$DISK_ID"
+if [[ $(cat_vmm_count "$CAT_ID") -eq 1 ]]; then
+  ok "Cold Run owns exactly one Cloud Hypervisor process"
+else
+  bad "expected exactly one Cloud Hypervisor process after Cold Run"
 fi
 
-boot1=$(boot_id)
-[ -n "$boot1" ] && ok "guest reports a kernel boot_id ($boot1)" || bad "no boot_id"
+echo "== 7. Destroy releases slugs; reuse creates new immutable IDs =="
+out=$(cats_json destroy "$CAT") || die "Cat destroy failed: $out"
+CAT_CREATED=0
+expect_json "Cat destroy reaches Destroyed" '.cat.state' destroyed "$out"
+out=$(cats_json disk destroy "$DISK") || die "disk destroy failed: $out"
+DISK_CREATED=0
+expect_json "disk destroy reaches Deleted" '.disk.status' deleted "$out"
 
-echo "== 2. ordinary enabled systemd service =="
-if $CATS exec $CAT -- sh -c '
-  set -eu
-  printf "%s\n" \
-    "#!/bin/sh" \
-    "set -eu" \
-    "state=/var/lib/cats-e2e-service" \
-    "mkdir -p \"\$state\"" \
-    "count=\$(cat \"\$state/start-count\" 2>/dev/null || printf 0)" \
-    "count=\$((count + 1))" \
-    "printf \"%s\\n\" \"\$count\" > \"\$state/start-count\"" \
-    "cat /proc/sys/kernel/random/boot_id > \"\$state/boot-id\"" \
-    "exec /bin/sleep infinity" \
-    > /usr/local/bin/cats-e2e-service
-  chmod 0755 /usr/local/bin/cats-e2e-service
-  printf "%s\n" \
-    "[Unit]" \
-    "Description=Cats systemd lifecycle probe" \
-    "After=cats-guest-agent.service" \
-    "" \
-    "[Service]" \
-    "Type=simple" \
-    "ExecStart=/usr/local/bin/cats-e2e-service" \
-    "Restart=on-failure" \
-    "" \
-    "[Install]" \
-    "WantedBy=multi-user.target" \
-    > /etc/systemd/system/cats-e2e.service
-  systemctl daemon-reload
-  systemctl enable --now cats-e2e.service
-' >/dev/null 2>&1; then
-  ok "enabled and started a normal Type=simple service"
+replacement_disk=$(cats_json disk create "$DISK" --size 1GiB) \
+  || die "disk slug reuse failed: $replacement_disk"
+DISK_CREATED=1
+REPLACEMENT_DISK_ID=$(jq -er '.disk.disk_id' <<<"$replacement_disk") \
+  || die "replacement disk response invalid: $replacement_disk"
+if [[ $REPLACEMENT_DISK_ID != "$DISK_ID" ]]; then
+  ok "Disk slug reuse creates a new immutable ID"
 else
-  bad "could not enable/start a normal Type=simple service"
+  bad "Disk slug reuse retained destroyed ID $DISK_ID"
 fi
-service_pid1=$(service_pid)
-service_count1=$(service_count)
-check "service starts once on the initial boot" "1" "$service_count1"
-check "service records the initial kernel boot" "$boot1" "$(service_boot_id)"
 
-echo "== 3. durable write through the real ext4 root =="
-$CATS exec $CAT -- sh -c 'echo metal-persistent-data > /data.txt && sync' >/dev/null 2>&1 \
-  && ok "wrote /data.txt + sync" || bad "guest write failed"
-
-echo "== 4. suspend/resume (vm.pause/resume): same boot =="
-out=$($CATS suspend $CAT 2>&1);  check "suspend" "observed=suspended" "$out"
-out=$($CATS resume $CAT 2>&1);   check "resume"  "observed=running"   "$out"
-check "boot_id preserved across suspend/resume" "$boot1" "$(boot_id)"
-
-echo "== 5. warm (vm.snapshot + full exit) / restore: same boot =="
-out=$($CATS warm $CAT 2>&1);     check "warm"    "observed=warm"      "$out"
-# Match the VMM executable itself. cats-noded's arguments contain both the
-# cloud-hypervisor path and (in this test deployment) an S3 bucket containing
-# "metal-e2e", so a loose `pgrep -f` produces a false positive.
-if pgrep -f '^/usr/local/bin/cloud-hypervisor( |$)' >/dev/null 2>&1; then bad "VMM still resident while Warm"; else ok "no resident VMM while Warm"; fi
-out=$($CATS resume $CAT 2>&1);   check "restore" "observed=running"   "$out"
-check "boot_id preserved across warm/restore" "$boot1" "$(boot_id)"
-check "file survives warm" "metal-persistent-data" "$($CATS exec $CAT -- cat /data.txt 2>/dev/null)"
-check "Warm preserves the service PID" "$service_pid1" "$(service_pid)"
-check "Warm does not restart the service" "$service_count1" "$(service_count)"
-
-echo "== 6. stop/start: fresh boot, durable data and enabled service intact =="
-out=$($CATS stop $CAT 2>&1);     check "stop"    "observed=cold"      "$out"
-cold_start_started_ms=$(date +%s%3N)
-out=$($CATS start $CAT 2>&1);    check "start"   "observed=running"   "$out"
-cold_start_ms=$(( $(date +%s%3N) - cold_start_started_ms ))
-echo "  INFO  cold-to-running ${cold_start_ms} ms (single sample; warm remote/root cache state)"
-boot2=$(boot_id)
-if [ -n "$boot2" ] && [ "$boot2" != "$boot1" ]; then ok "cold start is a fresh boot"; else bad "boot_id did not change on cold start ($boot2)"; fi
-check "flushed data survives cold restart" "metal-persistent-data" "$($CATS exec $CAT -- cat /data.txt 2>/dev/null)"
-if wait_service; then
-  ok "enabled service returns after Cold boot"
+replacement_cat=$(cats_json create "$CAT" \
+  --boot-image "$CATS_BOOT_IMAGE" --cpu 1 --memory 512MiB) \
+  || die "Cat slug reuse failed: $replacement_cat"
+CAT_CREATED=1
+REPLACEMENT_CAT_ID=$(jq -er '.cat.cat_id' <<<"$replacement_cat") \
+  || die "replacement Cat response invalid: $replacement_cat"
+if [[ $REPLACEMENT_CAT_ID != "$CAT_ID" ]]; then
+  ok "Cat slug reuse creates a new immutable ID"
 else
-  bad "enabled service did not return after Cold boot"
+  bad "Cat slug reuse retained destroyed ID $CAT_ID"
 fi
-check "Cold starts the service exactly once again" "2" "$(service_count)"
-check "restarted service records the new kernel boot" "$boot2" "$(service_boot_id)"
 
-echo "== 7. destroy =="
-out=$($CATS destroy $CAT 2>&1);  check "destroy" "destroyed" "$out"
+cats_json destroy "$CAT" >/dev/null || die "replacement Cat cleanup failed"
+CAT_CREATED=0
+cats_json disk destroy "$DISK" >/dev/null || die "replacement disk cleanup failed"
+DISK_CREATED=0
+trap - EXIT INT TERM
 
 echo
-echo "metal e2e: $pass passed, $fail failed"
-[ "$fail" -eq 0 ]
+echo "metal semantic e2e: $pass passed, $fail failed"
+[[ $fail -eq 0 ]]

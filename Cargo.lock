@@ -1056,9 +1056,7 @@ dependencies = [
  "anyhow",
  "base64",
  "cats-api",
- "cats-block-client",
  "cats-blockd",
- "cats-control-plane",
  "cats-metadata-store-postgres",
  "cats-metadata-store-sqlite",
  "cats-object-store-aws-s3",
@@ -1068,7 +1066,6 @@ dependencies = [
  "cats-test-support",
  "clap",
  "libc",
- "postgres",
  "ring",
  "serde_json",
  "tempfile",
@@ -1133,6 +1130,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "thiserror 2.0.19",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -1239,6 +1237,7 @@ dependencies = [
 name = "cats-metadata-store-postgres"
 version = "0.1.0"
 dependencies = [
+ "cats-api",
  "cats-control-plane",
  "cats-storage",
  "cats-test-support",
@@ -1246,6 +1245,7 @@ dependencies = [
  "postgres",
  "postgres-native-tls",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
 ]
 
@@ -1300,34 +1300,21 @@ name = "cats-node-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "aws-config",
  "axum",
- "base64",
- "bytes",
  "cats-api",
  "cats-blockd",
  "cats-control-plane",
- "cats-host-fence-aws",
- "cats-object-store-file",
- "cats-object-store-gateway",
  "cats-storage",
  "cats-test-support",
  "hex",
- "http-body-util",
- "hyper",
- "hyper-util",
  "libc",
- "postgres",
  "reqwest",
- "ring",
- "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
- "tokio-rustls",
  "tracing",
  "uuid",
 ]
@@ -1337,7 +1324,9 @@ name = "cats-node-agent-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "cats-api",
+ "cats-blockd",
  "cats-metadata-store-postgres",
  "cats-metering",
  "cats-node-agent",
@@ -1354,6 +1343,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 

@@ -4,21 +4,15 @@ After=cats-controld.service
 Wants=cats-controld.service
 
 [Service]
-# The provisioner installs the only NodeIdentity and Host-selected state path.
-# This unit has no node-id, hostname, metadata, or state-path override.
+# Registration identity and reachable address are explicit root-only
+# environment values. The provisioned Host lock prevents a second noded.
 # Controlled stop/restart is permitted only at state=cordoned cats=0/orphans=0.
 Environment=CATS_GUEST_NETWORK_CIDR=10.240.0.0/16
 Environment=CATS_NODE_LISTEN=127.0.0.1:7301
 Environment=CATS_NODE_SERVICE_NAME=cats-noded
 EnvironmentFile=/etc/cats/cats.env
-# The listener address is release-fixed below. Clear any stale manager or
-# EnvironmentFile override; startup still requires the four fixed Route v2
-# artifacts and the separately configured HTTPS rotation origin.
-UnsetEnvironment=CATS_ROUTE_V2_MACHINE_LISTEN
-# Per-Cat VMM/blockd processes are PID-1-owned sibling transient services in
-# system.slice, not children of this service cgroup. Reap every process that
-# does belong to the Agent while leaving those independently owned services
-# available for checkpoint + full-inventory adoption after restart.
+# Cloud Hypervisor and blockd are direct children of noded. A service stop is
+# the Host-local process fence and must reap the complete cgroup.
 KillMode=control-group
 # Root is required for /dev/kvm, kernel NBD attach and tap devices (Phase A;
 # privilege separation is a hardening milestone). The nbd module is loaded
@@ -26,26 +20,24 @@ KillMode=control-group
 # reprovisioning; the vhost-user path simply never uses it.
 ExecStartPre=/opt/cats/bin/install-guest-runtime-release startup-recover
 ExecStartPre=/usr/sbin/modprobe nbd nbds_max=64
-ExecStartPre=/opt/cats/bin/setup-guest-network
 ExecStart=/opt/cats/bin/cats-noded \
   --listen ${CATS_NODE_LISTEN} \
   --control-plane-url ${CATS_CONTROL_PLANE_URL} \
-  --route-v2-machine-listen 0.0.0.0:7444 \
-  --route-v2-rotation-origin ${CATS_ROUTE_V2_ROTATION_ORIGIN} \
+  --control-endpoint ${CATS_NODE_CONTROL_ENDPOINT} \
+  --node-id ${CATS_NODE_ID} \
+  --node-name ${CATS_NODE_NAME} \
+  --vendor ${CATS_NODE_VENDOR} \
+  --region ${CATS_NODE_REGION} \
+  --zone ${CATS_NODE_ZONE} \
+  --instance-id ${CATS_NODE_INSTANCE_ID} \
+  --machine-type ${CATS_NODE_MACHINE_TYPE} \
+  --total-cpu ${CATS_NODE_TOTAL_CPU} \
+  --total-memory ${CATS_NODE_TOTAL_MEMORY} \
   --guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json \
   --blockd-bin /opt/cats/bin/cats-blockd \
-  --runtime-systemctl-bin /usr/bin/systemctl \
-  --runtime-systemd-run-bin /usr/bin/systemd-run \
-  --runtime-cgroup-root /sys/fs/cgroup \
-  --runtime-proc-root /proc \
-  --runtime-network-class-root /sys/class/net \
-  --runtime-sys-block-root /sys/block \
-  --runtime-device-root /dev \
-  --runtime-blockd-socket-root /run/cats/blockd-v1 \
-  --runtime-vmm-socket-root /run/cats/vmm-v1 \
-  --runtime-inventory-scan-timeout-ms 5000 \
-  --runtime-effect-step-timeout-ms 30000 \
-  --vmm-launcher-bin /opt/cats/bin/cats-vmm-launcher \
+  --host-lock /var/lib/cats/node/host.lock \
+  --blockd-socket-root /run/cats/blockd-v1 \
+  --effect-timeout-ms 30000 \
   --vmm ch \
   --ch-bin /usr/local/bin/cloud-hypervisor \
   --ch-seed-image /opt/cats/guest/rootfs.ext4 \

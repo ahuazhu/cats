@@ -33,7 +33,6 @@ mod tests {
             api_url: Some("https://unreachable.invalid".to_owned()),
             token: None,
             workspace: None,
-            no_wait: false,
             json: false,
             command: crate::Command::Admin {
                 cmd: crate::AdminCommand::RuntimeNode {

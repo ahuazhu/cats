@@ -20,6 +20,7 @@ cats-api = { workspace = true }
 cats-metering = { workspace = true }
 cats-storage = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

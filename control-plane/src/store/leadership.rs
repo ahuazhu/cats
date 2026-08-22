@@ -5,37 +5,16 @@ use super::*;
 /// every singleton.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SingletonRole {
-    RuntimeSweeper,
-    /// Retired command-dispatch controller role used only by its test harness.
-    /// It deliberately shares the production sweeper lock so both authorities
-    /// can never run against one schema if composition regresses.
-    Reconciler,
-    BillingEnforcer,
     UsageProjector,
-    VolumeDeleteSweeper,
-    RouteController,
 }
 
 impl SingletonRole {
     fn lock_key(self) -> i32 {
-        match self {
-            Self::RuntimeSweeper | Self::Reconciler => 420_201,
-            Self::BillingEnforcer => 420_202,
-            Self::UsageProjector => 420_203,
-            Self::VolumeDeleteSweeper => 420_204,
-            Self::RouteController => 420_205,
-        }
+        420_203
     }
 
     pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::RuntimeSweeper => "runtime-sweeper",
-            Self::Reconciler => "reconciler",
-            Self::BillingEnforcer => "billing-enforcer",
-            Self::UsageProjector => "usage-projector",
-            Self::VolumeDeleteSweeper => "volume-delete-sweeper",
-            Self::RouteController => "route-controller",
-        }
+        "usage-projector"
     }
 }
 
@@ -108,31 +87,6 @@ impl Drop for SingletonSession {
     }
 }
 
-/// Ownership fence for one detached OCI deployment attempt.
-///
-/// The lock is acquired before the deployment record commits and is held by
-/// the detached task. Another replica can therefore distinguish a live task
-/// from a row whose owner process or database session disappeared, without a
-/// process-local registry or a persisted wall-clock lease.
-pub struct OciDeploymentLease {
-    client: Option<Client>,
-    connection_budget: Option<ConnectionBudgetPermit>,
-}
-
-impl Drop for OciDeploymentLease {
-    fn drop(&mut self) {
-        match (self.client.take(), self.connection_budget.take()) {
-            (Some(client), Some(connection_budget)) => {
-                drop_on_leadership_executor((client, connection_budget));
-            }
-            (client, connection_budget) => {
-                drop(client);
-                drop(connection_budget);
-            }
-        }
-    }
-}
-
 impl Store {
     pub(crate) fn singleton_session(&self, role: SingletonRole) -> Result<SingletonSession> {
         let connection_budget = acquire_singleton_connection_budget()?;
@@ -145,36 +99,5 @@ impl Store {
             role,
             acquired: false,
         })
-    }
-
-    pub(super) fn try_oci_deployment_lease(
-        &self,
-        attempt_id: &str,
-    ) -> Result<Option<OciDeploymentLease>> {
-        let connection_budget = acquire_oci_connection_budget()?;
-        let mut client =
-            off_runtime(|| schema::connect_client(&self.dsn, self.ca_file.as_deref()))?;
-        off_runtime(|| configure_session(&mut client))?;
-        let acquired = off_runtime(|| {
-            client
-                .query_one(
-                    "SELECT pg_try_advisory_lock(
-                        hashtextextended(current_schema() || ':oci-owner:' || $1, 0::BIGINT)
-                     )",
-                    &[&attempt_id],
-                )
-                .map_err(internal)?
-                .try_get(0)
-                .map_err(internal)
-        })?;
-        if acquired {
-            Ok(Some(OciDeploymentLease {
-                client: Some(client),
-                connection_budget: Some(connection_budget),
-            }))
-        } else {
-            off_runtime(move || drop(client));
-            Ok(None)
-        }
     }
 }

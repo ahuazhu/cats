@@ -17,12 +17,10 @@ use cats_storage::host_fence::{
     HostFenceProviderEvidence, ObjectWriteCutoffEvidence, ObjectWriteCutoffPort,
     ObjectWriterFenceTarget,
 };
-use cats_storage::object_write_authority::{ObjectWriteAuthorityState, ObjectWriteCutoffReceipt};
-use postgres::{Client, Row, Transaction};
+use cats_storage::object_write_authority::ObjectWriteCutoffReceipt;
+use postgres::{Client, Row};
 use sha2::{Digest, Sha256};
 
-use super::object_write::begin_object_writer_cutoff_in;
-use super::rows::database_now;
 use crate::store::executor::{BlockingExecutor, ExecutionError, Limits, SubmitError};
 use crate::store::transaction::{AuthorityTransactionError, AuthorityTxResult};
 use crate::store::{internal, schema, DsnSource, Store};
@@ -168,118 +166,6 @@ fn validate_request_binding(request: &HostFenceAttemptRequest) -> AuthorityTxRes
 }
 
 #[allow(dead_code, reason = "used by the gated C3 batch authority")]
-pub(super) fn load_queue_for_update(
-    transaction: &mut Transaction<'_>,
-    fence_attempt_id: &Id,
-) -> AuthorityTxResult<Option<HostFenceProviderQueueRecordV1>> {
-    transaction
-        .query_opt(
-            "SELECT request_bytes, request_sha256, enqueued_at_unix_ms, state,
-                    worker_id, claim_attempt_token, claim_generation,
-                    claim_lease_expires_at_unix_ms, evidence_bytes,
-                    evidence_sha256, completed_at_unix_ms
-               FROM host_fence_provider_queue_v1
-              WHERE fence_attempt_id=$1 FOR UPDATE",
-            &[&fence_attempt_id.as_str()],
-        )?
-        .as_ref()
-        .map(decode_queue_row)
-        .transpose()
-}
-
-/// Transaction-local queue producer used by the Host-scoped recovery seal.
-///
-/// Keeping the object-writer cutoff and queue insert in the caller's
-/// transaction lets Control add its immutable assigned-set barrier without a
-/// window in which the provider can act on an attempt that has no product
-/// recovery authority. Exact queue replay remains available to the legacy
-/// owner-side seam, but a batch producer must reject an existing queue row
-/// when its corresponding recovery-attempt row is absent.
-#[allow(
-    dead_code,
-    reason = "only the gated C3 batch authority may enqueue in production"
-)]
-pub(super) fn enqueue_host_fence_provider_attempt_in(
-    transaction: &mut Transaction<'_>,
-    request: &HostFenceAttemptRequest,
-) -> AuthorityTxResult<HostFenceProviderQueueRecordV1> {
-    validate_request_binding(request)?;
-    let bytes = canonical_request_bytes(request)?;
-    let digest = request_sha256(&bytes);
-    if let Some(existing) = load_queue_for_update(transaction, &request.binding.fence_attempt_id)? {
-        return exact_replay_or_conflict(existing, request, &digest);
-    }
-
-    lock_current_source(transaction, request)?;
-    // A missing-row SELECT has no PostgreSQL gap lock. The exact NodeIdentity
-    // lock above serializes concurrent attempts for one source, so recheck
-    // after acquiring it before starting a second cutoff or racing the
-    // immutable queue primary key.
-    if let Some(existing) = load_queue_for_update(transaction, &request.binding.fence_attempt_id)? {
-        return exact_replay_or_conflict(existing, request, &digest);
-    }
-    let now = database_now(transaction)?;
-    let authority = begin_object_writer_cutoff_in(
-        transaction,
-        &request.object_writer.writer_authority_id,
-        &request.binding.fence_attempt_id,
-        now,
-    )?;
-    validate_cutoff_authority(request, &authority)?;
-    let inserted = transaction.execute(
-        "INSERT INTO host_fence_provider_queue_v1 (
-            fence_attempt_id, request_bytes, request_sha256,
-            provider, host_partition, host_account_id, host_region,
-            immutable_host_id, node_id, expected_node_boot_id,
-            expected_agent_session_epoch, writer_authority_id,
-            workload_principal_id, object_store_scope_id,
-            network_quarantine_boundary_id, state,
-            claim_generation, renew_generation, enqueued_at_unix_ms
-         ) VALUES (
-            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
-            'pending',0,0,$16
-         )",
-        &[
-            &request.binding.fence_attempt_id.as_str(),
-            &bytes,
-            &digest.as_str(),
-            &request.binding.provider_scope.provider.as_str(),
-            &request.binding.provider_scope.partition.as_str(),
-            &request.binding.provider_scope.account_id.as_str(),
-            &request.binding.provider_scope.region.as_str(),
-            &request.binding.immutable_host_id.as_str(),
-            &request.binding.node_id.as_str(),
-            &request.binding.expected_node_boot_id.as_str(),
-            &pg(request.binding.expected_agent_session_epoch.get())?,
-            &request.object_writer.writer_authority_id.as_str(),
-            &request.object_writer.workload_principal_id.as_str(),
-            &request.object_writer.object_store_scope_id.as_str(),
-            &request.network_quarantine_boundary_id.as_str(),
-            &pg(now.get())?,
-        ],
-    )?;
-    if inserted != 1 {
-        return Err(corrupt("Host-fence provider queue insert changed no row"));
-    }
-    load_queue_for_update(transaction, &request.binding.fence_attempt_id)?
-        .ok_or_else(|| corrupt("Host-fence provider queue row disappeared after insert"))
-}
-
-#[allow(dead_code, reason = "used by the gated C3 batch producer")]
-fn exact_replay_or_conflict(
-    existing: HostFenceProviderQueueRecordV1,
-    request: &HostFenceAttemptRequest,
-    digest: &Sha256Digest,
-) -> AuthorityTxResult<HostFenceProviderQueueRecordV1> {
-    if existing.request == *request && existing.request_sha256 == *digest {
-        Ok(existing)
-    } else {
-        Err(application(ApiError::conflict(
-            "Host-fence attempt replay changed its sealed request",
-        )))
-    }
-}
-
 fn decode_queue_row(row: &Row) -> AuthorityTxResult<HostFenceProviderQueueRecordV1> {
     let request_bytes: Vec<u8> = row.try_get("request_bytes")?;
     let request = decode_canonical_request(&request_bytes)?;
@@ -355,105 +241,7 @@ fn decode_queue_row(row: &Row) -> AuthorityTxResult<HostFenceProviderQueueRecord
     })
 }
 
-#[allow(dead_code, reason = "used by the gated C3 batch producer")]
-fn lock_current_source(
-    transaction: &mut Transaction<'_>,
-    request: &HostFenceAttemptRequest,
-) -> AuthorityTxResult<()> {
-    let binding = &request.binding;
-    let Some(identity) = transaction.query_opt(
-        "SELECT host_provider, host_partition, host_account_id, host_region,
-                immutable_host_id, state
-           FROM node_identities WHERE node_id=$1 FOR UPDATE",
-        &[&binding.node_id.as_str()],
-    )?
-    else {
-        return Err(application(ApiError::not_found("NodeIdentity")));
-    };
-    if identity.try_get::<_, String>("state")? != "provisioned"
-        || identity.try_get::<_, String>("host_provider")?
-            != binding.provider_scope.provider.as_str()
-        || identity.try_get::<_, String>("host_partition")?
-            != binding.provider_scope.partition.as_str()
-        || identity.try_get::<_, String>("host_account_id")?
-            != binding.provider_scope.account_id.as_str()
-        || identity.try_get::<_, String>("host_region")? != binding.provider_scope.region.as_str()
-        || identity.try_get::<_, String>("immutable_host_id")? != binding.immutable_host_id.as_str()
-    {
-        return Err(application(ApiError::conflict(
-            "Host-fence request does not bind the current provisioned NodeIdentity",
-        )));
-    }
-    let Some(session) = transaction.query_opt(
-        "SELECT immutable_host_id, node_boot_id, agent_session_epoch
-           FROM current_agent_sessions WHERE node_id=$1 FOR UPDATE",
-        &[&binding.node_id.as_str()],
-    )?
-    else {
-        return Err(application(ApiError::conflict(
-            "Host-fence request has no current AgentSession",
-        )));
-    };
-    if session.try_get::<_, String>("immutable_host_id")? != binding.immutable_host_id.as_str()
-        || session.try_get::<_, String>("node_boot_id")? != binding.expected_node_boot_id.as_str()
-        || session.try_get::<_, i64>("agent_session_epoch")?
-            != pg(binding.expected_agent_session_epoch.get())?
-    {
-        return Err(application(ApiError::conflict(
-            "Host-fence request does not bind the current AgentSession",
-        )));
-    }
-    Ok(())
-}
-
-#[allow(dead_code, reason = "used by the gated C3 batch producer")]
-fn validate_cutoff_authority(
-    request: &HostFenceAttemptRequest,
-    authority: &cats_storage::object_write_authority::ObjectWriteAuthority,
-) -> AuthorityTxResult<()> {
-    let binding = &request.binding;
-    let writer = &authority.writer;
-    if writer.authority_id != request.object_writer.writer_authority_id
-        || writer.host_provider_scope != binding.provider_scope
-        || writer.immutable_host_id != binding.immutable_host_id
-        || writer.node_id != binding.node_id
-        || writer.object_provider_scope != request.object_writer.provider_scope
-        || writer.workload_principal_id != request.object_writer.workload_principal_id
-        || writer.object_store_scope_id != request.object_writer.object_store_scope_id
-    {
-        return Err(application(ApiError::conflict(
-            "Host-fence request does not bind the exact object-writer authority",
-        )));
-    }
-    match &authority.state {
-        ObjectWriteAuthorityState::CutoffPending {
-            fence_attempt_id, ..
-        }
-        | ObjectWriteAuthorityState::CutoffComplete {
-            receipt: ObjectWriteCutoffReceipt {
-                fence_attempt_id, ..
-            },
-        } if fence_attempt_id == &binding.fence_attempt_id => Ok(()),
-        _ => Err(corrupt(
-            "object-writer cutoff did not bind the enqueued fence attempt",
-        )),
-    }
-}
-
 impl Store {
-    /// Queue-only harness retained for the least-privilege worker protocol
-    /// tests. Production can enqueue only through the Host-scoped recovery
-    /// attempt transaction, which adds the assigned-set mutation barrier.
-    #[cfg(test)]
-    pub(crate) fn enqueue_host_fence_provider_attempt_for_test(
-        &self,
-        request: &HostFenceAttemptRequest,
-    ) -> crate::store::Result<HostFenceProviderQueueRecordV1> {
-        self.authority_transaction(|transaction| {
-            enqueue_host_fence_provider_attempt_in(transaction, request)
-        })
-    }
-
     /// Read one sealed attempt through its complete Host/Node/session scope.
     /// This is the owner-side discovery seam for authenticated Control APIs;
     /// it neither accepts an attempt ID alone nor exposes the provider DSN.

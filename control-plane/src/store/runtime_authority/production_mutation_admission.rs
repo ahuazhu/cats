@@ -18,9 +18,9 @@ use cats_api::production_mutation_admission::{
     ProductionMutationAdmissionMutation, ProductionMutationAdmissionState,
     ProductionMutationAdmissionStoredOutcome, ProductionMutationOpenBinding,
     ProductionQualificationAdmissionBinding, ProductionQualificationCloseKind,
-    ProductionQualificationMutationClass, ProductionQualificationProductInventoryReceipt,
-    PRODUCTION_CUTOVER_CLOCK_SKEW_MS, PRODUCTION_MUTATION_ADMISSION_SCHEMA_VERSION,
-    PRODUCTION_QUALIFICATION_MAX_LIFETIME_MS,
+    ProductionQualificationMutationClass, ProductionQualificationProductInventoryCounts,
+    ProductionQualificationProductInventoryReceipt, PRODUCTION_CUTOVER_CLOCK_SKEW_MS,
+    PRODUCTION_MUTATION_ADMISSION_SCHEMA_VERSION, PRODUCTION_QUALIFICATION_MAX_LIFETIME_MS,
     PRODUCTION_QUALIFICATION_PRODUCT_INVENTORY_RECEIPT_KIND,
 };
 use cats_api::runtime_reconciliation::{
@@ -233,10 +233,7 @@ fn qualification_product_inventory_in(
         ));
     }
 
-    let counts = super::product_rows::qualification_product_inventory_counts(
-        transaction,
-        &binding.workspace_id,
-    )?;
+    let counts = semantic_product_inventory_counts(transaction, &binding.workspace_id)?;
     let product_resource_count = [
         counts.current_cat_count,
         counts.root_disk_count,
@@ -280,8 +277,48 @@ fn qualification_product_inventory_in(
     ))
 }
 
+fn semantic_product_inventory_counts(
+    transaction: &mut Transaction<'_>,
+    workspace_id: &cats_api::runtime_reconciliation::Id,
+) -> AuthorityTxResult<ProductionQualificationProductInventoryCounts> {
+    let row = transaction.query_one(
+        "SELECT
+            (SELECT count(*) FROM cats
+              WHERE workspace_id=$1 AND destroyed_at IS NULL) AS current_cats,
+            (SELECT count(*) FROM cats
+              WHERE workspace_id=$1 AND destroyed_at IS NOT NULL) AS destroyed_cats,
+            (SELECT count(*) FROM persistent_disks
+              WHERE workspace_id=$1 AND deleted_at IS NULL) AS current_disks",
+        &[&workspace_id.as_str()],
+    )?;
+    let count = |name| -> AuthorityTxResult<WireU64> {
+        let value: i64 = row.try_get(name)?;
+        let value = u64::try_from(value)
+            .map_err(|_| corrupt("semantic product inventory count is negative"))?;
+        WireU64::new(value)
+            .ok_or_else(|| corrupt("semantic product inventory count exceeds the wire range"))
+    };
+    let zero = WireU64::new(0).expect("zero is wire-safe");
+    Ok(ProductionQualificationProductInventoryCounts {
+        current_cat_count: count("current_cats")?,
+        root_disk_count: zero,
+        persistent_disk_count: count("current_disks")?,
+        disk_snapshot_count: zero,
+        endpoint_count: zero,
+        hostname_endpoint_lookup_count: zero,
+        unresolved_lifecycle_operation_count: zero,
+        deleted_cat_tombstone_count: count("destroyed_cats")?,
+        terminal_lifecycle_operation_history_count: zero,
+        api_idempotency_receipt_count: zero,
+    })
+}
+
 /// Gate a new product mutation in the same transaction as its business write.
 /// Exact API replays call this only after finding no stored result.
+#[allow(
+    dead_code,
+    reason = "the semantic resource adapter has not yet composed the release mutation gate"
+)]
 pub(in crate::store) fn require_production_product_mutation_admitted(
     transaction: &mut Transaction<'_>,
     authenticated_workspace_id: &cats_api::runtime_reconciliation::Id,
@@ -1000,6 +1037,10 @@ fn exactly_one(changed: u64) -> AuthorityTxResult<()> {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "used by the retained release mutation gate for semantic resources"
+)]
 fn closed() -> AuthorityTransactionError {
     AuthorityTransactionError::Application(ApiError::unavailable(
         "production product mutations are Closed",

@@ -7,7 +7,7 @@
 
 use std::time::Instant;
 
-pub(crate) trait PhysicalReadContext {
+pub trait PhysicalReadContext {
     fn deadline(&self) -> Instant;
     fn check_active(&self) -> anyhow::Result<()>;
 }
@@ -19,4 +19,4 @@ pub(crate) trait PhysicalReadContext {
 /// atomic lifecycle executor must first retain and validate the command
 /// journal; this context only lets leaf adapters stop at bounded cancellation
 /// boundaries without depending on the retired Desired reconcile spine.
-pub(crate) trait PhysicalEffectContext: PhysicalReadContext {}
+pub trait PhysicalEffectContext: PhysicalReadContext {}

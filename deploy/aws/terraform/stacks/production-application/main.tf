@@ -33,23 +33,8 @@ module "cats_kubernetes" {
   namespace                                     = "cats"
   control_plane_image                           = var.control_plane_image
   control_plane_replicas                        = var.control_plane_replicas
-  gateway_image                                 = var.gateway_image
-  gateway_replicas                              = var.gateway_replicas
-  object_write_gateway_image                    = var.object_write_gateway_image
-  object_write_gateway_replicas                 = var.object_write_gateway_replicas
-  object_write_gateway_tls_secret_name          = var.object_write_gateway_tls_secret_name
-  object_write_gateway_nlb_security_group_id    = var.object_write_gateway_nlb_security_group_id
-  object_write_gateway_private_subnet_ids       = var.private_subnet_ids
-  object_write_spool_file_system_id             = var.object_write_spool_file_system_id
-  object_write_spool_access_point_id            = var.object_write_spool_access_point_id
-  object_write_provider_partition               = var.expected_aws_partition
-  object_write_provider_account_id              = var.expected_account_id
   maintenance_mode                              = var.maintenance_mode
   enable_public_ingress                         = var.enable_public_ingress
-  route_v2_control_artifact_secret_name         = var.route_v2_control_artifact_secret_name
-  route_v2_control_artifact_signer_revision     = var.route_v2_control_artifact_signer_revision
-  route_v2_control_artifact_secret_sha256       = var.route_v2_control_artifact_secret_sha256
-  route_v2_gateway_artifact_secret_name         = var.route_v2_gateway_artifact_secret_name
   runtime_secret_data                           = var.runtime_secret_data
   runtime_provisioner_trust_bundle_json         = var.runtime_provisioner_trust_bundle_json
   production_cutover_operator_trust_bundle_json = var.production_cutover_operator_trust_bundle_json
@@ -59,7 +44,6 @@ module "cats_kubernetes" {
   chunkstore_bucket_name                        = var.chunkstore_bucket_name
   chunkstore_region                             = var.aws_region
   chunkstore_prefix                             = var.chunkstore_prefix
-  route_rotation_nlb_security_group_id          = var.route_rotation_nlb_security_group_id
   usage_postgres_url                            = var.usage_postgres_url
   usage_postgres_schema                         = var.usage_postgres_schema
   usage_postgres_workers                        = var.usage_postgres_workers
@@ -83,7 +67,6 @@ module "cats_kubernetes" {
   acm_certificate_arn             = var.acm_certificate_arn
   public_subnet_ids               = var.public_subnet_ids
   control_plane_hosts             = var.control_plane_hosts
-  endpoint_wildcard_host          = var.endpoint_wildcard_host
 
   depends_on = [terraform_data.aws_target]
 }
@@ -102,7 +85,7 @@ locals {
   # state avoids an emergency kubectl edit becoming an unrecorded drift path.
   manage_dns = var.route53_zone_id != null && var.enable_public_ingress && !var.maintenance_mode
 
-  dns_hosts = setunion(toset(var.control_plane_hosts), toset([var.endpoint_wildcard_host]))
+  dns_hosts = toset(var.control_plane_hosts)
 }
 
 # Located by the tag EKS puts on the load balancer it provisions, because the
@@ -129,31 +112,4 @@ resource "aws_route53_record" "public" {
     zone_id                = data.aws_lb.public[0].zone_id
     evaluate_target_health = true
   }
-}
-
-# Stable private certificate authority name for the TLS pass-through NLB. The
-# Service status supplies only the generated ELB hostname; a private CNAME
-# keeps the serverAuth leaf SAN release-bound and deterministic.
-# The reviewed Route v2 rotation origin is frozen to the rotation Service's
-# cluster-local DNS name, but the Node Agents that read the ring are bare-metal
-# hosts in the VPC, not cluster members. A private zone for that name resolves
-# it to the internal NLB for VPC clients only; cluster clients keep using
-# CoreDNS and never leave the cluster. The Control machine certificate already
-# carries this exact name as a SAN, so TLS validates unchanged.
-resource "aws_route53_record" "route_rotation" {
-  count = var.route_rotation_private_zone_id == null ? 0 : 1
-
-  zone_id = var.route_rotation_private_zone_id
-  name    = "cats-controld-route-rotation.cats.svc.cluster.local"
-  type    = "CNAME"
-  ttl     = 60
-  records = [module.cats_kubernetes.route_rotation_load_balancer_hostname]
-}
-
-resource "aws_route53_record" "object_write_gateway" {
-  zone_id = var.object_write_gateway_private_zone_id
-  name    = var.object_write_gateway_private_dns_name
-  type    = "CNAME"
-  ttl     = 60
-  records = [module.cats_kubernetes.object_write_gateway_load_balancer_hostname]
 }

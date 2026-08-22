@@ -352,8 +352,8 @@ deploy/aws/tools/deploy-production-release.py apply \
 ```
 
 `apply` rehashes both saved plans and the exact config/package receipt, applies
-the application first, proves the Control, ObjectWrite Gateway, Route Gateway
-and credential-refresher image pins, then applies the worker bundle. Terraform
+the application first, proves the Control and credential-refresher image pins,
+then applies the worker bundle. Terraform
 waits for every explicitly named SSM association; a final read-only SSM probe
 requires the installed bundle receipt and active `cats-worker.service` on each
 Host. The deployer does not uncordon a Node, change mutation admission or run a
@@ -375,17 +375,22 @@ deploy/aws/tools/production-cat-lifecycle-e2e.py \
   --workspace-id <EXACT_WS_ID> \
   --boot-image-digest sha256:<GOLDEN_ROOT_DIGEST> \
   --cat-name release-e2e-<CUTOVER_ID> \
+  --disk-name release-disk-<CUTOVER_ID> \
+  --disk-size 1GiB \
+  --mount-path /data \
   --sleep-state suspend \
   --sleep-state warm \
   --sleep-state cold \
   --output /approved/evidence/production-cat-e2e
 ```
 
-Each sleep action must reach its matching public stable state before `run`.
-Suspended retains the exact runtime incarnation; Warm and Cold clear it before
-the next Running incarnation. Destroy must remove the Cat from the product
-list. If any step fails, the driver leaves the exact Cat and partial evidence
-in place and does not attempt an implicit destructive cleanup. Close and
+The driver uses only the clean-slate synchronous slug protocol. It creates and
+retries one PersistentDisk and one mounted Cat, checks all three sleep states
+and their semantic replays, exercises Cold detach/attach, returns through the
+Guest mount-ready barrier, destroys both resources, and proves that each slug
+can immediately name a new immutable resource identity. If any step fails, the
+driver leaves the exact resources and partial evidence in place and does not
+attempt an implicit destructive cleanup. Close and
 terminalize Qualification through `production-mutation-admission.py` after the
 E2E result is retained.
 

@@ -254,69 +254,11 @@ variable "worker_managed_environment" {
   default     = {}
 }
 
-variable "object_write_gateway_url" {
-  description = "Exact HTTPS origin of the ObjectWrite Gateway, as published by the application stack's object_write_gateway_url output."
-  type        = string
-
-  validation {
-    condition = (
-      can(regex("^https://gateway\\.object-write\\.[a-z0-9-]+\\.cats\\.internal$", var.object_write_gateway_url))
-    )
-    error_message = "object_write_gateway_url must be the platform-owned https://gateway.object-write.<environment>.cats.internal origin."
-  }
-}
-
-variable "route_v2_rotation_origin" {
-  description = "Independent server-authenticated HTTPS origin for Route v2 ring delivery and disabled-signer recovery."
-  type        = string
-  default     = "https://cats-controld-route-rotation.cats.svc.cluster.local:7444"
-
-  validation {
-    condition     = var.route_v2_rotation_origin == "https://cats-controld-route-rotation.cats.svc.cluster.local:7444"
-    error_message = "the first terminal release uses the fixed reviewed Route v2 rotation Service authority."
-  }
-}
-
 variable "worker_runtime_secret_data" {
-  description = "Optional legacy CATS_POSTGRES_URL compatibility map. Signed workers must not receive CATS_AUTH_TOKEN."
+  description = "Root-only direct Control/Node CATS_AUTH_TOKEN plus optional legacy CATS_POSTGRES_URL."
   type        = map(string)
   sensitive   = true
   default     = {}
-}
-
-variable "route_v2_node_artifact_secret_arn" {
-  description = "Pre-created Secrets Manager ARN for the exact six-file Node Route v2 artifact set. Terraform receives no artifact bytes."
-  type        = string
-  default     = ""
-
-  validation {
-    condition = (
-      var.route_v2_node_artifact_secret_arn == "" ||
-      (
-        startswith(
-          var.route_v2_node_artifact_secret_arn,
-          "arn:${var.expected_aws_partition}:secretsmanager:${var.aws_region}:${var.expected_account_id}:secret:cats-${var.environment}-route-v2-node-r1-",
-        ) &&
-        length(var.route_v2_node_artifact_secret_arn) == length("arn:${var.expected_aws_partition}:secretsmanager:${var.aws_region}:${var.expected_account_id}:secret:cats-${var.environment}-route-v2-node-r1-") + 6 &&
-        can(regex("[A-Za-z0-9]{6}$", var.route_v2_node_artifact_secret_arn))
-      )
-    )
-    error_message = "route_v2_node_artifact_secret_arn must be empty or the exact cats-<environment>-route-v2-node-r1 secret ARN in the expected partition, account, and region."
-  }
-}
-
-variable "route_v2_node_artifact_secret_version_id" {
-  description = "Exact Secrets Manager version ID for the revision-1 Node Route v2 artifact secret."
-  type        = string
-  default     = ""
-
-  validation {
-    condition = (
-      var.route_v2_node_artifact_secret_version_id == "" ||
-      can(regex("^[A-Za-z0-9-]{32,64}$", var.route_v2_node_artifact_secret_version_id))
-    )
-    error_message = "route_v2_node_artifact_secret_version_id must be empty or a 32-64 character Secrets Manager version ID."
-  }
 }
 
 variable "tags" {

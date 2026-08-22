@@ -28,7 +28,6 @@ static RETRY_JITTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub(crate) struct AuthorityRequestContext {
     deadline: Instant,
     phase: Arc<AtomicU8>,
-    cancelled: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     before_commit_claim: Arc<std::sync::Mutex<Option<CommitClaimBarrier>>>,
     #[cfg(test)]
@@ -182,7 +181,6 @@ impl AuthorityRequestContext {
         Self {
             deadline,
             phase: Arc::new(AtomicU8::new(AuthorityRequestPhase::Open.raw())),
-            cancelled: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             before_commit_claim: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -194,27 +192,6 @@ impl AuthorityRequestContext {
 
     pub(crate) fn cancel(&self) {
         request_cancel(self.phase.as_ref());
-        self.cancelled.notify_waiters();
-    }
-
-    pub(crate) async fn cancelled(&self) {
-        loop {
-            let notified = self.cancelled.notified();
-            if self.is_cancelled_or_expired() {
-                return;
-            }
-            tokio::select! {
-                biased;
-                () = notified => {}
-                () = tokio::time::sleep_until(tokio::time::Instant::from_std(self.deadline)) => {
-                    return;
-                }
-            }
-        }
-    }
-
-    pub(crate) fn is_cancelled_or_expired(&self) -> bool {
-        self.must_rollback()
     }
 
     fn must_rollback(&self) -> bool {
@@ -330,7 +307,15 @@ pub(super) enum AuthorityRequestDisposition<T> {
 pub(super) enum AuthorityTransactionError {
     Domain(AuthorityError),
     Application(ApiError),
+    #[allow(
+        dead_code,
+        reason = "retained strict disk mutation source awaits the semantic storage adapter"
+    )]
     CandidateCollision,
+    #[allow(
+        dead_code,
+        reason = "retained strict disk mutation source awaits the semantic storage adapter"
+    )]
     PlacementStale,
     Postgres(postgres::Error),
 }
@@ -374,30 +359,14 @@ enum AttemptFailure {
 enum AuthorityTransactionMode {
     ReadWrite,
     RepeatableRead,
-    /// Acquire the Route v2 machine-authority session barrier before BEGIN.
-    /// PostgreSQL establishes a repeatable-read snapshot at the first query,
-    /// so taking only an xact lock after BEGIN can otherwise retain facts from
-    /// before a writer that committed while this reader waited.
-    RouteV2RepeatableRead,
+    #[allow(
+        dead_code,
+        reason = "retained strict storage reads await the semantic storage adapter"
+    )]
     RepeatableReadOnly,
 }
 
 impl Store {
-    #[cfg(test)]
-    pub(super) fn inject_committed_response_loss_once(&self) {
-        self.commit_response_loss_once
-            .store(true, Ordering::Release);
-    }
-
-    #[cfg(test)]
-    pub(super) fn inject_committed_response_loss_once_after(&self, delay: Duration) {
-        self.commit_response_loss_delay_ms.store(
-            u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-            Ordering::Release,
-        );
-        self.inject_committed_response_loss_once();
-    }
-
     /// Arm only the commit belonging to an HTTP authority request. Read-only
     /// credential lookup happens earlier in the same handler and must not
     /// consume this deterministic response-loss fixture.
@@ -441,6 +410,10 @@ impl Store {
     /// candidate-local outcomes that are safe to isolate after PostgreSQL has
     /// successfully rolled back the candidate transaction. Infrastructure
     /// and rollback failures remain outer Store errors.
+    #[allow(
+        dead_code,
+        reason = "retained strict storage source awaits the semantic storage adapter"
+    )]
     pub(super) fn authority_transaction_disposition<T: Send>(
         &self,
         operation: impl FnMut(
@@ -494,6 +467,10 @@ impl Store {
     /// Consumers must receive either the complete mutually-consistent fact set
     /// or no fact set at all, so this deliberately shares the retry and
     /// fail-closed error policy of mutation transactions.
+    #[allow(
+        dead_code,
+        reason = "retained strict storage source awaits the semantic storage adapter"
+    )]
     pub(super) fn authority_read_snapshot<T: Send>(
         &self,
         operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
@@ -518,6 +495,10 @@ impl Store {
     /// repeatable-read snapshot. The explicit rollback disposition prevents a
     /// read from entering commit ambiguity, while the request context applies
     /// one absolute deadline to queue admission and PostgreSQL statements.
+    #[allow(
+        dead_code,
+        reason = "retained strict storage source awaits the semantic storage adapter"
+    )]
     pub(super) fn authority_request_read_snapshot<T: Send>(
         &self,
         request: &AuthorityRequestContext,
@@ -592,33 +573,6 @@ impl Store {
         }
     }
 
-    /// Route v2 machine-authority read whose shared writer barrier is acquired
-    /// on this exact PostgreSQL session before the repeatable-read transaction
-    /// begins. The session lock is released after rollback on every ordinary
-    /// path; any ambiguous acquire/release or panic retires the connection so
-    /// a lock can never leak into the next request.
-    pub(super) fn authority_request_route_v2_read_snapshot<T: Send>(
-        &self,
-        request: &AuthorityRequestContext,
-        mut operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
-    ) -> Result<T> {
-        match self.authority_transaction_outcome_with_hook(
-            move |transaction| operation(transaction).map(AuthorityRequestDisposition::Reject),
-            AuthorityTransactionMode::RouteV2RepeatableRead,
-            Some(request),
-            || {},
-        ) {
-            Ok(value) => Ok(value),
-            Err(AuthorityExecutionError::Store(error)) => Err(error),
-            Err(AuthorityExecutionError::CandidateCollision) => Err(internal(
-                "unexpected candidate-collision marker in a Route v2 authority read",
-            )),
-            Err(AuthorityExecutionError::PlacementStale) => Err(internal(
-                "unexpected placement-stale marker in a Route v2 authority read",
-            )),
-        }
-    }
-
     pub(super) fn authority_transaction_outcome<T: Send>(
         &self,
         operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
@@ -635,6 +589,10 @@ impl Store {
     /// non-commit and therefore permits that owner to reset its per-attempt
     /// phase before the closed transaction is replayed. Connection failures
     /// stay ambiguous and deliberately do not invoke this hook.
+    #[allow(
+        dead_code,
+        reason = "retained strict storage source awaits the semantic storage adapter"
+    )]
     pub(super) fn authority_transaction_outcome_with_definite_retry<T: Send>(
         &self,
         mut operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
@@ -683,46 +641,10 @@ impl Store {
                     Ok(client) => client,
                     Err(error) => return (Err(AttemptFailure::Infrastructure(error)), false),
                 };
-                let session_barrier_held =
-                    matches!(mode, AuthorityTransactionMode::RouteV2RepeatableRead);
-                if session_barrier_held {
-                    if let Err(error) = acquire_route_v2_machine_session_barrier(client, request) {
-                        // A lost response cannot prove whether the session
-                        // acquired the lock. Retiring it is the only safe
-                        // cleanup and also makes a retry use a fresh snapshot.
-                        return (Err(AttemptFailure::Postgres(error)), true);
-                    }
-                }
-
-                let transaction_outcome =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        run_authority_transaction_attempt(
-                            client,
-                            &mut operation,
-                            mode,
-                            request,
-                            self,
-                        )
-                    }));
-                let release =
-                    session_barrier_held.then(|| release_route_v2_machine_session_barrier(client));
-                match transaction_outcome {
-                    Ok(outcome) => match release {
-                        Some(Ok(true)) | None => (outcome, false),
-                        Some(Ok(false)) => (
-                            Err(AttemptFailure::Infrastructure(ApiError::unavailable(
-                                "Route v2 PostgreSQL session barrier was not held at release",
-                            ))),
-                            true,
-                        ),
-                        Some(Err(error)) => (Err(AttemptFailure::Postgres(error)), true),
-                    },
-                    Err(payload) => {
-                        // `enter_with_retirement` closes the client before
-                        // propagating this panic, irrespective of unlock.
-                        std::panic::resume_unwind(payload)
-                    }
-                }
+                (
+                    run_authority_transaction_attempt(client, &mut operation, mode, request, self),
+                    false,
+                )
             });
 
             match outcome {
@@ -898,8 +820,7 @@ fn run_authority_transaction_attempt<T: Send>(
     let _ = store;
     let mut transaction = match mode {
         AuthorityTransactionMode::ReadWrite => client.transaction(),
-        AuthorityTransactionMode::RepeatableRead
-        | AuthorityTransactionMode::RouteV2RepeatableRead => client
+        AuthorityTransactionMode::RepeatableRead => client
             .build_transaction()
             .isolation_level(IsolationLevel::RepeatableRead)
             .start(),
@@ -1009,44 +930,6 @@ fn run_authority_transaction_attempt<T: Send>(
     }
 }
 
-fn acquire_route_v2_machine_session_barrier(
-    client: &mut postgres::Client,
-    request: Option<&AuthorityRequestContext>,
-) -> std::result::Result<(), postgres::Error> {
-    let timeout_ms = request
-        .and_then(AuthorityRequestContext::remaining_timeout_millis)
-        .unwrap_or(1);
-    let lock_timeout_ms = timeout_ms.min(2_000);
-    client.batch_execute(&format!(
-        "SET statement_timeout = '{timeout_ms}ms'; \
-         SET lock_timeout = '{lock_timeout_ms}ms'"
-    ))?;
-    let lock = client.query_one(
-        "SELECT pg_advisory_lock_shared(hashtextextended(\
-             current_schema() || ':route-v2-gateway-identity', 0::BIGINT))",
-        &[],
-    );
-    let restore = client.batch_execute(
-        "SET statement_timeout = '5s'; \
-         SET lock_timeout = '2s'",
-    );
-    lock?;
-    restore?;
-    Ok(())
-}
-
-fn release_route_v2_machine_session_barrier(
-    client: &mut postgres::Client,
-) -> std::result::Result<bool, postgres::Error> {
-    Ok(client
-        .query_one(
-            "SELECT pg_advisory_unlock_shared(hashtextextended(\
-                 current_schema() || ':route-v2-gateway-identity', 0::BIGINT))",
-            &[],
-        )?
-        .get(0))
-}
-
 fn authority_retry_is_definite(error: &postgres::Error) -> bool {
     matches!(
         error.code(),
@@ -1135,15 +1018,6 @@ fn retry_delay(attempt: usize) -> Duration {
 #[cfg(test)]
 mod request_context_tests {
     use super::*;
-
-    #[tokio::test]
-    async fn cancellation_waiter_wakes_at_the_absolute_request_deadline() {
-        let context = AuthorityRequestContext::new(Instant::now() + Duration::from_millis(20));
-        tokio::time::timeout(cats_test_support::poll_bound(), context.cancelled())
-            .await
-            .expect("request deadline did not wake its cancellation waiter");
-        assert!(context.is_cancelled_or_expired());
-    }
 
     #[test]
     fn commit_attempt_stays_visible_to_a_racing_http_deadline() {

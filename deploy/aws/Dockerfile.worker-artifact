@@ -39,8 +39,6 @@ RUN test "${CATS_RELEASE_COMMIT_SHA}" != "" \
     && strip \
       target/release/cats \
       target/release/cats-noded \
-      target/release/cats-route-v2-node-r1-validator \
-      target/release/cats-vmm-launcher \
       target/release/cats-usage-schema-v16-verifier \
       target/release/cats-usage-terminal-receipt-verifier \
       target/release/cats-blockd \
@@ -48,8 +46,6 @@ RUN test "${CATS_RELEASE_COMMIT_SHA}" != "" \
       target/release/cats-e3-guest-workload \
     && install -D -m 0755 target/release/cats /out/cats \
     && install -D -m 0755 target/release/cats-noded /out/cats-noded \
-    && install -D -m 0755 target/release/cats-route-v2-node-r1-validator /out/cats-route-v2-node-r1-validator \
-    && install -D -m 0755 target/release/cats-vmm-launcher /out/cats-vmm-launcher \
     && install -D -m 0755 target/release/cats-usage-schema-v16-verifier /out/cats-usage-schema-v16-verifier \
     && install -D -m 0755 target/release/cats-usage-terminal-receipt-verifier /out/cats-usage-terminal-receipt-verifier \
     && install -D -m 0755 target/release/cats-blockd /out/cats-blockd \
@@ -63,7 +59,6 @@ COPY --chmod=0755 deploy/aws/old-host-positive-stop.py /out/old-host-positive-st
 COPY --chmod=0755 deploy/aws/metal/render-postgres-url.sh /out/render-postgres-url.sh
 COPY --chmod=0755 deploy/aws/metal/install-guest-runtime-release.sh /out/install-guest-runtime-release.sh
 COPY --chmod=0755 deploy/aws/metal/validate-node-identity-installation.sh /out/validate-node-identity-installation.sh
-COPY --chmod=0755 deploy/aws/metal/install-route-v2-node-r1.sh /out/install-route-v2-node-r1.sh
 COPY --chmod=0755 deploy/aws/metal/worker-deployment-transaction.sh /out/worker-deployment-transaction.sh
 # The Agent opens the runtime socket roots and the Host lock; it never creates
 # them. Without these two files the deployment cannot provision them and no
@@ -77,8 +72,6 @@ FROM scratch AS artifact
 
 COPY --from=builder /out/cats /cats
 COPY --from=builder /out/cats-noded /cats-noded
-COPY --from=builder /out/cats-route-v2-node-r1-validator /cats-route-v2-node-r1-validator
-COPY --from=builder /out/cats-vmm-launcher /cats-vmm-launcher
 COPY --from=builder /out/cats-usage-schema-v16-verifier /cats-usage-schema-v16-verifier
 COPY --from=builder /out/cats-usage-terminal-receipt-verifier /cats-usage-terminal-receipt-verifier
 COPY --from=builder /out/cats-blockd /cats-blockd
@@ -91,7 +84,6 @@ COPY --from=builder --chmod=0755 /out/old-host-positive-stop.py /old-host-positi
 COPY --from=builder --chmod=0755 /out/render-postgres-url.sh /render-postgres-url.sh
 COPY --from=builder --chmod=0755 /out/install-guest-runtime-release.sh /install-guest-runtime-release.sh
 COPY --from=builder --chmod=0755 /out/validate-node-identity-installation.sh /validate-node-identity-installation.sh
-COPY --from=builder --chmod=0755 /out/install-route-v2-node-r1.sh /install-route-v2-node-r1.sh
 COPY --from=builder --chmod=0755 /out/worker-deployment-transaction.sh /worker-deployment-transaction.sh
 COPY --from=builder --chmod=0755 /out/provision-vmm-socket-namespaces.sh /provision-vmm-socket-namespaces.sh
 COPY --from=builder --chmod=0644 /out/cats-vmm.conf /cats-vmm.conf

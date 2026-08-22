@@ -269,20 +269,36 @@ cats_bind_candidate_main() {
 }
 
 cats_wait_for_registered_node() {
-  # `/attestedz`, not `/healthz`: the deployment proves the candidate Agent
-  # established its session-bound complete-inventory attestation. `/healthz`
-  # additionally requires the Node to hold runtimes, which the cutover's
-  # cordoned empty Node never does, so gating on it could never succeed on a
-  # first Node.
-  local service=$1 url=${2:-http://127.0.0.1:7301/attestedz} deadline identity
+  # The semantic health endpoint returns 200 only after Control accepted this
+  # Node registration and its placement gate is open. It is authenticated with
+  # the same root-only Control/Node bearer as all synchronous Node commands.
+  local service=$1 url=${2:-http://127.0.0.1:7301/v1/health}
+  local deadline identity token environment_file
   [ -n "${CATS_WORKER_CANDIDATE_MAIN_PID:-}" \
       ] && [ -n "${CATS_WORKER_CANDIDATE_MAIN_START:-}" ] || return 1
+  if [ -n "${CATS_NODE_HEALTH_TOKEN:-}" ]; then
+    token=$CATS_NODE_HEALTH_TOKEN
+  else
+    if [ -n "${CATS_NODE_ENV_FILE:-}" ]; then
+      environment_file=$CATS_NODE_ENV_FILE
+    elif [ "$service" = cats-worker ]; then
+      environment_file=/etc/cats/worker.env
+    else
+      environment_file=/etc/cats/cats.env
+    fi
+    token=$(sed -n 's/^CATS_AUTH_TOKEN=//p' "$environment_file" 2>/dev/null | tail -1)
+  fi
+  [ "${#token}" -ge 16 ] || {
+    echo "$service has no valid root-only CATS_AUTH_TOKEN for its health probe" >&2
+    return 1
+  }
   deadline=$(($(date +%s) + 60))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     identity=$(cats_candidate_main_identity "$service" 2>/dev/null || true)
     if [ "$identity" = "$CATS_WORKER_CANDIDATE_MAIN_PID:$CATS_WORKER_CANDIDATE_MAIN_START" ] \
         && cats_require_node_service_active "$service" \
-        && curl --fail --silent --show-error --max-time 1 "$url" >/dev/null; then
+        && printf 'header = "Authorization: Bearer %s"\n' "$token" \
+          | curl --config - --fail --silent --show-error --max-time 1 "$url" >/dev/null; then
       return 0
     fi
     sleep 1
