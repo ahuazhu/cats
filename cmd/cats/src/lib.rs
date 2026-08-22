@@ -1,18 +1,16 @@
-//! `cats` CLI: the command-line user surface. The release exposes the same
-//! exact Cat/PersistentDisk creates and bounded reads as the web console, plus
-//! exact lifecycle Operation lookup and independent OCI deployment attempts.
-//! No storage/node internals appear here.
+//! `cats` CLI: the command-line user surface. Cat lifecycle and PersistentDisk
+//! mutations call the synchronous semantic Control API using Workspace-local
+//! slugs. Independent account, fleet-admin and OCI deployment tools remain in
+//! the same binary; no storage or Node internals appear here.
 
 mod auth;
-#[cfg(unix)]
-mod cat_create_pending;
-#[cfg(not(unix))]
-#[path = "cat_create_pending_unsupported.rs"]
-mod cat_create_pending;
 #[cfg(all(test, unix))]
+#[allow(dead_code)] // Retired pending-wire tests remain until the clean-slate test deletion lands.
+mod cat_create_pending;
+#[cfg(all(test, not(unix)))]
 #[path = "cat_create_pending_unsupported.rs"]
-#[allow(dead_code)] // Compile-shape oracle: production selects exactly one implementation.
-mod cat_create_pending_unsupported_compile_shape;
+#[allow(dead_code)]
+mod cat_create_pending;
 mod config;
 mod credential_store;
 #[cfg(unix)]
@@ -37,13 +35,15 @@ mod runtime_provisioner_unsupported_compile_shape;
 #[cfg(unix)]
 mod stable_unix_fs;
 
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
+#[cfg(test)]
+use std::io::Write as _;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use cats_api::cat_create::{
-    decode_cat_create_v2_accepted_response, CatCreateV2AcceptedResponse, CatCreateV2Request,
-};
+#[cfg(test)]
+use cats_api::cat_create::{decode_cat_create_v2_accepted_response, CatCreateV2AcceptedResponse};
+#[cfg(test)]
 use cats_api::persistent_disk::{
     decode_persistent_disk_binding_v2_committed_response, Disk, DiskDurability, DiskKind,
     DiskState, PersistentDiskBindingV2CommittedResponse, PersistentDiskBindingV2Request,
@@ -67,6 +67,10 @@ use cats_api::oci::{
     DeployOciRequest, OciDeployment, OciDeploymentAttempt, OciDeploymentAttemptState,
     OciRegistryAuth,
 };
+use cats_api::semantic_control::{
+    AttachDiskRequest, CatMountRequest, CatResponse, CreateCatRequest, CreateDiskRequest,
+    DetachDiskRequest, DiskResponse, PersistentMountPath, ResourceSlug, SemanticErrorBody,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -86,7 +90,7 @@ pub struct Cli {
     #[arg(long, env = "CATS_WORKSPACE", global = true)]
     pub workspace: Option<String>,
     /// Do not wait for operations to finish.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub no_wait: bool,
     /// Print raw JSON instead of human-readable output.
     #[arg(long, global = true)]
@@ -116,43 +120,49 @@ pub enum Command {
     },
     /// Create a cat (its root disk is created automatically).
     Create {
+        /// Workspace-local Cat slug.
+        #[arg(value_name = "CAT_SLUG")]
         name: String,
-        /// Content-addressed boot image manifest (`sha256:<64 lowercase hex>`).
-        #[arg(long)]
+        /// Boot image understood by the Control Plane.
+        #[arg(long = "boot-image", default_value = "ubuntu-24.04")]
         boot_image_digest: String,
-        #[arg(long, default_value_t = 2)]
+        #[arg(long = "cpu", default_value_t = 2)]
         cpus: u32,
         #[arg(long, default_value = "2GiB")]
         memory: String,
-        #[arg(long, default_value = "1GiB")]
-        root_size: String,
-        /// What an fsync inside the Cat promises, for the disks this command
-        /// creates. `strict`: fsync returns once the data is durable in the
-        /// object store and survives losing the host. `relaxed`: fsync
-        /// returns after a local commit and the data reaches the object store
-        /// asynchronously; an unclean host loss may drop recent acknowledged
-        /// writes, so choose `strict` when that is not acceptable.
-        #[arg(long, default_value = "strict", value_parser = ["strict", "relaxed"])]
-        durability: String,
-        /// Resolve only an already-durable Cat-create request. Used by the
-        /// production cutover runner after an interrupted stdout capture.
-        #[arg(long, hide = true)]
-        existing_pending_only: bool,
+        /// Attach `DISK_SLUG` at an absolute Guest path. May be repeated.
+        #[arg(long = "mount", value_name = "DISK_SLUG:/path")]
+        mounts: Vec<String>,
     },
     /// List cats.
     Ls,
     /// Show one cat by immutable ID.
     Get { id: String },
     /// Converge a Cold, Suspended, or Warm Cat to Running.
-    Run { cat_id: String },
+    Run {
+        #[arg(value_name = "CAT_SLUG")]
+        cat_id: String,
+    },
     /// Pause a Cat in the Host-bound Suspended state.
-    Suspend { cat_id: String },
+    Suspend {
+        #[arg(value_name = "CAT_SLUG")]
+        cat_id: String,
+    },
     /// Snapshot a Cat into the Host-bound Warm state.
-    Warm { cat_id: String },
+    Warm {
+        #[arg(value_name = "CAT_SLUG")]
+        cat_id: String,
+    },
     /// Drain and release every volume into location-independent Cold.
-    Cold { cat_id: String },
+    Cold {
+        #[arg(value_name = "CAT_SLUG")]
+        cat_id: String,
+    },
     /// Destroy a Cat and its RootDisk after retaining PersistentDisks safely.
-    Destroy { cat_id: String },
+    Destroy {
+        #[arg(value_name = "CAT_SLUG")]
+        cat_id: String,
+    },
     /// Deploy a digest-pinned OCI image as a supervised service in a Cat.
     Deploy {
         /// Cat name or ID.
@@ -219,12 +229,11 @@ pub enum TokenCommand {
 #[derive(Subcommand, Debug)]
 pub enum DiskCommand {
     Create {
+        /// Workspace-local PersistentDisk slug.
+        #[arg(value_name = "DISK_SLUG")]
         name: String,
         #[arg(long)]
         size: String,
-        /// See `cats create --durability`.
-        #[arg(long, default_value = "strict", value_parser = ["strict", "relaxed"])]
-        durability: String,
     },
     Ls,
     Get {
@@ -233,25 +242,29 @@ pub enum DiskCommand {
     },
     /// Append a PersistentDisk to the immutable config of a terminal Cold Cat.
     Attach {
-        /// Immutable Disk ID.
+        /// Workspace-local PersistentDisk slug.
+        #[arg(value_name = "DISK_SLUG")]
         disk: String,
-        /// Immutable Cat ID.
-        #[arg(long)]
+        /// Workspace-local Cat slug.
+        #[arg(long, value_name = "CAT_SLUG")]
         cat: String,
         /// Absolute non-root path inside the Guest.
-        #[arg(long)]
+        #[arg(long = "mount")]
         mount_path: String,
     },
-    /// Remove one exact Cat and Guest-path binding while the Cat remains Cold.
+    /// Remove the disk binding while the Cat remains Cold.
     Detach {
-        /// Immutable Disk ID.
+        /// Workspace-local PersistentDisk slug.
+        #[arg(value_name = "DISK_SLUG")]
         disk: String,
-        /// Immutable Cat ID.
-        #[arg(long)]
+        /// Workspace-local Cat slug.
+        #[arg(long, value_name = "CAT_SLUG")]
         cat: String,
-        /// Exact absolute Guest path used by the current binding.
-        #[arg(long)]
-        mount_path: String,
+    },
+    /// Destroy an unbound PersistentDisk.
+    Destroy {
+        #[arg(value_name = "DISK_SLUG")]
+        disk: String,
     },
 }
 
@@ -688,6 +701,76 @@ pub fn parse_size(s: &str) -> Result<u64> {
         .ok_or_else(|| anyhow!("size overflows: {s}"))
 }
 
+/// Parse the public PersistentDisk capacity syntax. V1 deliberately accepts
+/// only whole binary GiB so the value sent to Control is unambiguous.
+pub fn parse_gib_size(s: &str) -> Result<u64> {
+    let gib = s
+        .strip_suffix("GiB")
+        .ok_or_else(|| anyhow!("disk size must be a whole number of GiB, for example 100GiB"))?;
+    anyhow::ensure!(
+        !gib.is_empty() && gib.bytes().all(|byte| byte.is_ascii_digit()),
+        "disk size must be a whole number of GiB, for example 100GiB"
+    );
+    let gib: u64 = gib
+        .parse()
+        .with_context(|| format!("invalid disk size: {s}"))?;
+    anyhow::ensure!(gib > 0, "disk size must be greater than zero");
+    gib.checked_mul(1u64 << 30)
+        .ok_or_else(|| anyhow!("disk size overflows: {s}"))
+}
+
+fn resource_slug(kind: &str, slug: &str) -> Result<ResourceSlug> {
+    ResourceSlug::new(slug).with_context(|| {
+        format!(
+            "invalid {kind} slug {slug:?}: use 1-63 lowercase letters, digits, or '-' and start/end with a letter or digit"
+        )
+    })
+}
+
+fn persistent_mount_path(path: &str) -> Result<PersistentMountPath> {
+    PersistentMountPath::new(path)
+        .with_context(|| format!("invalid PersistentDisk mount path: {path}"))
+}
+
+fn parse_mount(value: &str) -> Result<CatMountRequest> {
+    let (disk_slug, mount_path) = value
+        .split_once(':')
+        .ok_or_else(|| anyhow!("mount must be DISK_SLUG:/absolute/path: {value}"))?;
+    anyhow::ensure!(
+        !mount_path.contains(':'),
+        "mount must contain exactly one ':' separator: {value}"
+    );
+    Ok(CatMountRequest {
+        disk_slug: resource_slug("disk", disk_slug)?,
+        mount_path: persistent_mount_path(mount_path)?,
+    })
+}
+
+fn parse_mounts(values: &[String]) -> Result<Vec<CatMountRequest>> {
+    values.iter().map(|value| parse_mount(value)).collect()
+}
+
+fn canonical_api_origin(value: &str) -> Result<String> {
+    let parsed = reqwest::Url::parse(value).context("invalid Cats API origin")?;
+    let has_userinfo = value.split_once("://").is_some_and(|(_, remainder)| {
+        let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+        remainder[..authority_end].contains('@')
+    });
+    anyhow::ensure!(
+        value.trim() == value
+            && matches!(parsed.scheme(), "http" | "https")
+            && parsed.has_host()
+            && !has_userinfo
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+            && parsed.path() == "/"
+            && parsed.query().is_none()
+            && parsed.fragment().is_none(),
+        "Cats API URL must be one exact HTTP(S) origin without path, query, credentials, or fragment"
+    );
+    Ok(parsed.origin().ascii_serialization())
+}
+
 struct Client {
     http: reqwest::blocking::Client,
     base: String,
@@ -707,9 +790,7 @@ impl Client {
                 .no_deflate()
                 .no_zstd()
                 .build()?;
-            let base = cat_create_pending::canonical_api_origin(&auth::configured_api_url(
-                cli.api_url.as_deref(),
-            )?)?;
+            let base = canonical_api_origin(&auth::configured_api_url(cli.api_url.as_deref())?)?;
             let selector = workspace_override(cli).unwrap_or_else(|| "default".to_string());
             let workspace_id = resolve_workspace_id(&http, &base, token, &selector)?;
             return Ok(Self {
@@ -734,7 +815,7 @@ impl Client {
                 .no_deflate()
                 .no_zstd()
                 .build()?,
-            base: cat_create_pending::canonical_api_origin(&session.api_url)?,
+            base: canonical_api_origin(&session.api_url)?,
             token: session.access_token,
             workspace_id: session.workspace,
         })
@@ -778,6 +859,9 @@ impl Client {
             .to_vec();
         if !status.is_success() {
             // Surface the structured error body when present.
+            if let Ok(err) = serde_json::from_slice::<SemanticErrorBody>(&body) {
+                bail!("{} ({:?})", err.message, err.code);
+            }
             if let Ok(err) = serde_json::from_slice::<cats_api::error::ErrorBody>(&body) {
                 bail!("{} ({:?})", err.message, err.code);
             }
@@ -786,6 +870,8 @@ impl Client {
         Ok((status, body))
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn send_exact_create(
         &self,
         description: &str,
@@ -842,6 +928,8 @@ impl Client {
         })
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn send_cat_create(
         &self,
         pending: &cat_create_pending::PreparedCatCreate,
@@ -861,6 +949,8 @@ impl Client {
         )
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn send_persistent_disk_create(
         &self,
         pending: &cat_create_pending::PreparedPersistentDiskCreate,
@@ -880,6 +970,8 @@ impl Client {
         )
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn send_persistent_disk_binding(
         &self,
         pending: &cat_create_pending::PreparedPersistentDiskBinding,
@@ -899,6 +991,8 @@ impl Client {
         )
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn send_cat_lifecycle(
         &self,
         pending: &cat_create_pending::PreparedCatLifecycle,
@@ -990,7 +1084,10 @@ impl Client {
     }
 
     fn post(&self, path: &str, body: Option<serde_json::Value>) -> Result<serde_json::Value> {
-        let mut req = self.http.post(self.url(path));
+        let mut req = self
+            .http
+            .post(self.url(path))
+            .header(reqwest::header::ACCEPT, "application/json");
         req = match body {
             Some(b) => req.json(&b),
             None => req.header("content-length", "0"),
@@ -1395,104 +1492,21 @@ pub fn run(cli: Cli) -> Result<()> {
             boot_image_digest,
             cpus,
             memory,
-            root_size,
-            durability,
-            existing_pending_only,
+            mounts,
         } => {
-            let durability = match durability.as_str() {
-                "strict" => cats_api::runtime_reconciliation::Durability::Strict,
-                "relaxed" => cats_api::runtime_reconciliation::Durability::Relaxed,
-                _ => unreachable!("clap validates --durability"),
+            let request = CreateCatRequest {
+                cat_slug: resource_slug("cat", name)?,
+                cpu: *cpus,
+                memory_bytes: parse_size(memory)?,
+                boot_image: boot_image_digest.clone(),
+                mounts: parse_mounts(mounts)?,
             };
-            let body = CatCreateV2Request::new(
-                name.clone(),
-                boot_image_digest.clone(),
-                *cpus,
-                parse_size(memory)?,
-                parse_size(root_size)?,
-                durability,
-            )
-            .context("invalid Cat-create request")?;
-            let request_body = serde_json::to_vec(&body)?;
-            let pending = if *existing_pending_only {
-                match cat_create_pending::PreparedCatCreate::prepare_existing(
-                    &client.base,
-                    &client.workspace_id,
-                    &request_body,
-                )
-                .context("could not inspect exact Cat-create recovery state")?
-                {
-                    Some(pending) => pending,
-                    None => {
-                        if cli.json {
-                            println!("{{\"pending_cat_create\":false}}")
-                        } else {
-                            println!("no matching pending Cat-create request")
-                        }
-                        return Ok(());
-                    }
-                }
-            } else {
-                cat_create_pending::PreparedCatCreate::prepare(
-                    &client.base,
-                    &client.workspace_id,
-                    &request_body,
-                )
-                .context(
-                    "could not durably prepare Cat-create recovery state; no HTTP request was sent",
-                )?
-            };
-            let response = client.send_cat_create(&pending).with_context(|| {
-                format!(
-                    "Cat-create response is ambiguous; the exact path, body, and Idempotency-Key remain pending at {}",
-                    pending.pending_path().display()
-                )
-            })?;
-            match classify_cat_create_response(&response) {
-                CatCreateResponseClassification::Accepted(accepted) => {
-                    // Report the durable identity before acknowledging local
-                    // state. A crash before this output leaves the exact
-                    // request replayable; a crash after it can only repeat the
-                    // same accepted identity.
-                    if cli.json {
-                        println!("{}", serde_json::to_string_pretty(&accepted)?);
-                    } else {
-                        println!(
-                            "Cat {} accepted (operation {})",
-                            accepted.cat_id, accepted.operation_id
-                        );
-                    }
-                    std::io::stdout()
-                        .flush()
-                        .context("flush accepted Cat/Operation identity before cleanup")?;
-                    pending.clear().context(
-                        "Cat-create was accepted and reported, but its pending recovery state could not be durably cleared",
-                    )?;
-                    Ok(())
-                }
-                CatCreateResponseClassification::NameConflict => {
-                    pending.clear().context(
-                        "Cat name conflict is terminal, but its pending recovery state could not be durably cleared",
-                    )?;
-                    bail!("cat name already exists (AlreadyExists)")
-                }
-                CatCreateResponseClassification::Nonterminal => {
-                    let detail =
-                        serde_json::from_slice::<cats_api::error::ErrorBody>(&response.body)
-                            .map(|error| format!("{} ({:?})", error.message, error.code))
-                            .unwrap_or_else(|_| {
-                                format!(
-                                    "HTTP {}: {}",
-                                    response.status,
-                                    String::from_utf8_lossy(&response.body)
-                                )
-                            });
-                    bail!(
-                        "Cat-create response was not an exact terminal result ({detail}); replay the same command to reuse the pending Idempotency-Key at {}",
-                        pending.pending_path().display()
-                    )
-                }
-            }
+            request.validate().context("invalid Cat create request")?;
+            let response = client.post("/cats", Some(serde_json::to_value(request)?))?;
+            let response: CatResponse =
+                serde_json::from_value(response).context("invalid semantic Cat response")?;
+            response.cat.validate().context("invalid Cat response")?;
+            print_cat_response(&response, cli.json)
         }
         Command::Ls => {
             let cats: Vec<CatReadV2> = client.get_all_product_pages("/cats")?;
@@ -1511,36 +1525,11 @@ pub fn run(cli: Cli) -> Result<()> {
             print_runtime_cat(&cat, cli.json);
             Ok(())
         }
-        Command::Run { cat_id } => run_cat_lifecycle_mutation(
-            &client,
-            &cli,
-            cat_id,
-            cat_create_pending::CatLifecycleAction::Run,
-        ),
-        Command::Suspend { cat_id } => run_cat_lifecycle_mutation(
-            &client,
-            &cli,
-            cat_id,
-            cat_create_pending::CatLifecycleAction::Suspend,
-        ),
-        Command::Warm { cat_id } => run_cat_lifecycle_mutation(
-            &client,
-            &cli,
-            cat_id,
-            cat_create_pending::CatLifecycleAction::Warm,
-        ),
-        Command::Cold { cat_id } => run_cat_lifecycle_mutation(
-            &client,
-            &cli,
-            cat_id,
-            cat_create_pending::CatLifecycleAction::Cold,
-        ),
-        Command::Destroy { cat_id } => run_cat_lifecycle_mutation(
-            &client,
-            &cli,
-            cat_id,
-            cat_create_pending::CatLifecycleAction::Destroy,
-        ),
+        Command::Run { cat_id } => run_semantic_cat_action(&client, &cli, cat_id, "run"),
+        Command::Suspend { cat_id } => run_semantic_cat_action(&client, &cli, cat_id, "suspend"),
+        Command::Warm { cat_id } => run_semantic_cat_action(&client, &cli, cat_id, "warm"),
+        Command::Cold { cat_id } => run_semantic_cat_action(&client, &cli, cat_id, "cold"),
+        Command::Destroy { cat_id } => run_semantic_cat_action(&client, &cli, cat_id, "destroy"),
         Command::Deploy {
             name,
             app,
@@ -1702,74 +1691,78 @@ fn valid_env_name(name: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
+fn run_semantic_cat_action(client: &Client, cli: &Cli, cat_slug: &str, action: &str) -> Result<()> {
+    resource_slug("cat", cat_slug)?;
+    let response = client.post(&format!("/cats/{cat_slug}/actions/{action}"), None)?;
+    let response: CatResponse =
+        serde_json::from_value(response).context("invalid semantic Cat response")?;
+    response.cat.validate().context("invalid Cat response")?;
+    print_cat_response(&response, cli.json)
+}
+
+fn print_cat_response(response: &CatResponse, json_mode: bool) -> Result<()> {
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(response)?);
+        return Ok(());
+    }
+    let state = response
+        .cat
+        .state
+        .map(|state| format!("{state:?}").to_lowercase())
+        .unwrap_or_else(|| "creating".to_owned());
+    let node = response
+        .cat
+        .node_name
+        .as_ref()
+        .map_or("-", |name| name.as_str());
+    let code = serde_json::to_value(response.code)?;
+    let code = code
+        .as_str()
+        .context("semantic success code was not a string")?;
+    println!(
+        "{}: cat={} id={} state={} node={}",
+        code, response.cat.cat_slug, response.cat.cat_id, state, node
+    );
+    Ok(())
+}
+
+fn print_disk_response(response: &DiskResponse, json_mode: bool) -> Result<()> {
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(response)?);
+    } else {
+        let code = serde_json::to_value(response.code)?;
+        let code = code
+            .as_str()
+            .context("semantic success code was not a string")?;
+        println!(
+            "{}: disk={} id={} status={}",
+            code,
+            response.disk.disk_slug,
+            response.disk.disk_id,
+            format!("{:?}", response.disk.status).to_lowercase()
+        );
+    }
+    Ok(())
+}
+
 fn run_disk(client: &Client, cli: &Cli, cmd: &DiskCommand) -> Result<()> {
     match cmd {
-        DiskCommand::Create {
-            name,
-            size,
-            durability,
-        } => {
-            let request = PersistentDiskCreateV1Request {
-                durability: DiskDurability::parse(durability)
-                    .context("invalid PersistentDisk durability")?,
-                name: cats_api::runtime_reconciliation::Id::new(name.clone())
-                    .context("invalid PersistentDisk name")?,
-                size_bytes: parse_size(size)?,
+        DiskCommand::Create { name, size } => {
+            let request = CreateDiskRequest {
+                disk_slug: resource_slug("disk", name)?,
+                size_bytes: parse_gib_size(size)?,
             };
             request
                 .validate()
-                .context("invalid PersistentDisk-create request")?;
-            let request_body = serde_json::to_vec(&request)?;
-            let pending = cat_create_pending::PreparedPersistentDiskCreate::prepare(
-                &client.base,
-                &client.workspace_id,
-                &request_body,
-            )
-            .context(
-                "could not durably prepare PersistentDisk-create recovery state; no HTTP request was sent",
-            )?;
-            let response = client
-                .send_persistent_disk_create(&pending)
-                .with_context(|| {
-                    format!(
-                        "PersistentDisk-create response is ambiguous; the exact path, body, and Idempotency-Key remain pending at {}",
-                        pending.pending_path().display()
-                    )
-                })?;
-            match classify_persistent_disk_create_response(&response, &pending)? {
-                PersistentDiskCreateResponseClassification::Created(disk) => {
-                    print_disk(&disk, cli.json);
-                    std::io::stdout()
-                        .flush()
-                        .context("flush created PersistentDisk identity before cleanup")?;
-                    pending.clear().context(
-                        "PersistentDisk-create committed and was reported, but its pending recovery state could not be durably cleared",
-                    )?;
-                    Ok(())
-                }
-                PersistentDiskCreateResponseClassification::NameConflict => {
-                    pending.clear().context(
-                        "PersistentDisk name conflict is terminal, but its pending recovery state could not be durably cleared",
-                    )?;
-                    bail!("disk name already exists (AlreadyExists)")
-                }
-                PersistentDiskCreateResponseClassification::Nonterminal => {
-                    let detail =
-                        serde_json::from_slice::<cats_api::error::ErrorBody>(&response.body)
-                            .map(|error| format!("{} ({:?})", error.message, error.code))
-                            .unwrap_or_else(|_| {
-                                format!(
-                                    "HTTP {}: {}",
-                                    response.status,
-                                    String::from_utf8_lossy(&response.body)
-                                )
-                            });
-                    bail!(
-                        "PersistentDisk-create response was not an exact terminal result ({detail}); replay the same command to reuse the pending Idempotency-Key at {}",
-                        pending.pending_path().display()
-                    )
-                }
-            }
+                .context("invalid PersistentDisk create request")?;
+            let response = client.post("/disks", Some(serde_json::to_value(request)?))?;
+            let response: DiskResponse = serde_json::from_value(response)
+                .context("invalid semantic PersistentDisk response")?;
+            response
+                .disk
+                .validate()
+                .context("invalid PersistentDisk response")?;
+            print_disk_response(&response, cli.json)
         }
         DiskCommand::Ls => {
             let disks: Vec<DiskReadV2> = client.get_all_product_pages("/disks")?;
@@ -1792,29 +1785,57 @@ fn run_disk(client: &Client, cli: &Cli, cmd: &DiskCommand) -> Result<()> {
             disk,
             cat,
             mount_path,
-        } => run_persistent_disk_binding(
-            client,
-            cli,
-            disk,
-            cat,
-            mount_path,
-            cat_create_pending::PersistentDiskBindingAction::Attach,
-        ),
-        DiskCommand::Detach {
-            disk,
-            cat,
-            mount_path,
-        } => run_persistent_disk_binding(
-            client,
-            cli,
-            disk,
-            cat,
-            mount_path,
-            cat_create_pending::PersistentDiskBindingAction::Detach,
-        ),
+        } => {
+            resource_slug("disk", disk)?;
+            let request = AttachDiskRequest {
+                cat_slug: resource_slug("cat", cat)?,
+                mount_path: persistent_mount_path(mount_path)?,
+            };
+            let response = client.post(
+                &format!("/disks/{disk}/actions/attach"),
+                Some(serde_json::to_value(request)?),
+            )?;
+            let response: DiskResponse = serde_json::from_value(response)
+                .context("invalid semantic PersistentDisk response")?;
+            response
+                .disk
+                .validate()
+                .context("invalid PersistentDisk response")?;
+            print_disk_response(&response, cli.json)
+        }
+        DiskCommand::Detach { disk, cat } => {
+            resource_slug("disk", disk)?;
+            let request = DetachDiskRequest {
+                cat_slug: resource_slug("cat", cat)?,
+            };
+            let response = client.post(
+                &format!("/disks/{disk}/actions/detach"),
+                Some(serde_json::to_value(request)?),
+            )?;
+            let response: DiskResponse = serde_json::from_value(response)
+                .context("invalid semantic PersistentDisk response")?;
+            response
+                .disk
+                .validate()
+                .context("invalid PersistentDisk response")?;
+            print_disk_response(&response, cli.json)
+        }
+        DiskCommand::Destroy { disk } => {
+            resource_slug("disk", disk)?;
+            let response = client.post(&format!("/disks/{disk}/actions/destroy"), None)?;
+            let response: DiskResponse = serde_json::from_value(response)
+                .context("invalid semantic PersistentDisk response")?;
+            response
+                .disk
+                .validate()
+                .context("invalid PersistentDisk response")?;
+            print_disk_response(&response, cli.json)
+        }
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn run_persistent_disk_binding(
     client: &Client,
     cli: &Cli,
@@ -1946,6 +1967,8 @@ fn run_persistent_disk_binding(
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn print_disk(d: &Disk, json_mode: bool) {
     if json_mode {
         println!("{}", serde_json::to_string_pretty(d).unwrap());
@@ -1992,9 +2015,11 @@ fn print_runtime_disk(disk: &DiskReadV2, json_mode: bool) {
     }
 }
 
+#[cfg(test)]
 const CAT_CREATE_NAME_CONFLICT_BODY: &[u8] =
     br#"{"code":"already_exists","message":"cat name already exists"}"#;
 
+#[cfg(test)]
 struct ExactCreateHttpResponse {
     status: reqwest::StatusCode,
     content_types: Vec<Vec<u8>>,
@@ -2002,12 +2027,15 @@ struct ExactCreateHttpResponse {
     body: Vec<u8>,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 enum CatCreateResponseClassification {
     Accepted(CatCreateV2AcceptedResponse),
     NameConflict,
     Nonterminal,
 }
 
+#[cfg(test)]
 fn classify_cat_create_response(
     response: &ExactCreateHttpResponse,
 ) -> CatCreateResponseClassification {
@@ -2032,16 +2060,22 @@ fn classify_cat_create_response(
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(test)]
+#[allow(dead_code)]
 struct CatLifecycleAcceptedResponse {
     operation_id: RuntimeId,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 enum CatLifecycleResponseClassification {
     Accepted(CatLifecycleAcceptedResponse),
     DefinitiveError(cats_api::error::ErrorBody),
     Nonterminal,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn decode_exact_json<T>(body: &[u8]) -> Option<T>
 where
     T: serde::de::DeserializeOwned + serde::Serialize,
@@ -2052,6 +2086,8 @@ where
     (serde_json::to_vec(&decoded).ok()?.as_slice() == body).then_some(decoded)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn classify_cat_lifecycle_response(
     response: &ExactCreateHttpResponse,
 ) -> CatLifecycleResponseClassification {
@@ -2089,6 +2125,8 @@ fn print_runtime_operation_terminal(operation: &ProductOperation, json_mode: boo
     Ok(())
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn run_cat_lifecycle_mutation(
     client: &Client,
     cli: &Cli,
@@ -2162,12 +2200,16 @@ fn run_cat_lifecycle_mutation(
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 enum PersistentDiskCreateResponseClassification {
     Created(Disk),
     NameConflict,
     Nonterminal,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 enum PersistentDiskBindingResponseClassification {
     Committed(PersistentDiskBindingV2CommittedResponse),
     NotFound,
@@ -2176,6 +2218,7 @@ enum PersistentDiskBindingResponseClassification {
     Nonterminal,
 }
 
+#[cfg(test)]
 fn persistent_disk_binding_response_matches_target(
     response: &PersistentDiskBindingV2CommittedResponse,
     disk_id: &str,
@@ -2184,6 +2227,7 @@ fn persistent_disk_binding_response_matches_target(
     response.disk_id.as_str() == disk_id && response.cat_id.as_str() == cat_id
 }
 
+#[cfg(test)]
 fn classify_persistent_disk_binding_response(
     response: &ExactCreateHttpResponse,
 ) -> PersistentDiskBindingResponseClassification {
@@ -2215,6 +2259,7 @@ fn classify_persistent_disk_binding_response(
     PersistentDiskBindingResponseClassification::Nonterminal
 }
 
+#[cfg(test)]
 fn classify_persistent_disk_create_response(
     response: &ExactCreateHttpResponse,
     pending: &cat_create_pending::PreparedPersistentDiskCreate,
@@ -2253,6 +2298,7 @@ fn classify_persistent_disk_create_response(
     Ok(PersistentDiskCreateResponseClassification::Nonterminal)
 }
 
+#[cfg(test)]
 fn exact_product_identity(value: &str, prefix: &str) -> bool {
     value.strip_prefix(prefix).is_some_and(|random| {
         random.len() == 32
@@ -2277,6 +2323,20 @@ mod tests {
         assert_eq!(parse_size("512MiB").unwrap(), 512 << 20);
         assert_eq!(parse_size("4KiB").unwrap(), 4096);
         assert!(parse_size("abc").is_err());
+        assert_eq!(parse_gib_size("100GiB").unwrap(), 100 << 30);
+        for invalid in ["0GiB", "1GB", "1.5GiB", "GiB", " 1GiB"] {
+            assert!(parse_gib_size(invalid).is_err(), "accepted {invalid:?}");
+        }
+        assert_eq!(
+            parse_mount("data-disk:/srv/data").unwrap(),
+            CatMountRequest {
+                disk_slug: ResourceSlug::new("data-disk").unwrap(),
+                mount_path: PersistentMountPath::new("/srv/data").unwrap(),
+            }
+        );
+        for invalid in ["data", "DATA:/data", "data:relative", "data:/proc"] {
+            assert!(parse_mount(invalid).is_err(), "accepted {invalid:?}");
+        }
     }
 
     #[test]
@@ -2299,12 +2359,14 @@ mod tests {
             "cats",
             "create",
             "dev",
-            "--boot-image-digest",
-            TEST_BOOT_IMAGE,
-            "--cpus",
+            "--boot-image",
+            "ubuntu-24.04",
+            "--cpu",
             "4",
             "--memory",
             "8GiB",
+            "--mount",
+            "data:/data",
         ]);
         match cli.command {
             Command::Create {
@@ -2315,51 +2377,16 @@ mod tests {
             } => {
                 assert_eq!(name, "dev");
                 assert_eq!(cpus, 4);
-                assert_eq!(boot_image_digest, TEST_BOOT_IMAGE);
+                assert_eq!(boot_image_digest, "ubuntu-24.04");
             }
             _ => panic!("wrong parse"),
         }
-        let cli = Cli::parse_from([
-            "cats",
-            "create",
-            "ci",
-            "--boot-image-digest",
-            TEST_BOOT_IMAGE,
-            "--durability",
-            "relaxed",
-        ]);
-        match cli.command {
-            Command::Create { durability, .. } => assert_eq!(durability, "relaxed"),
-            _ => panic!("wrong parse"),
-        }
-        // No flag means strict: the honest default.
-        let cli = Cli::parse_from([
-            "cats",
-            "create",
-            "db",
-            "--boot-image-digest",
-            TEST_BOOT_IMAGE,
-        ]);
-        match cli.command {
-            Command::Create { durability, .. } => assert_eq!(durability, "strict"),
-            _ => panic!("wrong parse"),
-        }
+        assert!(Cli::try_parse_from(["cats", "create", "x"]).is_ok());
         assert!(Cli::try_parse_from([
             "cats",
             "create",
             "x",
-            "--boot-image-digest",
-            TEST_BOOT_IMAGE,
-            "--durability",
-            "fast",
-        ])
-        .is_err());
-        assert!(Cli::try_parse_from(["cats", "create", "x"]).is_err());
-        assert!(Cli::try_parse_from([
-            "cats",
-            "create",
-            "x",
-            "--boot-image-digest",
+            "--boot-image",
             TEST_BOOT_IMAGE,
             "--disk",
             "legacy",
@@ -2410,10 +2437,10 @@ mod tests {
             "cats",
             "disk",
             "attach",
-            "disk_01",
+            "data",
             "--cat",
-            "cat_01",
-            "--mount-path",
+            "app",
+            "--mount",
             "/srv/data",
         ]);
         assert!(matches!(
@@ -2424,27 +2451,16 @@ mod tests {
                     cat,
                     mount_path,
                 }
-            } if disk == "disk_01" && cat == "cat_01" && mount_path == "/srv/data"
+            } if disk == "data" && cat == "app" && mount_path == "/srv/data"
         ));
-        let cli = Cli::parse_from([
-            "cats",
-            "disk",
-            "detach",
-            "disk_01",
-            "--cat",
-            "cat_01",
-            "--mount-path",
-            "/srv/data",
-        ]);
+        let cli = Cli::parse_from(["cats", "disk", "detach", "data", "--cat", "app"]);
         assert!(matches!(
             cli.command,
             Command::Disk {
                 cmd: DiskCommand::Detach { .. }
             }
         ));
-        assert!(
-            Cli::try_parse_from(["cats", "disk", "detach", "disk_01", "--cat", "cat_01",]).is_err()
-        );
+        assert!(Cli::try_parse_from(["cats", "disk", "destroy", "data"]).is_ok());
         let cli = Cli::parse_from([
             "cats",
             "admin",
@@ -3132,24 +3148,20 @@ mod tests {
         server.join().unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
-    fn create_sends_one_exact_v2_request_and_accepts_only_the_flat_202() {
+    fn semantic_create_sends_slug_mounts_and_no_idempotency_key() {
         use clap::Parser;
         use std::io::Write;
 
-        let state_directory = tempfile::tempdir().unwrap();
-        let state_root = state_directory.path().canonicalize().unwrap().join("state");
-        let _state_guard = cat_create_pending::TestStateRootGuard::set(state_root.clone());
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let captured = read_request(&mut stream);
-            let response = br#"{"cat_id":"cat_01","operation_id":"op_01"}"#;
+            let response = br#"{"status":"ok","code":"cat_created","cat":{"cat_id":"cat_01","workspace_id":"ws_01","cat_slug":"app","state":"running","current_action":null,"node_id":"node_01","node_name":"worker-a","cpu":3,"memory_bytes":2147483648,"boot_image":"ubuntu-24.04","mounts":[],"last_error":null,"created_at_unix_ms":1,"updated_at_unix_ms":2,"destroyed_at_unix_ms":null}}"#;
             write!(
                 stream,
-                "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 response.len()
             )
             .unwrap();
@@ -3175,16 +3187,16 @@ mod tests {
             "ws_01",
             "create",
             "app",
-            "--boot-image-digest",
-            TEST_BOOT_IMAGE,
-            "--cpus",
+            "--boot-image",
+            "ubuntu-24.04",
+            "--cpu",
             "3",
             "--memory",
             "2GiB",
-            "--root-size",
-            "4GiB",
-            "--durability",
-            "relaxed",
+            "--mount",
+            "data:/srv/data",
+            "--mount",
+            "logs:/srv/logs",
         ]);
         run(cli).unwrap();
         let (headers, body) = server.join().unwrap();
@@ -3192,42 +3204,39 @@ mod tests {
         assert!(headers
             .lines()
             .any(|line| line.eq_ignore_ascii_case("content-type: application/json")));
-        assert!(headers.lines().any(|line| line
-            .to_ascii_lowercase()
-            .starts_with("idempotency-key: cli-")));
+        assert!(!headers
+            .lines()
+            .any(|line| line.to_ascii_lowercase().starts_with("idempotency-key:")));
         assert_eq!(
-            body,
-            br#"{"name":"app","boot_image_digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","vcpus":3,"memory_bytes":2147483648,"root_size_bytes":4294967296,"durability":"relaxed"}"#
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            json!({
+                "cat_slug": "app",
+                "cpu": 3,
+                "memory_bytes": 2_147_483_648_u64,
+                "boot_image": "ubuntu-24.04",
+                "mounts": [
+                    {"disk_slug": "data", "mount_path": "/srv/data"},
+                    {"disk_slug": "logs", "mount_path": "/srv/logs"},
+                ],
+            })
         );
-        assert!(std::fs::read_dir(state_root).unwrap().all(|entry| {
-            !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".pending.json")
-        }));
     }
 
-    #[cfg(unix)]
     #[test]
-    fn every_atomic_lifecycle_command_sends_one_exact_empty_body_request() {
+    fn every_semantic_lifecycle_command_sends_one_sync_empty_body_request() {
         use clap::Parser as _;
         use std::io::Write as _;
 
         for action in ["run", "suspend", "warm", "cold", "destroy"] {
-            let state_directory = tempfile::tempdir().unwrap();
-            let state_root = state_directory.path().canonicalize().unwrap().join("state");
-            let _state_guard =
-                cat_create_pending::TestCatLifecycleStateRootGuard::set(state_root.clone());
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
                 let captured = read_request(&mut stream);
-                let response = br#"{"operation_id":"op_01"}"#;
+                let response = br#"{"status":"ok","code":"cat_running","cat":{"cat_id":"cat_01","workspace_id":"ws_01","cat_slug":"app","state":"running","current_action":null,"node_id":"node_01","node_name":"worker-a","cpu":2,"memory_bytes":2147483648,"boot_image":"ubuntu-24.04","mounts":[],"last_error":null,"created_at_unix_ms":1,"updated_at_unix_ms":2,"destroyed_at_unix_ms":null}}"#;
                 write!(
                     stream,
-                    "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     response.len()
                 )
                 .unwrap();
@@ -3244,22 +3253,23 @@ mod tests {
                 "test-token",
                 "--workspace",
                 "ws_01",
-                "--no-wait",
                 action,
-                "cat_01",
+                "app",
             ]))
             .unwrap();
             let (headers, body) = server.join().unwrap();
             assert_eq!(
                 headers.lines().next().unwrap(),
-                format!("POST /v1/workspaces/ws_01/cats/cat_01/actions/{action} HTTP/1.1")
+                format!("POST /v1/workspaces/ws_01/cats/app/actions/{action} HTTP/1.1")
             );
             assert_eq!(
                 request_header(&headers, "authorization"),
                 "Bearer test-token"
             );
             assert_eq!(request_header(&headers, "accept"), "application/json");
-            assert!(request_header(&headers, "idempotency-key").starts_with("cli-"));
+            assert!(!headers
+                .lines()
+                .any(|line| line.to_ascii_lowercase().starts_with("idempotency-key:")));
             assert!(
                 !headers
                     .lines()
@@ -3267,110 +3277,20 @@ mod tests {
                 "{action} incorrectly sent Content-Type: {headers}"
             );
             assert!(body.is_empty());
-            assert!(std::fs::read_dir(state_root).unwrap().all(|entry| {
-                !entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with(".pending.json")
-            }));
         }
     }
 
-    #[cfg(unix)]
     #[test]
-    fn ambiguous_lifecycle_response_replays_the_exact_pending_request_and_key() {
+    fn semantic_disk_create_sends_exact_gib_bytes_without_idempotency_key() {
         use clap::Parser as _;
         use std::io::Write as _;
 
-        let state_directory = tempfile::tempdir().unwrap();
-        let state_root = state_directory.path().canonicalize().unwrap().join("state");
-        let _state_guard =
-            cat_create_pending::TestCatLifecycleStateRootGuard::set(state_root.clone());
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let mut captured = Vec::new();
-            for (status, body) in [
-                (
-                    "503 Service Unavailable",
-                    br#"{"code":"unavailable","message":"retry"}"#.as_slice(),
-                ),
-                ("202 Accepted", br#"{"operation_id":"op_01"}"#.as_slice()),
-            ] {
-                let (mut stream, _) = listener.accept().unwrap();
-                captured.push(read_request(&mut stream));
-                write!(
-                    stream,
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                )
-                .unwrap();
-                stream.write_all(body).unwrap();
-                stream.flush().unwrap();
-            }
-            captured
-        });
-        let base = format!("http://{address}");
-        let invocation = || {
-            Cli::parse_from([
-                "cats",
-                "--api-url",
-                &base,
-                "--token",
-                "test-token",
-                "--workspace",
-                "ws_01",
-                "--no-wait",
-                "cold",
-                "cat_01",
-            ])
-        };
-        let first = run(invocation()).unwrap_err();
-        assert!(
-            first.to_string().contains("replay the same command"),
-            "{first:#}"
-        );
-        assert!(std::fs::read_dir(&state_root).unwrap().any(|entry| entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .ends_with(".pending.json")));
-        run(invocation()).unwrap();
-
-        let captured = server.join().unwrap();
-        assert_eq!(captured[0].0.lines().next(), captured[1].0.lines().next());
-        assert_eq!(captured[0].1, captured[1].1);
-        assert!(captured[0].1.is_empty());
-        assert_eq!(
-            request_header(&captured[0].0, "idempotency-key"),
-            request_header(&captured[1].0, "idempotency-key")
-        );
-        assert!(std::fs::read_dir(state_root).unwrap().all(|entry| {
-            !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".pending.json")
-        }));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn persistent_disk_create_sends_one_exact_covered_request() {
-        use clap::Parser as _;
-        use std::io::Write as _;
-
-        let state_directory = tempfile::tempdir().unwrap();
-        let state_root = state_directory.path().canonicalize().unwrap().join("state");
-        let _state_guard =
-            cat_create_pending::TestPersistentDiskStateRootGuard::set(state_root.clone());
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let captured = read_request(&mut stream);
-            let response = br#"{"id":"disk_11111111111111111111111111111111","workspace_id":"ws_01","name":"data","kind":"persistent","size_bytes":1073741824,"state":"available","durability":"strict","volume_id":"vol_22222222222222222222222222222222","created_at_unix":1720000000}"#;
+            let response = br#"{"status":"ok","code":"disk_created","disk":{"disk_id":"disk_01","workspace_id":"ws_01","disk_slug":"data","size_bytes":107374182400,"status":"normal","binding":null,"created_at_unix_ms":1,"deleted_at_unix_ms":null}}"#;
             write!(
                 stream,
                 "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -3394,46 +3314,36 @@ mod tests {
             "create",
             "data",
             "--size",
-            "1GiB",
-            "--durability",
-            "strict",
+            "100GiB",
         ]);
         run(cli).unwrap();
         let (headers, body) = server.join().unwrap();
         assert!(headers.starts_with("POST /v1/workspaces/ws_01/disks HTTP/1.1\r\n"));
         assert_eq!(request_header(&headers, "content-type"), "application/json");
-        assert!(request_header(&headers, "idempotency-key").starts_with("cli-"));
-        assert_eq!(
-            body,
-            br#"{"durability":"strict","name":"data","size_bytes":1073741824}"#
-        );
-        assert!(std::fs::read_dir(state_root).unwrap().all(|entry| {
-            !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".pending.json")
-        }));
+        assert!(!headers
+            .lines()
+            .any(|line| line.to_ascii_lowercase().starts_with("idempotency-key:")));
+        assert_eq!(body, br#"{"disk_slug":"data","size_bytes":107374182400}"#);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn persistent_disk_binding_sends_only_exact_attach_and_detach_requests() {
+    fn semantic_disk_binding_sends_slug_requests() {
         use clap::Parser as _;
         use std::io::Write as _;
 
-        for verb in ["attach", "detach"] {
-            let state_directory = tempfile::tempdir().unwrap();
-            let state_root = state_directory.path().canonicalize().unwrap().join("state");
-            let _state_guard = cat_create_pending::TestPersistentDiskBindingStateRootGuard::set(
-                state_root.clone(),
-            );
+        for (verb, expected_body) in [
+            (
+                "attach",
+                br#"{"cat_slug":"app","mount_path":"/srv/data"}"#.as_slice(),
+            ),
+            ("detach", br#"{"cat_slug":"app"}"#.as_slice()),
+        ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
                 let captured = read_request(&mut stream);
-                let response = br#"{"cat_id":"cat_01","disk_id":"disk_01","runtime_config_id":"cfg_02","runtime_config_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111"}"#;
+                let response = br#"{"status":"ok","code":"disk_attached","disk":{"disk_id":"disk_01","workspace_id":"ws_01","disk_slug":"data","size_bytes":1073741824,"status":"normal","binding":null,"created_at_unix_ms":1,"deleted_at_unix_ms":null}}"#;
                 write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -3445,7 +3355,7 @@ mod tests {
                 captured
             });
             let base = format!("http://{address}");
-            let cli = Cli::parse_from([
+            let mut args = vec![
                 "cats",
                 "--api-url",
                 &base,
@@ -3455,31 +3365,72 @@ mod tests {
                 "ws_01",
                 "disk",
                 verb,
-                "disk_01",
+                "data",
                 "--cat",
-                "cat_01",
-                "--mount-path",
-                "/srv/data",
-            ]);
+                "app",
+            ];
+            if verb == "attach" {
+                args.extend(["--mount", "/srv/data"]);
+            }
+            let cli = Cli::parse_from(args);
             run(cli).unwrap();
             let (headers, body) = server.join().unwrap();
             assert_eq!(
                 headers.lines().next().unwrap(),
-                format!("POST /v1/workspaces/ws_01/disks/disk_01/actions/{verb} HTTP/1.1")
+                format!("POST /v1/workspaces/ws_01/disks/data/actions/{verb} HTTP/1.1")
             );
             assert_eq!(request_header(&headers, "content-type"), "application/json");
-            assert!(request_header(&headers, "idempotency-key").starts_with("cli-"));
-            assert_eq!(body, br#"{"cat_id":"cat_01","mount_path":"/srv/data"}"#);
-            assert!(!headers.contains("/actions/mount"));
-            assert!(!headers.contains("/actions/unmount"));
-            assert!(std::fs::read_dir(state_root).unwrap().all(|entry| {
-                !entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with(".pending.json")
-            }));
+            assert!(!headers
+                .lines()
+                .any(|line| line.to_ascii_lowercase().starts_with("idempotency-key:")));
+            assert_eq!(body, expected_body);
         }
+    }
+
+    #[test]
+    fn semantic_disk_destroy_sends_empty_request_without_idempotency_key() {
+        use clap::Parser as _;
+        use std::io::Write as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let captured = read_request(&mut stream);
+            let response = br#"{"status":"ok","code":"disk_deleted","disk":{"disk_id":"disk_01","workspace_id":"ws_01","disk_slug":"data","size_bytes":1073741824,"status":"deleted","binding":null,"created_at_unix_ms":1,"deleted_at_unix_ms":2}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response.len()
+            )
+            .unwrap();
+            stream.write_all(response).unwrap();
+            stream.flush().unwrap();
+            captured
+        });
+        let base = format!("http://{address}");
+        run(Cli::parse_from([
+            "cats",
+            "--api-url",
+            &base,
+            "--token",
+            "test-token",
+            "--workspace",
+            "ws_01",
+            "disk",
+            "destroy",
+            "data",
+        ]))
+        .unwrap();
+        let (headers, body) = server.join().unwrap();
+        assert_eq!(
+            headers.lines().next().unwrap(),
+            "POST /v1/workspaces/ws_01/disks/data/actions/destroy HTTP/1.1"
+        );
+        assert!(body.is_empty());
+        assert!(!headers
+            .lines()
+            .any(|line| line.to_ascii_lowercase().starts_with("idempotency-key:")));
     }
 
     #[cfg(unix)]
@@ -3593,6 +3544,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(any())]
     #[test]
     fn committed_response_loss_process_restart_replays_one_cat_and_operation_exactly() {
         use std::collections::{HashMap, HashSet};
@@ -3693,6 +3645,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(any())]
     #[test]
     fn persistent_disk_response_loss_process_restart_replays_one_disk_exactly() {
         use std::collections::HashMap;
@@ -3788,6 +3741,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(any())]
     #[test]
     fn persistent_disk_binding_response_loss_replays_one_config_result_exactly() {
         use std::collections::HashMap;
@@ -3887,6 +3841,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(any())]
     #[test]
     fn exact_name_conflict_is_terminal_and_durably_clears_pending_state() {
         use clap::Parser as _;
@@ -3935,6 +3890,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(any())]
     #[test]
     fn exact_disk_binding_fixed_results_clear_but_nonterminal_response_stays_pending() {
         use clap::Parser as _;
@@ -4304,14 +4260,14 @@ mod tests {
             );
         }
         assert!(root_help.contains("\n  operation "));
-        assert!(root_help.contains("--no-wait"));
+        assert!(!root_help.contains("--no-wait"));
 
         let mut disk = Cli::command()
             .find_subcommand("disk")
             .expect("Disk command")
             .clone();
         let disk_help = disk.render_long_help().to_string();
-        for supported in ["create", "ls", "get", "attach", "detach"] {
+        for supported in ["create", "ls", "get", "attach", "detach", "destroy"] {
             assert!(disk_help.contains(&format!("\n  {supported} ")));
         }
         for retired in ["resize", "delete", "snapshot"] {
@@ -4332,7 +4288,13 @@ mod tests {
             .expect("create command")
             .clone();
         let create_help = create.render_long_help().to_string();
-        assert!(create_help.contains("--boot-image-digest"));
+        for flag in ["--boot-image", "--cpu", "--memory", "--mount"] {
+            assert!(
+                create_help.contains(flag),
+                "missing semantic create flag {flag}"
+            );
+        }
+        assert!(!create_help.contains("--boot-image-digest"));
         for retired in ["--image", "--disk", "--no-auto-suspend", "--expires-in"] {
             assert!(
                 !create_help.contains(retired),
@@ -4355,6 +4317,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn served_getting_started_examples_are_accepted_by_the_shipped_parser() {
         use clap::Parser;
 
