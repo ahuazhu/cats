@@ -21,14 +21,12 @@ use postgres::{Row, Transaction};
 use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use super::gateway_identity::lock_route_v2_machine_authority_shared;
-use super::object_write::open_object_write_authority_in;
+use super::object_write_root::open_object_write_authority_in;
 use super::pg_codec::PgBigInt;
-use super::route_signing_authority::node_acks_current_published_ring_in;
 use super::rows::database_now;
-use crate::store::agent_sessions::{
-    insert_node_identity_in, load_current_session_for_update, load_identity_by_node_for_update,
-    retire_node_identity_in, rotate_public_key_identity_in,
+use crate::store::node_identities::{
+    insert_node_identity_in, load_identity_by_node_for_update, retire_node_identity_in,
+    rotate_public_key_identity_in,
 };
 use crate::store::transaction::{
     AuthorityRequestDisposition, AuthorityTransactionError, AuthorityTxResult,
@@ -622,10 +620,6 @@ fn apply_runtime_node_authority_in(
     principal: &FleetPolicyPrincipal,
     apply: &RuntimeNodeAuthorityApply,
 ) -> AuthorityTxResult<RuntimeNodeAuthorityApplyStoreOutcome> {
-    // Every policy/provision mutation enters the Route authority barrier
-    // before touching Node rows. Rotation can therefore consume one exact
-    // current schedulable set without racing an uncordon or new Node phantom.
-    lock_route_v2_machine_authority_shared(transaction)?;
     lock_runtime_node_authority_apply(transaction, apply.apply_id.as_str())?;
     if !revalidate_machine_principal(transaction, principal)? {
         return Ok(RuntimeNodeAuthorityApplyStoreOutcome::AuthenticationFailed);
@@ -944,53 +938,33 @@ fn valid_policy_update(
     {
         return Ok(false);
     }
-    if current.scheduling_state != RuntimeSchedulingState::Schedulable
-        && next.scheduling_state == RuntimeSchedulingState::Schedulable
-        && !node_acks_current_published_ring_in(
-            transaction,
-            &current.node_id,
-            &next.capabilities.guest_config_digest,
-        )?
-    {
-        return Ok(false);
-    }
     Ok(true)
 }
 
 fn rotation_or_retire_quiescent(
     transaction: &mut Transaction<'_>,
     node_id: &Id,
-    db_now: UnixMillis,
+    _db_now: UnixMillis,
 ) -> AuthorityTxResult<bool> {
-    if node_has_active_runtime_bindings_for_update(transaction, node_id)? {
-        return Ok(false);
-    }
-    Ok(load_current_session_for_update(transaction, node_id)?
-        .is_none_or(|session| session.lease_deadline_unix_ms <= db_now))
+    Ok(!node_has_active_runtime_bindings_for_update(
+        transaction,
+        node_id,
+    )?)
 }
 
-/// Lock and detect the atomic lifecycle bindings which still depend on one
-/// Node.  A successful Cold is location-independent, while every unresolved
-/// command and every other current terminal head still owns a Node-local
-/// execution, journal, snapshot, tail, or recovery boundary.
+/// Lock and detect current semantic Cats which still depend on one Node.
 fn node_has_active_runtime_bindings_for_update(
     transaction: &mut Transaction<'_>,
     node_id: &Id,
 ) -> AuthorityTxResult<bool> {
     let rows = transaction.query(
-        "SELECT o.operation_id
-           FROM runtime_operations o
-           JOIN cat_records c ON c.cat_id=o.cat_id
-          WHERE o.node_id=$1
-            AND c.deleted_at IS NULL
-            AND (
-                o.state='unresolved' OR
-                (c.lifecycle_head_operation_id=o.operation_id
-                    AND c.stable_state IS DISTINCT FROM 'cold')
-            )
-          ORDER BY o.operation_id COLLATE \"C\"
+        "SELECT cat_id
+           FROM cats
+          WHERE node_id=$1 AND destroyed_at IS NULL
+            AND (state <> 'cold' OR current_action IS NOT NULL)
+          ORDER BY cat_id COLLATE \"C\"
           LIMIT 1
-          FOR UPDATE OF o, c",
+          FOR UPDATE",
         &[&node_id.as_str()],
     )?;
     Ok(!rows.is_empty())
