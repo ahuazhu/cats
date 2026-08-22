@@ -16,18 +16,7 @@ maintenance_mode = false
 enable_public_ingress = false
 
 control_plane_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/cats-control-plane@sha256:REPLACE_WITH_64_HEX_CHARACTERS"
-gateway_image       = "123456789012.dkr.ecr.us-east-1.amazonaws.com/cats-control-plane@sha256:REPLACE_WITH_GATEWAY_64_HEX_CHARACTERS"
-object_write_gateway_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/cats-control-plane@sha256:REPLACE_WITH_OBJECT_WRITE_GATEWAY_64_HEX_CHARACTERS"
 
-# These versioned Secrets are created through the root-only credential channel
-# before planning. They must be immutable and have exactly the documented
-# closed key sets; Terraform receives only their opaque names.
-route_v2_control_artifact_secret_name = "cats-route-v2-control-r1"
-route_v2_control_artifact_signer_revision = 1
-route_v2_control_artifact_secret_sha256 = "sha256:REPLACE_WITH_CONTROL_SECRET_MANIFEST_64_LOWERHEX"
-route_v2_gateway_artifact_secret_name = "cats-route-v2-gateway-r1"
-object_write_gateway_tls_secret_name  = "cats-object-write-gateway-tls-r1"
-endpoint_wildcard_host                = "*.cats.run"
 chunkstore_bucket_name   = "REPLACE_WITH_PLATFORM_CHUNKSTORE_BUCKET_OUTPUT"
 chunkstore_prefix        = "cats-fresh"
 control_postgres_schema  = "cats_fresh"
@@ -53,19 +42,6 @@ public_subnet_ids = [
   "subnet-REPLACE_A",
   "subnet-REPLACE_B",
 ]
-private_subnet_ids = [
-  "subnet-REPLACE_PRIVATE_A",
-  "subnet-REPLACE_PRIVATE_B",
-]
-
-# Exact platform outputs. The NLB SG admits only the metal-worker SG; the
-# private DNS name is the sole serverAuth SAN and never the generated ELB name.
-object_write_gateway_nlb_security_group_id = "sg-REPLACE"
-object_write_gateway_private_zone_id       = "Z_REPLACE_PRIVATE_ZONE"
-object_write_gateway_private_dns_name      = "gateway.object-write.production.cats.internal"
-object_write_spool_file_system_id           = "fs-REPLACE"
-object_write_spool_access_point_id          = "fsap-REPLACE"
-
 # Do not put runtime_secret_data, runtime_provisioner_trust_bundle_json,
 # storage_postgres_url, usage_postgres_url, stripe_secret_key,
 # stripe_webhook_secret, or rds_ca_pem in this file. Supply them through

@@ -27,14 +27,14 @@
 | Control 核心 | `control-plane/src/semantic_lifecycle.rs` | 同步动作、语义幂等、超时查询恢复、入口先撤后发 | 已完成并合入 |
 | noded HTTP client | `control-plane/src/semantic_noded_client.rs` | Control 同步调用 noded、Bearer、deadline、严格响应校验 | 已完成并合入 |
 | PersistentDisk | `control-plane/src/semantic_disk.rs`、`node-agent/src/semantic_mounts.rs` | create/binding/destroy 语义与 Guest 完整挂载确认 | Strict provision/delete backend 和 production composition 已完成；CH/Guest 物理挂载 E2E 待完成 |
-| CLI | `cmd/cats/` | slug 命令、同步 REST、`--mount`、GiB 解析、`node_name` 展示 | 已完成单协议切换，旧 Operation/pending/replay 已删除 |
-| noded 执行 | `node-agent/`、`cmd/noded/` | 同步 HTTP server、每 Cat 串行、destroy 清理、实际 effects 接入 | FakeVmm 已完成；CH bridge 可启动并 fail-closed，物理 effects 待接入 |
+| CLI | `cmd/cats/` | slug 命令、同步 REST、`--mount`、GiB 解析、`node_name` 展示 | 已完成单协议切换；Cat/Disk `ls/get` 已改读当前 slug 实体，旧 Operation/pending/replay 已删除 |
+| noded 执行 | `node-agent/`、`cmd/noded/` | 同步 HTTP server、每 Cat 串行、destroy 清理、实际 effects 接入 | 真实 effects 已接入 Root/Persistent volume、blockd、CH、Guest 初始化/挂载及 Suspend/Warm/Cold/Destroy；Node 定向编译和新协议 HTTP 回归已通过，真实 E2E 待完成 |
 | Node 管理 | Control API、Node heartbeat client | 注册、`node_name`、`control_endpoint`、offline/reset/drain/恢复 | 已完成并接入生产进程 |
 | Production adapters | Control adapter | Store/placement/noded/入口实现与公共 DTO 映射 | 已完成；公网 Gateway 细节按设计不在本协议范围 |
-| HTTP composition | Control router、AppState、controld/noded main | 新路由和服务接线，旧路由退出 | Control/noded 已完成；CH effects 为独立剩余项 |
-| 切换清理 | schema、router、旧模块和测试 | 删除旧表、旧入口、旧 runner 和只验证旧协议的测试 | 旧 HTTP/Store/schema 和已失去 fixture 的旧 authority/部署测试已删除；旧 Route v2 部署合同待随新入口传输实现退出 |
-| 纵向联调 | FakeVmm/PostgreSQL | Disk→Cat→状态动作→跨 Node→destroy→slug 复用 | HTTP Cat 全状态机和 PostgreSQL Disk/Store 场景已完成；真实双 Node 与 CH/Guest E2E 待完成 |
-| 最终门禁 | 全仓库与 Linux | 完整门禁、Linux Node/真实 VMM 冒烟 | `quality.sh full` 与 `quality.sh linux` 已通过；真实 CH/Guest 物理 E2E 仍待完成 |
+| HTTP composition | Control router、AppState、controld/noded main | 新路由和服务接线，旧路由退出 | Control/noded 已完成；生产 Kubernetes 不再传入旧 Route 监听，也不再部署旧 Gateway |
+| 切换清理 | schema、router、旧模块和测试 | 删除旧表、旧入口、旧 runner 和只验证旧协议的测试 | 旧 HTTP/Store/schema、Node authority 模块、Route validator/launcher、worker Route artifact 与专属测试已删除；适用场景已迁入新协议测试 |
+| 纵向联调 | FakeVmm/PostgreSQL | Disk→Cat→状态动作→跨 Node→destroy→slug 复用 | 双 noded HTTP 已验证允许的短暂双跑、撤流/切流和源 reset 收敛；真实双 Node 与 CH/Guest E2E 待 production 完成 |
+| 最终门禁 | 全仓库与 Linux | 完整门禁、Linux Node/真实 VMM 冒烟 | 基线提交的 `quality.sh full` 与 `quality.sh linux` 已通过；当前 effects 变更待 production E2E 后重跑最终门禁 |
 
 ## 3. 集成顺序
 
@@ -52,7 +52,7 @@
 - [x] 将 `disk_id`、`volume_id`、filesystem UUID 和 ext4 格式贯穿 Control、noded 与 Guest 确认。
 - [x] 接入 Disk 的 Strict volume/disk authority provision/delete backend 和 BlobStore 空前缀后置条件。
 - [x] 合入 noded 同步执行服务并接入 FakeVmm。
-- [ ] 接入 Cloud Hypervisor 和持久卷的真实 `SemanticCatEffects`。
+- [ ] 接入 Cloud Hypervisor 和持久卷的真实 `SemanticCatEffects`。（代码、Node 定向编译、新协议 HTTP 与 PG authority 回归已完成；待 Linux 门禁和 production CH/Guest E2E 后关闭。）
 - [x] 合入 Node 注册、心跳、主动探测、reset 和 drain 的服务与 HTTP client。
 - [x] 合入 offline Node 的 Cat 恢复核心和精确状态结算。
 - [x] 将 liveness 标记 offline 的结果接到恢复服务。
@@ -70,7 +70,7 @@
 - [x] 接入 Control 的 `withdraw → Node Ready → publish` 顺序。
 - [x] 通过真实 Control→noded HTTP 跑通 FakeVmm Cat 全状态机及每个动作的语义重试。
 - [x] 跑通 PostgreSQL Disk authority create/delete/retry/slug 复用和 semantic Store 并发场景。
-- [ ] 跑通真实双 Node 恢复和 CH/Guest 物理挂载 E2E。
+- [ ] 跑通真实双 Node 恢复和 CH/Guest 物理挂载 E2E。（双真实 HTTP noded 已通过；metal 验收脚本已迁到新协议并覆盖 Guest mount-ready，待 production 两台 Host 执行。）
 
 ### 阶段 D：单协议切换
 
@@ -81,16 +81,16 @@
 - [x] 删除 CLI 的 Operation get/wait、Idempotency-Key pending/replay 和旧 Disk mutation client。
 - [x] 删除旧 Operation/AgentSession/Route/NodeJob/observation Store 模块和退役导出。
 - [x] 从 v19 schema 删除旧 lifecycle/route settlement 表和 catalog probes。
-- [ ] 删除旧协议专属测试；把仍适用的并发、清理和恢复场景迁到新测试。
+- [x] 删除旧协议专属测试；把仍适用的并发、清理和恢复场景迁到新测试。（旧 Node authority/Route/launcher 模块的 inline 与部署测试已删除；同 Cat 串行、reset 清理、歧义恢复和跨 Node 恢复已迁移到 semantic tests。）
 
 ### 阶段 E：最终验证
 
 - [x] PostgreSQL 并发 create、slug 复用、Disk RWO、动作 CAS。
 - [x] Control 响应丢失后查询 noded 恢复。
 - [x] offline Node 下一次心跳触发 reset，关闭 placement、清理本地 Cat 后重新注册。
-- [x] `cargo test`/Clippy 的相关定向回归全部通过。
-- [x] 运行 `./scripts/quality.sh full`。
-- [x] 运行适用的 Linux Node/Cloud Hypervisor 门禁或记录环境阻塞。
+- [x] `cargo test`/Clippy 的相关定向回归全部通过；本轮 `quality.sh fast` 已通过。
+- [ ] 运行当前切换提交的 `./scripts/quality.sh full`。（基线已通过，本轮待冻结 clean commit 后执行。）
+- [ ] 运行当前切换提交适用的 Linux Node/Cloud Hypervisor 门禁。（基线已通过，本轮待发布 Host 执行。）
 
 ## 4. 已合入提交
 
@@ -166,3 +166,11 @@
 - `./scripts/quality.sh full` 在干净提交 `c55e77fc` 上通过全部阶段：fmt、skills、release images、deny/machete、workspace build、Clippy、workspace tests 和 rustdoc。
 - Linux 首轮 gate 的 build、Clippy、rustdoc 与新 Node privileged 网络测试通过；workspace/privileged blockd 两组失败均来自已删除的 `cat_records` fixture。按单协议切换边界删除 1,378 行旧 NBD/root-provision tests 和 202 行专属 fixture，并从 Linux gate 退出该旧 inventory；未恢复旧表。
 - `./scripts/quality.sh linux` 在干净提交 `d07538ef` 上复跑通过：Linux build、Clippy、workspace tests、rustdoc 全部通过，新 Node privileged 网络测试 2/2 通过；真实双 Node 与 CH/Guest 持久卷物理 E2E 不在该门禁中，仍作为显式剩余项。
+- 当前工作树已将 `--vmm ch` 从 fail-closed placeholder 替换为真实 RootDisk provision、PersistentDisk authority attach/初始化、blockd、Cloud Hypervisor、Guest mount-ready、Suspend/Warm/Cold/Destroy 和 Node reset effects；每 Cat 物理 lane 独立并行，停止前先完成所有 strict drain，任一 drain 不明确时保持进程和 attachment 供重试。
+- 新增 PostgreSQL volume join 回归：Root create/attach/detach/delete 重试、offline 跨 Node attach 推进写 epoch 并使旧 detach 无效、PersistentDisk 初始化只接受相同 Guest evidence；3/3 通过。Node reset 完成后在旧 Cat 恢复走之前保持 `reset_required` 的 Store 回归也已通过。
+- 本轮 `quality.sh fast` 首次发现 direct-acquire helper 的 Clippy 参数边界，已改为单一输入结构；受影响 crate 的 all-target Clippy 已通过。当前提交的 `quality.sh full`/Linux gate 尚未运行，不能沿用基线结果作为本轮交付证据。
+- 双 noded HTTP 恢复回归发现目标 Node 上 absent Cat 的 `run` 曾错误返回 `cat_not_found`；现已按完整配置从物理 Cold 建立目标实例，并验证 `withdraw source → target Running → publish target → source reset`，允许窗口内双跑而最终只保留目标实例。
+- 新协议补齐 Cat/Disk `ls/get`：CLI 和 Control 不再读取退役的 `runtime_product_reads` 分页投影，slug 查询只返回当前未 destroy/delete 的实体。metal E2E 已覆盖 create/action/Disk binding 重试、Guest mount-ready、进程状态、读接口和 Cat/Disk slug 复用。
+- `./scripts/quality.sh fast` 已在 dirty fingerprint `1c6a292a2672d7b2f66064951e6be623e236041f` 上通过 fmt、共享 skill/release image 检查和全 workspace Clippy。生产 AWS 探针已校准为“本机 AWS session 过期”，不是生产资源为空；发布前需刷新既有 AWS 登录。
+- 已删除退役 Node lifecycle command、runtime inventory、AgentSession/Route、launcher 等 authority 实现及其专属测试；保留的同 Cat 并发、reset 清理和双 Node 恢复均已迁移到新 semantic HTTP 测试。`cargo check -p cats-node-agent -p cats-node-agent-daemon --all-targets`、Node deployment contracts 20/20、双 Node semantic HTTP 2/2 和 `cargo machete --with-metadata` 通过。
+- 生产 worker bundle 不再构建、安装或校验旧 Route validator/launcher；Kubernetes application 不再向 controld 传入旧 Route 监听，也不再部署旧 Route Gateway、ObjectWrite Gateway、rotation Service、旧 PVC/NLB/DNS 或 Endpoint wildcard ingress，Control 镜像也不再携带旧 gateway binary。相关 Terraform module/production application 测试共 8/8、Control deployment contracts 61/61 通过；当前生产公网只把 Control host 路由到新同步 API。

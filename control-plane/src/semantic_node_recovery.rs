@@ -281,6 +281,7 @@ where
             claim,
             NodeCommand {
                 cat_id: claim.cat.cat_id.clone(),
+                workspace_id: claim.cat.workspace_id.clone(),
                 action: CatAction::Run,
                 config: Some(claim.cat.config.clone()),
             },
@@ -295,6 +296,7 @@ where
                     claim,
                     NodeCommand {
                         cat_id: claim.cat.cat_id.clone(),
+                        workspace_id: claim.cat.workspace_id.clone(),
                         action: CatAction::Suspend,
                         config: None,
                     },
@@ -307,6 +309,7 @@ where
                     claim,
                     NodeCommand {
                         cat_id: claim.cat.cat_id.clone(),
+                        workspace_id: claim.cat.workspace_id.clone(),
                         action: CatAction::Warm,
                         config: None,
                     },

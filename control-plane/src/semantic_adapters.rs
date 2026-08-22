@@ -770,7 +770,7 @@ impl NodedClient for SemanticNodedLifecycleAdapter {
                     let config = command.config.as_ref().ok_or_else(|| {
                         NodeClientError::Protocol("Create has no config".to_owned())
                     })?;
-                    let request = core_config_to_wire(config)?;
+                    let request = core_config_to_wire(&command.workspace_id, config)?;
                     self.client
                         .create_cat(&endpoint, &cat_id, &request, deadline)
                         .await
@@ -779,9 +779,12 @@ impl NodedClient for SemanticNodedLifecycleAdapter {
                 action => {
                     let request = NodedCatActionRequest {
                         config: if action == CatAction::Run {
-                            Some(core_config_to_wire(command.config.as_ref().ok_or_else(
-                                || NodeClientError::Protocol("Run has no config".to_owned()),
-                            )?)?)
+                            Some(core_config_to_wire(
+                                &command.workspace_id,
+                                command.config.as_ref().ok_or_else(|| {
+                                    NodeClientError::Protocol("Run has no config".to_owned())
+                                })?,
+                            )?)
                         } else {
                             None
                         },
@@ -907,7 +910,10 @@ fn wire_id(value: &str, label: &str) -> Result<Id, NodeClientError> {
         .ok_or_else(|| NodeClientError::Protocol(format!("stored {label} identity is invalid")))
 }
 
-fn core_config_to_wire(config: &CatCreateConfig) -> Result<NodedCatConfig, NodeClientError> {
+fn core_config_to_wire(
+    workspace_id: &str,
+    config: &CatCreateConfig,
+) -> Result<NodedCatConfig, NodeClientError> {
     let mounts = config
         .mounts
         .iter()
@@ -933,6 +939,7 @@ fn core_config_to_wire(config: &CatCreateConfig) -> Result<NodedCatConfig, NodeC
         })
         .collect::<Result<Vec<_>, NodeClientError>>()?;
     Ok(NodedCatConfig {
+        workspace_id: wire_id(workspace_id, "Workspace")?,
         cpu: config.cpu_count,
         memory_bytes: config.memory_bytes,
         boot_image: config.boot_image.clone(),

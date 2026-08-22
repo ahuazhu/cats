@@ -159,6 +159,7 @@ pub struct SemanticNodeSupervisor {
     registration: NodeRegistrationRequest,
     heartbeat_interval: Duration,
     retry_interval: Duration,
+    reset_completed_waiting: AtomicBool,
 }
 
 impl SemanticNodeSupervisor {
@@ -180,6 +181,7 @@ impl SemanticNodeSupervisor {
             registration,
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             retry_interval: DEFAULT_HEARTBEAT_RETRY_INTERVAL,
+            reset_completed_waiting: AtomicBool::new(false),
         })
     }
 
@@ -195,12 +197,7 @@ impl SemanticNodeSupervisor {
     }
 
     pub async fn register_until_ready(&self) -> anyhow::Result<()> {
-        let response = self
-            .transport
-            .register(self.registration.clone())
-            .await
-            .context("register Node")?;
-        self.apply_registration(response).await
+        self.reset_and_reregister().await
     }
 
     pub async fn heartbeat_once(&self, heartbeat: NodeHeartbeatRequest) -> anyhow::Result<()> {
@@ -251,30 +248,14 @@ impl SemanticNodeSupervisor {
         }
     }
 
-    async fn apply_registration(&self, response: NodeRegistrationResponse) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            response.node.node_id == self.registration.node_id,
-            "registration response returned another node_id"
-        );
-        match response.status {
-            NodeRegistrationStatus::Registered | NodeRegistrationStatus::AlreadyRegistered => {
-                anyhow::ensure!(
-                    response.node.status == NodeStatus::Running,
-                    "successful registration returned non-running Node"
-                );
-                self.placement_gate.open();
-                Ok(())
-            }
-            NodeRegistrationStatus::ResetRequired => self.reset_and_reregister().await,
-        }
-    }
-
     async fn reset_and_reregister(&self) -> anyhow::Result<()> {
         self.placement_gate.close();
-        self.reset
-            .reset_all_cats()
-            .await
-            .context("reset all local Cats")?;
+        if !self.reset_completed_waiting.swap(true, Ordering::AcqRel) {
+            if let Err(error) = self.reset.reset_all_cats().await {
+                self.reset_completed_waiting.store(false, Ordering::Release);
+                return Err(error).context("reset all local Cats");
+            }
+        }
         let mut completed = self.registration.clone();
         completed.reset_completed = true;
         let response = self
@@ -283,14 +264,26 @@ impl SemanticNodeSupervisor {
             .await
             .context("report completed Node reset")?;
         anyhow::ensure!(
-            matches!(
-                response.status,
-                NodeRegistrationStatus::Registered | NodeRegistrationStatus::AlreadyRegistered
-            ) && response.node.status == NodeStatus::Running,
-            "Control did not accept completed Node reset"
+            response.node.node_id == self.registration.node_id,
+            "completed reset response returned another node_id"
         );
-        self.placement_gate.open();
-        Ok(())
+        match response.status {
+            NodeRegistrationStatus::Registered | NodeRegistrationStatus::AlreadyRegistered
+                if response.node.status == NodeStatus::Running =>
+            {
+                self.reset_completed_waiting.store(false, Ordering::Release);
+                self.placement_gate.open();
+                Ok(())
+            }
+            NodeRegistrationStatus::ResetRequired
+                if response.node.status == NodeStatus::ResetRequired =>
+            {
+                anyhow::bail!(
+                    "Control is still recovering Cats from this reset Node; placement remains closed"
+                )
+            }
+            _ => anyhow::bail!("Control returned an invalid completed-reset response"),
+        }
     }
 }
 
@@ -454,7 +447,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_registration_opens_placement_without_reset() {
+    async fn startup_resets_local_state_before_opening_placement() {
         let transport = Arc::new(MockTransport {
             registrations: Mutex::new(VecDeque::from([response(
                 NodeRegistrationStatus::Registered,
@@ -477,6 +470,6 @@ mod tests {
         supervisor.register_until_ready().await.expect("register");
 
         assert!(gate.is_open());
-        assert_eq!(*reset.calls.lock().expect("reset calls"), 0);
+        assert_eq!(*reset.calls.lock().expect("reset calls"), 1);
     }
 }

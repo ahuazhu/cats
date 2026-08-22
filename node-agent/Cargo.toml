@@ -29,24 +29,12 @@ reqwest = { workspace = true, features = ["blocking"] }
 uuid = { workspace = true }
 libc = { workspace = true }
 tracing = { workspace = true }
-base64 = { workspace = true }
-bytes = { workspace = true }
-hyper = { workspace = true }
-hyper-util = { workspace = true }
-http-body-util = { workspace = true }
-rustls = { workspace = true }
-tokio-rustls = { workspace = true }
-# The Node mints its own attachment-scoped object-write Ed25519 keypairs. `ring`
-# is already the workspace's only Ed25519 implementation (it backs
-# `cats_api::agent_registration::Ed25519RequestSigner`), so generating the key
-# with anything else would introduce a second signature stack for one keypair.
-ring = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 cats-test-support = { workspace = true }
 cats-control-plane = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
-hex = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 cats-blockd = { workspace = true, features = ["test-vhost-user-frontend"] }

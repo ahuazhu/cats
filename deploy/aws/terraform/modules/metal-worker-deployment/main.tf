@@ -1,10 +1,8 @@
 data "aws_partition" "current" {}
 
 locals {
-  resource_name                = "${var.name_prefix}-${var.environment}-worker"
-  artifact_key                 = "worker/${var.worker_bundle_sha256}/cats-worker.tar.zst"
-  route_v2_install_root        = "/etc/cats/route-v2"
-  object_write_gateway_ca_file = "${local.route_v2_install_root}/node-server-ca-bundle.pem"
+  resource_name = "${var.name_prefix}-${var.environment}-worker"
+  artifact_key  = "worker/${var.worker_bundle_sha256}/cats-worker.tar.zst"
   tags = merge(var.tags, {
     Component   = "metal-worker-deployment"
     Environment = var.environment
@@ -23,9 +21,6 @@ locals {
     [
       "CATS_CHUNKSTORE_PREFIX=${var.chunkstore_prefix}",
       "CATS_POSTGRES_SCHEMA=${var.control_postgres_schema}",
-      "CATS_ROUTE_V2_ROTATION_ORIGIN=${var.route_v2_rotation_origin}",
-      "CATS_OBJECT_WRITE_GATEWAY_URL=${var.object_write_gateway_url}",
-      "CATS_OBJECT_WRITE_GATEWAY_CA_FILE=${local.object_write_gateway_ca_file}",
     ],
   ))
 
@@ -43,9 +38,6 @@ locals {
     [
       "CATS_CHUNKSTORE_PREFIX=${var.chunkstore_prefix}",
       "CATS_POSTGRES_SCHEMA=${var.control_postgres_schema}",
-      "CATS_ROUTE_V2_ROTATION_ORIGIN=${var.route_v2_rotation_origin}",
-      "CATS_OBJECT_WRITE_GATEWAY_URL=${var.object_write_gateway_url}",
-      "CATS_OBJECT_WRITE_GATEWAY_CA_FILE=${local.object_write_gateway_ca_file}",
     ],
     var.database_master_user_secret_arn == null ? [] : [
       "CATS_POSTGRES_SECRET_ARN=${var.database_master_user_secret_arn}",
@@ -101,8 +93,6 @@ locals {
     runtime_overlay=""
     environment_temp=""
     seed_temp=""
-    route_v2_secret=""
-    route_v2_stage=""
     archive_entries=""
     release_transaction_active=0
     release_installer=""
@@ -116,14 +106,11 @@ locals {
       fi
       rm -rf -- "$stage_path"
       rm -f -- "$artifact_path"
-      for temporary_path in "$runtime_secret" "$runtime_overlay" "$environment_temp" "$seed_temp" "$route_v2_secret" "$archive_entries"; do
+      for temporary_path in "$runtime_secret" "$runtime_overlay" "$environment_temp" "$seed_temp" "$archive_entries"; do
         if [ -n "$temporary_path" ]; then
           rm -f -- "$temporary_path"
         fi
       done
-      if [ -n "$route_v2_stage" ]; then
-        rm -rf -- "$route_v2_stage"
-      fi
       exit "$status"
     }
     trap cleanup EXIT
@@ -141,7 +128,6 @@ locals {
     tar --zstd -tvf "$artifact_path" | awk 'substr($1,1,1) !~ /^[-d]$/ { exit 1 }'
     tar --zstd -xf "$artifact_path" -C "$stage_path"
     . "$stage_path/worker-deployment-transaction.sh"
-    . "$stage_path/install-route-v2-node-r1.sh"
     "$stage_path/install-guest-runtime-release.sh" verify \
       "$stage_path/guest-runtime-release.v1"
     # The validator is itself part of the digest-checked, preflighted bundle.
@@ -149,50 +135,6 @@ locals {
     # Identity validation still precedes the idle check, service stop, or any
     # installed-file mutation.
     "$stage_path/validate-node-identity-installation.sh"
-
-    # Fetch the closed Node Route v2 artifact set before the first Cats
-    # installed-file mutation. Terraform and the SSM command carry only the
-    # opaque secret ARN; private bytes remain in root-only files and pipes,
-    # never argv, env or logs. The explicit IAM statement below grants this
-    # revision-1 secret and no other Route v2 secret.
-    route_v2_secret="$(mktemp /run/cats-route-v2-secret.XXXXXX)"
-    route_v2_stage="$(mktemp -d /run/cats-route-v2-stage.XXXXXX)"
-    chmod 0600 "$route_v2_secret"
-    chmod 0700 "$route_v2_stage"
-    aws secretsmanager get-secret-value \
-      --secret-id "${var.route_v2_node_artifact_secret_arn}" \
-      --version-id "${var.route_v2_node_artifact_secret_version_id}" \
-      --query SecretString \
-      --output text > "$route_v2_secret"
-    jq -e '
-      type == "object" and
-      keys == [
-        "gateway_client_ca_bundle_pem_b64",
-        "node_machine_server_certificate_pem_b64",
-        "node_machine_server_private_key_pem_b64",
-        "node_server_ca_bundle_pem_b64",
-        "public_key_ring_v1_json_b64",
-        "rotation_operator_trust_v1_json_b64"
-      ] and
-      all(.[]; type == "string" and length > 0)
-    ' "$route_v2_secret" >/dev/null
-
-    decode_route_v2_artifact() {
-      field=$1
-      destination=$2
-      mode=$3
-      jq -er --arg field "$field" '.[$field]' "$route_v2_secret" \
-        | base64 --decode > "$destination"
-      test -s "$destination"
-      chmod "$mode" "$destination"
-    }
-    decode_route_v2_artifact public_key_ring_v1_json_b64 "$route_v2_stage/public-key-ring.v1.json" 0644
-    decode_route_v2_artifact rotation_operator_trust_v1_json_b64 "$route_v2_stage/rotation-operator-trust.v1.json" 0644
-    decode_route_v2_artifact gateway_client_ca_bundle_pem_b64 "$route_v2_stage/gateway-client-ca-bundle.pem" 0644
-    decode_route_v2_artifact node_machine_server_certificate_pem_b64 "$route_v2_stage/node-machine-server-certificate.pem" 0644
-    decode_route_v2_artifact node_machine_server_private_key_pem_b64 "$route_v2_stage/node-machine-server-private-key.pem" 0600
-    decode_route_v2_artifact node_server_ca_bundle_pem_b64 "$route_v2_stage/node-server-ca-bundle.pem" 0644
-    "$stage_path/cats-route-v2-node-r1-validator" --directory "$route_v2_stage"
 
     # One Host-global open-file-description lock spans the entire mutation,
     # candidate start/readiness proof, and commit/rollback boundary.
@@ -205,16 +147,7 @@ locals {
     release_installer="${var.install_root}/bin/install-guest-runtime-release"
     cats_acquire_worker_deployment_lock
 
-    # Recheck the immutable initial state under the Host-global lock before the
-    # first systemd query. Concurrent installers can only converge on exact
-    # replay; conflicting bytes fail without a service mutation.
-    route_v2_install_state="$(cats_classify_route_v2_node_r1 \
-      "$stage_path/cats-route-v2-node-r1-validator" \
-      "$route_v2_stage" "${local.route_v2_install_root}")"
-    case "$route_v2_install_state" in absent|exact) ;; *) exit 1 ;; esac
-
-    # Only after that classification may the installer query systemd. Before
-    # publishing an activation journal, close both ways the cached old
+    # Before publishing an activation journal, close both ways the cached old
     # unit could start: a runtime mask covers this boot, while the fsynced new
     # unit/recovery helper covers a reboot. Only then may prepare expose a
     # candidate release identity. Prove physical idle immediately before the
@@ -225,12 +158,6 @@ locals {
     cats_gate_node_service cats-worker
     cats_worker_deployment_crash_probe after-mask-worker
 
-    if [ "$route_v2_install_state" = absent ]; then
-      cats_publish_route_v2_node_r1 \
-        "$stage_path/cats-route-v2-node-r1-validator" \
-        "$route_v2_stage" "${local.route_v2_install_root}"
-      cats_worker_deployment_crash_probe after-install-route-v2-artifacts
-    fi
     install -D -m 0755 "$stage_path/install-guest-runtime-release.sh" "$release_installer"
     cats_worker_deployment_crash_probe after-install-release-installer
     install -D -m 0755 "$stage_path/worker-deployment-transaction.sh" "${var.install_root}/bin/worker-deployment-transaction"
@@ -265,10 +192,6 @@ locals {
     cats_worker_deployment_crash_probe after-install-cats-cli
     install -D -m 0755 "$stage_path/cats-noded" "${var.install_root}/bin/cats-noded"
     cats_worker_deployment_crash_probe after-install-cats-noded
-    install -D -m 0755 "$stage_path/cats-route-v2-node-r1-validator" "${var.install_root}/bin/cats-route-v2-node-r1-validator"
-    cats_worker_deployment_crash_probe after-install-cats-route-v2-node-r1-validator
-    install -D -m 0755 "$stage_path/cats-vmm-launcher" "${var.install_root}/bin/cats-vmm-launcher"
-    cats_worker_deployment_crash_probe after-install-cats-vmm-launcher
     install -D -m 0755 "$stage_path/cats-usage-schema-v16-verifier" "${var.install_root}/bin/cats-usage-schema-v16-verifier"
     cats_worker_deployment_crash_probe after-install-cats-usage-schema-v16-verifier
     install -D -m 0755 "$stage_path/cats-usage-terminal-receipt-verifier" "${var.install_root}/bin/cats-usage-terminal-receipt-verifier"
@@ -402,8 +325,6 @@ if re.fullmatch(r"sha256:[0-9a-f]{64}", bundle_digest) is None:
 member_names = (
     "cats",
     "cats-noded",
-    "cats-route-v2-node-r1-validator",
-    "cats-vmm-launcher",
     "cats-usage-schema-v16-verifier",
     "cats-usage-terminal-receipt-verifier",
     "cats-blockd",
@@ -481,17 +402,47 @@ PY
       --query SecretString \
       --output text > "$runtime_secret"
     chmod 0600 "$runtime_secret"
-    # CATS_POSTGRES_URL is tolerated but no longer required or read: the DSN now
-    # comes from render-postgres-url, which reads the managed secret directly.
-    # A host still carrying the old key in worker.env is harmless once
-    # cats-worker passes url-file.
     jq -er '
-      if (keys - ["CATS_POSTGRES_URL"]) != [] then
+      if (keys - ["CATS_AUTH_TOKEN", "CATS_POSTGRES_URL"]) != [] or
+         (.CATS_AUTH_TOKEN | type != "string" or length < 16) then
         error("unexpected worker runtime secret keys")
       else
         [to_entries[] | "\(.key)=\(.value)"] | join("\n")
       end
     ' "$runtime_secret" > "$runtime_overlay"
+
+    # Registration is explicit in the direct protocol. Cross-check the
+    # provisioned identity against IMDS before publishing any per-Host values
+    # into the root-only environment file.
+    imds_token="$(curl -fsS -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
+      http://169.254.169.254/latest/api/token)"
+    identity_document="$(curl -fsS -H "X-aws-ec2-metadata-token: $imds_token" \
+      http://169.254.169.254/latest/dynamic/instance-identity/document)"
+    node_id="$(jq -er '.node_id' /etc/cats/identity/node-identity.v1.json)"
+    identity_instance="$(jq -er '.immutable_host_id' /etc/cats/identity/node-identity.v1.json)"
+    identity_vendor="$(jq -er '.provider_scope.provider' /etc/cats/identity/node-identity.v1.json)"
+    identity_region="$(jq -er '.provider_scope.region' /etc/cats/identity/node-identity.v1.json)"
+    instance_id="$(printf '%s' "$identity_document" | jq -er '.instanceId')"
+    node_region="$(printf '%s' "$identity_document" | jq -er '.region')"
+    node_zone="$(printf '%s' "$identity_document" | jq -er '.availabilityZone')"
+    machine_type="$(printf '%s' "$identity_document" | jq -er '.instanceType')"
+    private_ip="$(printf '%s' "$identity_document" | jq -er '.privateIp')"
+    [ "$identity_vendor" = aws ]
+    [ "$identity_instance" = "$instance_id" ]
+    [ "$identity_region" = "$node_region" ]
+    node_cpu="$(nproc)"
+    node_memory="$(awk '/^MemTotal:/ { printf "%.0f\\n", $2 * 1024; found=1 } END { if (!found) exit 1 }' /proc/meminfo)"
+    printf '%s\n' \
+      "CATS_NODE_ID=$node_id" \
+      "CATS_NODE_NAME=__CATS_WORKER_NAME__" \
+      "CATS_NODE_VENDOR=$identity_vendor" \
+      "CATS_NODE_REGION=$node_region" \
+      "CATS_NODE_ZONE=$node_zone" \
+      "CATS_NODE_INSTANCE_ID=$instance_id" \
+      "CATS_NODE_MACHINE_TYPE=$machine_type" \
+      "CATS_NODE_CONTROL_ENDPOINT=http://$private_ip:7301" \
+      "CATS_NODE_TOTAL_CPU=$node_cpu" \
+      "CATS_NODE_TOTAL_MEMORY=$node_memory" >> "$runtime_overlay"
 
     # Terraform-owned non-secret keys are merged the same way, so they reach a
     # host that already has a worker.env instead of only seeding a new one.
@@ -530,10 +481,11 @@ CATS_BASE_ENVIRONMENT
       {
         key = $0
         sub(/=.*/, "", key)
-        if (key == "CATS_AUTH_TOKEN" || key == "CATS_ROUTE_V2_MACHINE_LISTEN") {
-          # Signed Agent registration is the only production Node credential.
-          # A rolling cutover must remove a bearer or listener override left
-          # by an older release; the production unit passes literal 7444.
+        if (key == "CATS_ROUTE_V2_MACHINE_LISTEN" ||
+            key == "CATS_ROUTE_V2_ROTATION_ORIGIN" ||
+            key == "CATS_OBJECT_WRITE_GATEWAY_URL" ||
+            key == "CATS_OBJECT_WRITE_GATEWAY_CA_FILE") {
+          # Remove configuration retained by the retired Route/ObjectWrite path.
           next
         } else if (key in replacement) {
           print replacement[key]
@@ -587,8 +539,11 @@ CATS_BASE_ENVIRONMENT
     cats_commit_candidate "$release_installer"
     release_transaction_active=0
     cats_worker_deployment_crash_probe after-release-commit
-    echo "Route v2 Node artifact set installed from the scoped secret reference"
-    "${var.install_root}/bin/cats-noded" --help | grep -q -- "--runtime-cgroup-root"
+    echo "Semantic Control/Node worker installed from the scoped release bundle"
+    "${var.install_root}/bin/cats-noded" --help | grep -q -- "--control-endpoint"
+    "${var.install_root}/bin/cats-noded" --help | grep -q -- "--host-lock"
+    "${var.install_root}/bin/cats-noded" --help | grep -q -- "--blockd-socket-root"
+    ! "${var.install_root}/bin/cats-noded" --help | grep -q -- "--runtime-cgroup-root"
     ! "${var.install_root}/bin/cats-noded" --help | grep -q -- "--guest-agent-bin"
     ! "${var.install_root}/bin/cats-noded" --help | grep -q -- "--metering-cgroup-root"
     # Secret version ${aws_secretsmanager_secret_version.worker_runtime.version_id}
@@ -692,7 +647,7 @@ resource "aws_s3_object" "worker_bundle" {
 
 resource "aws_secretsmanager_secret" "worker_runtime" {
   name                    = "${local.resource_name}-runtime"
-  description             = "Root-only transitional worker compatibility values; signed workers receive no shared Control bearer."
+  description             = "Root-only direct Control/Node service token and optional PostgreSQL compatibility value."
   recovery_window_in_days = 30
 
   tags = local.tags
@@ -743,12 +698,6 @@ data "aws_iam_policy_document" "artifact_reader" {
     resources = [aws_secretsmanager_secret.worker_runtime.arn]
   }
 
-  statement {
-    sid       = "ReadRouteV2NodeArtifactSecret"
-    actions   = ["secretsmanager:GetSecretValue"]
-    resources = [var.route_v2_node_artifact_secret_arn]
-  }
-
   # render-postgres-url reads the database password from the one place that
   # holds the current one. Scoped to that secret; the worker gets no broader
   # Secrets Manager access.
@@ -793,7 +742,7 @@ resource "aws_ssm_association" "worker_deploy" {
   parameters = {
     # The script is shared across the fleet except for the one line where a
     # fresh host learns who it is.
-    commands = local.deployment_script
+    commands = replace(local.deployment_script, "__CATS_WORKER_NAME__", each.key)
   }
 
   targets {

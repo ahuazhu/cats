@@ -8,7 +8,7 @@ variable "environment" {
 }
 
 variable "expected_account_id" {
-  description = "Exact AWS account containing the worker and its Route v2 artifact secret."
+  description = "Exact AWS account containing the worker."
   type        = string
   nullable    = false
 
@@ -19,7 +19,7 @@ variable "expected_account_id" {
 }
 
 variable "expected_aws_partition" {
-  description = "Exact AWS partition containing the worker and its Route v2 artifact secret."
+  description = "Exact AWS partition containing the worker."
   type        = string
   nullable    = false
 
@@ -38,7 +38,7 @@ variable "expected_aws_partition" {
 }
 
 variable "aws_region" {
-  description = "Exact AWS region containing the worker and its Route v2 artifact secret."
+  description = "Exact AWS region containing the worker."
   type        = string
   nullable    = false
 
@@ -77,32 +77,6 @@ variable "control_postgres_schema" {
   validation {
     condition     = can(regex("^cats_[a-z0-9_]+$", var.control_postgres_schema)) && length(var.control_postgres_schema) <= 63
     error_message = "control_postgres_schema must be one lowercase cats_* PostgreSQL identifier no longer than 63 bytes."
-  }
-}
-
-variable "object_write_gateway_url" {
-  description = "Exact HTTPS origin of the ObjectWrite Gateway. Production IAM denies blockd every direct ChunkStore mutation, so this is the only path a Node may publish through."
-  type        = string
-
-  validation {
-    condition = (
-      can(regex("^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[1-9][0-9]{0,4})?$", var.object_write_gateway_url)) &&
-      !strcontains(var.object_write_gateway_url, "..")
-    )
-    error_message = "object_write_gateway_url must be one canonical HTTPS DNS origin."
-  }
-}
-
-variable "route_v2_rotation_origin" {
-  description = "Exact independent server-authenticated HTTPS origin for Route v2 ring delivery while Control readiness is closed."
-  type        = string
-
-  validation {
-    condition = (
-      can(regex("^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?:[1-9][0-9]{0,4}$", var.route_v2_rotation_origin)) &&
-      !strcontains(var.route_v2_rotation_origin, "..")
-    )
-    error_message = "route_v2_rotation_origin must be one canonical HTTPS DNS origin with an explicit port."
   }
 }
 
@@ -183,53 +157,23 @@ variable "instance_role_name" {
 }
 
 variable "worker_runtime_secret_data" {
-  description = "Optional compatibility values overlaid onto worker.env. Signed workers receive no shared Control bearer."
+  description = "Root-only worker secrets overlaid onto worker.env. The direct Control/Node protocol requires CATS_AUTH_TOKEN."
   type        = map(string)
   sensitive   = true
 
-  # CATS_POSTGRES_URL is accepted but no longer required, and nothing reads it
-  # once the worker passes url-file: the DSN is rendered from the managed
-  # secret at every start. Drop it from this map when the fleet has cut over.
   validation {
     condition = (
       length(setsubtract(
         toset(keys(var.worker_runtime_secret_data)),
-        toset(["CATS_POSTGRES_URL"])
-      )) == 0 &&
+        toset(["CATS_AUTH_TOKEN", "CATS_POSTGRES_URL"])
+      )) == 0 && contains(keys(var.worker_runtime_secret_data), "CATS_AUTH_TOKEN") &&
       alltrue([
         for value in values(var.worker_runtime_secret_data) :
         length(trimspace(value)) > 0 &&
         !strcontains(value, "\n") && !strcontains(value, "\r")
       ])
     )
-    error_message = "worker_runtime_secret_data may contain only a non-empty single-line legacy CATS_POSTGRES_URL; signed workers must not receive CATS_AUTH_TOKEN."
-  }
-}
-
-variable "route_v2_node_artifact_secret_arn" {
-  description = "ARN of the pre-created Secrets Manager value containing the exact five base64-encoded Node Route v2 artifacts. Terraform receives only the ARN."
-  type        = string
-
-  validation {
-    condition = (
-      startswith(
-        var.route_v2_node_artifact_secret_arn,
-        "arn:${var.expected_aws_partition}:secretsmanager:${var.aws_region}:${var.expected_account_id}:secret:${var.name_prefix}-${var.environment}-route-v2-node-r1-",
-      ) &&
-      length(var.route_v2_node_artifact_secret_arn) == length("arn:${var.expected_aws_partition}:secretsmanager:${var.aws_region}:${var.expected_account_id}:secret:${var.name_prefix}-${var.environment}-route-v2-node-r1-") + 6 &&
-      can(regex("[A-Za-z0-9]{6}$", var.route_v2_node_artifact_secret_arn))
-    )
-    error_message = "route_v2_node_artifact_secret_arn must identify the exact <name-prefix>-<environment>-route-v2-node-r1 secret in the expected partition, account, and region; rotation is outside the initial G2 contract."
-  }
-}
-
-variable "route_v2_node_artifact_secret_version_id" {
-  description = "Exact immutable Secrets Manager version ID selected for the revision-1 Node Route v2 artifact secret."
-  type        = string
-
-  validation {
-    condition     = can(regex("^[A-Za-z0-9-]{32,64}$", var.route_v2_node_artifact_secret_version_id))
-    error_message = "route_v2_node_artifact_secret_version_id must be a 32-64 character Secrets Manager version ID."
+    error_message = "worker_runtime_secret_data must contain a non-empty single-line CATS_AUTH_TOKEN and may additionally contain only legacy CATS_POSTGRES_URL."
   }
 }
 
@@ -285,10 +229,9 @@ variable "worker_managed_environment" {
         "CATS_POSTGRES_SCHEMA",
         "CATS_NODE_ID",
         "CATS_NODE_ADVERTISE_URL",
-        "CATS_ROUTE_V2_MACHINE_LISTEN",
       ]),
     )) == 0
-    error_message = "CATS_AUTH_TOKEN is forbidden on signed workers; CATS_CHUNKSTORE_PREFIX and CATS_POSTGRES_SCHEMA come only from their reviewed exact inputs; CATS_POSTGRES_SECRET_ARN goes through database_master_user_secret_arn so the matching IAM statement is emitted with it; node identity is per worker; the Route v2 listener is fixed by the production unit."
+    error_message = "CATS_AUTH_TOKEN belongs only in worker_runtime_secret_data; CATS_CHUNKSTORE_PREFIX and CATS_POSTGRES_SCHEMA come only from their reviewed exact inputs; CATS_POSTGRES_SECRET_ARN goes through database_master_user_secret_arn so the matching IAM statement is emitted with it; node identity is deployment-derived per worker."
   }
 
   validation {
@@ -330,8 +273,8 @@ variable "tags" {
 variable "worker_base_environment" {
   description = <<-EOT
     Non-secret, fleet-shared worker.env entries used only when the host has no
-    worker.env yet -- control plane and gateway URLs, region, ChunkStore
-    bucket, guest network CIDR. An existing file is never rewritten, so
+    worker.env yet -- Control URL, region, ChunkStore bucket and Guest network
+    CIDR. An existing file is never rewritten, so
     operator edits survive. Secrets belong in worker_runtime_secret_data; Node
     identity is a provisioner-owned artifact and must not be set here.
   EOT
@@ -343,7 +286,7 @@ variable "worker_base_environment" {
       toset(keys(var.worker_base_environment)),
       toset(["CATS_AUTH_TOKEN", "CATS_CHUNKSTORE_PREFIX", "CATS_POSTGRES_SCHEMA", "CATS_POSTGRES_URL"]),
     )) == 0
-    error_message = "CATS_AUTH_TOKEN is forbidden on signed workers; CATS_CHUNKSTORE_PREFIX and CATS_POSTGRES_SCHEMA come only from their reviewed exact inputs; the retired CATS_POSTGRES_URL compatibility value may only use worker_runtime_secret_data."
+    error_message = "CATS_AUTH_TOKEN belongs only in worker_runtime_secret_data; CATS_CHUNKSTORE_PREFIX and CATS_POSTGRES_SCHEMA come only from their reviewed exact inputs; the retired CATS_POSTGRES_URL compatibility value may only use worker_runtime_secret_data."
   }
 
   # Everything in this map reaches every fresh host identically, and a second
@@ -351,8 +294,8 @@ variable "worker_base_environment" {
   validation {
     condition = length(setintersection(
       toset(keys(var.worker_base_environment)),
-      toset(["CATS_NODE_ID", "CATS_NODE_ADVERTISE_URL", "CATS_ROUTE_V2_MACHINE_LISTEN"]),
+      toset(["CATS_NODE_ID", "CATS_NODE_ADVERTISE_URL"]),
     )) == 0
-    error_message = "Node identity is provisioner-owned artifact data and the Route v2 listener is fixed by the production unit; environment and IMDS overrides are forbidden."
+    error_message = "Node identity is provisioner-owned artifact data; environment and IMDS overrides are forbidden."
   }
 }

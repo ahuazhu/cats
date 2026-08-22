@@ -306,6 +306,7 @@ pub trait SemanticLifecycleStore: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeCommand {
     pub cat_id: String,
+    pub workspace_id: String,
     pub action: CatAction,
     /// Create and run carry the complete desired Cat configuration. Other
     /// actions operate on the already-known local Cat.
@@ -316,6 +317,7 @@ impl NodeCommand {
     fn from_claim(claim: &ActionClaim) -> Self {
         Self {
             cat_id: claim.cat.cat_id.clone(),
+            workspace_id: claim.cat.workspace_id.clone(),
             action: claim.action,
             config: matches!(claim.action, CatAction::Create | CatAction::Run)
                 .then(|| claim.cat.config.clone()),
@@ -780,6 +782,7 @@ where
         };
         let cleanup = NodeCommand {
             cat_id: claim.cat.cat_id.clone(),
+            workspace_id: claim.cat.workspace_id.clone(),
             action: CatAction::Destroy,
             config: None,
         };

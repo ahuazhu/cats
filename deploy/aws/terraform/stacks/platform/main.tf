@@ -572,23 +572,11 @@ data "aws_iam_policy_document" "metal_worker_chunkstore" {
   }
 
   statement {
-    sid     = "ReadChunkStore"
-    effect  = "Allow"
-    actions = ["s3:GetObject"]
-    resources = [
-      "${aws_s3_bucket.chunkstore.arn}/${var.chunkstore_prefix}/*",
-    ]
-  }
-
-  # An explicit identity-policy deny prevents a later broad attachment from
-  # silently restoring direct writes to blockd. The Gateway role below is a
-  # different principal and is unaffected.
-  statement {
-    sid    = "DenyDirectChunkStoreMutation"
-    effect = "Deny"
+    sid    = "ReadWriteChunkStore"
+    effect = "Allow"
     actions = [
-      "s3:AbortMultipartUpload",
       "s3:DeleteObject",
+      "s3:GetObject",
       "s3:PutObject",
     ]
     resources = [

@@ -616,462 +616,6 @@ fn old_host_positive_stop_contract_passes_calibrated_offline_fixture() {
 }
 
 #[test]
-fn clean_route_v2_deployment_contains_no_v1_route_grant_credential() {
-    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
-    let kubernetes_variables =
-        read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/variables.tf");
-    let application =
-        read_workspace_file("deploy/aws/terraform/stacks/production-application/main.tf");
-    let application_variables =
-        read_workspace_file("deploy/aws/terraform/stacks/production-application/variables.tf");
-    let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
-    let controld = read_workspace_file("cmd/controld/src/main.rs");
-    let control_lib = read_workspace_file("control-plane/src/lib.rs");
-    let control_server = read_workspace_file("control-plane/src/server.rs");
-    let api_lib = read_workspace_file("api/src/lib.rs");
-    let metal_install = read_workspace_file("deploy/metal/install.sh");
-    let mut surfaces = vec![
-        kubernetes.as_str(),
-        kubernetes_variables.as_str(),
-        application.as_str(),
-        application_variables.as_str(),
-        workflow.as_str(),
-        controld.as_str(),
-        control_lib.as_str(),
-        control_server.as_str(),
-        api_lib.as_str(),
-        metal_install.as_str(),
-    ];
-    let units = [
-        "deploy/metal/systemd/cats-controld.service",
-        "deploy/aws/metal/cats-worker.service",
-        "deploy/metal/systemd/cats-noded.service",
-    ]
-    .map(read_workspace_file);
-    surfaces.extend(units.iter().map(String::as_str));
-    for forbidden in [
-        "RouteGrantSigner",
-        "pub mod route_grant;",
-        "route_grant_signing",
-        "route_grant_private_key_pem",
-        "route_grant_public_key_pem",
-        "ROUTE_GRANT_PRIVATE_KEY_PEM_B64",
-        "CATS_ROUTE_GRANT_PRIVATE_KEY_FILE",
-        "CATS_ROUTE_GRANT_PUBLIC_KEY_FILE",
-        "CATS_ROUTE_GRANT_TTL_SECONDS",
-        "route-grant-private.pem",
-        "route-grant-public.pem",
-        "--route-grant-private-key-file",
-        "--route-grant-public-key-file",
-    ] {
-        assert!(
-            surfaces.iter().all(|surface| !surface.contains(forbidden)),
-            "clean Route v2 deployment retained V1 credential surface {forbidden:?}"
-        );
-    }
-    assert!(kubernetes.contains("route-v2-control-artifacts"));
-    assert!(kubernetes.contains("--route-v2-machine-listen"));
-    assert!(kubernetes.contains("--route-v2-rotation-listen"));
-    assert!(units[0].contains("--route-v2-machine-listen"));
-    assert!(units[0].contains("--route-v2-rotation-listen"));
-    for required_control_artifact in [
-        "gateway-workload-authority.v1.json",
-        "gateway-client-ca-bundle.pem",
-        "control-machine-server-certificate.pem",
-        "control-machine-server-private-key.pem",
-        "signer.v1.json",
-        "public-key-ring.v1.json",
-        "rotation-operator-trust.v1.json",
-        "signer-private-key.pem",
-    ] {
-        assert!(
-            metal_install.contains(required_control_artifact),
-            "direct-metal startup does not require Route v2 control artifact {required_control_artifact:?}"
-        );
-    }
-}
-
-#[test]
-fn route_v2_deployment_wires_closed_artifact_sets_without_private_bytes_in_terraform() {
-    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
-    let kubernetes_variables =
-        read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/variables.tf");
-    for expected in [
-        "route_v2_control_artifact_secret_name",
-        "route_v2_gateway_artifact_secret_name",
-        "--route-v2-machine-listen",
-        "0.0.0.0:7443",
-        "--route-v2-rotation-listen",
-        "0.0.0.0:7444",
-        "resource \"kubernetes_service_v1\" \"control_plane_route_v2_rotation\"",
-        "cats-controld-route-rotation",
-        "publish_not_ready_addresses = true",
-        "resource \"kubernetes_deployment_v1\" \"gateway\"",
-        "resource \"kubernetes_service_v1\" \"gateway\"",
-        "cats-gatewayd",
-        "endpoint_wildcard_host",
-        "node-server-ca-bundle.pem",
-        "gateway-machine-client-certificate.pem",
-        "gateway-machine-client-private-key.pem",
-        "/healthz",
-    ] {
-        assert!(
-            kubernetes.contains(expected) || kubernetes_variables.contains(expected),
-            "Route v2 Kubernetes deployment lost {expected:?}"
-        );
-    }
-    for forbidden in [
-        "gateway_machine_client_private_key_pem",
-        "control_machine_server_private_key_pem",
-        "signer_private_key_pem",
-    ] {
-        assert!(
-            !kubernetes_variables.contains(forbidden),
-            "Terraform variable {forbidden:?} would persist Route v2 bytes in state"
-        );
-    }
-    assert!(kubernetes.contains("default_mode = \"0400\""));
-    assert!(kubernetes.contains("run_as_user                = 0"));
-    assert!(kubernetes_variables
-        .contains("endswith(var.route_v2_control_artifact_secret_name, \"-r${var.route_v2_control_artifact_signer_revision}\")"));
-    assert!(kubernetes_variables
-        .contains("endswith(var.route_v2_gateway_artifact_secret_name, \"-r1\")"));
-
-    let worker =
-        read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
-    let worker_variables =
-        read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/variables.tf");
-    for expected in [
-        "route_v2_node_artifact_secret_arn",
-        "route_v2_node_artifact_secret_version_id",
-        "secretsmanager:GetSecretValue",
-        "public-key-ring.v1.json",
-        "rotation-operator-trust.v1.json",
-        "gateway-client-ca-bundle.pem",
-        "node-machine-server-certificate.pem",
-        "node-machine-server-private-key.pem",
-        "node-server-ca-bundle.pem",
-        "CATS_ROUTE_V2_ROTATION_ORIGIN",
-        "route_v2_rotation_origin",
-    ] {
-        assert!(
-            worker.contains(expected) || worker_variables.contains(expected),
-            "Route v2 worker deployment lost {expected:?}"
-        );
-    }
-    // Production IAM denies blockd every direct ChunkStore mutation, so a
-    // worker that does not learn the Gateway origin has no write path at all
-    // and fails closed on the first publish. Losing this key is silent.
-    for expected in [
-        "CATS_OBJECT_WRITE_GATEWAY_URL",
-        "object_write_gateway_url",
-        "CATS_OBJECT_WRITE_GATEWAY_CA_FILE=${local.object_write_gateway_ca_file}",
-        "object_write_gateway_ca_file",
-    ] {
-        assert!(
-            worker.contains(expected) || worker_variables.contains(expected),
-            "worker deployment lost ObjectWrite Gateway capability input {expected:?}"
-        );
-    }
-    assert_eq!(
-        worker.matches("\"/etc/cats/route-v2\"").count(),
-        1,
-        "the Route v2 install root must have one Terraform source"
-    );
-    assert!(
-        worker.contains("\"$route_v2_stage\" \"${local.route_v2_install_root}\""),
-        "the Route v2 installer and Gateway CA environment must share one install root"
-    );
-    assert!(
-        worker_variables
-            .contains("object_write_gateway_url must be one canonical HTTPS DNS origin."),
-        "the Gateway origin must stay an exact validated HTTPS origin"
-    );
-
-    assert!(!worker.contains("base64encode(var.route_grant_public_key_pem)"));
-    assert!(!worker_variables.contains("route_grant_public_key_pem"));
-    assert!(
-        worker_variables.contains(
-            "arn:${var.expected_aws_partition}:secretsmanager:${var.aws_region}:${var.expected_account_id}:secret:${var.name_prefix}-${var.environment}-route-v2-node-r1-"
-        ),
-        "worker Route v2 secret ARN validation must stay bound to the exact partition/account/region/name"
-    );
-    assert!(
-        worker_variables.contains(
-            "route_v2_node_artifact_secret_arn must identify the exact <name-prefix>-<environment>-route-v2-node-r1 secret in the expected partition, account, and region"
-        ),
-        "worker Route v2 secret ARN validation must remain exact rather than suffix-only"
-    );
-    assert!(worker.contains("--version-id \"${var.route_v2_node_artifact_secret_version_id}\""));
-    for expected in [
-        "cats_classify_route_v2_node_r1",
-        "route_v2_install_state",
-        "cats_publish_route_v2_node_r1",
-        "case \"$route_v2_install_state\" in absent|exact) ;; *) exit 1 ;; esac",
-    ] {
-        assert!(
-            worker.contains(expected),
-            "worker initial r1 install lost {expected:?}"
-        );
-    }
-    assert!(!worker.contains("find /etc/cats/route-v2 -mindepth 1 -maxdepth 1 -delete"));
-    let worker_unit = read_workspace_file("deploy/aws/metal/cats-worker.service");
-    assert!(worker_unit.contains("UnsetEnvironment=CATS_ROUTE_V2_MACHINE_LISTEN"));
-    assert!(worker_unit.contains("--route-v2-machine-listen 0.0.0.0:7444"));
-    assert!(worker_unit.contains("--route-v2-rotation-origin $CATS_ROUTE_V2_ROTATION_ORIGIN"));
-    assert!(!worker_unit.contains("Environment=CATS_ROUTE_V2_MACHINE_LISTEN="));
-    assert!(!worker_unit.contains("--route-grant-public-key-file"));
-
-    let direct_unit = read_workspace_file("deploy/metal/systemd/cats-noded.service");
-    assert!(direct_unit.contains("UnsetEnvironment=CATS_ROUTE_V2_MACHINE_LISTEN"));
-    assert!(!direct_unit.contains("Environment=CATS_ROUTE_V2_MACHINE_LISTEN="));
-    assert!(direct_unit.contains("--route-v2-machine-listen 0.0.0.0:7444"));
-    assert!(direct_unit.contains("--route-v2-rotation-origin ${CATS_ROUTE_V2_ROTATION_ORIGIN}"));
-    assert!(!direct_unit.contains("--route-grant-public-key-file"));
-}
-
-#[test]
-fn route_v2_release_contains_a_separate_digest_pinned_gateway_artifact() {
-    let dockerfile = read_workspace_file("deploy/aws/Dockerfile.gateway");
-    assert!(dockerfile.contains("cargo build --locked --release -p cats-network"));
-    assert!(dockerfile.contains("ENTRYPOINT [\"/usr/local/bin/cats-gatewayd\"]"));
-    assert!(!dockerfile.contains("COPY /etc/cats/route-v2"));
-
-    let release = read_workspace_file(".github/workflows/release.yml");
-    assert!(release.contains("file: deploy/aws/Dockerfile.gateway"));
-    assert!(release.contains("gateway-${GITHUB_SHA}"));
-
-    let manual = read_workspace_file("deploy/aws/tools/build-manual-release.sh");
-    let verifier = read_workspace_file("deploy/aws/tools/verify-manual-release.py");
-    for expected in [
-        "--gateway-image",
-        "deploy/aws/Dockerfile.gateway",
-        "--gateway-image-root",
-        "--gateway-image-reference",
-        "--gateway-image-digest",
-        "--gateway-image-registry-verified",
-    ] {
-        assert!(
-            manual.contains(expected) || verifier.contains(expected),
-            "manual Route v2 release lost {expected:?}"
-        );
-    }
-}
-
-#[test]
-fn production_artifacts_remove_the_v1_gateway_and_shared_route_mirror() {
-    for removed in [
-        "deploy/aws/terraform/modules/route-cache-infrastructure/main.tf",
-        "deploy/aws/terraform/modules/route-cache-infrastructure/variables.tf",
-        "deploy/aws/terraform/modules/route-cache-infrastructure/outputs.tf",
-        "deploy/aws/check-route-grant-nodes.sh",
-        "deploy/metal/systemd/cats-gatewayd.service",
-    ] {
-        assert!(
-            !workspace_root().join(removed).exists(),
-            "legacy production artifact still exists: {removed}"
-        );
-    }
-
-    for path in [
-        "deploy/aws/terraform/modules/cats-kubernetes/main.tf",
-        "deploy/aws/terraform/modules/cats-kubernetes/variables.tf",
-        "deploy/aws/terraform/modules/cats-kubernetes/outputs.tf",
-        "deploy/aws/terraform/stacks/production-application/main.tf",
-        "deploy/aws/terraform/stacks/production-application/variables.tf",
-        "deploy/aws/terraform/stacks/production-application/outputs.tf",
-        "deploy/aws/terraform/stacks/production-infrastructure/main.tf",
-        "deploy/aws/terraform/stacks/production-infrastructure/outputs.tf",
-        ".github/workflows/deploy-production.yml",
-        "deploy/aws/Dockerfile.control-plane",
-    ] {
-        let source = read_workspace_file(path);
-        for forbidden in [
-            "CATS_SHARED_ROUTE_CACHE_TABLE",
-            "shared_route_cache_table",
-            "ROUTE_CACHE_TABLE_NAME",
-            "route_cache_infrastructure",
-        ] {
-            assert!(
-                !source.contains(forbidden),
-                "{path} still ships or deploys legacy Gateway surface {forbidden:?}"
-            );
-        }
-    }
-
-    let manifest = read_workspace_file("network/Cargo.toml");
-    assert!(!manifest.contains("legacy-test-harness"));
-    assert!(!manifest.contains("aws-sdk-dynamodb"));
-    assert!(!manifest.contains("aws-config"));
-
-    let binary = read_workspace_file("network/src/main.rs");
-    for expected in [
-        "ControlRouteResolver::from_installed_artifacts",
-        "GatewayNodeRouteV2Client::from_installed_artifacts",
-        "GatewayIngress::new",
-        "load_installed_gateway_node_route_v2_machine_artifacts",
-    ] {
-        assert!(
-            binary.contains(expected),
-            "Route v2 Gateway lost {expected:?}"
-        );
-    }
-    for forbidden in [
-        "cats_network::spawn",
-        "/v1/routes/resolve",
-        "/v1/routes/wake",
-        "/v1/cats/",
-        "CATS_SHARED_ROUTE_CACHE_TABLE",
-        "READY ",
-    ] {
-        assert!(
-            !binary.contains(forbidden),
-            "default Gateway binary retained legacy behavior {forbidden:?}"
-        );
-    }
-
-    let metal = read_workspace_file("deploy/metal/install.sh");
-    assert!(metal.contains("cats_retire_legacy_gateway \\"));
-    assert!(metal.contains("/etc/systemd/system/cats-gatewayd.service \\"));
-    assert!(metal.contains("/etc/systemd/system/multi-user.target.wants/cats-gatewayd.service \\"));
-    assert!(metal.contains("\"$PREFIX/bin/cats-gatewayd\""));
-    assert!(!metal.contains("systemctl disable --now cats-gatewayd.service"));
-    assert!(!metal.contains("cats cats-controld cats-noded cats-gatewayd"));
-    assert!(!metal.contains("enable --now cats-controld cats-gatewayd"));
-    assert!(!metal.contains("status cats-controld cats-gatewayd cats-noded"));
-
-    let deployment = read_workspace_file("deploy/aws/metal/worker-deployment-transaction.sh");
-    for expected in [
-        "cats_retire_legacy_gateway()",
-        "systemctl disable \"$service\"",
-        "[ \"$load_state\" = not-found ]",
-        "cats_stop_node_service \"$service\" || return 1",
-        "cats_require_node_service_stopped \"$service\" || return 1",
-        "rm -f -- \"$unit_file\" \"$wants_link\" \"$binary_file\"",
-    ] {
-        assert!(
-            deployment.contains(expected),
-            "legacy Gateway retirement lost {expected:?}"
-        );
-    }
-    assert!(!deployment.contains("disable --now cats-gatewayd.service 2>/dev/null || true"));
-}
-
-#[cfg(unix)]
-#[test]
-fn legacy_gateway_retirement_fails_closed_before_removing_files() {
-    let fixture = tempfile::tempdir().expect("legacy Gateway retirement fixture");
-    let fake_bin = fixture.path().join("bin");
-    std::fs::create_dir_all(&fake_bin).expect("create fake systemctl directory");
-    let systemctl = fake_bin.join("systemctl");
-    std::fs::write(
-        &systemctl,
-        r#"#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\n' "$*" >> "$CATS_FAKE_SYSTEMCTL_TRACE"
-case "$1" in
-  disable)
-    case "$CATS_FAKE_SYSTEMCTL_MODE" in
-      absent|disable-fails-loaded) exit 1 ;;
-      *) exit 0 ;;
-    esac
-    ;;
-  stop)
-    case "$CATS_FAKE_SYSTEMCTL_MODE" in
-      absent|active-stop-fails) exit 1 ;;
-      *) exit 0 ;;
-    esac
-    ;;
-  show)
-    property=""
-    for argument in "$@"; do
-      case "$argument" in
-        --property=*) property=${argument#--property=} ;;
-      esac
-    done
-    case "$property:$CATS_FAKE_SYSTEMCTL_MODE" in
-      LoadState:absent) printf 'not-found\n' ;;
-      LoadState:*) printf 'loaded\n' ;;
-      ActiveState:active-after-stop) printf 'active\n' ;;
-      ActiveState:*) printf 'inactive\n' ;;
-      *) exit 64 ;;
-    esac
-    ;;
-  *) exit 64 ;;
-esac
-"#,
-    )
-    .expect("write fake systemctl");
-    let mut permissions = std::fs::metadata(&systemctl)
-        .expect("fake systemctl metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&systemctl, permissions).expect("make fake systemctl executable");
-
-    let helper = workspace_root().join("deploy/aws/metal/worker-deployment-transaction.sh");
-    let inherited_path = std::env::var("PATH").expect("PATH");
-    for (mode, succeeds, removes_files) in [
-        ("stopped", true, true),
-        ("absent", true, true),
-        ("disable-fails-loaded", false, false),
-        ("active-stop-fails", false, false),
-        ("active-after-stop", false, false),
-    ] {
-        let case_dir = fixture.path().join(mode);
-        let systemd_dir = case_dir.join("etc/systemd/system");
-        let unit_file = systemd_dir.join("cats-gatewayd.service");
-        let wants_link = systemd_dir.join("multi-user.target.wants/cats-gatewayd.service");
-        let binary_file = case_dir.join("opt/cats/bin/cats-gatewayd");
-        for path in [&unit_file, &wants_link, &binary_file] {
-            std::fs::create_dir_all(path.parent().expect("artifact parent"))
-                .expect("create legacy artifact parent");
-            std::fs::write(path, b"legacy").expect("write legacy artifact");
-        }
-        let trace_file = case_dir.join("systemctl.trace");
-        let output = Command::new("bash")
-            .args([
-                "-c",
-                ". \"$1\"; cats_retire_legacy_gateway \"$2\" \"$3\" \"$4\"",
-                "legacy-gateway-retirement-test",
-            ])
-            .arg(&helper)
-            .arg(&unit_file)
-            .arg(&wants_link)
-            .arg(&binary_file)
-            .env("CATS_FAKE_SYSTEMCTL_MODE", mode)
-            .env("CATS_FAKE_SYSTEMCTL_TRACE", &trace_file)
-            .env("PATH", format!("{}:{inherited_path}", fake_bin.display()))
-            .output()
-            .expect("run legacy Gateway retirement helper");
-        assert_eq!(
-            output.status.success(),
-            succeeds,
-            "unexpected {mode} result: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        for path in [&unit_file, &wants_link, &binary_file] {
-            assert_eq!(
-                path.exists(),
-                !removes_files,
-                "{mode} left the wrong artifact state at {}",
-                path.display()
-            );
-        }
-
-        let trace = std::fs::read_to_string(&trace_file).expect("read systemctl trace");
-        assert!(trace.contains("disable cats-gatewayd.service"));
-        if mode == "disable-fails-loaded" {
-            assert!(!trace.contains("stop cats-gatewayd.service"));
-        } else {
-            assert!(trace.contains("stop cats-gatewayd.service"));
-        }
-        if mode == "active-after-stop" {
-            assert!(trace.contains("show cats-gatewayd.service --property=ActiveState --value"));
-        }
-    }
-}
-
-#[test]
 fn control_plane_image_manifest_access_is_exact_and_read_only() {
     let identity = read_workspace_file("deploy/aws/terraform/modules/usage-infrastructure/main.tf");
     let manifest_policy = identity
@@ -1253,42 +797,6 @@ fn production_fresh_schema_and_chunkstore_prefix_are_single_reviewed_inputs() {
 }
 
 #[test]
-fn production_deploy_has_no_legacy_route_grant_admin_preflight() {
-    let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
-    for forbidden in [
-        "Check Route Grant verifier compatibility",
-        "/v1/admin/nodes",
-        "route-grant-public.sha256",
-        "check-route-grant-nodes.sh",
-    ] {
-        assert!(
-            !workflow.contains(forbidden),
-            "production deploy retained legacy Route Grant preflight {forbidden:?}"
-        );
-    }
-    assert!(
-        !workspace_root()
-            .join("deploy/aws/check-route-grant-nodes.sh")
-            .exists(),
-        "the unreachable V1 Node verifier must be removed with its workflow hook"
-    );
-
-    let initialize = workflow
-        .find("- name: Initialize application state")
-        .expect("application initialization step");
-    let plan = workflow
-        .find("- name: Plan production deployment")
-        .expect("production plan step");
-    let apply = workflow
-        .find("- name: Apply reviewed plan")
-        .expect("production apply step");
-    assert!(
-        initialize < plan && plan < apply,
-        "removing the legacy preflight must preserve plan/apply ordering"
-    );
-}
-
-#[test]
 fn release_build_publishes_the_control_plane_runtime_target() {
     let workflow = read_workspace_file(".github/workflows/release.yml");
     let build = workflow
@@ -1331,37 +839,9 @@ fn release_build_publishes_the_control_plane_runtime_target() {
         .expect("dedicated control-plane runtime stage");
     assert!(runtime.contains("ENTRYPOINT [\"/usr/local/bin/cats-controld\"]"));
 
-    // The object-write gateway Deployment reuses this image and starts
-    // /usr/local/bin/cats-object-write-gatewayd by explicit command; the
-    // runtime stage must ship that binary or the pod crash-loops on start.
-    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
-    assert!(
-        kubernetes.contains("command           = [\"/usr/local/bin/cats-object-write-gatewayd\"]")
-    );
-    assert!(runtime.contains(
-        "COPY --from=builder /out/cats-object-write-gatewayd /usr/local/bin/cats-object-write-gatewayd"
-    ));
+    assert!(!runtime.contains("cats-object-write-gatewayd"));
 }
 
-#[test]
-fn route_grant_application_deploys_only_the_route_v2_gateway() {
-    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
-    let control = kubernetes
-        .split_once("resource \"kubernetes_deployment_v1\" \"control_plane\"")
-        .and_then(|(_, rest)| rest.split_once("resource \"kubernetes_pod_disruption_budget_v1\""))
-        .map(|(section, _)| section)
-        .expect("control-plane Deployment section");
-    assert!(
-        control.contains("wait_for_rollout = true"),
-        "Terraform must wait for the complete control-plane rollout"
-    );
-    assert!(kubernetes.contains("resource \"kubernetes_deployment_v1\" \"gateway\""));
-    assert!(kubernetes.contains("endpoint_wildcard_host"));
-    assert!(kubernetes.contains("--control-plane-url"));
-    assert!(!kubernetes.contains("CATS_SHARED_ROUTE_CACHE_TABLE"));
-}
-
-#[cfg(unix)]
 fn ha_fixture_guard() -> std::sync::MutexGuard<'static, ()> {
     static FIXTURE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     FIXTURE_LOCK
@@ -3536,26 +3016,6 @@ fn production_control_plane_survives_one_pod_or_node_disruption() {
 }
 
 #[test]
-fn production_endpoint_ingress_routes_only_to_route_v2_gateway() {
-    let terraform = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
-    let variables =
-        read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/variables.tf");
-    assert!(terraform.contains("for host in var.control_plane_hosts"));
-    assert!(terraform.contains("host         = var.endpoint_wildcard_host"));
-    assert!(terraform.contains("service_name = \"cats-gatewayd\""));
-    assert!(variables.contains("endpoint_wildcard_host"));
-
-    let application =
-        read_workspace_file("deploy/aws/terraform/stacks/production-application/main.tf");
-    assert!(application.contains("setunion(toset(var.control_plane_hosts)"));
-    assert!(application.contains("endpoint_wildcard_host"));
-
-    let workflow = read_workspace_file(".github/workflows/deploy-production.yml");
-    assert!(workflow.contains("verify_deployment cats-controld"));
-    assert!(workflow.contains("verify_deployment cats-gatewayd"));
-}
-
-#[test]
 fn production_ha_drill_deletes_only_the_elected_reconciler_under_a_guard() {
     let workflow = read_workspace_file(".github/workflows/verify-control-plane-ha.yml");
     for expected in [
@@ -4006,65 +3466,6 @@ fn worker_installation_owns_all_runtime_socket_roots() {
     }
 }
 
-#[cfg(unix)]
-#[test]
-fn manual_worker_bootstrap_installs_route_v2_revision_one_without_rotation() {
-    let script = read_workspace_file("deploy/aws/metal/install-worker.sh");
-    let required = script
-        .find("CATS_ROUTE_V2_NODE_ARTIFACT_DIR is required")
-        .expect("required Node Route v2 artifact input");
-    let real_directory = script
-        .find("CATS_ROUTE_V2_NODE_ARTIFACT_DIR must be an absolute real directory")
-        .expect("absolute real Node Route v2 artifact directory check");
-    let closed_set = script
-        .find("Node Route v2 artifact source must contain exactly six")
-        .expect("closed Node Route v2 artifact set check");
-    let first_package_mutation = script.find("apt-get update -q").expect("package mutation");
-    assert!(
-        required < real_directory
-            && real_directory < closed_set
-            && closed_set < first_package_mutation,
-        "missing or malformed revision-1 artifacts must fail before package mutation"
-    );
-    let host_lock = script
-        .find("cats_acquire_worker_deployment_lock")
-        .expect("Host-global worker deployment lock");
-    let exact_classification = script
-        .find("ROUTE_V2_INSTALL_STATE=$(cats_classify_route_v2_node_r1")
-        .expect("exact existing revision-1 classification");
-    let first_systemd_mutation = script
-        .find("cats_gate_node_service cats-worker")
-        .expect("first serialized systemd mutation");
-    let publish_call = script
-        .find("cats_publish_route_v2_node_r1")
-        .expect("exact revision-1 publish");
-    let first_installed_mutation = script
-        .find("install -D -m 0755 \"$CATS_REPO/deploy/aws/metal/install-guest-runtime-release.sh\"")
-        .expect("first installed-file mutation");
-    assert!(
-        host_lock < exact_classification
-            && exact_classification < first_systemd_mutation
-            && exact_classification < first_installed_mutation
-            && publish_call < first_installed_mutation,
-        "exact replay/conflict classification must happen under the Host lock before any systemd or installed-file mutation, and first publish must precede later installed-file mutation"
-    );
-    for expected in [
-        "ROUTE_V2_INSTALL_STATE=$(cats_classify_route_v2_node_r1",
-        "cats_publish_route_v2_node_r1",
-        "[[ $ROUTE_V2_INSTALL_STATE == absent || $ROUTE_V2_INSTALL_STATE == exact ]]",
-        "after-install-route-v2-artifacts",
-        "node-machine-server-private-key.pem",
-        "node-server-ca-bundle.pem",
-    ] {
-        assert!(
-            script.contains(expected),
-            "manual revision-1 install lost {expected:?}"
-        );
-    }
-    assert!(!script.contains("find /etc/cats/route-v2 -mindepth 1 -maxdepth 1 -delete"));
-    assert!(!script.contains("CATS_ROUTE_GRANT_PUBLIC_KEY_FILE"));
-}
-
 #[test]
 fn release_artifacts_share_one_canonical_guest_payload() {
     let receipt_argument =
@@ -4216,9 +3617,6 @@ fn manual_release_builder_verifies_all_final_artifacts_and_writes_one_receipt() 
         "--input-file \"old_host_positive_stop=$source_root/deploy/aws/old-host-positive-stop.py\"",
         "--input-file \"production_mutation_admission_operator=$source_root/deploy/aws/production-mutation-admission.py\"",
         "--input-file \"production_cutover_proof_set=$source_root/deploy/aws/production_cutover_proof_set.py\"",
-        "--input-file \"route_v2_control_rollout_operator=$source_root/deploy/aws/terraform/qualification/tools/apply_route_v2_control_rollout_plan.py\"",
-        "--input-file \"route_v2_control_rollout_plan_validator=$source_root/deploy/aws/terraform/qualification/tools/validate_route_v2_control_rollout_plan.py\"",
-        "--input-file \"route_v2_control_rollout_receipt_signer=$worker_root/cats\"",
         "--export-images",
         "type=oci,dest=$control_archive",
         "type=oci,dest=$gateway_archive",
@@ -4496,19 +3894,12 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
     let identity_validate = terraform
         .find("validate-node-identity-installation.sh\"")
         .expect("staged identity validation");
-    let route_v2_validate = terraform
-        .find("cats-route-v2-node-r1-validator\" --directory \"$route_v2_stage\"")
-        .expect("staged Route v2 candidate validation");
     let deployment_lock = terraform
         .find("cats_acquire_worker_deployment_lock")
         .expect("Host deployment lock");
-    let exact_classification = terraform[deployment_lock..]
-        .find("route_v2_install_state=\"$(cats_classify_route_v2_node_r1")
-        .map(|offset| deployment_lock + offset)
-        .expect("exact Route v2 classification under the Host lock");
-    let locked_cgroup = terraform[exact_classification..]
+    let locked_cgroup = terraform[deployment_lock..]
         .find("cgroup_v2_root=\"$(cats_worker_cgroup_v2_root)\"")
-        .map(|offset| exact_classification + offset)
+        .map(|offset| deployment_lock + offset)
         .expect("cgroup-v2 root recomputation under the Host lock");
     let locked_idle_guard = terraform[locked_cgroup..]
         .find("require-idle-worker.sh\"")
@@ -4528,8 +3919,7 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
     assert!(
         archive_listing < archive_extract
             && archive_extract < release_verify
-            && release_verify < identity_validate
-            && identity_validate < route_v2_validate,
+            && release_verify < identity_validate,
         "nothing from the empty stage may execute before verified extraction"
     );
     let authorize = terraform
@@ -4548,10 +3938,8 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
         first_install < authorize && authorize < start && start < readiness && readiness < commit
     );
     assert!(
-        route_v2_validate < deployment_lock
+        identity_validate < deployment_lock
             && deployment_lock < locked_cgroup
-            && deployment_lock < exact_classification
-            && exact_classification < locked_cgroup
             && locked_cgroup < locked_idle_guard
             && locked_idle_guard < stop
             && stop < prepare
@@ -4560,16 +3948,26 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
     let pre_lock = &terraform[..deployment_lock];
     assert!(
         !pre_lock.contains("systemctl show"),
-        "exact Route v2 classification must happen under the Host lock before any systemctl query"
+        "the deployment lock must be held before any systemctl query"
     );
     assert!(
         !pre_lock.contains("require-idle-worker.sh"),
         "the worker deployment must not reintroduce an unlocked idle guard before the Host lock"
     );
-    for forbidden in ["169.254.169.254", "CATS_NODE_ID=", "--node-id"] {
+    assert!(
+        !terraform.contains("--node-id"),
+        "Terraform regained a CLI-derived Node identity"
+    );
+    for required in [
+        "jq -er '.node_id' /etc/cats/identity/node-identity.v1.json",
+        "[ \"$identity_instance\" = \"$instance_id\" ]",
+        "[ \"$identity_region\" = \"$node_region\" ]",
+        "CATS_NODE_ID=$node_id",
+        "CATS_NODE_CONTROL_ENDPOINT=http://$private_ip:7301",
+    ] {
         assert!(
-            !terraform.contains(forbidden),
-            "Terraform regained derived Node identity {forbidden:?}"
+            terraform.contains(required),
+            "direct Node registration lost its closed identity/IMDS cross-check {required:?}"
         );
     }
     for boundary in [

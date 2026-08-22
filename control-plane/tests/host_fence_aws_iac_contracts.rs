@@ -22,7 +22,7 @@ fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 }
 
 #[test]
-fn workers_are_read_only_and_only_the_gateway_can_publish_chunkstore_objects() {
+fn workers_can_publish_only_inside_the_exact_chunkstore_prefix() {
     let main = read_workspace_file("deploy/aws/terraform/stacks/platform/main.tf");
     let worker = between(
         &main,
@@ -30,76 +30,24 @@ fn workers_are_read_only_and_only_the_gateway_can_publish_chunkstore_objects() {
         "resource \"aws_iam_role_policy\" \"metal_worker_chunkstore\"",
     );
     for contract in [
-        "sid    = \"DenyDirectChunkStoreMutation\"",
-        "effect = \"Deny\"",
-        "\"s3:AbortMultipartUpload\"",
+        "sid    = \"ReadWriteChunkStore\"",
+        "effect = \"Allow\"",
         "\"s3:DeleteObject\"",
-        "\"s3:PutObject\"",
-        "${aws_s3_bucket.chunkstore.arn}/${var.chunkstore_prefix}/*",
-    ] {
-        assert!(worker.contains(contract), "missing worker deny: {contract}");
-    }
-    assert!(!worker.contains("ReadWriteChunkStore"));
-
-    let gateway = between(
-        &main,
-        "data \"aws_iam_policy_document\" \"object_write_gateway_chunkstore\"",
-        "resource \"aws_iam_role_policy\" \"object_write_gateway_chunkstore\"",
-    );
-    for contract in [
         "\"s3:GetObject\"",
         "\"s3:PutObject\"",
         "${aws_s3_bucket.chunkstore.arn}/${var.chunkstore_prefix}/*",
     ] {
         assert!(
-            gateway.contains(contract),
-            "missing gateway least-privilege contract: {contract}"
+            worker.contains(contract),
+            "missing worker scope: {contract}"
         );
     }
-    for forbidden in [
-        "s3:DeleteObject",
-        "s3:GetBucketLocation",
-        "s3:GetObjectAttributes",
-        "s3:ListBucket",
-        "s3:PutBucket",
-        "ec2:",
-        "iam:",
-        "Resource = [\"*\"]",
-    ] {
+    for forbidden in ["s3:PutBucket", "ec2:", "iam:", "Resource = [\"*\"]"] {
         assert!(
-            !gateway.contains(forbidden),
-            "gateway gained forbidden authority: {forbidden}"
+            !worker.contains(forbidden),
+            "worker gained forbidden authority: {forbidden}"
         );
     }
-
-    let association = between(
-        &main,
-        "resource \"aws_eks_pod_identity_association\" \"object_write_gateway\"",
-        "# HostFence provider permissions",
-    );
-    assert!(association.contains("namespace       = \"cats\""));
-    assert!(association.contains("service_account = \"cats-object-write-gateway\""));
-    assert!(association.contains("role_arn        = aws_iam_role.object_write_gateway.arn"));
-
-    let application =
-        read_workspace_file("deploy/aws/terraform/stacks/production-application/main.tf");
-    let kubernetes_module = between(&application, "module \"cats_kubernetes\"", "# Public DNS.");
-    // Token comparison, not column: `terraform fmt` aligns `=` to the longest
-    // key in the block, so a new module argument would otherwise break this.
-    assert!(
-        kubernetes_module
-            .lines()
-            .any(|line| line.split_whitespace().collect::<Vec<_>>()
-                == ["namespace", "=", "\"cats\""]),
-        "the Kubernetes module call must pin the reviewed namespace"
-    );
-    let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
-    let gateway_service_account = between(
-        &kubernetes,
-        "resource \"kubernetes_service_account_v1\" \"object_write_gateway\"",
-        "# Terraform receives only the immutable Secret name.",
-    );
-    assert!(gateway_service_account.contains("name      = \"cats-object-write-gateway\""));
 }
 
 #[test]

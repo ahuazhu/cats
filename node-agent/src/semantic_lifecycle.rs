@@ -51,11 +51,6 @@ impl SemanticActionCancellation {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_for_test() -> Self {
-        Self::new()
-    }
-
     fn cancel(&self) {
         self.signal.send_replace(true);
     }
@@ -109,6 +104,13 @@ pub trait SemanticCatEffects: Send + Sync + 'static {
         request: SemanticEffectRequest,
         cancellation: SemanticActionCancellation,
     ) -> SemanticEffectFuture;
+
+    /// Stop every Node-local physical effect and remove only local artifacts.
+    /// This is registration reset, not the product `destroy` action: it must
+    /// never delete a RootDisk or PersistentDisk.
+    fn reset_all(&self) -> SemanticEffectFuture {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +135,7 @@ pub struct SemanticCatResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticCatView {
     pub cat_id: String,
+    pub workspace_id: Id,
     pub state: Option<SemanticCatState>,
     pub active_action: Option<SemanticCatAction>,
     pub cpu: u32,
@@ -428,12 +431,34 @@ impl SemanticNodeService {
             }
             (_, None) => {}
         }
-        let Some(lane) = (match self.existing_lane_if_open(&cat_id) {
-            Ok(lane) => lane,
-            Err(response) => return response,
-        }) else {
-            return not_found_response(cat_id);
+        let lane = if action == SemanticCatAction::Run {
+            match self.lane_if_open(&cat_id) {
+                Ok(lane) => lane,
+                Err(response) => return response,
+            }
+        } else {
+            let Some(lane) = (match self.existing_lane_if_open(&cat_id) {
+                Ok(lane) => lane,
+                Err(response) => return response,
+            }) else {
+                return not_found_response(cat_id);
+            };
+            lane
         };
+        if action == SemanticCatAction::Run {
+            let mut state = lane.state();
+            if state.record.is_none() {
+                state.record = Some(CatRecord {
+                    config: requested_config
+                        .clone()
+                        .expect("Run configuration was validated above"),
+                    // A recovery target has no Host-local instance. Treat it
+                    // as physically Cold so the ordinary Run transition can
+                    // create the first VMM on this Node.
+                    state: Some(SemanticCatState::Cold),
+                });
+            }
+        }
         loop {
             let mut changed = lane.changed.subscribe();
             let sequence = {
@@ -573,27 +598,30 @@ impl SemanticNodeService {
         }
     }
 
-    /// Close admission, cancel and join every active Cat action, then remove
-    /// all registration-period Cat records. PersistentDisk product data is
-    /// outside this map and is never deleted by this reset.
+    /// Close admission, cancel and join every active Cat action, then ask the
+    /// installed effects owner to stop all local processes and artifacts.
+    /// Product disks are never deleted by this reset.
     pub async fn reset_all(&self) -> anyhow::Result<()> {
         self.placement_gate.close();
-        let cat_ids = self.cats().keys().cloned().collect::<Vec<_>>();
-        for cat_id in cat_ids {
-            let response = self.destroy_for_reset(cat_id.clone()).await;
-            if !matches!(
-                response.status,
-                SemanticResponseStatus::Ok | SemanticResponseStatus::AlreadyDone
-            ) {
-                let message = response
-                    .error
-                    .map(|error| error.message)
-                    .unwrap_or_else(|| response.code);
-                return Err(anyhow::anyhow!(
-                    "reset failed while cleaning {cat_id}: {message}"
-                ));
+        loop {
+            let lanes = self.cats().values().cloned().collect::<Vec<_>>();
+            let mut active = false;
+            for lane in &lanes {
+                let state = lane.state();
+                if let Some(action) = &state.active {
+                    action.cancellation.cancel();
+                    active = true;
+                }
             }
+            if !active {
+                break;
+            }
+            tokio::task::yield_now().await;
         }
+        self.effects
+            .reset_all()
+            .await
+            .map_err(|error| anyhow::anyhow!(error.message))?;
         self.cats().clear();
         Ok(())
     }
@@ -764,6 +792,7 @@ fn view(cat_id: &str, state: &CatLaneState) -> Option<SemanticCatView> {
     let record = state.record.as_ref()?;
     Some(SemanticCatView {
         cat_id: cat_id.to_owned(),
+        workspace_id: record.config.workspace_id.clone(),
         state: record.state,
         active_action: state.active.as_ref().map(|active| active.action),
         cpu: record.config.cpu,
@@ -962,6 +991,13 @@ async fn health(State(state): State<SemanticHttpState>, headers: HeaderMap) -> i
     if !authorized(&headers, &state.bearer_token) {
         return unauthorized().into_response();
     }
+    if !state.service.placement_gate().is_open() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "status": "not_ready" })),
+        )
+            .into_response();
+    }
     (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response()
 }
 
@@ -1136,6 +1172,7 @@ fn wire_view(view: SemanticCatView) -> Result<NodedCatView, &'static str> {
         state: view.state,
         active_action: view.active_action,
         config: NodedCatConfig {
+            workspace_id: view.workspace_id,
             cpu: view.cpu,
             memory_bytes: view.memory_bytes,
             boot_image: view.boot_image,
@@ -1232,6 +1269,7 @@ mod tests {
 
     fn config() -> SemanticCatConfig {
         SemanticCatConfig {
+            workspace_id: Id::new("ws_01").expect("valid workspace ID"),
             cpu: 2,
             memory_bytes: 4 * 1024 * 1024 * 1024,
             boot_image: "ubuntu-24.04".to_owned(),
@@ -1441,7 +1479,7 @@ mod tests {
     async fn http_requires_exact_bearer_token_and_wires_queries() {
         let effects = Arc::new(RecordingEffects::default());
         let service = SemanticNodeService::new(effects);
-        let (origin, server) = spawn_http(service).await;
+        let (origin, server) = spawn_http(service.clone()).await;
         let client = reqwest::Client::new();
 
         for authorization in [None, Some("Bearer wrong")] {
@@ -1462,6 +1500,16 @@ mod tests {
             .await
             .expect("authorized health");
         assert_eq!(health.status(), StatusCode::OK);
+
+        service.placement_gate().close();
+        let not_ready = client
+            .get(format!("{origin}/v1/health"))
+            .bearer_auth("test-secret-that-is-at-least-32-bytes")
+            .send()
+            .await
+            .expect("closed-gate health");
+        assert_eq!(not_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        service.placement_gate().open();
 
         let created = client
             .put(format!("{origin}/v1/cats/cat_01"))

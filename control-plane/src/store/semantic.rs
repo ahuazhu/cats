@@ -997,6 +997,19 @@ impl Store {
         })
     }
 
+    pub fn list_current_semantic_cat_ids(&self, workspace_id: &str) -> Result<Vec<String>> {
+        self.with(|client| {
+            client
+                .query(
+                    "SELECT cat_id FROM cats
+                      WHERE workspace_id=$1 AND destroyed_at IS NULL
+                      ORDER BY cat_slug,cat_id",
+                    &[&workspace_id],
+                )
+                .map(|rows| rows.into_iter().map(|row| row.get(0)).collect())
+        })
+    }
+
     pub fn find_semantic_cat_by_id(&self, cat_id: &str) -> Result<Option<CatRecord>> {
         self.with(|client| {
             client
@@ -1565,6 +1578,19 @@ impl Store {
         })
     }
 
+    pub fn list_current_semantic_disk_ids(&self, workspace_id: &str) -> Result<Vec<String>> {
+        self.with(|client| {
+            client
+                .query(
+                    "SELECT disk_id FROM persistent_disks
+                      WHERE workspace_id=$1 AND deleted_at IS NULL
+                      ORDER BY disk_slug,disk_id",
+                    &[&workspace_id],
+                )
+                .map(|rows| rows.into_iter().map(|row| row.get(0)).collect())
+        })
+    }
+
     pub fn find_semantic_disk_by_id(&self, disk_id: &str) -> Result<Option<PersistentDiskRecord>> {
         self.with(|client| {
             client
@@ -1754,6 +1780,34 @@ fn register_node_transaction(
         transaction.rollback()?;
         return Ok(RegisterNodeOutcome::Deleted(record));
     }
+    let has_current_cats: bool = transaction
+        .query_one(
+            "SELECT EXISTS (
+                SELECT 1 FROM cats
+                 WHERE node_id=$1 AND destroyed_at IS NULL
+            )",
+            &[&request.node_id],
+        )?
+        .get(0);
+    if request.reset_completed && has_current_cats {
+        let row = transaction.query_one(
+            &format!(
+                "UPDATE nodes
+                    SET control_endpoint=$2,node_version=$3,
+                        status='reset_required',updated_at={DB_NOW_MS}
+                  WHERE node_id=$1
+                  RETURNING {NODE_COLUMNS}"
+            ),
+            &[
+                &request.node_id,
+                &request.control_endpoint,
+                &request.node_version,
+            ],
+        )?;
+        let reset_required = row_to_node(&row);
+        transaction.commit()?;
+        return Ok(RegisterNodeOutcome::ResetRequired(reset_required));
+    }
     if matches!(
         record.status,
         NodeStatus::Offline | NodeStatus::ResetRequired
@@ -1764,11 +1818,7 @@ fn register_node_transaction(
     }
     let endpoint_changed = record.control_endpoint != request.control_endpoint;
     let version_changed = record.node_version != request.node_version;
-    let reset_completed = request.reset_completed
-        && matches!(
-            record.status,
-            NodeStatus::Offline | NodeStatus::ResetRequired
-        );
+    let reset_completed = request.reset_completed;
     if endpoint_changed || version_changed || reset_completed {
         let next_status = if reset_completed {
             NodeStatus::Running

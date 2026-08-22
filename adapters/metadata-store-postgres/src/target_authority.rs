@@ -110,7 +110,7 @@ impl PostgresVolumeDataAuthority {
             })
     }
 
-    fn dispatch<T>(
+    pub(super) fn dispatch<T>(
         &self,
         operation: impl FnOnce(&mut Client) -> Result<T, AuthorityError> + Send + 'static,
     ) -> Result<T, AuthorityError>
@@ -388,7 +388,7 @@ fn load_volume(client: &mut Client, volume_id: &Id) -> Result<VolumeRecord, Auth
         .ok_or(AuthorityError::NotFound)
 }
 
-fn load_volume_for_update(
+pub(super) fn load_volume_for_update(
     transaction: &mut Transaction<'_>,
     volume_id: &Id,
 ) -> Result<VolumeRecord, AuthorityError> {
@@ -482,19 +482,43 @@ fn node_volume_inventory_sql() -> String {
     )
 }
 
-fn database_now(transaction: &mut Transaction<'_>) -> Result<UnixMillis, AuthorityError> {
+pub(super) fn database_now(
+    transaction: &mut Transaction<'_>,
+) -> Result<UnixMillis, AuthorityError> {
     let row = transaction
         .query_one(&format!("SELECT {DB_NOW_MS}"), &[])
         .map_err(|_| AuthorityError::BackendUnknown)?;
     unix_millis(row.try_get(0).map_err(|_| AuthorityError::BackendUnknown)?)
 }
 
-fn update_volume(
+pub(super) fn update_volume(
     transaction: &mut Transaction<'_>,
     record: &VolumeRecord,
 ) -> Result<(), AuthorityError> {
+    update_volume_row(transaction, record, false, None)
+}
+
+pub(super) fn update_volume_and_owner(
+    transaction: &mut Transaction<'_>,
+    record: &VolumeRecord,
+    owner: Option<&VolumeOwnerBinding>,
+) -> Result<(), AuthorityError> {
+    update_volume_row(transaction, record, true, owner)
+}
+
+fn update_volume_row(
+    transaction: &mut Transaction<'_>,
+    record: &VolumeRecord,
+    replace_owner: bool,
+    owner: Option<&VolumeOwnerBinding>,
+) -> Result<(), AuthorityError> {
     let projection = project_volume_record(record)?;
     let record_json = serde_json::to_string(record).map_err(|_| AuthorityError::BackendUnknown)?;
+    let owner_binding_json = owner
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|_| AuthorityError::BackendUnknown)?;
+    let owner_node_id = owner.map(|binding| binding.owner_node_id.to_string());
     let size_bytes = to_pg(projection.size_bytes)?;
     let head_generation = to_pg(projection.head_generation.get())?;
     let lease_epoch = to_pg(projection.lease_epoch.get())?;
@@ -521,7 +545,9 @@ fn update_volume(
                 transition_source_kind=$15, transition_operation_id=$16,
                 transition_request_fingerprint=$17,
                 transition_placement_epoch=$18,
-                transition_lease_duration_ms=$19
+                transition_lease_duration_ms=$19,
+                owner_binding=CASE WHEN $20 THEN $21::TEXT::jsonb ELSE owner_binding END,
+                owner_node_id=CASE WHEN $20 THEN $22 ELSE owner_node_id END
               WHERE volume_id=$1",
             &[
                 &projection.volume_id,
@@ -543,6 +569,9 @@ fn update_volume(
                 &projection.transition_request_fingerprint,
                 &transition_placement,
                 &transition_duration,
+                &replace_owner,
+                &owner_binding_json,
+                &owner_node_id,
             ],
         )
         .map_err(|_| AuthorityError::BackendUnknown)?;

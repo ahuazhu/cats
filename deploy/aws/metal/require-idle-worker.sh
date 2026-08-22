@@ -135,7 +135,7 @@ while IFS= read -r process_line; do
     process_probe_seen=1
   fi
   case "$2" in
-    "$runtime_bin_root/cats-blockd"|"$runtime_bin_root/cats-vmm-launcher"|"$vmm_binary")
+    "$runtime_bin_root/cats-blockd"|"$vmm_binary")
       runtime_pids="$runtime_pids $1(${2##*/})"
       ;;
   esac

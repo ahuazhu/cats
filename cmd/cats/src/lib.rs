@@ -31,8 +31,7 @@ mod stable_unix_fs;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use cats_api::runtime_product_reads::{CatReadV2, DiskReadV2, ProductReadPage};
-use cats_api::runtime_reconciliation::Id as RuntimeId;
+use cats_api::runtime_reconciliation::Sha256Digest;
 use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 
@@ -43,8 +42,9 @@ use cats_api::oci::{
     OciRegistryAuth,
 };
 use cats_api::semantic_control::{
-    AttachDiskRequest, CatMountRequest, CatResponse, CreateCatRequest, CreateDiskRequest,
-    DetachDiskRequest, DiskResponse, PersistentMountPath, ResourceSlug, SemanticErrorBody,
+    AttachDiskRequest, CatMountRequest, CatResponse, CatView, CreateCatRequest, CreateDiskRequest,
+    DetachDiskRequest, DiskResponse, DiskView, PersistentMountPath, ResourceSlug,
+    SemanticErrorBody,
 };
 
 #[derive(Parser, Debug)]
@@ -96,7 +96,7 @@ pub enum Command {
         #[arg(value_name = "CAT_SLUG")]
         name: String,
         /// Boot image understood by the Control Plane.
-        #[arg(long = "boot-image", default_value = "ubuntu-24.04")]
+        #[arg(long = "boot-image", value_name = "sha256:DIGEST")]
         boot_image_digest: String,
         #[arg(long = "cpu", default_value_t = 2)]
         cpus: u32,
@@ -108,7 +108,7 @@ pub enum Command {
     },
     /// List cats.
     Ls,
-    /// Show one cat by immutable ID.
+    /// Show the current Cat selected by its Workspace-local slug.
     Get { id: String },
     /// Converge a Cold, Suspended, or Warm Cat to Running.
     Run {
@@ -204,7 +204,7 @@ pub enum DiskCommand {
     },
     Ls,
     Get {
-        /// Immutable Disk ID.
+        /// Workspace-local PersistentDisk slug.
         id: String,
     },
     /// Append a PersistentDisk to the immutable config of a terminal Cold Cat.
@@ -835,35 +835,6 @@ impl Client {
         self.send(self.http.get(self.url(path)))
     }
 
-    fn get_all_product_pages<T: serde::de::DeserializeOwned>(
-        &self,
-        collection: &str,
-    ) -> Result<Vec<T>> {
-        let mut items = Vec::new();
-        let mut cursor = None;
-        let mut seen = std::collections::BTreeSet::new();
-        loop {
-            let path = match cursor.as_deref() {
-                Some(cursor) => format!("{collection}?limit=100&cursor={cursor}"),
-                None => format!("{collection}?limit=100"),
-            };
-            let page: ProductReadPage<T> = serde_json::from_value(self.get(&path)?)?;
-            anyhow::ensure!(
-                page.next_cursor.is_none() || !page.items.is_empty(),
-                "product collection returned a cursor without an item"
-            );
-            items.extend(page.items);
-            let Some(next) = page.next_cursor else {
-                return Ok(items);
-            };
-            anyhow::ensure!(
-                seen.insert(next.clone()),
-                "product collection cursor repeated"
-            );
-            cursor = Some(next);
-        }
-    }
-
     fn post(&self, path: &str, body: Option<serde_json::Value>) -> Result<serde_json::Value> {
         let mut req = self
             .http
@@ -921,37 +892,24 @@ fn resolve_workspace_id(
     Ok(matched.id.clone())
 }
 
-fn print_runtime_cat(cat: &CatReadV2, json_mode: bool) {
+fn print_semantic_cat(cat: &CatView, json_mode: bool) {
     if json_mode {
         println!("{}", serde_json::to_string_pretty(cat).unwrap());
     } else {
-        let lifecycle = cat
-            .lifecycle
-            .stable_state
+        let state = cat
+            .state
             .map(|state| format!("{state:?}").to_lowercase())
-            .unwrap_or_else(|| "unknown".to_owned());
-        let (physical, node) = cat.observed.as_ref().map_or_else(
-            || ("unknown".to_owned(), "-".to_owned()),
-            |observed| {
-                (
-                    format!("{:?}", observed.physical_state).to_lowercase(),
-                    observed.node_id.to_string(),
-                )
-            },
-        );
+            .unwrap_or_else(|| "creating".to_owned());
+        let node = cat.node_name.as_ref().map_or("-", |name| name.as_str());
         println!(
-            "{:<16} id={:<38} lifecycle={:<9} physical={:<22} node={} config={}",
-            cat.name, cat.id, lifecycle, physical, node, cat.current_runtime_config_id,
+            "{:<16} id={:<38} state={:<9} node={} disks={}",
+            cat.cat_slug,
+            cat.cat_id,
+            state,
+            node,
+            cat.mounts.len(),
         );
     }
-}
-
-fn runtime_product_item_id<'a>(value: &'a str, prefix: &str, resource: &str) -> Result<&'a str> {
-    anyhow::ensure!(
-        RuntimeId::new(value.to_owned()).is_some() && value.starts_with(prefix),
-        "{resource} item key must be an immutable {prefix} ID"
-    );
-    Ok(value)
 }
 
 /// Run the CLI; returns the process exit code.
@@ -1149,11 +1107,13 @@ pub fn run(cli: Cli) -> Result<()> {
             memory,
             mounts,
         } => {
+            let boot_image = Sha256Digest::new(boot_image_digest.clone())
+                .context("--boot-image must be an exact sha256 digest")?;
             let request = CreateCatRequest {
                 cat_slug: resource_slug("cat", name)?,
                 cpu: *cpus,
                 memory_bytes: parse_size(memory)?,
-                boot_image: boot_image_digest.clone(),
+                boot_image: boot_image.as_str().to_owned(),
                 mounts: parse_mounts(mounts)?,
             };
             request.validate().context("invalid Cat create request")?;
@@ -1164,20 +1124,24 @@ pub fn run(cli: Cli) -> Result<()> {
             print_cat_response(&response, cli.json)
         }
         Command::Ls => {
-            let cats: Vec<CatReadV2> = client.get_all_product_pages("/cats")?;
+            let cats: Vec<CatView> = serde_json::from_value(client.get("/cats")?)
+                .context("invalid semantic Cat list response")?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&cats).unwrap());
+                println!("{}", serde_json::to_string_pretty(&cats)?);
             } else {
                 for cat in &cats {
-                    print_runtime_cat(cat, false);
+                    cat.validate().context("invalid Cat list item")?;
+                    print_semantic_cat(cat, false);
                 }
             }
             Ok(())
         }
         Command::Get { id } => {
-            let id = runtime_product_item_id(id, "cat_", "Cat")?;
-            let cat: CatReadV2 = serde_json::from_value(client.get(&format!("/cats/{id}"))?)?;
-            print_runtime_cat(&cat, cli.json);
+            let slug = resource_slug("cat", id)?;
+            let cat: CatView = serde_json::from_value(client.get(&format!("/cats/{slug}"))?)
+                .context("invalid semantic Cat response")?;
+            cat.validate().context("invalid Cat response")?;
+            print_semantic_cat(&cat, cli.json);
             Ok(())
         }
         Command::Run { cat_id } => run_semantic_cat_action(&client, &cli, cat_id, "run"),
@@ -1409,20 +1373,25 @@ fn run_disk(client: &Client, cli: &Cli, cmd: &DiskCommand) -> Result<()> {
             print_disk_response(&response, cli.json)
         }
         DiskCommand::Ls => {
-            let disks: Vec<DiskReadV2> = client.get_all_product_pages("/disks")?;
+            let disks: Vec<DiskView> = serde_json::from_value(client.get("/disks")?)
+                .context("invalid semantic PersistentDisk list response")?;
             if cli.json {
-                println!("{}", runtime_disk_list_json(&disks)?);
+                println!("{}", serde_json::to_string_pretty(&disks)?);
             } else {
                 for disk in &disks {
-                    print_runtime_disk(disk, false);
+                    disk.validate()
+                        .context("invalid PersistentDisk list item")?;
+                    print_semantic_disk(disk, false);
                 }
             }
             Ok(())
         }
         DiskCommand::Get { id } => {
-            let id = runtime_product_item_id(id, "disk_", "Disk")?;
-            let disk: DiskReadV2 = serde_json::from_value(client.get(&format!("/disks/{id}"))?)?;
-            print_runtime_disk(&disk, cli.json);
+            let slug = resource_slug("disk", id)?;
+            let disk: DiskView = serde_json::from_value(client.get(&format!("/disks/{slug}"))?)
+                .context("invalid semantic PersistentDisk response")?;
+            disk.validate().context("invalid PersistentDisk response")?;
+            print_semantic_disk(&disk, cli.json);
             Ok(())
         }
         DiskCommand::Attach {
@@ -1478,31 +1447,21 @@ fn run_disk(client: &Client, cli: &Cli, cmd: &DiskCommand) -> Result<()> {
     }
 }
 
-fn runtime_disk_list_json(disks: &[DiskReadV2]) -> serde_json::Result<String> {
-    serde_json::to_string_pretty(disks)
-}
-
-fn print_runtime_disk(disk: &DiskReadV2, json_mode: bool) {
+fn print_semantic_disk(disk: &DiskView, json_mode: bool) {
     if json_mode {
         println!("{}", serde_json::to_string_pretty(disk).unwrap());
     } else {
-        let kind = match disk.kind {
-            cats_api::runtime_product_reads::DiskReadKind::Root { .. } => "root",
-            cats_api::runtime_product_reads::DiskReadKind::Persistent => "persistent",
-        };
         let bound_cat = disk
             .binding
             .as_ref()
-            .map(|binding| binding.cat_id.as_str())
+            .map(|binding| binding.cat_slug.as_str())
             .unwrap_or("-");
         println!(
-            "{:<16} id={:<38} {:>8} MiB kind={:<10} admin={:<8} durability={:<7} cat={}",
-            disk.name,
-            disk.id,
+            "{:<16} id={:<38} {:>8} MiB status={:<8} cat={}",
+            disk.disk_slug,
+            disk.disk_id,
             disk.size_bytes >> 20,
-            kind,
-            format!("{:?}", disk.admin_state).to_lowercase(),
-            format!("{:?}", disk.durability).to_lowercase(),
+            format!("{:?}", disk.status).to_lowercase(),
             bound_cat,
         );
     }
@@ -1539,6 +1498,29 @@ mod tests {
     }
 
     #[test]
+    fn create_rejects_a_boot_image_alias_before_http() {
+        use clap::Parser as _;
+
+        let error = run(Cli::parse_from([
+            "cats",
+            "--api-url",
+            "http://127.0.0.1:1",
+            "--token",
+            "test-token",
+            "--workspace",
+            "ws_01",
+            "create",
+            "app",
+            "--boot-image",
+            "ubuntu-24.04",
+        ]))
+        .expect_err("boot image aliases are not installed-mode identities");
+        assert!(error
+            .to_string()
+            .contains("--boot-image must be an exact sha256 digest"));
+    }
+
+    #[test]
     fn cli_parses_typical_commands() {
         use clap::Parser;
         assert!(matches!(
@@ -1559,7 +1541,7 @@ mod tests {
             "create",
             "dev",
             "--boot-image",
-            "ubuntu-24.04",
+            TEST_BOOT_IMAGE,
             "--cpu",
             "4",
             "--memory",
@@ -1576,11 +1558,11 @@ mod tests {
             } => {
                 assert_eq!(name, "dev");
                 assert_eq!(cpus, 4);
-                assert_eq!(boot_image_digest, "ubuntu-24.04");
+                assert_eq!(boot_image_digest, TEST_BOOT_IMAGE);
             }
             _ => panic!("wrong parse"),
         }
-        assert!(Cli::try_parse_from(["cats", "create", "x"]).is_ok());
+        assert!(Cli::try_parse_from(["cats", "create", "x"]).is_err());
         assert!(Cli::try_parse_from([
             "cats",
             "create",
@@ -2127,20 +2109,24 @@ mod tests {
     }
 
     #[test]
-    fn disk_ls_json_is_one_parseable_document_after_two_pages() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let server = std::thread::spawn(move || {
-            for (expected_path, body) in [
-                (
-                    "GET /v1/workspaces/ws_01/disks?limit=100 HTTP/1.1",
-                    br#"{"items":[{"version":1,"id":"disk_01","workspace_id":"ws_01","name":"one","size_bytes":1048576,"durability":"strict","created_at_unix_ms":1,"kind":{"kind":"persistent"},"admin_state":"active","binding":null}],"next_cursor":"cursor_01"}"#.as_slice(),
-                ),
-                (
-                    "GET /v1/workspaces/ws_01/disks?limit=100&cursor=cursor_01 HTTP/1.1",
-                    br#"{"items":[{"version":1,"id":"disk_02","workspace_id":"ws_01","name":"two","size_bytes":2097152,"durability":"relaxed","created_at_unix_ms":2,"kind":{"kind":"persistent"},"admin_state":"deleting","binding":null}],"next_cursor":null}"#.as_slice(),
-                ),
-            ] {
+    fn semantic_reads_use_current_slugs_and_unpaged_collections() {
+        use clap::Parser as _;
+
+        for (args, expected_path, response) in [
+            (
+                vec!["get", "app"],
+                "GET /v1/workspaces/ws_01/cats/app HTTP/1.1",
+                br#"{"cat_id":"cat_01","workspace_id":"ws_01","cat_slug":"app","state":"running","current_action":null,"node_id":"node_01","node_name":"worker-a","cpu":1,"memory_bytes":536870912,"boot_image":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","mounts":[],"last_error":null,"created_at_unix_ms":1,"updated_at_unix_ms":2,"destroyed_at_unix_ms":null}"#.as_slice(),
+            ),
+            (
+                vec!["disk", "ls"],
+                "GET /v1/workspaces/ws_01/disks HTTP/1.1",
+                br#"[{"disk_id":"disk_01","workspace_id":"ws_01","disk_slug":"data","size_bytes":1073741824,"status":"normal","binding":null,"created_at_unix_ms":1,"deleted_at_unix_ms":null}]"#.as_slice(),
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
                 let (headers, request_body) = read_request(&mut stream);
                 assert!(request_body.is_empty());
@@ -2149,29 +2135,22 @@ mod tests {
                     request_header(&headers, "authorization"),
                     "Bearer test-token"
                 );
-                write_json_response(&mut stream, body);
-            }
-        });
-
-        let items: Vec<DiskReadV2> = runtime_test_client(base)
-            .get_all_product_pages("/disks")
-            .unwrap();
-        assert_eq!(items.len(), 2);
-        let document = runtime_disk_list_json(&items).unwrap();
-        let reparsed: Vec<DiskReadV2> = serde_json::from_str(&document).unwrap();
-        assert_eq!(reparsed, items);
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn product_item_keys_are_resource_typed_immutable_ids() {
-        assert_eq!(
-            runtime_product_item_id("cat_01", "cat_", "Cat").unwrap(),
-            "cat_01"
-        );
-        assert!(runtime_product_item_id("demo", "cat_", "Cat").is_err());
-        assert!(runtime_product_item_id("disk_01", "cat_", "Cat").is_err());
-        assert!(runtime_product_item_id("cat_01/operations", "cat_", "Cat").is_err());
+                write_json_response(&mut stream, response);
+            });
+            let mut argv = vec![
+                "cats",
+                "--api-url",
+                &base,
+                "--token",
+                "test-token",
+                "--workspace",
+                "ws_01",
+                "--json",
+            ];
+            argv.extend(args);
+            run(Cli::parse_from(argv)).unwrap();
+            server.join().unwrap();
+        }
     }
 
     #[test]
@@ -2214,7 +2193,7 @@ mod tests {
             "create",
             "app",
             "--boot-image",
-            "ubuntu-24.04",
+            TEST_BOOT_IMAGE,
             "--cpu",
             "3",
             "--memory",
@@ -2239,7 +2218,7 @@ mod tests {
                 "cat_slug": "app",
                 "cpu": 3,
                 "memory_bytes": 2_147_483_648_u64,
-                "boot_image": "ubuntu-24.04",
+                "boot_image": TEST_BOOT_IMAGE,
                 "mounts": [
                     {"disk_slug": "data", "mount_path": "/srv/data"},
                     {"disk_slug": "logs", "mount_path": "/srv/logs"},

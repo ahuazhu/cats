@@ -232,12 +232,12 @@ impl GuestClient {
         Ok(resp.body)
     }
 
-    pub(crate) fn syncfs_before(&mut self, deadline: Instant) -> Result<()> {
+    pub fn syncfs_before(&mut self, deadline: Instant) -> Result<()> {
         self.request_before(GuestRequestBody::Syncfs, deadline)
             .map(|_| ())
     }
 
-    pub(crate) fn work_status_before(
+    pub fn work_status_before(
         &mut self,
         after_sequence: Option<u64>,
         wait_timeout_ms: u64,
@@ -255,7 +255,7 @@ impl GuestClient {
         }
     }
 
-    pub(crate) fn prepare_suspend_before(
+    pub fn prepare_suspend_before(
         &mut self,
         expected_lease_sequence: u64,
         deadline: Instant,

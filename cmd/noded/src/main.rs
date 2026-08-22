@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use cats_api::runtime_reconciliation::Id;
@@ -8,7 +9,9 @@ use cats_api::semantic_control::{
     CatAction, CatState, NodeHeartbeatRequest, NodeName, NodeRegistrationRequest, NodeStatus,
     NodedControlEndpoint, NodedServiceToken,
 };
-use cats_node_agent::semantic_installed::InstalledSemanticCatEffects;
+use cats_metadata_store_postgres::PostgresVolumeDataAuthority;
+use cats_node_agent::ch::{BlockPath, ChConfig};
+use cats_node_agent::semantic_installed::{InstalledCatConfig, InstalledSemanticCatEffects};
 use cats_node_agent::semantic_lifecycle::{
     semantic_node_router, SemanticActionCancellation, SemanticCatEffects, SemanticEffectError,
     SemanticEffectFuture, SemanticEffectRequest, SemanticNodeService,
@@ -17,6 +20,10 @@ use cats_node_agent::semantic_node_client::{
     HttpSemanticNodeTransport, NodeClientFuture, NodeHeartbeatSource, NodePlacementGate,
     SemanticNodeSupervisor,
 };
+use cats_object_store_aws_s3::AwsS3BlobStoreFactory;
+use cats_object_store_file::FileBlobStoreFactory;
+use cats_storage::authority::{CatVolumeStore, VolumeDataAuthority};
+use cats_storage::{open_blob_store, AdapterConfig, AdapterSelection, BlobStoreFactory};
 use clap::Parser;
 
 #[derive(Parser)]
@@ -29,7 +36,7 @@ struct Args {
     /// Externally reachable absolute origin reported during registration.
     #[arg(long)]
     control_endpoint: String,
-    #[arg(long, env = "CATS_NODED_SERVICE_TOKEN", hide_env_values = true)]
+    #[arg(long, env = "CATS_AUTH_TOKEN", hide_env_values = true)]
     service_token: String,
     #[arg(long)]
     node_id: String,
@@ -45,17 +52,70 @@ struct Args {
     instance_id: String,
     #[arg(long)]
     machine_type: String,
-    #[arg(long, env = "CATS_NODE_VERSION")]
+    #[arg(
+        long,
+        env = "CATS_NODE_VERSION",
+        default_value = env!("CARGO_PKG_VERSION")
+    )]
     node_version: String,
     #[arg(long, default_value_t = 1)]
     total_cpu: u32,
     #[arg(long, default_value_t = 8 * 1024 * 1024 * 1024_u64)]
     total_memory: u64,
-    /// VMM effects adapter. `fake` is for integration; `ch` selects the
-    /// installed bridge, which fails each action closed until all physical
-    /// authority inputs are available.
+    /// VMM effects adapter. `fake` is for process tests; `ch` owns the real
+    /// blockd, Cloud Hypervisor and Guest effects.
     #[arg(long, default_value = "fake")]
     vmm: String,
+    #[arg(long, default_value = "/var/lib/cats/semantic-node")]
+    state_directory: PathBuf,
+    #[arg(long, default_value = "/run/cats/semantic-node")]
+    runtime_directory: PathBuf,
+    #[arg(long, default_value = "/var/lib/cats/node/host.lock")]
+    host_lock: PathBuf,
+    #[arg(long, default_value = "/run/cats/blockd-v1")]
+    blockd_socket_root: PathBuf,
+    #[arg(long, default_value = "/opt/cats/bin/cats-blockd")]
+    blockd_bin: PathBuf,
+    #[arg(long)]
+    metadata_store_adapter: Option<String>,
+    #[arg(long = "metadata-store-option", value_name = "KEY=VALUE")]
+    metadata_store_options: Vec<String>,
+    #[arg(long)]
+    object_store_adapter: Option<String>,
+    #[arg(long = "object-store-option", value_name = "KEY=VALUE")]
+    object_store_options: Vec<String>,
+    #[arg(long, default_value_t = 8 * 1024 * 1024 * 1024_u64)]
+    root_size_bytes: u64,
+    #[arg(long, default_value_t = 60_000)]
+    volume_lease_duration_ms: u64,
+    #[arg(long, default_value_t = 120_000)]
+    effect_timeout_ms: u64,
+    #[arg(long, default_value_t = 60_000)]
+    guest_ready_timeout_ms: u64,
+    #[arg(
+        long,
+        env = "CATS_GUEST_RUNTIME_PROFILE_RECEIPT_FILE",
+        value_name = "PATH"
+    )]
+    guest_runtime_profile_receipt_file: Option<PathBuf>,
+    #[arg(long, default_value = "/usr/local/bin/cloud-hypervisor")]
+    ch_bin: PathBuf,
+    #[arg(long)]
+    ch_seed_image: Option<PathBuf>,
+    #[arg(long, default_value = "kernel-nbd")]
+    ch_block_path: String,
+    #[arg(long, default_value_t = false)]
+    ch_block_direct: bool,
+    #[arg(long, default_value_t = 1)]
+    ch_vhost_user_queues: usize,
+    #[arg(long, default_value_t = 256)]
+    ch_vhost_user_queue_size: u16,
+    #[arg(long, default_value = "/usr/sbin/nbd-client")]
+    ch_nbd_client: PathBuf,
+    #[arg(long, default_value_t = 64)]
+    ch_nbd_devices: u32,
+    #[arg(long, default_value = "/usr/sbin/ip")]
+    ch_ip_bin: PathBuf,
 }
 
 #[derive(Default)]
@@ -102,10 +162,91 @@ impl SemanticCatEffects for FakeSemanticEffects {
     }
 }
 
-fn semantic_effects(vmm: &str) -> anyhow::Result<Arc<dyn SemanticCatEffects>> {
-    match vmm {
+fn semantic_effects(args: &Args, node_id: &Id) -> anyhow::Result<Arc<dyn SemanticCatEffects>> {
+    match args.vmm.as_str() {
         "fake" => Ok(Arc::new(FakeSemanticEffects::default())),
-        "ch" => Ok(Arc::new(InstalledSemanticCatEffects::new())),
+        "ch" => {
+            let receipt_path = args
+                .guest_runtime_profile_receipt_file
+                .as_deref()
+                .context("--guest-runtime-profile-receipt-file is required for --vmm ch")?;
+            let installed =
+                cats_api::runtime_artifacts::load_installed_guest_runtime_profile_receipt(
+                    receipt_path,
+                )
+                .context("load installed Guest runtime profile")?;
+            cats_api::runtime_artifacts::validate_installed_node_guest_runtime(&installed)
+                .context("validate installed Guest runtime")?;
+            let metadata_name = args
+                .metadata_store_adapter
+                .clone()
+                .context("--metadata-store-adapter is required for --vmm ch")?;
+            anyhow::ensure!(
+                metadata_name == cats_metadata_store_postgres::ADAPTER_NAME,
+                "installed mode supports only the postgres metadata adapter"
+            );
+            let object_name = args
+                .object_store_adapter
+                .clone()
+                .context("--object-store-adapter is required for --vmm ch")?;
+            let metadata_config = AdapterConfig::from_cli(args.metadata_store_options.clone())
+                .context("metadata adapter options")?;
+            let object_config = AdapterConfig::from_cli(args.object_store_options.clone())
+                .context("object adapter options")?;
+            let authority = PostgresVolumeDataAuthority::open_runtime(&metadata_config)
+                .context("open PostgreSQL Cat volume authority")?;
+            let volume_store: Arc<dyn CatVolumeStore> = authority.clone();
+            let volume_data: Arc<dyn VolumeDataAuthority> = authority;
+            let object_factories: [&dyn BlobStoreFactory; 2] =
+                [&FileBlobStoreFactory, &AwsS3BlobStoreFactory];
+            let blob = open_blob_store(&object_name, &object_config, &object_factories)
+                .context("open installed object store")?;
+            let socket_root = cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::from_canonical_path(
+                cats_api::runtime_reconciliation::HostPath::new(
+                    args.blockd_socket_root.to_string_lossy().into_owned(),
+                )
+                .context("blockd socket root is not canonical")?,
+            )
+            .context("blockd socket root is invalid")?;
+            let boot_contract = installed.boot_contract();
+            let ch = ChConfig {
+                block_direct: args.ch_block_direct,
+                ch_bin: args.ch_bin.clone(),
+                kernel: cats_api::runtime_artifacts::GUEST_KERNEL_PATH.into(),
+                initramfs: boot_contract
+                    .initramfs()
+                    .map(|_| cats_api::runtime_artifacts::GUEST_INITRAMFS_PATH.into()),
+                boot_contract: Some(boot_contract),
+                cmdline: installed.receipt().kernel_cmdline.as_str().to_owned(),
+                seed_image: args.ch_seed_image.clone(),
+                block_path: BlockPath::parse(&args.ch_block_path)?,
+                vhost_user_queues: args.ch_vhost_user_queues,
+                vhost_user_queue_size: args.ch_vhost_user_queue_size,
+                nbd_client_bin: args.ch_nbd_client.clone(),
+                nbd_devices: args.ch_nbd_devices,
+                ip_bin: args.ch_ip_bin.clone(),
+            };
+            Ok(Arc::new(InstalledSemanticCatEffects::new(
+                InstalledCatConfig {
+                    node_id: node_id.clone(),
+                    state_directory: args.state_directory.clone(),
+                    runtime_directory: args.runtime_directory.clone(),
+                    host_lock: args.host_lock.clone(),
+                    blockd_binary: args.blockd_bin.clone(),
+                    blockd_socket_root: socket_root,
+                    metadata_store: AdapterSelection::new(metadata_name, metadata_config),
+                    object_store: AdapterSelection::new(object_name, object_config),
+                    ch,
+                    root_size_bytes: args.root_size_bytes,
+                    lease_duration_ms: args.volume_lease_duration_ms,
+                    effect_timeout: Duration::from_millis(args.effect_timeout_ms),
+                    guest_ready_timeout: Duration::from_millis(args.guest_ready_timeout_ms),
+                },
+                volume_store,
+                volume_data,
+                blob,
+            )?))
+        }
         unsupported => anyhow::bail!("unsupported --vmm {unsupported}; expected fake or ch"),
     }
 }
@@ -182,17 +323,12 @@ async fn main() -> anyhow::Result<()> {
         args.total_cpu > 0 && args.total_memory > 0,
         "Node heartbeat capacity must be positive"
     );
+    let node_id = Id::new(args.node_id.clone()).context("invalid node_id")?;
     let vmm_mode = args.vmm.clone();
-    let effects = semantic_effects(&vmm_mode)?;
-    if vmm_mode == "ch" {
-        tracing::warn!(
-            "installed semantic effects are fail-closed until physical authority inputs are available"
-        );
-    }
+    let effects = semantic_effects(&args, &node_id)?;
 
     let token = NodedServiceToken::new(args.service_token)
         .context("service token must satisfy the shared noded token contract")?;
-    let node_id = Id::new(args.node_id).context("invalid node_id")?;
     let registration = NodeRegistrationRequest {
         node_id: node_id.clone(),
         node_name: NodeName::new(args.node_name).context("invalid node_name")?,
@@ -299,7 +435,8 @@ async fn shutdown_signal() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use clap::CommandFactory as _;
+    use cats_api::runtime_reconciliation::Id;
+    use clap::{CommandFactory as _, Parser as _};
 
     #[test]
     fn semantic_entrypoint_has_no_old_poll_or_operation_runtime() {
@@ -334,10 +471,39 @@ mod tests {
     }
 
     #[test]
-    fn semantic_effect_selection_is_explicit_and_fail_closed_for_installed_mode() {
-        assert!(super::semantic_effects("fake").is_ok());
-        assert!(super::semantic_effects("ch").is_ok());
-        let error = match super::semantic_effects("other") {
+    fn semantic_effect_selection_is_explicit() {
+        let mut args = super::Args::try_parse_from([
+            "cats-noded",
+            "--control-plane-url",
+            "http://127.0.0.1:7300",
+            "--control-endpoint",
+            "http://127.0.0.1:7001",
+            "--service-token",
+            "test-service-token",
+            "--node-id",
+            "node_01",
+            "--node-name",
+            "worker-01",
+            "--vendor",
+            "test",
+            "--region",
+            "test-1",
+            "--zone",
+            "test-1a",
+            "--instance-id",
+            "instance-01",
+            "--machine-type",
+            "test.large",
+            "--node-version",
+            "test",
+            "--vmm",
+            "fake",
+        ])
+        .expect("parse fake noded arguments");
+        let node_id = Id::new("node_01").unwrap();
+        assert!(super::semantic_effects(&args, &node_id).is_ok());
+        args.vmm = "other".to_owned();
+        let error = match super::semantic_effects(&args, &node_id) {
             Ok(_) => panic!("unknown VMM must be rejected"),
             Err(error) => error,
         };

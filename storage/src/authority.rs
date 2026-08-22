@@ -92,10 +92,20 @@ pub struct AuthorizedServingAttachment {
 /// this carrier until the Start protocol defines a real Takeover grant arm;
 /// no compatibility or opaque proof arm exists.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuthorizedServingCurrentLeaseProof {
-    pub grant: Box<LifecycleCommandStartVolumeGrantReceipt>,
-    pub grant_receipt_digest: Sha256Digest,
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AuthorizedServingCurrentLeaseProof {
+    /// Historical atomic-lifecycle Start grant. This arm remains part of the
+    /// storage carrier while the corresponding lifecycle composition is
+    /// retired from Control and Node production entrypoints.
+    Lifecycle {
+        grant: Box<LifecycleCommandStartVolumeGrantReceipt>,
+        grant_receipt_digest: Sha256Digest,
+    },
+    /// Current direct Control/Node composition. The immutable independent
+    /// NormalAcquire request/result carried by `acquire` already binds the
+    /// owner, epoch, placement and initial expiry. This arm supplies only the
+    /// lease duration needed for an exact same-owner startup renewal.
+    DirectAcquire { lease_duration_ms: u64 },
 }
 
 /// Immutable, thick authority that created one serving attachment. Normal
@@ -117,12 +127,17 @@ pub enum AuthorizedServingAcquire {
 
 impl AuthorizedServingAttachment {
     pub fn lease_duration_ms(&self) -> u64 {
-        match &self.current_lease.grant.authority {
-            LifecycleStartVolumeGrantAuthority::NormalAcquire { request, .. } => {
-                request.lease_duration_ms
-            }
-            LifecycleStartVolumeGrantAuthority::RenewSameNode { request, .. } => {
-                request.lease_duration_ms.get()
+        match &self.current_lease {
+            AuthorizedServingCurrentLeaseProof::Lifecycle { grant, .. } => match &grant.authority {
+                LifecycleStartVolumeGrantAuthority::NormalAcquire { request, .. } => {
+                    request.lease_duration_ms
+                }
+                LifecycleStartVolumeGrantAuthority::RenewSameNode { request, .. } => {
+                    request.lease_duration_ms.get()
+                }
+            },
+            AuthorizedServingCurrentLeaseProof::DirectAcquire { lease_duration_ms } => {
+                *lease_duration_ms
             }
         }
     }
@@ -191,13 +206,50 @@ pub fn validate_authorized_serving_attachment(
     {
         return Err(AuthorityError::BackendUnknown);
     }
-    let grant = attachment.current_lease.grant.as_ref();
+    if let AuthorizedServingCurrentLeaseProof::DirectAcquire { lease_duration_ms } =
+        &attachment.current_lease
+    {
+        let (
+            AcquireOrigin::Normal { transition_id },
+            AuthorizedServingAcquire::Normal { request, result },
+        ) = (&identity.acquire_origin, &attachment.acquire)
+        else {
+            return Err(AuthorityError::BackendUnknown);
+        };
+        validate_normal_acquire_pair(request, result)?;
+        if attachment.transition_source != VolumeTransitionSource::Independent
+            || *lease_duration_ms == 0
+            || *lease_duration_ms != request.lease_duration_ms
+            || request.volume_id != identity.volume_id
+            || request.transition_id != *transition_id
+            || request.attachment_id != identity.attachment_id
+            || request.placement_epoch != identity.placement_epoch
+            || result.volume_id != identity.volume_id
+            || result.transition_id != *transition_id
+            || result.attachment_id != identity.attachment_id
+            || result.resulting_epoch != identity.attachment_epoch
+            || attachment.lease_expires_at < result.lease_expires_at
+            || !remote_head_is_same_or_later(&attachment.head, &result.resulting_head)
+        {
+            return Err(AuthorityError::BackendUnknown);
+        }
+        return Ok(());
+    }
+
+    let AuthorizedServingCurrentLeaseProof::Lifecycle {
+        grant,
+        grant_receipt_digest,
+    } = &attachment.current_lease
+    else {
+        unreachable!("semantic current-lease proof returned above")
+    };
+    let grant = grant.as_ref();
     let recomputed_grant_digest =
         crate::lifecycle_volume::command_start_volume_grant_receipt_digest_from_closed_receipt(
             grant,
         )
         .map_err(|_| AuthorityError::BackendUnknown)?;
-    if recomputed_grant_digest != attachment.current_lease.grant_receipt_digest
+    if recomputed_grant_digest != *grant_receipt_digest
         || grant.volume.volume_id != identity.volume_id
         || grant.volume.size_bytes != attachment.size_bytes
         || grant.volume.durability != attachment.durability
@@ -376,9 +428,77 @@ pub fn authorized_serving_attachment_from_start_volume_grant(
             request: acquire_request,
             result: acquire_result,
         },
-        current_lease: AuthorizedServingCurrentLeaseProof {
+        current_lease: AuthorizedServingCurrentLeaseProof::Lifecycle {
             grant: Box::new(grant.clone()),
             grant_receipt_digest: grant_receipt_digest.clone(),
+        },
+    };
+    validate_authorized_serving_attachment(&attachment)?;
+    Ok(attachment)
+}
+
+/// Construct the blockd carrier for the direct Control/Node protocol from
+/// one independent NormalAcquire and a current same-owner authority reread.
+///
+/// The direct protocol does not manufacture a lifecycle Operation or Start
+/// receipt. The caller must have committed the acquire (or discovered its
+/// exact replay), and must pass the current head/expiry from the same locked
+/// authority row. Blockd independently rereads and renews this owner before it
+/// exposes Guest I/O.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectAcquireServingInput {
+    pub node_id: Id,
+    pub size_bytes: u64,
+    pub durability: VolumeDurability,
+    pub request: NormalAcquireRequest,
+    pub result: NormalAcquireResult,
+    pub current_head: RemoteHead,
+    pub current_lease_expires_at: UnixMillis,
+    pub object_write_credential: Option<ObjectWriteCredentialReference>,
+}
+
+pub fn authorized_serving_attachment_from_direct_acquire(
+    input: DirectAcquireServingInput,
+) -> Result<AuthorizedServingAttachment> {
+    let DirectAcquireServingInput {
+        node_id,
+        size_bytes,
+        durability,
+        request,
+        result,
+        current_head,
+        current_lease_expires_at,
+        object_write_credential,
+    } = input;
+    validate_normal_acquire_pair(&request, &result)?;
+    if current_lease_expires_at < result.lease_expires_at
+        || !remote_head_is_same_or_later(&current_head, &result.resulting_head)
+    {
+        return Err(AuthorityError::BackendUnknown);
+    }
+    let attachment = AuthorizedServingAttachment {
+        identity: AttachmentLineageIdentity {
+            volume_id: request.volume_id.clone(),
+            attachment_id: request.attachment_id.clone(),
+            attachment_epoch: result.resulting_epoch,
+            acquire_origin: AcquireOrigin::Normal {
+                transition_id: request.transition_id.clone(),
+            },
+            node_id,
+            placement_epoch: request.placement_epoch,
+        },
+        transition_source: VolumeTransitionSource::Independent,
+        object_write_credential,
+        size_bytes,
+        durability,
+        head: current_head,
+        lease_expires_at: current_lease_expires_at,
+        acquire: AuthorizedServingAcquire::Normal {
+            request: request.clone(),
+            result,
+        },
+        current_lease: AuthorizedServingCurrentLeaseProof::DirectAcquire {
+            lease_duration_ms: request.lease_duration_ms,
         },
     };
     validate_authorized_serving_attachment(&attachment)?;
@@ -630,6 +750,116 @@ pub trait VolumeDataAuthority: Send + Sync {
     fn renew_lease(&self, request: &RenewLeaseRequest) -> Result<RenewLeaseResult>;
     /// Replaces only the complete predecessor head under the named grant.
     fn compare_and_swap_head(&self, request: &VolumeHeadCasRequest) -> Result<VolumeHeadCasResult>;
+}
+
+/// Root identity created or discovered from one current Cat row.
+/// These fields are internal storage coordinates; they are not part of the
+/// user-facing Cat API and carry no caller-generated idempotency key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootVolumeSpec {
+    pub workspace_id: Id,
+    pub cat_id: Id,
+    pub disk_id: Id,
+    pub volume_id: Id,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PersistentInitialization {
+    Uninitialized {
+        initialization_token: RandomId128,
+        expected_blank_head: RemoteHead,
+    },
+    Initialized {
+        initialized_head: RemoteHead,
+    },
+}
+
+/// Exact product/storage join used to attach one volume to a Cat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatVolumeRole {
+    Root {
+        cat_id: Id,
+    },
+    Persistent {
+        cat_id: Id,
+        filesystem_uuid: RandomId128,
+        mount_path: cats_api::runtime_reconciliation::HostPath,
+        initialization: PersistentInitialization,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatVolume {
+    pub workspace_id: Id,
+    pub disk_id: Id,
+    pub volume_id: Id,
+    pub size_bytes: u64,
+    pub durability: VolumeDurability,
+    pub head: RemoteHead,
+    pub role: CatVolumeRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeAttachRequest {
+    pub node_id: Id,
+    pub volume: CatVolume,
+    pub lease_duration_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachedVolume {
+    pub volume: CatVolume,
+    pub serving: AuthorizedServingAttachment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistentInitializationCommit {
+    pub attached: AttachedVolume,
+    pub initialized_head: RemoteHead,
+    /// Canonical Guest filesystem-control response joined to this commit.
+    pub guest_evidence: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootDeleteState {
+    Absent,
+    Deleting,
+}
+
+/// Provider-neutral storage transition port used by the Node
+/// composition. Its identities are derived from the current Cat, volume and
+/// authority row; no external request ID or lifecycle Operation enters this
+/// boundary.
+pub trait CatVolumeStore: Send + Sync {
+    fn ensure_root_volume(&self, spec: &RootVolumeSpec) -> Result<CatVolume>;
+
+    fn load_persistent_volume(
+        &self,
+        workspace_id: &Id,
+        cat_id: &Id,
+        disk_id: &Id,
+        volume_id: &Id,
+        filesystem_uuid: &RandomId128,
+        mount_path: &cats_api::runtime_reconciliation::HostPath,
+    ) -> Result<CatVolume>;
+
+    fn attach_volume(&self, request: &VolumeAttachRequest) -> Result<AttachedVolume>;
+
+    fn detach_volume(&self, attached: &AttachedVolume) -> Result<()>;
+
+    /// Release every volume still attributed to this Node after the caller
+    /// has synchronously stopped all of its local VMM/blockd processes.
+    fn detach_node_volumes(&self, node_id: &Id) -> Result<usize>;
+
+    fn commit_persistent_initialization(
+        &self,
+        commit: &PersistentInitializationCommit,
+    ) -> Result<CatVolume>;
+
+    fn begin_root_delete(&self, volume: &CatVolume) -> Result<RootDeleteState>;
+
+    fn complete_root_delete(&self, volume: &CatVolume) -> Result<()>;
 }
 
 /// Provider-neutral, read-only authority snapshot used only by the signed

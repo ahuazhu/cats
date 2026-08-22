@@ -18,21 +18,6 @@ GUEST_RUNTIME_RELEASE_SOURCE=${CATS_GUEST_RUNTIME_RELEASE_DIR:-}
   echo "CATS_GUEST_RUNTIME_RELEASE_DIR must name the qualified guest-runtime-release.v1 payload" >&2
   exit 1
 }
-for route_v2_artifact in \
-  gateway-workload-authority.v1.json \
-  gateway-client-ca-bundle.pem \
-  control-machine-server-certificate.pem \
-  control-machine-server-private-key.pem \
-  signer.v1.json \
-  public-key-ring.v1.json \
-  rotation-operator-trust.v1.json \
-  signer-private-key.pem
-do
-  [[ -f /etc/cats/route-v2/$route_v2_artifact ]] || {
-    echo "/etc/cats/route-v2/$route_v2_artifact missing: install the closed Route v2 control artifact set before Cats" >&2
-    exit 1
-  }
-done
 "$REPO/deploy/aws/metal/validate-node-identity-installation.sh"
 . "$REPO/deploy/aws/metal/worker-deployment-transaction.sh"
 
@@ -103,7 +88,7 @@ cats_gate_node_service cats-noded
 cats_worker_deployment_crash_probe after-mask-worker
 # `enable --now` does not restart an already-running service. Stop Control
 # before replacing its binary/unit so the process that later becomes Ready is
-# necessarily the mandatory Route v2 composition from this release.
+# necessarily the direct semantic composition from this release.
 systemctl stop cats-controld.service >/dev/null 2>&1 || true
 
 install -D -m 0755 "$REPO/deploy/aws/metal/install-guest-runtime-release.sh" \
@@ -131,7 +116,7 @@ cats_worker_deployment_crash_probe after-installer-return
 echo "==> install binaries to $PREFIX/bin"
 install -d "$PREFIX/bin"
 cats_worker_deployment_crash_probe after-install-bin-directory
-for bin in cats cats-controld cats-noded cats-vmm-launcher cats-blockd cats-guest-agent; do
+for bin in cats cats-controld cats-noded cats-blockd cats-guest-agent; do
   install -m 0755 "$REPO/target/release/$bin" "$PREFIX/bin/$bin"
   cats_worker_deployment_crash_probe "after-install-$bin"
 done

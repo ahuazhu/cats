@@ -771,6 +771,52 @@ fn registration_starts_liveness_clock_and_offline_cas_rejects_racing_heartbeat()
 }
 
 #[test]
+fn completed_node_reset_stays_closed_until_current_cats_are_recovered() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    register_second_node(&store);
+    create_running_cat(&store, "cat-reset-recovery", "reset-recovery");
+
+    let mut completed = registration("node-a", "http://10.0.0.1:8443");
+    completed.reset_completed = true;
+    assert!(matches!(
+        store.register_semantic_node(completed.clone()).unwrap(),
+        RegisterNodeOutcome::ResetRequired(NodeRecord {
+            status: NodeStatus::ResetRequired,
+            ..
+        })
+    ));
+
+    let ClaimSemanticCatRecoveryOutcome::Claimed(claim) = store
+        .claim_semantic_cat_recovery("node-a", "cat-reset-recovery")
+        .unwrap()
+    else {
+        panic!("reset Node Cat must receive a recovery claim")
+    };
+    assert_eq!(claim.target_node_id, "node-b");
+    store
+        .finish_semantic_cat_recovery(
+            SemanticCatRecoverySettlement {
+                cat_id: "cat-reset-recovery",
+                source_node_id: "node-a",
+                target_node_id: "node-b",
+                target_state: CatState::Running,
+            },
+            SemanticCatRecoveryResult::Recovered,
+        )
+        .unwrap()
+        .expect("settle recovered Cat away from reset Node");
+
+    assert!(matches!(
+        store.register_semantic_node(completed).unwrap(),
+        RegisterNodeOutcome::RegistrationUpdated(NodeRecord {
+            status: NodeStatus::Running,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn offline_recovery_claim_replaces_old_lane_and_exactly_moves_placement() {
     let (store, _) = store_and_url();
     register_node(&store);

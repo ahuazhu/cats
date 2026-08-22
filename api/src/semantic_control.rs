@@ -640,6 +640,7 @@ impl CatIngressTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodedCatConfig {
+    pub workspace_id: Id,
     pub cpu: u32,
     pub memory_bytes: u64,
     pub boot_image: String,
@@ -649,6 +650,7 @@ pub struct NodedCatConfig {
 
 impl NodedCatConfig {
     pub fn validate(&self) -> Result<(), SemanticValidationError> {
+        validate_prefixed_id(&self.workspace_id, "ws_")?;
         if self.cpu == 0 {
             return Err(SemanticValidationError::Cpu);
         }
@@ -1259,6 +1261,7 @@ mod tests {
             state: None,
             active_action: Some(CatAction::Create),
             config: NodedCatConfig {
+                workspace_id: id("ws_01"),
                 cpu: 1,
                 memory_bytes: 1,
                 boot_image: "image".to_owned(),

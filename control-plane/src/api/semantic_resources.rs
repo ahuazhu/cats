@@ -17,8 +17,8 @@ use axum::routing::post;
 use axum::{Json, Router};
 use cats_api::error::ErrorCode;
 use cats_api::semantic_control::{
-    AttachDiskRequest, CatAction, CatResponse, CreateCatRequest, CreateDiskRequest,
-    DetachDiskRequest, DiskResponse, ResourceSlug, SemanticErrorBody, SemanticErrorCode,
+    AttachDiskRequest, CatAction, CatResponse, CatView, CreateCatRequest, CreateDiskRequest,
+    DetachDiskRequest, DiskResponse, DiskView, ResourceSlug, SemanticErrorBody, SemanticErrorCode,
     SemanticSuccessCode,
 };
 use serde::de::DeserializeOwned;
@@ -27,12 +27,14 @@ use super::{check_workspace_auth, Failure};
 use crate::server::AppState;
 
 pub const CATS_COLLECTION_PATH: &str = "/v1/workspaces/{workspace}/cats";
+pub const CAT_ITEM_PATH: &str = "/v1/workspaces/{workspace}/cats/{cat}";
 pub const CAT_RUN_PATH: &str = "/v1/workspaces/{workspace}/cats/{cat}/actions/run";
 pub const CAT_SUSPEND_PATH: &str = "/v1/workspaces/{workspace}/cats/{cat}/actions/suspend";
 pub const CAT_WARM_PATH: &str = "/v1/workspaces/{workspace}/cats/{cat}/actions/warm";
 pub const CAT_COLD_PATH: &str = "/v1/workspaces/{workspace}/cats/{cat}/actions/cold";
 pub const CAT_DESTROY_PATH: &str = "/v1/workspaces/{workspace}/cats/{cat}/actions/destroy";
 pub const DISKS_COLLECTION_PATH: &str = "/v1/workspaces/{workspace}/disks";
+pub const DISK_ITEM_PATH: &str = "/v1/workspaces/{workspace}/disks/{disk}";
 pub const DISK_ATTACH_PATH: &str = "/v1/workspaces/{workspace}/disks/{disk}/actions/attach";
 pub const DISK_DETACH_PATH: &str = "/v1/workspaces/{workspace}/disks/{disk}/actions/detach";
 pub const DISK_DESTROY_PATH: &str = "/v1/workspaces/{workspace}/disks/{disk}/actions/destroy";
@@ -48,6 +50,28 @@ pub type SemanticResourceFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send +
 /// `workspace_id` is the authenticated immutable Workspace ID returned by
 /// `check_workspace_auth`, never an untrusted value copied from the URL.
 pub trait SemanticResourceApi: Send + Sync {
+    fn list_cats<'a>(
+        &'a self,
+        workspace_id: &'a str,
+    ) -> SemanticResourceFuture<'a, Result<Vec<CatView>, SemanticErrorBody>>;
+
+    fn get_cat<'a>(
+        &'a self,
+        workspace_id: &'a str,
+        cat_slug: ResourceSlug,
+    ) -> SemanticResourceFuture<'a, Result<CatView, SemanticErrorBody>>;
+
+    fn list_disks<'a>(
+        &'a self,
+        workspace_id: &'a str,
+    ) -> SemanticResourceFuture<'a, Result<Vec<DiskView>, SemanticErrorBody>>;
+
+    fn get_disk<'a>(
+        &'a self,
+        workspace_id: &'a str,
+        disk_slug: ResourceSlug,
+    ) -> SemanticResourceFuture<'a, Result<DiskView, SemanticErrorBody>>;
+
     fn create_cat<'a>(
         &'a self,
         workspace_id: &'a str,
@@ -88,21 +112,105 @@ pub trait SemanticResourceApi: Send + Sync {
     ) -> SemanticResourceFuture<'a, Result<DiskResponse, SemanticErrorBody>>;
 }
 
-/// Builds only the new semantic mutation routes. Production composition
-/// merges this router explicitly after retiring the old handlers.
+/// Builds the clean-slate semantic resource routes. Production composition
+/// merges this router explicitly after retiring the old product handlers.
 pub fn routes(service: Arc<dyn SemanticResourceApi>) -> Router<AppState> {
     Router::<AppState>::new()
-        .route(CATS_COLLECTION_PATH, post(create_cat))
+        .route(CATS_COLLECTION_PATH, post(create_cat).get(list_cats))
+        .route(CAT_ITEM_PATH, axum::routing::get(get_cat))
         .route(CAT_RUN_PATH, post(run_cat))
         .route(CAT_SUSPEND_PATH, post(suspend_cat))
         .route(CAT_WARM_PATH, post(warm_cat))
         .route(CAT_COLD_PATH, post(cold_cat))
         .route(CAT_DESTROY_PATH, post(destroy_cat))
-        .route(DISKS_COLLECTION_PATH, post(create_disk))
+        .route(DISKS_COLLECTION_PATH, post(create_disk).get(list_disks))
+        .route(DISK_ITEM_PATH, axum::routing::get(get_disk))
         .route(DISK_ATTACH_PATH, post(attach_disk))
         .route(DISK_DETACH_PATH, post(detach_disk))
         .route(DISK_DESTROY_PATH, post(destroy_disk))
         .layer(Extension(service))
+}
+
+async fn list_cats(
+    State(state): State<AppState>,
+    Extension(service): Extension<Arc<dyn SemanticResourceApi>>,
+    Path(workspace): Path<String>,
+    request: Request<Body>,
+) -> Result<Response, SemanticHttpFailure> {
+    let workspace_id = authenticated_workspace_id(&state, request.headers(), &workspace).await?;
+    reject_retired_headers(request.headers())?;
+    reject_query(request.uri())?;
+    require_empty_body(request).await?;
+    let cats = service
+        .list_cats(&workspace_id)
+        .await
+        .map_err(SemanticHttpFailure)?;
+    for cat in &cats {
+        cat.validate()
+            .map_err(|error| internal_error(format!("service returned invalid Cat: {error}")))?;
+    }
+    Ok(success_response(StatusCode::OK, cats))
+}
+
+async fn get_cat(
+    State(state): State<AppState>,
+    Extension(service): Extension<Arc<dyn SemanticResourceApi>>,
+    Path((workspace, cat)): Path<(String, String)>,
+    request: Request<Body>,
+) -> Result<Response, SemanticHttpFailure> {
+    let workspace_id = authenticated_workspace_id(&state, request.headers(), &workspace).await?;
+    reject_retired_headers(request.headers())?;
+    reject_query(request.uri())?;
+    require_empty_body(request).await?;
+    let cat = service
+        .get_cat(&workspace_id, resource_slug(cat, "Cat")?)
+        .await
+        .map_err(SemanticHttpFailure)?;
+    cat.validate()
+        .map_err(|error| internal_error(format!("service returned invalid Cat: {error}")))?;
+    Ok(success_response(StatusCode::OK, cat))
+}
+
+async fn list_disks(
+    State(state): State<AppState>,
+    Extension(service): Extension<Arc<dyn SemanticResourceApi>>,
+    Path(workspace): Path<String>,
+    request: Request<Body>,
+) -> Result<Response, SemanticHttpFailure> {
+    let workspace_id = authenticated_workspace_id(&state, request.headers(), &workspace).await?;
+    reject_retired_headers(request.headers())?;
+    reject_query(request.uri())?;
+    require_empty_body(request).await?;
+    let disks = service
+        .list_disks(&workspace_id)
+        .await
+        .map_err(SemanticHttpFailure)?;
+    for disk in &disks {
+        disk.validate().map_err(|error| {
+            internal_error(format!("service returned invalid PersistentDisk: {error}"))
+        })?;
+    }
+    Ok(success_response(StatusCode::OK, disks))
+}
+
+async fn get_disk(
+    State(state): State<AppState>,
+    Extension(service): Extension<Arc<dyn SemanticResourceApi>>,
+    Path((workspace, disk)): Path<(String, String)>,
+    request: Request<Body>,
+) -> Result<Response, SemanticHttpFailure> {
+    let workspace_id = authenticated_workspace_id(&state, request.headers(), &workspace).await?;
+    reject_retired_headers(request.headers())?;
+    reject_query(request.uri())?;
+    require_empty_body(request).await?;
+    let disk = service
+        .get_disk(&workspace_id, resource_slug(disk, "PersistentDisk")?)
+        .await
+        .map_err(SemanticHttpFailure)?;
+    disk.validate().map_err(|error| {
+        internal_error(format!("service returned invalid PersistentDisk: {error}"))
+    })?;
+    Ok(success_response(StatusCode::OK, disk))
 }
 
 async fn create_cat(
@@ -479,6 +587,68 @@ mod tests {
     }
 
     impl SemanticResourceApi for MockApi {
+        fn list_cats<'a>(
+            &'a self,
+            _workspace_id: &'a str,
+        ) -> SemanticResourceFuture<'a, Result<Vec<CatView>, SemanticErrorBody>> {
+            Box::pin(async {
+                Ok(vec![
+                    cat_response_fixture(
+                        slug("web"),
+                        SemanticStatus::Ok,
+                        SemanticSuccessCode::CatCreated,
+                    )
+                    .cat,
+                ])
+            })
+        }
+
+        fn get_cat<'a>(
+            &'a self,
+            _workspace_id: &'a str,
+            cat_slug: ResourceSlug,
+        ) -> SemanticResourceFuture<'a, Result<CatView, SemanticErrorBody>> {
+            Box::pin(async move {
+                Ok(cat_response_fixture(
+                    cat_slug,
+                    SemanticStatus::Ok,
+                    SemanticSuccessCode::CatCreated,
+                )
+                .cat)
+            })
+        }
+
+        fn list_disks<'a>(
+            &'a self,
+            _workspace_id: &'a str,
+        ) -> SemanticResourceFuture<'a, Result<Vec<DiskView>, SemanticErrorBody>> {
+            Box::pin(async {
+                Ok(vec![
+                    disk_response_fixture(
+                        slug("data"),
+                        SemanticStatus::Ok,
+                        SemanticSuccessCode::DiskCreated,
+                    )
+                    .disk,
+                ])
+            })
+        }
+
+        fn get_disk<'a>(
+            &'a self,
+            _workspace_id: &'a str,
+            disk_slug: ResourceSlug,
+        ) -> SemanticResourceFuture<'a, Result<DiskView, SemanticErrorBody>> {
+            Box::pin(async move {
+                Ok(disk_response_fixture(
+                    disk_slug,
+                    SemanticStatus::Ok,
+                    SemanticSuccessCode::DiskCreated,
+                )
+                .disk)
+            })
+        }
+
         fn create_cat<'a>(
             &'a self,
             workspace_id: &'a str,
@@ -785,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn route_fixture_has_only_documented_semantic_mutations() {
+    fn route_fixture_has_only_documented_semantic_resources() {
         let _router: Router<AppState> = routes(Arc::new(MockApi::new()));
         let source = include_str!("semantic_resources.rs")
             .split_once("#[cfg(test)]")
@@ -793,12 +963,14 @@ mod tests {
             .0;
         for (name, path) in [
             ("CATS_COLLECTION_PATH", CATS_COLLECTION_PATH),
+            ("CAT_ITEM_PATH", CAT_ITEM_PATH),
             ("CAT_RUN_PATH", CAT_RUN_PATH),
             ("CAT_SUSPEND_PATH", CAT_SUSPEND_PATH),
             ("CAT_WARM_PATH", CAT_WARM_PATH),
             ("CAT_COLD_PATH", CAT_COLD_PATH),
             ("CAT_DESTROY_PATH", CAT_DESTROY_PATH),
             ("DISKS_COLLECTION_PATH", DISKS_COLLECTION_PATH),
+            ("DISK_ITEM_PATH", DISK_ITEM_PATH),
             ("DISK_ATTACH_PATH", DISK_ATTACH_PATH),
             ("DISK_DETACH_PATH", DISK_DETACH_PATH),
             ("DISK_DESTROY_PATH", DISK_DESTROY_PATH),

@@ -93,6 +93,16 @@ impl ResourceStoreError {
 }
 
 pub trait SemanticResourceStore: Send + Sync {
+    fn current_cat_ids<'a>(
+        &'a self,
+        workspace_id: &'a str,
+    ) -> SemanticResourceFuture<'a, Result<Vec<String>, ResourceStoreError>>;
+
+    fn current_disk_ids<'a>(
+        &'a self,
+        workspace_id: &'a str,
+    ) -> SemanticResourceFuture<'a, Result<Vec<String>, ResourceStoreError>>;
+
     fn current_disk<'a>(
         &'a self,
         workspace_id: &'a str,
@@ -174,6 +184,34 @@ impl PostgresSemanticResourceStore {
 }
 
 impl SemanticResourceStore for PostgresSemanticResourceStore {
+    fn current_cat_ids<'a>(
+        &'a self,
+        workspace_id: &'a str,
+    ) -> SemanticResourceFuture<'a, Result<Vec<String>, ResourceStoreError>> {
+        let store = Arc::clone(&self.store);
+        let workspace_id = workspace_id.to_owned();
+        Box::pin(async move {
+            store
+                .execute(move |store| store.list_current_semantic_cat_ids(&workspace_id))
+                .await
+                .map_err(resource_store_error)
+        })
+    }
+
+    fn current_disk_ids<'a>(
+        &'a self,
+        workspace_id: &'a str,
+    ) -> SemanticResourceFuture<'a, Result<Vec<String>, ResourceStoreError>> {
+        let store = Arc::clone(&self.store);
+        let workspace_id = workspace_id.to_owned();
+        Box::pin(async move {
+            store
+                .execute(move |store| store.list_current_semantic_disk_ids(&workspace_id))
+                .await
+                .map_err(resource_store_error)
+        })
+    }
+
     fn current_disk<'a>(
         &'a self,
         workspace_id: &'a str,
@@ -825,6 +863,64 @@ where
     R: SemanticResourceStore,
     B: SemanticPersistentDiskBackend,
 {
+    fn list_cats<'a>(
+        &'a self,
+        workspace_id: &'a str,
+    ) -> SemanticResourceFuture<'a, Result<Vec<wire::CatView>, wire::SemanticErrorBody>> {
+        Box::pin(async move {
+            let ids = self
+                .resources
+                .current_cat_ids(workspace_id)
+                .await
+                .map_err(internal_resource_error)?;
+            let mut cats = Vec::with_capacity(ids.len());
+            for id in ids {
+                cats.push(self.project_cat(&id).await?);
+            }
+            Ok(cats)
+        })
+    }
+
+    fn get_cat<'a>(
+        &'a self,
+        workspace_id: &'a str,
+        cat_slug: wire::ResourceSlug,
+    ) -> SemanticResourceFuture<'a, Result<wire::CatView, wire::SemanticErrorBody>> {
+        Box::pin(async move {
+            let cat = self.current_cat(workspace_id, &cat_slug).await?;
+            self.project_cat(&cat.cat_id).await
+        })
+    }
+
+    fn list_disks<'a>(
+        &'a self,
+        workspace_id: &'a str,
+    ) -> SemanticResourceFuture<'a, Result<Vec<wire::DiskView>, wire::SemanticErrorBody>> {
+        Box::pin(async move {
+            let ids = self
+                .resources
+                .current_disk_ids(workspace_id)
+                .await
+                .map_err(internal_resource_error)?;
+            let mut disks = Vec::with_capacity(ids.len());
+            for id in ids {
+                disks.push(self.project_disk(&id).await?);
+            }
+            Ok(disks)
+        })
+    }
+
+    fn get_disk<'a>(
+        &'a self,
+        workspace_id: &'a str,
+        disk_slug: wire::ResourceSlug,
+    ) -> SemanticResourceFuture<'a, Result<wire::DiskView, wire::SemanticErrorBody>> {
+        Box::pin(async move {
+            let disk = self.current_disk(workspace_id, &disk_slug).await?;
+            self.project_disk(&disk.disk_id).await
+        })
+    }
+
     fn create_cat<'a>(
         &'a self,
         workspace_id: &'a str,
@@ -1539,6 +1635,34 @@ mod tests {
     }
 
     impl SemanticResourceStore for MockResources {
+        fn current_cat_ids<'a>(
+            &'a self,
+            workspace_id: &'a str,
+        ) -> SemanticResourceFuture<'a, Result<Vec<String>, ResourceStoreError>> {
+            let ids = self
+                .cat
+                .iter()
+                .filter(|cat| cat.workspace_id == workspace_id)
+                .map(|cat| cat.cat_id.clone())
+                .collect();
+            Box::pin(async move { Ok(ids) })
+        }
+
+        fn current_disk_ids<'a>(
+            &'a self,
+            workspace_id: &'a str,
+        ) -> SemanticResourceFuture<'a, Result<Vec<String>, ResourceStoreError>> {
+            let ids = self
+                .disk
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|disk| disk.workspace_id == workspace_id)
+                .map(|disk| disk.disk_id.clone())
+                .collect();
+            Box::pin(async move { Ok(ids) })
+        }
+
         fn current_disk<'a>(
             &'a self,
             workspace_id: &'a str,

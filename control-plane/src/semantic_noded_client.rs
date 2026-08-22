@@ -503,7 +503,7 @@ mod tests {
             (Method::GET, NODED_CATS_PATH) => (200, r#"{"cats":[]}"#.to_owned()),
             (Method::GET, "/v1/cats/cat_01") => (
                 200,
-                r#"{"cat_id":"cat_01","state":null,"active_action":"create","config":{"cpu":2,"memory_bytes":4096,"boot_image":"image","mounts":[]}}"#.to_owned(),
+                r#"{"cat_id":"cat_01","state":null,"active_action":"create","config":{"workspace_id":"ws_01","cpu":2,"memory_bytes":4096,"boot_image":"image","mounts":[]}}"#.to_owned(),
             ),
             (Method::PUT, "/v1/cats/cat_01")
             | (Method::POST, "/v1/cats/cat_01/actions/run") => (
@@ -557,6 +557,7 @@ mod tests {
 
     fn config() -> NodedCatConfig {
         NodedCatConfig {
+            workspace_id: Id::new("ws_01").unwrap(),
             cpu: 2,
             memory_bytes: 4096,
             boot_image: "image".to_owned(),
@@ -627,7 +628,7 @@ mod tests {
         assert_eq!(seen[3].path, "/v1/cats/cat_01");
         assert_eq!(
             seen[3].body,
-            br#"{"cpu":2,"memory_bytes":4096,"boot_image":"image","mounts":[{"disk_id":"disk_01","volume_id":"vol_01","filesystem_uuid":"11111111111111111111111111111111","format":"ext4","mount_path":"/data"}]}"#
+            br#"{"workspace_id":"ws_01","cpu":2,"memory_bytes":4096,"boot_image":"image","mounts":[{"disk_id":"disk_01","volume_id":"vol_01","filesystem_uuid":"11111111111111111111111111111111","format":"ext4","mount_path":"/data"}]}"#
         );
         assert_eq!(seen[4].method, Method::POST);
         assert_eq!(seen[4].path, "/v1/cats/cat_01/actions/run");

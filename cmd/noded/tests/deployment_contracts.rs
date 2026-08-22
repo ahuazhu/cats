@@ -89,21 +89,14 @@ fn deployment_units_take_the_pinned_guest_cmdline_only_from_the_shared_receipt()
         assert!(text.contains(
             "--guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json"
         ));
-        assert!(text.contains("--vmm-launcher-bin /opt/cats/bin/cats-vmm-launcher"));
+        assert!(!text.contains("--vmm-launcher-bin"));
         for exact in [
-            "--route-v2-machine-listen 0.0.0.0:7444",
-            "--route-v2-rotation-origin",
-            "--runtime-systemctl-bin /usr/bin/systemctl",
-            "--runtime-systemd-run-bin /usr/bin/systemd-run",
-            "--runtime-cgroup-root /sys/fs/cgroup",
-            "--runtime-proc-root /proc",
-            "--runtime-network-class-root /sys/class/net",
-            "--runtime-sys-block-root /sys/block",
-            "--runtime-device-root /dev",
-            "--runtime-blockd-socket-root /run/cats/blockd-v1",
-            "--runtime-vmm-socket-root /run/cats/vmm-v1",
-            "--runtime-inventory-scan-timeout-ms 5000",
-            "--runtime-effect-step-timeout-ms 30000",
+            "--control-endpoint",
+            "--node-id",
+            "--node-name",
+            "--host-lock /var/lib/cats/node/host.lock",
+            "--blockd-socket-root /run/cats/blockd-v1",
+            "--effect-timeout-ms 30000",
         ] {
             assert!(
                 text.contains(exact),
@@ -123,24 +116,13 @@ fn deployment_units_take_the_pinned_guest_cmdline_only_from_the_shared_receipt()
         assert!(!text.contains("--ch-cmdline"));
         assert!(!text.contains("--guest-agent-bin"));
         assert!(!text.contains("--metering-cgroup-root"));
-    }
-    for environment in [
-        "deploy/metal/cats.env.example",
-        "deploy/aws/metal/worker.env.example",
-    ] {
-        let text = read_workspace_file(environment);
-        assert_eq!(
-            text.lines()
-                .filter(|line| line.starts_with("CATS_ROUTE_V2_ROTATION_ORIGIN=https://"))
-                .count(),
-            1,
-            "{environment} must provide exactly one mandatory HTTPS Route v2 rotation origin"
-        );
+        assert!(!text.contains("--route-v2-machine-listen"));
+        assert!(!text.contains("--runtime-systemd-run-bin"));
     }
 }
 
 #[test]
-fn node_agent_killmode_is_explicit_without_owning_per_cat_services() {
+fn node_agent_killmode_fences_direct_child_vmm_and_blockd_processes() {
     for unit in [
         "deploy/metal/systemd/cats-noded.service",
         "deploy/aws/metal/cats-worker.service",
@@ -160,58 +142,8 @@ fn node_agent_killmode_is_explicit_without_owning_per_cat_services() {
             text.contains("cats=0/orphans=0"),
             "{unit} must require a drained, empty node before a controlled stop or restart"
         );
-    }
-
-    let metal_readme = read_workspace_file("deploy/metal/README.md");
-    let first_install = metal_readme
-        .find("仅限首次安装、尚未创建任何 Cat")
-        .expect("metal install restart is explicitly limited to a fresh empty node");
-    let restart = metal_readme
-        .find("systemctl restart cats-noded")
-        .expect("metal installation documents its required configuration restart");
-    let later_cordon_guard = metal_readme
-        .find("first apply a reviewed A23 cordon")
-        .expect("metal restart instructions require a reviewed A23 cordon");
-    let later_empty_guard = metal_readme
-        .find("no assigned Desired runtimes or physical residue")
-        .expect("metal restart instructions require an empty, residue-free node");
-    assert!(
-        first_install < restart
-            && restart < later_cordon_guard
-            && later_cordon_guard < later_empty_guard,
-        "metal restart instructions must limit the direct command to first install and then document the drain/idle guard"
-    );
-
-    let process_owner =
-        read_workspace_file("node-agent/src/lifecycle_command/installed/start_platform.rs");
-    for exact in [
-        "fn submit_atomic_vmm_service(",
-        "let slice = cat_execution_slice_id(cat_id);",
-        ".arg(format!(\"--slice={slice}\"))",
-        ".arg(format!(\"--property=Slice={slice}\"))",
-        ".arg(\"--property=KillMode=control-group\")",
-        ".arg(\"--property=Restart=no\")",
-    ] {
-        assert!(
-            process_owner.contains(exact),
-            "per-Cat process ownership lost its independent systemd-service contract {exact:?}"
-        );
-    }
-
-    let linux_gate = read_workspace_file("scripts/linux-gate.sh");
-    for exact in [
-        "agent_unit=cats-noded.service",
-        "cat_unit=cats-serving-11111111111111111111111111111111.service",
-        "systemctl stop \"$agent_unit\"",
-        "systemctl restart \"$agent_unit\"",
-        "cat_start_ticks_after_restart",
-        "cat_control_group_after_restart",
-        "systemctl stop \"$cat_unit\"",
-    ] {
-        assert!(
-            linux_gate.contains(exact),
-            "the real PID1 Linux gate lacks the production Agent-stop/restart sibling-adoption probe {exact:?}"
-        );
+        assert!(text.contains("direct children of noded"));
+        assert!(!text.contains("--runtime-systemd-run-bin"));
     }
 }
 
@@ -231,13 +163,21 @@ fn linux_gate_names_the_current_privileged_network_boundary_cases() {
 }
 
 #[test]
-fn production_aws_worker_does_not_write_legacy_schedulability_state() {
+fn production_aws_worker_registers_explicit_identity_and_reachable_endpoint() {
     let unit = read_workspace_file("deploy/aws/metal/cats-worker.service");
-    assert!(
-        !unit.contains("--initially-cordoned") && !unit.contains("--node-id"),
-        "Agent registration must not manufacture or double-write legacy Node schedulability state"
-    );
-    assert!(unit.contains("/etc/cats/identity/node-identity.v1.json"));
+    assert!(!unit.contains("--initially-cordoned"));
+    for field in [
+        "--node-id $CATS_NODE_ID",
+        "--node-name $CATS_NODE_NAME",
+        "--control-endpoint $CATS_NODE_CONTROL_ENDPOINT",
+        "--instance-id $CATS_NODE_INSTANCE_ID",
+    ] {
+        assert!(unit.contains(field), "missing registration field {field}");
+    }
+    let deployment =
+        read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
+    assert!(deployment.contains("latest/dynamic/instance-identity/document"));
+    assert!(deployment.contains("[ \"$identity_instance\" = \"$instance_id\" ]"));
 }
 
 #[test]
@@ -299,16 +239,16 @@ fn production_platform_example_keeps_two_workers_in_distinct_subnets() {
 }
 
 #[test]
-fn manual_worker_bootstrap_refuses_the_example_identity() {
+fn manual_worker_bootstrap_documents_direct_registration_inputs() {
     let example = read_workspace_file("deploy/aws/metal/worker.env.example");
-    assert!(
-        !example.contains("CATS_NODE_ID=") && !example.contains("CATS_NODE_ADVERTISE_URL="),
-        "the worker environment must not be a second Node identity authority"
-    );
-    assert!(
-        !example.contains("CATS_AUTH_TOKEN="),
-        "signed workers must not receive the retired shared Control bearer"
-    );
+    for field in [
+        "CATS_NODE_ID=",
+        "CATS_NODE_NAME=",
+        "CATS_NODE_CONTROL_ENDPOINT=",
+        "CATS_AUTH_TOKEN=",
+    ] {
+        assert!(example.contains(field), "missing direct Node input {field}");
+    }
 
     let installer = read_workspace_file("deploy/aws/metal/install-worker.sh");
     assert!(installer.contains("validate-node-identity-installation.sh"));
@@ -334,22 +274,21 @@ fn manual_worker_bootstrap_refuses_the_example_identity() {
 }
 
 #[test]
-fn production_worker_release_rejects_and_removes_the_shared_control_bearer() {
+fn production_worker_release_installs_the_root_only_control_bearer() {
     let variables =
         read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/variables.tf");
-    assert!(!variables.contains("var.worker_runtime_secret_data[\"CATS_AUTH_TOKEN\"]"));
-    assert!(variables.contains("signed workers must not receive CATS_AUTH_TOKEN"));
+    assert!(
+        variables.contains("contains(keys(var.worker_runtime_secret_data), \"CATS_AUTH_TOKEN\")")
+    );
 
     let deployment =
         read_workspace_file("deploy/aws/terraform/modules/metal-worker-deployment/main.tf");
-    assert!(deployment.contains("if (keys - [\"CATS_POSTGRES_URL\"]) != []"));
+    assert!(deployment.contains("keys - [\"CATS_AUTH_TOKEN\", \"CATS_POSTGRES_URL\"]"));
     assert!(deployment.contains("[to_entries[] | \"\\(.key)=\\(.value)\"] | join(\"\\n\")"));
-    assert!(deployment
-        .contains("if (key == \"CATS_AUTH_TOKEN\" || key == \"CATS_ROUTE_V2_MACHINE_LISTEN\")"));
+    assert!(!deployment.contains("if (key == \"CATS_AUTH_TOKEN\" ||"));
 
     let installer = read_workspace_file("deploy/aws/metal/install-worker.sh");
-    assert!(installer.contains("$1 != \"CATS_AUTH_TOKEN\""));
-    assert!(installer.contains("after-remove-worker-shared-bearer"));
+    assert!(!installer.contains("$1 != \"CATS_AUTH_TOKEN\""));
 
     let stack =
         read_workspace_file("deploy/aws/terraform/stacks/production-infrastructure/main.tf");
@@ -513,19 +452,37 @@ fn guest_image_resolver_is_readable_under_a_restrictive_caller_umask() {
 }
 
 #[test]
-fn metal_acceptance_covers_systemd_service_lifecycle() {
+fn metal_acceptance_covers_semantic_lifecycle_disk_and_slug_reuse() {
     let text = read_workspace_file("deploy/metal/e2e.sh");
     for required in [
-        "guest uses systemd as PID 1",
-        "--no-auto-suspend",
-        "systemctl enable --now cats-e2e.service",
-        "Warm preserves the service PID",
-        "Warm does not restart the service",
-        "Cold starts the service exactly once again",
+        "CATS_BOOT_IMAGE",
+        "same disk create preserves ID",
+        "Guest mount path",
+        "same Cat create preserves ID",
+        "same suspend is already_suspended",
+        "Warm has no Cloud Hypervisor process",
+        "same cold is already_cold",
+        "same detach is already_detached",
+        "same attach is already_attached",
+        "Cold run reaches Running after Guest mount-ready",
+        "Disk slug reuse creates a new immutable ID",
+        "Cat slug reuse creates a new immutable ID",
     ] {
         assert!(
             text.contains(required),
-            "metal acceptance lost systemd lifecycle oracle {required:?}"
+            "metal acceptance lost semantic protocol oracle {required:?}"
+        );
+    }
+    for retired in [
+        "cats exec",
+        "--no-auto-suspend",
+        "cats resume",
+        "cats stop",
+        "cats start",
+    ] {
+        assert!(
+            !text.contains(retired),
+            "metal acceptance retained {retired:?}"
         );
     }
 }
@@ -844,7 +801,6 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
         );
     }
     for required in [
-        "COPY --from=builder /out/cats-vmm-launcher /cats-vmm-launcher",
         "COPY --chmod=0755 deploy/aws/metal/update-guest-seed.sh /out/update-guest-seed.sh",
         "COPY --chmod=0755 deploy/aws/metal/require-idle-worker.sh /out/require-idle-worker.sh",
         "COPY deploy/metal/guest-systemd /out/guest-systemd",
@@ -861,9 +817,6 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
     let first_install = deployment
         .find("install -D -m 0755 \"$stage_path/cats-noded\"")
         .expect("worker deployment installs cats-noded");
-    let launcher_install = deployment
-        .find("install -D -m 0755 \"$stage_path/cats-vmm-launcher\"")
-        .expect("worker deployment installs the fixed VMM launcher");
     let release_verify = deployment
         .find("install-guest-runtime-release.sh\" verify")
         .expect("worker deployment verifies the shared Guest release");
@@ -873,13 +826,9 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
     let deployment_lock = deployment
         .find("cats_acquire_worker_deployment_lock")
         .expect("worker deployment acquires its Host-global lock");
-    let exact_classification = deployment[deployment_lock..]
-        .find("route_v2_install_state=\"$(cats_classify_route_v2_node_r1")
-        .map(|offset| deployment_lock + offset)
-        .expect("worker deployment classifies exact Route v2 state under the lock");
-    let locked_cgroup = deployment[exact_classification..]
+    let locked_cgroup = deployment[deployment_lock..]
         .find("cgroup_v2_root=\"$(cats_worker_cgroup_v2_root)\"")
-        .map(|offset| exact_classification + offset)
+        .map(|offset| deployment_lock + offset)
         .expect("worker deployment recomputes its cgroup-v2 root under the lock");
     let locked_idle_guard = deployment[locked_cgroup..]
         .find(
@@ -910,18 +859,16 @@ fn production_worker_bundle_updates_an_idle_guest_seed_before_restart() {
     );
     assert!(
         !deployment[..deployment_lock].contains(idle_guard),
-        "Route v2 state must be classified under the Host lock before the idle guard queries systemd"
+        "the Host lock must be held before the idle guard queries systemd"
     );
     assert!(
         release_verify < deployment_lock
-            && deployment_lock < exact_classification
-            && exact_classification < locked_cgroup
+            && deployment_lock < locked_cgroup
             && locked_cgroup < locked_idle_guard
             && locked_idle_guard < stop
             && stop < prepare
             && prepare < first_install
-            && first_install < launcher_install
-            && launcher_install < update
+            && first_install < update
             && deployment[update..start].contains("\"${var.install_root}/bin/update-guest-seed\""),
         "worker must verify and guard the drain, stop, then replace release bytes before start"
     );
@@ -1951,6 +1898,10 @@ fi
                 .env("CATS_FAKE_SERVICE_MASKED", &masked)
                 .env("CATS_FAKE_MAIN_PID", std::process::id().to_string())
                 .env("CATS_FAKE_MAIN_PID_FILE", &main_pid_file)
+                .env(
+                    "CATS_NODE_HEALTH_TOKEN",
+                    "test-secret-that-is-at-least-32-bytes",
+                )
                 .env("CATS_TEST_START", current_process_start_ticks())
                 .spawn()
                 .expect("spawn candidate deployment owner"),
@@ -2408,14 +2359,11 @@ fn worker_release_refuses_live_runtime_binaries_outside_cat_slices() {
     std::fs::create_dir_all(&bin_root).expect("create bin fixture");
     let command_path = install_fake_cgroup2_findmnt(&bin_root);
 
-    // cats-blockd and the short-lived launcher may survive outside a Cat
-    // slice, while the VMM's name is longer than Linux comm. The guard must
-    // catch all of them by their full argv[0] path (issue #98).
+    // cats-blockd may survive outside the service process while the VMM's name
+    // is longer than Linux comm. The guard must catch both by full argv[0].
     let blockd_bin = bin_root.join("cats-blockd");
-    let launcher_bin = bin_root.join("cats-vmm-launcher");
     let vmm_bin = bin_root.join("cloud-hypervisor");
     std::os::unix::fs::symlink("/bin/sleep", &blockd_bin).expect("stage fake blockd");
-    std::os::unix::fs::symlink("/bin/sleep", &launcher_bin).expect("stage fake launcher");
     std::os::unix::fs::symlink("/bin/sleep", &vmm_bin).expect("stage fake vmm");
     let mut children = RuntimeChildren(Vec::new());
     children.0.push(
@@ -2425,26 +2373,15 @@ fn worker_release_refuses_live_runtime_binaries_outside_cat_slices() {
             .expect("spawn fake blockd"),
     );
     children.0.push(
-        std::process::Command::new(&launcher_bin)
-            .arg("300")
-            .spawn()
-            .expect("spawn fake launcher"),
-    );
-    children.0.push(
         std::process::Command::new(&vmm_bin)
             .arg("300")
             .spawn()
             .expect("spawn fake vmm"),
     );
     let blockd_pid = children.0[0].id();
-    let launcher_pid = children.0[1].id();
-    let vmm_pid = children.0[2].id();
-    wait_until_process_table_has(&[
-        (blockd_pid, &blockd_bin),
-        (launcher_pid, &launcher_bin),
-        (vmm_pid, &vmm_bin),
-    ])
-    .expect("runtime fixtures must be visible before exercising the guard");
+    let vmm_pid = children.0[1].id();
+    wait_until_process_table_has(&[(blockd_pid, &blockd_bin), (vmm_pid, &vmm_bin)])
+        .expect("runtime fixtures must be visible before exercising the guard");
 
     let guard = workspace_root().join("deploy/aws/metal/require-idle-worker.sh");
     let refused = std::process::Command::new(&guard)
@@ -2462,7 +2399,6 @@ fn worker_release_refuses_live_runtime_binaries_outside_cat_slices() {
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(
         stderr.contains(&format!("{blockd_pid}(cats-blockd)"))
-            && stderr.contains(&format!("{launcher_pid}(cats-vmm-launcher)"))
             && stderr.contains(&format!("{vmm_pid}(cloud-hypervisor)"))
             && stderr.contains("unpublished writes"),
         "guard must name all runtime pids and the journal hazard: {stderr}"
@@ -2948,7 +2884,7 @@ fn worker_release_atomically_updates_the_cloud_hypervisor_guest_seed() {
 fn state_provisioning_creates_the_host_lock_the_agent_only_ever_opens() {
     let provisioner = read_workspace_file("deploy/aws/metal/provision-vmm-socket-namespaces.sh");
 
-    let basename = cats_node_agent::agent_registration::HOST_LOCK_BASENAME;
+    let basename = "host.lock";
     assert!(
         provisioner.contains(&format!("CATS_HOST_LOCK_BASENAME={basename}")),
         "the provisioner must create the exact basename the Agent opens ({basename})"

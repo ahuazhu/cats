@@ -5,20 +5,16 @@ Wants=network-online.target
 
 [Service]
 Delegate=cpu memory
-# The provisioner supplies `/etc/cats/identity/node-identity.v1.json` and its
-# closed key/credential set; no cloud metadata or environment value can
-# construct identity or its selected state path.
+# The deployment transaction cross-checks the provisioned Node identity with
+# IMDS and writes the resulting registration fields into this root-only file.
 # Controlled stop/restart is permitted only at state=cordoned cats=0/orphans=0.
 Environment=CATS_GUEST_NETWORK_CIDR=10.240.0.0/16
 # Direct RDS remains the compatible default. A managed worker environment can
 # override this after the proxy exists and has passed its connectivity check.
 Environment=CATS_POSTGRES_SESSION_SETUP=client
 EnvironmentFile=/etc/cats/worker.env
-UnsetEnvironment=CATS_ROUTE_V2_MACHINE_LISTEN
-# Per-Cat VMM/blockd processes are PID-1-owned sibling transient services in
-# system.slice, not children of this service cgroup. Reap every process that
-# does belong to the Agent while leaving those independently owned services
-# available for checkpoint + full-inventory adoption after restart.
+# Cloud Hypervisor and blockd are direct children of noded. A service stop is
+# the Host-local process fence and must reap the complete cgroup.
 KillMode=control-group
 ExecStartPre=/opt/cats/bin/install-guest-runtime-release startup-recover
 ExecStartPre=/usr/sbin/modprobe nbd nbds_max=64
@@ -30,22 +26,21 @@ ExecStartPre=/opt/cats/bin/render-postgres-url
 ExecStart=/opt/cats/bin/cats-noded \
   --listen 0.0.0.0:7301 \
   --control-plane-url $CATS_CONTROL_PLANE_URL \
-  --route-v2-machine-listen 0.0.0.0:7444 \
-  --route-v2-rotation-origin $CATS_ROUTE_V2_ROTATION_ORIGIN \
+  --control-endpoint $CATS_NODE_CONTROL_ENDPOINT \
+  --node-id $CATS_NODE_ID \
+  --node-name $CATS_NODE_NAME \
+  --vendor $CATS_NODE_VENDOR \
+  --region $CATS_NODE_REGION \
+  --zone $CATS_NODE_ZONE \
+  --instance-id $CATS_NODE_INSTANCE_ID \
+  --machine-type $CATS_NODE_MACHINE_TYPE \
+  --total-cpu $CATS_NODE_TOTAL_CPU \
+  --total-memory $CATS_NODE_TOTAL_MEMORY \
   --guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json \
   --blockd-bin /opt/cats/bin/cats-blockd \
-  --runtime-systemctl-bin /usr/bin/systemctl \
-  --runtime-systemd-run-bin /usr/bin/systemd-run \
-  --runtime-cgroup-root /sys/fs/cgroup \
-  --runtime-proc-root /proc \
-  --runtime-network-class-root /sys/class/net \
-  --runtime-sys-block-root /sys/block \
-  --runtime-device-root /dev \
-  --runtime-blockd-socket-root /run/cats/blockd-v1 \
-  --runtime-vmm-socket-root /run/cats/vmm-v1 \
-  --runtime-inventory-scan-timeout-ms 5000 \
-  --runtime-effect-step-timeout-ms 30000 \
-  --vmm-launcher-bin /opt/cats/bin/cats-vmm-launcher \
+  --host-lock /var/lib/cats/node/host.lock \
+  --blockd-socket-root /run/cats/blockd-v1 \
+  --effect-timeout-ms 30000 \
   --metadata-store-adapter postgres \
   --metadata-store-option url-file=/run/cats/postgres-url \
   --metadata-store-option ca-file=/etc/cats/rds-ca.pem \
@@ -56,7 +51,8 @@ ExecStart=/opt/cats/bin/cats-noded \
   --object-store-option prefix=${CATS_CHUNKSTORE_PREFIX} \
   --vmm ch \
   --ch-bin /opt/cats/bin/cloud-hypervisor \
-  --ch-seed-image /opt/cats/guest/rootfs.ext4
+  --ch-seed-image /opt/cats/guest/rootfs.ext4 \
+  --ch-block-path kernel-nbd
 Restart=always
 RestartSec=2
 

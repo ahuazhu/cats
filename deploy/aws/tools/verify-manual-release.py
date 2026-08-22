@@ -36,8 +36,6 @@ MAX_RELEASE_MANIFEST_BYTES = 1024 * 1024
 WORKER_STATIC_FILES = {
     "cats",
     "cats-noded",
-    "cats-route-v2-node-r1-validator",
-    "cats-vmm-launcher",
     "cats-usage-schema-v16-verifier",
     "cats-usage-terminal-receipt-verifier",
     "cats-blockd",
@@ -50,7 +48,6 @@ WORKER_STATIC_FILES = {
     "render-postgres-url.sh",
     "install-guest-runtime-release.sh",
     "validate-node-identity-installation.sh",
-    "install-route-v2-node-r1.sh",
     "worker-deployment-transaction.sh",
     "provision-vmm-socket-namespaces.sh",
     "cats-vmm.conf",
@@ -74,8 +71,6 @@ WORKER_DIRECTORIES = {
 WORKER_EXECUTABLE_FILES = {
     "cats",
     "cats-noded",
-    "cats-route-v2-node-r1-validator",
-    "cats-vmm-launcher",
     "cats-usage-schema-v16-verifier",
     "cats-usage-terminal-receipt-verifier",
     "cats-blockd",
@@ -88,7 +83,6 @@ WORKER_EXECUTABLE_FILES = {
     "render-postgres-url.sh",
     "install-guest-runtime-release.sh",
     "validate-node-identity-installation.sh",
-    "install-route-v2-node-r1.sh",
     "worker-deployment-transaction.sh",
     "provision-vmm-socket-namespaces.sh",
 }
