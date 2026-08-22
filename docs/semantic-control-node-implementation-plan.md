@@ -32,8 +32,8 @@
 | Node 管理 | Control API、Node heartbeat client | 注册、`node_name`、`control_endpoint`、offline/reset/drain/恢复 | 已完成并接入生产进程 |
 | Production adapters | Control adapter | Store/placement/noded/入口实现与公共 DTO 映射 | 已完成；公网 Gateway 细节按设计不在本协议范围 |
 | HTTP composition | Control router、AppState、controld/noded main | 新路由和服务接线，旧路由退出 | Control/noded 已完成；CH effects 为独立剩余项 |
-| 切换清理 | schema、router、旧模块和测试 | 删除旧表、旧入口、旧 runner 和只验证旧协议的测试 | 旧 HTTP/production composition 已删除；Store/schema 清理进行中 |
-| 纵向联调 | FakeVmm/PostgreSQL | Disk→Cat→状态动作→跨 Node→destroy→slug 复用 | 待开始 |
+| 切换清理 | schema、router、旧模块和测试 | 删除旧表、旧入口、旧 runner 和只验证旧协议的测试 | 旧 HTTP/production composition 和旧 Store 模块已删除；schema catalog/旧集成测试清理进行中 |
+| 纵向联调 | FakeVmm/PostgreSQL | Disk→Cat→状态动作→跨 Node→destroy→slug 复用 | 真实 HTTP Cat 全状态机已完成；Disk backend、跨 Node 与 PostgreSQL 纵向场景待完成 |
 | 最终门禁 | 全仓库与 Linux | 完整门禁、Linux Node/真实 VMM 冒烟 | 待开始 |
 
 ## 3. 集成顺序
@@ -68,7 +68,8 @@
 - [x] 将 FakeVmm noded main 切换为同步 server、注册和 heartbeat supervisor。
 - [x] 用同一个 placement gate 阻止 reset 期间的新 Cat 动作。
 - [x] 接入 Control 的 `withdraw → Node Ready → publish` 顺序。
-- [ ] 跑通 FakeVmm 的 Cat/Disk 完整状态机。
+- [x] 通过真实 Control→noded HTTP 跑通 FakeVmm Cat 全状态机及每个动作的语义重试。
+- [ ] 跑通 Disk backend、跨 Node 恢复和 PostgreSQL 纵向场景。
 
 ### 阶段 D：单协议切换
 
@@ -77,6 +78,7 @@
 - [x] 删除旧 noded runner/journal 的 production composition。
 - [x] 删除旧 lifecycle/AgentSession/observation/Route/product HTTP 模块和 Gateway/rotation 监听接线。
 - [x] 删除 CLI 的 Operation get/wait、Idempotency-Key pending/replay 和旧 Disk mutation client。
+- [x] 删除旧 Operation/AgentSession/Route/NodeJob/observation Store 模块和退役导出。
 - [ ] 从 v19 schema 删除旧 lifecycle/route settlement 表和 catalog probes。
 - [ ] 删除旧协议专属测试；把仍适用的并发、清理和恢复场景迁到新测试。
 
@@ -115,6 +117,8 @@
 | `cc8b885d` | 每个 liveness 周期重新发现仍有 Cat 的 offline Node，Control 重启或临时失败后继续恢复 | level-triggered recovery test、Control/controld check |
 | `b87e9bc6`、`f476573b` | Disk 精确物理/文件系统身份、provisioning/deleting、完成 CAS、响应丢失恢复和 Node/Guest 三方挂载核对 | Resource 5、mount 4、recovery 6、installed 4、API 13 tests；Control/noded check |
 | `01e3713d` | CLI 删除旧 Operation、Idempotency-Key pending/replay 与退役 mutation 测试 | CLI 69 passed、3 ignored；Clippy `-D warnings` |
+| `769a4625` | 删除旧 lifecycle Operation、AgentSession、Route、NodeJob、observation settlement 等 Store 实现和退役导出 | semantic Store 46/46、cutover contract 6/6；Control/controld check |
+| `c601c7b0`、`0b96550d` | 真实 HTTP 纵向 Cat 生命周期：Control client→noded router→per-Cat lane→Fake effects，覆盖全状态和重复调用 | 纵向测试通过；Node workspace Clippy `-D warnings` 通过 |
 
 ## 5. 进度更新规则
 
@@ -141,5 +145,7 @@
 - Resource 聚合新增 4 个定向回归，覆盖 slug 解析、Disk 语义重试和 strict backend 未安装时的明确失败。
 - Disk 创建先持久化不可变物理身份，再调用后端；后端明确完成后才从 provisioning 进入 normal。删除同样先进入 deleting，明确完成后才释放 slug；响应丢失重试沿用同一身份。严格物理 backend 仍未接入，当前保持 fail-closed。
 - CLI 已删除 `operation get/wait`、隐藏 `--no-wait`、Idempotency-Key pending/replay 文件和旧 mutation client，只保留同步场景语义命令。
+- 旧 Operation、AgentSession、Route、NodeJob 和 observation settlement 的 Store 模块与导出已删除；schema catalog 和引用旧表的集成测试仍在并行清理。
+- 已用真实 HTTP composition 跑通 `create → suspend → run → warm → cold → run → destroy`，每个调用重复一次且只产生一次物理 effect；测试同时验证 Running 的入口发布和离开 Running 前撤流。
 - `--vmm ch` 已有明确的 installed effects 桥和单点 preflight；缺少精确 volume/runtime/route 输入时在任何物理副作用前失败，Fake 联调不受影响。
 - 切换合同的 noded 静态断言已按实际 `lane_if_open` 命名校准；production composition 已完成，旧 Store/schema 清理仍在进行。
