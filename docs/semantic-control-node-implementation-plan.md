@@ -110,6 +110,7 @@
 | `0dea4a2a` | offline Node 的 Cat 发现、目标 claim、完整配置恢复和精确终态结算 | Recovery 6 tests、semantic ingress adapter 1 test；来源分支 semantic PG 46 tests、Clippy |
 | `5ca7a6fe` | production Control 只保留 semantic resource/Node 主监听与独立 runtime node fence；删除旧 lifecycle/AgentSession/observation/Route/product HTTP 与 Gateway/rotation 接线 | Control/controld check、semantic tests 45/45 |
 | `a46e1cf4` | liveness 精确标记 offline 后自动触发 Cat 恢复，并复用同一 noded/入口实现 | Node liveness/recovery tests 14/14、controld check |
+| `cc8b885d` | 每个 liveness 周期重新发现仍有 Cat 的 offline Node，Control 重启或临时失败后继续恢复 | level-triggered recovery test、Control/controld check |
 
 ## 5. 进度更新规则
 
@@ -130,6 +131,7 @@
 - `SemanticResourceApi` 聚合和生产 composition 已完成；当前入口只保存 `cat_id → node_id`，无 generation、epoch 或 Operation，并已经替换生产 placeholder。
 - Control 已按 `withdraw → Node effect → Ready 后 publish` 切流；同一目标重试返回成功，未先撤流时禁止直接换 Node，旧 Node 的迟到 withdraw 不能删除新目标。当前目标支持直接 resolve；公网 Gateway/Endpoint 的传输细节按设计文档第 2 节明确不属于本协议实施范围。
 - offline Node 恢复已经纵向接入 liveness monitor：恢复 claim 期间保留旧 placement 作为重启后的发现线索，只把动作目标切到新 Node；目标终态确认后才切 placement。Running Ready 后发布入口，Suspended/Warm 从完整配置 Cold boot 后恢复原状态且不发布入口。
+- offline 恢复改为每个 liveness 周期按数据库当前状态重新发现：第一次恢复的临时错误或 Control 重启不会因为 Node 已经是 offline 而丢失后续重试。
 - production Control 已收敛到一个 semantic 主监听；旧 lifecycle、AgentSession、observation、Route Operation、旧 product handler 以及独立 Gateway/rotation 监听不再进入生产进程。Store/schema 中的退役实现和表正在下一切片删除。
 - 公开 Cat/Disk 同步 HTTP handlers、AppState 和主 router composition 已完成；切换合同 6/6 通过。
 - Resource 聚合新增 4 个定向回归，覆盖 slug 解析、Disk 语义重试和 strict backend 未安装时的明确失败。
