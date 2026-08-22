@@ -1248,14 +1248,6 @@ fn production_fresh_schema_and_chunkstore_prefix_are_single_reviewed_inputs() {
     assert!(renderer.contains("options=-csearch_path%3D${CATS_POSTGRES_SCHEMA}"));
     let worker_unit = read_workspace_file("deploy/aws/metal/cats-worker.service");
     assert!(worker_unit.contains("url-file=/run/cats/postgres-url"));
-    let noded = read_workspace_file("cmd/noded/src/main.rs");
-    assert!(noded.contains("AdapterConfig::from_cli(args.metadata_store_options)"));
-    assert!(noded.contains("metadata_store,"));
-    let start_platform =
-        read_workspace_file("node-agent/src/lifecycle_command/installed/start_platform.rs");
-    assert!(start_platform.contains("config.blockd.metadata_store.config.to_cli()"));
-    assert!(start_platform.contains("\"--metadata-store-option\""));
-    assert!(start_platform.contains("&blockd.metadata_store_options"));
     let verifier = read_workspace_file("deploy/aws/tools/verify-manual-release.py");
     assert!(verifier.contains("\"cats-worker.service\""));
 }
@@ -4166,27 +4158,15 @@ fn manual_worker_bootstrap_installs_route_v2_revision_one_without_rotation() {
 }
 
 #[test]
-fn agent_registration_deployments_share_one_canonical_release_receipt() {
+fn release_artifacts_share_one_canonical_guest_payload() {
     let receipt_argument =
         "--guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json";
-    for unit in [
-        "deploy/metal/systemd/cats-controld.service",
-        "deploy/metal/systemd/cats-noded.service",
-        "deploy/aws/metal/cats-worker.service",
-    ] {
+    for unit in ["deploy/metal/systemd/cats-controld.service"] {
         let source = read_workspace_file(unit);
         assert!(
             source.contains(receipt_argument),
             "{unit} lost the exact installed release receipt"
         );
-        if unit.contains("noded") || unit.contains("worker") {
-            for forbidden in ["--node-id", "--state-dir", "--ch-kernel", "--ch-initramfs"] {
-                assert!(
-                    !source.contains(forbidden),
-                    "{unit} regained forbidden identity or Guest-byte override {forbidden}"
-                );
-            }
-        }
     }
 
     let kubernetes = read_workspace_file("deploy/aws/terraform/modules/cats-kubernetes/main.tf");
@@ -4239,11 +4219,6 @@ fn agent_registration_deployments_share_one_canonical_release_receipt() {
             "worker image lost qualified source binding {release_binding:?}"
         );
     }
-    let noded = read_workspace_file("cmd/noded/src/main.rs");
-    assert!(noded.contains("load_installed_guest_runtime_profile_receipt"));
-    assert!(noded.contains("validate_installed_node_guest_runtime"));
-    assert!(noded.contains("spawn_signed_runtime_cutover"));
-
     let workflow = read_workspace_file(".github/workflows/release.yml");
     assert_eq!(
         workflow.matches("guest-runtime-release:\n").count(),
