@@ -1214,6 +1214,7 @@ mod tests {
     #[test]
     fn noded_contract_is_closed_and_status_error_shape_is_exact() {
         let body = br#"{
+            "workspace_id":"ws_01",
             "cpu":2,
             "memory_bytes":4294967296,
             "boot_image":"ubuntu-24.04",
@@ -1222,7 +1223,7 @@ mod tests {
         let request: NodedCreateCatRequest = serde_json::from_slice(body).unwrap();
         request.validate().unwrap();
         assert!(serde_json::from_slice::<NodedCreateCatRequest>(
-            br#"{"cpu":2,"memory_bytes":4,"boot_image":"image","mounts":[],"request_id":"req_01"}"#
+            br#"{"workspace_id":"ws_01","cpu":2,"memory_bytes":4,"boot_image":"image","mounts":[],"request_id":"req_01"}"#
         )
         .is_err());
 
