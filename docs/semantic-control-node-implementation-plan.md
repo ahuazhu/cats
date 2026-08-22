@@ -100,6 +100,7 @@
 | `65dab394` | 公开 Cat/Disk 同步 HTTP handlers 与语义请求解析 | Control 5 tests |
 | `4c880d8d` | 生命周期 Store、NodeRepository、noded HTTP production adapters | Adapter 4 tests；PG Store 7 tests（来源分支） |
 | `3b247458`、`6499b6a6` | Resource API 聚合、Control AppState/router、Node liveness 与旧入口退出 | Resource 5 tests、cutover contract 6/6、Control/controld check |
+| `b77b41e9` | Resource 聚合回归：slug→内部 ID、Disk 重试/冲突/绑定保护、backend fail-closed | Resource service 4 tests |
 
 ## 5. 进度更新规则
 
@@ -120,4 +121,5 @@
 - `SemanticResourceApi` 聚合和生产 composition 已完成；真实唯一入口 adapter 仍在并行实现，当前入口 placeholder 明确失败，不伪装成功。
 - 已确认旧 Route authority 不能安全充当新 `IngressPort`：它要求旧 lifecycle Operation、AgentSession、RuntimeReady 和 Route receipt；只改数据库目标也不能撤销已缓存 Grant 或关闭旧 Node admission。真实入口接入必须同时补 Gateway resolve、Node close/open+drain 和 semantic Ready 发布三个边界，完成前保持 fail-closed。
 - 公开 Cat/Disk 同步 HTTP handlers、AppState 和主 router composition 已完成；切换合同 6/6 通过。
+- Resource 聚合新增 4 个定向回归，覆盖 slug 解析、Disk 语义重试和 strict backend 未安装时的明确失败。
 - 切换合同的 noded 静态断言已按实际 `lane_if_open` 命名校准；production composition 仍待接线。
