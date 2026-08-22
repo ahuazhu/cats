@@ -143,11 +143,11 @@ impl NodePlacementGate {
         self.0.load(Ordering::Acquire)
     }
 
-    fn open(&self) {
+    pub(crate) fn open(&self) {
         self.0.store(true, Ordering::Release);
     }
 
-    fn close(&self) {
+    pub(crate) fn close(&self) {
         self.0.store(false, Ordering::Release);
     }
 }

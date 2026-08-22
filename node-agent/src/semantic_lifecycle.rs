@@ -23,6 +23,8 @@ use cats_api::semantic_control::{
 };
 use tokio::sync::watch;
 
+use crate::semantic_node_client::{NodeClientFuture, NodePlacementGate, NodeResetExecutor};
+
 pub use cats_api::semantic_control::{
     CatAction as SemanticCatAction, CatState as SemanticCatState,
     NodedCatConfig as SemanticCatConfig, NodedDiskMount as SemanticMount,
@@ -197,14 +199,32 @@ impl CatLane {
 pub struct SemanticNodeService {
     effects: Arc<dyn SemanticCatEffects>,
     cats: Arc<Mutex<BTreeMap<String, Arc<CatLane>>>>,
+    placement_gate: Arc<NodePlacementGate>,
 }
 
 impl SemanticNodeService {
+    /// Standalone-ready composition for FakeVmm and focused tests.
+    /// Production composition uses [`Self::with_placement_gate`] so the
+    /// registration supervisor owns the initial Closed -> Open transition.
     pub fn new(effects: Arc<dyn SemanticCatEffects>) -> Self {
+        let placement_gate = Arc::new(NodePlacementGate::default());
+        placement_gate.open();
+        Self::with_placement_gate(effects, placement_gate)
+    }
+
+    pub fn with_placement_gate(
+        effects: Arc<dyn SemanticCatEffects>,
+        placement_gate: Arc<NodePlacementGate>,
+    ) -> Self {
         Self {
             effects,
             cats: Arc::new(Mutex::new(BTreeMap::new())),
+            placement_gate,
         }
+    }
+
+    pub fn placement_gate(&self) -> Arc<NodePlacementGate> {
+        Arc::clone(&self.placement_gate)
     }
 
     fn cats(&self) -> MutexGuard<'_, BTreeMap<String, Arc<CatLane>>> {
@@ -217,11 +237,26 @@ impl SemanticNodeService {
         self.cats().get(cat_id).cloned()
     }
 
-    fn lane(&self, cat_id: &str) -> Arc<CatLane> {
-        self.cats()
+    fn lane_if_open(&self, cat_id: &str) -> Result<Arc<CatLane>, SemanticCatResponse> {
+        let mut cats = self.cats();
+        if !self.placement_gate.is_open() {
+            return Err(reset_required_response(cat_id.to_owned()));
+        }
+        Ok(cats
             .entry(cat_id.to_owned())
             .or_insert_with(|| Arc::new(CatLane::new()))
-            .clone()
+            .clone())
+    }
+
+    fn existing_lane_if_open(
+        &self,
+        cat_id: &str,
+    ) -> Result<Option<Arc<CatLane>>, SemanticCatResponse> {
+        let cats = self.cats();
+        if !self.placement_gate.is_open() {
+            return Err(reset_required_response(cat_id.to_owned()));
+        }
+        Ok(cats.get(cat_id).cloned())
     }
 
     pub async fn create(
@@ -250,7 +285,10 @@ impl SemanticNodeService {
             );
         }
         canonicalize_config(&mut config);
-        let lane = self.lane(&cat_id);
+        let lane = match self.lane_if_open(&cat_id) {
+            Ok(lane) => lane,
+            Err(response) => return response,
+        };
         loop {
             let mut changed = lane.changed.subscribe();
             let decision = {
@@ -385,7 +423,10 @@ impl SemanticNodeService {
             }
             (_, None) => {}
         }
-        let Some(lane) = self.existing_lane(&cat_id) else {
+        let Some(lane) = (match self.existing_lane_if_open(&cat_id) {
+            Ok(lane) => lane,
+            Err(response) => return response,
+        }) else {
             return not_found_response(cat_id);
         };
         loop {
@@ -474,6 +515,13 @@ impl SemanticNodeService {
     }
 
     pub async fn destroy(&self, cat_id: String) -> SemanticCatResponse {
+        if !self.placement_gate.is_open() {
+            return reset_required_response(cat_id);
+        }
+        self.destroy_for_reset(cat_id).await
+    }
+
+    async fn destroy_for_reset(&self, cat_id: String) -> SemanticCatResponse {
         if parse_cat_id(&cat_id).is_none() {
             return response_error(
                 cat_id,
@@ -518,6 +566,31 @@ impl SemanticNodeService {
                 }
             }
         }
+    }
+
+    /// Close admission, cancel and join every active Cat action, then remove
+    /// all registration-period Cat records. PersistentDisk product data is
+    /// outside this map and is never deleted by this reset.
+    pub async fn reset_all(&self) -> anyhow::Result<()> {
+        self.placement_gate.close();
+        let cat_ids = self.cats().keys().cloned().collect::<Vec<_>>();
+        for cat_id in cat_ids {
+            let response = self.destroy_for_reset(cat_id.clone()).await;
+            if !matches!(
+                response.status,
+                SemanticResponseStatus::Ok | SemanticResponseStatus::AlreadyDone
+            ) {
+                let message = response
+                    .error
+                    .map(|error| error.message)
+                    .unwrap_or_else(|| response.code);
+                return Err(anyhow::anyhow!(
+                    "reset failed while cleaning {cat_id}: {message}"
+                ));
+            }
+        }
+        self.cats().clear();
+        Ok(())
     }
 
     async fn run_effect(
@@ -654,6 +727,13 @@ impl SemanticNodeService {
     }
 }
 
+impl NodeResetExecutor for SemanticNodeService {
+    fn reset_all_cats(&self) -> NodeClientFuture<()> {
+        let service = self.clone();
+        Box::pin(async move { service.reset_all().await })
+    }
+}
+
 fn begin_action(state: &mut CatLaneState, action: SemanticCatAction) -> u64 {
     state.next_sequence = state.next_sequence.wrapping_add(1);
     let sequence = state.next_sequence;
@@ -710,6 +790,17 @@ fn not_found_response(cat_id: String) -> SemanticCatResponse {
     )
 }
 
+fn reset_required_response(cat_id: String) -> SemanticCatResponse {
+    response_error(
+        cat_id,
+        SemanticResponseStatus::Conflict,
+        "node_reset_required",
+        "Node registration is not ready for Cat actions",
+        None,
+        None,
+    )
+}
+
 fn response_error(
     cat_id: String,
     status: SemanticResponseStatus,
@@ -742,6 +833,7 @@ fn error_code_from_name(code: &str) -> SemanticErrorCode {
         "cat_destroyed" => SemanticErrorCode::CatDestroyed,
         "invalid_state" => SemanticErrorCode::InvalidState,
         "busy" => SemanticErrorCode::Busy,
+        "node_reset_required" => SemanticErrorCode::NodeResetRequired,
         "action_cancelled" => SemanticErrorCode::ActionCancelled,
         _ => SemanticErrorCode::InternalError,
     }
@@ -1183,6 +1275,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn different_cats_execute_in_parallel() {
+        let effects = Arc::new(RecordingEffects::default());
+        effects.block_create.store(true, Ordering::SeqCst);
+        let service = SemanticNodeService::new(effects.clone());
+        let first_service = service.clone();
+        let second_service = service.clone();
+        let first =
+            tokio::spawn(async move { first_service.create("cat_01".to_owned(), config()).await });
+        let second =
+            tokio::spawn(async move { second_service.create("cat_02".to_owned(), config()).await });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while effects.creates.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both Cat effects start without waiting for one another");
+
+        service
+            .reset_all()
+            .await
+            .expect("reset releases both creates");
+        assert_eq!(first.await.expect("first joins").code, "action_cancelled");
+        assert_eq!(second.await.expect("second joins").code, "action_cancelled");
+    }
+
+    #[tokio::test]
     async fn different_action_is_busy_while_create_is_running() {
         let effects = Arc::new(RecordingEffects::default());
         effects.block_create.store(true, Ordering::SeqCst);
@@ -1223,6 +1343,40 @@ mod tests {
             service.get("cat_01").expect("destroyed marker").state,
             Some(SemanticCatState::Destroyed)
         );
+    }
+
+    #[tokio::test]
+    async fn closed_registration_gate_prevents_physical_effects() {
+        let effects = Arc::new(RecordingEffects::default());
+        let gate = Arc::new(NodePlacementGate::default());
+        let service = SemanticNodeService::with_placement_gate(effects.clone(), gate);
+
+        let response = service.create("cat_01".to_owned(), config()).await;
+        assert_eq!(response.code, "node_reset_required");
+        assert!(effects.actions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reset_cancels_active_cats_and_starts_a_new_marker_period() {
+        let effects = Arc::new(RecordingEffects::default());
+        effects.block_create.store(true, Ordering::SeqCst);
+        let service = SemanticNodeService::new(effects.clone());
+        let create_service = service.clone();
+        let create =
+            tokio::spawn(async move { create_service.create("cat_01".to_owned(), config()).await });
+        tokio::time::timeout(Duration::from_secs(1), effects.create_started.notified())
+            .await
+            .expect("create starts");
+
+        service.reset_all().await.expect("reset completes");
+        assert_eq!(create.await.expect("create joins").code, "action_cancelled");
+        assert!(service.list().cats.is_empty());
+        assert!(!service.placement_gate().is_open());
+
+        service.placement_gate().open();
+        effects.block_create.store(false, Ordering::SeqCst);
+        let recreated = service.create("cat_01".to_owned(), config()).await;
+        assert_eq!(recreated.status, SemanticResponseStatus::Ok);
     }
 
     #[tokio::test]
@@ -1304,6 +1458,26 @@ mod tests {
             .await
             .expect("create response");
         assert_eq!(created.status(), StatusCode::OK);
+
+        let missing_run_config = client
+            .post(format!("{origin}/v1/cats/cat_01/actions/run"))
+            .bearer_auth("test-secret-that-is-at-least-32-bytes")
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("invalid run response");
+        assert_eq!(missing_run_config.status(), StatusCode::BAD_REQUEST);
+
+        let unexpected_cold_config = client
+            .post(format!("{origin}/v1/cats/cat_01/actions/cold"))
+            .bearer_auth("test-secret-that-is-at-least-32-bytes")
+            .json(&NodedCatActionRequest {
+                config: Some(config()),
+            })
+            .send()
+            .await
+            .expect("invalid cold response");
+        assert_eq!(unexpected_cold_config.status(), StatusCode::BAD_REQUEST);
 
         let cat: serde_json::Value = client
             .get(format!("{origin}/v1/cats/cat_01"))
