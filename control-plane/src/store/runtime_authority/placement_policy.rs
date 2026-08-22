@@ -264,24 +264,6 @@ impl Store {
             }))
         })
     }
-
-    #[cfg(test)]
-    pub(crate) fn rollback_runtime_node_authority_reservation_for_test(
-        &self,
-        apply_id: &str,
-        entered: &std::sync::Barrier,
-        release: &std::sync::Barrier,
-    ) -> Result<()> {
-        let request = AuthorityRequestContext::new(
-            std::time::Instant::now() + std::time::Duration::from_secs(30),
-        );
-        self.authority_request_transaction(&request, |transaction| {
-            lock_runtime_node_authority_apply(transaction, apply_id)?;
-            entered.wait();
-            release.wait();
-            Ok(AuthorityRequestDisposition::Reject(()))
-        })
-    }
 }
 
 fn install_trust_bundle_in(
@@ -1075,35 +1057,6 @@ fn insert_policy(
             &projection.node_transport_target.as_str(),
         ],
     )?)
-}
-
-#[cfg(test)]
-pub(super) fn insert_policy_for_test(
-    transaction: &mut Transaction<'_>,
-    policy: &NodePlacementPolicy,
-) -> AuthorityTxResult<()> {
-    insert_policy(transaction, policy)
-}
-
-#[cfg(test)]
-pub(crate) fn insert_policy_on_store_for_test(
-    store: &Store,
-    policy: &NodePlacementPolicy,
-) -> Result<()> {
-    store.authority_transaction(|transaction| insert_policy(transaction, policy))
-}
-
-#[cfg(test)]
-pub(crate) fn corrupt_policy_on_store_for_test(store: &Store) -> Result<()> {
-    store.with(|client| {
-        client
-            .execute(
-                "UPDATE runtime_node_placement_policies
-                    SET record='{}'::jsonb, policy_revision=policy_revision + 1",
-                &[],
-            )
-            .map(|_| ())
-    })
 }
 
 fn update_policy(

@@ -367,21 +367,6 @@ enum AuthorityTransactionMode {
 }
 
 impl Store {
-    #[cfg(test)]
-    pub(super) fn inject_committed_response_loss_once(&self) {
-        self.commit_response_loss_once
-            .store(true, Ordering::Release);
-    }
-
-    #[cfg(test)]
-    pub(super) fn inject_committed_response_loss_once_after(&self, delay: Duration) {
-        self.commit_response_loss_delay_ms.store(
-            u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-            Ordering::Release,
-        );
-        self.inject_committed_response_loss_once();
-    }
-
     /// Arm only the commit belonging to an HTTP authority request. Read-only
     /// credential lookup happens earlier in the same handler and must not
     /// consume this deterministic response-loss fixture.
