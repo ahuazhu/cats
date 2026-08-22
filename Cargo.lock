@@ -1338,6 +1338,7 @@ name = "cats-node-agent-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "cats-api",
  "cats-metadata-store-postgres",
  "cats-metering",
@@ -1355,6 +1356,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 
