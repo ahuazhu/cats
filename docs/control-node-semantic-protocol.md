@@ -141,6 +141,7 @@ WHERE destroyed_at IS NULL;
 nodes
 - node_id
 - node_name                 # 面向用户和运维人员的可读展示名
+- control_endpoint          # Control Plane同步访问noded的内部base URL
 - vendor                    # aws/gcp/...
 - region
 - zone
@@ -155,7 +156,8 @@ nodes
 约束：
 
 - `node_name` 必填，在 Node 列表、详情、Cat placement 和运维日志中优先展示；数据库关联和内部调用仍使用 `node_id`；
-- 同一个 `node_id` 的 `node_name` 创建后不可由注册或心跳隐式修改；
+- `control_endpoint` 必须是 Control Plane 可访问的绝对 `http` 或 `https` URL；Control Plane 使用内部共享凭证调用；
+- 同一个 `node_id` 的 `node_name` 和 `control_endpoint` 创建后不可由注册或心跳隐式修改；
 - 同一云环境中的 `instance_id` 必须唯一；
 - `deleted` Node 不能重新变为 `running`；重新提供机器时创建新的 `node_id`；
 - `draining`、`offline`、`reset_required` 和 `deleted` Node 不接受新的 Cat placement。
@@ -752,6 +754,7 @@ POST /v1/internal/nodes/register
 {
   "node_id": "node_123",
   "node_name": "worker-us-east-1a-01",
+  "control_endpoint": "http://10.0.1.23:7310",
   "vendor": "aws",
   "region": "us-east-1",
   "zone": "us-east-1a",
@@ -765,7 +768,7 @@ POST /v1/internal/nodes/register
 
 - `node_id + instance_id` 不存在：创建并返回 `registered`；
 - 完全相同且状态为 `running`：返回 `already_registered`；
-- `node_id` 相同但 `node_name` 或云实例信息不同：返回 `node_identity_conflict`；
+- `node_id` 相同但 `node_name`、`control_endpoint` 或云实例信息不同：返回 `node_identity_conflict`；
 - Node 为 `offline/reset_required`：返回 `reset_required`；
 - Node 为 `deleted`：拒绝注册，必须提供新的 `node_id`。
 
