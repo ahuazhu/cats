@@ -82,7 +82,7 @@
 
 | 提交 | 内容 | 定向验证 |
 |---|---|---|
-| `73659d66` | ADR-0059 与切换合同 | 文档合同通过；未完成项按预期失败 |
+| `73659d66`、`4a80df0b` | ADR-0059 与切换合同 | 当前 4/6 通过；noded 与 production composition 待接线 |
 | `f7cc7dc1` | 公共 semantic wire | API tests、Clippy |
 | `b845b381` | v19 schema 与 semantic Store | Control check、schema tests；PG tests 待环境 |
 | `ad88cc2e` | Control lifecycle coordinator | 10 tests、Clippy |
@@ -105,4 +105,5 @@
 - 建立并行工作树和空数据单协议基线。
 - 完成并合入公共 wire、v19 schema/Store、Control coordinator、noded HTTP client、CLI 和 Disk/mount-ready 切片。
 - 完成并合入 Node 管理服务、Control 注册/心跳路由和 noded heartbeat/reset client。
+- 切换合同当前 4/6 通过，只剩 noded 同步服务和 production composition 两项未完成。
 - noded 同步执行分支正在收尾；Production Store adapter 正在实现。
