@@ -726,3 +726,94 @@ fn inconsistent(message: impl Into<String>) -> ApiError {
         message.into()
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(
+        disk_hex: char,
+        volume_hex: char,
+        initialization_hex: char,
+        filesystem_hex: char,
+        delete_hex: char,
+    ) -> SemanticStrictPersistentDisk {
+        SemanticStrictPersistentDisk {
+            disk_id: Id::new(format!("disk_{}", disk_hex.to_string().repeat(32))).unwrap(),
+            workspace_id: Id::new("ws_strict_semantic").unwrap(),
+            name: Id::new("data").unwrap(),
+            volume_id: Id::new(format!("vol_{}", volume_hex.to_string().repeat(32))).unwrap(),
+            size_bytes: 4 * 1024 * 1024,
+            initialization_token: RandomId128::new(initialization_hex.to_string().repeat(32))
+                .unwrap(),
+            filesystem_uuid: RandomId128::new(filesystem_hex.to_string().repeat(32)).unwrap(),
+            delete_id: Id::new(format!("delete_{}", delete_hex.to_string().repeat(32))).unwrap(),
+        }
+    }
+
+    fn store() -> Store {
+        let store =
+            Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+        store
+            .with(|client| {
+                client.batch_execute(
+                    "INSERT INTO accounts (
+                        id,slug,display_name,kind,workos_organization_id,billing_account_id,
+                        personal_owner_user_id,status,created_at
+                     ) VALUES (
+                        'acct_strict_semantic','strict-semantic','Strict Semantic',
+                        'organization','org_strict_semantic','billing_strict_semantic',
+                        NULL,'active',1
+                     );
+                     INSERT INTO workspaces (
+                        id,account_id,slug,display_name,is_default,created_at
+                     ) VALUES (
+                        'ws_strict_semantic','acct_strict_semantic','default','Default',TRUE,1
+                     );",
+                )
+            })
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn create_delete_and_name_reuse_are_exact_without_operation_identity() {
+        let store = store();
+        let first = candidate('1', '2', '3', '4', '5');
+
+        store.ensure_semantic_strict_disk_created(&first).unwrap();
+        store.ensure_semantic_strict_disk_created(&first).unwrap();
+        store
+            .with(|client| {
+                let row = client.query_one(
+                    "SELECT d.admin_state,v.admin_state,v.lease_epoch
+                   FROM disk_records d JOIN volume_records v USING (volume_id)
+                  WHERE d.disk_id=$1",
+                    &[&first.disk_id.as_str()],
+                )?;
+                assert_eq!(row.get::<_, String>(0), "active");
+                assert_eq!(row.get::<_, String>(1), "active");
+                assert_eq!(row.get::<_, i64>(2), 0);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            store.begin_semantic_strict_disk_delete(&first).unwrap(),
+            SemanticStrictDeleteState::Deleting
+        );
+        assert_eq!(
+            store.begin_semantic_strict_disk_delete(&first).unwrap(),
+            SemanticStrictDeleteState::Deleting
+        );
+        store.complete_semantic_strict_disk_delete(&first).unwrap();
+        store.complete_semantic_strict_disk_delete(&first).unwrap();
+        assert!(store.semantic_strict_disk_is_absent(&first).unwrap());
+
+        let replacement = candidate('6', '7', '8', '9', 'a');
+        store
+            .ensure_semantic_strict_disk_created(&replacement)
+            .unwrap();
+        assert!(!store.semantic_strict_disk_is_absent(&replacement).unwrap());
+    }
+}
