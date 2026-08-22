@@ -128,6 +128,8 @@
 | `d156894b` | 删除依赖已退役 runtime authority fixture 的旧 Node object-write E2E | Node semantic 单测 20/20；真实 HTTP 纵向测试 1/1 |
 | `c55e77fc` | strict Volume Authority schema 统一到 v19，移除 noded 退役依赖，WorkOS 回归退出旧 GET Cat projection | authority PG 28/28、WorkOS 12/12、cargo-machete 通过；`quality.sh full` 全阶段通过 |
 | `b0231f98`、`d07538ef` | 删除依赖已退役 `cat_records`/lifecycle authority 的 blockd NBD crash、root provision fixture 及其专属 Linux gate，并记录退出范围 | deployment contracts 70/70、blockd remaining targets 全通过、cargo-machete 通过；`quality.sh linux` 全阶段通过 |
+| `e581aefb` | 合入 main 的完整 production package/deploy/E2E 工具并解决 clean-slate composition 冲突；发布 ADR 顺延为 ADR-0060 | 合并前 `e83b7717` Linux compatibility gate 全阶段通过；最终提交门禁待运行 |
+| `78163788` | production deployer 删除退役 Gateway 计划/验证；production E2E 迁到同步 Cat/Disk slug 协议并覆盖三休眠态、重试、物理挂载屏障、绑定和 slug 复用 | package、deployer、production E2E 三个离线 fixture 通过；相关 deployment contracts 3/3 通过 |
 
 ## 5. 进度更新规则
 
@@ -175,3 +177,5 @@
 - 已删除退役 Node lifecycle command、runtime inventory、AgentSession/Route、launcher 等 authority 实现及其专属测试；保留的同 Cat 并发、reset 清理和双 Node 恢复均已迁移到新 semantic HTTP 测试。`cargo check -p cats-node-agent -p cats-node-agent-daemon --all-targets`、Node deployment contracts 20/20、双 Node semantic HTTP 2/2 和 `cargo machete --with-metadata` 通过。
 - 生产 worker bundle 不再构建、安装或校验旧 Route validator/launcher；Kubernetes application 不再向 controld 传入旧 Route 监听，也不再部署旧 Route Gateway、ObjectWrite Gateway、rotation Service、旧 PVC/NLB/DNS 或 Endpoint wildcard ingress，Control 镜像也不再携带旧 gateway binary。相关 Terraform module/production application 测试共 8/8、Control deployment contracts 61/61 通过；当前生产公网只把 Control host 路由到新同步 API。
 - 当前 clean commit `5ea86c3e` 的 `./scripts/quality.sh full` 通过全部阶段：fmt、共享 skills、release image contract、deny/machete、workspace build、Clippy、workspace/PostgreSQL tests 与 rustdoc。首轮门禁发现并修正一处新 noded wire 测试缺少 `workspace_id`；第二轮按切换规则删除 3 个只验证已退役 ObjectWrite Gateway/PVC/NLB 生产编排的测试，Host fence 与 worker direct-S3 最小权限测试保留并通过 3/3。
+- 合并前 clean commit `e83b7717` 的 `./scripts/quality.sh linux` 已完整通过：workspace build/Clippy/tests、PostgreSQL、Rustdoc 以及 2 个 privileged Node 网络测试均通过。随后合入 production release 工具并继续修改，因此该结果只作为校准，最终发布提交仍须重跑 native/full 门禁。
+- 已合入 main 的 content-addressed production package/deploy 工具；部署计划和 rollout 验证不再引用退役 ObjectWrite/Route Gateway，只验证 Control、独立 credential refresher 和 worker bundle。新 production E2E 已删除 Operation wait，改为同步 Cat/Disk slug API，并在 36 个独立证据步骤覆盖 Disk create/retry、带盘 Cat create/retry、Suspended/Warm/Cold、动作 replay、Cold detach/attach、Guest mount-ready 后 Run、destroy 和 Cat/Disk slug 复用；三个离线 fixture 和相关部署合同通过。
