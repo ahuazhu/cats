@@ -23,7 +23,7 @@
 | 工作流 | 代码边界 | 交付内容 | 状态 |
 |---|---|---|---|
 | 公共协议 | `api/` | Cat/Disk/Node DTO、错误码、noded wire、Bearer token | 已完成并合入 |
-| 数据库 | `control-plane/src/store/` | v19 表、slug 部分唯一索引、Disk RWO、动作 CAS、数据库心跳时间 | 已合入；PG 行为测试待最终环境 |
+| 数据库 | `control-plane/src/store/` | v19 表、slug 部分唯一索引、Disk RWO、动作 CAS、数据库心跳时间 | 已完成；schema、并发与 authority PG 回归已通过 |
 | Control 核心 | `control-plane/src/semantic_lifecycle.rs` | 同步动作、语义幂等、超时查询恢复、入口先撤后发 | 已完成并合入 |
 | noded HTTP client | `control-plane/src/semantic_noded_client.rs` | Control 同步调用 noded、Bearer、deadline、严格响应校验 | 已完成并合入 |
 | PersistentDisk | `control-plane/src/semantic_disk.rs`、`node-agent/src/semantic_mounts.rs` | create/binding/destroy 语义与 Guest 完整挂载确认 | Strict provision/delete backend 和 production composition 已完成；CH/Guest 物理挂载 E2E 待完成 |
@@ -32,7 +32,7 @@
 | Node 管理 | Control API、Node heartbeat client | 注册、`node_name`、`control_endpoint`、offline/reset/drain/恢复 | 已完成并接入生产进程 |
 | Production adapters | Control adapter | Store/placement/noded/入口实现与公共 DTO 映射 | 已完成；公网 Gateway 细节按设计不在本协议范围 |
 | HTTP composition | Control router、AppState、controld/noded main | 新路由和服务接线，旧路由退出 | Control/noded 已完成；CH effects 为独立剩余项 |
-| 切换清理 | schema、router、旧模块和测试 | 删除旧表、旧入口、旧 runner 和只验证旧协议的测试 | 旧 HTTP/Store/schema/测试已删除；旧 Route v2 部署合同待随新入口传输实现退出 |
+| 切换清理 | schema、router、旧模块和测试 | 删除旧表、旧入口、旧 runner 和只验证旧协议的测试 | 旧 HTTP/Store/schema 和已失去 fixture 的旧 authority/部署测试已删除；旧 Route v2 部署合同待随新入口传输实现退出 |
 | 纵向联调 | FakeVmm/PostgreSQL | Disk→Cat→状态动作→跨 Node→destroy→slug 复用 | HTTP Cat 全状态机和 PostgreSQL Disk/Store 场景已完成；真实双 Node 与 CH/Guest E2E 待完成 |
 | 最终门禁 | 全仓库与 Linux | 完整门禁、Linux Node/真实 VMM 冒烟 | 待开始 |
 
@@ -86,9 +86,9 @@
 ### 阶段 E：最终验证
 
 - [x] PostgreSQL 并发 create、slug 复用、Disk RWO、动作 CAS。
-- [ ] Control 响应丢失后查询 noded 恢复。
-- [ ] offline Node 下一次心跳触发 reset 并最终单实例。
-- [ ] `cargo test`/Clippy 的相关定向回归全部通过。
+- [x] Control 响应丢失后查询 noded 恢复。
+- [x] offline Node 下一次心跳触发 reset，关闭 placement、清理本地 Cat 后重新注册。
+- [x] `cargo test`/Clippy 的相关定向回归全部通过。
 - [ ] 运行 `./scripts/quality.sh full`。
 - [ ] 运行适用的 Linux Node/Cloud Hypervisor 门禁或记录环境阻塞。
 
@@ -123,6 +123,9 @@
 | `e54c3084`、`4fa9f4a6`、`c03f26a8` | Strict PersistentDisk authority backend、最小独立 Store seam、production composition 和 PostgreSQL 回归 | backend 2、resource 5、Strict authority PG 1/1、semantic Store PG 11/11；Control/controld check |
 | `a4eb99cf`、`32145634`、`4b891105`、`e905980a`、`e762ce8d` | 删除旧协议 schema/catalog、HTTP 测试、request queue owner、OCI wait 配置和退役测试夹具 | schema PG 1/1、semantic schema 2/2、Control all-target Clippy `-D warnings` |
 | `2a7f4956` | 四份主架构文档统一到 ADR-0059，并明确双跑和未完成物理边界 | Markdown links 110/110、旧协议正向声明 0 |
+| `271c6bb1` | production mutation admission 与 fresh schema 统一绑定 v19 | admission 回归 2/2 |
+| `5e9940d8`、`9c4ab685` | 迁移只适用于旧 noded composition 的部署断言并清理 Clippy | deployment contracts 71/71；四个核心 crate all-target Clippy `-D warnings` |
+| `d156894b` | 删除依赖已退役 runtime authority fixture 的旧 Node object-write E2E | Node semantic 单测 20/20；真实 HTTP 纵向测试 1/1 |
 
 ## 5. 进度更新规则
 
@@ -155,3 +158,5 @@
 - PostgreSQL 已验证 Strict Disk authority 的重复 create/delete、同 slug 新身份复用，以及 semantic Store 的 11 个并发、RWO、心跳数据库时间、入口和恢复场景。
 - `--vmm ch` 已有明确的 installed effects 桥和单点 preflight；缺少精确 volume/runtime/route 输入时在任何物理副作用前失败，Fake 联调不受影响。
 - 切换合同的 noded 静态断言已按实际 `lane_if_open` 命名校准；production composition 已完成，旧 Store/schema 清理仍在进行。
+- 定向收尾已完成：API semantic 13/13、CLI 69/69（3 ignored）、cutover contract 6/6、Node semantic 20/20、真实 HTTP 纵向 1/1，四个核心 crate 的 all-target Clippy `-D warnings` 通过。
+- 已删除依赖退役 `AgentSession`/writer-authority provision fixture 的 Node object-write E2E，并同步移除不再使用的 dev dependencies；不会为 v19 重新制造旧 fixture。
