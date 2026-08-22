@@ -127,6 +127,7 @@
 | `5e9940d8`、`9c4ab685` | 迁移只适用于旧 noded composition 的部署断言并清理 Clippy | deployment contracts 71/71；四个核心 crate all-target Clippy `-D warnings` |
 | `d156894b` | 删除依赖已退役 runtime authority fixture 的旧 Node object-write E2E | Node semantic 单测 20/20；真实 HTTP 纵向测试 1/1 |
 | `c55e77fc` | strict Volume Authority schema 统一到 v19，移除 noded 退役依赖，WorkOS 回归退出旧 GET Cat projection | authority PG 28/28、WorkOS 12/12、cargo-machete 通过；`quality.sh full` 全阶段通过 |
+| `b0231f98` | 删除依赖已退役 `cat_records`/lifecycle authority 的 blockd NBD crash、root provision fixture 及其专属 Linux gate | deployment contracts 70/70、blockd remaining targets 全通过、cargo-machete 通过；Linux gate 待复跑 |
 
 ## 5. 进度更新规则
 
@@ -163,3 +164,4 @@
 - 已删除依赖退役 `AgentSession`/writer-authority provision fixture 的 Node object-write E2E，并同步移除不再使用的 dev dependencies；不会为 v19 重新制造旧 fixture。
 - 首轮 full gate 发现并完成三个切换收尾：noded 的 4 个退役依赖、strict Volume Authority 的 v18 常量、5 处 WorkOS 对旧 GET Cat projection 的断言；其中仍适用的 `/v1/me`、session 和 admin 行为已保留并迁移。
 - `./scripts/quality.sh full` 在干净提交 `c55e77fc` 上通过全部阶段：fmt、skills、release images、deny/machete、workspace build、Clippy、workspace tests 和 rustdoc。
+- Linux 首轮 gate 的 build、Clippy、rustdoc 与新 Node privileged 网络测试通过；workspace/privileged blockd 两组失败均来自已删除的 `cat_records` fixture。按单协议切换边界删除 1,378 行旧 NBD/root-provision tests 和 202 行专属 fixture，并从 Linux gate 退出该旧 inventory；未恢复旧表。
