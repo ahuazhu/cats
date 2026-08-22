@@ -21,5 +21,6 @@ pub mod route_signing_rotation;
 pub mod route_v2_machine;
 pub mod runtime_cutover;
 pub mod runtime_inventory;
+pub mod semantic_mounts;
 pub mod state_directory;
 pub mod vmm_launcher;
