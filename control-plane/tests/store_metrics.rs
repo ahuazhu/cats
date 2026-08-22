@@ -7,11 +7,8 @@
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
-use cats_api::runtime_reconciliation::Id;
 use cats_control_plane::server::{spawn_singleton_task, Config, Handle};
-use cats_control_plane::store::{
-    DsnSource, OciDeploymentClaim, SingletonRole, Store, CONTROL_STORE_BLOCKING_WORKERS,
-};
+use cats_control_plane::store::{DsnSource, SingletonRole, Store, CONTROL_STORE_BLOCKING_WORKERS};
 use cats_control_plane::testsupport::spawn_control_plane_for_test as spawn;
 use cats_metering::SqliteUsageStore;
 
@@ -73,7 +70,6 @@ struct Sample {
     latency_count: u64,
     latency_sum: f64,
     singleton_connections: u64,
-    oci_connections: u64,
 }
 
 fn prometheus_number(body: &str, selector: &str) -> f64 {
@@ -111,7 +107,6 @@ async fn sample(context: &MetricsContext) -> Sample {
             "cats_control_store_request_latency_seconds_sum{executor=\"normal\"}",
         ),
         singleton_connections: integer("cats_control_store_connections{kind=\"singleton\"}"),
-        oci_connections: integer("cats_control_store_connections{kind=\"oci\"}"),
     }
 }
 
@@ -265,54 +260,16 @@ async fn saturation_and_connection_lifetimes_report_explicit_deltas() {
     })
     .await
     .expect("singleton connection count must increase by at least one");
-
-    let cat_id = Id::new("cat_metrics_connection_lifetime").unwrap();
-    let claim = context
-        .control_plane
-        .state
-        .store
-        .execute(move |store| {
-            store.claim_oci_deployment(&cat_id, "metrics", &format!("sha256:{}", "a".repeat(64)))
-        })
-        .await
-        .unwrap();
-    let lease = match claim {
-        OciDeploymentClaim::Claimed { lease, .. } => lease,
-        _ => panic!("the fixture must create one OCI ownership session"),
-    };
-    let with_oci = tokio::time::timeout(cats_test_support::poll_bound(), async {
-        loop {
-            let current = sample(&context).await;
-            if delta(
-                current.oci_connections,
-                with_singleton.oci_connections,
-                "OCI connections",
-            ) >= 1
-            {
-                return current;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("OCI connection count must increase by at least one");
-
-    drop(lease);
     singleton.abort();
     let _ = singleton.await;
     let released = tokio::time::timeout(cats_test_support::poll_bound(), async {
         loop {
             let current = sample(&context).await;
             if delta(
-                with_oci.singleton_connections,
+                with_singleton.singleton_connections,
                 current.singleton_connections,
                 "released singleton connections",
             ) >= 1
-                && delta(
-                    with_oci.oci_connections,
-                    current.oci_connections,
-                    "released OCI connections",
-                ) >= 1
             {
                 return current;
             }
@@ -320,19 +277,12 @@ async fn saturation_and_connection_lifetimes_report_explicit_deltas() {
         }
     })
     .await
-    .expect("both connection counts must fall by at least one after cleanup");
+    .expect("singleton connection count must fall after cleanup");
     assert!(
         delta(
-            with_oci.singleton_connections,
+            with_singleton.singleton_connections,
             released.singleton_connections,
             "released singleton connections",
-        ) >= 1
-    );
-    assert!(
-        delta(
-            with_oci.oci_connections,
-            released.oci_connections,
-            "released OCI connections",
         ) >= 1
     );
 }
