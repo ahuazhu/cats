@@ -8,6 +8,7 @@ pub mod object_write_gateway;
 pub(crate) mod route_grant_v2;
 pub(crate) mod route_rotation_machine;
 pub mod semantic_lifecycle;
+pub mod semantic_noded_client;
 pub mod server;
 pub mod store;
 #[doc(hidden)]

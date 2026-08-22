@@ -301,6 +301,8 @@ pub enum SemanticSuccessCode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticErrorCode {
+    Unauthorized,
+    InvalidRequest,
     CatNotFound,
     CatConfigurationConflict,
     CatDestroyed,
@@ -322,6 +324,7 @@ pub enum SemanticErrorCode {
     GuestWarmFailed,
     GuestColdFailed,
     DestroyFailed,
+    ActionCancelled,
     Timeout,
     InternalError,
 }
@@ -329,6 +332,8 @@ pub enum SemanticErrorCode {
 impl SemanticErrorCode {
     pub const fn http_status(self) -> u16 {
         match self {
+            Self::Unauthorized => 401,
+            Self::InvalidRequest => 400,
             Self::CatNotFound | Self::DiskNotFound => 404,
             Self::CatConfigurationConflict
             | Self::Busy
@@ -337,7 +342,8 @@ impl SemanticErrorCode {
             | Self::DiskInUse
             | Self::DiskAlreadyAttached
             | Self::DiskBindingConflict
-            | Self::MountPathConflict => 409,
+            | Self::MountPathConflict
+            | Self::ActionCancelled => 409,
             Self::CatDestroyed
             | Self::InvalidState
             | Self::NodeResetRequired
@@ -674,9 +680,43 @@ impl NodedCatActionRequest {
 #[serde(deny_unknown_fields)]
 pub struct NodedCatView {
     pub cat_id: Id,
-    pub state: CatState,
+    /// `None` exists only while the first create is executing.
+    pub state: Option<CatState>,
     pub active_action: Option<CatAction>,
     pub config: NodedCatConfig,
+}
+
+impl NodedCatView {
+    pub fn validate(&self) -> Result<(), SemanticValidationError> {
+        validate_prefixed_id(&self.cat_id, "cat_")?;
+        match (self.state, self.active_action) {
+            (None, Some(CatAction::Create)) => {}
+            (None, _) | (Some(_), Some(CatAction::Create)) => {
+                return Err(SemanticValidationError::CatShape)
+            }
+            (Some(_), _) => {}
+        }
+        self.config.validate()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodedCatListResponse {
+    pub cats: Vec<NodedCatView>,
+}
+
+impl NodedCatListResponse {
+    pub fn validate(&self) -> Result<(), SemanticValidationError> {
+        let mut cat_ids = HashSet::with_capacity(self.cats.len());
+        for cat in &self.cats {
+            cat.validate()?;
+            if !cat_ids.insert(cat.cat_id.as_str()) {
+                return Err(SemanticValidationError::DuplicateCat);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -846,6 +886,8 @@ pub enum SemanticValidationError {
     DuplicateDisk,
     #[error("a mount_path occurs more than once in the mount set")]
     DuplicateMountPath,
+    #[error("a Cat occurs more than once in a complete noded list")]
+    DuplicateCat,
     #[error("Cat placement must carry node_id and node_name together")]
     Placement,
     #[error("resource cpu or memory is invalid")]
@@ -1159,6 +1201,25 @@ mod tests {
             invalid.validate(),
             Err(SemanticValidationError::ResponseShape)
         );
+
+        let creating = NodedCatView {
+            cat_id: id("cat_01"),
+            state: None,
+            active_action: Some(CatAction::Create),
+            config: NodedCatConfig {
+                cpu: 1,
+                memory_bytes: 1,
+                boot_image: "image".to_owned(),
+                mounts: Vec::new(),
+            },
+        };
+        creating.validate().unwrap();
+        let mut invalid_creating = creating;
+        invalid_creating.active_action = Some(CatAction::Run);
+        assert_eq!(
+            invalid_creating.validate(),
+            Err(SemanticValidationError::CatShape)
+        );
     }
 
     #[test]
@@ -1186,6 +1247,9 @@ mod tests {
             r#"{"code":"cat_must_be_cold","message":"Cat must be Cold before attach"}"#
         );
         assert_eq!(body.code.http_status(), 422);
+        assert_eq!(SemanticErrorCode::Unauthorized.http_status(), 401);
+        assert_eq!(SemanticErrorCode::InvalidRequest.http_status(), 400);
+        assert_eq!(SemanticErrorCode::ActionCancelled.http_status(), 409);
         assert_eq!(SemanticErrorCode::NodeUnavailable.http_status(), 503);
         assert_eq!(SemanticErrorCode::Timeout.http_status(), 504);
     }
