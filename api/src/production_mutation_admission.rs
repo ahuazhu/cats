@@ -29,7 +29,7 @@ pub const PRODUCTION_QUALIFICATION_PRODUCT_INVENTORY_PATH: &str =
     "/v1/admin/production/qualification-product-inventory-discoveries";
 pub const PRODUCTION_MUTATION_ADMISSION_REQUEST_MAX_WIRE_BYTES: usize = 65_536;
 pub const PRODUCTION_MUTATION_ADMISSION_RESPONSE_MAX_WIRE_BYTES: usize = 131_072;
-pub const PRODUCTION_MUTATION_ADMISSION_SCHEMA_VERSION: u64 = 18;
+pub const PRODUCTION_MUTATION_ADMISSION_SCHEMA_VERSION: u64 = 19;
 pub const PRODUCTION_MUTATION_ADMISSION_METHOD: &str = "POST";
 pub const PRODUCTION_CUTOVER_CREDENTIAL_ID_HEADER: &str = "cats-production-cutover-credential-id";
 pub const PRODUCTION_CUTOVER_SIGNATURE_HEADER: &str = "cats-production-cutover-signature";
