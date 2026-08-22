@@ -34,7 +34,7 @@
 | HTTP composition | Control router、AppState、controld/noded main | 新路由和服务接线，旧路由退出 | Control/noded 已完成；CH effects 为独立剩余项 |
 | 切换清理 | schema、router、旧模块和测试 | 删除旧表、旧入口、旧 runner 和只验证旧协议的测试 | 旧 HTTP/Store/schema 和已失去 fixture 的旧 authority/部署测试已删除；旧 Route v2 部署合同待随新入口传输实现退出 |
 | 纵向联调 | FakeVmm/PostgreSQL | Disk→Cat→状态动作→跨 Node→destroy→slug 复用 | HTTP Cat 全状态机和 PostgreSQL Disk/Store 场景已完成；真实双 Node 与 CH/Guest E2E 待完成 |
-| 最终门禁 | 全仓库与 Linux | 完整门禁、Linux Node/真实 VMM 冒烟 | `quality.sh full` 已通过；Linux gate 待运行 |
+| 最终门禁 | 全仓库与 Linux | 完整门禁、Linux Node/真实 VMM 冒烟 | `quality.sh full` 与 `quality.sh linux` 已通过；真实 CH/Guest 物理 E2E 仍待完成 |
 
 ## 3. 集成顺序
 
@@ -90,7 +90,7 @@
 - [x] offline Node 下一次心跳触发 reset，关闭 placement、清理本地 Cat 后重新注册。
 - [x] `cargo test`/Clippy 的相关定向回归全部通过。
 - [x] 运行 `./scripts/quality.sh full`。
-- [ ] 运行适用的 Linux Node/Cloud Hypervisor 门禁或记录环境阻塞。
+- [x] 运行适用的 Linux Node/Cloud Hypervisor 门禁或记录环境阻塞。
 
 ## 4. 已合入提交
 
@@ -127,7 +127,7 @@
 | `5e9940d8`、`9c4ab685` | 迁移只适用于旧 noded composition 的部署断言并清理 Clippy | deployment contracts 71/71；四个核心 crate all-target Clippy `-D warnings` |
 | `d156894b` | 删除依赖已退役 runtime authority fixture 的旧 Node object-write E2E | Node semantic 单测 20/20；真实 HTTP 纵向测试 1/1 |
 | `c55e77fc` | strict Volume Authority schema 统一到 v19，移除 noded 退役依赖，WorkOS 回归退出旧 GET Cat projection | authority PG 28/28、WorkOS 12/12、cargo-machete 通过；`quality.sh full` 全阶段通过 |
-| `b0231f98` | 删除依赖已退役 `cat_records`/lifecycle authority 的 blockd NBD crash、root provision fixture 及其专属 Linux gate | deployment contracts 70/70、blockd remaining targets 全通过、cargo-machete 通过；Linux gate 待复跑 |
+| `b0231f98`、`d07538ef` | 删除依赖已退役 `cat_records`/lifecycle authority 的 blockd NBD crash、root provision fixture 及其专属 Linux gate，并记录退出范围 | deployment contracts 70/70、blockd remaining targets 全通过、cargo-machete 通过；`quality.sh linux` 全阶段通过 |
 
 ## 5. 进度更新规则
 
@@ -165,3 +165,4 @@
 - 首轮 full gate 发现并完成三个切换收尾：noded 的 4 个退役依赖、strict Volume Authority 的 v18 常量、5 处 WorkOS 对旧 GET Cat projection 的断言；其中仍适用的 `/v1/me`、session 和 admin 行为已保留并迁移。
 - `./scripts/quality.sh full` 在干净提交 `c55e77fc` 上通过全部阶段：fmt、skills、release images、deny/machete、workspace build、Clippy、workspace tests 和 rustdoc。
 - Linux 首轮 gate 的 build、Clippy、rustdoc 与新 Node privileged 网络测试通过；workspace/privileged blockd 两组失败均来自已删除的 `cat_records` fixture。按单协议切换边界删除 1,378 行旧 NBD/root-provision tests 和 202 行专属 fixture，并从 Linux gate 退出该旧 inventory；未恢复旧表。
+- `./scripts/quality.sh linux` 在干净提交 `d07538ef` 上复跑通过：Linux build、Clippy、workspace tests、rustdoc 全部通过，新 Node privileged 网络测试 2/2 通过；真实双 Node 与 CH/Guest 持久卷物理 E2E 不在该门禁中，仍作为显式剩余项。
