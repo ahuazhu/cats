@@ -134,6 +134,9 @@ pub struct CatRecord {
     pub created_at: i64,
     pub updated_at: i64,
     pub destroyed_at: Option<i64>,
+    /// Non-null only while a background scanner exclusively owns recovery of
+    /// this exact action occurrence.
+    pub current_action_recovery_started_at: Option<i64>,
 }
 
 impl CatRecord {
@@ -274,6 +277,7 @@ pub enum BeginCatActionOutcome {
 pub struct FinishCatAction<'a> {
     pub expected_action: CatAction,
     pub expected_action_started_at: i64,
+    pub expected_recovery_started_at: Option<i64>,
     pub expected_node_id: Option<&'a str>,
     pub final_state: CatState,
     pub final_node_id: Option<&'a str>,
@@ -715,6 +719,11 @@ impl Store {
                     AdmitCatCreateOutcome::ConfigurationConflict(aggregate)
                 } else {
                     match aggregate.cat.current_action {
+                        Some(CatAction::Create)
+                            if aggregate.cat.current_action_recovery_started_at.is_some() =>
+                        {
+                            AdmitCatCreateOutcome::Busy(aggregate)
+                        }
                         Some(CatAction::Create) => AdmitCatCreateOutcome::SameAction(
                             refresh_current_action_activity(&mut transaction, aggregate)?,
                         ),
@@ -773,6 +782,11 @@ impl Store {
                     AdmitCatCreateOutcome::ConfigurationConflict(aggregate)
                 } else {
                     match aggregate.cat.current_action {
+                        Some(CatAction::Create)
+                            if aggregate.cat.current_action_recovery_started_at.is_some() =>
+                        {
+                            AdmitCatCreateOutcome::Busy(aggregate)
+                        }
                         Some(CatAction::Create) => AdmitCatCreateOutcome::SameAction(
                             refresh_current_action_activity(&mut transaction, aggregate)?,
                         ),
@@ -894,6 +908,13 @@ impl Store {
                 return Ok(AdmitCatActionOutcome::AlreadyDone(aggregate));
             }
             match aggregate.cat.current_action {
+                Some(current)
+                    if current == action
+                        && aggregate.cat.current_action_recovery_started_at.is_some() =>
+                {
+                    transaction.commit()?;
+                    return Ok(AdmitCatActionOutcome::Busy(aggregate));
+                }
                 Some(current) if current == action => {
                     let aggregate = refresh_current_action_activity(&mut transaction, aggregate)?;
                     transaction.commit()?;
@@ -952,6 +973,7 @@ impl Store {
                             END,
                             current_action=$2,
                             current_action_started_at=GREATEST({DB_NOW_MS}, updated_at + 1),
+                            current_action_recovery_started_at=NULL,
                             current_action_node_id=$3,updated_at={DB_NOW_MS},
                             last_error_code=NULL,last_error_message=NULL
                       WHERE cat_id=$1
@@ -1094,13 +1116,13 @@ impl Store {
         })
     }
 
-    /// Returns one DB-time ordered page of ordinary non-Destroy lifecycle
-    /// actions with no foreground activity for `stale_after_ms`. Same-action
-    /// admission refreshes `updated_at` without changing the action occurrence
-    /// identity. Cross-Node offline recovery owns a distinct multi-step state
-    /// machine while reusing a `run` lane, so those rows remain exclusively
-    /// with that recovery loop.
-    pub fn list_stale_semantic_cat_actions(
+    /// Atomically leases one DB-time ordered page of ordinary non-Destroy
+    /// lifecycle actions with no foreground activity for `stale_after_ms`.
+    /// The row locks serialize this handoff with same-action admission: either
+    /// the retry refreshes activity first, or it observes the committed lease
+    /// and does not drive the occurrence. An abandoned lease becomes eligible
+    /// for another scanner after the same bounded interval.
+    pub fn claim_stale_semantic_cat_actions(
         &self,
         stale_after_ms: i64,
         limit: usize,
@@ -1120,21 +1142,38 @@ impl Store {
                        FROM cats
                       WHERE current_action IS NOT NULL
                         AND current_action<>'destroy'
-                        AND updated_at <= {DB_NOW_MS} - $1
+                        AND (
+                            (current_action_recovery_started_at IS NULL
+                             AND updated_at <= {DB_NOW_MS} - $1)
+                            OR current_action_recovery_started_at <= {DB_NOW_MS} - $1
+                        )
                         AND NOT (
                             current_action='run'
                             AND node_id IS NOT NULL
                             AND current_action_node_id IS DISTINCT FROM node_id
                         )
-                      ORDER BY updated_at, cat_id COLLATE \"C\"
+                      ORDER BY COALESCE(current_action_recovery_started_at, updated_at),
+                               cat_id COLLATE \"C\"
                       LIMIT $2
-                      FOR SHARE SKIP LOCKED"
+                      FOR UPDATE SKIP LOCKED"
                 ),
                 &[&stale_after_ms, &limit],
             )?;
             let mut cats = Vec::with_capacity(rows.len());
             for row in rows {
-                cats.push(cat_with_mounts(&mut transaction, row_to_cat(&row))?);
+                let cat_id: &str = row.get(0);
+                let claimed = transaction.query_one(
+                    &format!(
+                        "UPDATE cats
+                            SET current_action_recovery_started_at=GREATEST(
+                                {DB_NOW_MS}, current_action_recovery_started_at + 1
+                            )
+                          WHERE cat_id=$1
+                          RETURNING {CAT_COLUMNS}"
+                    ),
+                    &[&cat_id],
+                )?;
+                cats.push(cat_with_mounts(&mut transaction, row_to_cat(&claimed))?);
             }
             transaction.commit()?;
             Ok(cats)
@@ -1150,24 +1189,28 @@ impl Store {
         expected_action: CatAction,
         expected_node_id: Option<&str>,
         expected_action_started_at: i64,
+        expected_recovery_started_at: i64,
     ) -> Result<bool> {
         self.with(|client| {
             client
                 .execute(
                     &format!(
                         "UPDATE cats
-                            SET updated_at={DB_NOW_MS}
+                            SET updated_at={DB_NOW_MS},
+                                current_action_recovery_started_at=NULL
                           WHERE cat_id=$1
                             AND current_action=$2
                             AND current_action<>'destroy'
                             AND current_action_node_id IS NOT DISTINCT FROM $3
-                            AND current_action_started_at=$4"
+                            AND current_action_started_at=$4
+                            AND current_action_recovery_started_at=$5"
                     ),
                     &[
                         &cat_id,
                         &expected_action.as_str(),
                         &expected_node_id,
                         &expected_action_started_at,
+                        &expected_recovery_started_at,
                     ],
                 )
                 .map(|changed| changed == 1)
@@ -1186,6 +1229,7 @@ impl Store {
                     "UPDATE cats
                         SET current_action=$2,
                             current_action_started_at=GREATEST({DB_NOW_MS}, updated_at + 1),
+                            current_action_recovery_started_at=NULL,
                             current_action_node_id=$3,
                             updated_at={DB_NOW_MS},
                             last_error_code=NULL,
@@ -1202,7 +1246,7 @@ impl Store {
         let Some(row) = self.find_semantic_cat_by_id(cat_id)? else {
             return Ok(BeginCatActionOutcome::NotFound);
         };
-        if row.current_action == Some(action) {
+        if row.current_action == Some(action) && row.current_action_recovery_started_at.is_none() {
             Ok(BeginCatActionOutcome::SameActionInProgress(row))
         } else {
             Ok(BeginCatActionOutcome::Busy(row))
@@ -1222,19 +1266,21 @@ impl Store {
             let row = transaction.query_opt(
                 &format!(
                     "UPDATE cats
-                        SET state=$5,
-                            node_id=$6,
+                        SET state=$6,
+                            node_id=$7,
                             current_action=NULL,
                             current_action_started_at=NULL,
+                            current_action_recovery_started_at=NULL,
                             current_action_node_id=NULL,
-                            last_error_code=$7,
-                            last_error_message=$8,
-                            destroyed_at=CASE WHEN $5='destroyed' THEN {DB_NOW_MS} ELSE NULL END,
+                            last_error_code=$8,
+                            last_error_message=$9,
+                            destroyed_at=CASE WHEN $6='destroyed' THEN {DB_NOW_MS} ELSE NULL END,
                             updated_at={DB_NOW_MS}
                       WHERE cat_id=$1
                         AND current_action=$2
                         AND current_action_node_id IS NOT DISTINCT FROM $3
                         AND current_action_started_at=$4
+                        AND current_action_recovery_started_at IS NOT DISTINCT FROM $5
                       RETURNING {CAT_COLUMNS}"
                 ),
                 &[
@@ -1242,6 +1288,7 @@ impl Store {
                     &finish.expected_action.as_str(),
                     &finish.expected_node_id,
                     &finish.expected_action_started_at,
+                    &finish.expected_recovery_started_at,
                     &finish.final_state.as_str(),
                     &finish.final_node_id,
                     &finish.error_code,
@@ -1413,11 +1460,10 @@ impl Store {
         })
     }
 
-    /// Discovers a bounded snapshot of unresolved Destroy claims with no
-    /// foreground activity for the supplied grace period. Discovery is not
-    /// authority: callers must settle through the exact action occurrence and
-    /// Node predicate after noded discovery.
-    pub fn list_pending_semantic_destroy_claims(
+    /// Atomically leases a bounded page of unresolved Destroy claims with no
+    /// foreground activity for the supplied grace period. The same persisted
+    /// handoff used by ordinary recovery excludes a racing foreground retry.
+    pub fn claim_pending_semantic_destroy_claims(
         &self,
         minimum_age_ms: i64,
         limit: i64,
@@ -1428,17 +1474,33 @@ impl Store {
                 &format!(
                     "SELECT {CAT_COLUMNS} FROM cats
                       WHERE current_action='destroy'
-                        AND updated_at <= {DB_NOW_MS} - $1
+                        AND (
+                            (current_action_recovery_started_at IS NULL
+                             AND updated_at <= {DB_NOW_MS} - $1)
+                            OR current_action_recovery_started_at <= {DB_NOW_MS} - $1
+                        )
                         AND destroyed_at IS NULL
-                      ORDER BY updated_at,cat_id
+                      ORDER BY COALESCE(current_action_recovery_started_at, updated_at),cat_id
                       LIMIT $2
-                      FOR SHARE SKIP LOCKED"
+                      FOR UPDATE SKIP LOCKED"
                 ),
                 &[&minimum_age_ms, &limit],
             )?;
             let mut cats = Vec::with_capacity(rows.len());
             for row in rows {
-                cats.push(cat_with_mounts(&mut transaction, row_to_cat(&row))?);
+                let cat_id: &str = row.get(0);
+                let claimed = transaction.query_one(
+                    &format!(
+                        "UPDATE cats
+                            SET current_action_recovery_started_at=GREATEST(
+                                {DB_NOW_MS}, current_action_recovery_started_at + 1
+                            )
+                          WHERE cat_id=$1
+                          RETURNING {CAT_COLUMNS}"
+                    ),
+                    &[&cat_id],
+                )?;
+                cats.push(cat_with_mounts(&mut transaction, row_to_cat(&claimed))?);
             }
             transaction.commit()?;
             Ok(cats)
@@ -1453,19 +1515,27 @@ impl Store {
         cat_id: &str,
         expected_node_id: Option<&str>,
         expected_action_started_at: i64,
+        expected_recovery_started_at: i64,
     ) -> Result<bool> {
         self.with(|client| {
             client
                 .execute(
                     &format!(
                         "UPDATE cats
-                            SET updated_at={DB_NOW_MS}
+                            SET updated_at={DB_NOW_MS},
+                                current_action_recovery_started_at=NULL
                           WHERE cat_id=$1
                             AND current_action='destroy'
                             AND current_action_node_id IS NOT DISTINCT FROM $2
-                            AND current_action_started_at=$3"
+                            AND current_action_started_at=$3
+                            AND current_action_recovery_started_at=$4"
                     ),
-                    &[&cat_id, &expected_node_id, &expected_action_started_at],
+                    &[
+                        &cat_id,
+                        &expected_node_id,
+                        &expected_action_started_at,
+                        &expected_recovery_started_at,
+                    ],
                 )
                 .map(|changed| changed == 1)
         })
@@ -1656,6 +1726,7 @@ impl Store {
                     "UPDATE cats
                         SET current_action='run',
                             current_action_started_at=GREATEST({DB_NOW_MS}, updated_at + 1),
+                            current_action_recovery_started_at=NULL,
                             current_action_node_id=$3,
                             last_error_code=NULL,last_error_message=NULL,
                             updated_at={DB_NOW_MS}
@@ -1722,6 +1793,7 @@ impl Store {
                     "UPDATE cats
                         SET state=$6,node_id=$9,
                             current_action=NULL,current_action_started_at=NULL,
+                            current_action_recovery_started_at=NULL,
                             current_action_node_id=NULL,
                             last_error_code=$7,last_error_message=$8,
                             updated_at={DB_NOW_MS}
@@ -2422,7 +2494,8 @@ const fn semantic_action_allowed(action: CatAction, state: Option<CatState>) -> 
 
 const CAT_COLUMNS: &str = "cat_id,workspace_id,cat_slug,state,current_action,
     current_action_started_at,current_action_node_id,node_id,cpu_count,memory_bytes,
-    boot_image,last_error_code,last_error_message,created_at,updated_at,destroyed_at";
+    boot_image,last_error_code,last_error_message,created_at,updated_at,destroyed_at,
+    current_action_recovery_started_at";
 const NODE_COLUMNS: &str = "node_id,node_name,control_endpoint,vendor,region,zone,instance_id,
     machine_type,node_version,status,created_at,updated_at";
 const HEARTBEAT_COLUMNS: &str = "node_id,last_heartbeat_at,node_reported_at,reported_status,
@@ -2450,6 +2523,7 @@ fn row_to_cat(row: &Row) -> CatRecord {
         created_at: row.get(13),
         updated_at: row.get(14),
         destroyed_at: row.get(15),
+        current_action_recovery_started_at: row.get(16),
     }
 }
 

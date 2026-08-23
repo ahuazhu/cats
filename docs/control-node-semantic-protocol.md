@@ -103,6 +103,7 @@ cats
 - state                     # running/suspended/warm/cold/failure/destroyed；首次create进行中可为空
 - current_action            # create/run/suspend/warm/cold/destroy；空表示没有动作
 - current_action_started_at
+- current_action_recovery_started_at # 后台 scanner 对该 occurrence 的有界恢复 lease；通常为空
 - current_action_node_id    # 本次动作选中的Node；动作结束后清空
 - node_id                   # running/suspended/warm时必填；cold/destroyed时为空
 - cpu_count
@@ -637,16 +638,18 @@ Control Plane 可能在 `noded` 已经完成动作、但数据库尚未更新时
 6. 如果 Node 不可达，进入 Node 失联流程。
 
 生产 Control 为普通动作和 Destroy 分别使用 schema-scoped PostgreSQL advisory lock 选举一个恢复任务。
-两者都只扫描至少 135 秒没有前台活动、已经越过正常 120 秒同步请求 deadline 和最长 10 秒 Create 清理窗口的 claim；相同 action 的重试只刷新数据库 `updated_at` 活动时钟，不改变 `current_action_started_at` 精确 occurrence 身份。前台 deadline 从 ingress withdraw/publish 等 claim 后效果之前开始并约束这些等待。每批和并发都有上限，
+两者都只扫描至少 135 秒没有前台活动、已经越过正常 120 秒同步请求 deadline 和最长 10 秒 Create 清理窗口的 claim；相同 action 的重试只刷新数据库 `updated_at` 活动时钟，不改变 `current_action_started_at` 精确 occurrence 身份。前台 deadline 从 ingress withdraw/publish 等 claim 后效果之前开始并约束这些等待。scanner 在同一个 Cat 行锁事务内复核 inactivity 并写入 `current_action_recovery_started_at` lease：重试先提交时该行不再 eligible，scanner 先提交时后续相同 action 请求返回 `busy` 而不驱动物理效果。每批和并发都有上限，
 并执行上述同一套 discovery-first 与 exact settlement 规则；普通动作扫描排除由独立多步骤循环负责的
 跨 Node 失联恢复 `run` lane，也排除专用 Destroy lane。
 
 选举会话丢失会取消本轮恢复并在退避后重新参选；其他 replica 也可继续扫描，shutdown 才终止重选循环。
 扫描器和用户重试不能各自定义恢复规则，也不成为新的 lifecycle authority。两类扫描都按
-`updated_at, cat_id` 取最旧批次；单项失败以 Cat ID、action、目标 Node 和
-`current_action_started_at` 的 exact CAS 刷新 `updated_at`，把它轮转到未尝试 claim 之后，失败满批次
+`updated_at, cat_id` 取最旧批次；单项失败以 Cat ID、action、目标 Node、
+`current_action_started_at` 和 recovery lease 的 exact CAS 清除 lease 并刷新 `updated_at`，把它轮转到未尝试 claim 之后，失败满批次
 不能饿死后续动作。
 
+scanner crash 后，未清除的 lease 超过同一 135 秒界限即可由后继 scanner 精确重新领取；旧 owner 的终态 CAS
+不能结算新 lease。该 lease 只串行化同一 Node 上的 Control 恢复驱动，不是跨 Node fencing 证据。
 135 秒只是触发精确查询/恢复的无前台活动时间，不是 Node 失联判断，也不是 fencing 证据。heartbeat、日志、
 metrics 和 runtime inventory 仍然不能结算动作；扫描器必须向 `current_action_node_id` 对应的 noded
 确认实际状态。

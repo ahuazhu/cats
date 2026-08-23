@@ -70,6 +70,7 @@ fn create_running_cat(store: &Store, cat_id: &str, slug: &str) -> CatRecord {
             cat_id,
             FinishCatAction {
                 expected_action: CatAction::Create,
+                expected_recovery_started_at: None,
                 expected_node_id: Some("node-a"),
                 expected_action_started_at: created
                     .current_action_started_at
@@ -173,6 +174,7 @@ fn create_running_cat_on(
             cat_id,
             FinishCatAction {
                 expected_action: CatAction::Create,
+                expected_recovery_started_at: None,
                 expected_node_id: Some(node_id),
                 expected_action_started_at: created
                     .current_action_started_at
@@ -268,7 +270,7 @@ fn destroy_preempts_an_in_progress_create_on_its_reserved_node() {
     // Simulate Control exiting after the replacement claim commits but
     // before it dispatches to noded. A later elected scanner must rediscover
     // the exact Destroy lane and its inherited Node.
-    let pending = store.list_pending_semantic_destroy_claims(0, 32).unwrap();
+    let pending = store.claim_pending_semantic_destroy_claims(0, 32).unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].cat.cat_id, "cat-destroy-creating");
     assert_eq!(pending[0].cat.current_action, Some(CatAction::Destroy));
@@ -276,12 +278,22 @@ fn destroy_preempts_an_in_progress_create_on_its_reserved_node() {
         pending[0].cat.current_action_node_id.as_deref(),
         Some("node-a")
     );
+    assert!(matches!(
+        store
+            .admit_semantic_cat_action(
+                SemanticCatSelector::Id("cat-destroy-creating"),
+                CatAction::Destroy,
+            )
+            .unwrap(),
+        AdmitCatActionOutcome::Busy(_)
+    ));
 
     assert!(store
         .finish_semantic_cat_action(
             "cat-destroy-creating",
             FinishCatAction {
                 expected_action: CatAction::Create,
+                expected_recovery_started_at: None,
                 expected_node_id: Some("node-a"),
                 expected_action_started_at: creating
                     .cat
@@ -301,8 +313,9 @@ fn destroy_preempts_an_in_progress_create_on_its_reserved_node() {
             "cat-destroy-creating",
             FinishCatAction {
                 expected_action: CatAction::Destroy,
+                expected_recovery_started_at: pending[0].cat.current_action_recovery_started_at,
                 expected_node_id: Some("node-a"),
-                expected_action_started_at: destroy
+                expected_action_started_at: pending[0]
                     .cat
                     .current_action_started_at
                     .expect("destroy claim has a start time"),
@@ -316,7 +329,7 @@ fn destroy_preempts_an_in_progress_create_on_its_reserved_node() {
         .expect("destroy owns the replacement claim");
     assert_eq!(destroyed.state, Some(CatState::Destroyed));
     assert!(store
-        .list_pending_semantic_destroy_claims(0, 32)
+        .claim_pending_semantic_destroy_claims(0, 32)
         .unwrap()
         .is_empty());
 }
@@ -347,7 +360,7 @@ fn failed_destroy_recovery_rotates_behind_an_untried_claim() {
         })
         .unwrap();
 
-    let first = store.list_pending_semantic_destroy_claims(0, 2).unwrap();
+    let first = store.claim_pending_semantic_destroy_claims(0, 2).unwrap();
     assert_eq!(first.len(), 2);
     let first_ids = first
         .iter()
@@ -365,11 +378,14 @@ fn failed_destroy_recovery_rotates_behind_an_untried_claim() {
                 cat.cat
                     .current_action_started_at
                     .expect("Destroy claim has a start time"),
+                cat.cat
+                    .current_action_recovery_started_at
+                    .expect("Destroy recovery claim has a lease"),
             )
             .unwrap());
     }
 
-    let second = store.list_pending_semantic_destroy_claims(0, 2).unwrap();
+    let second = store.claim_pending_semantic_destroy_claims(0, 2).unwrap();
     assert_eq!(second[0].cat.cat_id, untried);
 }
 
@@ -394,6 +410,7 @@ fn cold_run_and_offline_recovery_share_the_least_loaded_policy() {
             "cat-cold",
             FinishCatAction {
                 expected_action: CatAction::Cold,
+                expected_recovery_started_at: None,
                 expected_node_id: cold.cat.current_action_node_id.as_deref(),
                 expected_action_started_at: cold
                     .cat
@@ -919,6 +936,7 @@ fn ingress_publish_and_withdraw_are_scenario_idempotent() {
             "cat-ingress",
             FinishCatAction {
                 expected_action: CatAction::Create,
+                expected_recovery_started_at: None,
                 expected_node_id: Some("node-a"),
                 expected_action_started_at: created
                     .current_action_started_at
@@ -965,6 +983,7 @@ fn ingress_publish_and_withdraw_are_scenario_idempotent() {
             "cat-ingress",
             FinishCatAction {
                 expected_action: CatAction::Suspend,
+                expected_recovery_started_at: None,
                 expected_node_id: Some("node-a"),
                 expected_action_started_at: suspend
                     .current_action_started_at
@@ -988,6 +1007,7 @@ fn ingress_publish_and_withdraw_are_scenario_idempotent() {
             "cat-ingress",
             FinishCatAction {
                 expected_action: CatAction::Run,
+                expected_recovery_started_at: None,
                 expected_node_id: Some("node-a"),
                 expected_action_started_at: run
                     .current_action_started_at
@@ -1150,6 +1170,7 @@ fn destroyed_cat_releases_slug_without_changing_historical_identity() {
             "cat-old",
             FinishCatAction {
                 expected_action: CatAction::Destroy,
+                expected_recovery_started_at: None,
                 expected_node_id: Some("node-a"),
                 expected_action_started_at: destroy
                     .current_action_started_at
@@ -1315,11 +1336,89 @@ fn stale_action_scan_uses_database_age_and_excludes_special_recovery_lanes() {
         })
         .unwrap();
 
-    let stale = store.list_stale_semantic_cat_actions(135_000, 64).unwrap();
+    let stale = store.claim_stale_semantic_cat_actions(135_000, 64).unwrap();
     assert_eq!(stale.len(), 1);
     assert_eq!(stale[0].cat.cat_id, "cat-stale-action");
     assert_eq!(stale[0].cat.current_action, Some(CatAction::Create));
     assert_eq!(stale[0].cat.current_action_started_at, Some(1));
+    let recovery_started_at = stale[0]
+        .cat
+        .current_action_recovery_started_at
+        .expect("scanner must persist its recovery lease before returning");
+
+    let AdmitCatCreateOutcome::Busy(busy) = store
+        .admit_semantic_cat_create(AtomicCatCreate {
+            cat_id: "cat-stale-action",
+            workspace_id: "ws_semantic",
+            cat_slug: "stale-action",
+            cpu_count: 2,
+            memory_bytes: 1 << 30,
+            boot_image: "sha256:image",
+            mounts: &[],
+        })
+        .unwrap()
+    else {
+        panic!("a retry after scanner handoff must not drive the leased occurrence")
+    };
+    assert_eq!(
+        busy.cat.current_action_recovery_started_at,
+        Some(recovery_started_at)
+    );
+
+    // Simulate the elected scanner dying with its lease. Once the same
+    // bounded lease age has elapsed, a successor takes a new exact token.
+    store
+        .with(|client| {
+            client.execute(
+                "UPDATE cats
+                    SET current_action_recovery_started_at=
+                        current_action_recovery_started_at - 135001
+                  WHERE cat_id='cat-stale-action'",
+                &[],
+            )?;
+            client.query_one("SELECT pg_sleep(0.005)", &[]).map(|_| ())
+        })
+        .unwrap();
+    let reclaimed = store.claim_stale_semantic_cat_actions(135_000, 64).unwrap();
+    assert_eq!(reclaimed.len(), 1);
+    let successor_recovery_started_at = reclaimed[0]
+        .cat
+        .current_action_recovery_started_at
+        .expect("successor scanner must replace the expired lease");
+    assert_ne!(successor_recovery_started_at, recovery_started_at);
+
+    assert!(store
+        .finish_semantic_cat_action(
+            "cat-stale-action",
+            FinishCatAction {
+                expected_action: CatAction::Create,
+                expected_action_started_at: 1,
+                expected_recovery_started_at: Some(recovery_started_at),
+                expected_node_id: Some("node-a"),
+                final_state: CatState::Running,
+                final_node_id: Some("node-a"),
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .unwrap()
+        .is_none());
+    assert!(store
+        .finish_semantic_cat_action(
+            "cat-stale-action",
+            FinishCatAction {
+                expected_action: CatAction::Create,
+                expected_action_started_at: 1,
+                expected_recovery_started_at: Some(successor_recovery_started_at),
+                expected_node_id: Some("node-a"),
+                final_state: CatState::Running,
+                final_node_id: Some("node-a"),
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .unwrap()
+        .is_some());
 }
 
 #[test]
@@ -1359,7 +1458,7 @@ fn same_action_retry_refreshes_activity_without_changing_occurrence_identity() {
     };
     assert_eq!(retry.cat.current_action_started_at, Some(started_at));
     assert!(store
-        .list_stale_semantic_cat_actions(135_000, 64)
+        .claim_stale_semantic_cat_actions(135_000, 64)
         .unwrap()
         .is_empty());
 
@@ -1436,7 +1535,7 @@ fn unresolved_stale_actions_rotate_behind_an_untried_claim() {
         })
         .unwrap();
 
-    let first = store.list_stale_semantic_cat_actions(135_000, 2).unwrap();
+    let first = store.claim_stale_semantic_cat_actions(135_000, 2).unwrap();
     assert_eq!(first.len(), 2);
     let first_ids = first
         .iter()
@@ -1452,12 +1551,17 @@ fn unresolved_stale_actions_rotate_behind_an_untried_claim() {
             .cat
             .current_action_started_at
             .expect("stale claim has a start time");
+        let recovery_started_at = cat
+            .cat
+            .current_action_recovery_started_at
+            .expect("stale recovery claim has a lease");
         assert!(!store
             .rotate_stale_semantic_cat_action(
                 &cat.cat.cat_id,
                 action,
                 cat.cat.current_action_node_id.as_deref(),
                 started_at + 1,
+                recovery_started_at,
             )
             .unwrap());
         assert!(store
@@ -1466,11 +1570,12 @@ fn unresolved_stale_actions_rotate_behind_an_untried_claim() {
                 action,
                 cat.cat.current_action_node_id.as_deref(),
                 started_at,
+                recovery_started_at,
             )
             .unwrap());
     }
 
-    let second = store.list_stale_semantic_cat_actions(135_000, 2).unwrap();
+    let second = store.claim_stale_semantic_cat_actions(135_000, 2).unwrap();
     assert_eq!(second[0].cat.cat_id, untried);
 }
 
@@ -1495,6 +1600,7 @@ fn action_settlement_requires_the_exact_claim_start_time() {
             "cat-exact-action",
             FinishCatAction {
                 expected_action: CatAction::Suspend,
+                expected_recovery_started_at: None,
                 expected_node_id: Some("node-a"),
                 expected_action_started_at: started_at + 1,
                 final_state: CatState::Suspended,
@@ -1517,6 +1623,7 @@ fn action_settlement_requires_the_exact_claim_start_time() {
             "cat-exact-action",
             FinishCatAction {
                 expected_action: CatAction::Suspend,
+                expected_recovery_started_at: None,
                 expected_node_id: Some("node-a"),
                 expected_action_started_at: started_at,
                 final_state: CatState::Suspended,
@@ -1591,6 +1698,7 @@ fn persistent_disk_is_rwo_and_slug_is_reusable_after_delete() {
             "cat-disk",
             FinishCatAction {
                 expected_action: CatAction::Cold,
+                expected_recovery_started_at: None,
                 expected_node_id: Some("node-a"),
                 expected_action_started_at: cold
                     .current_action_started_at
@@ -1902,6 +2010,7 @@ fn completed_node_reset_reopens_when_only_failed_cats_remain() {
             "cat-reset-failure",
             FinishCatAction {
                 expected_action: CatAction::Create,
+                expected_recovery_started_at: None,
                 expected_node_id: Some("node-a"),
                 expected_action_started_at: created
                     .current_action_started_at
@@ -2002,6 +2111,7 @@ fn offline_recovery_claim_replaces_old_lane_and_exactly_moves_placement() {
             "cat-recovery",
             FinishCatAction {
                 expected_action: CatAction::Cold,
+                expected_recovery_started_at: None,
                 expected_node_id: Some("node-a"),
                 expected_action_started_at: cold_started_at,
                 final_state: CatState::Cold,

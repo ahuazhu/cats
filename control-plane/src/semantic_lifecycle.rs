@@ -231,6 +231,9 @@ pub struct ActionClaim {
     pub cat: CatRecord,
     pub action: CatAction,
     pub started_at_unix_ms: i64,
+    /// Present only when a background scanner owns the persistent recovery
+    /// lease for this exact action occurrence.
+    pub recovery_started_at_unix_ms: Option<i64>,
     pub node_id: Option<String>,
 }
 
@@ -298,10 +301,10 @@ pub trait SemanticLifecycleStore: Send + Sync {
         action: CatAction,
     ) -> SemanticFuture<'a, Result<Admission, StoreError>>;
 
-    /// Returns a bounded snapshot of committed Destroy claims old enough not
-    /// to belong exclusively to a still-running admission request. The rows
-    /// remain authoritative only while their exact action and Node still
-    /// match during settlement.
+    /// Atomically leases a bounded set of committed Destroy claims old enough
+    /// not to belong exclusively to a still-running admission request. The
+    /// lease must exclude same-action foreground admission and remain part of
+    /// exact settlement ownership.
     fn pending_destroy_claims<'a>(
         &'a self,
         minimum_age: Duration,
@@ -336,8 +339,9 @@ pub trait SemanticLifecycleStore: Send + Sync {
     ) -> SemanticFuture<'a, Result<CatRecord, StoreError>>;
 }
 
-/// Persistence discovery used only by the level-triggered stale-action
-/// recovery worker. Implementations must use database time for the age test.
+/// Persistence handoff used only by the level-triggered stale-action recovery
+/// worker. Implementations must use database time for the age test and commit
+/// an exclusive recovery lease before returning a claim.
 pub trait SemanticActionRecoveryStore: SemanticLifecycleStore {
     fn stale_actions<'a>(
         &'a self,
@@ -1070,9 +1074,9 @@ where
     N: NodedClient,
     I: IngressPort,
 {
-    /// Runs one bounded, concurrent recovery pass. Every claim is discovered
-    /// from the current PostgreSQL row and then follows the same `resume`
-    /// state machine as a repeated user request.
+    /// Runs one bounded, concurrent recovery pass. Every claim is atomically
+    /// leased from the current PostgreSQL row and then follows the same
+    /// discovery-first `resume` state machine as a repeated user request.
     pub async fn recover_stale_actions_once(
         &self,
         policy: ActionRecoveryPolicy,
@@ -1246,7 +1250,10 @@ mod tests {
             }
         }
 
-        fn with_stale_actions(self, claims: Vec<ActionClaim>) -> Self {
+        fn with_stale_actions(self, mut claims: Vec<ActionClaim>) -> Self {
+            for claim in &mut claims {
+                claim.recovery_started_at_unix_ms = Some(2);
+            }
             self.state
                 .lock()
                 .expect("mock store")
@@ -1255,7 +1262,8 @@ mod tests {
             self
         }
 
-        fn queue_pending_destroy(&self, claim: ActionClaim) {
+        fn queue_pending_destroy(&self, mut claim: ActionClaim) {
+            claim.recovery_started_at_unix_ms = Some(2);
             self.state
                 .lock()
                 .expect("mock store")
@@ -1586,6 +1594,7 @@ mod tests {
             cat,
             action,
             started_at_unix_ms: 1,
+            recovery_started_at_unix_ms: None,
             node_id: Some("node-1".to_owned()),
         }
     }
@@ -1850,6 +1859,7 @@ mod tests {
             cat: original.clone(),
             action: CatAction::Destroy,
             started_at_unix_ms: 1,
+            recovery_started_at_unix_ms: None,
             node_id: None,
         };
         let store = MockStore::new(original, Admission::Claimed(action_claim));
@@ -1979,6 +1989,7 @@ mod tests {
             cat: original.clone(),
             action: CatAction::Run,
             started_at_unix_ms: 1,
+            recovery_started_at_unix_ms: None,
             node_id: Some("node-2".to_owned()),
         };
         let store = MockStore::new(original, Admission::Claimed(action_claim));

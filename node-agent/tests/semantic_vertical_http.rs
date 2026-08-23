@@ -85,6 +85,7 @@ impl SemanticLifecycleStore for MemoryLifecycleStore {
                         cat,
                         action: ControlAction::Create,
                         started_at_unix_ms: 1,
+                        recovery_started_at_unix_ms: None,
                         node_id: Some(NODE_ID.to_owned()),
                     }))
                 }
@@ -99,6 +100,7 @@ impl SemanticLifecycleStore for MemoryLifecycleStore {
                         cat,
                         action: ControlAction::Create,
                         started_at_unix_ms: 1,
+                        recovery_started_at_unix_ms: None,
                     }))
                 }
                 CreateDecision::Busy => Ok(Admission::Busy(
@@ -149,6 +151,7 @@ impl SemanticLifecycleStore for MemoryLifecycleStore {
                         cat,
                         action,
                         started_at_unix_ms: 1,
+                        recovery_started_at_unix_ms: None,
                         node_id: selected_node,
                     }))
                 }
@@ -161,6 +164,7 @@ impl SemanticLifecycleStore for MemoryLifecycleStore {
                     cat: existing,
                     action,
                     started_at_unix_ms: 1,
+                    recovery_started_at_unix_ms: None,
                 })),
                 ActionDecision::Busy => Ok(Admission::Busy(existing)),
                 ActionDecision::InvalidState => Ok(Admission::InvalidState(existing)),

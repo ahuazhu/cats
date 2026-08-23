@@ -148,7 +148,7 @@ impl SemanticLifecycleStore for SemanticStoreAdapter {
             store
                 .execute(move |store| {
                     store
-                        .list_pending_semantic_destroy_claims(minimum_age_ms, limit)?
+                        .claim_pending_semantic_destroy_claims(minimum_age_ms, limit)?
                         .into_iter()
                         .map(|cat| claim_from_aggregate(cat, CatAction::Destroy))
                         .collect()
@@ -166,6 +166,13 @@ impl SemanticLifecycleStore for SemanticStoreAdapter {
         let cat_id = claim.cat.cat_id.clone();
         let node_id = claim.node_id.clone();
         let started_at_unix_ms = claim.started_at_unix_ms;
+        let Some(recovery_started_at_unix_ms) = claim.recovery_started_at_unix_ms else {
+            return Box::pin(async {
+                Err(StoreError::new(
+                    "Destroy recovery rotation omitted its recovery lease",
+                ))
+            });
+        };
         Box::pin(async move {
             store
                 .execute(move |store| {
@@ -173,6 +180,7 @@ impl SemanticLifecycleStore for SemanticStoreAdapter {
                         &cat_id,
                         node_id.as_deref(),
                         started_at_unix_ms,
+                        recovery_started_at_unix_ms,
                     )
                 })
                 .await
@@ -246,6 +254,7 @@ fn settle_action<'a>(
                     FinishCatAction {
                         expected_action: core_action_to_stored(claim.action),
                         expected_action_started_at: claim.started_at_unix_ms,
+                        expected_recovery_started_at: claim.recovery_started_at_unix_ms,
                         expected_node_id: claim.node_id.as_deref(),
                         final_state: core_state_to_stored(resulting_state),
                         final_node_id,
@@ -279,7 +288,7 @@ impl SemanticActionRecoveryStore for SemanticStoreAdapter {
             store
                 .execute(move |store| {
                     store
-                        .list_stale_semantic_cat_actions(stale_after_ms, limit)?
+                        .claim_stale_semantic_cat_actions(stale_after_ms, limit)?
                         .into_iter()
                         .map(|cat| {
                             let action = cat.cat.current_action.ok_or_else(|| {
@@ -303,6 +312,13 @@ impl SemanticActionRecoveryStore for SemanticStoreAdapter {
         let action = core_action_to_stored(claim.action);
         let node_id = claim.node_id.clone();
         let started_at_unix_ms = claim.started_at_unix_ms;
+        let Some(recovery_started_at_unix_ms) = claim.recovery_started_at_unix_ms else {
+            return Box::pin(async {
+                Err(StoreError::new(
+                    "ordinary recovery rotation omitted its recovery lease",
+                ))
+            });
+        };
         Box::pin(async move {
             store
                 .execute(move |store| {
@@ -311,6 +327,7 @@ impl SemanticActionRecoveryStore for SemanticStoreAdapter {
                         action,
                         node_id.as_deref(),
                         started_at_unix_ms,
+                        recovery_started_at_unix_ms,
                     )
                 })
                 .await
@@ -381,10 +398,12 @@ fn claim_from_aggregate(
         .cat
         .current_action_started_at
         .ok_or_else(|| ApiError::internal("claimed semantic Cat action omitted its start time"))?;
+    let recovery_started_at_unix_ms = cat.cat.current_action_recovery_started_at;
     Ok(ActionClaim {
         cat: aggregate_to_core(cat)?,
         action,
         started_at_unix_ms,
+        recovery_started_at_unix_ms,
         node_id,
     })
 }
@@ -1186,6 +1205,7 @@ mod tests {
                 state,
                 current_action: action,
                 current_action_started_at: action.map(|_| 1),
+                current_action_recovery_started_at: None,
                 current_action_node_id: action.map(|_| "node_01".to_owned()),
                 node_id: state
                     .is_some_and(|state| {
