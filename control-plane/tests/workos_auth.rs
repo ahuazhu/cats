@@ -1159,6 +1159,31 @@ async fn workos_callback_rejects_tampered_state_before_code_exchange() {
 }
 
 #[tokio::test]
+async fn workos_callback_uses_matching_flow_when_a_stale_duplicate_cookie_precedes_it() {
+    let ctx = Ctx::new().await;
+    let (flow_cookie, state) = ctx.begin_login("user").await;
+    let callback = ctx
+        .http
+        .get(ctx.url(&format!("/auth/callback?code=user-code&state={state}")))
+        .header(
+            "Cookie",
+            format!("cats_user_auth_flow=stale-host-cookie; {flow_cookie}"),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+    assert_eq!(callback.headers().get(LOCATION).unwrap(), "/user/");
+    assert!(callback
+        .headers()
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| value.starts_with("cats_user_session=")));
+}
+
+#[tokio::test]
 async fn workos_callback_returns_auth_failures_to_the_originating_site() {
     let ctx = Ctx::new().await;
 
@@ -1277,6 +1302,30 @@ async fn user_login_switches_from_admin_org_to_the_only_mapped_workspace() {
     );
     assert_eq!(session["user"]["id"], "user_admin-user-code");
     assert_eq!(ctx.exchanges.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn user_session_uses_valid_session_when_a_stale_duplicate_cookie_precedes_it() {
+    let ctx = Ctx::new().await;
+    let session_cookie = ctx.login("user", "user-code").await;
+    let response = ctx
+        .http
+        .get(ctx.url("/auth/session?site=user"))
+        .header(
+            "Cookie",
+            format!("cats_user_session=stale-host-cookie; {session_cookie}"),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["authenticated"], true);
+    assert_eq!(
+        body["active_workspace_id"],
+        ctx.workspace_id("default/default")
+    );
 }
 
 #[tokio::test]

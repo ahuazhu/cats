@@ -49,6 +49,25 @@ pub struct SwitchWorkspaceRequest {
     workspace_id: String,
 }
 
+fn best_session_cookie(
+    config: &WorkOsConfig,
+    headers: &HeaderMap,
+    cookie_name: &str,
+) -> Option<(String, SessionState)> {
+    let mut refreshable = None;
+    for sealed in cookie_values(headers, cookie_name).into_iter().rev() {
+        let session =
+            SessionManager::new(None, sealed.clone(), &config.cookie_password).authenticate();
+        if session.authenticated {
+            return Some((sealed, session));
+        }
+        if session.needs_refresh && refreshable.is_none() {
+            refreshable = Some((sealed, session));
+        }
+    }
+    refreshable
+}
+
 pub async fn session(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -60,9 +79,14 @@ pub async fn session(
         .as_ref()
         .ok_or_else(|| ApiError::failed_precondition("WorkOS AuthKit is not configured"))?;
     let site = Site::parse(&query.site).ok_or_else(|| ApiError::invalid("unknown auth site"))?;
-    let sealed = cookie_value(&headers, site.session_cookie()).unwrap_or_default();
+    let (sealed, mut session) = best_session_cookie(config, &headers, site.session_cookie())
+        .unwrap_or_else(|| {
+            let sealed = String::new();
+            let session =
+                SessionManager::new(None, &sealed, &config.cookie_password).authenticate();
+            (sealed, session)
+        });
     let manager = SessionManager::new(Some(&config.client), &sealed, &config.cookie_password);
-    let mut session = manager.authenticate();
     let mut replacement_cookie = None;
     if session.needs_refresh {
         let refreshed = manager
@@ -129,10 +153,9 @@ pub async fn switch_workspace(
         .workos
         .as_ref()
         .ok_or_else(|| ApiError::failed_precondition("WorkOS AuthKit is not configured"))?;
-    let requested_sealed = cookie_value(&headers, USER_SESSION_COOKIE)
-        .ok_or_else(|| ApiError::unauthenticated("missing WorkOS user session"))?;
-    let requested_session =
-        SessionManager::new(None, &requested_sealed, &config.cookie_password).authenticate();
+    let (requested_sealed, requested_session) =
+        best_session_cookie(config, &headers, USER_SESSION_COOKIE)
+            .ok_or_else(|| ApiError::unauthenticated("missing WorkOS user session"))?;
     if !requested_session.authenticated || requested_session.session_id.is_empty() {
         return Err(ApiError::unauthenticated("invalid WorkOS user session").into());
     }
@@ -379,9 +402,9 @@ pub async fn logout(
         .as_ref()
         .ok_or_else(|| ApiError::failed_precondition("WorkOS AuthKit is not configured"))?;
     let site = Site::parse(&query.site).ok_or_else(|| ApiError::invalid("unknown auth site"))?;
-    let sealed = cookie_value(&headers, site.session_cookie()).unwrap_or_default();
-    let manager = SessionManager::new(Some(&config.client), sealed, &config.cookie_password);
-    let session = manager.authenticate();
+    let session = best_session_cookie(config, &headers, site.session_cookie())
+        .map(|(_, session)| session)
+        .unwrap_or_else(|| SessionManager::new(None, "", &config.cookie_password).authenticate());
     if !session.session_id.is_empty() {
         let params = RevokeSessionParams::new(RevokeSession {
             session_id: session.session_id.clone(),
@@ -568,10 +591,10 @@ pub fn web_session_is_admin_without_store(state: &AppState, headers: &HeaderMap)
     let Some(config) = state.cfg.workos.as_ref() else {
         return false;
     };
-    let Some(sealed) = cookie_value(headers, Site::Admin.session_cookie()) else {
+    let Some((_, session)) = best_session_cookie(config, headers, Site::Admin.session_cookie())
+    else {
         return false;
     };
-    let session = SessionManager::new(None, sealed, &config.cookie_password).authenticate();
     session_is_admin(config, &session)
 }
 
@@ -581,8 +604,7 @@ async fn identity_from_cookie(
     site: Site,
 ) -> Option<WebIdentity> {
     let config = state.cfg.workos.clone()?;
-    let sealed = cookie_value(headers, site.session_cookie())?;
-    let session = SessionManager::new(None, sealed, &config.cookie_password).authenticate();
+    let (_, session) = best_session_cookie(&config, headers, site.session_cookie())?;
     state
         .store
         .execute(move |store| {
