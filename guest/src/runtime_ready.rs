@@ -418,12 +418,13 @@ fn mounts_from_bytes(
             .context("mountinfo root is not canonical")?;
         let mount_path = HostPath::new(unescape_mountinfo(left[4])?)
             .context("mountinfo mount point is not canonical")?;
-        let source_path = HostPath::new(unescape_mountinfo(right[1])?)
+        let _source_alias = HostPath::new(unescape_mountinfo(right[1])?)
             .context("mountinfo source is not canonical")?;
-        anyhow::ensure!(
-            source_path == device.device_path,
-            "mountinfo source path disagrees with its kernel device number"
-        );
+        // mount(2) accepts the retained `/proc/self/fd/N` used by filesystem
+        // control, and mountinfo is allowed to preserve that source spelling.
+        // Major/minor plus the retained sysfs/fstat identity is the authority;
+        // normalize the observation to the proven canonical `/dev/vdX` path.
+        let source_path = device.device_path.clone();
         let filesystem_type =
             Id::new(right[0].to_owned()).context("mountinfo filesystem type is not canonical")?;
         let options: Vec<&str> = left[5].split(',').collect();
@@ -809,26 +810,25 @@ mod tests {
     }
 
     #[test]
-    fn collector_fails_closed_on_uuid_source_and_mount_drift() {
+    fn collector_normalizes_source_alias_and_fails_closed_on_uuid_and_mount_drift() {
         let device = snapshot(0, "cats-root", (252, 0));
         let provider = stable_provider(
             vec![device.clone()],
-            "30 1 252:0 / / rw - ext4 /dev/vdb rw\n",
+            "30 1 252:0 / / rw - ext4 /proc/self/fd/19 rw\n",
             &[("vda", uuid(0xaa))],
         );
         let collector = RuntimeReadyCollector::for_test(provider);
-        assert!(collector
+        let ready = collector
             .collect(
                 request(),
                 VsockLocalEndpoint {
                     cid: 3,
-                    port: 5_000
+                    port: 5_000,
                 },
                 "33333333333333333333333333333333",
             )
-            .unwrap_err()
-            .to_string()
-            .contains("source path"));
+            .unwrap();
+        assert_eq!(ready.mounts[0].source_path.as_str(), "/dev/vda");
 
         let provider = fake_provider(
             vec![vec![device.clone()]],
