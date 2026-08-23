@@ -226,6 +226,137 @@ fn atomic_create_uses_committed_shape_and_skips_non_running_nodes() {
 }
 
 #[test]
+fn destroy_preempts_an_in_progress_create_on_its_reserved_node() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    let creating = admit_cat(
+        &store,
+        "cat-destroy-creating",
+        "destroy-creating",
+        2,
+        1 << 30,
+    );
+    assert_eq!(creating.cat.state, None);
+    assert_eq!(creating.cat.current_action, Some(CatAction::Create));
+    assert_eq!(
+        creating.cat.current_action_node_id.as_deref(),
+        Some("node-a")
+    );
+
+    let AdmitCatActionOutcome::Acquired(destroy) = store
+        .admit_semantic_cat_action(
+            SemanticCatSelector::Id("cat-destroy-creating"),
+            CatAction::Destroy,
+        )
+        .unwrap()
+    else {
+        panic!("destroy must replace the in-progress create claim")
+    };
+    assert_eq!(destroy.cat.state, Some(CatState::Failure));
+    assert_eq!(destroy.cat.current_action, Some(CatAction::Destroy));
+    assert_eq!(
+        destroy.cat.current_action_node_id.as_deref(),
+        Some("node-a")
+    );
+
+    // Simulate Control exiting after the replacement claim commits but
+    // before it dispatches to noded. A later elected scanner must rediscover
+    // the exact Destroy lane and its inherited Node.
+    let pending = store.list_pending_semantic_destroy_claims(0, 32).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].cat.cat_id, "cat-destroy-creating");
+    assert_eq!(pending[0].cat.current_action, Some(CatAction::Destroy));
+    assert_eq!(
+        pending[0].cat.current_action_node_id.as_deref(),
+        Some("node-a")
+    );
+
+    assert!(store
+        .finish_semantic_cat_action(
+            "cat-destroy-creating",
+            FinishCatAction {
+                expected_action: CatAction::Create,
+                expected_node_id: Some("node-a"),
+                final_state: CatState::Running,
+                final_node_id: Some("node-a"),
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .unwrap()
+        .is_none());
+
+    let destroyed = store
+        .finish_semantic_cat_action(
+            "cat-destroy-creating",
+            FinishCatAction {
+                expected_action: CatAction::Destroy,
+                expected_node_id: Some("node-a"),
+                final_state: CatState::Destroyed,
+                final_node_id: None,
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .unwrap()
+        .expect("destroy owns the replacement claim");
+    assert_eq!(destroyed.state, Some(CatState::Destroyed));
+    assert!(store
+        .list_pending_semantic_destroy_claims(0, 32)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn failed_destroy_recovery_rotates_behind_an_untried_claim() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    let cat_ids = ["cat-rotate-a", "cat-rotate-b", "cat-rotate-c"];
+    for cat_id in cat_ids {
+        let slug = cat_id.trim_start_matches("cat-");
+        admit_cat(&store, cat_id, slug, 1, 1 << 30);
+        assert!(matches!(
+            store
+                .admit_semantic_cat_action(SemanticCatSelector::Id(cat_id), CatAction::Destroy,)
+                .unwrap(),
+            AdmitCatActionOutcome::Acquired(_)
+        ));
+    }
+    store
+        .with(|client| {
+            client
+                .execute(
+                    "UPDATE cats SET updated_at=(SELECT MAX(created_at) FROM cats)",
+                    &[],
+                )
+                .map(|_| ())
+        })
+        .unwrap();
+
+    let first = store.list_pending_semantic_destroy_claims(0, 2).unwrap();
+    assert_eq!(first.len(), 2);
+    let first_ids = first
+        .iter()
+        .map(|cat| cat.cat.cat_id.as_str())
+        .collect::<Vec<_>>();
+    let untried = cat_ids
+        .into_iter()
+        .find(|cat_id| !first_ids.contains(cat_id))
+        .expect("one claim must remain outside the first bounded page");
+    for cat in first {
+        assert!(store
+            .rotate_pending_semantic_destroy_claim(
+                &cat.cat.cat_id,
+                cat.cat.current_action_node_id.as_deref(),
+            )
+            .unwrap());
+    }
+
+    let second = store.list_pending_semantic_destroy_claims(0, 2).unwrap();
+    assert_eq!(second[0].cat.cat_id, untried);
+}
+
+#[test]
 fn cold_run_and_offline_recovery_share_the_least_loaded_policy() {
     let (store, _) = store_and_url();
     register_node(&store);

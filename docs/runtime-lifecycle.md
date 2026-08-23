@@ -1,10 +1,11 @@
 # Runtime 生命周期
 
-- 状态：ADR-0059 当前产品合同；实现和物理资格边界见
+- 状态：ADR-0059 + ADR-0062 当前产品合同；实现和物理资格边界见
   [Architecture §3](architecture.md#3-当前实现边界)
 - 决策：[ADR-0002](decisions/0002-lifecycle-states-running-suspended-warm-cold.md)、
   [ADR-0022](decisions/0022-relaxed-local-first-dual-watermark.md)、
-  [ADR-0059](decisions/0059-semantic-control-node-synchronous-protocol.md)
+  [ADR-0059](decisions/0059-semantic-control-node-synchronous-protocol.md)、
+  [ADR-0062](decisions/0062-destroy-preempts-in-progress-cat-actions.md)
 - 精确协议：[Control Plane 与 noded 同步协议设计](control-node-semantic-protocol.md)
 
 本文组合产品状态、同步动作、入口屏障和数据屏障。用户面只有
@@ -65,11 +66,15 @@ Control 对每个动作执行同一顺序：
 6. 在 transaction 外同步调用目标 noded。
 7. 写稳定结果、placement 和错误，并清除动作字段。
 
-相同动作正在进行时，重复调用查询目标 noded并等待同一结果；不同动作返回 `busy`。多 Control
-replica 依靠数据库条件更新串行化，而不是依靠进程内锁。
+相同动作正在进行时，重复调用查询目标 noded并等待同一结果；不同的非 destroy 动作返回 `busy`。
+destroy 是唯一例外：它在数据库行锁内替换当前动作，并继承被替换动作的目标 Node，使 noded 取消、
+等待并清理同一个物理执行 lane。被替换动作的迟到结果不能覆盖 destroy。多 Control replica 依靠
+数据库条件更新串行化，而不是依靠进程内锁。
 
 Control 在 noded 已完成、数据库尚未更新时退出，恢复者读取 `current_action_node_id`，调用
 `GET /v1/cats/{cat_id}`，再按实际结果更新当前行。heartbeat、日志和 metrics 都不能完成动作。
+已提交 Destroy 超过正常同步请求 deadline 后，由 PostgreSQL 单例选举的有界扫描器自动执行同一套
+discovery-first 恢复；扫描不成为新的结算 authority。
 
 ### 3.2 noded
 
@@ -235,7 +240,8 @@ Control 崩溃恢复动作只查询保存的目标 Node 和 Cat 实际状态。
 - 同一 Workspace 并发 create 同一 slug 只产生一个当前 Cat；destroy 后同 slug 新建得到新 `cat_id`。
 - 相同配置 create、相同目标动作和相同 attach 不产生第二次效果；参数不同返回 conflict。
 - 多 Control replica 只能取得一个 `current_action`；noded 同一 Cat 动作串行，不同 Cat 可以并行。
-- destroy 能终止进行中的 create，并阻止同一旧 `cat_id` 再启动。
+- destroy 能从任意未销毁稳定态、failure 或首次 create 进行中取得执行权；它终止进行中的动作，并
+  阻止同一旧 `cat_id` 再启动。
 - noded 成功、Control 写回前退出，恢复后查询 Node完成当前行。
 - Running 发布入口前 Guest 和 mounts Ready；离开 Running 先撤入口。
 - offline 恢复先撤旧入口，新 Node Ready 后发布；旧 Node 返回时 reset 并最终收敛到单实例。

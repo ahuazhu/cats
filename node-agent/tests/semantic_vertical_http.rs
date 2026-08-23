@@ -25,7 +25,7 @@ use cats_node_agent::semantic_lifecycle::{
     semantic_node_router, SemanticActionCancellation, SemanticCatEffects, SemanticEffectError,
     SemanticEffectFuture, SemanticEffectRequest, SemanticNodeService,
 };
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Notify};
 use tokio::time::Instant;
 
 const CAT_ID: &str = "cat_01";
@@ -77,7 +77,7 @@ impl SemanticLifecycleStore for MemoryLifecycleStore {
                         state: None,
                         current_action: Some(ControlAction::Create),
                         current_action_node_id: Some(NODE_ID.to_owned()),
-                        node_id: Some(NODE_ID.to_owned()),
+                        node_id: None,
                         config: request.config.clone(),
                     };
                     state.cat = Some(cat.clone());
@@ -125,11 +125,21 @@ impl SemanticLifecycleStore for MemoryLifecycleStore {
             }
             match classify_action(&existing, action) {
                 ActionDecision::Claim => {
-                    let selected_node = existing
-                        .node_id
-                        .clone()
-                        .or_else(|| (action != ControlAction::Destroy).then(|| NODE_ID.to_owned()));
+                    let selected_node = if action == ControlAction::Destroy {
+                        existing
+                            .current_action_node_id
+                            .clone()
+                            .or_else(|| existing.node_id.clone())
+                    } else {
+                        existing
+                            .node_id
+                            .clone()
+                            .or_else(|| Some(NODE_ID.to_owned()))
+                    };
                     let cat = state.cat.as_mut().expect("existing Cat");
+                    if action == ControlAction::Destroy && cat.state.is_none() {
+                        cat.state = Some(ControlState::Failure);
+                    }
                     cat.current_action = Some(action);
                     cat.current_action_node_id = selected_node.clone();
                     let cat = cat.clone();
@@ -152,6 +162,21 @@ impl SemanticLifecycleStore for MemoryLifecycleStore {
                 ActionDecision::InvalidState => Ok(Admission::InvalidState(existing)),
             }
         })
+    }
+
+    fn pending_destroy_claims<'a>(
+        &'a self,
+        _minimum_age: Duration,
+        _limit: usize,
+    ) -> SemanticFuture<'a, Result<Vec<ActionClaim>, StoreError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn rotate_pending_destroy<'a>(
+        &'a self,
+        _claim: &'a ActionClaim,
+    ) -> SemanticFuture<'a, Result<bool, StoreError>> {
+        Box::pin(async { Ok(false) })
     }
 
     fn node_control_endpoint<'a>(
@@ -333,6 +358,56 @@ impl SemanticCatEffects for ControlledFakeEffects {
     }
 }
 
+#[derive(Clone, Default)]
+struct BlockingCreateEffects {
+    create_started: Arc<Notify>,
+    actions: Arc<Mutex<Vec<NodeAction>>>,
+}
+
+impl BlockingCreateEffects {
+    async fn wait_for_create(&self) {
+        self.create_started.notified().await;
+    }
+
+    fn actions(&self) -> Vec<NodeAction> {
+        self.actions.lock().expect("blocking effects").clone()
+    }
+}
+
+impl SemanticCatEffects for BlockingCreateEffects {
+    fn execute(
+        &self,
+        request: SemanticEffectRequest,
+        cancellation: SemanticActionCancellation,
+    ) -> SemanticEffectFuture {
+        let effects = self.clone();
+        Box::pin(async move {
+            effects
+                .actions
+                .lock()
+                .expect("blocking effects")
+                .push(request.action);
+            if request.action == NodeAction::Create {
+                effects.create_started.notify_one();
+                while !cancellation.is_cancelled() {
+                    tokio::task::yield_now().await;
+                }
+                return Err(SemanticEffectError::new(
+                    SemanticErrorCode::ActionCancelled,
+                    "create cancelled by destroy",
+                ));
+            }
+            if request.action == NodeAction::Destroy {
+                return Ok(());
+            }
+            Err(SemanticEffectError::new(
+                SemanticErrorCode::InvalidState,
+                "blocking effects only support create and destroy",
+            ))
+        })
+    }
+}
+
 fn action_name(action: NodeAction) -> &'static str {
     match action {
         NodeAction::Create => "create",
@@ -422,7 +497,7 @@ struct RunningNode {
 }
 
 impl RunningNode {
-    async fn start(effects: ControlledFakeEffects, token: NodedServiceToken) -> Self {
+    async fn start(effects: impl SemanticCatEffects, token: NodedServiceToken) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind semantic Node test listener");
@@ -808,6 +883,48 @@ async fn semantic_control_to_node_http_lifecycle_is_scenario_idempotent() {
             "effect:destroy",
         ]
     );
+
+    node.stop().await;
+}
+
+#[tokio::test]
+async fn semantic_destroy_preempts_an_in_progress_create_over_http() {
+    let effects = BlockingCreateEffects::default();
+    let token =
+        NodedServiceToken::new("destroy-preemption-token-00000001").expect("valid service token");
+    let node = RunningNode::start(effects.clone(), token.clone()).await;
+    let store = MemoryLifecycleStore::new(node.endpoint.as_str().to_owned());
+    let ingress_effects = ControlledFakeEffects::new(Arc::new(Mutex::new(Vec::new())));
+    let ingress = MemoryIngress::new(ingress_effects, Arc::new(Mutex::new(Vec::new())));
+    let wire_client = SemanticNodedClient::new(token, SemanticNodedClientConfig::default())
+        .expect("semantic noded client");
+    let adapter =
+        SemanticNodedLifecycleAdapter::with_call_deadline(wire_client, Duration::from_secs(1))
+            .expect("semantic lifecycle adapter");
+    let service = Arc::new(SemanticLifecycleService::new(
+        store.clone(),
+        adapter,
+        ingress,
+        test_timeouts(),
+    ));
+
+    let create_service = Arc::clone(&service);
+    let create = tokio::spawn(async move { create_service.create(create_request()).await });
+    tokio::time::timeout(Duration::from_secs(1), effects.wait_for_create())
+        .await
+        .expect("create reaches the blocking physical effect");
+
+    let destroyed = service
+        .destroy(CatSelector::Id(CAT_ID.to_owned()))
+        .await
+        .expect("destroy preempts create");
+    assert_outcome(&destroyed, OutcomeStatus::Ok, ControlState::Destroyed);
+    assert!(matches!(
+        create.await.expect("create task joins"),
+        Err(cats_control_plane::semantic_lifecycle::LifecycleError::Store(_))
+    ));
+    assert_eq!(effects.actions(), [NodeAction::Create, NodeAction::Destroy]);
+    assert_eq!(store.cat().state, Some(ControlState::Destroyed));
 
     node.stop().await;
 }
