@@ -418,7 +418,8 @@ PY
       http://169.254.169.254/latest/api/token)"
     identity_document="$(curl -fsS -H "X-aws-ec2-metadata-token: $imds_token" \
       http://169.254.169.254/latest/dynamic/instance-identity/document)"
-    node_id="$(jq -er '.node_id' /etc/cats/identity/node-identity.v1.json)"
+    identity_node_id="$(jq -er '.node_id' /etc/cats/identity/node-identity.v1.json)"
+    semantic_node_id="node_$identity_node_id"
     identity_instance="$(jq -er '.immutable_host_id' /etc/cats/identity/node-identity.v1.json)"
     identity_vendor="$(jq -er '.provider_scope.provider' /etc/cats/identity/node-identity.v1.json)"
     identity_region="$(jq -er '.provider_scope.region' /etc/cats/identity/node-identity.v1.json)"
@@ -433,7 +434,7 @@ PY
     node_cpu="$(nproc)"
     node_memory="$(awk '/^MemTotal:/ { printf "%.0f\n", $2 * 1024; found=1 } END { if (!found) exit 1 }' /proc/meminfo)"
     printf '%s\n' \
-      "CATS_NODE_ID=$node_id" \
+      "CATS_NODE_ID=$semantic_node_id" \
       "CATS_NODE_NAME=__CATS_WORKER_NAME__" \
       "CATS_NODE_VENDOR=$identity_vendor" \
       "CATS_NODE_REGION=$node_region" \
