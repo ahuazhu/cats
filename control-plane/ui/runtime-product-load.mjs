@@ -35,34 +35,49 @@ export function setRuntimeProductLoadingShell(root, loading) {
   });
 }
 
-function validatePage(page) {
-  if (!page || !Array.isArray(page.items) || !(page.next_cursor === null || typeof page.next_cursor === "string")) {
-    throw new Error("invalid runtime product page");
-  }
-  if (page.next_cursor !== null && page.items.length === 0) {
-    throw new Error("runtime product page advanced without an item");
-  }
+async function loadCollection({ workspaceId, resource, signal, requestCollection }) {
+  assertNotAborted(signal);
+  const items = await requestCollection(
+    `/v1/workspaces/${encodeURIComponent(workspaceId)}/${resource}`,
+    { signal },
+  );
+  assertNotAborted(signal);
+  if (!Array.isArray(items)) throw new Error(`invalid semantic ${resource} collection`);
+  return items;
 }
 
-async function loadPages({ workspaceId, resource, signal, requestPage }) {
-  const items = [];
-  const seen = new Set();
-  let cursor = "";
-  do {
-    assertNotAborted(signal);
-    const suffix = cursor ? `&cursor=${encodeURIComponent(cursor)}` : "";
-    const page = await requestPage(
-      `/v1/workspaces/${encodeURIComponent(workspaceId)}/${resource}?limit=100${suffix}`,
-      { signal },
-    );
-    assertNotAborted(signal);
-    validatePage(page);
-    items.push(...page.items);
-    cursor = page.next_cursor || "";
-    if (cursor && seen.has(cursor)) throw new Error("runtime product cursor repeated");
-    if (cursor) seen.add(cursor);
-  } while (cursor);
-  return items;
+export function runtimeCatView(cat) {
+  const actionState = {
+    create: "creating",
+    run: "starting",
+    suspend: "suspending",
+    warm: "warming",
+    cold: "cooling",
+    destroy: "destroying",
+  }[cat.current_action];
+  return {
+    ...cat,
+    id: cat.cat_id,
+    name: cat.cat_slug,
+    spec: { cpus: cat.cpu, memory_mib: Math.floor(Number(cat.memory_bytes) / 1048576) },
+    desired_state: cat.current_action || cat.state || "unknown",
+    observed_state: cat.state || actionState || "unknown",
+    created_at_unix: Math.floor(Number(cat.created_at_unix_ms) / 1000),
+    auto_suspend: false,
+    expires_at_unix: null,
+  };
+}
+
+export function runtimeDiskView(disk) {
+  return {
+    ...disk,
+    id: disk.disk_id,
+    name: disk.disk_slug,
+    kind: "persistent",
+    state: disk.status === "deleted" ? "deleted" : (disk.binding ? "bound" : "available"),
+    bound_cat_id: disk.binding?.cat_id || null,
+    created_at_unix: Math.floor(Number(disk.created_at_unix_ms) / 1000),
+  };
 }
 
 export async function loadAll({ workspaceId, signal, requestPage }) {
@@ -73,8 +88,8 @@ export async function loadAll({ workspaceId, signal, requestPage }) {
     throw new Error("runtime product load requires a request function");
   }
   const [cats, disks] = await Promise.all([
-    loadPages({ workspaceId, resource: "cats", signal, requestPage }),
-    loadPages({ workspaceId, resource: "disks", signal, requestPage }),
+    loadCollection({ workspaceId, resource: "cats", signal, requestCollection: requestPage }),
+    loadCollection({ workspaceId, resource: "disks", signal, requestCollection: requestPage }),
   ]);
   assertNotAborted(signal);
   return { workspaceId, cats, disks };

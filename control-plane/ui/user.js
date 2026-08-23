@@ -14,20 +14,16 @@ import {
 } from "/ui/common.js";
 import { getLocale, initI18n, localizedApiMessage, onLocaleChange, t } from "/ui/i18n.js";
 import {
-  assertRuntimeCutoverClientRequestSupported,
-  buildCatCreateV2Request,
-  catCreateV2Path,
-  listPendingCatCreateV2,
-  sendDurableCatCreateV2,
-} from "/ui/cat-create-v2.mjs";
-import {
-  buildPersistentDiskCreateV1Request,
-  listPendingPersistentDiskCreateV1,
-  persistentDiskCreateV1Path,
-  sendDurablePersistentDiskCreateV1,
-} from "/ui/persistent-disk-create-v1.mjs";
+  assertSemanticConsoleRequestSupported,
+  buildSemanticCatCreateRequest,
+  buildSemanticDiskCreateRequest,
+  createSemanticCat,
+  createSemanticDisk,
+} from "/ui/semantic-resource-client.mjs";
 import {
   loadAll as loadRuntimeProductReads,
+  runtimeCatView,
+  runtimeDiskView,
   setRuntimeProductLoadingShell,
 } from "/ui/runtime-product-load.mjs";
 
@@ -121,7 +117,6 @@ async function switchWorkspace(workspaceId, { updateUrl = true } = {}) {
   const transition = { generation, workspaceId };
   state.runtimeProductWorkspaceLoading = transition;
   setRuntimeProductLoadingShell(document, true);
-  let switched = false;
   try {
     const session = await request("/auth/workspace", {
       method: "POST",
@@ -140,7 +135,6 @@ async function switchWorkspace(workspaceId, { updateUrl = true } = {}) {
       if (workspace) window.history.pushState(null, "", workspaceUrl(workspace));
     }
     render();
-    switched = true;
     await loadAll({ quiet: true });
   } finally {
     if (state.runtimeProductWorkspaceLoading === transition) {
@@ -148,11 +142,10 @@ async function switchWorkspace(workspaceId, { updateUrl = true } = {}) {
       render();
     }
   }
-  if (switched) await resumePendingProductCreates();
 }
 
 async function authenticatedRequestWithStatus(path, options = {}) {
-  assertRuntimeCutoverClientRequestSupported(path, options.method || "GET");
+  assertSemanticConsoleRequestSupported(path, options.method || "GET");
   try {
     return await requestWithStatus(path, options);
   } catch (error) {
@@ -182,89 +175,6 @@ async function authenticatedRequest(path, options = {}) {
 
 function idempotencyHeaders() {
   return { "Idempotency-Key": globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}` };
-}
-
-async function sendPendingCatCreate(path, requestBody, onAccepted, expectedPending) {
-  return sendDurableCatCreateV2({
-    workspaceId: state.activeWorkspaceId,
-    path,
-    requestBody,
-    send: authenticatedRequestWithStatus,
-    onAccepted,
-    ...(expectedPending ? { expectedPending } : {}),
-  });
-}
-
-async function resumePendingCatCreates() {
-  if (!state.activeWorkspaceId) return;
-  let pending;
-  try {
-    pending = await listPendingCatCreateV2({ workspaceId: state.activeWorkspaceId });
-  } catch (error) {
-    toast(t("common.error"), error.message, "error");
-    return;
-  }
-  for (const request of pending) {
-    try {
-      await sendPendingCatCreate(request.path, request.requestBody, (accepted) => {
-        toast(t("user.operation.accepted"), `${accepted.cat_id} · ${accepted.operation_id}`);
-      }, request.expectedPending);
-    } catch (error) {
-      // Ambiguous and non-terminal outcomes intentionally retain the exact
-      // browser-persistent request for the next reload or explicit refresh.
-      toast(t("common.error"), error.message, "error");
-    }
-  }
-}
-
-async function sendPendingPersistentDiskCreate(
-  workspaceId,
-  path,
-  requestBody,
-  onCreated,
-  expectedPending,
-) {
-  return sendDurablePersistentDiskCreateV1({
-    workspaceId,
-    path,
-    requestBody,
-    send: authenticatedRequestWithStatus,
-    onCreated,
-    ...(expectedPending ? { expectedPending } : {}),
-  });
-}
-
-async function resumePendingPersistentDiskCreates() {
-  if (!state.activeWorkspaceId) return;
-  let pending;
-  try {
-    pending = await listPendingPersistentDiskCreateV1({
-      workspaceId: state.activeWorkspaceId,
-    });
-  } catch (error) {
-    toast(t("common.error"), error.message, "error");
-    return;
-  }
-  for (const request of pending) {
-    try {
-      await sendPendingPersistentDiskCreate(
-        state.activeWorkspaceId,
-        request.path,
-        request.requestBody,
-        (disk) => toast(t("user.disk.created"), `${disk.name} · ${formatBytes(disk.size_bytes)}`),
-        request.expectedPending,
-      );
-    } catch (error) {
-      toast(t("common.error"), error.message, "error");
-    }
-  }
-}
-
-async function resumePendingProductCreates() {
-  await Promise.all([
-    resumePendingCatCreates(),
-    resumePendingPersistentDiskCreates(),
-  ]);
 }
 
 function showApp() {
@@ -349,29 +259,6 @@ function cancelRuntimeProductLoad() {
   if (!active) return;
   active.controller.abort();
   if (!active.quiet) setBusy(active.button, false);
-}
-
-function runtimeCatView(cat) {
-  return {
-    ...cat,
-    spec: { cpus: cat.desired.vcpus, memory_mib: Math.floor(cat.desired.memory_bytes / 1048576) },
-    desired_state: cat.desired.target,
-    observed_state: cat.observed?.stable_state || "unknown",
-    node_id: cat.desired.node_id,
-    created_at_unix: Math.floor(Number(cat.created_at_unix_ms) / 1000),
-    auto_suspend: false,
-    expires_at_unix: null,
-  };
-}
-
-function runtimeDiskView(disk) {
-  return {
-    ...disk,
-    kind: disk.kind.kind,
-    state: disk.admin_state === "deleting" ? "deleting" : (disk.binding ? "bound" : "available"),
-    bound_cat_id: disk.binding?.cat_id || null,
-    created_at_unix: Math.floor(Number(disk.created_at_unix_ms) / 1000),
-  };
 }
 
 function render() {
@@ -980,7 +867,7 @@ document.querySelector("#logout-button").addEventListener("click", () => {
   window.location.assign("/auth/logout?site=user");
 });
 document.querySelector("#refresh-button").addEventListener("click", () => {
-  const requests = [loadAll(), resumePendingProductCreates()];
+  const requests = [loadAll()];
   if (state.activeView === "billing") requests.push(loadBilling());
   Promise.all(requests).catch(() => {});
 });
@@ -1023,19 +910,21 @@ document.querySelector("#create-cat-form").addEventListener("submit", async (eve
   error.textContent = "";
   setBusy(button, true);
   try {
-    const body = buildCatCreateV2Request({
+    const body = buildSemanticCatCreateRequest({
       name: values.get("name"),
-      bootImageDigest: values.get("boot_image_digest"),
+      bootImage: values.get("boot_image_digest"),
       vcpus: values.get("vcpus"),
       memoryMib: values.get("memory_mib"),
-      rootGib: values.get("root_gib"),
-      durability: values.get("durability"),
     });
-    await sendPendingCatCreate(catCreateV2Path(state.activeWorkspaceId), JSON.stringify(body), (accepted) => {
-      toast(t("user.operation.accepted"), `${accepted.cat_id} · ${accepted.operation_id}`);
-      createCatDialog.close();
-      form.reset();
+    const response = await createSemanticCat({
+      immutableWorkspaceId: state.activeWorkspaceId,
+      request: body,
+      send: authenticatedRequestWithStatus,
     });
+    createCatDialog.close();
+    form.reset();
+    await loadAll({ quiet: true });
+    toast(t("user.cat.created"), `${response.cat.cat_slug} · ${response.cat.cat_id}`);
   } catch (caught) {
     error.textContent = caught.message;
   } finally {
@@ -1057,22 +946,19 @@ document.querySelector("#create-disk-form").addEventListener("submit", async (ev
   setBusy(button, true);
   try {
     const workspaceId = state.activeWorkspaceId;
-    const body = buildPersistentDiskCreateV1Request({
+    const body = buildSemanticDiskCreateRequest({
       name: values.get("name"),
       sizeGib: values.get("size_gib"),
-      durability: values.get("durability"),
     });
-    await sendPendingPersistentDiskCreate(
-      workspaceId,
-      persistentDiskCreateV1Path(workspaceId),
-      JSON.stringify(body),
-      async (disk) => {
-        createDiskDialog.close();
-        form.reset();
-        if (workspaceId === state.activeWorkspaceId) await loadAll({ quiet: true });
-        toast(t("user.disk.created"), `${disk.name} · ${formatBytes(disk.size_bytes)}`);
-      },
-    );
+    const response = await createSemanticDisk({
+      immutableWorkspaceId: workspaceId,
+      request: body,
+      send: authenticatedRequestWithStatus,
+    });
+    createDiskDialog.close();
+    form.reset();
+    if (workspaceId === state.activeWorkspaceId) await loadAll({ quiet: true });
+    toast(t("user.disk.created"), `${response.disk.disk_slug} · ${formatBytes(response.disk.size_bytes)}`);
   } catch (caught) {
     error.textContent = caught.message;
   } finally {
@@ -1118,9 +1004,16 @@ async function initializeAuth() {
     document.querySelector("#workos-login-button").classList.toggle("is-hidden", !state.authConfig.workos_enabled);
     updateLoginDescription();
     if (state.authConfig.workos_enabled) {
+      let session;
       try {
-        const session = await request("/auth/session?site=user");
-        applySession(session);
+        session = await request("/auth/session?site=user");
+      } catch (_) {
+        showLogin(loginError.textContent || callbackError);
+        return;
+      }
+      applySession(session);
+      showApp();
+      try {
         const path = window.location.pathname.split("/").filter(Boolean);
         if (path[0] === "user" && path.length >= 3) {
           const accountSlug = decodeURIComponent(path[1]);
@@ -1135,9 +1028,7 @@ async function initializeAuth() {
         if (workspace && window.location.pathname !== workspaceUrl(workspace)) {
           window.history.replaceState(null, "", workspaceUrl(workspace));
         }
-        showApp();
         await loadAll({ quiet: true });
-        await resumePendingProductCreates();
         if (topupStatus) {
           switchView("billing");
           await loadBilling({ quiet: true }).catch(() => {});
@@ -1147,10 +1038,10 @@ async function initializeAuth() {
             toast(t("user.billing.topup.cancelled"), "", "error");
           }
         }
-        return;
-      } catch (_) {
-        // No WorkOS session yet; remain on the sign-in screen.
+      } catch (error) {
+        toast(t("user.refreshFailed"), error.message, "error");
       }
+      return;
     }
   } catch (error) {
     loginError.textContent = t("user.authConfigFailed", { message: error.message });
