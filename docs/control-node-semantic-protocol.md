@@ -594,7 +594,8 @@ DELETE /v1/cats/{cat_id}
 - Create Cat 使用 `(workspace_id, cat_slug)` 唯一约束串行化。
 - Create Disk 使用 `(workspace_id, disk_slug)` 唯一约束串行化。
 - Cat action 更新 `current_action` 时使用 Cat 行条件更新；只有 `current_action IS NULL` 的请求可以取得执行权。
-- 同一更新同时写入 `current_action_node_id`，使其他 Control replica知道应该查询哪台 Node。
+- 同一更新同时写入 `current_action_node_id` 和 PostgreSQL 分配的 `current_action_started_at`，使其他
+  Control replica知道应该查询哪台 Node，并使终态 CAS 只结算同一次 claim。
 - 相同 `current_action` 的重复调用不创建第二个执行；它查询 `noded` 并等待当前动作结束。
 - Disk attach/detach/destroy 在一个数据库 transaction 中锁定目标 Disk 和相关 Cat。
 - create、Cold run 和失联恢复使用 [ADR-0061](decisions/0061-semantic-least-allocated-placement.md)
@@ -621,7 +622,15 @@ Control Plane 可能在 `noded` 已经完成动作、但数据库尚未更新时
 5. 如果 `noded` 报告明确失败，写 `failure`。
 6. 如果 Node 不可达，进入 Node 失联流程。
 
-Control Plane 可以周期扫描超时的 `current_action`，但扫描器和用户重试必须使用同一套状态判断，不能各自定义恢复规则。
+`controld` 以 PostgreSQL 时间周期扫描持续至少 60 秒的 `current_action`，使用独立的 PostgreSQL
+advisory lock 保证多 replica 只有一个扫描者，并调用与用户重试相同的恢复状态机。扫描按有界批次并发；
+终态写回同时比较 Cat ID、action、目标 Node 和 `current_action_started_at`，因此旧扫描结果不能清除后来
+复用同名 action 的 claim。跨 Node 失联恢复虽然复用 `run` 字段，但由独立的多步骤恢复循环负责，不进入
+这个普通动作扫描器。
+
+60 秒只是触发精确查询/恢复的动作年龄，不是 Node 失联判断，也不是 fencing 证据。heartbeat、日志、
+metrics 和 runtime inventory 仍然不能结算动作；扫描器必须向 `current_action_node_id` 对应的 noded
+确认实际状态。
 
 ## 11. 核心流程
 

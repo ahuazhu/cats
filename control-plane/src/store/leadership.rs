@@ -6,15 +6,22 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SingletonRole {
     UsageProjector,
+    SemanticActionRecovery,
 }
 
 impl SingletonRole {
     fn lock_key(self) -> i32 {
-        420_203
+        match self {
+            Self::UsageProjector => 420_203,
+            Self::SemanticActionRecovery => 420_204,
+        }
     }
 
     pub(crate) fn name(self) -> &'static str {
-        "usage-projector"
+        match self {
+            Self::UsageProjector => "usage-projector",
+            Self::SemanticActionRecovery => "semantic-action-recovery",
+        }
     }
 }
 

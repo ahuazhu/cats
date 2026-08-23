@@ -27,6 +27,7 @@
 - 同步 Cat/Disk API、CLI、Control lifecycle 和 noded HTTP client/server；
 - noded 按 Cat 串行、destroy 清理、Node registration/heartbeat/reset/drain；
 - offline Node 的 level-triggered Cat 恢复，以及 `withdraw old -> Ready -> publish new`；
+- `controld` 对普通 `current_action` 的单例超时恢复扫描，按 noded 实际状态收敛而不使用 heartbeat 结算；
 - 真实 Control→noded HTTP 的 Cat 全状态机和重复调用语义；
 - 已接入 production composition 的 Strict PersistentDisk provision/delete backend，包括 volume/disk authority 和 BlobStore delete postcondition；
 - production Control 只挂载 semantic resource/Node 主监听，旧 lifecycle Operation、AgentSession、

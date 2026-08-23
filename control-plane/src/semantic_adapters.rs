@@ -22,8 +22,8 @@ use tokio::time::Instant;
 use crate::semantic_lifecycle::{
     ActionClaim, Admission, CatAction, CatCreateConfig, CatMount, CatRecord, CatSelector, CatState,
     CreateCatRequest, IngressError, IngressPort, NodeCatStatus, NodeClientError, NodeCommand,
-    NodeCommandResult, NodeControlEndpoint, NodedClient, SemanticFuture, SemanticLifecycleStore,
-    StoreError,
+    NodeCommandResult, NodeControlEndpoint, NodedClient, SemanticActionRecoveryStore,
+    SemanticFuture, SemanticLifecycleStore, StoreError,
 };
 use crate::semantic_node::{
     NodeFuture, NodeRecord as ManagedNodeRecord, NodeRepository, StaleNodeCandidate,
@@ -201,6 +201,7 @@ fn settle_action<'a>(
                     &claim.cat.cat_id,
                     FinishCatAction {
                         expected_action: core_action_to_stored(claim.action),
+                        expected_action_started_at: claim.started_at_unix_ms,
                         expected_node_id: claim.node_id.as_deref(),
                         final_state: core_state_to_stored(resulting_state),
                         final_node_id,
@@ -219,6 +220,35 @@ fn settle_action<'a>(
             .await
             .map_err(store_error)
     })
+}
+
+impl SemanticActionRecoveryStore for SemanticStoreAdapter {
+    fn stale_actions<'a>(
+        &'a self,
+        stale_after: Duration,
+        limit: usize,
+    ) -> SemanticFuture<'a, Result<Vec<ActionClaim>, StoreError>> {
+        let store = Arc::clone(&self.store);
+        Box::pin(async move {
+            let stale_after_ms = i64::try_from(stale_after.as_millis())
+                .map_err(|_| StoreError::new("stale action age exceeds PostgreSQL BIGINT"))?;
+            store
+                .execute(move |store| {
+                    store
+                        .list_stale_semantic_cat_actions(stale_after_ms, limit)?
+                        .into_iter()
+                        .map(|cat| {
+                            let action = cat.cat.current_action.ok_or_else(|| {
+                                ApiError::internal("stale action scan returned an idle Cat")
+                            })?;
+                            claim_from_aggregate(cat, stored_action_to_core(action))
+                        })
+                        .collect()
+                })
+                .await
+                .map_err(store_error)
+        })
+    }
 }
 
 fn map_create_admission(outcome: AdmitCatCreateOutcome) -> crate::store::Result<Admission> {
@@ -279,9 +309,14 @@ fn claim_from_aggregate(
     action: CatAction,
 ) -> crate::store::Result<ActionClaim> {
     let node_id = cat.cat.current_action_node_id.clone();
+    let started_at_unix_ms = cat
+        .cat
+        .current_action_started_at
+        .ok_or_else(|| ApiError::internal("claimed semantic Cat action omitted its start time"))?;
     Ok(ActionClaim {
         cat: aggregate_to_core(cat)?,
         action,
+        started_at_unix_ms,
         node_id,
     })
 }

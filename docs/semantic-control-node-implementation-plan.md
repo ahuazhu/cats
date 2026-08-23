@@ -24,7 +24,7 @@
 |---|---|---|---|
 | 公共协议 | `api/` | Cat/Disk/Node DTO、错误码、noded wire、Bearer token | 已完成并合入 |
 | 数据库 | `control-plane/src/store/` | v19 表、slug 部分唯一索引、Disk RWO、动作 CAS、数据库心跳时间 | 已完成；schema、并发与 authority PG 回归已通过 |
-| Control 核心 | `control-plane/src/semantic_lifecycle.rs` | 同步动作、语义幂等、超时查询恢复、入口先撤后发 | 已完成并合入 |
+| Control 核心 | `control-plane/src/semantic_lifecycle.rs` | 同步动作、语义幂等、60 秒单例超时扫描、查询恢复、入口先撤后发 | 已完成并合入 |
 | noded HTTP client | `control-plane/src/semantic_noded_client.rs` | Control 同步调用 noded、Bearer、deadline、严格响应校验 | 已完成并合入 |
 | PersistentDisk | `control-plane/src/semantic_disk.rs`、`node-agent/src/semantic_mounts.rs` | create/binding/destroy 语义与 Guest 完整挂载确认 | 已完成：真实 kernel-NBD、CH、Guest ext4 `/data` mount-ready、Cold detach/attach 和同盘重挂通过 |
 | CLI | `cmd/cats/` | slug 命令、同步 REST、`--mount`、GiB 解析、`node_name` 展示 | 已完成单协议切换；Cat/Disk `ls/get` 已改读当前 slug 实体，旧 Operation/pending/replay 已删除 |
@@ -57,6 +57,7 @@
 - [x] 合入 offline Node 的 Cat 恢复核心和精确状态结算。
 - [x] 将 liveness 标记 offline 的结果接到恢复服务。
 - [x] Store 完成 create 原子建立 Cat/初始 bindings、placement 复核和 stale Node 查询。
+- [x] `controld` 单例扫描 PostgreSQL 中持续 60 秒的普通 `current_action`，向目标 noded 查询并用精确 claim CAS 收敛。
 - [x] 完成生命周期、Node 管理和 noded HTTP 的 production adapter。
 - [x] 完成 `SemanticResourceApi` 聚合。
 - [x] 完成基于当前 Cat/Node 的唯一入口 Store 和 production adapter。

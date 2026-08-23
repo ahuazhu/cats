@@ -262,6 +262,7 @@ pub enum BeginCatActionOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FinishCatAction<'a> {
     pub expected_action: CatAction,
+    pub expected_action_started_at: i64,
     pub expected_node_id: Option<&'a str>,
     pub final_state: CatState,
     pub final_node_id: Option<&'a str>,
@@ -382,6 +383,7 @@ pub struct SemanticCatRecoverySettlement<'a> {
     pub source_node_id: &'a str,
     pub target_node_id: &'a str,
     pub target_state: CatState,
+    pub expected_action_started_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -888,7 +890,8 @@ impl Store {
             let row = transaction.query_one(
                 &format!(
                     "UPDATE cats
-                        SET current_action=$2,current_action_started_at={DB_NOW_MS},
+                        SET current_action=$2,
+                            current_action_started_at=GREATEST({DB_NOW_MS}, updated_at + 1),
                             current_action_node_id=$3,updated_at={DB_NOW_MS},
                             last_error_code=NULL,last_error_message=NULL
                       WHERE cat_id=$1
@@ -1031,6 +1034,45 @@ impl Store {
         })
     }
 
+    /// Returns one DB-time ordered page of ordinary lifecycle actions whose
+    /// persisted claim age has crossed `stale_after_ms`. Cross-Node offline
+    /// recovery owns a distinct multi-step state machine while reusing a
+    /// `run` lane, so those rows remain exclusively with that recovery loop.
+    pub fn list_stale_semantic_cat_actions(
+        &self,
+        stale_after_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<CatWithMounts>> {
+        if stale_after_ms <= 0 || !(1..=1024).contains(&limit) {
+            return Err(cats_api::error::ApiError::invalid(
+                "stale semantic action scan bounds are invalid",
+            ));
+        }
+        let limit = i64::try_from(limit)
+            .map_err(|_| cats_api::error::ApiError::invalid("scan limit exceeds BIGINT"))?;
+        self.with(|client| {
+            let rows = client.query(
+                &format!(
+                    "SELECT {CAT_COLUMNS}
+                       FROM cats
+                      WHERE current_action IS NOT NULL
+                        AND current_action_started_at <= {DB_NOW_MS} - $1
+                        AND NOT (
+                            current_action='run'
+                            AND node_id IS NOT NULL
+                            AND current_action_node_id IS DISTINCT FROM node_id
+                        )
+                      ORDER BY current_action_started_at, cat_id COLLATE \"C\"
+                      LIMIT $2"
+                ),
+                &[&stale_after_ms, &limit],
+            )?;
+            rows.into_iter()
+                .map(|row| cat_with_mounts(client, row_to_cat(&row)))
+                .collect()
+        })
+    }
+
     pub fn try_begin_semantic_cat_action(
         &self,
         cat_id: &str,
@@ -1042,7 +1084,7 @@ impl Store {
                 &format!(
                     "UPDATE cats
                         SET current_action=$2,
-                            current_action_started_at={DB_NOW_MS},
+                            current_action_started_at=GREATEST({DB_NOW_MS}, updated_at + 1),
                             current_action_node_id=$3,
                             updated_at={DB_NOW_MS},
                             last_error_code=NULL,
@@ -1066,8 +1108,9 @@ impl Store {
         }
     }
 
-    /// Settle only the action and Node that still own the Cat row.  A late
-    /// completion cannot clear another action acquired afterward.
+    /// Settle only the action occurrence and Node that still own the Cat row.
+    /// A late completion cannot clear another action acquired afterward,
+    /// including a later occurrence of the same action/Node tuple.
     pub fn finish_semantic_cat_action(
         &self,
         cat_id: &str,
@@ -1078,24 +1121,26 @@ impl Store {
             let row = transaction.query_opt(
                 &format!(
                     "UPDATE cats
-                        SET state=$4,
-                            node_id=$5,
+                        SET state=$5,
+                            node_id=$6,
                             current_action=NULL,
                             current_action_started_at=NULL,
                             current_action_node_id=NULL,
-                            last_error_code=$6,
-                            last_error_message=$7,
-                            destroyed_at=CASE WHEN $4='destroyed' THEN {DB_NOW_MS} ELSE NULL END,
+                            last_error_code=$7,
+                            last_error_message=$8,
+                            destroyed_at=CASE WHEN $5='destroyed' THEN {DB_NOW_MS} ELSE NULL END,
                             updated_at={DB_NOW_MS}
                       WHERE cat_id=$1
                         AND current_action=$2
                         AND current_action_node_id IS NOT DISTINCT FROM $3
+                        AND current_action_started_at=$4
                       RETURNING {CAT_COLUMNS}"
                 ),
                 &[
                     &cat_id,
                     &finish.expected_action.as_str(),
                     &finish.expected_node_id,
+                    &finish.expected_action_started_at,
                     &finish.final_state.as_str(),
                     &finish.final_node_id,
                     &finish.error_code,
@@ -1336,7 +1381,7 @@ impl Store {
                 &format!(
                     "UPDATE cats
                         SET current_action='run',
-                            current_action_started_at={DB_NOW_MS},
+                            current_action_started_at=GREATEST({DB_NOW_MS}, updated_at + 1),
                             current_action_node_id=$3,
                             last_error_code=NULL,last_error_message=NULL,
                             updated_at={DB_NOW_MS}
@@ -1357,9 +1402,10 @@ impl Store {
         })
     }
 
-    /// Settle only the exact recovery lane and source placement. Success
-    /// publishes the new placement while retaining the pre-failure product
-    /// state; failure records a cleanup-required Cat on the target Node.
+    /// Settle only the exact recovery occurrence, lane and source placement.
+    /// Success publishes the new placement while retaining the pre-failure
+    /// product state; failure records a cleanup-required Cat on the target
+    /// Node.
     pub fn finish_semantic_cat_recovery(
         &self,
         settlement: SemanticCatRecoverySettlement<'_>,
@@ -1378,16 +1424,17 @@ impl Store {
             let row = transaction.query_opt(
                 &format!(
                     "UPDATE cats
-                        SET state=$5,node_id=$3,
+                        SET state=$6,node_id=$3,
                             current_action=NULL,current_action_started_at=NULL,
                             current_action_node_id=NULL,
-                            last_error_code=$6,last_error_message=$7,
+                            last_error_code=$7,last_error_message=$8,
                             updated_at={DB_NOW_MS}
                       WHERE cat_id=$1
                         AND node_id=$2
                         AND current_action='run'
                         AND current_action_node_id=$3
                         AND state=$4
+                        AND current_action_started_at=$5
                         AND destroyed_at IS NULL
                       RETURNING {CAT_COLUMNS}"
                 ),
@@ -1396,6 +1443,7 @@ impl Store {
                     &settlement.source_node_id,
                     &settlement.target_node_id,
                     &settlement.target_state.as_str(),
+                    &settlement.expected_action_started_at,
                     &state,
                     &error_code,
                     &error_message,

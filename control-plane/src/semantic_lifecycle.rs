@@ -10,6 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
+use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 
 /// Boxed future used by the persistence and noded integration ports.
@@ -209,12 +210,14 @@ pub fn classify_action(cat: &CatRecord, action: CatAction) -> ActionDecision {
     }
 }
 
-/// A transactionally claimed action. Its identity is exactly Cat, action and
-/// selected Node; there is no independent operation identifier.
+/// A transactionally claimed action. The database-assigned start time is part
+/// of the identity so a late recovery cannot settle a later occurrence of the
+/// same Cat/action/Node tuple.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionClaim {
     pub cat: CatRecord,
     pub action: CatAction,
+    pub started_at_unix_ms: i64,
     pub node_id: Option<String>,
 }
 
@@ -300,6 +303,16 @@ pub trait SemanticLifecycleStore: Send + Sync {
         code: &'a str,
         message: &'a str,
     ) -> SemanticFuture<'a, Result<CatRecord, StoreError>>;
+}
+
+/// Persistence discovery used only by the level-triggered stale-action
+/// recovery worker. Implementations must use database time for the age test.
+pub trait SemanticActionRecoveryStore: SemanticLifecycleStore {
+    fn stale_actions<'a>(
+        &'a self,
+        stale_after: Duration,
+        limit: usize,
+    ) -> SemanticFuture<'a, Result<Vec<ActionClaim>, StoreError>>;
 }
 
 /// Exact command sent synchronously to noded.
@@ -483,11 +496,46 @@ impl From<StoreError> for LifecycleError {
 }
 
 /// Orchestrates one synchronous Control-to-noded lifecycle action.
+#[derive(Clone)]
 pub struct SemanticLifecycleService<S, N, I> {
     store: S,
     noded: N,
     ingress: I,
     timeouts: LifecycleTimeouts,
+}
+
+/// A lifecycle action becomes eligible for recovery after this age. This is
+/// deliberately independent from heartbeat age: the scanner confirms the
+/// exact Cat state with noded before settlement.
+pub const DEFAULT_STALE_ACTION_AGE: Duration = Duration::from_secs(60);
+pub const DEFAULT_ACTION_RECOVERY_SCAN_INTERVAL: Duration = Duration::from_secs(5);
+pub const DEFAULT_ACTION_RECOVERY_BATCH_SIZE: usize = 64;
+pub const DEFAULT_ACTION_RECOVERY_CONCURRENCY: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActionRecoveryPolicy {
+    pub stale_after: Duration,
+    pub scan_interval: Duration,
+    pub batch_size: usize,
+    pub concurrency: usize,
+}
+
+impl Default for ActionRecoveryPolicy {
+    fn default() -> Self {
+        Self {
+            stale_after: DEFAULT_STALE_ACTION_AGE,
+            scan_interval: DEFAULT_ACTION_RECOVERY_SCAN_INTERVAL,
+            batch_size: DEFAULT_ACTION_RECOVERY_BATCH_SIZE,
+            concurrency: DEFAULT_ACTION_RECOVERY_CONCURRENCY,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ActionRecoveryReport {
+    pub discovered: usize,
+    pub settled: usize,
+    pub unresolved: usize,
 }
 
 impl<S, N, I> SemanticLifecycleService<S, N, I>
@@ -856,6 +904,92 @@ where
     }
 }
 
+impl<S, N, I> SemanticLifecycleService<S, N, I>
+where
+    S: SemanticActionRecoveryStore,
+    N: NodedClient,
+    I: IngressPort,
+{
+    /// Runs one bounded, concurrent recovery pass. Every claim is discovered
+    /// from the current PostgreSQL row and then follows the same `resume`
+    /// state machine as a repeated user request.
+    pub async fn recover_stale_actions_once(
+        &self,
+        policy: ActionRecoveryPolicy,
+    ) -> Result<ActionRecoveryReport, StoreError> {
+        if policy.stale_after.is_zero() || policy.batch_size == 0 || policy.concurrency == 0 {
+            return Err(StoreError::new("invalid semantic action recovery policy"));
+        }
+        let claims = self
+            .store
+            .stale_actions(policy.stale_after, policy.batch_size)
+            .await?;
+        let discovered = claims.len();
+        let outcomes = stream::iter(claims)
+            .map(|claim| async move {
+                let cat_id = claim.cat.cat_id.clone();
+                let action = claim.action;
+                let started_at_unix_ms = claim.started_at_unix_ms;
+                let result = self.resume(claim).await;
+                (cat_id, action, started_at_unix_ms, result)
+            })
+            .buffer_unordered(policy.concurrency)
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut report = ActionRecoveryReport {
+            discovered,
+            ..ActionRecoveryReport::default()
+        };
+        for (cat_id, action, started_at_unix_ms, result) in outcomes {
+            match result {
+                Ok(outcome) => {
+                    report.settled += 1;
+                    tracing::info!(
+                        %cat_id,
+                        ?action,
+                        started_at_unix_ms,
+                        state = ?outcome.cat.state,
+                        "stale semantic Cat action recovered"
+                    );
+                }
+                Err(error @ (LifecycleError::Failed { .. } | LifecycleError::Timeout { .. })) => {
+                    report.settled += 1;
+                    tracing::warn!(
+                        %cat_id,
+                        ?action,
+                        started_at_unix_ms,
+                        ?error,
+                        "stale semantic Cat action recovered to terminal failure"
+                    );
+                }
+                Err(error) => {
+                    report.unresolved += 1;
+                    tracing::warn!(
+                        %cat_id,
+                        ?action,
+                        started_at_unix_ms,
+                        ?error,
+                        "stale semantic Cat action recovery did not settle"
+                    );
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Level-triggered recovery loop. Multi-replica exclusion is supplied by
+    /// the PostgreSQL singleton wrapper in the composition root.
+    pub async fn run_stale_action_recovery(&self, policy: ActionRecoveryPolicy) {
+        loop {
+            if let Err(error) = self.recover_stale_actions_once(policy).await {
+                tracing::warn!(message = %error.message, "stale semantic Cat action scan failed");
+            }
+            tokio::time::sleep(policy.scan_interval).await;
+        }
+    }
+}
+
 enum Discovery {
     Complete(CatState),
     Failed { code: String, message: String },
@@ -896,6 +1030,7 @@ mod tests {
 
     struct MockStoreState {
         admissions: VecDeque<Admission>,
+        stale_actions: VecDeque<Vec<ActionClaim>>,
         cat: CatRecord,
         in_transaction: bool,
         endpoint_reads: usize,
@@ -908,6 +1043,7 @@ mod tests {
             Self {
                 state: Arc::new(Mutex::new(MockStoreState {
                     admissions: VecDeque::from([admission]),
+                    stale_actions: VecDeque::new(),
                     cat,
                     in_transaction: false,
                     endpoint_reads: 0,
@@ -915,6 +1051,15 @@ mod tests {
                     failures: 0,
                 })),
             }
+        }
+
+        fn with_stale_actions(self, claims: Vec<ActionClaim>) -> Self {
+            self.state
+                .lock()
+                .expect("mock store")
+                .stale_actions
+                .push_back(claims);
+            self
         }
     }
 
@@ -990,6 +1135,24 @@ mod tests {
                 state.cat.current_action = None;
                 state.cat.current_action_node_id = None;
                 Ok(state.cat.clone())
+            })
+        }
+    }
+
+    impl SemanticActionRecoveryStore for MockStore {
+        fn stale_actions<'a>(
+            &'a self,
+            _stale_after: Duration,
+            _limit: usize,
+        ) -> SemanticFuture<'a, Result<Vec<ActionClaim>, StoreError>> {
+            Box::pin(async move {
+                Ok(self
+                    .state
+                    .lock()
+                    .expect("mock store")
+                    .stale_actions
+                    .pop_front()
+                    .unwrap_or_default())
             })
         }
     }
@@ -1143,6 +1306,7 @@ mod tests {
         ActionClaim {
             cat,
             action,
+            started_at_unix_ms: 1,
             node_id: Some("node-1".to_owned()),
         }
     }
@@ -1389,6 +1553,7 @@ mod tests {
         let action_claim = ActionClaim {
             cat: original.clone(),
             action: CatAction::Destroy,
+            started_at_unix_ms: 1,
             node_id: None,
         };
         let store = MockStore::new(original, Admission::Claimed(action_claim));
@@ -1413,6 +1578,7 @@ mod tests {
         let action_claim = ActionClaim {
             cat: original.clone(),
             action: CatAction::Run,
+            started_at_unix_ms: 1,
             node_id: Some("node-2".to_owned()),
         };
         let store = MockStore::new(original, Admission::Claimed(action_claim));
@@ -1456,6 +1622,58 @@ mod tests {
         assert_eq!(
             noded.state.lock().expect("noded").events,
             ["withdraw:node-1", "node:Cold"]
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_action_scan_discovers_noded_terminal_state_without_reexecution() {
+        let original = cat(None, Some(CatAction::Create));
+        let action_claim = claim(original.clone(), CatAction::Create);
+        let store = MockStore::new(original, Admission::SameAction(action_claim.clone()))
+            .with_stale_actions(vec![action_claim]);
+        let noded = MockNoded::new(
+            store.clone(),
+            [],
+            [Ok(NodeCatStatus::Present {
+                state: Some(CatState::Running),
+                active_action: None,
+            })],
+        );
+        let ingress = MockIngress::new(&noded);
+        let service =
+            SemanticLifecycleService::new(store.clone(), noded.clone(), ingress, fast_timeouts());
+
+        let report = service
+            .recover_stale_actions_once(ActionRecoveryPolicy {
+                stale_after: Duration::from_secs(60),
+                scan_interval: Duration::from_secs(5),
+                batch_size: 64,
+                concurrency: 8,
+            })
+            .await
+            .expect("stale action scan");
+
+        assert_eq!(
+            report,
+            ActionRecoveryReport {
+                discovered: 1,
+                settled: 1,
+                unresolved: 0,
+            }
+        );
+        assert!(noded.state.lock().expect("noded").commands.is_empty());
+        assert_eq!(store.state.lock().expect("store").completions, 1);
+        assert_eq!(
+            noded.state.lock().expect("noded").events,
+            ["publish:node-1"]
+        );
+    }
+
+    #[test]
+    fn stale_action_recovery_defaults_to_sixty_seconds() {
+        assert_eq!(
+            ActionRecoveryPolicy::default().stale_after,
+            Duration::from_secs(60)
         );
     }
 }

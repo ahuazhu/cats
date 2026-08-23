@@ -36,6 +36,7 @@ pub struct RecoveryClaim {
     pub source_node_id: String,
     pub target_node_id: String,
     pub target_state: CatState,
+    pub started_at_unix_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -575,6 +576,7 @@ impl SemanticNodeRecoveryStore for PostgresSemanticNodeRecoveryStore {
                                 source_node_id: &claim.source_node_id,
                                 target_node_id: &claim.target_node_id,
                                 target_state: core_state_to_stored(claim.target_state),
+                                expected_action_started_at: claim.started_at_unix_ms,
                             },
                             result,
                         )?
@@ -617,11 +619,16 @@ fn map_admission(
 }
 
 fn stored_claim_to_core(claim: StoredRecoveryClaim) -> crate::store::Result<RecoveryClaim> {
+    let started_at_unix_ms =
+        claim.cat.cat.current_action_started_at.ok_or_else(|| {
+            ApiError::internal("stored recovery claim omitted its action start time")
+        })?;
     Ok(RecoveryClaim {
         cat: stored_cat_to_core(claim.cat)?,
         source_node_id: claim.source_node_id,
         target_node_id: claim.target_node_id,
         target_state: stored_state_to_core(claim.target_state),
+        started_at_unix_ms,
     })
 }
 
@@ -909,6 +916,7 @@ mod tests {
             source_node_id: "node-source".to_owned(),
             target_node_id: "node-target".to_owned(),
             target_state: state,
+            started_at_unix_ms: 1,
         }
     }
 

@@ -62,6 +62,7 @@ pub struct Handle {
     server_task: tokio::task::JoinHandle<()>,
     semantic_node_liveness_shutdown: tokio::sync::watch::Sender<bool>,
     semantic_node_liveness_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    semantic_action_recovery_task: ManagedSingletonTask,
     server_shutdown: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
@@ -96,6 +97,7 @@ impl Handle {
             let _ = shutdown.send(());
         }
         self.semantic_node_liveness_shutdown.send_replace(true);
+        self.semantic_action_recovery_task.begin_shutdown();
         self.state.runtime_node_authority.begin_shutdown();
     }
 
@@ -105,6 +107,10 @@ impl Handle {
         if let Some(task) = task.take() {
             task.await.context("semantic Node liveness task failed")?;
         }
+        self.semantic_action_recovery_task
+            .shutdown()
+            .await
+            .context("semantic action recovery task failed")?;
         self.state
             .runtime_node_authority
             .shutdown_commit_resolutions()
@@ -227,6 +233,7 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         semantic_ingress,
         crate::semantic_lifecycle::LifecycleTimeouts::default(),
     );
+    let semantic_action_recovery = semantic_lifecycle.clone();
     let semantic_resources: Arc<dyn crate::api::semantic_resources::SemanticResourceApi> = Arc::new(
         crate::semantic_resource_service::ProductionSemanticResourceApi::with_disk_backend(
             semantic_lifecycle,
@@ -269,6 +276,20 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         .await
         .with_context(|| format!("bind {}", state.cfg.listen))?;
     let addr = listener.local_addr()?;
+    let semantic_action_recovery_task = spawn_managed_singleton_task(
+        Arc::clone(&state.store),
+        SingletonRole::SemanticActionRecovery,
+        move || {
+            let semantic_action_recovery = semantic_action_recovery.clone();
+            async move {
+                semantic_action_recovery
+                    .run_stale_action_recovery(
+                        crate::semantic_lifecycle::ActionRecoveryPolicy::default(),
+                    )
+                    .await;
+            }
+        },
+    );
     let app = crate::api::router(state.clone());
     let (server_shutdown, server_shutdown_rx) = tokio::sync::oneshot::channel();
     let server_task = tokio::spawn(async move {
@@ -288,6 +309,7 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         server_task,
         semantic_node_liveness_shutdown,
         semantic_node_liveness_task: tokio::sync::Mutex::new(Some(semantic_node_liveness_task)),
+        semantic_action_recovery_task,
         server_shutdown: std::sync::Mutex::new(Some(server_shutdown)),
     })
 }

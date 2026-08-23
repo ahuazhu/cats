@@ -609,6 +609,7 @@ impl PostgresSemanticLifecycleStore {
                         &claim.cat.cat_id,
                         db::FinishCatAction {
                             expected_action: lifecycle_action_to_db(claim.action),
+                            expected_action_started_at: claim.started_at_unix_ms,
                             expected_node_id: claim.node_id.as_deref(),
                             final_state: lifecycle_state_to_db(state),
                             final_node_id: final_node_id.as_deref(),
@@ -708,9 +709,13 @@ fn action_claim(
     action: lifecycle::CatAction,
 ) -> Result<lifecycle::ActionClaim, lifecycle::StoreError> {
     let node_id = cat.cat.current_action_node_id.clone();
+    let started_at_unix_ms = cat.cat.current_action_started_at.ok_or_else(|| {
+        lifecycle::StoreError::new("claimed semantic Cat action omitted its start time")
+    })?;
     Ok(lifecycle::ActionClaim {
         cat: db_aggregate_to_lifecycle(cat)?,
         action,
+        started_at_unix_ms,
         node_id,
     })
 }
