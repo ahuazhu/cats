@@ -126,13 +126,27 @@ def main() -> int:
             )
         ]
 
+        root_directory = tarfile.TarInfo(".")
+        root_directory.type = tarfile.DIRTYPE
+        root_directory.mode = 0o755
         member = tarfile.TarInfo("release-manifest.v1.json")
         member.mode = 0o444
         transport = scratch / "positive.tar.zst"
-        make_transport(transport, [member])
+        make_transport(transport, [root_directory, member])
         extracted = scratch / "positive"
         package.extract_transport(transport, extracted)
         assert (extracted / member.name).read_bytes() == member.name.encode()
+
+        root_file = tarfile.TarInfo(".")
+        root_file.mode = 0o444
+        root_file_transport = scratch / "root-file.tar.zst"
+        make_transport(root_file_transport, [root_file])
+        try:
+            package.extract_transport(root_file_transport, scratch / "root-file")
+        except package.PackagingError as error:
+            assert "unsafe path" in str(error)
+        else:
+            raise AssertionError("packager accepted a regular file as the archive root")
 
         traversal = tarfile.TarInfo("../escape")
         traversal.mode = 0o444
