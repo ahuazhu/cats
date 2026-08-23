@@ -37,6 +37,16 @@ run "the_apply_blocks_on_the_components_that_can_become_ready" {
   }
 
   assert {
+    condition     = nonsensitive(kubernetes_secret_v1.runtime.data["CATS_USER_SITE_URL"]) == "https://cats.run/user/"
+    error_message = "WorkOS user login must return to the user console rather than the public landing page."
+  }
+
+  assert {
+    condition     = nonsensitive(kubernetes_secret_v1.runtime.data["CATS_ADMIN_SITE_URL"]) == "https://ops.cats.run/"
+    error_message = "WorkOS administrator login must return to the administrator console."
+  }
+
+  assert {
     condition     = kubernetes_deployment_v1.control_plane.spec[0].template[0].metadata[0].annotations["cats.run/production-cutover-operator-trust-sha256"] == sha256(var.production_cutover_operator_trust_bundle_json)
     error_message = "changing production operator trust must trigger a Control rollout."
   }
