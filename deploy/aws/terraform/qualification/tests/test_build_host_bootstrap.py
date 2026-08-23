@@ -179,6 +179,18 @@ class BuildHostBoundaryTests(unittest.TestCase):
         self.assertIn("/usr/bin/env -i", helper)
         self.assertIn("job_cgroup_drained:true", helper)
         self.assertIn("output_frozen:true", helper)
+        # Guest Agent changes need a new immutable Golden Root, but rebuilding
+        # unrelated OCI images made this operationally easy to skip. The same
+        # trusted native lane therefore exposes a separately receipted rootfs
+        # artifact and proves the ext4 image contains the exact built Agent.
+        self.assertIn("prepare|verify|build|golden-root", helper)
+        self.assertIn("cats-golden-root.ext4", helper)
+        self.assertIn('build_kind:"golden-root"', helper)
+        self.assertIn('e2fsck -fn rootfs.ext4', helper)
+        self.assertIn(
+            'debugfs -R "dump /usr/bin/cats-guest-agent ${installed_agent}"', helper
+        )
+        self.assertIn("cmp --silent", helper)
         # rustup-init dispatches on argv[0]; saving the installer under the
         # lock's underscore key made every prepare fail with "unknown proxy
         # name", so the helper must download and execute the hyphenated name.

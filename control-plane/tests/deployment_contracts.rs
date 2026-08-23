@@ -3733,6 +3733,44 @@ fn manual_release_builder_verifies_all_final_artifacts_and_writes_one_receipt() 
 }
 
 #[test]
+fn trusted_native_lane_can_publish_an_exact_golden_root_without_rebuilding_images() {
+    let helper = read_workspace_file(
+        "deploy/aws/terraform/qualification/build-host/tools/manual-release-host.sh",
+    );
+    for required in [
+        "prepare|verify|build|golden-root",
+        "cargo build --locked --release -p cats-guest-agent",
+        "deploy/metal/build-guest-image.sh",
+        "sha256sum --check SHA256SUMS",
+        "e2fsck -fn rootfs.ext4",
+        "debugfs -R \"dump /usr/bin/cats-guest-agent ${installed_agent}\"",
+        "cmp --silent",
+        "cats-golden-root.ext4",
+        "cats-golden-root.v1.json",
+        "build_kind:\"golden-root\"",
+        "output_frozen:true",
+    ] {
+        assert!(
+            helper.contains(required),
+            "trusted Golden Root lane lost {required:?}"
+        );
+    }
+
+    let golden_root = helper
+        .split_once("run_golden_root_build()")
+        .and_then(|(_, tail)| tail.split_once("case \"${operation}\""))
+        .map(|(body, _)| body)
+        .expect("dedicated Golden Root build body");
+    assert!(
+        !golden_root.contains("docker build")
+            && !golden_root.contains("docker push")
+            && !golden_root.contains("terraform")
+            && !golden_root.contains("kubectl"),
+        "Golden Root build must not rebuild images or contain deployment effects"
+    );
+}
+
+#[test]
 fn production_release_packager_is_offline_characterized() {
     let root = workspace_root();
     let output = Command::new("python3")
