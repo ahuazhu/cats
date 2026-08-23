@@ -57,7 +57,7 @@
 - [x] 合入 offline Node 的 Cat 恢复核心和精确状态结算。
 - [x] 将 liveness 标记 offline 的结果接到恢复服务。
 - [x] Store 完成 create 原子建立 Cat/初始 bindings、placement 复核和 stale Node 查询。
-- [x] `controld` 单例扫描 PostgreSQL 中持续 125 秒的普通 `current_action`，向目标 noded 查询并用精确 claim CAS 收敛。
+- [x] `controld` 单例扫描 PostgreSQL 中持续 135 秒、已越过前台 deadline 和 Create 清理窗口的普通 `current_action`，向目标 noded 查询并用精确 claim CAS 收敛。
 - [x] 完成生命周期、Node 管理和 noded HTTP 的 production adapter。
 - [x] 完成 `SemanticResourceApi` 聚合。
 - [x] 完成基于当前 Cat/Node 的唯一入口 Store 和 production adapter。

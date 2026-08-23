@@ -637,7 +637,7 @@ Control Plane 可能在 `noded` 已经完成动作、但数据库尚未更新时
 6. 如果 Node 不可达，进入 Node 失联流程。
 
 生产 Control 为普通动作和 Destroy 分别使用 schema-scoped PostgreSQL advisory lock 选举一个恢复任务。
-两者都只扫描持续至少 125 秒、已经越过正常 120 秒同步请求 deadline 的 claim，每批和并发都有上限，
+两者都只扫描持续至少 135 秒、已经越过正常 120 秒同步请求 deadline 和最长 10 秒 Create 清理窗口的 claim，每批和并发都有上限，
 并执行上述同一套 discovery-first 与 exact settlement 规则；普通动作扫描排除由独立多步骤循环负责的
 跨 Node 失联恢复 `run` lane，也排除专用 Destroy lane。
 
@@ -647,7 +647,7 @@ Control Plane 可能在 `noded` 已经完成动作、但数据库尚未更新时
 `current_action_started_at` 的 exact CAS 刷新 `updated_at`，把它轮转到未尝试 claim 之后，失败满批次
 不能饿死后续动作。
 
-125 秒只是触发精确查询/恢复的动作年龄，不是 Node 失联判断，也不是 fencing 证据。heartbeat、日志、
+135 秒只是触发精确查询/恢复的动作年龄，不是 Node 失联判断，也不是 fencing 证据。heartbeat、日志、
 metrics 和 runtime inventory 仍然不能结算动作；扫描器必须向 `current_action_node_id` 对应的 noded
 确认实际状态。
 

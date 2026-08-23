@@ -544,10 +544,11 @@ pub struct SemanticLifecycleService<S, N, I> {
 }
 
 /// A lifecycle action becomes eligible for recovery after the foreground
-/// request's 120-second deadline plus a five-second scheduling margin. This
-/// is deliberately independent from heartbeat age: the scanner confirms the
-/// exact Cat state with noded before settlement.
-pub const DEFAULT_STALE_ACTION_AGE: Duration = Duration::from_secs(125);
+/// request's 120-second deadline, the possible ten-second failed-Create
+/// cleanup, and a five-second scheduling margin. This is deliberately
+/// independent from heartbeat age: the scanner confirms the exact Cat state
+/// with noded before settlement.
+pub const DEFAULT_STALE_ACTION_AGE: Duration = Duration::from_secs(135);
 pub const DEFAULT_ACTION_RECOVERY_SCAN_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEFAULT_ACTION_RECOVERY_BATCH_SIZE: usize = 64;
 pub const DEFAULT_ACTION_RECOVERY_CONCURRENCY: usize = 8;
@@ -1965,7 +1966,7 @@ mod tests {
 
         let report = service
             .recover_stale_actions_once(ActionRecoveryPolicy {
-                stale_after: Duration::from_secs(125),
+                stale_after: Duration::from_secs(135),
                 scan_interval: Duration::from_secs(5),
                 batch_size: 64,
                 concurrency: 8,
@@ -2014,7 +2015,8 @@ mod tests {
     #[test]
     fn stale_action_recovery_starts_after_foreground_deadline() {
         let stale_after = ActionRecoveryPolicy::default().stale_after;
-        assert_eq!(stale_after, Duration::from_secs(125));
-        assert!(stale_after > LifecycleTimeouts::default().total);
+        let foreground = LifecycleTimeouts::default();
+        assert_eq!(stale_after, Duration::from_secs(135));
+        assert!(stale_after > foreground.total + foreground.create_cleanup);
     }
 }

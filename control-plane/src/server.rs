@@ -20,9 +20,10 @@ use crate::store::{DsnSource, SingletonRole, Store};
 const SINGLETON_ELECTION_RETRY: Duration = Duration::from_millis(500);
 const SINGLETON_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
 const DESTROY_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
-// A live request owns its claim for at most the default 120-second lifecycle
-// deadline. Waiting beyond it prevents the recovery task from racing the
-// ordinary response path while still bounding crash recovery.
+// A live request owns its claim through the default 120-second lifecycle
+// deadline and a possible ten-second failed-Create cleanup. Waiting beyond
+// both prevents the recovery task from racing the ordinary response path
+// while still bounding crash recovery.
 const DESTROY_RECOVERY_MINIMUM_AGE: Duration = crate::semantic_lifecycle::DEFAULT_STALE_ACTION_AGE;
 const DESTROY_RECOVERY_BATCH_SIZE: usize = 32;
 const DESTROY_RECOVERY_MAX_IN_FLIGHT: usize = 4;

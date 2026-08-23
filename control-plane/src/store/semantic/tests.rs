@@ -1315,7 +1315,7 @@ fn stale_action_scan_uses_database_age_and_excludes_special_recovery_lanes() {
         })
         .unwrap();
 
-    let stale = store.list_stale_semantic_cat_actions(125_000, 64).unwrap();
+    let stale = store.list_stale_semantic_cat_actions(135_000, 64).unwrap();
     assert_eq!(stale.len(), 1);
     assert_eq!(stale[0].cat.cat_id, "cat-stale-action");
     assert_eq!(stale[0].cat.current_action, Some(CatAction::Create));
@@ -1356,7 +1356,7 @@ fn unresolved_stale_actions_rotate_behind_an_untried_claim() {
         })
         .unwrap();
 
-    let first = store.list_stale_semantic_cat_actions(125_000, 2).unwrap();
+    let first = store.list_stale_semantic_cat_actions(135_000, 2).unwrap();
     assert_eq!(first.len(), 2);
     let first_ids = first
         .iter()
@@ -1390,7 +1390,7 @@ fn unresolved_stale_actions_rotate_behind_an_untried_claim() {
             .unwrap());
     }
 
-    let second = store.list_stale_semantic_cat_actions(125_000, 2).unwrap();
+    let second = store.list_stale_semantic_cat_actions(135_000, 2).unwrap();
     assert_eq!(second[0].cat.cat_id, untried);
 }
 
