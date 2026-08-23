@@ -5,12 +5,16 @@
 //! `O_NOFOLLOW`, brackets the effect with sysfs/fstat/mountinfo samples, and
 //! refuses to unmount or replace a foreign object.
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::Read as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
+#[cfg(any(target_os = "linux", test))]
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileExt as _, FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _};
+#[cfg(any(target_os = "linux", test))]
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
@@ -352,11 +356,7 @@ impl FilesystemController {
         ensure_active(guard)?;
         retained.verify(&self.device_snapshot(request)?)?;
         let target_path = Path::new(request.filesystem.mount_path.as_str());
-        let target = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY)
-            .open(target_path)
-            .with_context(|| format!("open mount target {}", target_path.display()))?;
+        let target = open_or_create_mount_target(target_path)?;
         let target_meta = target.metadata().context("fstat mount target")?;
         let path_meta = std::fs::symlink_metadata(target_path).context("lstat mount target")?;
         anyhow::ensure!(
@@ -396,6 +396,73 @@ impl FilesystemController {
         _guard: EffectGuard,
     ) -> Result<()> {
         anyhow::bail!("Persistent filesystem mount is Linux-only")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_or_create_mount_target(target_path: &Path) -> Result<File> {
+    let root = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open("/")
+        .context("open Guest filesystem root")?;
+    open_or_create_mount_target_beneath(root, target_path)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn open_or_create_mount_target_beneath(mut parent: File, target_path: &Path) -> Result<File> {
+    anyhow::ensure!(target_path.is_absolute(), "mount target is not absolute");
+    let mut depth = 0_usize;
+    for component in target_path.components() {
+        let Component::Normal(name) = component else {
+            anyhow::ensure!(
+                component == Component::RootDir,
+                "mount target is not canonical"
+            );
+            continue;
+        };
+        depth += 1;
+        let name = CString::new(name.as_bytes()).context("mount target component contains NUL")?;
+        let next = match open_directory_at(&parent, &name) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // SAFETY: `name` is a live NUL-terminated single path
+                // component and `parent` is a retained directory descriptor.
+                let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) };
+                if result != 0 {
+                    let error = std::io::Error::last_os_error();
+                    anyhow::ensure!(
+                        error.kind() == std::io::ErrorKind::AlreadyExists,
+                        "create mount target component failed: {error}"
+                    );
+                }
+                open_directory_at(&parent, &name)
+                    .context("open newly created mount target component")?
+            }
+            Err(error) => return Err(error).context("open mount target component"),
+        };
+        parent = next;
+    }
+    anyhow::ensure!(depth > 0, "PersistentDisk mount target cannot be /");
+    Ok(parent)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn open_directory_at(parent: &File, name: &CString) -> std::io::Result<File> {
+    // SAFETY: `name` is a live NUL-terminated single path component and the
+    // returned descriptor receives unique ownership through `File`.
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        // SAFETY: `descriptor` is a fresh successful `openat` result.
+        Ok(unsafe { File::from_raw_fd(descriptor) })
     }
 }
 
@@ -941,6 +1008,53 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("not a block device"));
+    }
+
+    #[test]
+    fn mount_target_is_created_descriptor_relative_and_replays() {
+        let root = tempfile::tempdir().unwrap();
+        let first = open_or_create_mount_target_beneath(
+            File::open(root.path()).unwrap(),
+            Path::new("/var/lib/data"),
+        )
+        .unwrap();
+        let first_meta = first.metadata().unwrap();
+        let path_meta = std::fs::symlink_metadata(root.path().join("var/lib/data")).unwrap();
+        assert_eq!(
+            (first_meta.dev(), first_meta.ino()),
+            (path_meta.dev(), path_meta.ino())
+        );
+
+        let replay = open_or_create_mount_target_beneath(
+            File::open(root.path()).unwrap(),
+            Path::new("/var/lib/data"),
+        )
+        .unwrap();
+        let replay_meta = replay.metadata().unwrap();
+        assert_eq!(
+            (first_meta.dev(), first_meta.ino()),
+            (replay_meta.dev(), replay_meta.ino())
+        );
+    }
+
+    #[test]
+    fn mount_target_creation_refuses_symlink_components_and_root() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
+
+        let error = open_or_create_mount_target_beneath(
+            File::open(root.path()).unwrap(),
+            Path::new("/escape/data"),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("open mount target component"));
+        assert!(!outside.path().join("data").exists());
+
+        let error =
+            open_or_create_mount_target_beneath(File::open(root.path()).unwrap(), Path::new("/"))
+                .unwrap_err();
+        assert!(error.to_string().contains("cannot be /"));
     }
 
     #[test]
