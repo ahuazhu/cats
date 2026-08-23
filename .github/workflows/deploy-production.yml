@@ -45,6 +45,9 @@ jobs:
       CHUNKSTORE_BUCKET_NAME: ${{ vars.CHUNKSTORE_BUCKET_NAME }}
       CHUNKSTORE_PREFIX: ${{ vars.CHUNKSTORE_PREFIX }}
       CONTROL_POSTGRES_SCHEMA: ${{ vars.CONTROL_POSTGRES_SCHEMA }}
+      # Exact operator-qualified Golden Root selected automatically for every
+      # newly allocated Cat. Existing Cats retain their stored digest.
+      DEFAULT_BOOT_IMAGE_DIGEST: ${{ vars.DEFAULT_BOOT_IMAGE_DIGEST }}
       # Canonical A23 public trust bundle emitted by the central provisioner.
       # Base64 preserves its exact JSON bytes through GitHub configuration.
       RUNTIME_PROVISIONER_TRUST_BUNDLE_B64: ${{ secrets.RUNTIME_PROVISIONER_TRUST_BUNDLE_B64 }}
@@ -181,6 +184,7 @@ jobs:
             CHUNKSTORE_BUCKET_NAME \
             CHUNKSTORE_PREFIX \
             CONTROL_POSTGRES_SCHEMA \
+            DEFAULT_BOOT_IMAGE_DIGEST \
             RDS_MASTER_USER_SECRET_ARN \
             RUNTIME_PROVISIONER_TRUST_BUNDLE_B64
           do
@@ -194,6 +198,10 @@ jobs:
               echo "::error::CONTROL_POSTGRES_SCHEMA must be one lowercase cats_* PostgreSQL identifier"
               exit 1
             }
+          [[ "$DEFAULT_BOOT_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "::error::DEFAULT_BOOT_IMAGE_DIGEST must be one exact lowercase sha256 digest"
+            exit 1
+          }
 
           printf '%s' "$PRODUCTION_TFVARS_B64" \
             | base64 --decode > "$RUNNER_TEMP/production.tfvars"
@@ -217,6 +225,7 @@ jobs:
             > "$RUNNER_TEMP/live-secret.json"
           jq -c '
               del(
+                .CATS_BOOT_IMAGE,
                 .CATS_POSTGRES_URL,
                 .CATS_USAGE_STORE_ADAPTER,
                 .CATS_USAGE_POSTGRES_URL,
@@ -457,6 +466,7 @@ jobs:
             -var="expected_aws_partition=$EXPECTED_AWS_PARTITION" \
             -var="aws_region=$EXPECTED_AWS_REGION" \
             -var="control_plane_image=$IMAGE_REF" \
+            -var="default_boot_image_digest=$DEFAULT_BOOT_IMAGE_DIGEST" \
             -var="chunkstore_bucket_name=$CHUNKSTORE_BUCKET_NAME" \
             -var="chunkstore_prefix=$CHUNKSTORE_PREFIX" \
             -var="control_postgres_schema=$CONTROL_POSTGRES_SCHEMA" \

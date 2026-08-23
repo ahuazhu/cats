@@ -877,24 +877,32 @@ pub struct ProductionSemanticResourceApi<L, R, B = UnavailablePersistentDiskBack
     lifecycle: L,
     resources: R,
     disk_backend: B,
+    default_boot_image: String,
 }
 
 impl<L, R> ProductionSemanticResourceApi<L, R, UnavailablePersistentDiskBackend> {
-    pub fn new(lifecycle: L, resources: R) -> Self {
+    pub fn new(lifecycle: L, resources: R, default_boot_image: impl Into<String>) -> Self {
         Self {
             lifecycle,
             resources,
             disk_backend: UnavailablePersistentDiskBackend,
+            default_boot_image: default_boot_image.into(),
         }
     }
 }
 
 impl<L, R, B> ProductionSemanticResourceApi<L, R, B> {
-    pub fn with_disk_backend(lifecycle: L, resources: R, disk_backend: B) -> Self {
+    pub fn with_disk_backend(
+        lifecycle: L,
+        resources: R,
+        disk_backend: B,
+        default_boot_image: impl Into<String>,
+    ) -> Self {
         Self {
             lifecycle,
             resources,
             disk_backend,
+            default_boot_image: default_boot_image.into(),
         }
     }
 }
@@ -998,7 +1006,7 @@ where
                     config: lifecycle::CatCreateConfig {
                         cpu_count: request.cpu,
                         memory_bytes: request.memory_bytes,
-                        boot_image: request.boot_image,
+                        boot_image: self.default_boot_image.clone(),
                         mounts,
                     },
                 })
@@ -1611,6 +1619,9 @@ mod tests {
 
     use super::*;
 
+    const DEFAULT_BOOT_IMAGE: &str =
+        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     struct MockLifecycle {
         creates: Mutex<Vec<lifecycle::CreateCatRequest>>,
     }
@@ -1945,8 +1956,11 @@ mod tests {
 
     #[tokio::test]
     async fn create_cat_resolves_mount_slug_to_immutable_disk_id() {
-        let api =
-            ProductionSemanticResourceApi::new(MockLifecycle::new(), MockResources::populated());
+        let api = ProductionSemanticResourceApi::new(
+            MockLifecycle::new(),
+            MockResources::populated(),
+            DEFAULT_BOOT_IMAGE,
+        );
 
         let response = api
             .create_cat(
@@ -1955,7 +1969,6 @@ mod tests {
                     cat_slug: wire::ResourceSlug::new("worker").unwrap(),
                     cpu: 2,
                     memory_bytes: 1024,
-                    boot_image: "image".to_owned(),
                     mounts: vec![wire::CatMountRequest {
                         disk_slug: wire::ResourceSlug::new("data").unwrap(),
                         mount_path: wire::PersistentMountPath::new("/data").unwrap(),
@@ -1966,6 +1979,7 @@ mod tests {
             .unwrap();
 
         let creates = api.lifecycle.creates.lock().unwrap();
+        assert_eq!(creates[0].config.boot_image, DEFAULT_BOOT_IMAGE);
         assert_eq!(creates[0].config.mounts[0].disk_id, "disk_current");
         assert_eq!(response.status, wire::SemanticStatus::Ok);
         assert_eq!(response.cat.mounts[0].disk_id.as_str(), "disk_current");
@@ -1973,8 +1987,11 @@ mod tests {
 
     #[tokio::test]
     async fn disk_create_retries_by_current_slug_and_fails_closed_without_backend() {
-        let api =
-            ProductionSemanticResourceApi::new(MockLifecycle::new(), MockResources::populated());
+        let api = ProductionSemanticResourceApi::new(
+            MockLifecycle::new(),
+            MockResources::populated(),
+            DEFAULT_BOOT_IMAGE,
+        );
 
         let existing = api
             .create_disk(
@@ -2026,6 +2043,7 @@ mod tests {
             MockLifecycle::new(),
             resources,
             backend,
+            DEFAULT_BOOT_IMAGE,
         );
         let request = || wire::CreateDiskRequest {
             disk_slug: wire::ResourceSlug::new("recoverable-data").unwrap(),
@@ -2050,8 +2068,11 @@ mod tests {
 
     #[tokio::test]
     async fn attach_resolves_both_slugs_before_mutation() {
-        let api =
-            ProductionSemanticResourceApi::new(MockLifecycle::new(), MockResources::populated());
+        let api = ProductionSemanticResourceApi::new(
+            MockLifecycle::new(),
+            MockResources::populated(),
+            DEFAULT_BOOT_IMAGE,
+        );
 
         let response = api
             .attach_disk(
@@ -2090,7 +2111,8 @@ mod tests {
             },
             cat_slug: "worker".to_owned(),
         });
-        let api = ProductionSemanticResourceApi::new(MockLifecycle::new(), resources);
+        let api =
+            ProductionSemanticResourceApi::new(MockLifecycle::new(), resources, DEFAULT_BOOT_IMAGE);
 
         let in_use = api
             .destroy_disk("ws_test", wire::ResourceSlug::new("data").unwrap())

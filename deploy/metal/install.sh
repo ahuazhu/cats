@@ -11,11 +11,22 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 CH_VERSION=${CH_VERSION:-v53.0}
 PREFIX=/opt/cats
 GUEST_RUNTIME_RELEASE_SOURCE=${CATS_GUEST_RUNTIME_RELEASE_DIR:-}
+CONTROL_BOOT_IMAGE=${CATS_BOOT_IMAGE:-}
 
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 [[ -e /dev/kvm ]] || { echo "/dev/kvm missing: use a *.metal instance" >&2; exit 1; }
 [[ -d $GUEST_RUNTIME_RELEASE_SOURCE ]] || {
   echo "CATS_GUEST_RUNTIME_RELEASE_DIR must name the qualified guest-runtime-release.v1 payload" >&2
+  exit 1
+}
+if [[ -f /etc/cats/cats.env ]]; then
+  configured_boot_image=$(sed -nE \
+    's/^CATS_BOOT_IMAGE=(sha256:[0-9a-f]{64})$/\1/p' /etc/cats/cats.env)
+  CONTROL_BOOT_IMAGE=$configured_boot_image
+fi
+[[ $CONTROL_BOOT_IMAGE =~ ^sha256:[0-9a-f]{64}$ ]] || {
+  echo "CATS_BOOT_IMAGE must name the current qualified Golden Root digest" >&2
+  echo "set it for the first install or in /etc/cats/cats.env before an upgrade" >&2
   exit 1
 }
 "$REPO/deploy/aws/metal/validate-node-identity-installation.sh"
@@ -227,6 +238,7 @@ install -o root -g root -m 0755 \
 cats_worker_deployment_crash_probe after-provision-vmm-socket-namespaces
 if [[ ! -f /etc/cats/cats.env ]]; then
   install -m 0600 "$REPO/deploy/metal/cats.env.example" /etc/cats/cats.env
+  printf '\nCATS_BOOT_IMAGE=%s\n' "$CONTROL_BOOT_IMAGE" >> /etc/cats/cats.env
   cats_worker_deployment_crash_probe after-install-cats-environment
   echo "    wrote /etc/cats/cats.env (edit for S3; defaults to local file blobstore)"
 fi

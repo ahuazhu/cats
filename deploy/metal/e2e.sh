@@ -17,7 +17,7 @@ die() { echo "metal semantic e2e: $*" >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || die "jq is required"
 [[ -n ${CATS_TOKEN:-} ]] || die "set CATS_TOKEN (or CATS_ADMIN_TOKEN in /etc/cats/cats.env)"
 [[ ${CATS_BOOT_IMAGE:-} =~ ^sha256:[0-9a-f]{64}$ ]] || \
-  die "set CATS_BOOT_IMAGE to the exact sha256 digest of an installed Root image manifest"
+  die "set CATS_BOOT_IMAGE in Control's environment to the current qualified Root image digest"
 
 suffix=${CATS_E2E_SUFFIX:-$(date +%s)-$$}
 CAT=${CATS_E2E_CAT_SLUG:-e2e-cat-$suffix}
@@ -77,14 +77,14 @@ expect_json "same disk create is already_exists" '.code' already_exists "$retry"
 expect_json "same disk create preserves ID" '.disk.disk_id' "$DISK_ID" "$retry"
 
 echo "== 2. Cat create performs real Root/Persistent attach and Guest mount =="
-out=$(cats_json create "$CAT" \
-  --boot-image "$CATS_BOOT_IMAGE" --cpu 1 --memory 512MiB --mount "$DISK:$MOUNT") \
+out=$(cats_json create "$CAT" --cpu 1 --memory 512MiB --mount "$DISK:$MOUNT") \
   || die "Cat create failed: $out"
 CAT_CREATED=1
 CAT_ID=$(jq -er '.cat.cat_id' <<<"$out") || die "Cat create returned invalid JSON: $out"
 FIRST_NODE=$(jq -er '.cat.node_id' <<<"$out") || die "Cat create did not return placement: $out"
 expect_json "Cat create reaches Running" '.cat.state' running "$out"
 expect_json "Cat create returns cat_created" '.code' cat_created "$out"
+expect_json "Control selected the current default Root image" '.cat.boot_image' "$CATS_BOOT_IMAGE" "$out"
 expect_json "Cat reports exact PersistentDisk" '.cat.mounts[0].disk_id' "$DISK_ID" "$out"
 expect_json "Cat reports exact Guest mount path" '.cat.mounts[0].mount_path' "$MOUNT" "$out"
 if [[ $(cat_vmm_count "$CAT_ID") -eq 1 ]]; then
@@ -92,8 +92,7 @@ if [[ $(cat_vmm_count "$CAT_ID") -eq 1 ]]; then
 else
   bad "expected exactly one Cloud Hypervisor process for $CAT_ID"
 fi
-retry=$(cats_json create "$CAT" \
-  --boot-image "$CATS_BOOT_IMAGE" --cpu 1 --memory 512MiB --mount "$DISK:$MOUNT") \
+retry=$(cats_json create "$CAT" --cpu 1 --memory 512MiB --mount "$DISK:$MOUNT") \
   || die "Cat create replay failed: $retry"
 expect_json "same Cat create is already_exists" '.code' already_exists "$retry"
 expect_json "same Cat create preserves ID" '.cat.cat_id' "$CAT_ID" "$retry"
@@ -178,8 +177,7 @@ else
   bad "Disk slug reuse retained destroyed ID $DISK_ID"
 fi
 
-replacement_cat=$(cats_json create "$CAT" \
-  --boot-image "$CATS_BOOT_IMAGE" --cpu 1 --memory 512MiB) \
+replacement_cat=$(cats_json create "$CAT" --cpu 1 --memory 512MiB) \
   || die "Cat slug reuse failed: $replacement_cat"
 CAT_CREATED=1
 REPLACEMENT_CAT_ID=$(jq -er '.cat.cat_id' <<<"$replacement_cat") \

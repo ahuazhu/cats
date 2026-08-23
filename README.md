@@ -73,7 +73,7 @@ FakeVmm Node和Gateway：
 
 export CATS_API_URL=http://127.0.0.1:7300
 export CATS_TOKEN=dev-admin-token
-target/debug/cats create dev --boot-image ubuntu-24.04 --cpu 2 --memory 2GiB
+target/debug/cats create dev --cpu 2 --memory 2GiB
 target/debug/cats exec dev -- echo hello
 
 ./scripts/dev.sh status

@@ -11,19 +11,15 @@ import {
   diskCollectionPath,
 } from "./semantic-resource-client.mjs";
 
-const DIGEST = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
 test("semantic builders emit only the current scenario-identity DTOs", () => {
   assert.deepEqual(buildSemanticCatCreateRequest({
     name: "app",
-    bootImage: DIGEST,
     vcpus: 2,
     memoryMib: 2048,
   }), {
     cat_slug: "app",
     cpu: 2,
     memory_bytes: 2147483648,
-    boot_image: DIGEST,
     mounts: [],
   });
   assert.deepEqual(buildSemanticDiskCreateRequest({ name: "data-disk", sizeGib: 100 }), {
@@ -38,7 +34,6 @@ test("semantic Cat create sends no request identifier and accepts exact retry id
   const sent = [];
   const request = buildSemanticCatCreateRequest({
     name: "app",
-    bootImage: DIGEST,
     vcpus: 2,
     memoryMib: 1024,
   });
@@ -123,7 +118,6 @@ test("semantic client rejects query pagination and retired console surfaces loca
 test("semantic create rejects a response bound to another slug", async () => {
   const request = buildSemanticCatCreateRequest({
     name: "app",
-    bootImage: DIGEST,
     vcpus: 1,
     memoryMib: 512,
   });

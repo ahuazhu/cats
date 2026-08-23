@@ -85,7 +85,9 @@ pub struct CatMount {
     pub mount_path: String,
 }
 
-/// Configuration whose equality defines a repeated Cat create.
+/// Complete stored Cat configuration. `boot_image` is selected by Control and
+/// remains part of every internal Node command, but it is not a user-selected
+/// create parameter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatCreateConfig {
     pub cpu_count: u32,
@@ -95,11 +97,12 @@ pub struct CatCreateConfig {
 }
 
 impl CatCreateConfig {
-    /// Compares create configuration without treating mount order as meaning.
+    /// Compares user-selected create parameters without treating mount order
+    /// as meaning. A deployment default-image update cannot invalidate a retry
+    /// of a Cat that already froze its earlier exact digest.
     pub fn semantically_matches(&self, other: &Self) -> bool {
         self.cpu_count == other.cpu_count
             && self.memory_bytes == other.memory_bytes
-            && self.boot_image == other.boot_image
             && sorted_mounts(&self.mounts) == sorted_mounts(&other.mounts)
     }
 }
@@ -1611,7 +1614,7 @@ mod tests {
     }
 
     #[test]
-    fn create_config_ignores_mount_order_but_not_values() {
+    fn create_config_ignores_mount_order_and_new_default_but_not_user_values() {
         let request = CreateCatRequest {
             workspace_id: "workspace-1".to_owned(),
             cat_slug: "web".to_owned(),
@@ -1637,6 +1640,11 @@ mod tests {
         };
         let mut existing = cat(Some(CatState::Running), None);
         existing.config.mounts = request.config.mounts.iter().rev().cloned().collect();
+        assert_eq!(
+            classify_create(Some(&existing), &request),
+            CreateDecision::AlreadyExists
+        );
+        existing.config.boot_image = "sha256:new-control-default".to_owned();
         assert_eq!(
             classify_create(Some(&existing), &request),
             CreateDecision::AlreadyExists

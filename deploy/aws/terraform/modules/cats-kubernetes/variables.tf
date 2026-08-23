@@ -19,6 +19,16 @@ variable "control_plane_image" {
   }
 }
 
+variable "default_boot_image_digest" {
+  description = "Current qualified Golden Root selected by Control for every newly allocated Cat."
+  type        = string
+
+  validation {
+    condition     = can(regex("^sha256:[0-9a-f]{64}$", var.default_boot_image_digest))
+    error_message = "default_boot_image_digest must be one exact lowercase sha256 digest."
+  }
+}
+
 
 variable "control_plane_replicas" {
   description = "Number of active-active control-plane API replicas; singleton loops elect independently through PostgreSQL."
@@ -72,6 +82,7 @@ variable "runtime_secret_data" {
         "CATS_OBJECT_STORE_ADAPTER",
         "CATS_OBJECT_STORE_OPTIONS",
         "CATS_NODED_SERVICE_TOKEN",
+        "CATS_BOOT_IMAGE",
       ])
     )) == 0
     error_message = "runtime_secret_data cannot override Terraform-managed storage, usage database, or derived Node service settings."

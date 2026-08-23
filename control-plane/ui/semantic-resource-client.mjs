@@ -1,6 +1,5 @@
 const ID = /^[A-Za-z0-9._:-]{1,128}$/;
 const SLUG = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
-const SHA256 = /^sha256:[0-9a-f]{64}$/;
 const JSON_CONTENT_TYPE = "application/json";
 const MAX_VOLUME_BYTES = 1_099_511_627_776;
 
@@ -35,14 +34,11 @@ export function diskCollectionPath(value) {
   return `/v1/workspaces/${workspaceId(value)}/disks`;
 }
 
-export function buildSemanticCatCreateRequest({ name, bootImage, vcpus, memoryMib }) {
-  const image = String(bootImage ?? "").trim();
-  if (!SHA256.test(image)) throw new Error("invalid boot image digest");
+export function buildSemanticCatCreateRequest({ name, vcpus, memoryMib }) {
   return {
     cat_slug: resourceSlug(name, "Cat name"),
     cpu: positiveSafeInteger(vcpus, "cpu"),
     memory_bytes: positiveSafeInteger(Number(memoryMib) * (1024 ** 2), "memory_bytes"),
-    boot_image: image,
     mounts: [],
   };
 }
@@ -76,7 +72,6 @@ export async function createSemanticCat({ immutableWorkspaceId, request, send })
   const path = catCollectionPath(immutableWorkspaceId);
   const expected = buildSemanticCatCreateRequest({
     name: request?.cat_slug,
-    bootImage: request?.boot_image,
     vcpus: request?.cpu,
     memoryMib: Number(request?.memory_bytes) / (1024 ** 2),
   });

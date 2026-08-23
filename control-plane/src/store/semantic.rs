@@ -679,8 +679,11 @@ impl Store {
     /// complete immutable configuration and all initial disk bindings.
     ///
     /// Placement is selected and reserved in this transaction. An
-    /// already-existing slug is still classified from its full configuration;
-    /// only a genuinely new create returns `NodeNotSchedulable`.
+    /// already-existing slug is classified from every user-selected create
+    /// parameter. `boot_image` is the Control-owned current default: it is
+    /// frozen only when a new row is inserted and is not re-compared after the
+    /// deployment default advances. Only a genuinely new create returns
+    /// `NodeNotSchedulable`.
     pub fn admit_semantic_cat_create(
         &self,
         request: AtomicCatCreate<'_>,
@@ -2450,7 +2453,6 @@ fn cat_create_configuration_matches(
 ) -> bool {
     if existing.cat.cpu_count != request.cpu_count
         || existing.cat.memory_bytes != request.memory_bytes
-        || existing.cat.boot_image != request.boot_image
     {
         return false;
     }

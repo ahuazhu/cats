@@ -2,7 +2,7 @@
 <ol>
   <li>Sign in at <a href="/user/">the user console</a>.</li>
   <li>Choose the Workspace that will own the resource.</li>
-  <li>Create a Cat with a lowercase name, exact <code>sha256:</code> boot-image digest, CPU, memory, RootDisk size, and durability.</li>
+  <li>Create a Cat with a lowercase name, CPU, memory, RootDisk size, and durability. Control automatically selects the current qualified boot image.</li>
   <li>Keep the returned Cat and Operation IDs. The console can list and inspect the current projection.</li>
 </ol>
 <p>Cat create is browser-persistent. If the server commits but the response is lost, reload or refresh replays the exact path, canonical body, and Idempotency-Key.</p>
@@ -10,7 +10,7 @@
 
 <h2 id="cli">Create with the CLI</h2>
 <pre><code>cats login
-cats create dev --boot-image-digest sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --cpus 2 --memory 2GiB --root-size 1GiB --durability strict
+cats create dev --cpus 2 --memory 2GiB --root-size 1GiB --durability strict
 cats ls
 cats get cat_…
 cats operation wait op_…</code></pre>

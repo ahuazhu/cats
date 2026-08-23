@@ -188,7 +188,6 @@
       <header><div><small data-i18n="user.catDialog.eyebrow">NEW COMPUTE</small><h2 data-i18n="user.catDialog.title">Create Cat</h2></div><button class="icon-button" value="cancel" data-i18n-aria-label="common.close" aria-label="Close">×</button></header>
       <div class="form-grid">
         <label class="span-2"><span data-i18n="common.name">Name</span><input name="name" placeholder="dev" pattern="[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?" maxlength="30" required><small data-i18n="user.catDialog.nameHint">Letters, numbers, and hyphens</small></label>
-        <label class="span-2"><span data-i18n="user.catDialog.image">Boot image digest</span><input name="boot_image_digest" placeholder="sha256:…" pattern="sha256:[0-9a-f]{64}" required></label>
         <label><span>CPU</span><input name="vcpus" type="number" min="1" max="64" value="2" required></label>
         <label><span data-i18n="user.catDialog.memory">Memory (MiB)</span><input name="memory_mib" type="number" min="128" value="2048" required></label>
       </div>

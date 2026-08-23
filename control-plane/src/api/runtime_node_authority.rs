@@ -1650,6 +1650,7 @@ mod tests {
             usage_store: usage.clone(),
             credit_store: usage,
             image_blob: crate::testsupport::unavailable_image_blob(),
+            default_boot_image: crate::testsupport::test_boot_image(),
             auth_token: "runtime-node-authority-unit-service-token".into(),
             noded_service_token: "semantic-node-test-token-00000000".into(),
             guest_runtime_profile_receipt: crate::testsupport::test_guest_runtime_profile_receipt(),

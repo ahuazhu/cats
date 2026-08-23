@@ -44,6 +44,16 @@ variable "control_plane_image" {
   type        = string
 }
 
+variable "default_boot_image_digest" {
+  description = "Current qualified Golden Root used automatically for newly allocated Cats."
+  type        = string
+
+  validation {
+    condition     = can(regex("^sha256:[0-9a-f]{64}$", var.default_boot_image_digest))
+    error_message = "default_boot_image_digest must be one exact lowercase sha256 digest."
+  }
+}
+
 
 variable "control_plane_replicas" {
   description = "Active-active cats-controld API replica count."

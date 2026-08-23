@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use cats_api::runtime_reconciliation::{GuestRuntimeProfileReceipt, RuntimeProvisionerTrustBundle};
+use cats_api::runtime_reconciliation::{
+    GuestRuntimeProfileReceipt, RuntimeProvisionerTrustBundle, Sha256Digest,
+};
 use cats_metering::{CreditStore, UsageStore};
 use cats_storage::BlobStore;
 
@@ -38,6 +40,9 @@ pub struct Config {
     /// Retained as a storage-provider boundary for independently composed
     /// volume/object-write workers. Semantic lifecycle does not read it.
     pub image_blob: Arc<dyn BlobStore>,
+    /// Exact deployment-selected Golden Root used for every newly allocated
+    /// Cat. The public create API never accepts an image override.
+    pub default_boot_image: String,
     pub auth_token: String,
     pub noded_service_token: String,
     /// Retained in configuration until Node effect composition consumes the
@@ -154,6 +159,8 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         cfg.auth_token != cfg.admin_token,
         "service and admin tokens must be different"
     );
+    Sha256Digest::new(cfg.default_boot_image.clone())
+        .context("CATS_BOOT_IMAGE must be an exact lowercase sha256 digest")?;
     let cfg = Arc::new(cfg);
     let ca_file = cfg
         .control_store_ca_file
@@ -304,6 +311,7 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
                 Arc::clone(&store),
                 Arc::clone(&cfg.image_blob),
             ),
+            cfg.default_boot_image.clone(),
         ),
     );
     let (semantic_node_liveness_shutdown, semantic_node_liveness_rx) =

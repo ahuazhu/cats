@@ -912,7 +912,6 @@ document.querySelector("#create-cat-form").addEventListener("submit", async (eve
   try {
     const body = buildSemanticCatCreateRequest({
       name: values.get("name"),
-      bootImage: values.get("boot_image_digest"),
       vcpus: values.get("vcpus"),
       memoryMib: values.get("memory_mib"),
     });

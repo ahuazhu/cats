@@ -24,8 +24,7 @@
 
 ## 当前 Cat 命令
 
-    cats create NAME --boot-image-digest sha256:DIGEST
-                     [--cpus N] [--memory SIZE]
+    cats create NAME [--cpus N] [--memory SIZE]
                      [--root-size SIZE]
                      [--durability strict|relaxed]
     cats ls
@@ -36,7 +35,7 @@
     cats cold CAT_ID
     cats destroy CAT_ID
 
-`create` 要求 digest-pinned Boot Image，默认 2 CPU、2 GiB Memory、1 GiB RootDisk 与 Strict Durability。List 会跟随有界 Cursor；Item Lookup 只接受不可变 `cat_…` ID。
+`create` 自动使用部署当前已资格化的 Boot Image，默认 2 CPU、2 GiB Memory、1 GiB RootDisk 与 Strict Durability。List 会跟随有界 Cursor；Item Lookup 只接受不可变 `cat_…` ID。
 
 已有 Cat 的五个 Lifecycle 命令也只接受不可变 `cat_…` ID。CLI 会在发送前持久化精确的空 Request 与 Idempotency-Key，并在响应不明确时原样重放。默认等待返回的 Operation；`--no-wait` 则立即输出 Operation ID。已退役的 `start`、`stop`、`delete` 与 `resume` 命令不是兼容别名。
 
