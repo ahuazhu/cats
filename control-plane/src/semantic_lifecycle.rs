@@ -186,7 +186,11 @@ pub fn classify_action(cat: &CatRecord, action: CatAction) -> ActionDecision {
     }
     match cat.current_action {
         Some(current) if current == action => return ActionDecision::SameAction,
-        Some(_) => return ActionDecision::Busy,
+        Some(_) if action != CatAction::Destroy => return ActionDecision::Busy,
+        // Destroy is the one product action allowed to replace an unresolved
+        // action. The Store must preserve that action's selected Node so noded
+        // can cancel it and clean the same physical execution lane.
+        Some(_) => {}
         None => {}
     }
     let allowed = match action {
@@ -285,6 +289,24 @@ pub trait SemanticLifecycleStore: Send + Sync {
         action: CatAction,
     ) -> SemanticFuture<'a, Result<Admission, StoreError>>;
 
+    /// Returns a bounded snapshot of committed Destroy claims old enough not
+    /// to belong exclusively to a still-running admission request. The rows
+    /// remain authoritative only while their exact action and Node still
+    /// match during settlement.
+    fn pending_destroy_claims<'a>(
+        &'a self,
+        minimum_age: Duration,
+        limit: usize,
+    ) -> SemanticFuture<'a, Result<Vec<ActionClaim>, StoreError>>;
+
+    /// Moves a failed recovery attempt behind older untried Destroy claims.
+    /// The update must match the exact current Destroy occurrence and Node; a
+    /// stale recovery attempt is a successful no-op.
+    fn rotate_pending_destroy<'a>(
+        &'a self,
+        claim: &'a ActionClaim,
+    ) -> SemanticFuture<'a, Result<bool, StoreError>>;
+
     /// Resolves `nodes.control_endpoint` after admission has committed.
     fn node_control_endpoint<'a>(
         &'a self,
@@ -313,6 +335,14 @@ pub trait SemanticActionRecoveryStore: SemanticLifecycleStore {
         stale_after: Duration,
         limit: usize,
     ) -> SemanticFuture<'a, Result<Vec<ActionClaim>, StoreError>>;
+
+    /// Moves an unresolved ordinary action behind older untried claims. The
+    /// update must match the exact action occurrence and selected Node; a
+    /// stale recovery attempt is a successful no-op.
+    fn rotate_stale_action<'a>(
+        &'a self,
+        claim: &'a ActionClaim,
+    ) -> SemanticFuture<'a, Result<bool, StoreError>>;
 }
 
 /// Exact command sent synchronously to noded.
@@ -504,10 +534,11 @@ pub struct SemanticLifecycleService<S, N, I> {
     timeouts: LifecycleTimeouts,
 }
 
-/// A lifecycle action becomes eligible for recovery after this age. This is
-/// deliberately independent from heartbeat age: the scanner confirms the
+/// A lifecycle action becomes eligible for recovery after the foreground
+/// request's 120-second deadline plus a five-second scheduling margin. This
+/// is deliberately independent from heartbeat age: the scanner confirms the
 /// exact Cat state with noded before settlement.
-pub const DEFAULT_STALE_ACTION_AGE: Duration = Duration::from_secs(60);
+pub const DEFAULT_STALE_ACTION_AGE: Duration = Duration::from_secs(125);
 pub const DEFAULT_ACTION_RECOVERY_SCAN_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEFAULT_ACTION_RECOVERY_BATCH_SIZE: usize = 64;
 pub const DEFAULT_ACTION_RECOVERY_CONCURRENCY: usize = 8;
@@ -586,6 +617,63 @@ where
     /// semantic command still needs to be sent.
     pub async fn resume(&self, claim: ActionClaim) -> Result<LifecycleOutcome, LifecycleError> {
         self.drive_claim(claim, true).await
+    }
+
+    /// Recovers a bounded batch of Destroy claims that survived their
+    /// admitting Control request. Multiple claims are driven concurrently,
+    /// but each retains the normal discovery-first and exact-settlement
+    /// semantics.
+    pub async fn recover_pending_destroys(
+        &self,
+        minimum_age: Duration,
+        limit: usize,
+        max_in_flight: usize,
+    ) -> Result<PendingDestroyRecoveryReport, StoreError> {
+        if limit == 0 {
+            return Ok(PendingDestroyRecoveryReport::default());
+        }
+        let claims = self
+            .store
+            .pending_destroy_claims(minimum_age, limit)
+            .await?;
+        let discovered = claims.len();
+        let results = stream::iter(claims)
+            .map(|claim| async move {
+                let cat_id = claim.cat.cat_id.clone();
+                let recovery_claim = claim.clone();
+                let result = self.resume(claim).await;
+                let rotation = if result.is_err() {
+                    Some(self.store.rotate_pending_destroy(&recovery_claim).await)
+                } else {
+                    None
+                };
+                (cat_id, result, rotation)
+            })
+            .buffer_unordered(max_in_flight.max(1))
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut report = PendingDestroyRecoveryReport {
+            discovered,
+            ..PendingDestroyRecoveryReport::default()
+        };
+        for (cat_id, result, rotation) in results {
+            match result {
+                Ok(_) => report.completed += 1,
+                Err(error) => {
+                    report.failed += 1;
+                    tracing::warn!(%cat_id, ?error, "pending Destroy recovery failed");
+                    if let Some(Err(rotation_error)) = rotation {
+                        tracing::warn!(
+                            %cat_id,
+                            ?rotation_error,
+                            "failed Destroy recovery could not be rotated"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(report)
     }
 
     async fn action(
@@ -796,6 +884,10 @@ where
                 Ok(NodeCatStatus::Present {
                     active_action: Some(_),
                     ..
+                }) if claim.action == CatAction::Destroy => return Ok(Discovery::Execute),
+                Ok(NodeCatStatus::Present {
+                    active_action: Some(_),
+                    ..
                 }) => {
                     return Ok(Discovery::Failed {
                         code: "node_busy".to_owned(),
@@ -930,8 +1022,18 @@ where
                 let cat_id = claim.cat.cat_id.clone();
                 let action = claim.action;
                 let started_at_unix_ms = claim.started_at_unix_ms;
+                let recovery_claim = claim.clone();
                 let result = self.resume(claim).await;
-                (cat_id, action, started_at_unix_ms, result)
+                let needs_rotation = !matches!(
+                    &result,
+                    Ok(_) | Err(LifecycleError::Failed { .. } | LifecycleError::Timeout { .. })
+                );
+                let rotation = if needs_rotation {
+                    Some(self.store.rotate_stale_action(&recovery_claim).await)
+                } else {
+                    None
+                };
+                (cat_id, action, started_at_unix_ms, result, rotation)
             })
             .buffer_unordered(policy.concurrency)
             .collect::<Vec<_>>()
@@ -941,7 +1043,7 @@ where
             discovered,
             ..ActionRecoveryReport::default()
         };
-        for (cat_id, action, started_at_unix_ms, result) in outcomes {
+        for (cat_id, action, started_at_unix_ms, result, rotation) in outcomes {
             match result {
                 Ok(outcome) => {
                     report.settled += 1;
@@ -972,6 +1074,15 @@ where
                         ?error,
                         "stale semantic Cat action recovery did not settle"
                     );
+                    if let Some(Err(rotation_error)) = rotation {
+                        tracing::warn!(
+                            %cat_id,
+                            ?action,
+                            started_at_unix_ms,
+                            ?rotation_error,
+                            "unresolved semantic Cat action could not be rotated"
+                        );
+                    }
                 }
             }
         }
@@ -988,6 +1099,14 @@ where
             tokio::time::sleep(policy.scan_interval).await;
         }
     }
+}
+
+/// Summary of one bounded pending-Destroy recovery pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PendingDestroyRecoveryReport {
+    pub discovered: usize,
+    pub completed: usize,
+    pub failed: usize,
 }
 
 enum Discovery {
@@ -1031,11 +1150,14 @@ mod tests {
     struct MockStoreState {
         admissions: VecDeque<Admission>,
         stale_actions: VecDeque<Vec<ActionClaim>>,
+        pending_destroy_claims: VecDeque<Vec<ActionClaim>>,
+        endpoint_errors: VecDeque<StoreError>,
         cat: CatRecord,
         in_transaction: bool,
         endpoint_reads: usize,
         completions: usize,
         failures: usize,
+        rotations: usize,
     }
 
     impl MockStore {
@@ -1044,11 +1166,14 @@ mod tests {
                 state: Arc::new(Mutex::new(MockStoreState {
                     admissions: VecDeque::from([admission]),
                     stale_actions: VecDeque::new(),
+                    pending_destroy_claims: VecDeque::new(),
+                    endpoint_errors: VecDeque::new(),
                     cat,
                     in_transaction: false,
                     endpoint_reads: 0,
                     completions: 0,
                     failures: 0,
+                    rotations: 0,
                 })),
             }
         }
@@ -1060,6 +1185,22 @@ mod tests {
                 .stale_actions
                 .push_back(claims);
             self
+        }
+
+        fn queue_pending_destroy(&self, claim: ActionClaim) {
+            self.state
+                .lock()
+                .expect("mock store")
+                .pending_destroy_claims
+                .push_back(vec![claim]);
+        }
+
+        fn queue_endpoint_error(&self, error: StoreError) {
+            self.state
+                .lock()
+                .expect("mock store")
+                .endpoint_errors
+                .push_back(error);
         }
     }
 
@@ -1091,6 +1232,37 @@ mod tests {
             })
         }
 
+        fn pending_destroy_claims<'a>(
+            &'a self,
+            _minimum_age: Duration,
+            _limit: usize,
+        ) -> SemanticFuture<'a, Result<Vec<ActionClaim>, StoreError>> {
+            Box::pin(async move {
+                Ok(self
+                    .state
+                    .lock()
+                    .expect("mock store")
+                    .pending_destroy_claims
+                    .pop_front()
+                    .unwrap_or_default())
+            })
+        }
+
+        fn rotate_pending_destroy<'a>(
+            &'a self,
+            claim: &'a ActionClaim,
+        ) -> SemanticFuture<'a, Result<bool, StoreError>> {
+            Box::pin(async move {
+                let mut state = self.state.lock().expect("mock store");
+                let current = state.cat.current_action == Some(CatAction::Destroy)
+                    && state.cat.current_action_node_id == claim.node_id;
+                if current {
+                    state.rotations += 1;
+                }
+                Ok(current)
+            })
+        }
+
         fn node_control_endpoint<'a>(
             &'a self,
             _node_id: &'a str,
@@ -1099,6 +1271,9 @@ mod tests {
                 let mut state = self.state.lock().expect("mock store");
                 assert!(!state.in_transaction, "endpoint read crossed admission tx");
                 state.endpoint_reads += 1;
+                if let Some(error) = state.endpoint_errors.pop_front() {
+                    return Err(error);
+                }
                 NodeControlEndpoint::new("http://node.test")
             })
         }
@@ -1153,6 +1328,21 @@ mod tests {
                     .stale_actions
                     .pop_front()
                     .unwrap_or_default())
+            })
+        }
+
+        fn rotate_stale_action<'a>(
+            &'a self,
+            claim: &'a ActionClaim,
+        ) -> SemanticFuture<'a, Result<bool, StoreError>> {
+            Box::pin(async move {
+                let mut state = self.state.lock().expect("mock store");
+                let current = state.cat.current_action == Some(claim.action)
+                    && state.cat.current_action_node_id == claim.node_id;
+                if current {
+                    state.rotations += 1;
+                }
+                Ok(current)
             })
         }
     }
@@ -1381,6 +1571,17 @@ mod tests {
             ActionDecision::Busy
         );
         assert_eq!(
+            classify_action(
+                &cat(Some(CatState::Running), Some(CatAction::Warm)),
+                CatAction::Destroy
+            ),
+            ActionDecision::Claim
+        );
+        assert_eq!(
+            classify_action(&cat(None, Some(CatAction::Create)), CatAction::Destroy),
+            ActionDecision::Claim
+        );
+        assert_eq!(
             classify_action(&cat(Some(CatState::Failure), None), CatAction::Run),
             ActionDecision::InvalidState
         );
@@ -1573,6 +1774,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_destroy_preempts_the_node_action_seen_during_recovery() {
+        let original = cat(Some(CatState::Running), Some(CatAction::Destroy));
+        let action_claim = claim(original.clone(), CatAction::Destroy);
+        let store = MockStore::new(original, Admission::SameAction(action_claim));
+        let noded = MockNoded::new(
+            store.clone(),
+            [Ok(NodeCommandResult::Succeeded(CatState::Destroyed))],
+            [Ok(NodeCatStatus::Present {
+                state: Some(CatState::Running),
+                active_action: Some(CatAction::Warm),
+            })],
+        );
+        let ingress = MockIngress::new(&noded);
+        let service =
+            SemanticLifecycleService::new(store.clone(), noded.clone(), ingress, fast_timeouts());
+
+        let outcome = service
+            .destroy(CatSelector::Id("cat-1".to_owned()))
+            .await
+            .expect("destroy must preempt the stale Node action");
+
+        assert_eq!(outcome.cat.state, Some(CatState::Destroyed));
+        assert_eq!(
+            noded
+                .state
+                .lock()
+                .expect("noded")
+                .commands
+                .iter()
+                .map(|command| command.action)
+                .collect::<Vec<_>>(),
+            [CatAction::Destroy]
+        );
+        assert_eq!(store.state.lock().expect("store").failures, 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_scan_redispatches_destroy_committed_before_control_crash() {
+        let original = cat(Some(CatState::Failure), Some(CatAction::Destroy));
+        let action_claim = claim(original.clone(), CatAction::Destroy);
+        let store = MockStore::new(original, Admission::SameAction(action_claim.clone()));
+        store.queue_pending_destroy(action_claim);
+        let noded = MockNoded::new(
+            store.clone(),
+            [Ok(NodeCommandResult::Succeeded(CatState::Destroyed))],
+            [Ok(NodeCatStatus::Present {
+                state: None,
+                active_action: Some(CatAction::Create),
+            })],
+        );
+        let ingress = MockIngress::new(&noded);
+        let service =
+            SemanticLifecycleService::new(store.clone(), noded.clone(), ingress, fast_timeouts());
+
+        let report = service
+            .recover_pending_destroys(Duration::ZERO, 32, 4)
+            .await
+            .expect("scan committed Destroy");
+
+        assert_eq!(
+            report,
+            PendingDestroyRecoveryReport {
+                discovered: 1,
+                completed: 1,
+                failed: 0,
+            }
+        );
+        assert_eq!(store.state.lock().expect("store").completions, 1);
+        assert_eq!(
+            noded
+                .state
+                .lock()
+                .expect("noded")
+                .commands
+                .iter()
+                .map(|command| command.action)
+                .collect::<Vec<_>>(),
+            [CatAction::Destroy]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_pending_destroy_is_rotated_behind_untried_claims() {
+        let original = cat(Some(CatState::Failure), Some(CatAction::Destroy));
+        let action_claim = claim(original.clone(), CatAction::Destroy);
+        let store = MockStore::new(original, Admission::SameAction(action_claim.clone()));
+        store.queue_pending_destroy(action_claim);
+        store.queue_endpoint_error(StoreError::new("Node endpoint unavailable"));
+        let noded = MockNoded::new(store.clone(), [], []);
+        let ingress = MockIngress::new(&noded);
+        let service = SemanticLifecycleService::new(store.clone(), noded, ingress, fast_timeouts());
+
+        let report = service
+            .recover_pending_destroys(Duration::ZERO, 32, 4)
+            .await
+            .expect("scan remains available after one claim fails");
+
+        assert_eq!(report.discovered, 1);
+        assert_eq!(report.completed, 0);
+        assert_eq!(report.failed, 1);
+        assert_eq!(store.state.lock().expect("store").rotations, 1);
+    }
+
+    #[tokio::test]
     async fn cross_node_run_withdraws_old_then_starts_then_publishes_new() {
         let original = cat(Some(CatState::Running), Some(CatAction::Run));
         let action_claim = ActionClaim {
@@ -1645,7 +1950,7 @@ mod tests {
 
         let report = service
             .recover_stale_actions_once(ActionRecoveryPolicy {
-                stale_after: Duration::from_secs(60),
+                stale_after: Duration::from_secs(125),
                 scan_interval: Duration::from_secs(5),
                 batch_size: 64,
                 concurrency: 8,
@@ -1669,11 +1974,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn unresolved_stale_action_is_rotated_behind_untried_claims() {
+        let original = cat(None, Some(CatAction::Create));
+        let action_claim = claim(original.clone(), CatAction::Create);
+        let store = MockStore::new(original, Admission::SameAction(action_claim.clone()))
+            .with_stale_actions(vec![action_claim]);
+        store.queue_endpoint_error(StoreError::new("Node endpoint unavailable"));
+        let noded = MockNoded::new(store.clone(), [], []);
+        let ingress = MockIngress::new(&noded);
+        let service = SemanticLifecycleService::new(store.clone(), noded, ingress, fast_timeouts());
+
+        let report = service
+            .recover_stale_actions_once(ActionRecoveryPolicy::default())
+            .await
+            .expect("scan remains available after one claim fails");
+
+        assert_eq!(report.discovered, 1);
+        assert_eq!(report.settled, 0);
+        assert_eq!(report.unresolved, 1);
+        assert_eq!(store.state.lock().expect("store").rotations, 1);
+    }
+
     #[test]
-    fn stale_action_recovery_defaults_to_sixty_seconds() {
-        assert_eq!(
-            ActionRecoveryPolicy::default().stale_after,
-            Duration::from_secs(60)
-        );
+    fn stale_action_recovery_starts_after_foreground_deadline() {
+        let stale_after = ActionRecoveryPolicy::default().stale_after;
+        assert_eq!(stale_after, Duration::from_secs(125));
+        assert!(stale_after > LifecycleTimeouts::default().total);
     }
 }

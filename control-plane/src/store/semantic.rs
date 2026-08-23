@@ -852,10 +852,14 @@ impl Store {
                     transaction.commit()?;
                     return Ok(AdmitCatActionOutcome::SameAction(aggregate));
                 }
-                Some(_) => {
+                Some(_) if action != CatAction::Destroy => {
                     transaction.commit()?;
                     return Ok(AdmitCatActionOutcome::Busy(aggregate));
                 }
+                // Destroy replaces an unresolved action in this locked row.
+                // Its noded target remains the replaced action's selected
+                // Node, where the physical work must be cancelled and joined.
+                Some(_) => {}
                 None => {}
             }
             if !semantic_action_allowed(action, aggregate.cat.state) {
@@ -867,6 +871,11 @@ impl Store {
                 (CatAction::Run, Some(CatState::Cold)) => {
                     ACTIVE_PLACEMENT_STRATEGY.select_running_node(&mut transaction, None)?
                 }
+                (CatAction::Destroy, _) => aggregate
+                    .cat
+                    .current_action_node_id
+                    .clone()
+                    .or_else(|| aggregate.cat.node_id.clone()),
                 _ => aggregate.cat.node_id.clone(),
             };
             let action_node_id = selected_node_id.as_deref();
@@ -890,7 +899,11 @@ impl Store {
             let row = transaction.query_one(
                 &format!(
                     "UPDATE cats
-                        SET current_action=$2,
+                        SET state=CASE
+                                WHEN $2='destroy' AND state IS NULL THEN 'failure'
+                                ELSE state
+                            END,
+                            current_action=$2,
                             current_action_started_at=GREATEST({DB_NOW_MS}, updated_at + 1),
                             current_action_node_id=$3,updated_at={DB_NOW_MS},
                             last_error_code=NULL,last_error_message=NULL
@@ -1034,7 +1047,7 @@ impl Store {
         })
     }
 
-    /// Returns one DB-time ordered page of ordinary lifecycle actions whose
+    /// Returns one DB-time ordered page of ordinary non-Destroy lifecycle actions whose
     /// persisted claim age has crossed `stale_after_ms`. Cross-Node offline
     /// recovery owns a distinct multi-step state machine while reusing a
     /// `run` lane, so those rows remain exclusively with that recovery loop.
@@ -1051,25 +1064,64 @@ impl Store {
         let limit = i64::try_from(limit)
             .map_err(|_| cats_api::error::ApiError::invalid("scan limit exceeds BIGINT"))?;
         self.with(|client| {
-            let rows = client.query(
+            let mut transaction = client.transaction()?;
+            let rows = transaction.query(
                 &format!(
                     "SELECT {CAT_COLUMNS}
                        FROM cats
                       WHERE current_action IS NOT NULL
+                        AND current_action<>'destroy'
                         AND current_action_started_at <= {DB_NOW_MS} - $1
                         AND NOT (
                             current_action='run'
                             AND node_id IS NOT NULL
                             AND current_action_node_id IS DISTINCT FROM node_id
                         )
-                      ORDER BY current_action_started_at, cat_id COLLATE \"C\"
-                      LIMIT $2"
+                      ORDER BY updated_at, cat_id COLLATE \"C\"
+                      LIMIT $2
+                      FOR SHARE SKIP LOCKED"
                 ),
                 &[&stale_after_ms, &limit],
             )?;
-            rows.into_iter()
-                .map(|row| cat_with_mounts(client, row_to_cat(&row)))
-                .collect()
+            let mut cats = Vec::with_capacity(rows.len());
+            for row in rows {
+                cats.push(cat_with_mounts(&mut transaction, row_to_cat(&row))?);
+            }
+            transaction.commit()?;
+            Ok(cats)
+        })
+    }
+
+    /// Durably rotates one unresolved ordinary recovery attempt behind older
+    /// untried claims. The exact occurrence predicate makes a stale attempt a
+    /// successful no-op.
+    pub fn rotate_stale_semantic_cat_action(
+        &self,
+        cat_id: &str,
+        expected_action: CatAction,
+        expected_node_id: Option<&str>,
+        expected_action_started_at: i64,
+    ) -> Result<bool> {
+        self.with(|client| {
+            client
+                .execute(
+                    &format!(
+                        "UPDATE cats
+                            SET updated_at={DB_NOW_MS}
+                          WHERE cat_id=$1
+                            AND current_action=$2
+                            AND current_action<>'destroy'
+                            AND current_action_node_id IS NOT DISTINCT FROM $3
+                            AND current_action_started_at=$4"
+                    ),
+                    &[
+                        &cat_id,
+                        &expected_action.as_str(),
+                        &expected_node_id,
+                        &expected_action_started_at,
+                    ],
+                )
+                .map(|changed| changed == 1)
         })
     }
 
@@ -1288,6 +1340,63 @@ impl Store {
             }
             transaction.commit()?;
             Ok(cats)
+        })
+    }
+
+    /// Discovers a bounded snapshot of unresolved Destroy claims older than
+    /// the supplied grace period. Discovery is not authority: callers must
+    /// settle through the exact action/Node predicate after noded discovery.
+    pub fn list_pending_semantic_destroy_claims(
+        &self,
+        minimum_age_ms: i64,
+        limit: i64,
+    ) -> Result<Vec<CatWithMounts>> {
+        self.with(|client| {
+            let mut transaction = client.transaction()?;
+            let rows = transaction.query(
+                &format!(
+                    "SELECT {CAT_COLUMNS} FROM cats
+                      WHERE current_action='destroy'
+                        AND current_action_started_at <= {DB_NOW_MS} - $1
+                        AND destroyed_at IS NULL
+                      ORDER BY updated_at,cat_id
+                      LIMIT $2
+                      FOR SHARE SKIP LOCKED"
+                ),
+                &[&minimum_age_ms, &limit],
+            )?;
+            let mut cats = Vec::with_capacity(rows.len());
+            for row in rows {
+                cats.push(cat_with_mounts(&mut transaction, row_to_cat(&row))?);
+            }
+            transaction.commit()?;
+            Ok(cats)
+        })
+    }
+
+    /// Durably rotates one failed recovery attempt behind older untried
+    /// Destroy claims. The exact occurrence predicate prevents a stale
+    /// scanner from touching a different action or Node lane.
+    pub fn rotate_pending_semantic_destroy_claim(
+        &self,
+        cat_id: &str,
+        expected_node_id: Option<&str>,
+        expected_action_started_at: i64,
+    ) -> Result<bool> {
+        self.with(|client| {
+            client
+                .execute(
+                    &format!(
+                        "UPDATE cats
+                            SET updated_at={DB_NOW_MS}
+                          WHERE cat_id=$1
+                            AND current_action='destroy'
+                            AND current_action_node_id IS NOT DISTINCT FROM $2
+                            AND current_action_started_at=$3"
+                    ),
+                    &[&cat_id, &expected_node_id, &expected_action_started_at],
+                )
+                .map(|changed| changed == 1)
         })
     }
 
@@ -2077,7 +2186,7 @@ const fn semantic_action_allowed(action: CatAction, state: Option<CatState>) -> 
         (CatAction::Suspend, Some(CatState::Running)) => true,
         (CatAction::Warm, Some(CatState::Running | CatState::Suspended)) => true,
         (CatAction::Cold, Some(CatState::Running | CatState::Suspended | CatState::Warm)) => true,
-        (CatAction::Destroy, Some(state)) => !matches!(state, CatState::Destroyed),
+        (CatAction::Destroy, state) => !matches!(state, Some(CatState::Destroyed)),
         _ => false,
     }
 }

@@ -136,6 +136,50 @@ impl SemanticLifecycleStore for SemanticStoreAdapter {
         })
     }
 
+    fn pending_destroy_claims<'a>(
+        &'a self,
+        minimum_age: Duration,
+        limit: usize,
+    ) -> SemanticFuture<'a, Result<Vec<ActionClaim>, StoreError>> {
+        let store = Arc::clone(&self.store);
+        Box::pin(async move {
+            let minimum_age_ms = i64::try_from(minimum_age.as_millis()).unwrap_or(i64::MAX);
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            store
+                .execute(move |store| {
+                    store
+                        .list_pending_semantic_destroy_claims(minimum_age_ms, limit)?
+                        .into_iter()
+                        .map(|cat| claim_from_aggregate(cat, CatAction::Destroy))
+                        .collect()
+                })
+                .await
+                .map_err(store_error)
+        })
+    }
+
+    fn rotate_pending_destroy<'a>(
+        &'a self,
+        claim: &'a ActionClaim,
+    ) -> SemanticFuture<'a, Result<bool, StoreError>> {
+        let store = Arc::clone(&self.store);
+        let cat_id = claim.cat.cat_id.clone();
+        let node_id = claim.node_id.clone();
+        let started_at_unix_ms = claim.started_at_unix_ms;
+        Box::pin(async move {
+            store
+                .execute(move |store| {
+                    store.rotate_pending_semantic_destroy_claim(
+                        &cat_id,
+                        node_id.as_deref(),
+                        started_at_unix_ms,
+                    )
+                })
+                .await
+                .map_err(store_error)
+        })
+    }
+
     fn node_control_endpoint<'a>(
         &'a self,
         node_id: &'a str,
@@ -244,6 +288,30 @@ impl SemanticActionRecoveryStore for SemanticStoreAdapter {
                             claim_from_aggregate(cat, stored_action_to_core(action))
                         })
                         .collect()
+                })
+                .await
+                .map_err(store_error)
+        })
+    }
+
+    fn rotate_stale_action<'a>(
+        &'a self,
+        claim: &'a ActionClaim,
+    ) -> SemanticFuture<'a, Result<bool, StoreError>> {
+        let store = Arc::clone(&self.store);
+        let cat_id = claim.cat.cat_id.clone();
+        let action = core_action_to_stored(claim.action);
+        let node_id = claim.node_id.clone();
+        let started_at_unix_ms = claim.started_at_unix_ms;
+        Box::pin(async move {
+            store
+                .execute(move |store| {
+                    store.rotate_stale_semantic_cat_action(
+                        &cat_id,
+                        action,
+                        node_id.as_deref(),
+                        started_at_unix_ms,
+                    )
                 })
                 .await
                 .map_err(store_error)
