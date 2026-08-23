@@ -430,7 +430,12 @@ def extract_transport(transport: Path, release: Path) -> None:
                 if len(members) >= MAX_ARCHIVE_MEMBERS:
                     raise PackagingError("release transport has too many members")
                 path = PurePosixPath(member.name)
-                if not path.parts or path.is_absolute() or ".." in path.parts:
+                root_directory = member.name == "." and member.isdir()
+                if (
+                    (not path.parts and not root_directory)
+                    or path.is_absolute()
+                    or ".." in path.parts
+                ):
                     raise PackagingError("release transport has an unsafe path")
                 if not (member.isdir() or member.isreg()):
                     raise PackagingError("release transport contains a link or special member")
