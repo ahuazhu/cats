@@ -201,6 +201,7 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
             crate::semantic_node_recovery::RecoveryTimeouts::default(),
         ),
     );
+    let planned_drain_recovery = Arc::clone(&recovery);
     let offline_recovery: crate::semantic_node::OfflineNodeRecovery = Arc::new(move |node_id| {
         let recovery = Arc::clone(&recovery);
         Box::pin(async move {
@@ -219,6 +220,15 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
             Ok(())
         })
     });
+    let planned_drain: crate::semantic_node::PlannedNodeDrain = Arc::new(move |node_id| {
+        let recovery = Arc::clone(&planned_drain_recovery);
+        Box::pin(async move {
+            recovery
+                .drain_node(&node_id)
+                .await
+                .map_err(|error| cats_api::error::ApiError::internal(error.message))
+        })
+    });
     let semantic_node_repository: Arc<dyn crate::semantic_node::NodeRepository> =
         Arc::new(crate::semantic_adapters::SemanticNodeRepositoryAdapter::new(Arc::clone(&store)));
     let semantic_node_probe: Arc<dyn crate::semantic_node::NodeHealthProbe> = Arc::new(
@@ -229,7 +239,8 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
             semantic_node_repository,
             semantic_node_probe,
         )
-        .with_offline_recovery(offline_recovery),
+        .with_offline_recovery(offline_recovery)
+        .with_planned_drain(planned_drain),
     );
     let semantic_node_http = crate::api::semantic_nodes::SemanticNodeHttpState::new(
         Arc::clone(&semantic_node_service),

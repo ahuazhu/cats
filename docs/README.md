@@ -26,7 +26,8 @@
 
 - v19 Cat/Disk/Node 当前资源 schema、可复用 slug、Disk binding RWO、数据库时间 heartbeat 和当前入口目标；
 - 同步 Cat/Disk API、CLI、Control lifecycle 和 noded HTTP client/server；
-- noded 按 Cat 串行、destroy 清理、Node registration/heartbeat/reset/drain；
+- noded 按 Cat 串行、destroy 清理、Node registration/heartbeat/reset；Control 的管理接口先 cordon Node，
+  再以可重试的 Cold-based drain 迁移其 Running/Suspended/Warm Cat；
 - offline Node 的 level-triggered Cat 恢复，以及 `withdraw old -> Ready -> publish new`；
 - 真实 Control→noded HTTP 的 Cat 全状态机和重复调用语义；
 - 已接入 production composition 的 Strict PersistentDisk provision/delete backend，包括 volume/disk authority 和 BlobStore delete postcondition；
@@ -88,6 +89,7 @@ AgentSession 或 HostFenceRecovery 协调的段落，都由 ADR-0059 supersede�
 - [0059 Control/Node 场景语义同步协议](decisions/0059-semantic-control-node-synchronous-protocol.md)
 - [0062 Destroy 抢占进行中的 Cat 动作](decisions/0062-destroy-preempts-in-progress-cat-actions.md)
 - [0061 场景语义 Least-Allocated Placement](decisions/0061-semantic-least-allocated-placement.md)
+- [0062 Level-Triggered Planned Node Drain](decisions/0062-level-triggered-planned-node-drain.md)
 - [0002 四态生命周期](decisions/0002-lifecycle-states-running-suspended-warm-cold.md)
 - [0031 PostgreSQL control store](decisions/0031-control-store-on-postgresql.md)
 - [0032 Control Plane 多副本](decisions/0032-control-plane-multi-replica-and-postgresql-leadership.md)

@@ -163,16 +163,28 @@ Automatic cloud/BMC fencing、真实 provider 资格和长期不对称分区处�
 
 ## 7. 正常维护与 drain
 
-正常 Node 退出时：
+fleet administrator 通过以下无 body 管理接口启动正常 Node 退出：
+
+```text
+POST /v1/admin/nodes/{node_id}/actions/drain
+```
+
+Control 执行：
 
 1. 将 Node 置为 `draining`，停止新 placement；
-2. 记录每个 Cat 原状态；
+2. 为每个 Running/Suspended/Warm Cat 记录原状态，并用 Least-Allocated 策略预留另一个 running Node；
 3. 将每个 Cat 转成 Cold，确认数据已经远端持久并关闭本地 writer；
 4. 在其他 running Node run；
 5. 原状态为 Suspended/Warm 时，在目标 Node 再转换到对应状态；
-6. 全部成功后关闭旧 Node。
+6. 返回逐 Cat 的 `migrated/stale/blocked` 结果。
 
-任一 Cat 无法 Cold 时，drain 失败并保留该 Cat，不强制关机。入口依然遵守先撤旧、Ready 后发新。
+`draining` 和 per-Cat relocation claim 都在 PostgreSQL 中持久化。周期任务反复发现仍有 Cat 的 draining
+Node，所以请求取消或 Control 重启不会取消排空。普通生命周期动作不会被 drain 抢占；`busy`、没有目标
+Node、源 Cold 失败或目标恢复失败都会返回顶层 `blocked`。任一 Cat 无法 Cold 时保留在源 Node，不强制
+关机。入口依然遵守先撤旧、Ready 后发新；Suspended/Warm 的目标端瞬时 Running 不发布入口。
+
+接口不会自动关机、delete 或 uncordon。只有收到 `drained` 并完成必要的失败清理/检查后，运维才执行独立
+的 Node 停机步骤；Node 保持 `draining`，防止停机前重新接收 placement。
 
 ## 8. 运行监控
 

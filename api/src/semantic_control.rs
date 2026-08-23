@@ -16,6 +16,7 @@ pub const NODED_AUTHORIZATION_HEADER: &str = "authorization";
 pub const NODED_BEARER_SCHEME: &str = "Bearer";
 pub const NODED_HEALTH_PATH: &str = "/v1/health";
 pub const NODED_CATS_PATH: &str = "/v1/cats";
+pub const CONTROL_NODE_DRAIN_PATH: &str = "/v1/admin/nodes/{node_id}/actions/drain";
 
 const MAX_BOOT_IMAGE_BYTES: usize = 512;
 const MAX_NODE_TEXT_BYTES: usize = 255;
@@ -620,6 +621,93 @@ pub struct NodeResponse {
     pub node: NodeView,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeDrainStatus {
+    Drained,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum NodeDrainCatResult {
+    Migrated {
+        cat_id: Id,
+        target_node_id: Id,
+        state: CatState,
+    },
+    Stale {
+        cat_id: Id,
+    },
+    Blocked {
+        cat_id: Id,
+        code: String,
+        message: String,
+    },
+}
+
+impl NodeDrainCatResult {
+    fn cat_id(&self) -> &Id {
+        match self {
+            Self::Migrated { cat_id, .. }
+            | Self::Stale { cat_id }
+            | Self::Blocked { cat_id, .. } => cat_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeDrainResponse {
+    pub status: NodeDrainStatus,
+    pub source_node_id: Id,
+    pub cats: Vec<NodeDrainCatResult>,
+}
+
+impl NodeDrainResponse {
+    pub fn validate(&self) -> Result<(), SemanticValidationError> {
+        validate_prefixed_id(&self.source_node_id, "node_")?;
+        let mut cat_ids = HashSet::with_capacity(self.cats.len());
+        let mut blocked = false;
+        for result in &self.cats {
+            validate_prefixed_id(result.cat_id(), "cat_")?;
+            if !cat_ids.insert(result.cat_id().as_str()) {
+                return Err(SemanticValidationError::DuplicateCat);
+            }
+            match result {
+                NodeDrainCatResult::Migrated {
+                    target_node_id,
+                    state,
+                    ..
+                } => {
+                    validate_prefixed_id(target_node_id, "node_")?;
+                    if !matches!(
+                        state,
+                        CatState::Running | CatState::Suspended | CatState::Warm
+                    ) {
+                        return Err(SemanticValidationError::ResponseShape);
+                    }
+                }
+                NodeDrainCatResult::Blocked { code, message, .. } => {
+                    blocked = true;
+                    if code.is_empty()
+                        || code.len() > 128
+                        || message.is_empty()
+                        || message.len() > 4096
+                    {
+                        return Err(SemanticValidationError::ResponseShape);
+                    }
+                }
+                NodeDrainCatResult::Stale { .. } => {}
+            }
+        }
+        if (self.status == NodeDrainStatus::Blocked) != blocked {
+            return Err(SemanticValidationError::ResponseShape);
+        }
+        Ok(())
+    }
+}
+
 /// The current Node selected for new traffic to one Cat. Absence of this DTO
 /// from a resolve result means that traffic has been withdrawn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1193,6 +1281,45 @@ mod tests {
         ] {
             assert!(serde_json::from_slice::<CatIngressTarget>(retired).is_err());
         }
+    }
+
+    #[test]
+    fn node_drain_response_is_closed_and_status_matches_blocked_cats() {
+        let response = NodeDrainResponse {
+            status: NodeDrainStatus::Blocked,
+            source_node_id: id("node_source"),
+            cats: vec![
+                NodeDrainCatResult::Migrated {
+                    cat_id: id("cat_ok"),
+                    target_node_id: id("node_target"),
+                    state: CatState::Warm,
+                },
+                NodeDrainCatResult::Blocked {
+                    cat_id: id("cat_blocked"),
+                    code: "flush_failed".to_owned(),
+                    message: "retained volume did not reach R=L".to_owned(),
+                },
+            ],
+        };
+        response.validate().unwrap();
+        let encoded = serde_json::to_string(&response).unwrap();
+        let decoded: NodeDrainResponse = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, response);
+
+        let mut invalid = response;
+        invalid.status = NodeDrainStatus::Drained;
+        assert_eq!(
+            invalid.validate(),
+            Err(SemanticValidationError::ResponseShape)
+        );
+        assert!(serde_json::from_str::<NodeDrainResponse>(
+            r#"{"status":"drained","source_node_id":"node_source","cats":[],"operation_id":"op_1"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<NodeDrainResponse>(
+            r#"{"status":"drained","source_node_id":"node_source","cats":[{"status":"stale","cat_id":"cat_gone","operation_id":"op_1"}]}"#
+        )
+        .is_err());
     }
 
     #[test]

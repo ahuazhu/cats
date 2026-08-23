@@ -429,7 +429,12 @@ POST /v1/workspaces/{workspace_id}/disks
 POST /v1/workspaces/{workspace_id}/disks/{disk_slug}/actions/attach
 POST /v1/workspaces/{workspace_id}/disks/{disk_slug}/actions/detach
 POST /v1/workspaces/{workspace_id}/disks/{disk_slug}/actions/destroy
+
+POST /v1/admin/nodes/{node_id}/actions/drain
 ```
+
+Node drain 是 fleet administrator 管理路由，不接受 Workspace automation/service principal，也没有请求
+body。认证和 Node 状态错误使用通用错误响应；已经 `draining` 的相同 Node 请求会继续当前排空。
 
 Create Cat 请求：
 
@@ -837,12 +842,48 @@ Node running
 -> 在目标Node上run
 -> 原状态是suspended时再suspend
 -> 原状态是warm时再warm
--> 全部完成后关闭旧Node
+-> 返回逐Cat结果
+-> 运维确认完成后另行关闭旧Node
 ```
 
 跨 Node 不搬运 Suspended/Warm 的本地内存状态。原来是 Suspended 或 Warm 的 Cat 会在目标 Node 上先正常 run，再转换回对应状态。
 
-任一 Cat 无法 Cold 时，Node drain 失败并保留该 Cat，不强制关机。
+管理入口为：
+
+```text
+POST /v1/admin/nodes/{node_id}/actions/drain
+```
+
+Control 在接受任何 Cat 迁移前先把 Node 提交为 `draining`。每个 Cat 的原 state、源 placement 和目标
+reservation 保存在 Cat 当前行；后台 liveness 周期会重新发现仍有 Cat 的 draining Node，因此请求取消、
+Control 重启或重复调用都继续同一排空。已有普通 `current_action` 返回 `blocked/busy`，不会被排空抢占。
+
+成功响应为 HTTP 200：
+
+```json
+{
+  "status": "blocked",
+  "source_node_id": "node_source",
+  "cats": [
+    {
+      "status": "migrated",
+      "cat_id": "cat_web",
+      "target_node_id": "node_target",
+      "state": "running"
+    },
+    {
+      "status": "blocked",
+      "cat_id": "cat_worker",
+      "code": "busy",
+      "message": "Cat has another lifecycle action in progress"
+    }
+  ]
+}
+```
+
+顶层只有 `drained/blocked`；逐 Cat 只有 `migrated/stale/blocked`。任一 Cat 无法 Cold 时，排空阻塞并把
+失败 Cat 留在源 Node，不强制关机。目标恢复失败的 Cat 留在目标 Node 的 `failure` 状态供显式清理。接口
+不会自动关闭或 uncordon Node；Node 保持 `draining`。
 
 ### 14.2 异常退出
 
@@ -969,6 +1010,8 @@ internal_error
 - reset完成前不接受新Cat。
 - draining Node不接受新placement。
 - planned drain保持每个Cat最终产品状态。
+- planned drain在迁移前持久化目标 reservation，Control 重启后继续，且不抢占普通Cat动作。
+- planned drain要求源端先完成Cold；源端失败留源清理，目标端失败留目标清理。
 - offline Node 上的 Cat 在跨 Node 恢复前先撤掉旧入口，新实例 Ready 前不发布新入口。
 - 入口切换后只把新进入的流量发送到新 Node。
 - offline Node 的下一次成功心跳返回 `reset_required`，noded 不等待下一个心跳周期，立即停止和清理残留 Cat。

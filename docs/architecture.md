@@ -66,7 +66,7 @@ heartbeat 利用率不成为 placement authority。
 |---|---|---|
 | 公共协议 | Cat/Disk/Node 同步 DTO、稳定错误码、内部 Bearer 认证已组成；严格拒绝旧幂等和 Operation 字段 | 最终全仓协议残留检查待门禁 |
 | PostgreSQL | v19 当前资源表、可复用 slug 的部分唯一索引、Disk binding RWO、Cat 动作 CAS、数据库接收时间心跳和当前入口目标已组成；旧 lifecycle/Route settlement schema 已删除 | 最终 PostgreSQL 全仓门待跑 |
-| Control | 同步 lifecycle、超时后 Node 查询、资源 API、入口先撤后发、Node 注册/心跳/reset/drain 和失联恢复已接入生产进程；真实 Control→noded HTTP 的 Cat 全状态机与重复语义已通过 | PersistentDisk/CH 完整纵向联调和最终门禁待完成 |
+| Control | 同步 lifecycle、超时后 Node 查询、资源 API、入口先撤后发、Node 注册/心跳/reset、管理面 planned drain 和失联恢复已接入生产进程；真实 Control→noded HTTP 的 Cat 全状态机与重复语义已通过 | PersistentDisk/CH 完整纵向联调和最终门禁待完成 |
 | noded | 同步 HTTP server、按 Cat 串行、destroy 清理、reset gate、注册和 heartbeat supervisor已组成 | Cloud Hypervisor 的完整实际 effects 尚未接入；当前 CH bridge 在缺少精确输入时会在物理副作用前失败 |
 | PersistentDisk | slug、目录、binding 语义、精确卷/文件系统身份、Guest mount-ready 校验器和 Strict provision/delete backend 已组成；backend 已接入 production composition | Guest/CH 物理挂载链和产品 E2E 尚未完成 |
 | Node 失联恢复 | offline 后按数据库当前事实反复发现未迁走 Cat，先撤入口、在其他 running Node 恢复、Ready 后发布；旧 Node 回来要求 reset | 双跑窗口的真实两 Node 验证待完成；协议本身不承诺严格物理单实例 |
@@ -219,8 +219,14 @@ running -> draining -> 停止新 placement
         -> 转为 Cold
         -> 在目标 Node 从远端启动
         -> 恢复原 Running/Suspended/Warm 目标
-        -> 关闭旧 Node
+        -> 返回逐 Cat drained/blocked 报告
+        -> 运维确认 drained 后另行关闭旧 Node
 ```
+
+fleet administrator 调用 `POST /v1/admin/nodes/{node_id}/actions/drain` 启动该流程。Control 先提交
+`draining`，再为每个 Cat 持久化 exact 目标 reservation；请求取消或 Control 重启后，周期任务会从
+PostgreSQL 当前行继续。已有生命周期动作不会被抢占，没有其他 running Node、源端不能安全 Cold 或目标
+恢复失败都会返回 `blocked`。接口不自动关闭或重新开放 Node，完成后 Node 仍保持 `draining`。
 
 异常失联的目标流程是：
 

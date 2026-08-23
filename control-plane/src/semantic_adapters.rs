@@ -680,6 +680,15 @@ impl NodeRepository for SemanticNodeRepositoryAdapter {
                 .await
         })
     }
+
+    fn planned_drain_candidates(&self) -> NodeFuture<Vec<String>> {
+        let store = Arc::clone(&self.store);
+        Box::pin(async move {
+            store
+                .execute(|store| store.list_semantic_draining_nodes_with_cats())
+                .await
+        })
+    }
 }
 
 fn map_registration_outcome(

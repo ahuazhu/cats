@@ -149,6 +149,11 @@ Suspended 仍依赖原 Node。当前同步协议不要求保留一套独立的 c
 Cold 可以在其他 Node 从远端数据启动。任一 Root/PersistentDisk 无法证明远端持久或无法关闭 writer 时，
 不能返回 Cold。
 
+计划 Node 排空使用同一数据屏障：Control 先把源 Node 置为 `draining`，撤销 Cat 的旧入口，并要求源端
+完成 Cold，之后才允许在 Least-Allocated 选出的其他 running Node 上 Run。原状态为 Suspended/Warm 时，
+目标端 Run 后再恢复原状态，瞬时 Running 不发布入口。源 Cold 失败必须把 Cat 留在源 Node 并阻止排空；
+不能为了维护窗口猜测数据已持久或强制删除本地 writer。
+
 ### 4.5 destroy -> Destroyed
 
 destroy 先撤流并停止同一 Cat 的当前动作和本地运行资源。PersistentDisk 只解除 binding，不随 Cat 删除；

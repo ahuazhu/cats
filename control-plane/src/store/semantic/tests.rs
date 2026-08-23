@@ -416,6 +416,215 @@ fn cold_run_and_offline_recovery_share_the_least_loaded_policy() {
 }
 
 #[test]
+fn planned_drain_claims_are_retryable_balanced_and_settle_on_the_exact_failure_side() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    register_second_node(&store);
+    register_third_node(&store);
+    for index in 0..3 {
+        create_running_cat_on(
+            &store,
+            &format!("cat-drain-{index}"),
+            &format!("drain-{index}"),
+            "node-a",
+            2,
+            1 << 30,
+        );
+    }
+    store
+        .transition_semantic_node_status("node-a", &[NodeStatus::Running], NodeStatus::Draining)
+        .unwrap()
+        .unwrap();
+
+    let ClaimSemanticCatRecoveryOutcome::Claimed(source_failure) = store
+        .claim_semantic_cat_drain("node-a", "cat-drain-0")
+        .unwrap()
+    else {
+        panic!("draining Cat must receive a relocation claim")
+    };
+    assert_eq!(source_failure.target_node_id, "node-b");
+    assert_eq!(source_failure.cat.cat.state, Some(CatState::Running));
+    assert_eq!(source_failure.cat.cat.node_id.as_deref(), Some("node-a"));
+    assert_eq!(
+        source_failure.cat.cat.current_action_node_id.as_deref(),
+        Some("node-b")
+    );
+    assert!(matches!(
+        store
+            .admit_semantic_cat_action(SemanticCatSelector::Id("cat-drain-0"), CatAction::Run,)
+            .unwrap(),
+        AdmitCatActionOutcome::Busy(_)
+    ));
+    assert!(matches!(
+        store
+            .claim_semantic_cat_drain("node-a", "cat-drain-0")
+            .unwrap(),
+        ClaimSemanticCatRecoveryOutcome::AlreadyClaimed(ref retry)
+            if retry.target_node_id == "node-b"
+    ));
+
+    let ClaimSemanticCatRecoveryOutcome::Claimed(target_failure) = store
+        .claim_semantic_cat_drain("node-a", "cat-drain-1")
+        .unwrap()
+    else {
+        panic!("second draining Cat must receive a relocation claim")
+    };
+    assert_eq!(target_failure.target_node_id, "node-c");
+    let ClaimSemanticCatRecoveryOutcome::Claimed(recovered) = store
+        .claim_semantic_cat_drain("node-a", "cat-drain-2")
+        .unwrap()
+    else {
+        panic!("third draining Cat must receive a relocation claim")
+    };
+    assert_eq!(recovered.target_node_id, "node-b");
+    store
+        .transition_semantic_node_status("node-b", &[NodeStatus::Running], NodeStatus::Draining)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        store
+            .claim_semantic_cat_drain("node-a", "cat-drain-2")
+            .unwrap(),
+        ClaimSemanticCatRecoveryOutcome::AlreadyClaimed(ref retry)
+            if retry.target_node_id == "node-b"
+    ));
+
+    let source_failed = store
+        .finish_semantic_cat_recovery(
+            SemanticCatRecoverySettlement {
+                cat_id: "cat-drain-0",
+                source_node_id: "node-a",
+                target_node_id: "node-b",
+                target_state: CatState::Running,
+            },
+            SemanticCatRecoveryResult::FailedOnSource {
+                code: "flush_failed",
+                message: "source did not reach Cold",
+            },
+        )
+        .unwrap()
+        .expect("source failure settlement");
+    assert_eq!(source_failed.cat.state, Some(CatState::Failure));
+    assert_eq!(source_failed.cat.node_id.as_deref(), Some("node-a"));
+
+    let target_failed = store
+        .finish_semantic_cat_recovery(
+            SemanticCatRecoverySettlement {
+                cat_id: "cat-drain-1",
+                source_node_id: "node-a",
+                target_node_id: "node-c",
+                target_state: CatState::Running,
+            },
+            SemanticCatRecoveryResult::Failed {
+                code: "guest_start_failed",
+                message: "target did not become Ready",
+            },
+        )
+        .unwrap()
+        .expect("target failure settlement");
+    assert_eq!(target_failed.cat.state, Some(CatState::Failure));
+    assert_eq!(target_failed.cat.node_id.as_deref(), Some("node-c"));
+
+    let settled = store
+        .finish_semantic_cat_recovery(
+            SemanticCatRecoverySettlement {
+                cat_id: "cat-drain-2",
+                source_node_id: "node-a",
+                target_node_id: "node-b",
+                target_state: CatState::Running,
+            },
+            SemanticCatRecoveryResult::Recovered,
+        )
+        .unwrap()
+        .expect("successful drain settlement");
+    assert_eq!(settled.cat.state, Some(CatState::Running));
+    assert_eq!(settled.cat.node_id.as_deref(), Some("node-b"));
+    let replayed = store
+        .finish_semantic_cat_recovery(
+            SemanticCatRecoverySettlement {
+                cat_id: "cat-drain-2",
+                source_node_id: "node-a",
+                target_node_id: "node-b",
+                target_state: CatState::Running,
+            },
+            SemanticCatRecoveryResult::Recovered,
+        )
+        .unwrap()
+        .expect("exact drain settlement replay");
+    assert_eq!(replayed.cat, settled.cat);
+}
+
+#[test]
+fn planned_drain_does_not_replace_an_existing_lifecycle_action() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    register_second_node(&store);
+    create_running_cat(&store, "cat-drain-busy", "drain-busy");
+    assert!(matches!(
+        store
+            .try_begin_semantic_cat_action("cat-drain-busy", CatAction::Suspend, Some("node-a"),)
+            .unwrap(),
+        BeginCatActionOutcome::Acquired(_)
+    ));
+    store
+        .transition_semantic_node_status("node-a", &[NodeStatus::Running], NodeStatus::Draining)
+        .unwrap()
+        .unwrap();
+
+    let ClaimSemanticCatRecoveryOutcome::Busy(busy) = store
+        .claim_semantic_cat_drain("node-a", "cat-drain-busy")
+        .unwrap()
+    else {
+        panic!("planned drain must not replace a live lifecycle action")
+    };
+    assert_eq!(busy.cat.current_action, Some(CatAction::Suspend));
+    assert_eq!(busy.cat.current_action_node_id.as_deref(), Some("node-a"));
+
+    let current = store
+        .find_semantic_cat_by_id("cat-drain-busy")
+        .unwrap()
+        .expect("busy Cat remains present");
+    assert_eq!(current.current_action, Some(CatAction::Suspend));
+    assert_eq!(current.current_action_node_id.as_deref(), Some("node-a"));
+}
+
+#[test]
+fn planned_drain_blocks_on_an_inflight_placement_reserved_before_cordon() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    register_second_node(&store);
+    let admitted = admit_cat(&store, "cat-drain-reserved", "drain-reserved", 2, 1 << 30);
+    assert_eq!(admitted.cat.state, None);
+    assert_eq!(admitted.cat.current_action, Some(CatAction::Create));
+    assert_eq!(
+        admitted.cat.current_action_node_id.as_deref(),
+        Some("node-a")
+    );
+    assert_eq!(admitted.cat.node_id, None);
+
+    store
+        .transition_semantic_node_status("node-a", &[NodeStatus::Running], NodeStatus::Draining)
+        .unwrap()
+        .unwrap();
+
+    let candidates = store.list_semantic_node_drain_cats("node-a").unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].cat.cat_id, "cat-drain-reserved");
+    assert_eq!(
+        store.list_semantic_draining_nodes_with_cats().unwrap(),
+        ["node-a"]
+    );
+    let ClaimSemanticCatRecoveryOutcome::Busy(busy) = store
+        .claim_semantic_cat_drain("node-a", "cat-drain-reserved")
+        .unwrap()
+    else {
+        panic!("drain must wait for the placement admitted before cordon")
+    };
+    assert_eq!(busy.cat.current_action, Some(CatAction::Create));
+    assert_eq!(busy.cat.current_action_node_id.as_deref(), Some("node-a"));
+}
+
+#[test]
 fn concurrent_atomic_creates_reserve_an_even_distribution() {
     let (store, url) = store_and_url();
     register_node(&store);

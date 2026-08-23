@@ -14,6 +14,8 @@ use cats_api::semantic_control::{
     NodeHeartbeatRequest, NodeHeartbeatResponse, NodeRegistrationRequest, NodeRegistrationResponse,
     NodeStatus, NodedServiceToken, NODED_HEALTH_PATH,
 };
+
+use crate::semantic_node_recovery::NodeDrainReport;
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 pub const MISSED_HEARTBEATS_BEFORE_PROBE: u32 = 3;
 pub const MISSED_HEARTBEAT_WINDOW: Duration =
@@ -21,6 +23,7 @@ pub const MISSED_HEARTBEAT_WINDOW: Duration =
 
 pub type NodeFuture<T> = Pin<Box<dyn Future<Output = Result<T, ApiError>> + Send>>;
 pub type OfflineNodeRecovery = Arc<dyn Fn(String) -> NodeFuture<()> + Send + Sync>;
+pub type PlannedNodeDrain = Arc<dyn Fn(String) -> NodeFuture<NodeDrainReport> + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeRecord {
@@ -68,6 +71,8 @@ pub trait NodeRepository: Send + Sync {
     ) -> NodeFuture<bool>;
 
     fn offline_recovery_candidates(&self) -> NodeFuture<Vec<String>>;
+
+    fn planned_drain_candidates(&self) -> NodeFuture<Vec<String>>;
 }
 
 pub trait NodeHealthProbe: Send + Sync {
@@ -122,6 +127,7 @@ pub struct NodeManagementService {
     health_probe: Arc<dyn NodeHealthProbe>,
     missed_heartbeat_window: Duration,
     offline_recovery: Option<OfflineNodeRecovery>,
+    planned_drain: Option<PlannedNodeDrain>,
 }
 
 impl NodeManagementService {
@@ -134,6 +140,7 @@ impl NodeManagementService {
             health_probe,
             missed_heartbeat_window: MISSED_HEARTBEAT_WINDOW,
             offline_recovery: None,
+            planned_drain: None,
         }
     }
 
@@ -152,11 +159,17 @@ impl NodeManagementService {
             health_probe,
             missed_heartbeat_window,
             offline_recovery: None,
+            planned_drain: None,
         })
     }
 
     pub fn with_offline_recovery(mut self, recovery: OfflineNodeRecovery) -> Self {
         self.offline_recovery = Some(recovery);
+        self
+    }
+
+    pub fn with_planned_drain(mut self, drain: PlannedNodeDrain) -> Self {
+        self.planned_drain = Some(drain);
         self
     }
 
@@ -183,6 +196,16 @@ impl NodeManagementService {
     pub async fn begin_drain(&self, node_id: String) -> Result<NodeRecord, ApiError> {
         validate_token("node_id", &node_id)?;
         self.repository.begin_drain(node_id).await
+    }
+
+    pub async fn drain_node(&self, node_id: String) -> Result<NodeDrainReport, ApiError> {
+        validate_token("node_id", &node_id)?;
+        let drain = self
+            .planned_drain
+            .as_ref()
+            .ok_or_else(|| ApiError::failed_precondition("planned Node drain is not configured"))?;
+        self.repository.begin_drain(node_id.clone()).await?;
+        drain(node_id).await
     }
 
     pub async fn placement_candidates(&self) -> Result<Vec<NodeRecord>, ApiError> {
@@ -222,6 +245,7 @@ impl NodeManagementService {
             }
         }
         self.recover_offline_nodes().await?;
+        self.continue_planned_drains().await?;
         Ok(changed)
     }
 
@@ -232,6 +256,34 @@ impl NodeManagementService {
         for node_id in self.repository.offline_recovery_candidates().await? {
             if let Err(error) = recover(node_id.clone()).await {
                 tracing::warn!(%node_id, %error, "offline Node Cat recovery failed; retrying after the next liveness pass");
+            }
+        }
+        Ok(())
+    }
+
+    async fn continue_planned_drains(&self) -> Result<(), ApiError> {
+        let Some(drain) = &self.planned_drain else {
+            return Ok(());
+        };
+        for node_id in self.repository.planned_drain_candidates().await? {
+            match drain(node_id.clone()).await {
+                Ok(report) if report.is_drained() => {
+                    tracing::info!(%node_id, "planned Node drain completed");
+                }
+                Ok(report) => {
+                    tracing::warn!(
+                        %node_id,
+                        blocked_cats = report
+                            .cats
+                            .iter()
+                            .filter(|cat| matches!(cat.status, crate::semantic_node_recovery::CatDrainStatus::Blocked { .. }))
+                            .count(),
+                        "planned Node drain remains blocked; retrying after the next liveness pass"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(%node_id, %error, "planned Node drain pass failed; retrying after the next liveness pass");
+                }
             }
         }
         Ok(())
@@ -327,6 +379,8 @@ mod tests {
     struct MockRepository {
         stale: Mutex<Vec<StaleNodeCandidate>>,
         marked: Mutex<Vec<String>>,
+        drained: Mutex<Vec<String>>,
+        drain_candidates: Mutex<Vec<String>>,
     }
 
     impl NodeRepository for MockRepository {
@@ -363,7 +417,8 @@ mod tests {
             })
         }
 
-        fn begin_drain(&self, _node_id: String) -> NodeFuture<NodeRecord> {
+        fn begin_drain(&self, node_id: String) -> NodeFuture<NodeRecord> {
+            self.drained.lock().expect("lock drains").push(node_id);
             Box::pin(async { Ok(record(NodeStatus::Draining)) })
         }
 
@@ -389,6 +444,15 @@ mod tests {
 
         fn offline_recovery_candidates(&self) -> NodeFuture<Vec<String>> {
             let nodes = self.marked.lock().expect("lock marks").clone();
+            Box::pin(async move { Ok(nodes) })
+        }
+
+        fn planned_drain_candidates(&self) -> NodeFuture<Vec<String>> {
+            let nodes = self
+                .drain_candidates
+                .lock()
+                .expect("lock drain candidates")
+                .clone();
             Box::pin(async move { Ok(nodes) })
         }
     }
@@ -490,5 +554,110 @@ mod tests {
             .await
             .expect_err("invalid utilization");
         assert_eq!(error.message, "heartbeat resource values are invalid");
+    }
+
+    #[tokio::test]
+    async fn planned_drain_cordons_before_invoking_relocation() {
+        let repository = Arc::new(MockRepository::default());
+        let invoked = Arc::new(Mutex::new(Vec::new()));
+        let drain: PlannedNodeDrain = {
+            let invoked = Arc::clone(&invoked);
+            let repository = Arc::clone(&repository);
+            Arc::new(move |node_id| {
+                assert_eq!(
+                    repository.drained.lock().expect("lock drains").as_slice(),
+                    std::slice::from_ref(&node_id)
+                );
+                invoked
+                    .lock()
+                    .expect("lock invoked drains")
+                    .push(node_id.clone());
+                Box::pin(async move {
+                    Ok(NodeDrainReport {
+                        source_node_id: node_id,
+                        cats: Vec::new(),
+                    })
+                })
+            })
+        };
+        let service = NodeManagementService::new(
+            repository.clone(),
+            Arc::new(MockProbe {
+                answers: Mutex::new(VecDeque::new()),
+            }),
+            Duration::from_secs(30),
+        )
+        .expect("service")
+        .with_planned_drain(drain);
+
+        let report = service
+            .drain_node("node_a".to_owned())
+            .await
+            .expect("drain Node");
+
+        assert!(report.is_drained());
+        assert_eq!(*repository.drained.lock().expect("lock drains"), ["node_a"]);
+        assert_eq!(*invoked.lock().expect("lock invoked drains"), ["node_a"]);
+    }
+
+    #[tokio::test]
+    async fn unconfigured_planned_drain_has_no_cordon_side_effect() {
+        let repository = Arc::new(MockRepository::default());
+        let service = NodeManagementService::new(
+            repository.clone(),
+            Arc::new(MockProbe {
+                answers: Mutex::new(VecDeque::new()),
+            }),
+            Duration::from_secs(30),
+        )
+        .expect("service");
+
+        let error = service
+            .drain_node("node_a".to_owned())
+            .await
+            .expect_err("drain callback is required before cordon");
+
+        assert_eq!(error.message, "planned Node drain is not configured");
+        assert!(repository.drained.lock().expect("lock drains").is_empty());
+    }
+
+    #[tokio::test]
+    async fn liveness_pass_resumes_persisted_draining_nodes() {
+        let repository = Arc::new(MockRepository {
+            drain_candidates: Mutex::new(vec!["node_a".to_owned()]),
+            ..MockRepository::default()
+        });
+        let invoked = Arc::new(Mutex::new(Vec::new()));
+        let drain: PlannedNodeDrain = {
+            let invoked = Arc::clone(&invoked);
+            Arc::new(move |node_id| {
+                invoked
+                    .lock()
+                    .expect("lock invoked drains")
+                    .push(node_id.clone());
+                Box::pin(async move {
+                    Ok(NodeDrainReport {
+                        source_node_id: node_id,
+                        cats: Vec::new(),
+                    })
+                })
+            })
+        };
+        let service = NodeManagementService::new(
+            repository,
+            Arc::new(MockProbe {
+                answers: Mutex::new(VecDeque::new()),
+            }),
+            Duration::from_secs(30),
+        )
+        .expect("service")
+        .with_planned_drain(drain);
+
+        assert!(service
+            .detect_offline_nodes()
+            .await
+            .expect("run liveness pass")
+            .is_empty());
+        assert_eq!(*invoked.lock().expect("lock invoked drains"), ["node_a"]);
     }
 }
