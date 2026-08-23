@@ -531,7 +531,7 @@ def verify_application(config: dict[str, Any], manifest: dict[str, Any]) -> dict
 
 def send_worker_probe(config: dict[str, Any], instance_ids: list[str], digest: str) -> str:
     command = (
-        "set -Eeuo pipefail\n"
+        "set -eu\n"
         "receipt=/opt/cats/release/worker-installation-receipt.v1.json\n"
         "test -f \"$receipt\"\n"
         f"test \"$(jq -er .worker_bundle_sha256 \"$receipt\")\" = {json.dumps(digest)}\n"
