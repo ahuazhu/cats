@@ -416,7 +416,7 @@ fn cold_run_and_offline_recovery_share_the_least_loaded_policy() {
 }
 
 #[test]
-fn planned_drain_claims_are_retryable_balanced_and_settle_on_the_exact_failure_side() {
+fn planned_drain_claims_are_retryable_balanced_and_settle_exact_target_failures() {
     let (store, _) = store_and_url();
     register_node(&store);
     register_second_node(&store);
@@ -436,17 +436,17 @@ fn planned_drain_claims_are_retryable_balanced_and_settle_on_the_exact_failure_s
         .unwrap()
         .unwrap();
 
-    let ClaimSemanticCatRecoveryOutcome::Claimed(source_failure) = store
+    let ClaimSemanticCatRecoveryOutcome::Claimed(source_blocked) = store
         .claim_semantic_cat_drain("node-a", "cat-drain-0")
         .unwrap()
     else {
         panic!("draining Cat must receive a relocation claim")
     };
-    assert_eq!(source_failure.target_node_id, "node-b");
-    assert_eq!(source_failure.cat.cat.state, Some(CatState::Running));
-    assert_eq!(source_failure.cat.cat.node_id.as_deref(), Some("node-a"));
+    assert_eq!(source_blocked.target_node_id, "node-b");
+    assert_eq!(source_blocked.cat.cat.state, Some(CatState::Running));
+    assert_eq!(source_blocked.cat.cat.node_id.as_deref(), Some("node-a"));
     assert_eq!(
-        source_failure.cat.cat.current_action_node_id.as_deref(),
+        source_blocked.cat.cat.current_action_node_id.as_deref(),
         Some("node-b")
     );
     assert!(matches!(
@@ -489,23 +489,15 @@ fn planned_drain_claims_are_retryable_balanced_and_settle_on_the_exact_failure_s
             if retry.target_node_id == "node-b"
     ));
 
-    let source_failed = store
-        .finish_semantic_cat_recovery(
-            SemanticCatRecoverySettlement {
-                cat_id: "cat-drain-0",
-                source_node_id: "node-a",
-                target_node_id: "node-b",
-                target_state: CatState::Running,
-            },
-            SemanticCatRecoveryResult::FailedOnSource {
-                code: "flush_failed",
-                message: "source did not reach Cold",
-            },
-        )
-        .unwrap()
-        .expect("source failure settlement");
-    assert_eq!(source_failed.cat.state, Some(CatState::Failure));
-    assert_eq!(source_failed.cat.node_id.as_deref(), Some("node-a"));
+    assert!(matches!(
+        store
+            .claim_semantic_cat_drain("node-a", "cat-drain-0")
+            .unwrap(),
+        ClaimSemanticCatRecoveryOutcome::AlreadyClaimed(ref retry)
+            if retry.target_node_id == "node-b"
+                && retry.cat.cat.state == Some(CatState::Running)
+                && retry.cat.cat.node_id.as_deref() == Some("node-a")
+    ));
 
     let target_failed = store
         .finish_semantic_cat_recovery(

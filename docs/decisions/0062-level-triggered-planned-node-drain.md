@@ -32,11 +32,11 @@ ADR-0059 模型没有独立 Operation/job 表，本次也不恢复已被取代�
 5. exact claim 提交后，Control 按以下顺序执行：撤销旧入口；要求源 noded 将 Cat 转为 Cold；确认 retained
    volume 已远端持久且本地 writer 已关闭；在目标 noded Run；若原状态为 Suspended 或 Warm，再转换回该
    状态。只有原状态为 Running 且目标 Ready 后才发布新入口；Warm/Suspended 的瞬时 Running 不发布入口。
-6. 源 Cold 成功是目标执行的前置条件。源 Cold 明确失败时，Cat 以 `failure` 留在源 Node 供清理；目标
-   启动/恢复明确失败时，Cat 以 `failure` 留在目标 Node 供清理。timeout、transport failure、malformed
-   response 或状态查询不完整都属于结果不明：只返回 `blocked` 并保留原 state、source placement 和 exact
-   relocation claim，后续 pass 必须先发现 postcondition，不能把它们结算成 `failure`。旧 Node 不会由
-   drain 接口自动关闭。
+6. 源 Cold 成功是目标执行的前置条件。只要源尚未确认 Cold，包括 noded 明确返回 failure/conflict，都只
+   返回 `blocked` 并保留原 state、source placement 和 exact relocation claim；不能在数据屏障未越过时
+   terminalize 成不可重试的 `failure`。timeout、transport failure、malformed response 或状态查询不完整
+   遵守相同规则，后续 pass 必须先发现 postcondition。目标启动/恢复明确失败时，Cat 以 `failure` 留在目标
+   Node 供清理；目标结果不明仍保留 claim。旧 Node 不会由 drain 接口自动关闭。
 7. 成功 settlement 只接受 exact source placement、target reservation 和原 state，并将稳定 placement
    改为目标、恢复原 state、清空 action。相同 settlement 可以安全重放；不匹配的迟到结果不能覆盖新事实。
 8. Control 的独立周期 recovery worker 扫描所有仍为 `draining` 且仍有 Cat placement 的 Node，并再次执行

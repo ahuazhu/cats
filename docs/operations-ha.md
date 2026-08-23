@@ -184,10 +184,11 @@ Node，所以请求取消或 Control 重启不会取消排空。普通生命周�
 Node、源 Cold 失败或目标恢复失败都会返回顶层 `blocked`。任一 Cat 无法 Cold 时保留在源 Node，不强制
 关机。入口依然遵守先撤旧、Ready 后发新；Suspended/Warm 的目标端瞬时 Running 不发布入口。
 
-只有明确的源/目标失败才结算 `failure`；timeout、transport/protocol ambiguity 或不完整 discovery 保留
-原 state、source placement 和 exact relocation claim。预留目标不再可用时，后续 pass 在 Cat row lock 内
-原子改投另一个 running Node，旧目标的迟到 settlement 不能覆盖新 reservation。planned drain/recovery
-worker 与 heartbeat/liveness probe 分离，慢迁移不能推迟其他 Node 的失联判定。
+源 Cold 只要未确认成功（包括明确 failure/conflict）就不结算 `failure`，而是保留原 state、source
+placement 和 exact relocation claim；目标端只有明确失败才结算到目标 `failure`，结果不明仍保留 claim。
+预留目标不再可用时，后续 pass 在 Cat row lock 内原子改投另一个 running Node，旧目标的迟到 settlement
+不能覆盖新 reservation。planned drain/recovery worker 与 heartbeat/liveness probe 分离，慢迁移不能推迟
+其他 Node 的失联判定。
 
 接口不会自动关机、delete 或 uncordon。只有收到 `drained` 并完成必要的失败清理/检查后，运维才执行独立
 的 Node 停机步骤；Node 保持 `draining`，防止停机前重新接收 placement。

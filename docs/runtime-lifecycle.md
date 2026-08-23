@@ -152,10 +152,11 @@ Cold 可以在其他 Node 从远端数据启动。任一 Root/PersistentDisk 无
 计划 Node 排空使用同一数据屏障：Control 先把源 Node 置为 `draining`，撤销 Cat 的旧入口，并要求源端
 完成 Cold，之后才允许在 Least-Allocated 选出的其他 running Node 上 Run。原状态为 Suspended/Warm 时，
 目标端 Run 后再恢复原状态，瞬时 Running 不发布入口。源 Cold 失败必须把 Cat 留在源 Node 并阻止排空；
-不能为了维护窗口猜测数据已持久或强制删除本地 writer。只有 noded 明确返回失败才能把 Cat 结算为
-`failure`；timeout、transport/protocol error 或不完整查询保留原产品状态和 relocation claim，由后续周期
-先发现实际状态再继续。已预留目标失联时，下一周期以 Cat row lock 和 exact target predicate 重新选择
-running Node，旧目标的迟到结算不能覆盖新 reservation。
+不能为了维护窗口猜测数据已持久或强制删除本地 writer。源端未确认 Cold 时，即使 noded 明确返回失败，
+也保留原产品状态、source placement 和 relocation claim，由后续周期在修复后重试；不能清掉 claim 并
+terminalize 成不可重试的 `failure`。目标恢复只有明确失败才结算为目标 `failure`，结果不明保留 claim。
+已预留目标失联时，下一周期以 Cat row lock 和 exact target predicate 重新选择 running Node，旧目标的迟到
+结算不能覆盖新 reservation。
 
 ### 4.5 destroy -> Destroyed
 
