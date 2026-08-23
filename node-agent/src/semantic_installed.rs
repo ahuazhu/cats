@@ -352,11 +352,11 @@ impl InstalledInner {
             check_cancellation(cancellation, CatAction::Run)?;
             let root = self.ensure_root(cat_id, config)?;
             let root = self.attach(root)?;
-            let mut root = self.local_volume(&cat, None, root, 0)?;
-            if root.attached.volume.head.generation.get() == 0 {
-                self.provision_root(config, &mut root)?;
-            }
+            let root = self.local_volume(&cat, None, root, 0)?;
             cat.volumes.push(root);
+            if cat.volumes[0].attached.volume.head.generation.get() == 0 {
+                self.provision_root(config, &mut cat.volumes[0])?;
+            }
 
             for (index, requested) in config.mounts.iter().enumerate() {
                 check_cancellation(cancellation, CatAction::Run)?;
@@ -1559,7 +1559,270 @@ fn check_cancellation(cancellation: &SemanticActionCancellation, action: CatActi
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use cats_api::runtime_reconciliation::{
+        Epoch, FenceEpoch, NormalAcquireRequest, NormalAcquireResult, UnixMillis, VolumeDurability,
+        VolumeRecord,
+    };
+    use cats_storage::authority::{
+        authorized_serving_attachment_from_direct_acquire, AuthorityError,
+        DirectAcquireServingInput, RenewLeaseRequest, RenewLeaseResult, VolumeHeadCasRequest,
+        VolumeHeadCasResult,
+    };
+
     use super::*;
+
+    struct RecordingRootStore {
+        root: CatVolume,
+        attached: AttachedVolume,
+        detach_calls: AtomicUsize,
+    }
+
+    impl CatVolumeStore for RecordingRootStore {
+        fn ensure_root_volume(
+            &self,
+            _spec: &RootVolumeSpec,
+        ) -> cats_storage::authority::Result<CatVolume> {
+            Ok(self.root.clone())
+        }
+
+        fn load_persistent_volume(
+            &self,
+            _workspace_id: &Id,
+            _cat_id: &Id,
+            _disk_id: &Id,
+            _volume_id: &Id,
+            _filesystem_uuid: &RandomId128,
+            _mount_path: &HostPath,
+        ) -> cats_storage::authority::Result<CatVolume> {
+            Err(AuthorityError::NotFound)
+        }
+
+        fn attach_volume(
+            &self,
+            request: &VolumeAttachRequest,
+        ) -> cats_storage::authority::Result<AttachedVolume> {
+            assert_eq!(request.volume, self.root);
+            Ok(self.attached.clone())
+        }
+
+        fn detach_volume(&self, attached: &AttachedVolume) -> cats_storage::authority::Result<()> {
+            assert_eq!(attached, &self.attached);
+            self.detach_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn detach_node_volumes(&self, _node_id: &Id) -> cats_storage::authority::Result<usize> {
+            Ok(0)
+        }
+
+        fn commit_persistent_initialization(
+            &self,
+            _commit: &PersistentInitializationCommit,
+        ) -> cats_storage::authority::Result<CatVolume> {
+            Err(AuthorityError::BackendUnknown)
+        }
+
+        fn begin_root_delete(
+            &self,
+            _volume: &CatVolume,
+        ) -> cats_storage::authority::Result<RootDeleteState> {
+            Err(AuthorityError::BackendUnknown)
+        }
+
+        fn complete_root_delete(&self, _volume: &CatVolume) -> cats_storage::authority::Result<()> {
+            Err(AuthorityError::BackendUnknown)
+        }
+    }
+
+    struct UnusedVolumeData;
+
+    impl VolumeDataAuthority for UnusedVolumeData {
+        fn load_volume(&self, _volume_id: &Id) -> cats_storage::authority::Result<VolumeRecord> {
+            Err(AuthorityError::BackendUnknown)
+        }
+
+        fn renew_lease(
+            &self,
+            _request: &RenewLeaseRequest,
+        ) -> cats_storage::authority::Result<RenewLeaseResult> {
+            Err(AuthorityError::BackendUnknown)
+        }
+
+        fn compare_and_swap_head(
+            &self,
+            _request: &VolumeHeadCasRequest,
+        ) -> cats_storage::authority::Result<VolumeHeadCasResult> {
+            Err(AuthorityError::BackendUnknown)
+        }
+    }
+
+    struct MissingBlob;
+
+    impl BlobStore for MissingBlob {
+        fn put_immutable(&self, _key: &str, _data: &[u8]) -> cats_storage::blob::Result<()> {
+            Err(cats_storage::BlobError::Backend {
+                key: "unused".to_owned(),
+                message: "unexpected write".to_owned(),
+            })
+        }
+
+        fn get(&self, key: &str) -> cats_storage::blob::Result<Vec<u8>> {
+            Err(cats_storage::BlobError::NotFound(key.to_owned()))
+        }
+
+        fn exists(&self, _key: &str) -> cats_storage::blob::Result<bool> {
+            Ok(false)
+        }
+
+        fn delete(&self, _key: &str) -> cats_storage::blob::Result<()> {
+            Ok(())
+        }
+
+        fn list(&self, _prefix: &str) -> cats_storage::blob::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn root_store() -> Arc<RecordingRootStore> {
+        let workspace_id = Id::new("ws_cleanup").expect("workspace ID");
+        let cat_id = Id::new("cat_cleanup").expect("Cat ID");
+        let volume_id = Id::new("vol_cleanup").expect("volume ID");
+        let head = blank_head();
+        let root = CatVolume {
+            workspace_id,
+            disk_id: Id::new("disk_cleanup").expect("disk ID"),
+            volume_id: volume_id.clone(),
+            size_bytes: 4 << 20,
+            durability: VolumeDurability::Strict,
+            head: head.clone(),
+            role: CatVolumeRole::Root { cat_id },
+        };
+        let transition_id =
+            RandomId128::new("11111111111111111111111111111111").expect("transition ID");
+        let request = NormalAcquireRequest {
+            volume_id: volume_id.clone(),
+            transition_id: transition_id.clone(),
+            attachment_id: Id::new("attach_cleanup").expect("attachment ID"),
+            expected_unowned_epoch: FenceEpoch::new(0).expect("zero epoch"),
+            placement_epoch: Epoch::new(1).expect("placement epoch"),
+            lease_duration_ms: 5_000,
+        };
+        let result = NormalAcquireResult {
+            volume_id,
+            transition_id,
+            attachment_id: request.attachment_id.clone(),
+            resulting_epoch: FenceEpoch::new(1).expect("attachment epoch"),
+            resulting_head: head.clone(),
+            lease_expires_at: UnixMillis::new(6_000).expect("lease expiry"),
+        };
+        let serving =
+            authorized_serving_attachment_from_direct_acquire(DirectAcquireServingInput {
+                node_id: Id::new("node_cleanup").expect("Node ID"),
+                size_bytes: root.size_bytes,
+                durability: root.durability,
+                request,
+                result,
+                current_head: head,
+                current_lease_expires_at: UnixMillis::new(6_000).expect("lease expiry"),
+                object_write_credential: None,
+            })
+            .expect("direct attachment");
+        Arc::new(RecordingRootStore {
+            root: root.clone(),
+            attached: AttachedVolume {
+                volume: root,
+                serving,
+            },
+            detach_calls: AtomicUsize::new(0),
+        })
+    }
+
+    #[test]
+    fn missing_root_manifest_releases_the_new_attachment() {
+        let directory = tempfile::tempdir_in("/tmp").expect("temporary installed directory");
+        let socket_root = directory.path().join("sockets");
+        let host_lock = directory.path().join("host.lock");
+        drop(
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&host_lock)
+                .expect("provision Host lock"),
+        );
+        let config = InstalledCatConfig {
+            node_id: Id::new("node_cleanup").expect("Node ID"),
+            state_directory: directory.path().join("state"),
+            runtime_directory: directory.path().join("runtime"),
+            host_lock,
+            blockd_binary: PathBuf::from("/unused/cats-blockd"),
+            blockd_socket_root: ManagedBlockdSocketRoot::from_canonical_path(
+                HostPath::new(socket_root.to_string_lossy().into_owned()).expect("socket root"),
+            )
+            .expect("managed socket root"),
+            metadata_store: AdapterSelection::new(
+                "postgres",
+                cats_storage::AdapterConfig::from_cli(Vec::<String>::new())
+                    .expect("empty metadata config"),
+            ),
+            object_store: AdapterSelection::new(
+                "file",
+                cats_storage::AdapterConfig::from_cli(Vec::<String>::new())
+                    .expect("empty object config"),
+            ),
+            ch: ChConfig {
+                block_direct: false,
+                ch_bin: PathBuf::from("/unused/cloud-hypervisor"),
+                kernel: PathBuf::from("/unused/vmlinuz"),
+                initramfs: None,
+                boot_contract: None,
+                cmdline: String::new(),
+                seed_image: None,
+                block_path: BlockPath::VhostUser,
+                vhost_user_queues: 1,
+                vhost_user_queue_size: 256,
+                nbd_client_bin: PathBuf::from("/unused/nbd-client"),
+                nbd_devices: 1,
+                ip_bin: PathBuf::from("/unused/ip"),
+            },
+            root_size_bytes: 4 << 20,
+            lease_duration_ms: 5_000,
+            effect_timeout: Duration::from_secs(1),
+            guest_ready_timeout: Duration::from_secs(1),
+        };
+        let volumes = root_store();
+        let effects = InstalledSemanticCatEffects::new(
+            config,
+            Arc::clone(&volumes) as Arc<dyn CatVolumeStore>,
+            Arc::new(UnusedVolumeData),
+            Arc::new(MissingBlob),
+        )
+        .expect("installed effects");
+        let request = NodedCatConfig {
+            workspace_id: Id::new("ws_cleanup").expect("workspace ID"),
+            cpu: 1,
+            memory_bytes: 1 << 30,
+            boot_image: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .to_owned(),
+            mounts: Vec::new(),
+        };
+
+        let error = match effects.inner.start_fresh(
+            &Id::new("cat_cleanup").expect("Cat ID"),
+            &request,
+            &SemanticActionCancellation::new(),
+        ) {
+            Ok(_) => panic!("missing manifest must fail create"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("read immutable Root image manifest"));
+        assert_eq!(volumes.detach_calls.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn host_lock_excludes_a_second_installed_agent() {

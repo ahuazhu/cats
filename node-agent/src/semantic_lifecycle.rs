@@ -44,7 +44,7 @@ pub struct SemanticActionCancellation {
 }
 
 impl SemanticActionCancellation {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let (signal, _) = watch::channel(false);
         Self {
             signal: Arc::new(signal),
