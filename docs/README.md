@@ -85,6 +85,7 @@ AgentSession 或 HostFenceRecovery 协调的段落，都由 ADR-0059 supersede�
 ### 当前协调决策
 
 - [0059 Control/Node 场景语义同步协议](decisions/0059-semantic-control-node-synchronous-protocol.md)
+- [0061 场景语义 Least-Allocated Placement](decisions/0061-semantic-least-allocated-placement.md)
 - [0002 四态生命周期](decisions/0002-lifecycle-states-running-suspended-warm-cold.md)
 - [0031 PostgreSQL control store](decisions/0031-control-store-on-postgresql.md)
 - [0032 Control Plane 多副本](decisions/0032-control-plane-multi-replica-and-postgresql-leadership.md)

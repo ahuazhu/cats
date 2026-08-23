@@ -483,11 +483,6 @@ impl lifecycle::SemanticLifecycleStore for PostgresSemanticLifecycleStore {
         Box::pin(async move {
             store
                 .execute(move |store| {
-                    let node_id = store
-                        .list_running_semantic_nodes()?
-                        .into_iter()
-                        .next()
-                        .map(|node| node.node_id);
                     let db_mounts = mounts
                         .iter()
                         .map(|(binding_id, mount)| db::NewCatMount {
@@ -507,7 +502,6 @@ impl lifecycle::SemanticLifecycleStore for PostgresSemanticLifecycleStore {
                         cat_id: &cat_id,
                         workspace_id: &request.workspace_id,
                         cat_slug: &request.cat_slug,
-                        node_id: node_id.as_deref(),
                         cpu_count,
                         memory_bytes,
                         boot_image: &request.config.boot_image,
@@ -530,15 +524,6 @@ impl lifecycle::SemanticLifecycleStore for PostgresSemanticLifecycleStore {
         Box::pin(async move {
             store
                 .execute(move |store| {
-                    let selected_node = if action == lifecycle::CatAction::Run {
-                        store
-                            .list_running_semantic_nodes()?
-                            .into_iter()
-                            .next()
-                            .map(|node| node.node_id)
-                    } else {
-                        None
-                    };
                     let selector = match &selector {
                         lifecycle::CatSelector::Id(cat_id) => db::SemanticCatSelector::Id(cat_id),
                         lifecycle::CatSelector::Slug {
@@ -549,11 +534,7 @@ impl lifecycle::SemanticLifecycleStore for PostgresSemanticLifecycleStore {
                             cat_slug,
                         },
                     };
-                    store.admit_semantic_cat_action(
-                        selector,
-                        lifecycle_action_to_db(action),
-                        selected_node.as_deref(),
-                    )
+                    store.admit_semantic_cat_action(selector, lifecycle_action_to_db(action))
                 })
                 .await
                 .map_err(lifecycle_store_error)

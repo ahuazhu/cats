@@ -104,6 +104,222 @@ fn register_second_node(store: &Store) {
     ));
 }
 
+fn register_third_node(store: &Store) {
+    assert!(matches!(
+        store
+            .register_semantic_node(registration_with_identity(
+                "node-c",
+                "http://10.0.0.3:8443",
+                "worker-c",
+                "i-semantic-c",
+            ))
+            .unwrap(),
+        RegisterNodeOutcome::Registered(_)
+    ));
+}
+
+fn admit_cat(
+    store: &Store,
+    cat_id: &str,
+    cat_slug: &str,
+    cpu_count: i64,
+    memory_bytes: i64,
+) -> CatWithMounts {
+    let AdmitCatCreateOutcome::Created(cat) = store
+        .admit_semantic_cat_create(AtomicCatCreate {
+            cat_id,
+            workspace_id: "ws_semantic",
+            cat_slug,
+            cpu_count,
+            memory_bytes,
+            boot_image: "sha256:image",
+            mounts: &[],
+        })
+        .unwrap()
+    else {
+        panic!("new atomic Cat must be admitted")
+    };
+    cat
+}
+
+fn create_running_cat_on(
+    store: &Store,
+    cat_id: &str,
+    slug: &str,
+    node_id: &str,
+    cpu_count: i64,
+    memory_bytes: i64,
+) -> CatRecord {
+    let CreateCatOutcome::Created(created) = store
+        .create_semantic_cat(NewCat {
+            cat_id,
+            workspace_id: "ws_semantic",
+            cat_slug: slug,
+            node_id,
+            cpu_count,
+            memory_bytes,
+            boot_image: "sha256:image",
+        })
+        .unwrap()
+    else {
+        panic!("new semantic Cat must be created")
+    };
+    assert_eq!(created.current_action, Some(CatAction::Create));
+    store
+        .finish_semantic_cat_action(
+            cat_id,
+            FinishCatAction {
+                expected_action: CatAction::Create,
+                expected_node_id: Some(node_id),
+                final_state: CatState::Running,
+                final_node_id: Some(node_id),
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .unwrap()
+        .unwrap()
+}
+
+#[test]
+fn atomic_create_balances_equal_shapes_and_counts_in_progress_reservations() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    register_second_node(&store);
+
+    let placements = (0..4)
+        .map(|index| {
+            let cat_id = format!("cat-balanced-{index}");
+            let slug = format!("balanced-{index}");
+            admit_cat(&store, &cat_id, &slug, 2, 1 << 30)
+                .cat
+                .current_action_node_id
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(placements, ["node-a", "node-b", "node-a", "node-b"]);
+}
+
+#[test]
+fn atomic_create_uses_committed_shape_and_skips_non_running_nodes() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    register_second_node(&store);
+    create_running_cat_on(&store, "cat-heavy-a", "heavy-a", "node-a", 8, 8 << 30);
+
+    let selected = admit_cat(&store, "cat-light", "light", 1, 1 << 30);
+    assert_eq!(
+        selected.cat.current_action_node_id.as_deref(),
+        Some("node-b")
+    );
+
+    store
+        .transition_semantic_node_status("node-b", &[NodeStatus::Running], NodeStatus::Draining)
+        .unwrap()
+        .unwrap();
+    let selected = admit_cat(&store, "cat-after-drain", "after-drain", 1, 1 << 30);
+    assert_eq!(
+        selected.cat.current_action_node_id.as_deref(),
+        Some("node-a")
+    );
+}
+
+#[test]
+fn cold_run_and_offline_recovery_share_the_least_loaded_policy() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    register_second_node(&store);
+    register_third_node(&store);
+    create_running_cat_on(&store, "cat-load-a", "load-a", "node-a", 4, 1 << 30);
+    create_running_cat_on(&store, "cat-load-b", "load-b", "node-b", 4, 1 << 30);
+    create_running_cat_on(&store, "cat-cold", "cold", "node-a", 1, 1 << 30);
+
+    let AdmitCatActionOutcome::Acquired(cold) = store
+        .admit_semantic_cat_action(SemanticCatSelector::Id("cat-cold"), CatAction::Cold)
+        .unwrap()
+    else {
+        panic!("running Cat must acquire Cold")
+    };
+    store
+        .finish_semantic_cat_action(
+            "cat-cold",
+            FinishCatAction {
+                expected_action: CatAction::Cold,
+                expected_node_id: cold.cat.current_action_node_id.as_deref(),
+                final_state: CatState::Cold,
+                final_node_id: None,
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+    let AdmitCatActionOutcome::Acquired(run) = store
+        .admit_semantic_cat_action(SemanticCatSelector::Id("cat-cold"), CatAction::Run)
+        .unwrap()
+    else {
+        panic!("Cold Cat must acquire Run")
+    };
+    assert_eq!(run.cat.current_action_node_id.as_deref(), Some("node-c"));
+
+    create_running_cat_on(
+        &store,
+        "cat-recovery-source",
+        "recovery-source",
+        "node-a",
+        1,
+        1 << 30,
+    );
+    store
+        .transition_semantic_node_status("node-a", &[NodeStatus::Running], NodeStatus::Offline)
+        .unwrap()
+        .unwrap();
+    let ClaimSemanticCatRecoveryOutcome::Claimed(claim) = store
+        .claim_semantic_cat_recovery("node-a", "cat-recovery-source")
+        .unwrap()
+    else {
+        panic!("offline Cat must receive a recovery claim")
+    };
+    assert_eq!(claim.target_node_id, "node-c");
+}
+
+#[test]
+fn concurrent_atomic_creates_reserve_an_even_distribution() {
+    let (store, url) = store_and_url();
+    register_node(&store);
+    register_second_node(&store);
+    let barrier = Arc::new(Barrier::new(9));
+    let stores = (0..8)
+        .map(|_| Store::connect(&url, None).unwrap())
+        .collect::<Vec<_>>();
+    let handles = stores
+        .into_iter()
+        .enumerate()
+        .map(|(index, store)| {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let cat_id = format!("cat-concurrent-{index}");
+                let slug = format!("concurrent-{index}");
+                barrier.wait();
+                admit_cat(&store, &cat_id, &slug, 2, 1 << 30)
+                    .cat
+                    .current_action_node_id
+                    .unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let mut placements = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    placements.sort_unstable();
+
+    assert_eq!(placements[..4], ["node-a"; 4]);
+    assert_eq!(placements[4..], ["node-b"; 4]);
+}
+
 #[test]
 fn ingress_publish_and_withdraw_are_scenario_idempotent() {
     let (store, _) = store_and_url();
@@ -642,7 +858,6 @@ fn atomic_create_persists_full_mount_config_and_retries_by_semantics() {
         cat_id: "cat-atomic",
         workspace_id: "ws_semantic",
         cat_slug: "atomic",
-        node_id: Some("node-a"),
         cpu_count: 2,
         memory_bytes: 1 << 30,
         boot_image: "sha256:image",
@@ -701,7 +916,6 @@ fn rejected_atomic_mount_rolls_back_cat_and_binding_together() {
                 cat_id: "cat-rollback",
                 workspace_id: "ws_semantic",
                 cat_slug: "rollback",
-                node_id: Some("node-a"),
                 cpu_count: 2,
                 memory_bytes: 1 << 30,
                 boot_image: "sha256:image",
