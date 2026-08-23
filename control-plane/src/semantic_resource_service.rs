@@ -565,6 +565,23 @@ impl lifecycle::SemanticLifecycleStore for PostgresSemanticLifecycleStore {
         })
     }
 
+    fn rotate_pending_destroy<'a>(
+        &'a self,
+        claim: &'a lifecycle::ActionClaim,
+    ) -> lifecycle::SemanticFuture<'a, Result<bool, lifecycle::StoreError>> {
+        let store = Arc::clone(&self.store);
+        let cat_id = claim.cat.cat_id.clone();
+        let node_id = claim.node_id.clone();
+        Box::pin(async move {
+            store
+                .execute(move |store| {
+                    store.rotate_pending_semantic_destroy_claim(&cat_id, node_id.as_deref())
+                })
+                .await
+                .map_err(lifecycle_store_error)
+        })
+    }
+
     fn node_control_endpoint<'a>(
         &'a self,
         node_id: &'a str,

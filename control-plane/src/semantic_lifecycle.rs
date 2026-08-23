@@ -297,6 +297,14 @@ pub trait SemanticLifecycleStore: Send + Sync {
         limit: usize,
     ) -> SemanticFuture<'a, Result<Vec<ActionClaim>, StoreError>>;
 
+    /// Moves a failed recovery attempt behind older untried Destroy claims.
+    /// The update must match the exact current Destroy action and Node; a
+    /// stale recovery attempt is a successful no-op.
+    fn rotate_pending_destroy<'a>(
+        &'a self,
+        claim: &'a ActionClaim,
+    ) -> SemanticFuture<'a, Result<bool, StoreError>>;
+
     /// Resolves `nodes.control_endpoint` after admission has committed.
     fn node_control_endpoint<'a>(
         &'a self,
@@ -577,7 +585,14 @@ where
         let results = stream::iter(claims)
             .map(|claim| async move {
                 let cat_id = claim.cat.cat_id.clone();
-                (cat_id, self.resume(claim).await)
+                let recovery_claim = claim.clone();
+                let result = self.resume(claim).await;
+                let rotation = if result.is_err() {
+                    Some(self.store.rotate_pending_destroy(&recovery_claim).await)
+                } else {
+                    None
+                };
+                (cat_id, result, rotation)
             })
             .buffer_unordered(max_in_flight.max(1))
             .collect::<Vec<_>>()
@@ -587,12 +602,19 @@ where
             discovered,
             ..PendingDestroyRecoveryReport::default()
         };
-        for (cat_id, result) in results {
+        for (cat_id, result, rotation) in results {
             match result {
                 Ok(_) => report.completed += 1,
                 Err(error) => {
                     report.failed += 1;
                     tracing::warn!(%cat_id, ?error, "pending Destroy recovery failed");
+                    if let Some(Err(rotation_error)) = rotation {
+                        tracing::warn!(
+                            %cat_id,
+                            ?rotation_error,
+                            "failed Destroy recovery could not be rotated"
+                        );
+                    }
                 }
             }
         }
@@ -968,11 +990,13 @@ mod tests {
     struct MockStoreState {
         admissions: VecDeque<Admission>,
         pending_destroy_claims: VecDeque<Vec<ActionClaim>>,
+        endpoint_errors: VecDeque<StoreError>,
         cat: CatRecord,
         in_transaction: bool,
         endpoint_reads: usize,
         completions: usize,
         failures: usize,
+        rotations: usize,
     }
 
     impl MockStore {
@@ -981,11 +1005,13 @@ mod tests {
                 state: Arc::new(Mutex::new(MockStoreState {
                     admissions: VecDeque::from([admission]),
                     pending_destroy_claims: VecDeque::new(),
+                    endpoint_errors: VecDeque::new(),
                     cat,
                     in_transaction: false,
                     endpoint_reads: 0,
                     completions: 0,
                     failures: 0,
+                    rotations: 0,
                 })),
             }
         }
@@ -996,6 +1022,14 @@ mod tests {
                 .expect("mock store")
                 .pending_destroy_claims
                 .push_back(vec![claim]);
+        }
+
+        fn queue_endpoint_error(&self, error: StoreError) {
+            self.state
+                .lock()
+                .expect("mock store")
+                .endpoint_errors
+                .push_back(error);
         }
     }
 
@@ -1043,6 +1077,21 @@ mod tests {
             })
         }
 
+        fn rotate_pending_destroy<'a>(
+            &'a self,
+            claim: &'a ActionClaim,
+        ) -> SemanticFuture<'a, Result<bool, StoreError>> {
+            Box::pin(async move {
+                let mut state = self.state.lock().expect("mock store");
+                let current = state.cat.current_action == Some(CatAction::Destroy)
+                    && state.cat.current_action_node_id == claim.node_id;
+                if current {
+                    state.rotations += 1;
+                }
+                Ok(current)
+            })
+        }
+
         fn node_control_endpoint<'a>(
             &'a self,
             _node_id: &'a str,
@@ -1051,6 +1100,9 @@ mod tests {
                 let mut state = self.state.lock().expect("mock store");
                 assert!(!state.in_transaction, "endpoint read crossed admission tx");
                 state.endpoint_reads += 1;
+                if let Some(error) = state.endpoint_errors.pop_front() {
+                    return Err(error);
+                }
                 NodeControlEndpoint::new("http://node.test")
             })
         }
@@ -1595,6 +1647,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             [CatAction::Destroy]
         );
+    }
+
+    #[tokio::test]
+    async fn failed_pending_destroy_is_rotated_behind_untried_claims() {
+        let original = cat(Some(CatState::Failure), Some(CatAction::Destroy));
+        let action_claim = claim(original.clone(), CatAction::Destroy);
+        let store = MockStore::new(original, Admission::SameAction(action_claim.clone()));
+        store.queue_pending_destroy(action_claim);
+        store.queue_endpoint_error(StoreError::new("Node endpoint unavailable"));
+        let noded = MockNoded::new(store.clone(), [], []);
+        let ingress = MockIngress::new(&noded);
+        let service = SemanticLifecycleService::new(store.clone(), noded, ingress, fast_timeouts());
+
+        let report = service
+            .recover_pending_destroys(Duration::ZERO, 32, 4)
+            .await
+            .expect("scan remains available after one claim fails");
+
+        assert_eq!(report.discovered, 1);
+        assert_eq!(report.completed, 0);
+        assert_eq!(report.failed, 1);
+        assert_eq!(store.state.lock().expect("store").rotations, 1);
     }
 
     #[tokio::test]

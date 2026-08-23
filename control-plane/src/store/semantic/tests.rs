@@ -308,6 +308,55 @@ fn destroy_preempts_an_in_progress_create_on_its_reserved_node() {
 }
 
 #[test]
+fn failed_destroy_recovery_rotates_behind_an_untried_claim() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    let cat_ids = ["cat-rotate-a", "cat-rotate-b", "cat-rotate-c"];
+    for cat_id in cat_ids {
+        let slug = cat_id.trim_start_matches("cat-");
+        admit_cat(&store, cat_id, slug, 1, 1 << 30);
+        assert!(matches!(
+            store
+                .admit_semantic_cat_action(SemanticCatSelector::Id(cat_id), CatAction::Destroy,)
+                .unwrap(),
+            AdmitCatActionOutcome::Acquired(_)
+        ));
+    }
+    store
+        .with(|client| {
+            client
+                .execute(
+                    "UPDATE cats SET updated_at=(SELECT MAX(created_at) FROM cats)",
+                    &[],
+                )
+                .map(|_| ())
+        })
+        .unwrap();
+
+    let first = store.list_pending_semantic_destroy_claims(0, 2).unwrap();
+    assert_eq!(first.len(), 2);
+    let first_ids = first
+        .iter()
+        .map(|cat| cat.cat.cat_id.as_str())
+        .collect::<Vec<_>>();
+    let untried = cat_ids
+        .into_iter()
+        .find(|cat_id| !first_ids.contains(cat_id))
+        .expect("one claim must remain outside the first bounded page");
+    for cat in first {
+        assert!(store
+            .rotate_pending_semantic_destroy_claim(
+                &cat.cat.cat_id,
+                cat.cat.current_action_node_id.as_deref(),
+            )
+            .unwrap());
+    }
+
+    let second = store.list_pending_semantic_destroy_claims(0, 2).unwrap();
+    assert_eq!(second[0].cat.cat_id, untried);
+}
+
+#[test]
 fn cold_run_and_offline_recovery_share_the_least_loaded_policy() {
     let (store, _) = store_and_url();
     register_node(&store);

@@ -1275,7 +1275,7 @@ impl Store {
                       WHERE current_action='destroy'
                         AND current_action_started_at <= {DB_NOW_MS} - $1
                         AND destroyed_at IS NULL
-                      ORDER BY current_action_started_at,cat_id
+                      ORDER BY updated_at,cat_id
                       LIMIT $2
                       FOR SHARE SKIP LOCKED"
                 ),
@@ -1287,6 +1287,30 @@ impl Store {
             }
             transaction.commit()?;
             Ok(cats)
+        })
+    }
+
+    /// Durably rotates one failed recovery attempt behind older untried
+    /// Destroy claims. The exact predicate prevents a stale scanner from
+    /// touching a different action or Node lane.
+    pub fn rotate_pending_semantic_destroy_claim(
+        &self,
+        cat_id: &str,
+        expected_node_id: Option<&str>,
+    ) -> Result<bool> {
+        self.with(|client| {
+            client
+                .execute(
+                    &format!(
+                        "UPDATE cats
+                            SET updated_at={DB_NOW_MS}
+                          WHERE cat_id=$1
+                            AND current_action='destroy'
+                            AND current_action_node_id IS NOT DISTINCT FROM $2"
+                    ),
+                    &[&cat_id, &expected_node_id],
+                )
+                .map(|changed| changed == 1)
         })
     }
 

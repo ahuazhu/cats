@@ -35,7 +35,8 @@ Destroy claim 后、调用 noded 前退出，使该行永久停留在未结算�
    deadline 的未结算 Destroy，每次只取有界批次并以有界并发执行 ADR-0059 的 discovery-first 恢复。
    因此 Control 在 claim commit 后、noded dispatch 前退出也会自动重新派发。失去选举会话会取消正在
    恢复的任务并在退避后重建会话、重新参选；其他 replica 也可取得选举并继续扫描。shutdown 才终止
-   重选循环。
+   重选循环。扫描按 `updated_at, cat_id` 取最旧行；单项恢复失败后用 exact Destroy/Node CAS 刷新
+   `updated_at`，把它持久轮转到尚未尝试的 claim 之后，不能让一个失败满批次饿死后续 Destroy。
 7. 扫描只是发现，不是新 authority。Node 查询决定是否需要重发；数据库 exact settlement 决定结果
    是否仍属于当前 Destroy。heartbeat、日志、inventory 和 scanner 内存都不能结算动作。
 8. 本决策不增加 wire 字段、schema 列、Operation identity 或协议兼容分支。现有
@@ -51,7 +52,8 @@ Destroy claim 后、调用 noded 前退出，使该行永久停留在未结算�
    旧动作时重发 Destroy，并最终精确结算 Destroyed。
 4. 无 placement 的 Cold/Failure Cat 可以直接结算 Destroyed；未知盘和 PersistentDisk 数据仍按原存储
    合同 fail closed，不因本决策变成可丢弃数据。
-5. 恢复扫描有 age、batch、并发和 singleton 边界，正常同步请求窗口内不与恢复任务竞争。
+5. 恢复扫描有 age、batch、并发、失败轮转和 singleton 边界，正常同步请求窗口内不与恢复任务竞争，
+   永久失败的旧 claim 也不能阻止较新的 claim 被尝试。
 
 ## 后果
 

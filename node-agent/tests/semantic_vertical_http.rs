@@ -172,6 +172,13 @@ impl SemanticLifecycleStore for MemoryLifecycleStore {
         Box::pin(async { Ok(Vec::new()) })
     }
 
+    fn rotate_pending_destroy<'a>(
+        &'a self,
+        _claim: &'a ActionClaim,
+    ) -> SemanticFuture<'a, Result<bool, StoreError>> {
+        Box::pin(async { Ok(false) })
+    }
+
     fn node_control_endpoint<'a>(
         &'a self,
         node_id: &'a str,
