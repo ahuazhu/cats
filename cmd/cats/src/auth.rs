@@ -6,12 +6,12 @@ use base64::Engine;
 use cats_api::auth::{CliAuthConfigResponse, MeResponse, Workspace};
 use cats_api::list::ListResponse;
 use reqwest::blocking::Client as HttpClient;
-use workos::resources::user_management::AuthenticateWithRefreshTokenParams;
 
 use crate::config::{
     canonical_https_origin, CliStateLock, Credentials, FleetAdminCredentials, FleetAdminStateLock,
     StoredConfig, DEFAULT_API_URL,
 };
+use crate::workos_client;
 
 pub(crate) struct UserSession {
     pub api_url: String,
@@ -78,14 +78,9 @@ pub(crate) fn login(provided_api_url: Option<&str>) -> Result<StoredConfig> {
     let workos_api_base_url = public
         .workos_api_base_url
         .context("control plane did not publish its WorkOS API base URL")?;
-    let workos = workos::Client::builder()
-        .client_id(&client_id)
-        .base_url(&workos_api_base_url)
-        .try_build()
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let runtime = tokio::runtime::Runtime::new()?;
-    let device = runtime
-        .block_on(workos.authkit().start_device_authorization())
+    let workos = public_workos_client(&client_id, &workos_api_base_url)?;
+    let device = workos
+        .start_device_authorization()
         .map_err(|error| anyhow::anyhow!("start WorkOS device login: {error}"))?;
     let verification_url = device
         .verification_uri_complete
@@ -98,16 +93,12 @@ pub(crate) fn login(provided_api_url: Option<&str>) -> Result<StoredConfig> {
     }
     println!("Waiting for authentication…");
     let interval = Duration::from_secs_f64(device.interval.unwrap_or(5.0).max(1.0));
-    let authenticated = runtime
-        .block_on(
-            workos
-                .authkit()
-                .poll_device_code(&device.device_code, interval),
-        )
+    let authenticated = workos
+        .poll_device_code(&device.device_code, interval)
         .map_err(|error| anyhow::anyhow!("WorkOS login failed: {error}"))?;
     let mut credentials = Credentials {
-        access_token: authenticated.access_token.into_inner(),
-        refresh_token: authenticated.refresh_token.into_inner(),
+        access_token: authenticated.access_token,
+        refresh_token: authenticated.refresh_token,
         active_organization_id: authenticated.organization_id,
     };
     let me: MeResponse = get_json(
@@ -129,13 +120,7 @@ pub(crate) fn login(provided_api_url: Option<&str>) -> Result<StoredConfig> {
         .cloned()
         .unwrap_or_else(|| me.workspaces[0].clone());
     if Some(selected.organization_id.as_str()) != credentials.active_organization_id.as_deref() {
-        credentials = refresh_for_workspace(
-            &runtime,
-            &workos,
-            &credentials,
-            &selected,
-            Some(&me.user.id),
-        )?;
+        credentials = refresh_for_workspace(&workos, &credentials, &selected, Some(&me.user.id))?;
     }
     let _state_lock = CliStateLock::acquire()?;
     credentials.save(&api_url)?;
@@ -153,9 +138,8 @@ pub(crate) fn fleet_admin_login(provided_api_url: Option<&str>) -> Result<FleetA
     let (raw_api_url, canonical_origin) = fleet_admin_origins(provided_api_url)?;
     let public = fleet_admin_public_config(&canonical_origin)?;
     let workos = public_workos_client(&public.client_id, &public.api_base_url)?;
-    let runtime = tokio::runtime::Runtime::new()?;
-    let device = runtime
-        .block_on(workos.authkit().start_device_authorization())
+    let device = workos
+        .start_device_authorization()
         .map_err(|error| anyhow::anyhow!("start WorkOS fleet-administrator login: {error}"))?;
     let verification_url = device
         .verification_uri_complete
@@ -168,24 +152,19 @@ pub(crate) fn fleet_admin_login(provided_api_url: Option<&str>) -> Result<FleetA
     }
     println!("Waiting for fleet-administrator authentication…");
     let interval = Duration::from_secs_f64(device.interval.unwrap_or(5.0).max(1.0));
-    let authenticated = runtime
-        .block_on(
-            workos
-                .authkit()
-                .poll_device_code(&device.device_code, interval),
-        )
+    let authenticated = workos
+        .poll_device_code(&device.device_code, interval)
         .map_err(|error| anyhow::anyhow!("WorkOS fleet-administrator login failed: {error}"))?;
     let subject = authenticated.user.id.clone();
     let email = authenticated.user.email.clone();
     let initial = FleetAdminCredentials {
-        access_token: authenticated.access_token.into_inner(),
-        refresh_token: authenticated.refresh_token.into_inner(),
+        access_token: authenticated.access_token,
+        refresh_token: authenticated.refresh_token,
         organization_id: authenticated.organization_id.unwrap_or_default(),
         subject,
         email,
     };
-    let credentials =
-        scope_fleet_admin_credentials(&runtime, &workos, initial, &public.organization_id)?;
+    let credentials = scope_fleet_admin_credentials(&workos, initial, &public.organization_id)?;
     let lock = FleetAdminStateLock::acquire(&canonical_origin)?;
     // Login intentionally replaces any prior administrator identity, but it
     // still rereads the globally shared credential while holding the same
@@ -209,10 +188,8 @@ pub(crate) fn fleet_admin_session(provided_api_url: Option<&str>) -> Result<Flee
         || token_expires_soon(&credentials.access_token)
     {
         let workos = public_workos_client(&public.client_id, &public.api_base_url)?;
-        let runtime = tokio::runtime::Runtime::new()?;
         lock.assert_current()?;
         let refreshed = refresh_for_fleet_admin(
-            &runtime,
             &workos,
             &credentials,
             &public.organization_id,
@@ -324,29 +301,22 @@ fn fleet_admin_request_url(canonical_origin: &str, path: &str) -> Result<String>
     Ok(format!("{canonical_origin}{path}"))
 }
 
-fn public_workos_client(client_id: &str, api_base_url: &str) -> Result<workos::Client> {
-    workos::Client::builder()
-        .client_id(client_id)
-        .base_url(api_base_url)
-        .try_build()
+fn public_workos_client(
+    client_id: &str,
+    api_base_url: &str,
+) -> Result<workos_client::PublicClient> {
+    workos_client::PublicClient::new(client_id, api_base_url)
         .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
 fn refresh_for_fleet_admin(
-    runtime: &tokio::runtime::Runtime,
-    workos: &workos::Client,
+    workos: &workos_client::PublicClient,
     credentials: &FleetAdminCredentials,
     organization_id: &str,
     expected_subject: Option<&str>,
 ) -> Result<FleetAdminCredentials> {
-    let mut params = AuthenticateWithRefreshTokenParams::new(credentials.refresh_token.clone());
-    params.organization_id = Some(organization_id.to_owned());
-    let refreshed = runtime
-        .block_on(
-            workos
-                .user_management()
-                .authenticate_with_refresh_token(params),
-        )
+    let refreshed = workos
+        .authenticate_with_refresh_token(&credentials.refresh_token, organization_id)
         .map_err(|error| anyhow::anyhow!("refresh WorkOS fleet-administrator session: {error}"))?;
     anyhow::ensure!(
         refreshed.organization_id.as_deref() == Some(organization_id),
@@ -356,8 +326,8 @@ fn refresh_for_fleet_admin(
         bail!("WorkOS refreshed a different fleet-administrator identity");
     }
     Ok(FleetAdminCredentials {
-        access_token: refreshed.access_token.into_inner(),
-        refresh_token: refreshed.refresh_token.into_inner(),
+        access_token: refreshed.access_token,
+        refresh_token: refreshed.refresh_token,
         organization_id: organization_id.to_owned(),
         subject: refreshed.user.id,
         email: refreshed.user.email,
@@ -365,8 +335,7 @@ fn refresh_for_fleet_admin(
 }
 
 fn scope_fleet_admin_credentials(
-    runtime: &tokio::runtime::Runtime,
-    workos: &workos::Client,
+    workos: &workos_client::PublicClient,
     credentials: FleetAdminCredentials,
     organization_id: &str,
 ) -> Result<FleetAdminCredentials> {
@@ -374,13 +343,7 @@ fn scope_fleet_admin_credentials(
         return Ok(credentials);
     }
     let subject = credentials.subject.clone();
-    refresh_for_fleet_admin(
-        runtime,
-        workos,
-        &credentials,
-        organization_id,
-        Some(&subject),
-    )
+    refresh_for_fleet_admin(workos, &credentials, organization_id, Some(&subject))
 }
 
 pub(crate) fn user_session(
@@ -408,9 +371,7 @@ pub(crate) fn user_session(
         || token_expires_soon(&credentials.access_token)
     {
         let workos = public_client(&config)?;
-        let runtime = tokio::runtime::Runtime::new()?;
         credentials = refresh_for_workspace(
-            &runtime,
             &workos,
             &credentials,
             &workspace,
@@ -478,10 +439,8 @@ pub(crate) fn switch_workspace(
         != Some(workspace.organization_id.as_str())
         || token_expires_soon(&current_credentials.access_token)
     {
-        let runtime = tokio::runtime::Runtime::new()?;
         let workos = public_client(&config)?;
         let credentials = refresh_for_workspace(
-            &runtime,
             &workos,
             &current_credentials,
             &workspace,
@@ -527,16 +486,13 @@ pub(crate) fn logout(provided_api_url: Option<&str>) -> Result<()> {
         );
         if let Some(mut credentials) = Credentials::load(&api_url)? {
             if token_expires_soon(&credentials.access_token) {
-                if let (Ok(runtime), Ok(workos)) =
-                    (tokio::runtime::Runtime::new(), public_client(&config))
-                {
+                if let Ok(workos) = public_client(&config) {
                     if let Some(workspace) = config
                         .current_workspace
                         .as_deref()
                         .and_then(|selector| resolve_workspace(&config.workspaces, selector))
                     {
                         if let Ok(refreshed) = refresh_for_workspace(
-                            &runtime,
                             &workos,
                             &credentials,
                             &workspace,
@@ -563,29 +519,18 @@ pub(crate) fn logout(provided_api_url: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn public_client(config: &StoredConfig) -> Result<workos::Client> {
-    workos::Client::builder()
-        .client_id(&config.workos_client_id)
-        .base_url(&config.workos_api_base_url)
-        .try_build()
-        .map_err(|error| anyhow::anyhow!(error.to_string()))
+fn public_client(config: &StoredConfig) -> Result<workos_client::PublicClient> {
+    public_workos_client(&config.workos_client_id, &config.workos_api_base_url)
 }
 
 fn refresh_for_workspace(
-    runtime: &tokio::runtime::Runtime,
-    workos: &workos::Client,
+    workos: &workos_client::PublicClient,
     credentials: &Credentials,
     workspace: &Workspace,
     expected_user_id: Option<&str>,
 ) -> Result<Credentials> {
-    let mut params = AuthenticateWithRefreshTokenParams::new(credentials.refresh_token.clone());
-    params.organization_id = Some(workspace.organization_id.clone());
-    let refreshed = runtime
-        .block_on(
-            workos
-                .user_management()
-                .authenticate_with_refresh_token(params),
-        )
+    let refreshed = workos
+        .authenticate_with_refresh_token(&credentials.refresh_token, &workspace.organization_id)
         .map_err(|error| anyhow::anyhow!("refresh WorkOS session: {error}"))?;
     if refreshed.organization_id.as_deref() != Some(workspace.organization_id.as_str()) {
         bail!("WorkOS did not authorize workspace {}", workspace.slug);
@@ -594,8 +539,8 @@ fn refresh_for_workspace(
         bail!("WorkOS refreshed a different user identity");
     }
     Ok(Credentials {
-        access_token: refreshed.access_token.into_inner(),
-        refresh_token: refreshed.refresh_token.into_inner(),
+        access_token: refreshed.access_token,
+        refresh_token: refreshed.refresh_token,
         active_organization_id: refreshed.organization_id,
     })
 }
@@ -728,10 +673,14 @@ mod tests {
         }
     }
 
-    fn write_json_response(mut stream: &std::net::TcpStream, body: &str) {
+    fn write_json_response(stream: &std::net::TcpStream, body: &str) {
+        write_json_response_with_status(stream, "200 OK", body);
+    }
+
+    fn write_json_response_with_status(mut stream: &std::net::TcpStream, status: &str, body: &str) {
         write!(
             stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
         )
@@ -990,12 +939,98 @@ mod tests {
     #[test]
     fn admin_only_identity_needs_no_workspace_or_scope_refresh() {
         let workos = public_workos_client("client_test", "http://127.0.0.1:1").unwrap();
-        let runtime = tokio::runtime::Runtime::new().unwrap();
         let credentials = admin_credentials("org_admin");
-        let scoped =
-            scope_fleet_admin_credentials(&runtime, &workos, credentials, "org_admin").unwrap();
+        let scoped = scope_fleet_admin_credentials(&workos, credentials, "org_admin").unwrap();
         assert_eq!(scoped.organization_id, "org_admin");
         assert_eq!(scoped.subject, "user_admin");
+    }
+
+    #[test]
+    fn device_login_preserves_workos_request_and_polling_contract() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let request = String::from_utf8(read_http_request(&stream)).unwrap();
+            assert!(request.starts_with("POST /user_management/authorize/device HTTP/1.1\r\n"));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("\r\nuser-agent: workos-rust/2.5.0\r\n"),
+                "the narrow client must preserve the replaced SDK's wire identity"
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(
+                    request.split_once("\r\n\r\n").unwrap().1
+                )
+                .unwrap(),
+                serde_json::json!({ "client_id": "client_test" })
+            );
+            write_json_response(
+                &stream,
+                &serde_json::json!({
+                    "device_code": "device_test",
+                    "user_code": "ABCD-EFGH",
+                    "verification_uri": "https://example.com/activate",
+                    "verification_uri_complete": "https://example.com/activate?code=ABCD-EFGH",
+                    "expires_in": 600,
+                    "interval": 0.001
+                })
+                .to_string(),
+            );
+
+            let (stream, _) = listener.accept().unwrap();
+            let request = String::from_utf8(read_http_request(&stream)).unwrap();
+            assert!(request.starts_with("POST /user_management/authenticate HTTP/1.1\r\n"));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(
+                    request.split_once("\r\n\r\n").unwrap().1
+                )
+                .unwrap(),
+                serde_json::json!({
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                    "client_id": "client_test",
+                    "device_code": "device_test"
+                })
+            );
+            write_json_response_with_status(
+                &stream,
+                "400 Bad Request",
+                r#"{"error":"authorization_pending","error_description":"still waiting"}"#,
+            );
+
+            let (stream, _) = listener.accept().unwrap();
+            let request = String::from_utf8(read_http_request(&stream)).unwrap();
+            assert!(request.contains(r#""device_code":"device_test""#));
+            write_json_response(
+                &stream,
+                &serde_json::json!({
+                    "user": {
+                        "object": "user",
+                        "id": "user_test",
+                        "email": "user@example.com",
+                        "email_verified": true,
+                        "created_at": "2026-08-10T00:00:00.000Z",
+                        "updated_at": "2026-08-10T00:00:00.000Z"
+                    },
+                    "organization_id": "org_test",
+                    "access_token": "access-test",
+                    "refresh_token": "refresh-test"
+                })
+                .to_string(),
+            );
+        });
+
+        let workos = public_workos_client("client_test", &format!("http://{address}")).unwrap();
+        let device = workos.start_device_authorization().unwrap();
+        let authenticated = workos
+            .poll_device_code(&device.device_code, Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(authenticated.user.id, "user_test");
+        assert_eq!(authenticated.organization_id.as_deref(), Some("org_test"));
+        assert_eq!(authenticated.access_token, "access-test");
+        assert_eq!(authenticated.refresh_token, "refresh-test");
+        server.join().unwrap();
     }
 
     #[test]
@@ -1032,9 +1067,7 @@ mod tests {
             .unwrap();
         });
         let workos = public_workos_client("client_test", &format!("http://{address}")).unwrap();
-        let runtime = tokio::runtime::Runtime::new().unwrap();
         let scoped = scope_fleet_admin_credentials(
-            &runtime,
             &workos,
             admin_credentials("org_ordinary_workspace"),
             "org_admin",
