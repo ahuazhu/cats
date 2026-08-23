@@ -100,6 +100,7 @@ pub trait SemanticNodeRecoveryStore: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryFinish<'a> {
     Recovered,
+    RetrySource { code: &'a str, message: &'a str },
     Failed { code: &'a str, message: &'a str },
 }
 
@@ -318,10 +319,26 @@ where
 
         if let Err(failure) = self.make_source_cold(&claim).await {
             // The source has not crossed the Cold data-safety barrier. Keep
-            // its original product state, placement, and exact claim even
-            // when noded reports an explicit failure. This preserves the
-            // intended target and lets a later pass retry after the source is
-            // repaired instead of terminalizing an unrecoverable Failure row.
+            // its original product state and placement, but release the exact
+            // unused target reservation. No target effect starts before this
+            // barrier, so a later pass can safely choose a currently running
+            // target after the source is repaired. This also prevents the old
+            // target's own drain from being pinned by a retryable source.
+            let settled = self
+                .store
+                .finish(
+                    &claim,
+                    RecoveryFinish::RetrySource {
+                        code: &failure.code,
+                        message: &failure.message,
+                    },
+                )
+                .await?;
+            if settled.is_none() {
+                return Err(NodeRecoveryError {
+                    message: "blocked source Cold claim is no longer current".to_owned(),
+                });
+            }
             return Ok(blocked_drain_cat(
                 &candidate.cat_id,
                 &failure.code,
@@ -815,6 +832,9 @@ impl PostgresSemanticNodeRecoveryStore {
                 .execute(move |store| {
                     let result = match &owned_result {
                         OwnedRecoveryFinish::Recovered => SemanticCatRecoveryResult::Recovered,
+                        OwnedRecoveryFinish::RetrySource { code, message } => {
+                            SemanticCatRecoveryResult::RetrySource { code, message }
+                        }
                         OwnedRecoveryFinish::Failed { code, message } => {
                             SemanticCatRecoveryResult::Failed { code, message }
                         }
@@ -970,6 +990,10 @@ impl SemanticNodeRecoveryStore for PostgresSemanticNodeRecoveryStore {
     ) -> RecoveryFuture<'a, Result<Option<CatRecord>, StoreError>> {
         let owned_result = match result {
             RecoveryFinish::Recovered => OwnedRecoveryFinish::Recovered,
+            RecoveryFinish::RetrySource { code, message } => OwnedRecoveryFinish::RetrySource {
+                code: code.to_owned(),
+                message: message.to_owned(),
+            },
             RecoveryFinish::Failed { code, message } => OwnedRecoveryFinish::Failed {
                 code: code.to_owned(),
                 message: message.to_owned(),
@@ -981,6 +1005,7 @@ impl SemanticNodeRecoveryStore for PostgresSemanticNodeRecoveryStore {
 
 enum OwnedRecoveryFinish {
     Recovered,
+    RetrySource { code: String, message: String },
     Failed { code: String, message: String },
 }
 
@@ -1106,6 +1131,7 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum OwnedFinish {
         Recovered,
+        RetrySource { code: String, message: String },
         Failed { code: String, message: String },
     }
 
@@ -1209,6 +1235,10 @@ mod tests {
             Box::pin(async move {
                 let result = match result {
                     RecoveryFinish::Recovered => OwnedFinish::Recovered,
+                    RecoveryFinish::RetrySource { code, message } => OwnedFinish::RetrySource {
+                        code: code.to_owned(),
+                        message: message.to_owned(),
+                    },
                     RecoveryFinish::Failed { code, message } => OwnedFinish::Failed {
                         code: code.to_owned(),
                         message: message.to_owned(),
@@ -1686,7 +1716,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planned_drain_cold_failure_retains_the_relocation_claim() {
+    async fn planned_drain_cold_failure_releases_the_target_but_preserves_source_retry() {
         let (service, observed) = service(
             RecoveryAdmission::Claimed(claim(CatState::Running)),
             [Ok(NodeCommandResult::Failed {
@@ -1707,12 +1737,18 @@ mod tests {
             CatDrainStatus::Blocked { code, .. } if code == "flush_failed"
         ));
         let observed = observed.lock().expect("observed");
-        assert!(observed.finishes.is_empty());
+        assert_eq!(
+            observed.finishes,
+            [OwnedFinish::RetrySource {
+                code: "flush_failed".to_owned(),
+                message: "retained volume did not reach R=L".to_owned(),
+            }]
+        );
         assert!(!observed.events.iter().any(|event| event == "endpoint"));
     }
 
     #[tokio::test]
-    async fn planned_drain_ambiguous_source_timeout_retains_the_relocation_claim() {
+    async fn planned_drain_ambiguous_source_releases_the_target_but_preserves_source_retry() {
         let (service, observed) = service(
             RecoveryAdmission::Claimed(claim(CatState::Running)),
             [Err(NodeClientError::Timeout)],
@@ -1730,7 +1766,13 @@ mod tests {
             CatDrainStatus::Blocked { code, .. } if code == "drain_source_timeout"
         ));
         let observed = observed.lock().expect("observed");
-        assert!(observed.finishes.is_empty());
+        assert_eq!(
+            observed.finishes,
+            [OwnedFinish::RetrySource {
+                code: "drain_source_timeout".to_owned(),
+                message: "source noded Cold request timed out".to_owned(),
+            }]
+        );
         assert!(!observed.events.iter().any(|event| event == "endpoint"));
     }
 

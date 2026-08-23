@@ -33,17 +33,20 @@ ADR-0059 模型没有独立 Operation/job 表，本次也不恢复已被取代�
    volume 已远端持久且本地 writer 已关闭；在目标 noded Run；若原状态为 Suspended 或 Warm，再转换回该
    状态。只有原状态为 Running 且目标 Ready 后才发布新入口；Warm/Suspended 的瞬时 Running 不发布入口。
 6. 源 Cold 成功是目标执行的前置条件。只要源尚未确认 Cold，包括 noded 明确返回 failure/conflict，都只
-   返回 `blocked` 并保留原 state、source placement 和 exact relocation claim；不能在数据屏障未越过时
-   terminalize 成不可重试的 `failure`。timeout、transport failure、malformed response 或状态查询不完整
-   遵守相同规则，后续 pass 必须先发现 postcondition。目标启动/恢复明确失败时，Cat 以 `failure` 留在目标
-   Node 供清理；目标结果不明仍保留 claim。旧 Node 不会由 drain 接口自动关闭。
+   返回 `blocked` 并保留原 state 和 source placement；不能在数据屏障未越过时 terminalize 成不可重试的
+   `failure`。目标端在这条屏障前尚未执行，因此同一 exact settlement 释放 target reservation，后续 pass
+   重新选择当前 running Node；timeout、transport failure、malformed response 或状态查询不完整遵守相同
+   规则。目标启动/恢复明确失败时，Cat 以 `failure` 留在目标 Node 供清理；目标结果不明仍保留 exact
+   claim。旧 Node 不会由 drain 接口自动关闭。
 7. 成功 settlement 只接受 exact source placement、target reservation 和原 state，并将稳定 placement
    改为目标、恢复原 state、清空 action。相同 settlement 可以安全重放；不匹配的迟到结果不能覆盖新事实。
 8. Control 的独立周期 recovery worker 扫描所有仍为 `draining` 且仍有 Cat placement 的 Node，并再次执行
    同一发现/claim/discovery 流程。扫描同时包含 cordon 前已经提交到 `current_action_node_id`、但尚未形成
    稳定 placement 的 reservation。因此 HTTP 取消、Control 重启、在途 create/run 和多个 replica 的重复
    执行都不会让 Node 过早报告 drained。这个 worker 与 heartbeat/liveness probe 循环分别推进；慢 noded
-   lifecycle 请求不能推迟其他 Node 的失联判定，两者都响应同一进程 shutdown 并取消当前有界工作。
+   lifecycle 请求不能推迟其他 Node 的失联判定，两者都响应同一进程 shutdown 并取消当前有界工作。一个
+   Node 作为 relocation target 的 reservation 也阻止它误报 drained；若源 Cold 阻塞，第 6 条会释放这个
+   尚未使用的 reservation，因此不会永久占住目标 Node。
 9. 响应为 HTTP 200 的闭集报告：顶层 `drained` 表示本次发现的 Cat 都已迁移或已变成 stale；任一 Cat
    无法迁移时为 `blocked`，并返回稳定 code/message。认证、输入、Node 状态或 Store 故障仍使用通用 HTTP
    错误。

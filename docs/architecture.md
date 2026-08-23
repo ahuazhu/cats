@@ -226,9 +226,9 @@ running -> draining -> 停止新 placement
 fleet administrator 调用 `POST /v1/admin/nodes/{node_id}/actions/drain` 启动该流程。Control 先提交
 `draining`，再为每个 Cat 持久化 exact 目标 reservation；请求取消或 Control 重启后，周期任务会从
 PostgreSQL 当前行继续。已有生命周期动作不会被抢占，没有其他 running Node、源端不能安全 Cold 或目标
-恢复失败都会返回 `blocked`。结果不明时保留 exact claim；预留目标失联时在 row lock 内 exact retarget，
-旧目标的迟到 settlement 不能覆盖新目标。接口不自动关闭或重新开放 Node，完成后 Node 仍保持
-`draining`。
+恢复失败都会返回 `blocked`。源 Cold 未成功时保留源 state/placement 并释放尚未使用的目标 reservation，
+下一周期重新 claim；目标恢复结果不明时保留 exact claim。预留目标失联时在 row lock 内 exact retarget，
+旧目标的迟到 settlement 不能覆盖新目标。接口不自动关闭或重新开放 Node，完成后 Node 仍保持 `draining`。
 
 异常失联的目标流程是：
 

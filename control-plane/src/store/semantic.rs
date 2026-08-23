@@ -386,6 +386,7 @@ pub enum ClaimSemanticCatRecoveryOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticCatRecoveryResult<'a> {
     Recovered,
+    RetrySource { code: &'a str, message: &'a str },
     Failed { code: &'a str, message: &'a str },
 }
 
@@ -1581,8 +1582,9 @@ impl Store {
 
     /// Settle only the exact relocation lane and source placement. Success
     /// publishes the new placement while retaining the pre-relocation product
-    /// state. Source Cold failures do not settle this lane; a target
-    /// start/restore failure remains attached to the target for cleanup.
+    /// state. A source Cold failure releases only the unused target
+    /// reservation while preserving retryable source state and placement; a
+    /// target start/restore failure remains attached to that target for cleanup.
     pub fn finish_semantic_cat_recovery(
         &self,
         settlement: SemanticCatRecoverySettlement<'_>,
@@ -1604,6 +1606,12 @@ impl Store {
                     settlement.target_node_id,
                     None,
                     None,
+                ),
+                SemanticCatRecoveryResult::RetrySource { code, message } => (
+                    settlement.target_state.as_str(),
+                    settlement.source_node_id,
+                    Some(code),
+                    Some(message),
                 ),
                 SemanticCatRecoveryResult::Failed { code, message } => (
                     CatState::Failure.as_str(),

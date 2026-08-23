@@ -657,6 +657,87 @@ fn planned_drain_retargets_an_offline_reserved_node_with_an_exact_claim() {
 }
 
 #[test]
+fn blocked_source_releases_a_draining_target_and_reclaims_elsewhere() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    register_second_node(&store);
+    register_third_node(&store);
+    create_running_cat_on(
+        &store,
+        "cat-drain-release-target",
+        "drain-release-target",
+        "node-a",
+        2,
+        1 << 30,
+    );
+    store
+        .transition_semantic_node_status("node-a", &[NodeStatus::Running], NodeStatus::Draining)
+        .unwrap()
+        .unwrap();
+
+    let ClaimSemanticCatRecoveryOutcome::Claimed(first) = store
+        .claim_semantic_cat_drain("node-a", "cat-drain-release-target")
+        .unwrap()
+    else {
+        panic!("draining source must receive its first relocation claim")
+    };
+    assert_eq!(first.target_node_id, "node-b");
+    store
+        .transition_semantic_node_status("node-b", &[NodeStatus::Running], NodeStatus::Draining)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .list_semantic_node_drain_cats("node-b")
+            .unwrap()
+            .into_iter()
+            .map(|cat| cat.cat.cat_id)
+            .collect::<Vec<_>>(),
+        ["cat-drain-release-target"]
+    );
+
+    let released = store
+        .finish_semantic_cat_recovery(
+            SemanticCatRecoverySettlement {
+                cat_id: "cat-drain-release-target",
+                source_node_id: "node-a",
+                target_node_id: "node-b",
+                target_state: CatState::Running,
+            },
+            SemanticCatRecoveryResult::RetrySource {
+                code: "flush_failed",
+                message: "source did not reach Cold",
+            },
+        )
+        .unwrap()
+        .expect("blocked source releases the exact unused target");
+    assert_eq!(released.cat.state, Some(CatState::Running));
+    assert_eq!(released.cat.node_id.as_deref(), Some("node-a"));
+    assert_eq!(released.cat.current_action, None);
+    assert_eq!(released.cat.current_action_node_id, None);
+    assert_eq!(
+        released.cat.last_error_code.as_deref(),
+        Some("flush_failed")
+    );
+    assert!(store
+        .list_semantic_node_drain_cats("node-b")
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store.list_semantic_draining_nodes_with_cats().unwrap(),
+        ["node-a"]
+    );
+
+    let ClaimSemanticCatRecoveryOutcome::Claimed(retry) = store
+        .claim_semantic_cat_drain("node-a", "cat-drain-release-target")
+        .unwrap()
+    else {
+        panic!("source retry must reclaim on another running target")
+    };
+    assert_eq!(retry.target_node_id, "node-c");
+}
+
+#[test]
 fn planned_drain_blocks_on_an_inflight_placement_reserved_before_cordon() {
     let (store, _) = store_and_url();
     register_node(&store);
