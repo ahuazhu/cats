@@ -61,7 +61,7 @@ export function runtimeCatView(cat) {
     name: cat.cat_slug,
     spec: { cpus: cat.cpu, memory_mib: Math.floor(Number(cat.memory_bytes) / 1048576) },
     desired_state: cat.current_action || cat.state || "unknown",
-    observed_state: cat.state || actionState || "unknown",
+    observed_state: actionState || cat.state || "unknown",
     created_at_unix: Math.floor(Number(cat.created_at_unix_ms) / 1000),
     auto_suspend: false,
     expires_at_unix: null,

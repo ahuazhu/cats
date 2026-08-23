@@ -183,7 +183,7 @@ test("semantic Cat and Disk views map directly into the shipped console rows", (
 
 test("semantic Cat transition names are readable", () => {
   assert.equal(runtimeCatView({ current_action: "create" }).observed_state, "creating");
-  assert.equal(runtimeCatView({ current_action: "run" }).observed_state, "starting");
+  assert.equal(runtimeCatView({ state: "cold", current_action: "run" }).observed_state, "starting");
   assert.equal(runtimeCatView({ current_action: "cold" }).observed_state, "cooling");
 });
 
