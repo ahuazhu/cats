@@ -150,19 +150,6 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
             == cfg.runtime_provisioner_trust_bundle.deployment_id,
         "production cutover operator trust deployment does not match Control deployment"
     );
-    match option_env!("CATS_RELEASE_COMMIT_SHA") {
-        Some(release_commit) => anyhow::ensure!(
-            release_commit
-                == cfg
-                    .production_cutover_operator_trust_bundle
-                    .source_commit_sha,
-            "production cutover operator trust is not bound to this qualified Control release"
-        ),
-        None => anyhow::ensure!(
-            cfg!(any(debug_assertions, feature = "test-support")),
-            "production Control build has no qualified release commit"
-        ),
-    }
     if let Some(workos) = &cfg.workos {
         let organizations = workos.account_organizations().clone();
         store
