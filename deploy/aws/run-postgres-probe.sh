@@ -17,7 +17,14 @@ if [[ -n $postgres_url_file ]]; then
     echo "postgres-url-file must be an absolute regular file" >&2
     exit 64
   }
-  [[ -s $postgres_url_file && $(stat --format='%a' "$postgres_url_file") == 600 ]] || {
+  postgres_url_mode=""
+  if ! postgres_url_mode="$(stat --format='%a' "$postgres_url_file" 2>/dev/null)"; then
+    postgres_url_mode="$(stat -f '%Lp' "$postgres_url_file" 2>/dev/null)" || {
+      echo "postgres-url-file mode could not be read" >&2
+      exit 64
+    }
+  fi
+  [[ -s $postgres_url_file && $postgres_url_mode == 600 ]] || {
     echo "postgres-url-file must be a non-empty mode-0600 file" >&2
     exit 64
   }
