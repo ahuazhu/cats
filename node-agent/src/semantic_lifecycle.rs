@@ -165,6 +165,7 @@ struct ActiveAction {
     sequence: u64,
     action: SemanticCatAction,
     cancellation: SemanticActionCancellation,
+    completion: watch::Sender<Option<SemanticCatResponse>>,
 }
 
 #[derive(Debug, Default)]
@@ -633,7 +634,7 @@ impl SemanticNodeService {
         sequence: u64,
         action: SemanticCatAction,
     ) -> SemanticCatResponse {
-        let (config, cancellation) = {
+        let (config, cancellation, completion_sender, mut completion) = {
             let state = lane.state();
             let record = state
                 .record
@@ -643,100 +644,58 @@ impl SemanticNodeService {
                 .active
                 .as_ref()
                 .expect("started action remains active");
-            (record.config.clone(), active.cancellation.clone())
+            (
+                record.config.clone(),
+                active.cancellation.clone(),
+                active.completion.clone(),
+                active.completion.subscribe(),
+            )
         };
-        let effect = self.effects.execute(
-            SemanticEffectRequest {
-                cat_id: cat_id.to_owned(),
-                action,
-                config,
-            },
-            cancellation,
-        );
-        let result = tokio::spawn(effect).await.unwrap_or_else(|error| {
-            Err(SemanticEffectError::new(
-                SemanticErrorCode::InternalError,
-                format!("physical effect task failed: {error}"),
-            ))
+        let effects = Arc::clone(&self.effects);
+        let effect_cat_id = cat_id.to_owned();
+        let effect_lane = Arc::clone(&lane);
+        tokio::spawn(async move {
+            let effect = effects.execute(
+                SemanticEffectRequest {
+                    cat_id: effect_cat_id.clone(),
+                    action,
+                    config,
+                },
+                cancellation,
+            );
+            let result = tokio::spawn(effect).await.unwrap_or_else(|error| {
+                Err(SemanticEffectError::new(
+                    SemanticErrorCode::InternalError,
+                    format!("physical effect task failed: {error}"),
+                ))
+            });
+            let response = complete_effect(&effect_cat_id, &effect_lane, sequence, action, result);
+            completion_sender.send_replace(Some(response));
+            effect_lane.publish_change();
         });
 
-        let response = {
-            let mut state = lane.state();
-            let is_current = state
-                .active
-                .as_ref()
-                .is_some_and(|active| active.sequence == sequence && active.action == action);
-            if !is_current {
-                response_error(
+        loop {
+            if let Some(response) = completion.borrow_and_update().clone() {
+                return response;
+            }
+            if completion.changed().await.is_err() {
+                let (state, active_action) = {
+                    let state = lane.state();
+                    (
+                        state.record.as_ref().and_then(|record| record.state),
+                        state.active.as_ref().map(|active| active.action),
+                    )
+                };
+                return response_error(
                     cat_id.to_owned(),
                     SemanticResponseStatus::Failed,
                     "internal_error",
-                    "action completion did not match the active Cat action",
-                    state.record.as_ref().and_then(|record| record.state),
-                    state.active.as_ref().map(|active| active.action),
-                )
-            } else {
-                state.active = None;
-                let cancelled_for_destroy =
-                    state.destroy_pending && action != SemanticCatAction::Destroy;
-                match result {
-                    Ok(()) if cancelled_for_destroy => response_error(
-                        cat_id.to_owned(),
-                        SemanticResponseStatus::Failed,
-                        "action_cancelled",
-                        "action was cancelled by destroy",
-                        state.record.as_ref().and_then(|record| record.state),
-                        None,
-                    ),
-                    Ok(()) => {
-                        let target = action.target_state();
-                        if let Some(record) = &mut state.record {
-                            record.state = Some(target);
-                        }
-                        if action == SemanticCatAction::Destroy {
-                            state.destroy_pending = false;
-                        }
-                        SemanticCatResponse {
-                            status: SemanticResponseStatus::Ok,
-                            code: success_code(action).to_owned(),
-                            cat_id: cat_id.to_owned(),
-                            state: Some(target),
-                            active_action: None,
-                            error: None,
-                        }
-                    }
-                    Err(_error) if cancelled_for_destroy => response_error(
-                        cat_id.to_owned(),
-                        SemanticResponseStatus::Failed,
-                        "action_cancelled",
-                        "action was cancelled by destroy",
-                        state.record.as_ref().and_then(|record| record.state),
-                        None,
-                    ),
-                    Err(error) => {
-                        if let Some(record) = &mut state.record {
-                            record.state = Some(SemanticCatState::Failure);
-                        }
-                        if action == SemanticCatAction::Destroy {
-                            state.destroy_pending = false;
-                        }
-                        SemanticCatResponse {
-                            status: SemanticResponseStatus::Failed,
-                            code: error_code_name(error.code).to_owned(),
-                            cat_id: cat_id.to_owned(),
-                            state: Some(SemanticCatState::Failure),
-                            active_action: None,
-                            error: Some(WireErrorBody {
-                                code: error.code,
-                                message: error.message,
-                            }),
-                        }
-                    }
-                }
+                    "physical effect completion channel closed",
+                    state,
+                    active_action,
+                );
             }
-        };
-        lane.publish_change();
-        response
+        }
     }
 
     pub fn get(&self, cat_id: &str) -> Option<SemanticCatView> {
@@ -770,12 +729,96 @@ impl NodeResetExecutor for SemanticNodeService {
 fn begin_action(state: &mut CatLaneState, action: SemanticCatAction) -> u64 {
     state.next_sequence = state.next_sequence.wrapping_add(1);
     let sequence = state.next_sequence;
+    let (completion, _) = watch::channel(None);
     state.active = Some(ActiveAction {
         sequence,
         action,
         cancellation: SemanticActionCancellation::new(),
+        completion,
     });
     sequence
+}
+
+fn complete_effect(
+    cat_id: &str,
+    lane: &CatLane,
+    sequence: u64,
+    action: SemanticCatAction,
+    result: Result<(), SemanticEffectError>,
+) -> SemanticCatResponse {
+    let mut state = lane.state();
+    let is_current = state
+        .active
+        .as_ref()
+        .is_some_and(|active| active.sequence == sequence && active.action == action);
+    if !is_current {
+        return response_error(
+            cat_id.to_owned(),
+            SemanticResponseStatus::Failed,
+            "internal_error",
+            "action completion did not match the active Cat action",
+            state.record.as_ref().and_then(|record| record.state),
+            state.active.as_ref().map(|active| active.action),
+        );
+    }
+
+    state.active = None;
+    let cancelled_for_destroy = state.destroy_pending && action != SemanticCatAction::Destroy;
+    let response = match result {
+        Ok(()) if cancelled_for_destroy => response_error(
+            cat_id.to_owned(),
+            SemanticResponseStatus::Failed,
+            "action_cancelled",
+            "action was cancelled by destroy",
+            state.record.as_ref().and_then(|record| record.state),
+            None,
+        ),
+        Ok(()) => {
+            let target = action.target_state();
+            if let Some(record) = &mut state.record {
+                record.state = Some(target);
+            }
+            if action == SemanticCatAction::Destroy {
+                state.destroy_pending = false;
+            }
+            SemanticCatResponse {
+                status: SemanticResponseStatus::Ok,
+                code: success_code(action).to_owned(),
+                cat_id: cat_id.to_owned(),
+                state: Some(target),
+                active_action: None,
+                error: None,
+            }
+        }
+        Err(_error) if cancelled_for_destroy => response_error(
+            cat_id.to_owned(),
+            SemanticResponseStatus::Failed,
+            "action_cancelled",
+            "action was cancelled by destroy",
+            state.record.as_ref().and_then(|record| record.state),
+            None,
+        ),
+        Err(error) => {
+            if let Some(record) = &mut state.record {
+                record.state = Some(SemanticCatState::Failure);
+            }
+            if action == SemanticCatAction::Destroy {
+                state.destroy_pending = false;
+            }
+            SemanticCatResponse {
+                status: SemanticResponseStatus::Failed,
+                code: error_code_name(error.code).to_owned(),
+                cat_id: cat_id.to_owned(),
+                state: Some(SemanticCatState::Failure),
+                active_action: None,
+                error: Some(WireErrorBody {
+                    code: error.code,
+                    message: error.message,
+                }),
+            }
+        }
+    };
+    response
 }
 
 fn parse_cat_id(value: &str) -> Option<Id> {
@@ -1318,6 +1361,38 @@ mod tests {
 
         assert_eq!(first.status, SemanticResponseStatus::Ok);
         assert_eq!(second.status, SemanticResponseStatus::AlreadyDone);
+        assert_eq!(effects.creates.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dropped_create_waiter_does_not_abandon_the_node_owned_effect() {
+        let effects = Arc::new(RecordingEffects::default());
+        effects.create_delay_ms.store(30, Ordering::SeqCst);
+        let service = SemanticNodeService::new(effects.clone());
+        let first_service = service.clone();
+        let first =
+            tokio::spawn(async move { first_service.create("cat_01".to_owned(), config()).await });
+        tokio::time::timeout(Duration::from_secs(1), effects.create_started.notified())
+            .await
+            .expect("create effect starts");
+
+        first.abort();
+        let _ = first.await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let cat = service.get("cat_01").expect("Cat marker remains");
+                if cat.state == Some(SemanticCatState::Running) && cat.active_action.is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Node-owned effect reaches its terminal state");
+
+        let replay = service.create("cat_01".to_owned(), config()).await;
+        assert_eq!(replay.status, SemanticResponseStatus::AlreadyDone);
         assert_eq!(effects.creates.load(Ordering::SeqCst), 1);
     }
 
