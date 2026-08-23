@@ -168,6 +168,12 @@ struct ActiveAction {
     completion: watch::Sender<Option<SemanticCatResponse>>,
 }
 
+enum EffectDecision {
+    Start(u64),
+    Join(watch::Receiver<Option<SemanticCatResponse>>),
+    WaitForChange,
+}
+
 #[derive(Debug, Default)]
 struct CatLaneState {
     record: Option<CatRecord>,
@@ -299,7 +305,6 @@ impl SemanticNodeService {
             Err(response) => return response,
         };
         loop {
-            let mut changed = lane.changed.subscribe();
             let decision = {
                 let mut state = lane.state();
                 if let Some(record) = &state.record {
@@ -329,7 +334,7 @@ impl SemanticNodeService {
                 }
                 if let Some(active) = &state.active {
                     if active.action == SemanticCatAction::Create {
-                        None
+                        EffectDecision::Join(active.completion.subscribe())
                     } else {
                         return busy_response(&cat_id, &state, "another action is active");
                     }
@@ -351,17 +356,23 @@ impl SemanticNodeService {
                         config: config.clone(),
                         state: None,
                     });
-                    Some(sequence)
+                    EffectDecision::Start(sequence)
                 }
             };
             match decision {
-                Some(sequence) => {
+                EffectDecision::Start(sequence) => {
                     return self
                         .run_effect(&cat_id, lane, sequence, SemanticCatAction::Create)
                         .await;
                 }
-                None => {
-                    let _ = changed.changed().await;
+                EffectDecision::Join(completion) => {
+                    let response = wait_for_effect_completion(&cat_id, &lane, completion).await;
+                    if response.status == SemanticResponseStatus::Failed {
+                        return response;
+                    }
+                }
+                EffectDecision::WaitForChange => {
+                    unreachable!("create never cancels another action")
                 }
             }
         }
@@ -461,7 +472,6 @@ impl SemanticNodeService {
             }
         }
         loop {
-            let mut changed = lane.changed.subscribe();
             let sequence = {
                 let mut state = lane.state();
                 let Some(record) = &state.record else {
@@ -495,7 +505,7 @@ impl SemanticNodeService {
                                 Some(active.action),
                             );
                         }
-                        None
+                        EffectDecision::Join(active.completion.subscribe())
                     } else {
                         return busy_response(&cat_id, &state, "another action is active");
                     }
@@ -531,15 +541,21 @@ impl SemanticNodeService {
                             .expect("the transition was validated against this Cat record")
                             .config = config.clone();
                     }
-                    Some(begin_action(&mut state, action))
+                    EffectDecision::Start(begin_action(&mut state, action))
                 }
             };
             match sequence {
-                Some(sequence) => {
+                EffectDecision::Start(sequence) => {
                     return self.run_effect(&cat_id, lane, sequence, action).await;
                 }
-                None => {
-                    let _ = changed.changed().await;
+                EffectDecision::Join(completion) => {
+                    let response = wait_for_effect_completion(&cat_id, &lane, completion).await;
+                    if response.status == SemanticResponseStatus::Failed {
+                        return response;
+                    }
+                }
+                EffectDecision::WaitForChange => {
+                    unreachable!("action never cancels another action")
                 }
             }
         }
@@ -578,21 +594,29 @@ impl SemanticNodeService {
                 }
                 state.destroy_pending = true;
                 if let Some(active) = &state.active {
-                    if active.action != SemanticCatAction::Destroy {
+                    if active.action == SemanticCatAction::Destroy {
+                        EffectDecision::Join(active.completion.subscribe())
+                    } else {
                         active.cancellation.cancel();
+                        EffectDecision::WaitForChange
                     }
-                    None
                 } else {
-                    Some(begin_action(&mut state, SemanticCatAction::Destroy))
+                    EffectDecision::Start(begin_action(&mut state, SemanticCatAction::Destroy))
                 }
             };
             match sequence {
-                Some(sequence) => {
+                EffectDecision::Start(sequence) => {
                     return self
                         .run_effect(&cat_id, lane, sequence, SemanticCatAction::Destroy)
                         .await;
                 }
-                None => {
+                EffectDecision::Join(completion) => {
+                    let response = wait_for_effect_completion(&cat_id, &lane, completion).await;
+                    if response.status == SemanticResponseStatus::Failed {
+                        return response;
+                    }
+                }
+                EffectDecision::WaitForChange => {
                     let _ = changed.changed().await;
                 }
             }
@@ -634,7 +658,7 @@ impl SemanticNodeService {
         sequence: u64,
         action: SemanticCatAction,
     ) -> SemanticCatResponse {
-        let (config, cancellation, completion_sender, mut completion) = {
+        let (config, cancellation, completion_sender, completion) = {
             let state = lane.state();
             let record = state
                 .record
@@ -674,28 +698,7 @@ impl SemanticNodeService {
             effect_lane.publish_change();
         });
 
-        loop {
-            if let Some(response) = completion.borrow_and_update().clone() {
-                return response;
-            }
-            if completion.changed().await.is_err() {
-                let (state, active_action) = {
-                    let state = lane.state();
-                    (
-                        state.record.as_ref().and_then(|record| record.state),
-                        state.active.as_ref().map(|active| active.action),
-                    )
-                };
-                return response_error(
-                    cat_id.to_owned(),
-                    SemanticResponseStatus::Failed,
-                    "internal_error",
-                    "physical effect completion channel closed",
-                    state,
-                    active_action,
-                );
-            }
-        }
+        wait_for_effect_completion(cat_id, &lane, completion).await
     }
 
     pub fn get(&self, cat_id: &str) -> Option<SemanticCatView> {
@@ -715,6 +718,35 @@ impl SemanticNodeService {
                 .into_iter()
                 .filter_map(|(cat_id, lane)| view(&cat_id, &lane.state()))
                 .collect(),
+        }
+    }
+}
+
+async fn wait_for_effect_completion(
+    cat_id: &str,
+    lane: &CatLane,
+    mut completion: watch::Receiver<Option<SemanticCatResponse>>,
+) -> SemanticCatResponse {
+    loop {
+        if let Some(response) = completion.borrow_and_update().clone() {
+            return response;
+        }
+        if completion.changed().await.is_err() {
+            let (state, active_action) = {
+                let state = lane.state();
+                (
+                    state.record.as_ref().and_then(|record| record.state),
+                    state.active.as_ref().map(|active| active.action),
+                )
+            };
+            return response_error(
+                cat_id.to_owned(),
+                SemanticResponseStatus::Failed,
+                "internal_error",
+                "physical effect completion channel closed",
+                state,
+                active_action,
+            );
         }
     }
 }
@@ -1256,6 +1288,7 @@ mod tests {
         calls: Mutex<Vec<SemanticCatAction>>,
         creates: AtomicUsize,
         block_create: AtomicBool,
+        fail_create: AtomicBool,
         create_delay_ms: AtomicUsize,
         create_started: Notify,
     }
@@ -1285,6 +1318,8 @@ mod tests {
             }
             let blocked = self.block_create.load(Ordering::SeqCst)
                 && request.action == SemanticCatAction::Create;
+            let fail_create = self.fail_create.load(Ordering::SeqCst)
+                && request.action == SemanticCatAction::Create;
             let delay_ms = self.create_delay_ms.load(Ordering::SeqCst);
             Box::pin(async move {
                 if blocked {
@@ -1304,6 +1339,12 @@ mod tests {
                             ));
                         }
                     }
+                }
+                if fail_create {
+                    return Err(SemanticEffectError::new(
+                        SemanticErrorCode::InternalError,
+                        "original physical failure",
+                    ));
                 }
                 Ok(())
             })
@@ -1361,6 +1402,31 @@ mod tests {
 
         assert_eq!(first.status, SemanticResponseStatus::Ok);
         assert_eq!(second.status, SemanticResponseStatus::AlreadyDone);
+        assert_eq!(effects.creates.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_create_returns_the_original_failure_to_every_waiter() {
+        let effects = Arc::new(RecordingEffects::default());
+        effects.create_delay_ms.store(30, Ordering::SeqCst);
+        effects.fail_create.store(true, Ordering::SeqCst);
+        let service = SemanticNodeService::new(effects.clone());
+        let first_service = service.clone();
+        let first =
+            tokio::spawn(async move { first_service.create("cat_01".to_owned(), config()).await });
+        tokio::time::timeout(Duration::from_secs(1), effects.create_started.notified())
+            .await
+            .expect("first create starts");
+
+        let second = service.create("cat_01".to_owned(), config()).await;
+        let first = first.await.expect("first create joins");
+
+        for response in [first, second] {
+            assert_eq!(response.status, SemanticResponseStatus::Failed);
+            let error = response.error.expect("failure includes an error");
+            assert_eq!(error.code, SemanticErrorCode::InternalError);
+            assert_eq!(error.message, "original physical failure");
+        }
         assert_eq!(effects.creates.load(Ordering::SeqCst), 1);
     }
 

@@ -279,7 +279,7 @@ impl SemanticCatEffects for InstalledSemanticCatEffects {
             tokio::task::spawn_blocking(move || inner.apply(request, cancellation))
                 .await
                 .map_err(|error| installed_error(format!("join installed effect: {error}")))?
-                .map_err(|error| installed_error(error.to_string()))
+                .map_err(format_installed_error)
         })
     }
 
@@ -289,7 +289,7 @@ impl SemanticCatEffects for InstalledSemanticCatEffects {
             tokio::task::spawn_blocking(move || inner.reset_all())
                 .await
                 .map_err(|error| installed_error(format!("join installed reset: {error}")))?
-                .map_err(|error| installed_error(error.to_string()))
+                .map_err(format_installed_error)
         })
     }
 }
@@ -307,6 +307,7 @@ struct ManagedCat {
     snapshot_directory: PathBuf,
     volumes: Vec<LocalVolume>,
     vmm: Option<Child>,
+    boot_descriptors: Option<cats_api::runtime_artifacts::VerifiedGuestRuntimeLaunch>,
 }
 
 struct LocalVolume {
@@ -346,6 +347,7 @@ impl InstalledInner {
             runtime_directory,
             volumes: Vec::with_capacity(config.mounts.len() + 1),
             vmm: None,
+            boot_descriptors: None,
         };
 
         let result = (|| {
@@ -386,21 +388,21 @@ impl InstalledInner {
             let disks = self.start_block_frontends(&mut cat, false)?;
             ch::prepare_memory_backing(&cat.memory_file, bytes_to_mib(cat.config.memory_bytes)?)
                 .context("prepare Guest memory backing")?;
-            cat.vmm = Some(
-                ch::spawn_vmm(&ChSpawn {
-                    cfg: &self.config.ch,
-                    api_sock: &cat.api_socket,
-                    vsock_sock: &cat.vsock_socket,
-                    serial_log: &cat.serial_log,
-                    cpus: cat.config.cpu,
-                    memory_mib: bytes_to_mib(cat.config.memory_bytes)?,
-                    memory_file: Some(&cat.memory_file),
-                    disks: &disks,
-                    restore_from: None,
-                    network: None,
-                })
-                .context("spawn Cloud Hypervisor")?,
-            );
+            let spawned = ch::spawn_vmm_retaining_boot(&ChSpawn {
+                cfg: &self.config.ch,
+                api_sock: &cat.api_socket,
+                vsock_sock: &cat.vsock_socket,
+                serial_log: &cat.serial_log,
+                cpus: cat.config.cpu,
+                memory_mib: bytes_to_mib(cat.config.memory_bytes)?,
+                memory_file: Some(&cat.memory_file),
+                disks: &disks,
+                restore_from: None,
+                network: None,
+            })
+            .context("spawn Cloud Hypervisor")?;
+            cat.vmm = Some(spawned.child);
+            cat.boot_descriptors = spawned.boot_descriptors;
             self.wait_for_guest(&mut cat)?;
             self.prepare_persistent_volumes(&mut cat)?;
             self.confirm_guest_ready(&mut cat)?;
@@ -1046,6 +1048,10 @@ impl InstalledInner {
             "Warm snapshot directory is absent"
         );
         check_cancellation(cancellation, CatAction::Run)?;
+        anyhow::ensure!(
+            self.config.ch.boot_contract.is_none() || cat.boot_descriptors.is_some(),
+            "Warm restore lost its verified Guest boot descriptors"
+        );
         let disks = self.start_block_frontends(cat, true)?;
         cat.vmm = Some(
             ch::spawn_vmm(&ChSpawn {
@@ -1550,6 +1556,10 @@ fn installed_error(message: impl Into<String>) -> SemanticEffectError {
     )
 }
 
+fn format_installed_error(error: anyhow::Error) -> SemanticEffectError {
+    installed_error(format!("{error:#}"))
+}
+
 fn check_cancellation(cancellation: &SemanticActionCancellation, action: CatAction) -> Result<()> {
     if action != CatAction::Destroy && cancellation.is_cancelled() {
         bail!("installed action was cancelled by destroy");
@@ -1572,6 +1582,17 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn installed_effect_error_preserves_the_physical_cause_chain() {
+        let error = anyhow::anyhow!("inner device failure").context("outer Guest operation");
+        let mapped = format_installed_error(error);
+
+        assert_eq!(
+            mapped.message,
+            "outer Guest operation: inner device failure"
+        );
+    }
 
     struct RecordingRootStore {
         root: CatVolume,
