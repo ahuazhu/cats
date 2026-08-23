@@ -632,8 +632,9 @@ Control Plane 可能在 `noded` 已经完成动作、但数据库尚未更新时
 
 生产 Control 通过 schema-scoped PostgreSQL advisory lock 选举一个 Destroy 恢复任务。它只扫描早于
 正常同步请求 deadline 的未结算 Destroy，每批和并发都有上限，并执行上述同一套 discovery-first 与
-exact settlement 规则。选举会话丢失或 shutdown 会取消恢复；其他 replica 可继续扫描。该扫描器和
-用户重试不能各自定义恢复规则，也不成为新的 lifecycle authority。
+exact settlement 规则。选举会话丢失会取消本轮恢复并在退避后重新参选；其他 replica 也可继续扫描。
+shutdown 才终止重选循环。该扫描器和用户重试不能各自定义恢复规则，也不成为新的 lifecycle
+authority。
 
 ## 11. 核心流程
 

@@ -463,7 +463,10 @@ async fn run_singleton_election<F, Fut>(
                             tracing::warn!(role = role.name(), %error, "singleton session lost");
                             task.abort();
                             let _ = task.await;
-                            return;
+                            if retry_or_shutdown(&mut shutdown).await {
+                                return;
+                            }
+                            continue 'election;
                         }
                     }
                 }
@@ -534,5 +537,66 @@ async fn close_singleton(session: crate::store::SingletonSession) {
     if let Err(error) = crate::store::execute_leadership_cleanup(move || session.close_now()).await
     {
         tracing::error!(%error, "singleton session cleanup failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn singleton_reenters_election_after_its_postgres_session_is_lost() {
+        let store = Arc::new(
+            Store::connect(&crate::testsupport::isolated_control_store_url(), None)
+                .expect("test Store"),
+        );
+        let starts = Arc::new(AtomicUsize::new(0));
+        let task_starts = Arc::clone(&starts);
+        let role = SingletonRole::SemanticDestroyRecovery;
+        let task = spawn_managed_singleton_task(Arc::clone(&store), role, move || {
+            let task_starts = Arc::clone(&task_starts);
+            async move {
+                task_starts.fetch_add(1, Ordering::AcqRel);
+                std::future::pending::<()>().await;
+            }
+        });
+
+        cats_test_support::wait_until_async("first singleton leadership", || async {
+            starts.load(Ordering::Acquire) == 1
+        })
+        .await;
+
+        let role_key = role.lock_key();
+        let terminated: bool = store
+            .execute(move |store| {
+                store.with(|client| {
+                    let rows = client.query(
+                        "SELECT pid FROM pg_catalog.pg_locks
+                          WHERE locktype='advisory'
+                            AND classid=hashtext(current_schema())::oid
+                            AND objid=$1::int4::oid
+                            AND objsubid=2
+                            AND granted
+                            AND pid<>pg_backend_pid()",
+                        &[&role_key],
+                    )?;
+                    assert_eq!(rows.len(), 1, "calibrate exact singleton lock lookup");
+                    let pid: i32 = rows[0].get(0);
+                    client
+                        .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+                        .map(|row| row.get(0))
+                })
+            })
+            .await
+            .expect("terminate elected singleton session");
+        assert!(terminated);
+
+        cats_test_support::wait_until_async("singleton leadership after session loss", || async {
+            starts.load(Ordering::Acquire) >= 2
+        })
+        .await;
+        task.shutdown().await.expect("singleton shutdown");
     }
 }

@@ -33,8 +33,9 @@ Destroy claim 后、调用 noded 前退出，使该行永久停留在未结算�
    保证只形成一个物理清理 lane。
 6. Control 组成一个 schema-scoped PostgreSQL advisory-lock 单例恢复任务。它周期读取早于正常同步请求
    deadline 的未结算 Destroy，每次只取有界批次并以有界并发执行 ADR-0059 的 discovery-first 恢复。
-   因此 Control 在 claim commit 后、noded dispatch 前退出也会自动重新派发。失去选举会话或 shutdown
-   会取消正在恢复的任务；其他 replica 随后取得选举并继续扫描。
+   因此 Control 在 claim commit 后、noded dispatch 前退出也会自动重新派发。失去选举会话会取消正在
+   恢复的任务并在退避后重建会话、重新参选；其他 replica 也可取得选举并继续扫描。shutdown 才终止
+   重选循环。
 7. 扫描只是发现，不是新 authority。Node 查询决定是否需要重发；数据库 exact settlement 决定结果
    是否仍属于当前 Destroy。heartbeat、日志、inventory 和 scanner 内存都不能结算动作。
 8. 本决策不增加 wire 字段、schema 列、Operation identity 或协议兼容分支。现有

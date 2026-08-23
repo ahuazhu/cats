@@ -10,7 +10,7 @@ pub enum SingletonRole {
 }
 
 impl SingletonRole {
-    fn lock_key(self) -> i32 {
+    pub(crate) fn lock_key(self) -> i32 {
         match self {
             Self::UsageProjector => 420_203,
             Self::SemanticDestroyRecovery => 420_204,
