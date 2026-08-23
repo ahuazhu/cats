@@ -3,7 +3,12 @@ name = "cats-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-publish = false
+description = "Command-line client for the Cats microVM platform"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["microvm", "virtualization", "cli"]
+publish = ["crates-io"]
 
 [[bin]]
 name = "cats"
