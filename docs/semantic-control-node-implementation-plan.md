@@ -1,6 +1,6 @@
 # 场景语义 Control/Node 协议实施计划
 
-- 状态：实施中
+- 状态：最终验证中
 - 开始日期：2026-08-22
 - 设计合同：[Control Plane 与 noded 同步协议设计](control-node-semantic-protocol.md)
 - 决策：[ADR-0059](decisions/0059-semantic-control-node-synchronous-protocol.md)
@@ -26,15 +26,15 @@
 | 数据库 | `control-plane/src/store/` | v19 表、slug 部分唯一索引、Disk RWO、动作 CAS、数据库心跳时间 | 已完成；schema、并发与 authority PG 回归已通过 |
 | Control 核心 | `control-plane/src/semantic_lifecycle.rs` | 同步动作、语义幂等、超时查询恢复、入口先撤后发 | 已完成并合入 |
 | noded HTTP client | `control-plane/src/semantic_noded_client.rs` | Control 同步调用 noded、Bearer、deadline、严格响应校验 | 已完成并合入 |
-| PersistentDisk | `control-plane/src/semantic_disk.rs`、`node-agent/src/semantic_mounts.rs` | create/binding/destroy 语义与 Guest 完整挂载确认 | Strict provision/delete backend 和 production composition 已完成；CH/Guest 物理挂载 E2E 待完成 |
+| PersistentDisk | `control-plane/src/semantic_disk.rs`、`node-agent/src/semantic_mounts.rs` | create/binding/destroy 语义与 Guest 完整挂载确认 | 已完成：真实 kernel-NBD、CH、Guest ext4 `/data` mount-ready、Cold detach/attach 和同盘重挂通过 |
 | CLI | `cmd/cats/` | slug 命令、同步 REST、`--mount`、GiB 解析、`node_name` 展示 | 已完成单协议切换；Cat/Disk `ls/get` 已改读当前 slug 实体，旧 Operation/pending/replay 已删除 |
-| noded 执行 | `node-agent/`、`cmd/noded/` | 同步 HTTP server、每 Cat 串行、destroy 清理、实际 effects 接入 | 真实 effects 已接入 Root/Persistent volume、blockd、CH、Guest 初始化/挂载及 Suspend/Warm/Cold/Destroy；Node 定向编译和新协议 HTTP 回归已通过，真实 E2E 待完成 |
-| Node 管理 | Control API、Node heartbeat client | 注册、`node_name`、`control_endpoint`、offline/reset/drain/恢复 | 已完成并接入生产进程 |
+| noded 执行 | `node-agent/`、`cmd/noded/` | 同步 HTTP server、每 Cat 串行、destroy 清理、实际 effects 接入 | 已完成：真实 effects 与 kernel-NBD production E2E 覆盖 Root/Persistent、CH、Guest、三休眠态、Destroy 和 reset |
+| Node 管理 | Control API、Node heartbeat client | 注册、`node_name`、`control_endpoint`、offline/reset/drain/恢复 | 已完成并接入生产进程；production 两台 Node 已分别以 `node_metal-1`/`metal-1`、`node_metal-2`/`metal-2` 注册并持续写入数据库时间心跳 |
 | Production adapters | Control adapter | Store/placement/noded/入口实现与公共 DTO 映射 | 已完成；公网 Gateway 细节按设计不在本协议范围 |
 | HTTP composition | Control router、AppState、controld/noded main | 新路由和服务接线，旧路由退出 | Control/noded 已完成；生产 Kubernetes 不再传入旧 Route 监听，也不再部署旧 Gateway |
 | 切换清理 | schema、router、旧模块和测试 | 删除旧表、旧入口、旧 runner 和只验证旧协议的测试 | 旧 HTTP/Store/schema、Node authority 模块、Route validator/launcher、worker Route artifact 与专属测试已删除；适用场景已迁入新协议测试 |
-| 纵向联调 | FakeVmm/PostgreSQL | Disk→Cat→状态动作→跨 Node→destroy→slug 复用 | 双 noded HTTP 已验证允许的短暂双跑、撤流/切流和源 reset 收敛；真实双 Node 与 CH/Guest E2E 待 production 完成 |
-| 最终门禁 | 全仓库与 Linux | 完整门禁、Linux Node/真实 VMM 冒烟 | 基线提交的 `quality.sh full` 与 `quality.sh linux` 已通过；当前 effects 变更待 production E2E 后重跑最终门禁 |
+| 纵向联调 | FakeVmm/PostgreSQL | Disk→Cat→状态动作→跨 Node→destroy→slug 复用 | 已完成：production metal-1→metal-2 恢复、目标物理实例、源 reset/re-register 和最终清理通过 |
+| 最终门禁 | 全仓库与 Linux | 完整门禁、Linux Node/真实 VMM 冒烟 | `5cc9723e` 的真实 VMM E2E 已通过；迁移旧 Node ID 部署断言后的精确 main `6daae688` 正在重跑本机 full 与 production x86_64 native full |
 
 ## 3. 集成顺序
 
@@ -52,7 +52,7 @@
 - [x] 将 `disk_id`、`volume_id`、filesystem UUID 和 ext4 格式贯穿 Control、noded 与 Guest 确认。
 - [x] 接入 Disk 的 Strict volume/disk authority provision/delete backend 和 BlobStore 空前缀后置条件。
 - [x] 合入 noded 同步执行服务并接入 FakeVmm。
-- [ ] 接入 Cloud Hypervisor 和持久卷的真实 `SemanticCatEffects`。（代码、Node 定向编译、新协议 HTTP 与 PG authority 回归已完成；待 Linux 门禁和 production CH/Guest E2E 后关闭。）
+- [x] 接入 Cloud Hypervisor 和持久卷的真实 `SemanticCatEffects`。（production kernel-NBD、CH、Guest mount-ready、Suspend/Warm/Cold、Cold detach/attach 与同盘重挂已通过。）
 - [x] 合入 Node 注册、心跳、主动探测、reset 和 drain 的服务与 HTTP client。
 - [x] 合入 offline Node 的 Cat 恢复核心和精确状态结算。
 - [x] 将 liveness 标记 offline 的结果接到恢复服务。
@@ -70,7 +70,7 @@
 - [x] 接入 Control 的 `withdraw → Node Ready → publish` 顺序。
 - [x] 通过真实 Control→noded HTTP 跑通 FakeVmm Cat 全状态机及每个动作的语义重试。
 - [x] 跑通 PostgreSQL Disk authority create/delete/retry/slug 复用和 semantic Store 并发场景。
-- [ ] 跑通真实双 Node 恢复和 CH/Guest 物理挂载 E2E。（双真实 HTTP noded 已通过；metal 验收脚本已迁到新协议并覆盖 Guest mount-ready，待 production 两台 Host 执行。）
+- [x] 跑通真实双 Node 恢复和 CH/Guest 物理挂载 E2E。（`cat_9465449693b2` 从 metal-1 恢复到 metal-2；源返回后 reset/re-register 且 local Cat/CH/blockd 均为 0。）
 
 ### 阶段 D：单协议切换
 
@@ -89,8 +89,8 @@
 - [x] Control 响应丢失后查询 noded 恢复。
 - [x] offline Node 下一次心跳触发 reset，关闭 placement、清理本地 Cat 后重新注册。
 - [x] `cargo test`/Clippy 的相关定向回归全部通过；本轮 `quality.sh fast` 已通过。
-- [x] 运行当前切换提交的 `./scripts/quality.sh full`。（clean commit `5ea86c3e` 全阶段通过。）
-- [ ] 运行当前切换提交适用的 Linux Node/Cloud Hypervisor 门禁。（基线已通过，本轮待发布 Host 执行。）
+- [ ] 运行当前切换提交的 `./scripts/quality.sh full`。（早期 clean commit 已通过；精确 main `6daae688` 正在最终重跑。）
+- [ ] 运行当前切换提交适用的 production x86_64 native full 门禁。（早期 release 已通过；精确 main `6daae688` 正在最终重跑。）
 
 ## 4. 已合入提交
 
@@ -130,6 +130,14 @@
 | `b0231f98`、`d07538ef` | 删除依赖已退役 `cat_records`/lifecycle authority 的 blockd NBD crash、root provision fixture 及其专属 Linux gate，并记录退出范围 | deployment contracts 70/70、blockd remaining targets 全通过、cargo-machete 通过；`quality.sh linux` 全阶段通过 |
 | `e581aefb` | 合入 main 的完整 production package/deploy/E2E 工具并解决 clean-slate composition 冲突；发布 ADR 顺延为 ADR-0060 | 合并前 `e83b7717` Linux compatibility gate 全阶段通过；最终提交门禁待运行 |
 | `78163788` | production deployer 删除退役 Gateway 计划/验证；production E2E 迁到同步 Cat/Disk slug 协议并覆盖三休眠态、重试、物理挂载屏障、绑定和 slug 复用 | package、deployer、production E2E 三个离线 fixture 通过；相关 deployment contracts 3/3 通过 |
+| `38b7eacd` | 合并最终退役测试清理与跨 Python 版本的安全 release transport 解包 | 本机 `quality.sh full`、`quality.sh linux` 全通过；production x86_64 native full receipt `job.shXFNb`、冻结日志 SHA-256 `1fa830d7f5459f824bf2cf4fcc739d4bd61ca1b8a04705ee22fb2d220a02450a` |
+| `44aa0ff1`、`62aa5f91` | production clean-slate Control 上线、worker memory 渲染修复，以及 semantic `node_id` 与展示 `node_name` 的部署映射修复 | `44aa0ff1` native full 通过；Terraform 定向测试 1/1；production 保存计划仅原地更新两条 association，0 add/0 destroy；两台 Node active、health OK、activation journal 清除，Control 表中均为 running 且活动 Cat 为 0 |
+| `cb6c32be` | production mutation admission、proof-set、reset 和 usage terminal finalizer 统一绑定 clean-slate Control schema v19 | proof-set、final-open、clean-slate reset 和 usage terminal finalizer 五组离线 fixture 通过；退役 v18 qualification binding 显式拒绝；production x86_64 native full 与 registry verification 通过 |
+| `5181bcf3` | Warm 恢复保留首次启动的 verified boot FD；installed effect 保留完整物理错误链；同场景并发重试加入原 effect 的精确终态 | Node 52/52、semantic HTTP 2/2、Node all-target Clippy `-D warnings`、diff check 通过；production Worker-only 发布及两轮真实 Warm restore 通过 |
+| `75290b5b` | Guest 为 PersistentDisk 安全创建缺失 mount target，descriptor-relative 拒绝 symlink 与 `/` | Guest 31/31、Guest all-target Clippy `-D warnings`、diff check 通过；production Worker-only 发布与双 Node 安装探针通过，物理 E2E 待执行 |
+| `99c62282` | 受信 native Golden Root 独立构建、ext4/镜像内 Guest Agent 精确校验和 immutable build receipt | build-host 23/23、Control 定向 deployment contract 2/2、bash syntax、fmt/diff check 通过；production 构建/发布待执行 |
+| `5cc9723e` | Guest 按内核设备号认证 mountinfo source alias，并归一化为已证明的 `/dev/vdX` | Guest 31/31、all-target Clippy `-D warnings`、fmt/diff check；production PersistentDisk 全生命周期与双 Node 恢复通过 |
+| `6daae688` | 将 worker 部署合同从退役的直接 Node ID 字面量迁到 immutable Host identity 派生的 `node_*` ID 和独立 `node_name` | 原失败的 deployment contract 精确回归通过，fmt/diff check 通过；最终 full 门禁正在重跑 |
 
 ## 5. 进度更新规则
 
@@ -179,3 +187,35 @@
 - 当前 clean commit `5ea86c3e` 的 `./scripts/quality.sh full` 通过全部阶段：fmt、共享 skills、release image contract、deny/machete、workspace build、Clippy、workspace/PostgreSQL tests 与 rustdoc。首轮门禁发现并修正一处新 noded wire 测试缺少 `workspace_id`；第二轮按切换规则删除 3 个只验证已退役 ObjectWrite Gateway/PVC/NLB 生产编排的测试，Host fence 与 worker direct-S3 最小权限测试保留并通过 3/3。
 - 合并前 clean commit `e83b7717` 的 `./scripts/quality.sh linux` 已完整通过：workspace build/Clippy/tests、PostgreSQL、Rustdoc 以及 2 个 privileged Node 网络测试均通过。随后合入 production release 工具并继续修改，因此该结果只作为校准，最终发布提交仍须重跑 native/full 门禁。
 - 已合入 main 的 content-addressed production package/deploy 工具；部署计划和 rollout 验证不再引用退役 ObjectWrite/Route Gateway，只验证 Control、独立 credential refresher 和 worker bundle。新 production E2E 已删除 Operation wait，改为同步 Cat/Disk slug API，并在 36 个独立证据步骤覆盖 Disk create/retry、带盘 Cat create/retry、Suspended/Warm/Cold、动作 replay、Cold detach/attach、Guest mount-ready 后 Run、destroy 和 Cat/Disk slug 复用；三个离线 fixture 和相关部署合同通过。
+
+### 2026-08-23
+
+- clean-slate r28 Control 已运行精确镜像 `44aa0ff1`，两副本健康；两台 metal worker 安装同一 registry-verified bundle。
+- production 首次 worker 启动暴露旧 provisioned identity `metal-1`/`metal-2` 不满足 semantic `node_` ID 前缀。部署现在从不可变 identity 派生 `node_metal-1`/`node_metal-2`，同时保留 `metal-1`/`metal-2` 作为展示 `node_name`；Terraform 回归同时固定这两个字段的独立性。
+- 两条既有 SSM association 原地重放成功。两台 `cats-worker` 均为 active，本机 `/v1/health` 返回 OK，worker receipt 绑定 exact bundle，失败发布遗留的 activation journal 已清除。
+- 通过 SSM 私网端口转发读取 Control authority：两台 Node 均为 `running`，`control_endpoint` 分别为 `http://10.20.150.162:7301` 与 `http://10.20.143.174:7301`，`node_heartbeats.last_heartbeat_at` 持续由数据库时间更新；当前活动 Cat 为 0。
+- Node ID 修复已通过 PR #358 合入 exact main `62aa5f91`。准备 qualification 时发现 Python operator 仍硬编码 schema 18，已统一修到 19 并通过 PR #359 合入 exact main `cb6c32be`；该精确提交的 x86_64 native full 与发布包 registry verification 已完成。生产 ALB、Ingress 和四个公开 DNS alias 已创建，两个 Control target 健康，`https://cats.run/healthz` 通过受信 TLS 返回 200；真实 Cat/Disk、CH/Guest 挂载和双 Node 恢复仍保持未完成状态。
+- production release `cb6c32be` 已部署：Control/refresher 使用 digest-pinned 镜像，两台 metal Node 使用 worker bundle `sha256:346fbcfcdfbe150f7028c477e0f508fb71286d81c994fda8272fc9af4bd779b8`，正式 deployment receipt 状态为 `applied`。首轮 postcondition 暴露 `AWS-RunShellScript` 的 `/bin/sh` 不支持 `set -Eeuo pipefail`，已用 POSIX `set -eu` 修复、增加 fixture 并通过 PR #360 合入 main；修正版 probe 在两台 Node 上通过。
+- production 同步协议 E2E 已验证 PersistentDisk create 成功且相同 slug/参数重试返回 `already_exists`。首个 Cat create 校准出 fresh `cats-atomic-r28` 漏发 Golden Root，而相同 digest 的 125 个内容对象和 canonical manifest 仍在 r27；已逐对象重算 SHA-256，以专用 image namespace 条件写入 r28，并按 data-first/manifest-last 顺序完成发布，目标现在精确为 125 data + 1 manifest。
+- Golden Root 缺漏进一步暴露两个 failure-path 缺口：Root attachment 在 manifest provision 失败前未进入清理集合，以及 reset Node 被仍指向自己的 `failure` Cat 永久阻塞注册。PR #361 已补齐 attachment 失败 detach 和“仅剩 failure Cat 时重新开放、保留显式 destroy”语义；Node 单测与 PostgreSQL Store 回归通过，production 补丁发布正在进行。
+- PR #361 和 #362 已随 exact release `42ad4ef5` 发布；后者按 review 结论移除了 Control 启动时对 operator-trust/source-commit 完全相等的要求，签名、AWS role 和 deployment ID 校验继续保留。x86_64 native full、两台 worker 安装和正式 deployment receipt 均已通过。
+- production E2E 已通过 PersistentDisk create 及同场景重放，并把 Golden Root 读取推进到真实 Root provision。检查确认 r28 运行配置与 live IAM 曾分裂：Node、镜像发布者和磁盘删除角色仍引用旧前缀；对应 live policy 已校准到仓库 platform IaC 的 r28 权限。发布流程必须补充跨 stack prefix preflight，当前不得把这次手工校准视为最终自动化。
+- 第三轮真实创建已完成 Root provision、启动 Cloud Hypervisor，并由串口证据确认 Guest 到达 `multi-user.target` 且 Guest Agent 启动；随后暴露同步调用方超时会丢弃 Node 终态提交、永久遗留 `active_action=create`。PR #363（merge `d3ecd009`）已将 effect 和终态提交改为 Node-owned，并增加“等待者 abort 后 effect 仍终态、同场景重放不重复执行”的回归；Node 10/10 与 all-target Clippy 通过，production 发布进行中。
+- 当前 production worker 的实际 argv 为 `--ch-block-path kernel-nbd`。交付顺序已调整为先跑通可用 kernel-NBD 版本及其 CH/Guest、PersistentDisk 和双 Node 恢复；vhost-user 切换不再阻塞本轮验收，后续独立推进。
+- 精确提交 `d3ecd009` 的 production x86_64 native full、内容寻址构建、三张镜像 registry digest verification 和 package receipt 已完成；发布包的 `release_id` 为 `sha256:2028c613205067adfa98c2ed46413188cc98efea18469375b34c06c44be74897`，worker bundle 为 `sha256:a887483a99b16957f9a464142611fead745ffcbf56df9d2401d33a9d2804894c`。本地长会话中断曾留下一个不完整下载，已从带 version ID 的内容寻址 S3 对象重新下载，并在解压和发布前校验精确 SHA-256；远端原生构建未重跑。
+- PR #364 已合入部署标准化修复：operator trust bundle 变化现在进入 Control Pod template digest 并触发滚动，Worker 安装探针会等待 managed association、receipt digest 和服务 active 同时收敛，避免再次人工处理 ConfigMap 不滚动及安装/探针竞态。fixture、Python 编译、Terraform module test 1/1 和 diff check 均通过。
+- `d3ecd009` 已发布到 production；两台 Worker 的 managed association 均成功，安装 receipt 精确匹配 `sha256:a887483a99b16957f9a464142611fead745ffcbf56df9d2401d33a9d2804894c`。旧 deployer 在 association 更新后 7 秒即探测并误报失败，真实安装结果已通过两台 SSM 证据校准；PR #364 已修复后续发布的该竞态。
+- production kernel-NBD 已完成可用子集验收：真实 blockd、`/dev/nbd0`、Cloud Hypervisor、Guest Agent 与 `multi-user.target` 证据成立；Create/相同场景 replay、Suspend/Run 及 replay、Cold/Run 及 replay、Destroy、destroy 后同 slug 创建新 Cat ID 全部通过。测试资源已清理。
+- 完整 E2E 仍有两个独立失败：PersistentDisk 首次 Guest filesystem-control 失败，而 Control 内部 create 重试覆盖了原始错误；Warm snapshot 的 `config.json` 记录首次 VMM 的 `/proc/self/fd/32` 和 `/proc/self/fd/33`，恢复进程无法打开 initramfs，CH 明确报 `No such device or address`。两项保持未完成，vhost-user 切换已按“先交付可用 kernel-NBD”顺序后移。
+- PR #365（merge `5181bcf3`）已完成上述 Worker 修复：首次启动的 verified kernel/initramfs descriptors 随 `ManagedCat` 保留并供 Warm restore 子进程继承；同场景重试直接订阅原 action 的 terminal response，不再把物理失败覆盖为后续 `invalid_state`；installed effect 使用完整 anyhow cause chain。Node 全套测试与 Clippy 已通过，下一步仅发布 Worker 并重跑 production Warm/PersistentDisk。
+- 精确提交 `5181bcf3` 的 production native package 与 registry verification 已完成，Worker bundle 为 `sha256:5e8cf8ec014d5a640eaa6bdb9bebfadb97092a76e7b733bc635640a74c5848d4`。Worker-only 计划已应用，没有 application/Control/refresher 变更；两条 association 均为 Success，两台 installation receipt、systemd active 和带 Node bearer 的 `/v1/health` 探针均通过。首次手工计划把 metal-2 ID 少写末尾 `d`，导致只完成 metal-1；第二份保存计划使用 canonical deployment config 的正确 ID 后补齐，机器与 SSM 身份本身无故障。
+- production kernel-NBD Warm 已修复并验收：同一真实 Cat 在 metal-1 上连续两轮完成 `Running → Warm → Running`；第二轮 Warm/Run 的同场景重放分别返回 `already_done`，证明 retained boot descriptors 可跨多轮 snapshot/restore 使用。最终 Destroy 成功且 Workspace 当前 Cat 列表为空；证据在 `dist/deploy-5181bcf3/private-work/warm-kernel-r1/`。
+- production PersistentDisk 首次失败的精确原因已由新错误链暴露：Guest 已识别并格式化设备，但 `/data` mount target 不存在。PR #366（merge `75290b5b`）现按 filesystem root descriptor 逐 component `openat(O_NOFOLLOW|O_DIRECTORY)`，仅在 `ENOENT` 时 `mkdirat`，重放复用同一 inode，并拒绝中间 symlink 与 `/`；Guest 31/31 和 all-target Clippy 已通过，待 Worker-only 发布/E2E。
+- `75290b5b` native package 与 registry verification 已完成，Worker bundle 为 `sha256:fe0767fa984a765eac1e43fc3dfb9b83de0ef4abfdbbf0669ed1f8ab3a3c5a6b`；Worker-only 计划只替换 bundle 与两条 association，两台 association、installation receipt、systemd active 和认证 health 均通过。发布后读取终态时本机 AWS `login_session` 失效，重新执行标准 `aws login` 后 STS/SSM 立即恢复；不是远端部署故障。
+- Worker-only 发布不能更新已写入 Golden Root 的 Guest Agent，因而第一次 PersistentDisk 重跑仍命中旧镜像中的 `/data` 缺失错误。PR #367 已合入 exact main `99c62282`，新增受信 native `golden-root` 独立构建通道：不重建 OCI/Worker，校验 ext4、从镜像抽取 Guest Agent 与 exact source 二进制逐字节比较，并写普通 immutable build receipt 后供内容寻址发布；脚本语法、build-host 23/23 和 Control 定向契约测试通过，下一步在 production build Host 构建并发布新 Golden Root。
+- 新 Golden Root 构建前已显式 Destroy 上一次失败的 `cat_d6c70e58e03c`；原 PersistentDisk `disk_c0337b5e29c5487bb0b79c52665d2ead` 保持 `normal`、unbound，将用于新镜像的同盘重试。exact main `99c62282` 的 native Golden Root build `8fa275fd-b36b-428d-a344-d7bddef072c3` 已成功并发布内容寻址 ext4：1 GiB、SHA-256 `1eef3154e1236e67d88cc8dfe64a071536952323123df29d34b0b273f36f6d71`、immutable build receipt `c8ae15bcd0b3ebe24b25efec43fa073c28aaa576c8b7ee951bfe9609d26b9403`；Worker 中转对象校验和一致，正在发布到 production r28 image namespace。
+- 新 Golden Root 已发布到 production r28：`sha256:1eef3154e1236e67d88cc8dfe64a071536952323123df29d34b0b273f36f6d71`，137 个非零数据对象、574,619,648 上传字节，manifest-last。SSM wrapper 因错误要求 blockd 输出自带 `sha256:` 前缀而返回 1，但没有重跑；后置发现已验证 manifest version 1、image ID、1 GiB size 和 137 chunk 精确一致，因此发布终态成立。下一步用该 digest 重跑 PersistentDisk 全生命周期。
+- 新镜像重跑已证明 `/data` 创建修复进入 Guest，但推进到下一条 fail-closed：mountinfo 的 source 字符串与 `/dev/vdX` 不同。Linux 实测确认 mount(2) 接受保留的 `/proc/self/fd/N`，而 mountinfo source spelling 不属于设备 authority；authority 是精确 major/minor、sysfs/fstat 和保留 FD。PR #368 已合入 exact main `5cc9723e`，在 Filesystem Control 与 RuntimeReady 将合法 source alias 归一化为已证明的 `/dev/vdX`，同时保留路径规范性、UUID、mount drift 与重复挂载检查；Guest 31/31、all-target Clippy、fmt/diff check 通过。失败 Cat 已 Destroy，PersistentDisk 继续 unbound 保留，正在构建新 Golden Root。
+- exact main `5cc9723e` source bundle 已内容寻址发布；Golden Root-only production build SSM `ca41ec78-b64f-49a5-97ca-53de090b7795` 正在执行，不涉及 Control/Gateway/Worker 部署。
+- exact main `5cc9723e` 的 Golden Root `sha256:d38d959f3fe1e2387a8a6313b3db7a8bf1c591ec5715a86c2dcc95c630e419e3` 已发布。保留的旧 PersistentDisk 在新 Guest 中达到 `/data` mount-ready；Suspend/Warm/Cold、Cold detach/attach、同盘重挂及全部语义重放通过。Running Cat 随 metal-1 停服恢复到 metal-2，目标实体为 1 CH + 2 blockd + 2 nbd-client；metal-1 返回后 reset/re-register 且 local Cat/CH/blockd 均为 0，目标仍可 Suspend/Run。最终 Cat/Disk 列表均为 0，两台 Worker active 且无残留物理进程。production E2E 证据在 `dist/deploy-5cc9723e/private-work/golden-root-r1/`。
+- `5cc9723e` 的首次最终 full 门禁只发现一项部署合同仍要求退役字面量 `CATS_NODE_ID=$node_id`；生产脚本实际已由 immutable identity 派生 `semantic_node_id=node_$identity_node_id` 并独立写入 `CATS_NODE_NAME`。该测试没有删除，而是迁到新身份合同；PR #369 合入 exact main `6daae688`，原失败精确回归、fmt 和 diff check 已通过，双 full 门禁将在该提交重跑。
