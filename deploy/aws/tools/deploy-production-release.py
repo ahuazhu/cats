@@ -392,8 +392,8 @@ def terraform_plan_command(
                 "-var=metal_worker_enabled=true",
                 f"-var=worker_bundle_path={package / 'release' / worker['bundle_name']}",
                 f"-var=worker_bundle_sha256={worker['bundle_sha256'][7:]}",
-                "-var-json=metal_worker_instances=" + canonical_json(config["worker_instances"]).decode(),
-                "-var-json=metal_worker_deploy_instances="
+                "-var=metal_worker_instances=" + canonical_json(config["worker_instances"]).decode(),
+                "-var=metal_worker_deploy_instances="
                 + canonical_json(sorted(config["worker_instances"])).decode(),
             ]
         )
