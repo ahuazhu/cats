@@ -431,7 +431,7 @@ PY
     [ "$identity_instance" = "$instance_id" ]
     [ "$identity_region" = "$node_region" ]
     node_cpu="$(nproc)"
-    node_memory="$(awk '/^MemTotal:/ { printf "%.0f\\n", $2 * 1024; found=1 } END { if (!found) exit 1 }' /proc/meminfo)"
+    node_memory="$(awk '/^MemTotal:/ { printf "%.0f\n", $2 * 1024; found=1 } END { if (!found) exit 1 }' /proc/meminfo)"
     printf '%s\n' \
       "CATS_NODE_ID=$node_id" \
       "CATS_NODE_NAME=__CATS_WORKER_NAME__" \
