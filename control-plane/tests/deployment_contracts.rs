@@ -4110,7 +4110,9 @@ fn worker_release_install_is_closed_durable_and_identity_fail_closed() {
         "jq -er '.node_id' /etc/cats/identity/node-identity.v1.json",
         "[ \"$identity_instance\" = \"$instance_id\" ]",
         "[ \"$identity_region\" = \"$node_region\" ]",
-        "CATS_NODE_ID=$node_id",
+        "semantic_node_id=\"node_$identity_node_id\"",
+        "CATS_NODE_ID=$semantic_node_id",
+        "CATS_NODE_NAME=__CATS_WORKER_NAME__",
         "CATS_NODE_CONTROL_ENDPOINT=http://$private_ip:7301",
     ] {
         assert!(
