@@ -96,6 +96,7 @@ fn deployment_units_take_the_pinned_guest_cmdline_only_from_the_shared_receipt()
             "--node-name",
             "--host-lock /var/lib/cats/node/host.lock",
             "--blockd-socket-root /run/cats/blockd-v1",
+            "--golden-root-cache-image /var/lib/cats/golden-root-cache/rootfs.ext4",
             "--effect-timeout-ms 30000",
         ] {
             assert!(

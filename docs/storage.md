@@ -137,7 +137,12 @@ Metadata fencing只阻止旧写者发布Root，不能证明旧VMM已停止。跨
 
 Golden Root 位于独立的 `images/<image-id>/` 命名空间。镜像 ID 来自完整镜像内容，非零 Chunk
 按内容寻址，manifest 最后写入。空卷 provision 时只发布引用这些 Base 的 Map，不为每个 Cat
-复制相同 rootfs。之后的小写继续形成卷私有 Delta，只有达到 Base 重写条件时才私有化整块。
+复制相同 rootfs。安装模式 Node 可按
+[ADR-0061](decisions/0061-node-local-golden-root-provision-validation.md) 使用独立的 Node 共享单槽 cache：
+精确命中时重建同一 manifest并并发确认远端对象存在，从而避免每个新 Cat 重新 GET 完整 Golden Root body；
+miss 时以同一批远端已验证 bytes 原子填充 cache。本地文件不进入 Map、不直接服务 Guest，任一不匹配回退
+远端 body 校验。之后的小写继续形成卷私有 Delta，只有达到 Base
+重写条件时才私有化整块。
 第一版 Golden Image 不删除，不引入尚无可靠 oracle 的 image GC。
 
 ## 恢复与 GC

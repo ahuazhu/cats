@@ -37,6 +37,7 @@ ExecStart=/opt/cats/bin/cats-noded \
   --blockd-bin /opt/cats/bin/cats-blockd \
   --host-lock /var/lib/cats/node/host.lock \
   --blockd-socket-root /run/cats/blockd-v1 \
+  --golden-root-cache-image /var/lib/cats/golden-root-cache/rootfs.ext4 \
   --effect-timeout-ms 30000 \
   --vmm ch \
   --ch-bin /usr/local/bin/cloud-hypervisor \
