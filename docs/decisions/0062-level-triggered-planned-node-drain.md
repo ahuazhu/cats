@@ -33,21 +33,28 @@ ADR-0059 模型没有独立 Operation/job 表，本次也不恢复已被取代�
    volume 已远端持久且本地 writer 已关闭；在目标 noded Run；若原状态为 Suspended 或 Warm，再转换回该
    状态。只有原状态为 Running 且目标 Ready 后才发布新入口；Warm/Suspended 的瞬时 Running 不发布入口。
 6. 源 Cold 成功是目标执行的前置条件。源 Cold 明确失败时，Cat 以 `failure` 留在源 Node 供清理；目标
-   启动/恢复明确失败时，Cat 以 `failure` 留在目标 Node 供清理。两种结果都在响应中标为 `blocked`，旧
-   Node 不会由 drain 接口自动关闭。
+   启动/恢复明确失败时，Cat 以 `failure` 留在目标 Node 供清理。timeout、transport failure、malformed
+   response 或状态查询不完整都属于结果不明：只返回 `blocked` 并保留原 state、source placement 和 exact
+   relocation claim，后续 pass 必须先发现 postcondition，不能把它们结算成 `failure`。旧 Node 不会由
+   drain 接口自动关闭。
 7. 成功 settlement 只接受 exact source placement、target reservation 和原 state，并将稳定 placement
    改为目标、恢复原 state、清空 action。相同 settlement 可以安全重放；不匹配的迟到结果不能覆盖新事实。
-8. Control 的周期任务扫描所有仍为 `draining` 且仍有 Cat placement 的 Node，并再次执行同一发现/claim/
-   discovery 流程。扫描同时包含 cordon 前已经提交到 `current_action_node_id`、但尚未形成稳定 placement 的
-   reservation。因此 HTTP 取消、Control 重启、在途 create/run 和多个 replica 的重复执行都不会让 Node
-   过早报告 drained。
+8. Control 的独立周期 recovery worker 扫描所有仍为 `draining` 且仍有 Cat placement 的 Node，并再次执行
+   同一发现/claim/discovery 流程。扫描同时包含 cordon 前已经提交到 `current_action_node_id`、但尚未形成
+   稳定 placement 的 reservation。因此 HTTP 取消、Control 重启、在途 create/run 和多个 replica 的重复
+   执行都不会让 Node 过早报告 drained。这个 worker 与 heartbeat/liveness probe 循环分别推进；慢 noded
+   lifecycle 请求不能推迟其他 Node 的失联判定，两者都响应同一进程 shutdown 并取消当前有界工作。
 9. 响应为 HTTP 200 的闭集报告：顶层 `drained` 表示本次发现的 Cat 都已迁移或已变成 stale；任一 Cat
    无法迁移时为 `blocked`，并返回稳定 code/message。认证、输入、Node 状态或 Store 故障仍使用通用 HTTP
    错误。
 10. drain 完成后 Node 保持 `draining`。停机、删除或重新开放 placement 是独立的显式运维步骤，不能由
     “当前没有 Cat”隐式触发。
 11. 如果源 Node 在 planned drain 中变成 `offline`，planned pass 不再调用它，也不猜测 Cold。保留的
-    exact relocation claim 由 ADR-0059 的 offline recovery 接管；这仍受其已接受的非 fence 双跑风险约束。
+   exact relocation claim 由 ADR-0059 的 offline recovery 接管；这仍受其已接受的非 fence 双跑风险约束。
+12. 如果已经预留的目标 Node 变成 `offline/reset_required/deleted` 或不再存在，源仍为 `draining` 的下一
+    pass 在 Cat row lock 内用 ADR-0061 选择另一个 running Node，并在同一事务撤销可能已经发布的 exact
+    旧目标入口、替换 target reservation。旧 target 的迟到 publish/settlement 因当前 target predicate 不匹配
+    而零写入；普通非 relocation action 仍返回 `busy`。
 
 ## 后果
 

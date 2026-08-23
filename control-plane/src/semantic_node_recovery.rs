@@ -227,7 +227,7 @@ where
         &self,
         source_node_id: &str,
     ) -> Result<NodeRecoveryReport, NodeRecoveryError> {
-        let candidates = self.store.list_drain_source_cats(source_node_id).await?;
+        let candidates = self.store.list_source_cats(source_node_id).await?;
         let mut results = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             results.push(self.recover_cat(source_node_id, candidate).await?);
@@ -246,7 +246,7 @@ where
         &self,
         source_node_id: &str,
     ) -> Result<NodeDrainReport, NodeRecoveryError> {
-        let candidates = self.store.list_source_cats(source_node_id).await?;
+        let candidates = self.store.list_drain_source_cats(source_node_id).await?;
         let mut results = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             results.push(self.drain_cat(source_node_id, candidate).await?);
@@ -326,9 +326,11 @@ where
         }
 
         if let Err(failure) = self.make_source_cold(&claim).await {
-            // If liveness changed the source to offline, retain the exact
-            // claim for the level-triggered offline recovery path.
-            if failure.code == "source_node_not_draining" {
+            // A timeout, transport/protocol ambiguity, or Node state change
+            // cannot prove the source's physical state. Keep the exact claim
+            // so the next level-triggered pass can discover the postcondition
+            // or hand it to offline recovery.
+            if failure.class == RecoveryFailureClass::Retryable {
                 return Ok(blocked_drain_cat(
                     &candidate.cat_id,
                     &failure.code,
@@ -368,6 +370,13 @@ where
                 })
             }
             Err(failure) => {
+                if failure.class == RecoveryFailureClass::Retryable {
+                    return Ok(blocked_drain_cat(
+                        &candidate.cat_id,
+                        &failure.code,
+                        failure.message,
+                    ));
+                }
                 let settled = self
                     .store
                     .finish(
@@ -529,7 +538,7 @@ where
                     | NodeCommandResult::AlreadyDone(CatState::Cold),
                 )) => return Ok(()),
                 Ok(Ok(NodeCommandResult::Succeeded(_) | NodeCommandResult::AlreadyDone(_))) => {
-                    return Err(RecoveryFailure::new(
+                    return Err(RecoveryFailure::retryable(
                         "node_protocol_error",
                         "source noded returned success without reaching Cold",
                     ));
@@ -537,12 +546,12 @@ where
                 Ok(Ok(
                     NodeCommandResult::Failed { code, message }
                     | NodeCommandResult::Conflict { code, message },
-                )) => return Err(RecoveryFailure::new(code, message)),
+                )) => return Err(RecoveryFailure::definitive(code, message)),
                 Ok(Ok(NodeCommandResult::Busy)) => {
                     last_transport = "source noded remained busy during drain".to_owned();
                 }
                 Ok(Err(NodeClientError::Protocol(message))) => {
-                    return Err(RecoveryFailure::new("node_protocol_error", message));
+                    return Err(RecoveryFailure::retryable("node_protocol_error", message));
                 }
                 Ok(Err(NodeClientError::Unavailable(message))) => last_transport = message,
                 Ok(Err(NodeClientError::Timeout)) | Err(_) => {}
@@ -557,7 +566,10 @@ where
                 tokio::time::sleep(self.timeouts.retry_interval).await;
             }
         }
-        Err(RecoveryFailure::new("drain_source_timeout", last_transport))
+        Err(RecoveryFailure::retryable(
+            "drain_source_timeout",
+            last_transport,
+        ))
     }
 
     async fn drive(&self, claim: &RecoveryClaim) -> Result<(), RecoveryFailure> {
@@ -610,7 +622,7 @@ where
                 .await?;
             }
             CatState::Cold | CatState::Failure | CatState::Destroyed => {
-                return Err(RecoveryFailure::new(
+                return Err(RecoveryFailure::definitive(
                     "recovery_state_unsupported",
                     "recovery claim has an unsupported target state",
                 ));
@@ -623,7 +635,7 @@ where
         self.ingress
             .publish(&claim.cat.cat_id, &claim.target_node_id)
             .await
-            .map_err(|error| RecoveryFailure::new("ingress_publish_failed", error.message))
+            .map_err(|error| RecoveryFailure::retryable("ingress_publish_failed", error.message))
     }
 
     async fn target_is_complete(&self, claim: &RecoveryClaim) -> Result<bool, RecoveryFailure> {
@@ -639,10 +651,10 @@ where
                 active_action: None,
             })) => Ok(state == claim.target_state),
             Ok(Ok(NodeCatStatus::Failed { code, message })) => {
-                Err(RecoveryFailure::new(code, message))
+                Err(RecoveryFailure::definitive(code, message))
             }
             Ok(Err(NodeClientError::Protocol(message))) => {
-                Err(RecoveryFailure::new("node_protocol_error", message))
+                Err(RecoveryFailure::retryable("node_protocol_error", message))
             }
             Ok(Ok(NodeCatStatus::Absent | NodeCatStatus::Present { .. }))
             | Ok(Err(NodeClientError::Timeout | NodeClientError::Unavailable(_)))
@@ -671,7 +683,7 @@ where
                     return Ok(());
                 }
                 Ok(Ok(NodeCommandResult::Succeeded(_) | NodeCommandResult::AlreadyDone(_))) => {
-                    return Err(RecoveryFailure::new(
+                    return Err(RecoveryFailure::retryable(
                         "node_protocol_error",
                         "noded returned success without the requested recovery state",
                     ));
@@ -679,12 +691,12 @@ where
                 Ok(Ok(
                     NodeCommandResult::Failed { code, message }
                     | NodeCommandResult::Conflict { code, message },
-                )) => return Err(RecoveryFailure::new(code, message)),
+                )) => return Err(RecoveryFailure::definitive(code, message)),
                 Ok(Ok(NodeCommandResult::Busy)) => {
                     last_transport = "noded remained busy during recovery".to_owned();
                 }
                 Ok(Err(NodeClientError::Protocol(message))) => {
-                    return Err(RecoveryFailure::new("node_protocol_error", message));
+                    return Err(RecoveryFailure::retryable("node_protocol_error", message));
                 }
                 Ok(Err(NodeClientError::Unavailable(message))) => last_transport = message,
                 Ok(Err(NodeClientError::Timeout)) | Err(_) => {}
@@ -697,7 +709,10 @@ where
                 tokio::time::sleep(self.timeouts.retry_interval).await;
             }
         }
-        Err(RecoveryFailure::new("recovery_timeout", last_transport))
+        Err(RecoveryFailure::retryable(
+            "recovery_timeout",
+            last_transport,
+        ))
     }
 
     async fn inspect_expected(
@@ -717,10 +732,10 @@ where
                 active_action: None,
             })) => Ok(state == expected),
             Ok(Ok(NodeCatStatus::Failed { code, message })) => {
-                Err(RecoveryFailure::new(code, message))
+                Err(RecoveryFailure::definitive(code, message))
             }
             Ok(Err(NodeClientError::Protocol(message))) => {
-                Err(RecoveryFailure::new("node_protocol_error", message))
+                Err(RecoveryFailure::retryable("node_protocol_error", message))
             }
             Ok(Ok(NodeCatStatus::Absent | NodeCatStatus::Present { .. }))
             | Ok(Err(NodeClientError::Timeout | NodeClientError::Unavailable(_)))
@@ -735,7 +750,7 @@ where
         self.store
             .node_control_endpoint(&claim.target_node_id)
             .await
-            .map_err(|error| RecoveryFailure::new("node_unavailable", error.message))
+            .map_err(|error| RecoveryFailure::retryable("node_unavailable", error.message))
     }
 
     async fn draining_endpoint(
@@ -745,7 +760,7 @@ where
         self.store
             .draining_node_control_endpoint(&claim.source_node_id)
             .await
-            .map_err(|error| RecoveryFailure::new("source_node_not_draining", error.message))
+            .map_err(|error| RecoveryFailure::retryable("source_node_not_draining", error.message))
     }
 }
 
@@ -773,15 +788,31 @@ fn blocked_drain_cat(cat_id: &str, code: &str, message: String) -> CatDrainResul
 struct RecoveryFailure {
     code: String,
     message: String,
+    class: RecoveryFailureClass,
 }
 
 impl RecoveryFailure {
-    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+    fn definitive(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
             message: message.into(),
+            class: RecoveryFailureClass::Definitive,
         }
     }
+
+    fn retryable(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            class: RecoveryFailureClass::Retryable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryFailureClass {
+    Definitive,
+    Retryable,
 }
 
 /// PostgreSQL adapter for the atomic recovery methods. It deliberately uses
@@ -1139,7 +1170,21 @@ mod tests {
                     .lock()
                     .expect("observed")
                     .events
-                    .push("list".to_owned());
+                    .push("list_source".to_owned());
+                Ok(self.candidates.clone())
+            })
+        }
+
+        fn list_drain_source_cats<'a>(
+            &'a self,
+            _source_node_id: &'a str,
+        ) -> RecoveryFuture<'a, Result<Vec<RecoveryCandidate>, StoreError>> {
+            Box::pin(async move {
+                self.observed
+                    .lock()
+                    .expect("observed")
+                    .events
+                    .push("list_drain".to_owned());
                 Ok(self.candidates.clone())
             })
         }
@@ -1425,7 +1470,7 @@ mod tests {
         assert_eq!(
             observed.events,
             [
-                "list",
+                "list_source",
                 "withdraw:node-source",
                 "claim",
                 "endpoint",
@@ -1530,7 +1575,10 @@ mod tests {
 
         assert_eq!(report.cats[0].status, CatRecoveryStatus::ColdNoAction);
         let observed = observed.lock().expect("observed");
-        assert_eq!(observed.events, ["list", "withdraw:node-source", "claim"]);
+        assert_eq!(
+            observed.events,
+            ["list_source", "withdraw:node-source", "claim"]
+        );
         assert!(observed.commands.is_empty());
         assert!(observed.finishes.is_empty());
     }
@@ -1578,7 +1626,10 @@ mod tests {
             CatRecoveryStatus::Failed { code, .. } if code == "recovery_state_unsupported"
         ));
         let observed = observed.lock().expect("observed");
-        assert_eq!(observed.events, ["list", "withdraw:node-source", "claim"]);
+        assert_eq!(
+            observed.events,
+            ["list_source", "withdraw:node-source", "claim"]
+        );
         assert!(observed.commands.is_empty());
         assert!(observed.finishes.is_empty());
     }
@@ -1613,7 +1664,7 @@ mod tests {
         assert_eq!(
             observed.events,
             [
-                "list",
+                "list_drain",
                 "claim",
                 "withdraw:node-source",
                 "source_endpoint",
@@ -1728,6 +1779,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn planned_drain_ambiguous_source_timeout_retains_the_relocation_claim() {
+        let (service, observed) = service(
+            RecoveryAdmission::Claimed(claim(CatState::Running)),
+            [Err(NodeClientError::Timeout)],
+            [Ok(NodeCatStatus::Absent), Ok(NodeCatStatus::Absent)],
+        );
+
+        let report = service
+            .drain_node("node-source")
+            .await
+            .expect("report ambiguous source Cold");
+
+        assert!(!report.is_drained());
+        assert!(matches!(
+            &report.cats[0].status,
+            CatDrainStatus::Blocked { code, .. } if code == "drain_source_timeout"
+        ));
+        let observed = observed.lock().expect("observed");
+        assert!(observed.finishes.is_empty());
+        assert!(!observed.events.iter().any(|event| event == "endpoint"));
+    }
+
+    #[tokio::test]
     async fn planned_drain_target_failure_settles_cleanup_on_target() {
         let (service, observed) = service(
             RecoveryAdmission::Claimed(claim(CatState::Running)),
@@ -1766,6 +1840,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn planned_drain_ambiguous_target_timeout_retains_the_relocation_claim() {
+        let (service, observed) = service(
+            RecoveryAdmission::Claimed(claim(CatState::Running)),
+            [
+                Ok(NodeCommandResult::Succeeded(CatState::Cold)),
+                Err(NodeClientError::Timeout),
+            ],
+            [
+                Ok(NodeCatStatus::Absent),
+                Ok(NodeCatStatus::Absent),
+                Ok(NodeCatStatus::Absent),
+            ],
+        );
+
+        let report = service
+            .drain_node("node-source")
+            .await
+            .expect("report ambiguous target Run");
+
+        assert!(!report.is_drained());
+        assert!(matches!(
+            &report.cats[0].status,
+            CatDrainStatus::Blocked { code, .. } if code == "recovery_timeout"
+        ));
+        let observed = observed.lock().expect("observed");
+        assert!(observed.finishes.is_empty());
+        assert!(!observed
+            .events
+            .iter()
+            .any(|event| event.starts_with("publish:")));
+    }
+
+    #[tokio::test]
     async fn planned_drain_without_target_blocks_before_source_effects() {
         let (service, observed) = service(
             RecoveryAdmission::NoRunningTarget(cat(Some(CatState::Running))),
@@ -1780,7 +1887,7 @@ mod tests {
 
         assert!(!report.is_drained());
         let observed = observed.lock().expect("observed");
-        assert_eq!(observed.events, ["list", "claim"]);
+        assert_eq!(observed.events, ["list_drain", "claim"]);
         assert!(observed.commands.is_empty());
         assert!(observed.finishes.is_empty());
     }
@@ -1804,7 +1911,7 @@ mod tests {
             CatDrainStatus::Blocked { code, .. } if code == "busy"
         ));
         let observed = observed.lock().expect("observed");
-        assert_eq!(observed.events, ["list", "claim"]);
+        assert_eq!(observed.events, ["list_drain", "claim"]);
         assert!(observed.commands.is_empty());
         assert!(observed.finishes.is_empty());
     }

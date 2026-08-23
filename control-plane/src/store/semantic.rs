@@ -1497,31 +1497,42 @@ impl Store {
             // resource: the stable placement is still the source while the
             // run lane names a distinct target admitted while running. A
             // later cordon does not invalidate that already-owned placement.
+            let mut unavailable_drain_target = None;
             if aggregate.cat.current_action == Some(CatAction::Run) {
                 if let Some(target_node_id) = aggregate.cat.current_action_node_id.clone() {
-                    if target_node_id != source_node_id
-                        && transaction
+                    if target_node_id != source_node_id {
+                        let target_is_available = transaction
                             .query_opt(
                                 "SELECT node_id FROM nodes
                                   WHERE node_id=$1 AND status IN ('running','draining') FOR SHARE",
                                 &[&target_node_id],
                             )?
-                            .is_some()
-                    {
-                        let claim = SemanticCatRecoveryClaim {
-                            cat: aggregate,
-                            source_node_id: source_node_id.to_owned(),
-                            target_node_id,
-                            target_state,
-                        };
-                        transaction.commit()?;
-                        return Ok(ClaimSemanticCatRecoveryOutcome::AlreadyClaimed(claim));
+                            .is_some();
+                        if target_is_available {
+                            let claim = SemanticCatRecoveryClaim {
+                                cat: aggregate,
+                                source_node_id: source_node_id.to_owned(),
+                                target_node_id,
+                                target_state,
+                            };
+                            transaction.commit()?;
+                            return Ok(ClaimSemanticCatRecoveryOutcome::AlreadyClaimed(claim));
+                        }
+                        // A planned drain may replace only its recognizable
+                        // cross-Node Run reservation after that exact target
+                        // stops accepting placement. The Cat row lock and the
+                        // target-bound settlement predicate prevent a late
+                        // result for the old target from winning.
+                        if required_source == SemanticRelocationSource::Draining {
+                            unavailable_drain_target = Some(target_node_id);
+                        }
                     }
                 }
             }
 
             if required_source == SemanticRelocationSource::Draining
                 && aggregate.cat.current_action.is_some()
+                && unavailable_drain_target.is_none()
             {
                 transaction.commit()?;
                 return Ok(ClaimSemanticCatRecoveryOutcome::Busy(aggregate));
@@ -1533,6 +1544,17 @@ impl Store {
                 transaction.commit()?;
                 return Ok(ClaimSemanticCatRecoveryOutcome::NoRunningTarget(aggregate));
             };
+            if let Some(old_target_node_id) = unavailable_drain_target {
+                // Running drain publishes ingress before settling placement.
+                // Close an exact old-target publication in the same Cat-row
+                // transaction that replaces the reservation. A concurrent or
+                // late publish for the old target observes the new claim and
+                // fails CatNotReady.
+                transaction.execute(
+                    "DELETE FROM cat_ingress_targets WHERE cat_id=$1 AND node_id=$2",
+                    &[&cat_id, &old_target_node_id],
+                )?;
+            }
             let row = transaction.query_one(
                 &format!(
                     "UPDATE cats

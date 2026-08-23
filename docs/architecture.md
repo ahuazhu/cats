@@ -226,7 +226,9 @@ running -> draining -> 停止新 placement
 fleet administrator 调用 `POST /v1/admin/nodes/{node_id}/actions/drain` 启动该流程。Control 先提交
 `draining`，再为每个 Cat 持久化 exact 目标 reservation；请求取消或 Control 重启后，周期任务会从
 PostgreSQL 当前行继续。已有生命周期动作不会被抢占，没有其他 running Node、源端不能安全 Cold 或目标
-恢复失败都会返回 `blocked`。接口不自动关闭或重新开放 Node，完成后 Node 仍保持 `draining`。
+恢复失败都会返回 `blocked`。结果不明时保留 exact claim；预留目标失联时在 row lock 内 exact retarget，
+旧目标的迟到 settlement 不能覆盖新目标。接口不自动关闭或重新开放 Node，完成后 Node 仍保持
+`draining`。
 
 异常失联的目标流程是：
 
@@ -241,8 +243,9 @@ PostgreSQL 当前行继续。已有生命周期动作不会被抢占，没有其
 -> reset 完成后重新注册，才允许 placement
 ```
 
-恢复扫描是 level-triggered：每个 liveness 周期按 PostgreSQL 当前状态重新发现 offline Node 上尚未迁走
-的 Cat，因此 Control 重启或一次临时错误不会永久丢失恢复工作。
+恢复扫描是 level-triggered：独立 recovery 周期按 PostgreSQL 当前状态重新发现 offline Node 上尚未迁走
+的 Cat，因此 Control 重启或一次临时错误不会永久丢失恢复工作。它与 heartbeat/liveness probe 循环并行，
+慢 lifecycle 网络调用不会延迟其他 Node 的失联判定。
 
 本协议假设旧 Node 会在允许的心跳窗口内重新联系 Control。双跑通常上限为允许的心跳窗口加停止清理
 时间；唯一入口只保护新流量，旧连接、后台任务、主动出站请求和旧实例写盘仍可能继续。长期不对称

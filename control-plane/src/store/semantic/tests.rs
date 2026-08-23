@@ -589,6 +589,82 @@ fn planned_drain_does_not_replace_an_existing_lifecycle_action() {
 }
 
 #[test]
+fn planned_drain_retargets_an_offline_reserved_node_with_an_exact_claim() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    register_second_node(&store);
+    register_third_node(&store);
+    create_running_cat_on(
+        &store,
+        "cat-drain-retarget",
+        "drain-retarget",
+        "node-a",
+        2,
+        1 << 30,
+    );
+    store
+        .transition_semantic_node_status("node-a", &[NodeStatus::Running], NodeStatus::Draining)
+        .unwrap()
+        .unwrap();
+
+    let ClaimSemanticCatRecoveryOutcome::Claimed(old_claim) = store
+        .claim_semantic_cat_drain("node-a", "cat-drain-retarget")
+        .unwrap()
+    else {
+        panic!("draining Cat must receive its first relocation claim")
+    };
+    assert_eq!(old_claim.target_node_id, "node-b");
+    assert!(matches!(
+        store
+            .publish_semantic_cat_ingress("cat-drain-retarget", "node-b")
+            .unwrap(),
+        PublishCatIngressOutcome::Published(_)
+    ));
+    store
+        .transition_semantic_node_status("node-b", &[NodeStatus::Running], NodeStatus::Offline)
+        .unwrap()
+        .unwrap();
+
+    let ClaimSemanticCatRecoveryOutcome::Claimed(replacement) = store
+        .claim_semantic_cat_drain("node-a", "cat-drain-retarget")
+        .unwrap()
+    else {
+        panic!("offline reserved target must be replaced")
+    };
+    assert_eq!(replacement.target_node_id, "node-c");
+    assert_eq!(
+        store
+            .resolve_semantic_cat_ingress("cat-drain-retarget")
+            .unwrap(),
+        None
+    );
+    assert!(matches!(
+        store
+            .publish_semantic_cat_ingress("cat-drain-retarget", "node-b")
+            .unwrap(),
+        PublishCatIngressOutcome::CatNotReady
+    ));
+    assert!(store
+        .finish_semantic_cat_recovery(
+            SemanticCatRecoverySettlement {
+                cat_id: "cat-drain-retarget",
+                source_node_id: "node-a",
+                target_node_id: "node-b",
+                target_state: CatState::Running,
+            },
+            SemanticCatRecoveryResult::Recovered,
+        )
+        .unwrap()
+        .is_none());
+    let current = store
+        .find_semantic_cat_by_id("cat-drain-retarget")
+        .unwrap()
+        .expect("retargeted Cat remains current");
+    assert_eq!(current.current_action, Some(CatAction::Run));
+    assert_eq!(current.current_action_node_id.as_deref(), Some("node-c"));
+}
+
+#[test]
 fn planned_drain_blocks_on_an_inflight_placement_reserved_before_cordon() {
     let (store, _) = store_and_url();
     register_node(&store);

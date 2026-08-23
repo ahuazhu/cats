@@ -855,8 +855,9 @@ POST /v1/admin/nodes/{node_id}/actions/drain
 ```
 
 Control 在接受任何 Cat 迁移前先把 Node 提交为 `draining`。每个 Cat 的原 state、源 placement 和目标
-reservation 保存在 Cat 当前行；后台 liveness 周期会重新发现仍有 Cat 的 draining Node，因此请求取消、
-Control 重启或重复调用都继续同一排空。已有普通 `current_action` 返回 `blocked/busy`，不会被排空抢占。
+reservation 保存在 Cat 当前行；独立 recovery 周期会重新发现仍有 Cat 的 draining Node，因此请求取消、
+Control 重启或重复调用都继续同一排空。耗时迁移不在 heartbeat/liveness probe 的串行路径上。已有普通
+`current_action` 返回 `blocked/busy`，不会被排空抢占。
 
 成功响应为 HTTP 200：
 
@@ -884,6 +885,12 @@ Control 重启或重复调用都继续同一排空。已有普通 `current_actio
 顶层只有 `drained/blocked`；逐 Cat 只有 `migrated/stale/blocked`。任一 Cat 无法 Cold 时，排空阻塞并把
 失败 Cat 留在源 Node，不强制关机。目标恢复失败的 Cat 留在目标 Node 的 `failure` 状态供显式清理。接口
 不会自动关闭或 uncordon Node；Node 保持 `draining`。
+
+这里“失败”只包括 noded 明确返回的终态 failure/conflict。timeout、transport/protocol ambiguity 或无法
+完成 postcondition query 时保留原 state、source placement 和 relocation claim，下一 recovery pass 继续
+discovery。若 reserved target 已经 offline/reset_required/deleted 或不存在，源仍 draining 时在 Cat row
+lock 内以 Least-Allocated 策略选择新 target，并在同一事务撤销可能已经发布的 exact 旧目标入口、替换
+reservation；旧 target 的迟到 publish/settlement 因 exact target 不匹配而不能提交。
 
 ### 14.2 异常退出
 
@@ -916,6 +923,8 @@ retry_interval
 - noded 每次都先检查目标结果是否已经满足；
 - create 最终超时后，Control 额外调用一次 noded DELETE 清理本地资源；
 - 其他动作最终超时后，Control 查询一次 Cat 状态；无法确定时写 `failure`；
+- planned drain 是上一条的窄例外：源 Cold 或目标恢复结果不明时保留 exact relocation claim，由独立周期
+  worker 重试 discovery，不写 `failure`；
 - destroy 超时保持 `failure`，允许用户再次 destroy；
 - timeout 不自动选择另一台 Node，Node 迁移只走 Node offline 流程。
 
@@ -1012,6 +1021,9 @@ internal_error
 - planned drain保持每个Cat最终产品状态。
 - planned drain在迁移前持久化目标 reservation，Control 重启后继续，且不抢占普通Cat动作。
 - planned drain要求源端先完成Cold；源端失败留源清理，目标端失败留目标清理。
+- planned drain的源/目标结果不明时保留原状态和claim；reserved target失联时能exact retarget，旧结果不能
+  覆盖新target。
+- 慢planned drain或offline recovery不能阻塞heartbeat probe cadence，shutdown会取消当前周期工作。
 - offline Node 上的 Cat 在跨 Node 恢复前先撤掉旧入口，新实例 Ready 前不发布新入口。
 - 入口切换后只把新进入的流量发送到新 Node。
 - offline Node 的下一次成功心跳返回 `reset_required`，noded 不等待下一个心跳周期，立即停止和清理残留 Cat。

@@ -244,9 +244,12 @@ impl NodeManagementService {
                 changed.push(candidate.node_id);
             }
         }
-        self.recover_offline_nodes().await?;
-        self.continue_planned_drains().await?;
         Ok(changed)
+    }
+
+    async fn continue_node_work(&self) -> Result<(), ApiError> {
+        self.recover_offline_nodes().await?;
+        self.continue_planned_drains().await
     }
 
     async fn recover_offline_nodes(&self) -> Result<(), ApiError> {
@@ -289,10 +292,31 @@ impl NodeManagementService {
         Ok(())
     }
 
-    /// Runs the fleet liveness pass at the same 10-second cadence as Node
-    /// heartbeats. Errors leave status unchanged and are retried next tick.
-    pub async fn run_liveness_monitor(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
-        let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+    /// Runs liveness detection and lifecycle recovery on independent loops.
+    /// Slow noded lifecycle calls therefore cannot postpone heartbeat probes.
+    pub async fn run_liveness_monitor(&self, shutdown: tokio::sync::watch::Receiver<bool>) {
+        self.run_node_monitors(shutdown, HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL)
+            .await;
+    }
+
+    async fn run_node_monitors(
+        &self,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+        liveness_interval: Duration,
+        recovery_interval: Duration,
+    ) {
+        tokio::join!(
+            self.run_liveness_probe_monitor(shutdown.clone(), liveness_interval),
+            self.run_recovery_monitor(shutdown, recovery_interval),
+        );
+    }
+
+    async fn run_liveness_probe_monitor(
+        &self,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        cadence: Duration,
+    ) {
+        let mut interval = tokio::time::interval(cadence);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -305,6 +329,38 @@ impl NodeManagementService {
                         }
                         Err(error) => {
                             tracing::warn!(%error, "Node liveness pass failed; leaving Node status unchanged");
+                        }
+                    }
+                }
+                result = shutdown.changed() => {
+                    if result.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn run_recovery_monitor(
+        &self,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        cadence: Duration,
+    ) {
+        let mut interval = tokio::time::interval(cadence);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    tokio::select! {
+                        result = self.continue_node_work() => {
+                            if let Err(error) = result {
+                                tracing::warn!(%error, "Node recovery pass failed; retrying after the next recovery interval");
+                            }
+                        }
+                        result = shutdown.changed() => {
+                            if result.is_err() || *shutdown.borrow() {
+                                return;
+                            }
                         }
                     }
                 }
@@ -379,6 +435,7 @@ mod tests {
     struct MockRepository {
         stale: Mutex<Vec<StaleNodeCandidate>>,
         marked: Mutex<Vec<String>>,
+        marked_notify: tokio::sync::Notify,
         drained: Mutex<Vec<String>>,
         drain_candidates: Mutex<Vec<String>>,
     }
@@ -439,6 +496,7 @@ mod tests {
                 .lock()
                 .expect("lock marks")
                 .push(candidate.node_id);
+            self.marked_notify.notify_one();
             Box::pin(async { Ok(true) })
         }
 
@@ -511,6 +569,11 @@ mod tests {
             *repository.marked.lock().expect("lock marks"),
             vec!["node_failed"]
         );
+        assert!(recovered.lock().expect("lock recoveries").is_empty());
+        service
+            .continue_node_work()
+            .await
+            .expect("recover marked offline Node");
         assert_eq!(
             *recovered.lock().expect("lock recoveries"),
             vec!["node_failed"]
@@ -522,6 +585,10 @@ mod tests {
             .await
             .expect("retry offline recovery")
             .is_empty());
+        service
+            .continue_node_work()
+            .await
+            .expect("retry offline recovery work");
         assert_eq!(
             *recovered.lock().expect("lock recoveries"),
             vec!["node_failed", "node_failed"]
@@ -622,7 +689,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn liveness_pass_resumes_persisted_draining_nodes() {
+    async fn recovery_pass_resumes_persisted_draining_nodes() {
         let repository = Arc::new(MockRepository {
             drain_candidates: Mutex::new(vec!["node_a".to_owned()]),
             ..MockRepository::default()
@@ -653,11 +720,70 @@ mod tests {
         .expect("service")
         .with_planned_drain(drain);
 
-        assert!(service
-            .detect_offline_nodes()
+        service
+            .continue_node_work()
             .await
-            .expect("run liveness pass")
-            .is_empty());
+            .expect("run recovery pass");
         assert_eq!(*invoked.lock().expect("lock invoked drains"), ["node_a"]);
+    }
+
+    #[tokio::test]
+    async fn stalled_drain_does_not_delay_liveness_detection_or_shutdown() {
+        let repository = Arc::new(MockRepository {
+            drain_candidates: Mutex::new(vec!["node_drain".to_owned()]),
+            ..MockRepository::default()
+        });
+        let probe = Arc::new(MockProbe {
+            answers: Mutex::new(VecDeque::new()),
+        });
+        let drain_started = Arc::new(tokio::sync::Notify::new());
+        let drain: PlannedNodeDrain = {
+            let drain_started = Arc::clone(&drain_started);
+            Arc::new(move |_node_id| {
+                let drain_started = Arc::clone(&drain_started);
+                Box::pin(async move {
+                    drain_started.notify_one();
+                    std::future::pending::<()>().await;
+                    unreachable!("pending drain can only be cancelled")
+                })
+            })
+        };
+        let service =
+            NodeManagementService::new(repository.clone(), probe.clone(), Duration::from_secs(30))
+                .expect("service")
+                .with_planned_drain(drain);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let monitor = tokio::spawn(async move {
+            service
+                .run_node_monitors(
+                    shutdown_rx,
+                    Duration::from_millis(10),
+                    Duration::from_millis(10),
+                )
+                .await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), drain_started.notified())
+            .await
+            .expect("drain worker starts");
+        repository
+            .stale
+            .lock()
+            .expect("lock stale")
+            .push(StaleNodeCandidate {
+                node_id: "node_failed".to_owned(),
+                control_endpoint: "http://failed:7010".to_owned(),
+                last_heartbeat_at: "2026-08-23 00:00:00+00".to_owned(),
+            });
+        probe.answers.lock().expect("lock probes").push_back(false);
+
+        tokio::time::timeout(Duration::from_secs(1), repository.marked_notify.notified())
+            .await
+            .expect("liveness detection continues while drain is pending");
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), monitor)
+            .await
+            .expect("shutdown cancels pending drain")
+            .expect("monitor task succeeds");
     }
 }
