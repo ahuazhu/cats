@@ -1303,7 +1303,7 @@ fn stale_action_scan_uses_database_age_and_excludes_special_recovery_lanes() {
     store
         .with(|client| {
             client.execute(
-                "UPDATE cats SET current_action_started_at=1
+                "UPDATE cats SET current_action_started_at=1,updated_at=1
                    WHERE cat_id = ANY($1::TEXT[])",
                 &[&vec![
                     "cat-stale-action",
@@ -1320,6 +1320,47 @@ fn stale_action_scan_uses_database_age_and_excludes_special_recovery_lanes() {
     assert_eq!(stale[0].cat.cat_id, "cat-stale-action");
     assert_eq!(stale[0].cat.current_action, Some(CatAction::Create));
     assert_eq!(stale[0].cat.current_action_started_at, Some(1));
+}
+
+#[test]
+fn same_action_retry_refreshes_activity_without_changing_occurrence_identity() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    let admitted = admit_cat(&store, "cat-stale-retry", "stale-retry", 2, 1 << 30);
+    let started_at = admitted
+        .cat
+        .current_action_started_at
+        .expect("Create claim has a start time");
+    store
+        .with(|client| {
+            client
+                .execute(
+                    "UPDATE cats SET updated_at=1 WHERE cat_id='cat-stale-retry'",
+                    &[],
+                )
+                .map(|_| ())
+        })
+        .unwrap();
+
+    let AdmitCatCreateOutcome::SameAction(retry) = store
+        .admit_semantic_cat_create(AtomicCatCreate {
+            cat_id: "cat-stale-retry",
+            workspace_id: "ws_semantic",
+            cat_slug: "stale-retry",
+            cpu_count: 2,
+            memory_bytes: 1 << 30,
+            boot_image: "sha256:image",
+            mounts: &[],
+        })
+        .unwrap()
+    else {
+        panic!("matching Create retry must resume the current occurrence")
+    };
+    assert_eq!(retry.cat.current_action_started_at, Some(started_at));
+    assert!(store
+        .list_stale_semantic_cat_actions(135_000, 64)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -1349,7 +1390,7 @@ fn unresolved_stale_actions_rotate_behind_an_untried_claim() {
                 .execute(
                     "UPDATE cats
                         SET current_action_started_at=1,
-                            updated_at=(SELECT MAX(created_at) FROM cats)",
+                            updated_at=1",
                     &[],
                 )
                 .map(|_| ())

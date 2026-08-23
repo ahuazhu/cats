@@ -711,16 +711,19 @@ impl Store {
                 let cat = row_to_cat(&row);
                 let aggregate = cat_with_mounts(&mut transaction, cat)?;
                 let configuration_matches = cat_create_configuration_matches(&aggregate, &request);
-                transaction.commit()?;
-                return Ok(if !configuration_matches {
+                let outcome = if !configuration_matches {
                     AdmitCatCreateOutcome::ConfigurationConflict(aggregate)
                 } else {
                     match aggregate.cat.current_action {
-                        Some(CatAction::Create) => AdmitCatCreateOutcome::SameAction(aggregate),
+                        Some(CatAction::Create) => AdmitCatCreateOutcome::SameAction(
+                            refresh_current_action_activity(&mut transaction, aggregate)?,
+                        ),
                         Some(_) => AdmitCatCreateOutcome::Busy(aggregate),
                         None => AdmitCatCreateOutcome::AlreadyExists(aggregate),
                     }
-                });
+                };
+                transaction.commit()?;
+                return Ok(outcome);
             }
 
             let Some(node_id) =
@@ -766,16 +769,19 @@ impl Store {
                 )?;
                 let aggregate = cat_with_mounts(&mut transaction, row_to_cat(&row))?;
                 let configuration_matches = cat_create_configuration_matches(&aggregate, &request);
-                transaction.commit()?;
-                return Ok(if !configuration_matches {
+                let outcome = if !configuration_matches {
                     AdmitCatCreateOutcome::ConfigurationConflict(aggregate)
                 } else {
                     match aggregate.cat.current_action {
-                        Some(CatAction::Create) => AdmitCatCreateOutcome::SameAction(aggregate),
+                        Some(CatAction::Create) => AdmitCatCreateOutcome::SameAction(
+                            refresh_current_action_activity(&mut transaction, aggregate)?,
+                        ),
                         Some(_) => AdmitCatCreateOutcome::Busy(aggregate),
                         None => AdmitCatCreateOutcome::AlreadyExists(aggregate),
                     }
-                });
+                };
+                transaction.commit()?;
+                return Ok(outcome);
             };
             let cat = row_to_cat(&row);
 
@@ -889,6 +895,7 @@ impl Store {
             }
             match aggregate.cat.current_action {
                 Some(current) if current == action => {
+                    let aggregate = refresh_current_action_activity(&mut transaction, aggregate)?;
                     transaction.commit()?;
                     return Ok(AdmitCatActionOutcome::SameAction(aggregate));
                 }
@@ -1087,10 +1094,12 @@ impl Store {
         })
     }
 
-    /// Returns one DB-time ordered page of ordinary non-Destroy lifecycle actions whose
-    /// persisted claim age has crossed `stale_after_ms`. Cross-Node offline
-    /// recovery owns a distinct multi-step state machine while reusing a
-    /// `run` lane, so those rows remain exclusively with that recovery loop.
+    /// Returns one DB-time ordered page of ordinary non-Destroy lifecycle
+    /// actions with no foreground activity for `stale_after_ms`. Same-action
+    /// admission refreshes `updated_at` without changing the action occurrence
+    /// identity. Cross-Node offline recovery owns a distinct multi-step state
+    /// machine while reusing a `run` lane, so those rows remain exclusively
+    /// with that recovery loop.
     pub fn list_stale_semantic_cat_actions(
         &self,
         stale_after_ms: i64,
@@ -1111,7 +1120,7 @@ impl Store {
                        FROM cats
                       WHERE current_action IS NOT NULL
                         AND current_action<>'destroy'
-                        AND current_action_started_at <= {DB_NOW_MS} - $1
+                        AND updated_at <= {DB_NOW_MS} - $1
                         AND NOT (
                             current_action='run'
                             AND node_id IS NOT NULL
@@ -1404,9 +1413,10 @@ impl Store {
         })
     }
 
-    /// Discovers a bounded snapshot of unresolved Destroy claims older than
-    /// the supplied grace period. Discovery is not authority: callers must
-    /// settle through the exact action/Node predicate after noded discovery.
+    /// Discovers a bounded snapshot of unresolved Destroy claims with no
+    /// foreground activity for the supplied grace period. Discovery is not
+    /// authority: callers must settle through the exact action occurrence and
+    /// Node predicate after noded discovery.
     pub fn list_pending_semantic_destroy_claims(
         &self,
         minimum_age_ms: i64,
@@ -1418,7 +1428,7 @@ impl Store {
                 &format!(
                     "SELECT {CAT_COLUMNS} FROM cats
                       WHERE current_action='destroy'
-                        AND current_action_started_at <= {DB_NOW_MS} - $1
+                        AND updated_at <= {DB_NOW_MS} - $1
                         AND destroyed_at IS NULL
                       ORDER BY updated_at,cat_id
                       LIMIT $2
@@ -2337,6 +2347,29 @@ fn cat_with_mounts(
             })
             .collect(),
     })
+}
+
+/// Records that a foreground request is actively resuming the same action
+/// occurrence. The action start time remains unchanged because it is the
+/// settlement identity; only the scanner's DB-time activity clock advances.
+fn refresh_current_action_activity(
+    client: &mut impl postgres::GenericClient,
+    mut aggregate: CatWithMounts,
+) -> std::result::Result<CatWithMounts, postgres::Error> {
+    // Each caller holds this Cat row FOR UPDATE and has already classified it
+    // as the same active action occurrence, so Cat identity is sufficient for
+    // this activity-only update.
+    let row = client.query_one(
+        &format!(
+            "UPDATE cats
+                SET updated_at=GREATEST({DB_NOW_MS}, updated_at + 1)
+              WHERE cat_id=$1
+              RETURNING {CAT_COLUMNS}"
+        ),
+        &[&aggregate.cat.cat_id],
+    )?;
+    aggregate.cat = row_to_cat(&row);
+    Ok(aggregate)
 }
 
 fn cat_create_configuration_matches(

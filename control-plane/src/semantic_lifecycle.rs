@@ -543,11 +543,13 @@ pub struct SemanticLifecycleService<S, N, I> {
     timeouts: LifecycleTimeouts,
 }
 
-/// A lifecycle action becomes eligible for recovery after the foreground
-/// request's 120-second deadline (which starts before ingress work), the
-/// possible ten-second failed-Create cleanup, and a five-second scheduling
-/// margin. This is deliberately independent from heartbeat age: the scanner
-/// confirms the exact Cat state with noded before settlement.
+/// A lifecycle action becomes eligible for recovery after 135 seconds without
+/// foreground activity: the request's 120-second deadline (which starts before
+/// ingress work), the possible ten-second failed-Create cleanup, and a
+/// five-second scheduling margin. Same-action admission refreshes the activity
+/// clock without replacing the exact action occurrence. This is deliberately
+/// independent from heartbeat age: the scanner confirms the exact Cat state
+/// with noded before settlement.
 pub const DEFAULT_STALE_ACTION_AGE: Duration = Duration::from_secs(135);
 pub const DEFAULT_ACTION_RECOVERY_SCAN_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEFAULT_ACTION_RECOVERY_BATCH_SIZE: usize = 64;
