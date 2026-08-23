@@ -660,12 +660,15 @@ fn mounts_from_bytes(
             mounts.len() < FILESYSTEM_CONTROL_MAX_MOUNTS_V1,
             "mount count exceeds filesystem control bound"
         );
-        let source_path = HostPath::new(unescape_mountinfo(right[1])?)
+        let _source_alias = HostPath::new(unescape_mountinfo(right[1])?)
             .context("mountinfo source path is not canonical")?;
-        anyhow::ensure!(
-            source_path == device.reported_path,
-            "mountinfo source path disagrees with device number"
-        );
+        // The kernel device number, not mount(2)'s caller-selected source
+        // spelling, identifies the mounted block device. We intentionally
+        // mount through a retained `/proc/self/fd/N`; kernels/filesystems may
+        // preserve that spelling instead of reporting `/dev/vdX`. The retained
+        // descriptor and sysfs/fstat samples already prove the exact device,
+        // so expose its canonical `/dev/vdX` path in the signed observation.
+        let source_path = device.reported_path.clone();
         let options: Vec<&str> = left[5].split(',').collect();
         let access = match (
             options.iter().filter(|value| **value == "rw").count(),
@@ -953,7 +956,7 @@ mod tests {
     }
 
     #[test]
-    fn mountinfo_requires_exact_source_and_reports_sorted_mounts() {
+    fn mountinfo_uses_device_number_as_authority_and_reports_canonical_path() {
         let device = DeviceSnapshot {
             guest_device: GuestDeviceIdentity {
                 serial: Id::new("cats-data").unwrap(),
@@ -973,13 +976,12 @@ mod tests {
         .unwrap();
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].mount_path.as_str(), "/data");
-        assert!(mounts_from_bytes(
-            b"31 1 252:16 / /data rw,nodev - ext4 /dev/other rw\n",
+        let aliased = mounts_from_bytes(
+            b"31 1 252:16 / /data rw,nodev - ext4 /proc/self/fd/19 rw\n",
             &device,
         )
-        .unwrap_err()
-        .to_string()
-        .contains("source path"));
+        .unwrap();
+        assert_eq!(aliased[0].source_path.as_str(), "/dev/vdb");
     }
 
     #[test]
