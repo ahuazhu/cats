@@ -17,8 +17,7 @@ const I18N_JS: &str = include_str!("../ui/i18n.js");
 const COMMON_JS: &str = include_str!("../ui/common.js");
 const USER_JS: &str = include_str!("../ui/user.js");
 const ADMIN_JS: &str = include_str!("../ui/admin.js");
-const CAT_CREATE_V2_JS: &str = include_str!("../ui/cat-create-v2.mjs");
-const PERSISTENT_DISK_CREATE_V1_JS: &str = include_str!("../ui/persistent-disk-create-v1.mjs");
+const SEMANTIC_RESOURCE_CLIENT_JS: &str = include_str!("../ui/semantic-resource-client.mjs");
 const RUNTIME_PRODUCT_LOAD_JS: &str = include_str!("../ui/runtime-product-load.mjs");
 
 const PUBLIC_CSS: &str = include_str!("../ui/public/public.css");
@@ -895,10 +894,9 @@ where
         .route("/ui/common.js", get(common_script))
         .route("/ui/user.js", get(user_script))
         .route("/ui/admin.js", get(admin_script))
-        .route("/ui/cat-create-v2.mjs", get(cat_create_v2_script))
         .route(
-            "/ui/persistent-disk-create-v1.mjs",
-            get(persistent_disk_create_v1_script),
+            "/ui/semantic-resource-client.mjs",
+            get(semantic_resource_client_script),
         )
         .route(
             "/ui/runtime-product-load.mjs",
@@ -926,14 +924,10 @@ pub async fn admin_script() -> Response {
     console_asset("text/javascript; charset=utf-8", ADMIN_JS)
 }
 
-pub async fn cat_create_v2_script() -> Response {
-    console_asset("text/javascript; charset=utf-8", CAT_CREATE_V2_JS)
-}
-
-pub async fn persistent_disk_create_v1_script() -> Response {
+pub async fn semantic_resource_client_script() -> Response {
     console_asset(
         "text/javascript; charset=utf-8",
-        PERSISTENT_DISK_CREATE_V1_JS,
+        SEMANTIC_RESOURCE_CLIENT_JS,
     )
 }
 
@@ -1018,9 +1012,9 @@ mod tests {
     };
 
     use super::{
-        console_asset_routes, not_found, ADMIN_GUIDE, ADMIN_HTML, ADMIN_JS, CAT_CREATE_V2_JS,
-        COMMON_JS, DOCS, I18N_JS, LANDING_EN, LANDING_ZH, PERSISTENT_DISK_CREATE_V1_JS,
-        RUNTIME_PRODUCT_LOAD_JS, USER_HTML, USER_JS,
+        console_asset_routes, not_found, ADMIN_GUIDE, ADMIN_HTML, ADMIN_JS, COMMON_JS, DOCS,
+        I18N_JS, LANDING_EN, LANDING_ZH, RUNTIME_PRODUCT_LOAD_JS, SEMANTIC_RESOURCE_CLIENT_JS,
+        USER_HTML, USER_JS,
     };
 
     #[tokio::test]
@@ -1038,10 +1032,9 @@ mod tests {
         });
 
         for (path, expected) in [
-            ("/ui/cat-create-v2.mjs", CAT_CREATE_V2_JS),
             (
-                "/ui/persistent-disk-create-v1.mjs",
-                PERSISTENT_DISK_CREATE_V1_JS,
+                "/ui/semantic-resource-client.mjs",
+                SEMANTIC_RESOURCE_CLIENT_JS,
             ),
             ("/ui/runtime-product-load.mjs", RUNTIME_PRODUCT_LOAD_JS),
         ] {
@@ -1259,47 +1252,55 @@ mod tests {
         assert!(!USER_JS.contains("apiFetch("));
         assert!(!USER_JS.contains("state.workspaceId"));
         assert!(RUNTIME_PRODUCT_LOAD_JS.contains("export async function loadAll"));
+        assert!(!RUNTIME_PRODUCT_LOAD_JS.contains("?limit="));
+        assert!(!RUNTIME_PRODUCT_LOAD_JS.contains("next_cursor"));
+        let initialize_auth = USER_JS
+            .split("async function initializeAuth()")
+            .nth(1)
+            .expect("initializeAuth is present");
+        let show_app = initialize_auth
+            .find("showApp();")
+            .expect("authenticated app is shown");
+        let load_products = initialize_auth
+            .find("await loadAll({ quiet: true });")
+            .expect("initial product load is present");
+        assert!(
+            show_app < load_products,
+            "authentication success must reveal the app before product reads"
+        );
     }
 
     #[test]
     fn shipped_console_exposes_only_exact_creates_and_reads_across_the_closed_authority_boundary() {
         for contract in [
-            "buildCatCreateV2Request",
-            "sendDurableCatCreateV2",
-            "resumePendingCatCreates",
-            "buildPersistentDiskCreateV1Request",
-            "sendDurablePersistentDiskCreateV1",
-            "resumePendingPersistentDiskCreates",
-            "bootImageDigest: values.get(\"boot_image_digest\")",
-            "durability: values.get(\"durability\")",
+            "buildSemanticCatCreateRequest",
+            "createSemanticCat",
+            "buildSemanticDiskCreateRequest",
+            "createSemanticDisk",
+            "bootImage: values.get(\"boot_image_digest\")",
         ] {
             assert!(
                 USER_JS.contains(contract),
-                "missing v2 create contract {contract:?}"
+                "missing semantic create contract {contract:?}"
             );
         }
         for contract in [
-            "parseCatCreateV2AcceptedResponseBody",
-            "status !== 202",
-            "globalThis.indexedDB",
-            "globalThis.navigator?.locks",
-            "{ durability: \"strict\" }",
-            "insertWithinWorkspaceLimit",
-            "PendingReplayToken",
-            "Idempotency-Key",
-            "request_body",
+            "cat_slug:",
+            "disk_slug:",
+            "memory_bytes:",
+            "boot_image:",
+            "already_exists",
+            "assertSemanticConsoleRequestSupported",
         ] {
             assert!(
-                CAT_CREATE_V2_JS.contains(contract),
-                "missing durable v2 create contract {contract:?}"
+                SEMANTIC_RESOURCE_CLIENT_JS.contains(contract),
+                "missing semantic resource contract {contract:?}"
             );
         }
         for contract in [
             "name=\"boot_image_digest\"",
             "name=\"vcpus\"",
             "name=\"memory_mib\"",
-            "name=\"root_gib\"",
-            "name=\"durability\"",
             "data-view=\"cats\">",
             "data-view=\"disks\">",
             "data-view=\"operations\" hidden",
@@ -1318,12 +1319,20 @@ mod tests {
                     .next()
             })
             .expect("create handler is present");
-        assert!(create_handler.contains("sendPendingCatCreate("));
-        assert!(USER_JS.contains("request.expectedPending"));
-        assert!(
-            USER_JS.matches("resumePendingProductCreates()").count() >= 4,
-            "pending create recovery must be wired into initialization, Workspace switching, and refresh"
-        );
+        assert!(create_handler.contains("createSemanticCat({"));
+        for retired in [
+            "Idempotency-Key",
+            "indexedDB",
+            "PendingReplayToken",
+            "resumePendingProductCreates",
+            "operation_id",
+            "?limit=",
+        ] {
+            assert!(
+                !create_handler.contains(retired) && !SEMANTIC_RESOURCE_CLIENT_JS.contains(retired),
+                "release console retained retired protocol token {retired:?}"
+            );
+        }
         for retired_control in ["data-cat-action", "data-disk-action", "#exec-form"] {
             assert!(
                 !USER_JS.contains(retired_control),
@@ -1344,10 +1353,9 @@ mod tests {
         }
         assert!(ADMIN_HTML.contains("data-view=\"nodes\" hidden"));
         assert!(ADMIN_HTML.contains("id=\"view-nodes\" hidden"));
-        assert!(USER_JS.contains("assertRuntimeCutoverClientRequestSupported(path"));
-        assert!(ADMIN_JS.contains("assertRuntimeCutoverClientRequestSupported(path"));
-        assert!(CAT_CREATE_V2_JS.contains("retiredWorkspaceSurface"));
-        assert!(CAT_CREATE_V2_JS.contains("retiredFleetSurface"));
+        assert!(USER_JS.contains("assertSemanticConsoleRequestSupported(path"));
+        assert!(ADMIN_JS.contains("assertSemanticConsoleRequestSupported(path"));
+        assert!(SEMANTIC_RESOURCE_CLIENT_JS.contains("closedSurface"));
     }
 
     #[test]
