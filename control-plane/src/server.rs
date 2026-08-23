@@ -1,8 +1,9 @@
 //! Clean-slate semantic Control assembly.
 //!
 //! The public HTTP server owns only workspace/auth/billing, semantic resource
-//! operations and semantic Node registration/liveness. Retired lifecycle,
-//! inventory, AgentSession and Route Operation workers are not composed.
+//! operations, committed-Destroy recovery and semantic Node
+//! registration/liveness. Retired lifecycle, inventory, AgentSession and
+//! Route Operation workers are not composed.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -18,6 +19,13 @@ use crate::store::{DsnSource, SingletonRole, Store};
 
 const SINGLETON_ELECTION_RETRY: Duration = Duration::from_millis(500);
 const SINGLETON_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
+const DESTROY_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
+// A live request owns its claim for at most the default 120-second lifecycle
+// deadline. Waiting beyond it prevents the recovery task from racing the
+// ordinary response path while still bounding crash recovery.
+const DESTROY_RECOVERY_MINIMUM_AGE: Duration = Duration::from_secs(125);
+const DESTROY_RECOVERY_BATCH_SIZE: usize = 32;
+const DESTROY_RECOVERY_MAX_IN_FLIGHT: usize = 4;
 
 #[derive(Clone)]
 pub struct Config {
@@ -60,6 +68,7 @@ pub struct Handle {
     pub addr: std::net::SocketAddr,
     pub state: AppState,
     server_task: tokio::task::JoinHandle<()>,
+    semantic_destroy_recovery_task: ManagedSingletonTask,
     semantic_node_liveness_shutdown: tokio::sync::watch::Sender<bool>,
     semantic_node_liveness_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     server_shutdown: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -95,12 +104,17 @@ impl Handle {
         {
             let _ = shutdown.send(());
         }
+        self.semantic_destroy_recovery_task.begin_shutdown();
         self.semantic_node_liveness_shutdown.send_replace(true);
         self.state.runtime_node_authority.begin_shutdown();
     }
 
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         self.begin_shutdown();
+        self.semantic_destroy_recovery_task
+            .shutdown()
+            .await
+            .context("semantic Destroy recovery task failed")?;
         let mut task = self.semantic_node_liveness_task.lock().await;
         if let Some(task) = task.take() {
             task.await.context("semantic Node liveness task failed")?;
@@ -227,6 +241,40 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         semantic_ingress,
         crate::semantic_lifecycle::LifecycleTimeouts::default(),
     );
+    let destroy_recovery_lifecycle = semantic_lifecycle.clone();
+    let semantic_destroy_recovery_task = spawn_managed_singleton_task(
+        Arc::clone(&store),
+        SingletonRole::SemanticDestroyRecovery,
+        move || {
+            let lifecycle = destroy_recovery_lifecycle.clone();
+            async move {
+                let mut interval = tokio::time::interval(DESTROY_RECOVERY_INTERVAL);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    interval.tick().await;
+                    match lifecycle
+                        .recover_pending_destroys(
+                            DESTROY_RECOVERY_MINIMUM_AGE,
+                            DESTROY_RECOVERY_BATCH_SIZE,
+                            DESTROY_RECOVERY_MAX_IN_FLIGHT,
+                        )
+                        .await
+                    {
+                        Ok(report) if report.discovered > 0 => tracing::info!(
+                            discovered = report.discovered,
+                            completed = report.completed,
+                            failed = report.failed,
+                            "pending Destroy recovery pass completed"
+                        ),
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(?error, "pending Destroy discovery failed");
+                        }
+                    }
+                }
+            }
+        },
+    );
     let semantic_resources: Arc<dyn crate::api::semantic_resources::SemanticResourceApi> = Arc::new(
         crate::semantic_resource_service::ProductionSemanticResourceApi::with_disk_backend(
             semantic_lifecycle,
@@ -286,6 +334,7 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         addr,
         state,
         server_task,
+        semantic_destroy_recovery_task,
         semantic_node_liveness_shutdown,
         semantic_node_liveness_task: tokio::sync::Mutex::new(Some(semantic_node_liveness_task)),
         server_shutdown: std::sync::Mutex::new(Some(server_shutdown)),

@@ -1,6 +1,7 @@
 # Control Plane 与 noded 同步协议设计
 
-- 状态：ADR-0059 已接受，正在实施
+- 状态：ADR-0059 已接受，并由 [ADR-0062](decisions/0062-destroy-preempts-in-progress-cat-actions.md)
+  修正 Destroy 抢占与崩溃恢复；正在实施
 - 范围：Cat、Node、PersistentDisk 的控制面数据模型、同步接口、状态转换与场景语义幂等
 - 切换方式：空数据、单协议直接替换旧 lifecycle 协调；不提供兼容层或数据迁移，实施进度见[执行计划](semantic-control-node-implementation-plan.md)
 
@@ -629,7 +630,10 @@ Control Plane 可能在 `noded` 已经完成动作、但数据库尚未更新时
 5. 如果 `noded` 报告明确失败，写 `failure`。
 6. 如果 Node 不可达，进入 Node 失联流程。
 
-Control Plane 可以周期扫描超时的 `current_action`，但扫描器和用户重试必须使用同一套状态判断，不能各自定义恢复规则。
+生产 Control 通过 schema-scoped PostgreSQL advisory lock 选举一个 Destroy 恢复任务。它只扫描早于
+正常同步请求 deadline 的未结算 Destroy，每批和并发都有上限，并执行上述同一套 discovery-first 与
+exact settlement 规则。选举会话丢失或 shutdown 会取消恢复；其他 replica 可继续扫描。该扫描器和
+用户重试不能各自定义恢复规则，也不成为新的 lifecycle authority。
 
 ## 11. 核心流程
 

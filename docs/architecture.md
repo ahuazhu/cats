@@ -1,8 +1,9 @@
 # Cats 技术架构
 
 - 状态：目标架构 + 当前实现边界；Control/Node 生命周期以
-  [ADR-0059](decisions/0059-semantic-control-node-synchronous-protocol.md) 为当前唯一协议
-- 更新：2026-08-22
+  [ADR-0059](decisions/0059-semantic-control-node-synchronous-protocol.md) 及其
+  [ADR-0062 Destroy 修正](decisions/0062-destroy-preempts-in-progress-cat-actions.md) 为当前协议
+- 更新：2026-08-23
 - 适用范围：产品资源、控制面、Node、网络入口、microVM 与块存储
 
 ## 1. 大目标

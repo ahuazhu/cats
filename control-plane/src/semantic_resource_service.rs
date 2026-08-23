@@ -5,6 +5,7 @@
 //! lifecycle Operation, or compatibility protocol enters this adapter.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use cats_api::runtime_reconciliation::Id;
 use cats_api::semantic_control as wire;
@@ -539,6 +540,28 @@ impl lifecycle::SemanticLifecycleStore for PostgresSemanticLifecycleStore {
                 .await
                 .map_err(lifecycle_store_error)
                 .and_then(map_action_admission)
+        })
+    }
+
+    fn pending_destroy_claims<'a>(
+        &'a self,
+        minimum_age: Duration,
+        limit: usize,
+    ) -> lifecycle::SemanticFuture<'a, Result<Vec<lifecycle::ActionClaim>, lifecycle::StoreError>>
+    {
+        let store = Arc::clone(&self.store);
+        Box::pin(async move {
+            let minimum_age_ms = i64::try_from(minimum_age.as_millis()).unwrap_or(i64::MAX);
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            store
+                .execute(move |store| {
+                    store.list_pending_semantic_destroy_claims(minimum_age_ms, limit)
+                })
+                .await
+                .map_err(lifecycle_store_error)?
+                .into_iter()
+                .map(|cat| action_claim(cat, lifecycle::CatAction::Destroy))
+                .collect()
         })
     }
 

@@ -1,10 +1,11 @@
 # Runtime 生命周期
 
-- 状态：ADR-0059 当前产品合同；实现和物理资格边界见
+- 状态：ADR-0059 + ADR-0062 当前产品合同；实现和物理资格边界见
   [Architecture §3](architecture.md#3-当前实现边界)
 - 决策：[ADR-0002](decisions/0002-lifecycle-states-running-suspended-warm-cold.md)、
   [ADR-0022](decisions/0022-relaxed-local-first-dual-watermark.md)、
-  [ADR-0059](decisions/0059-semantic-control-node-synchronous-protocol.md)
+  [ADR-0059](decisions/0059-semantic-control-node-synchronous-protocol.md)、
+  [ADR-0062](decisions/0062-destroy-preempts-in-progress-cat-actions.md)
 - 精确协议：[Control Plane 与 noded 同步协议设计](control-node-semantic-protocol.md)
 
 本文组合产品状态、同步动作、入口屏障和数据屏障。用户面只有
@@ -72,6 +73,8 @@ destroy 是唯一例外：它在数据库行锁内替换当前动作，并继承
 
 Control 在 noded 已完成、数据库尚未更新时退出，恢复者读取 `current_action_node_id`，调用
 `GET /v1/cats/{cat_id}`，再按实际结果更新当前行。heartbeat、日志和 metrics 都不能完成动作。
+已提交 Destroy 超过正常同步请求 deadline 后，由 PostgreSQL 单例选举的有界扫描器自动执行同一套
+discovery-first 恢复；扫描不成为新的结算 authority。
 
 ### 3.2 noded
 

@@ -1259,6 +1259,37 @@ impl Store {
         })
     }
 
+    /// Discovers a bounded snapshot of unresolved Destroy claims older than
+    /// the supplied grace period. Discovery is not authority: callers must
+    /// settle through the exact action/Node predicate after noded discovery.
+    pub fn list_pending_semantic_destroy_claims(
+        &self,
+        minimum_age_ms: i64,
+        limit: i64,
+    ) -> Result<Vec<CatWithMounts>> {
+        self.with(|client| {
+            let mut transaction = client.transaction()?;
+            let rows = transaction.query(
+                &format!(
+                    "SELECT {CAT_COLUMNS} FROM cats
+                      WHERE current_action='destroy'
+                        AND current_action_started_at <= {DB_NOW_MS} - $1
+                        AND destroyed_at IS NULL
+                      ORDER BY current_action_started_at,cat_id
+                      LIMIT $2
+                      FOR SHARE SKIP LOCKED"
+                ),
+                &[&minimum_age_ms, &limit],
+            )?;
+            let mut cats = Vec::with_capacity(rows.len());
+            for row in rows {
+                cats.push(cat_with_mounts(&mut transaction, row_to_cat(&row))?);
+            }
+            transaction.commit()?;
+            Ok(cats)
+        })
+    }
+
     /// Atomically replaces any old-Node action lane with one recovery `run`
     /// claim and selects another currently running Node. The source placement
     /// stays on the Cat until terminal recovery, so a Control restart can

@@ -259,6 +259,18 @@ fn destroy_preempts_an_in_progress_create_on_its_reserved_node() {
         Some("node-a")
     );
 
+    // Simulate Control exiting after the replacement claim commits but
+    // before it dispatches to noded. A later elected scanner must rediscover
+    // the exact Destroy lane and its inherited Node.
+    let pending = store.list_pending_semantic_destroy_claims(0, 32).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].cat.cat_id, "cat-destroy-creating");
+    assert_eq!(pending[0].cat.current_action, Some(CatAction::Destroy));
+    assert_eq!(
+        pending[0].cat.current_action_node_id.as_deref(),
+        Some("node-a")
+    );
+
     assert!(store
         .finish_semantic_cat_action(
             "cat-destroy-creating",
@@ -289,6 +301,10 @@ fn destroy_preempts_an_in_progress_create_on_its_reserved_node() {
         .unwrap()
         .expect("destroy owns the replacement claim");
     assert_eq!(destroyed.state, Some(CatState::Destroyed));
+    assert!(store
+        .list_pending_semantic_destroy_claims(0, 32)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]

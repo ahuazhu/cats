@@ -164,6 +164,14 @@ impl SemanticLifecycleStore for MemoryLifecycleStore {
         })
     }
 
+    fn pending_destroy_claims<'a>(
+        &'a self,
+        _minimum_age: Duration,
+        _limit: usize,
+    ) -> SemanticFuture<'a, Result<Vec<ActionClaim>, StoreError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn node_control_endpoint<'a>(
         &'a self,
         node_id: &'a str,

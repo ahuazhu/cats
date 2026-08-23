@@ -16,8 +16,9 @@
 
 ## 当前实现与目标
 
-当前 Control/Node 生命周期唯一协议由
-[ADR-0059](decisions/0059-semantic-control-node-synchronous-protocol.md)决定：Control 用资源当前行和
+当前 Control/Node 生命周期协议由
+[ADR-0059](decisions/0059-semantic-control-node-synchronous-protocol.md)及其
+[ADR-0062 Destroy 修正](decisions/0062-destroy-preempts-in-progress-cat-actions.md)决定：Control 用资源当前行和
 `current_action` 串行动作，transaction 外同步调用 noded；幂等来自 Workspace、slug、完整参数和目标
 状态，不使用 request ID、Operation、Node poll/result 或 per-Cat journal。
 
@@ -85,6 +86,7 @@ AgentSession 或 HostFenceRecovery 协调的段落，都由 ADR-0059 supersede�
 ### 当前协调决策
 
 - [0059 Control/Node 场景语义同步协议](decisions/0059-semantic-control-node-synchronous-protocol.md)
+- [0062 Destroy 抢占进行中的 Cat 动作](decisions/0062-destroy-preempts-in-progress-cat-actions.md)
 - [0061 场景语义 Least-Allocated Placement](decisions/0061-semantic-least-allocated-placement.md)
 - [0002 四态生命周期](decisions/0002-lifecycle-states-running-suspended-warm-cold.md)
 - [0031 PostgreSQL control store](decisions/0031-control-store-on-postgresql.md)

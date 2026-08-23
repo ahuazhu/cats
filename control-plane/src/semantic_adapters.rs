@@ -136,6 +136,28 @@ impl SemanticLifecycleStore for SemanticStoreAdapter {
         })
     }
 
+    fn pending_destroy_claims<'a>(
+        &'a self,
+        minimum_age: Duration,
+        limit: usize,
+    ) -> SemanticFuture<'a, Result<Vec<ActionClaim>, StoreError>> {
+        let store = Arc::clone(&self.store);
+        Box::pin(async move {
+            let minimum_age_ms = i64::try_from(minimum_age.as_millis()).unwrap_or(i64::MAX);
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            store
+                .execute(move |store| {
+                    store
+                        .list_pending_semantic_destroy_claims(minimum_age_ms, limit)?
+                        .into_iter()
+                        .map(|cat| claim_from_aggregate(cat, CatAction::Destroy))
+                        .collect()
+                })
+                .await
+                .map_err(store_error)
+        })
+    }
+
     fn node_control_endpoint<'a>(
         &'a self,
         node_id: &'a str,

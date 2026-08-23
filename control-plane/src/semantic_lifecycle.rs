@@ -10,6 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
+use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 
 /// Boxed future used by the persistence and noded integration ports.
@@ -286,6 +287,16 @@ pub trait SemanticLifecycleStore: Send + Sync {
         action: CatAction,
     ) -> SemanticFuture<'a, Result<Admission, StoreError>>;
 
+    /// Returns a bounded snapshot of committed Destroy claims old enough not
+    /// to belong exclusively to a still-running admission request. The rows
+    /// remain authoritative only while their exact action and Node still
+    /// match during settlement.
+    fn pending_destroy_claims<'a>(
+        &'a self,
+        minimum_age: Duration,
+        limit: usize,
+    ) -> SemanticFuture<'a, Result<Vec<ActionClaim>, StoreError>>;
+
     /// Resolves `nodes.control_endpoint` after admission has committed.
     fn node_control_endpoint<'a>(
         &'a self,
@@ -487,6 +498,7 @@ impl From<StoreError> for LifecycleError {
 }
 
 /// Orchestrates one synchronous Control-to-noded lifecycle action.
+#[derive(Clone)]
 pub struct SemanticLifecycleService<S, N, I> {
     store: S,
     noded: N,
@@ -542,6 +554,49 @@ where
     /// semantic command still needs to be sent.
     pub async fn resume(&self, claim: ActionClaim) -> Result<LifecycleOutcome, LifecycleError> {
         self.drive_claim(claim, true).await
+    }
+
+    /// Recovers a bounded batch of Destroy claims that survived their
+    /// admitting Control request. Multiple claims are driven concurrently,
+    /// but each retains the normal discovery-first and exact-settlement
+    /// semantics.
+    pub async fn recover_pending_destroys(
+        &self,
+        minimum_age: Duration,
+        limit: usize,
+        max_in_flight: usize,
+    ) -> Result<PendingDestroyRecoveryReport, StoreError> {
+        if limit == 0 {
+            return Ok(PendingDestroyRecoveryReport::default());
+        }
+        let claims = self
+            .store
+            .pending_destroy_claims(minimum_age, limit)
+            .await?;
+        let discovered = claims.len();
+        let results = stream::iter(claims)
+            .map(|claim| async move {
+                let cat_id = claim.cat.cat_id.clone();
+                (cat_id, self.resume(claim).await)
+            })
+            .buffer_unordered(max_in_flight.max(1))
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut report = PendingDestroyRecoveryReport {
+            discovered,
+            ..PendingDestroyRecoveryReport::default()
+        };
+        for (cat_id, result) in results {
+            match result {
+                Ok(_) => report.completed += 1,
+                Err(error) => {
+                    report.failed += 1;
+                    tracing::warn!(%cat_id, ?error, "pending Destroy recovery failed");
+                }
+            }
+        }
+        Ok(report)
     }
 
     async fn action(
@@ -864,6 +919,14 @@ where
     }
 }
 
+/// Summary of one bounded pending-Destroy recovery pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PendingDestroyRecoveryReport {
+    pub discovered: usize,
+    pub completed: usize,
+    pub failed: usize,
+}
+
 enum Discovery {
     Complete(CatState),
     Failed { code: String, message: String },
@@ -904,6 +967,7 @@ mod tests {
 
     struct MockStoreState {
         admissions: VecDeque<Admission>,
+        pending_destroy_claims: VecDeque<Vec<ActionClaim>>,
         cat: CatRecord,
         in_transaction: bool,
         endpoint_reads: usize,
@@ -916,6 +980,7 @@ mod tests {
             Self {
                 state: Arc::new(Mutex::new(MockStoreState {
                     admissions: VecDeque::from([admission]),
+                    pending_destroy_claims: VecDeque::new(),
                     cat,
                     in_transaction: false,
                     endpoint_reads: 0,
@@ -923,6 +988,14 @@ mod tests {
                     failures: 0,
                 })),
             }
+        }
+
+        fn queue_pending_destroy(&self, claim: ActionClaim) {
+            self.state
+                .lock()
+                .expect("mock store")
+                .pending_destroy_claims
+                .push_back(vec![claim]);
         }
     }
 
@@ -951,6 +1024,22 @@ mod tests {
                 let admission = state.admissions.pop_front().expect("admission");
                 state.in_transaction = false;
                 Ok(admission)
+            })
+        }
+
+        fn pending_destroy_claims<'a>(
+            &'a self,
+            _minimum_age: Duration,
+            _limit: usize,
+        ) -> SemanticFuture<'a, Result<Vec<ActionClaim>, StoreError>> {
+            Box::pin(async move {
+                Ok(self
+                    .state
+                    .lock()
+                    .expect("mock store")
+                    .pending_destroy_claims
+                    .pop_front()
+                    .unwrap_or_default())
             })
         }
 
@@ -1461,6 +1550,51 @@ mod tests {
             [CatAction::Destroy]
         );
         assert_eq!(store.state.lock().expect("store").failures, 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_scan_redispatches_destroy_committed_before_control_crash() {
+        let original = cat(Some(CatState::Failure), Some(CatAction::Destroy));
+        let action_claim = claim(original.clone(), CatAction::Destroy);
+        let store = MockStore::new(original, Admission::SameAction(action_claim.clone()));
+        store.queue_pending_destroy(action_claim);
+        let noded = MockNoded::new(
+            store.clone(),
+            [Ok(NodeCommandResult::Succeeded(CatState::Destroyed))],
+            [Ok(NodeCatStatus::Present {
+                state: None,
+                active_action: Some(CatAction::Create),
+            })],
+        );
+        let ingress = MockIngress::new(&noded);
+        let service =
+            SemanticLifecycleService::new(store.clone(), noded.clone(), ingress, fast_timeouts());
+
+        let report = service
+            .recover_pending_destroys(Duration::ZERO, 32, 4)
+            .await
+            .expect("scan committed Destroy");
+
+        assert_eq!(
+            report,
+            PendingDestroyRecoveryReport {
+                discovered: 1,
+                completed: 1,
+                failed: 0,
+            }
+        );
+        assert_eq!(store.state.lock().expect("store").completions, 1);
+        assert_eq!(
+            noded
+                .state
+                .lock()
+                .expect("noded")
+                .commands
+                .iter()
+                .map(|command| command.action)
+                .collect::<Vec<_>>(),
+            [CatAction::Destroy]
+        );
     }
 
     #[tokio::test]
