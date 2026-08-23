@@ -1303,7 +1303,7 @@ fn stale_action_scan_uses_database_age_and_excludes_special_recovery_lanes() {
     store
         .with(|client| {
             client.execute(
-                "UPDATE cats SET current_action_started_at=1,updated_at=1
+                "UPDATE cats SET created_at=1,current_action_started_at=1,updated_at=1
                    WHERE cat_id = ANY($1::TEXT[])",
                 &[&vec![
                     "cat-stale-action",
@@ -1335,7 +1335,8 @@ fn same_action_retry_refreshes_activity_without_changing_occurrence_identity() {
         .with(|client| {
             client
                 .execute(
-                    "UPDATE cats SET updated_at=1 WHERE cat_id='cat-stale-retry'",
+                    "UPDATE cats SET created_at=1,updated_at=1
+                      WHERE cat_id='cat-stale-retry'",
                     &[],
                 )
                 .map(|_| ())
@@ -1389,7 +1390,8 @@ fn unresolved_stale_actions_rotate_behind_an_untried_claim() {
             client
                 .execute(
                     "UPDATE cats
-                        SET current_action_started_at=1,
+                        SET created_at=1,
+                            current_action_started_at=1,
                             updated_at=1",
                     &[],
                 )
