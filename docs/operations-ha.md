@@ -79,7 +79,7 @@ transaction 之外：
 
 相同动作的重复请求查询/等待同一目标；不同动作返回 `busy`。如果 noded 已完成而 Control 在写回前
 退出，新 replica 读取 `current_action_node_id` 并查询 `GET /v1/cats/{cat_id}`。heartbeat、日志和 runtime
-inventory 不能结算动作。`controld` 越过 120 秒前台 deadline 和最长 10 秒 Create 清理窗口后的普通动作扫描、单例选举和精确终态 CAS 见
+inventory 不能结算动作。`controld` 的 120 秒前台 deadline 覆盖 claim 后的 ingress 等待；越过该 deadline 和最长 10 秒 Create 清理窗口后的普通动作扫描、单例选举和精确终态 CAS 见
 [Control–Node 语义协议 §10](control-node-semantic-protocol.md#10-control-plane-异常后的恢复)。
 
 Create Cat 和 Create Disk 依靠当前 slug 的部分唯一索引串行化。destroy/delete 后历史行退出索引，slug

@@ -637,7 +637,7 @@ Control Plane 可能在 `noded` 已经完成动作、但数据库尚未更新时
 6. 如果 Node 不可达，进入 Node 失联流程。
 
 生产 Control 为普通动作和 Destroy 分别使用 schema-scoped PostgreSQL advisory lock 选举一个恢复任务。
-两者都只扫描持续至少 135 秒、已经越过正常 120 秒同步请求 deadline 和最长 10 秒 Create 清理窗口的 claim，每批和并发都有上限，
+两者都只扫描持续至少 135 秒、已经越过正常 120 秒同步请求 deadline 和最长 10 秒 Create 清理窗口的 claim；前台 deadline 从 ingress withdraw/publish 等 claim 后效果之前开始并约束这些等待。每批和并发都有上限，
 并执行上述同一套 discovery-first 与 exact settlement 规则；普通动作扫描排除由独立多步骤循环负责的
 跨 Node 失联恢复 `run` lane，也排除专用 Destroy lane。
 

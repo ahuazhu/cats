@@ -544,10 +544,10 @@ pub struct SemanticLifecycleService<S, N, I> {
 }
 
 /// A lifecycle action becomes eligible for recovery after the foreground
-/// request's 120-second deadline, the possible ten-second failed-Create
-/// cleanup, and a five-second scheduling margin. This is deliberately
-/// independent from heartbeat age: the scanner confirms the exact Cat state
-/// with noded before settlement.
+/// request's 120-second deadline (which starts before ingress work), the
+/// possible ten-second failed-Create cleanup, and a five-second scheduling
+/// margin. This is deliberately independent from heartbeat age: the scanner
+/// confirms the exact Cat state with noded before settlement.
 pub const DEFAULT_STALE_ACTION_AGE: Duration = Duration::from_secs(135);
 pub const DEFAULT_ACTION_RECOVERY_SCAN_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEFAULT_ACTION_RECOVERY_BATCH_SIZE: usize = 64;
@@ -726,6 +726,10 @@ where
         claim: ActionClaim,
         recover_first: bool,
     ) -> Result<LifecycleOutcome, LifecycleError> {
+        // Start the foreground ownership window before any post-admission
+        // effect. In particular, ingress withdrawal must not postpone this
+        // deadline until the persisted claim becomes recovery-eligible.
+        let deadline = Instant::now() + self.timeouts.total;
         if claim.action.target() != CatState::Destroyed && claim.node_id.is_none() {
             return self
                 .fail(
@@ -736,23 +740,50 @@ where
                 .await;
         }
         if claim.action == CatAction::Destroy && claim.node_id.is_none() {
-            return self.complete(&claim, CatState::Destroyed).await;
+            return self.complete(&claim, CatState::Destroyed, deadline).await;
         }
 
         if let Some(old_node_id) = self.withdraw_target(&claim) {
-            if let Err(error) = self.ingress.withdraw(&claim.cat.cat_id, old_node_id).await {
+            let Some(timeout) = bounded_timeout(self.timeouts.total, deadline) else {
                 return self
-                    .fail(&claim, "ingress_withdraw_failed", &error.message)
+                    .fail(
+                        &claim,
+                        "ingress_withdraw_failed",
+                        "semantic ingress withdrawal timed out",
+                    )
                     .await;
+            };
+            match tokio::time::timeout(
+                timeout,
+                self.ingress.withdraw(&claim.cat.cat_id, old_node_id),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return self
+                        .fail(&claim, "ingress_withdraw_failed", &error.message)
+                        .await;
+                }
+                Err(_) => {
+                    return self
+                        .fail(
+                            &claim,
+                            "ingress_withdraw_failed",
+                            "semantic ingress withdrawal timed out",
+                        )
+                        .await;
+                }
             }
         }
 
-        let deadline = Instant::now() + self.timeouts.total;
         let node_id = claim.node_id.as_deref().expect("Node checked above");
 
         if recover_first {
             match self.discover(&claim, node_id, deadline).await? {
-                Discovery::Complete(state) => return self.complete(&claim, state).await,
+                Discovery::Complete(state) => {
+                    return self.complete(&claim, state, deadline).await;
+                }
                 Discovery::Failed { code, message } => {
                     return self.fail(&claim, &code, &message).await;
                 }
@@ -782,7 +813,7 @@ where
                             )
                             .await;
                     }
-                    return self.complete(&claim, state).await;
+                    return self.complete(&claim, state, deadline).await;
                 }
                 Ok(
                     NodeCommandResult::Failed { code, message }
@@ -792,7 +823,9 @@ where
                 }
                 Ok(NodeCommandResult::Busy) => {
                     match self.discover(&claim, node_id, deadline).await? {
-                        Discovery::Complete(state) => return self.complete(&claim, state).await,
+                        Discovery::Complete(state) => {
+                            return self.complete(&claim, state, deadline).await;
+                        }
                         Discovery::Failed { code, message } => {
                             return self.fail(&claim, &code, &message).await;
                         }
@@ -810,7 +843,7 @@ where
         }
 
         match self.discover(&claim, node_id, deadline).await? {
-            Discovery::Complete(state) => self.complete(&claim, state).await,
+            Discovery::Complete(state) => self.complete(&claim, state, deadline).await,
             Discovery::Failed { code, message } => self.fail(&claim, &code, &message).await,
             Discovery::Execute | Discovery::TimedOut => {
                 if claim.action == CatAction::Create {
@@ -927,26 +960,26 @@ where
     }
 
     async fn cleanup_failed_create(&self, claim: &ActionClaim, node_id: &str) {
-        let Ok(endpoint) = self.store.node_control_endpoint(node_id).await else {
-            return;
+        let cleanup = async {
+            let Ok(endpoint) = self.store.node_control_endpoint(node_id).await else {
+                return;
+            };
+            let cleanup = NodeCommand {
+                cat_id: claim.cat.cat_id.clone(),
+                workspace_id: claim.cat.workspace_id.clone(),
+                action: CatAction::Destroy,
+                config: None,
+            };
+            let _ = self.noded.execute(&endpoint, &cleanup).await;
         };
-        let cleanup = NodeCommand {
-            cat_id: claim.cat.cat_id.clone(),
-            workspace_id: claim.cat.workspace_id.clone(),
-            action: CatAction::Destroy,
-            config: None,
-        };
-        let _ = tokio::time::timeout(
-            self.timeouts.create_cleanup,
-            self.noded.execute(&endpoint, &cleanup),
-        )
-        .await;
+        let _ = tokio::time::timeout(self.timeouts.create_cleanup, cleanup).await;
     }
 
     async fn complete(
         &self,
         claim: &ActionClaim,
         state: CatState,
+        deadline: Instant,
     ) -> Result<LifecycleOutcome, LifecycleError> {
         if state == CatState::Running {
             let Some(node_id) = claim.node_id.as_deref() else {
@@ -958,10 +991,33 @@ where
                     )
                     .await;
             };
-            if let Err(error) = self.ingress.publish(&claim.cat.cat_id, node_id).await {
+            let Some(timeout) = bounded_timeout(self.timeouts.total, deadline) else {
                 return self
-                    .fail(claim, "ingress_publish_failed", &error.message)
+                    .fail(
+                        claim,
+                        "ingress_publish_failed",
+                        "semantic ingress publication timed out",
+                    )
                     .await;
+            };
+            match tokio::time::timeout(timeout, self.ingress.publish(&claim.cat.cat_id, node_id))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return self
+                        .fail(claim, "ingress_publish_failed", &error.message)
+                        .await;
+                }
+                Err(_) => {
+                    return self
+                        .fail(
+                            claim,
+                            "ingress_publish_failed",
+                            "semantic ingress publication timed out",
+                        )
+                        .await;
+                }
             }
         }
         let cat = self.store.complete_action(claim, state).await?;
@@ -1474,6 +1530,27 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct PendingWithdrawIngress;
+
+    impl IngressPort for PendingWithdrawIngress {
+        fn withdraw<'a>(
+            &'a self,
+            _cat_id: &'a str,
+            _old_node_id: &'a str,
+        ) -> SemanticFuture<'a, Result<(), IngressError>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn publish<'a>(
+            &'a self,
+            _cat_id: &'a str,
+            _new_node_id: &'a str,
+        ) -> SemanticFuture<'a, Result<(), IngressError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     fn config() -> CatCreateConfig {
         CatCreateConfig {
             cpu_count: 2,
@@ -1944,6 +2021,32 @@ mod tests {
             noded.state.lock().expect("noded").events,
             ["withdraw:node-1", "node:Cold"]
         );
+    }
+
+    #[tokio::test]
+    async fn foreground_deadline_includes_ingress_withdrawal() {
+        let original = cat(Some(CatState::Running), Some(CatAction::Cold));
+        let action_claim = claim(original.clone(), CatAction::Cold);
+        let store = MockStore::new(original, Admission::Claimed(action_claim));
+        let noded = MockNoded::new(store.clone(), [], []);
+        let service = SemanticLifecycleService::new(
+            store.clone(),
+            noded.clone(),
+            PendingWithdrawIngress,
+            fast_timeouts(),
+        );
+
+        let error = service
+            .cold(CatSelector::Id("cat-1".to_owned()))
+            .await
+            .expect_err("an ingress withdrawal cannot outlive the foreground deadline");
+
+        assert!(matches!(
+            error,
+            LifecycleError::Failed { ref code, .. } if code == "ingress_withdraw_failed"
+        ));
+        assert!(noded.state.lock().expect("noded").commands.is_empty());
+        assert_eq!(store.state.lock().expect("store").failures, 1);
     }
 
     #[tokio::test]
