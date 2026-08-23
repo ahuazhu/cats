@@ -1014,7 +1014,7 @@ mod tests {
     use super::{
         console_asset_routes, not_found, ADMIN_GUIDE, ADMIN_HTML, ADMIN_JS, COMMON_JS, DOCS,
         I18N_JS, LANDING_EN, LANDING_ZH, RUNTIME_PRODUCT_LOAD_JS, SEMANTIC_RESOURCE_CLIENT_JS,
-        USER_HTML, USER_JS,
+        STYLES_CSS, USER_HTML, USER_JS,
     };
 
     #[tokio::test]
@@ -1356,6 +1356,14 @@ mod tests {
         assert!(USER_JS.contains("assertSemanticConsoleRequestSupported(path"));
         assert!(ADMIN_JS.contains("assertSemanticConsoleRequestSupported(path"));
         assert!(SEMANTIC_RESOURCE_CLIENT_JS.contains("closedSurface"));
+    }
+
+    #[test]
+    fn hidden_console_controls_remain_hidden_when_components_set_display() {
+        assert!(
+            STYLES_CSS.contains("[hidden] { display: none !important; }"),
+            "the shared stylesheet must preserve the HTML hidden contract"
+        );
     }
 
     #[test]
