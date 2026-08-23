@@ -261,6 +261,10 @@ def main() -> int:
         probe = json.loads(observed_aws[0][parameters_index])["commands"][0]
         assert probe.startswith("set -eu\n")
         assert "pipefail" not in probe
+        assert "deadline=$(( $(date +%s) + 600 ))" in probe
+        assert "sleep 5" in probe
+        assert "did not converge before the probe deadline" in probe
+        assert json.loads(observed_aws[0][parameters_index])["executionTimeout"] == ["660"]
 
     print("production release deployment fixture: PASS")
     return 0
