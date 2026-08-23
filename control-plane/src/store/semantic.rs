@@ -136,6 +136,17 @@ pub struct CatRecord {
     pub destroyed_at: Option<i64>,
 }
 
+impl CatRecord {
+    fn has_internal_relocation_claim(&self) -> bool {
+        self.current_action == Some(CatAction::Run)
+            && self
+                .node_id
+                .as_deref()
+                .zip(self.current_action_node_id.as_deref())
+                .is_some_and(|(source, target)| source != target)
+    }
+}
+
 /// The only Node selected for new traffic to a Cat. No row means that new
 /// traffic is withdrawn. This projection deliberately carries no lifecycle
 /// Operation, request identity or heartbeat state.
@@ -366,13 +377,16 @@ pub enum ClaimSemanticCatRecoveryOutcome {
     ColdNoAction(CatWithMounts),
     UnsupportedState(CatWithMounts),
     NoRunningTarget(CatWithMounts),
+    Busy(CatWithMounts),
     SourceNotOffline,
+    SourceNotDraining,
     Stale,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticCatRecoveryResult<'a> {
     Recovered,
+    RetrySource { code: &'a str, message: &'a str },
     Failed { code: &'a str, message: &'a str },
 }
 
@@ -382,6 +396,28 @@ pub struct SemanticCatRecoverySettlement<'a> {
     pub source_node_id: &'a str,
     pub target_node_id: &'a str,
     pub target_state: CatState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticRelocationSource {
+    Offline,
+    Draining,
+}
+
+impl SemanticRelocationSource {
+    fn accepts(self, status: &str) -> bool {
+        match self {
+            Self::Offline => matches!(status, "offline" | "reset_required"),
+            Self::Draining => status == "draining",
+        }
+    }
+
+    fn mismatch(self) -> ClaimSemanticCatRecoveryOutcome {
+        match self {
+            Self::Offline => ClaimSemanticCatRecoveryOutcome::SourceNotOffline,
+            Self::Draining => ClaimSemanticCatRecoveryOutcome::SourceNotDraining,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -841,6 +877,10 @@ impl Store {
             };
             let cat = row_to_cat(&row);
             let aggregate = cat_with_mounts(&mut transaction, cat)?;
+            if aggregate.cat.has_internal_relocation_claim() {
+                transaction.commit()?;
+                return Ok(AdmitCatActionOutcome::Busy(aggregate));
+            }
             if aggregate.cat.state == Some(action_target(action)) {
                 transaction.commit()?;
                 return Ok(AdmitCatActionOutcome::AlreadyDone(aggregate));
@@ -1212,6 +1252,27 @@ impl Store {
         })
     }
 
+    /// Level-triggered planned-drain discovery. A draining Node remains here
+    /// until no current Cat retains its source placement, so another Control
+    /// replica can resume after request cancellation or process restart.
+    pub fn list_semantic_draining_nodes_with_cats(&self) -> Result<Vec<String>> {
+        self.with(|client| {
+            client
+                .query(
+                    "SELECT n.node_id FROM nodes n
+                      WHERE n.status='draining'
+                        AND EXISTS (
+                            SELECT 1 FROM cats c
+                             WHERE (c.node_id=n.node_id OR c.current_action_node_id=n.node_id)
+                               AND c.destroyed_at IS NULL
+                        )
+                      ORDER BY n.node_id",
+                    &[],
+                )
+                .map(|rows| rows.into_iter().map(|row| row.get(0)).collect())
+        })
+    }
+
     /// Mark a stale Node offline only if its heartbeat DB timestamp is still
     /// exactly the one observed before the active health probe.
     pub fn mark_semantic_node_offline_if_heartbeat_unchanged(
@@ -1314,6 +1375,30 @@ impl Store {
         })
     }
 
+    /// Planned drain must also observe a placement transaction that reserved
+    /// this Node before the cordon committed but has not published stable
+    /// `node_id` yet. The exact claim recheck reports that action as busy.
+    pub fn list_semantic_node_drain_cats(&self, node_id: &str) -> Result<Vec<CatWithMounts>> {
+        self.with(|client| {
+            let mut transaction = client.transaction()?;
+            let rows = transaction.query(
+                &format!(
+                    "SELECT {CAT_COLUMNS} FROM cats
+                      WHERE (node_id=$1 OR current_action_node_id=$1)
+                        AND destroyed_at IS NULL
+                      ORDER BY cat_id FOR SHARE"
+                ),
+                &[&node_id],
+            )?;
+            let mut cats = Vec::with_capacity(rows.len());
+            for row in rows {
+                cats.push(cat_with_mounts(&mut transaction, row_to_cat(&row))?);
+            }
+            transaction.commit()?;
+            Ok(cats)
+        })
+    }
+
     /// Atomically replaces any old-Node action lane with one recovery `run`
     /// claim and selects another currently running Node. The source placement
     /// stays on the Cat until terminal recovery, so a Control restart can
@@ -1323,6 +1408,35 @@ impl Store {
         source_node_id: &str,
         cat_id: &str,
     ) -> Result<ClaimSemanticCatRecoveryOutcome> {
+        self.claim_semantic_cat_relocation(
+            source_node_id,
+            cat_id,
+            SemanticRelocationSource::Offline,
+        )
+    }
+
+    /// Planned drain uses the same durable relocation claim as offline
+    /// recovery, but it admits only an exact `draining` source. The stable
+    /// state and source placement remain unchanged while Control first makes
+    /// the source Cold and then restores the Cat on the reserved target.
+    pub fn claim_semantic_cat_drain(
+        &self,
+        source_node_id: &str,
+        cat_id: &str,
+    ) -> Result<ClaimSemanticCatRecoveryOutcome> {
+        self.claim_semantic_cat_relocation(
+            source_node_id,
+            cat_id,
+            SemanticRelocationSource::Draining,
+        )
+    }
+
+    fn claim_semantic_cat_relocation(
+        &self,
+        source_node_id: &str,
+        cat_id: &str,
+        required_source: SemanticRelocationSource,
+    ) -> Result<ClaimSemanticCatRecoveryOutcome> {
         self.with(|client| {
             let mut transaction = client.transaction()?;
             let source = transaction.query_opt(
@@ -1331,11 +1445,11 @@ impl Store {
             )?;
             let Some(source) = source else {
                 transaction.rollback()?;
-                return Ok(ClaimSemanticCatRecoveryOutcome::SourceNotOffline);
+                return Ok(required_source.mismatch());
             };
-            if !matches!(source.get::<_, &str>(0), "offline" | "reset_required") {
+            if !required_source.accepts(source.get(0)) {
                 transaction.rollback()?;
-                return Ok(ClaimSemanticCatRecoveryOutcome::SourceNotOffline);
+                return Ok(required_source.mismatch());
             }
 
             let row = transaction.query_opt(
@@ -1347,11 +1461,22 @@ impl Store {
                 return Ok(ClaimSemanticCatRecoveryOutcome::Stale);
             };
             let cat = row_to_cat(&row);
-            if cat.destroyed_at.is_some() || cat.node_id.as_deref() != Some(source_node_id) {
+            if cat.destroyed_at.is_some() {
                 transaction.rollback()?;
                 return Ok(ClaimSemanticCatRecoveryOutcome::Stale);
             }
             let aggregate = cat_with_mounts(&mut transaction, cat)?;
+            if aggregate.cat.node_id.as_deref() != Some(source_node_id) {
+                if required_source == SemanticRelocationSource::Draining
+                    && aggregate.cat.current_action.is_some()
+                    && aggregate.cat.current_action_node_id.as_deref() == Some(source_node_id)
+                {
+                    transaction.commit()?;
+                    return Ok(ClaimSemanticCatRecoveryOutcome::Busy(aggregate));
+                }
+                transaction.commit()?;
+                return Ok(ClaimSemanticCatRecoveryOutcome::Stale);
+            }
             let Some(target_state) = aggregate.cat.state else {
                 transaction.commit()?;
                 return Ok(ClaimSemanticCatRecoveryOutcome::UnsupportedState(aggregate));
@@ -1368,30 +1493,49 @@ impl Store {
                 CatState::Running | CatState::Suspended | CatState::Warm => {}
             }
 
-            // A previous recovery claim is recognizable without another
+            // A previous relocation claim is recognizable without another
             // resource: the stable placement is still the source while the
-            // run lane names a distinct running target.
+            // run lane names a distinct target admitted while running. A
+            // later cordon does not invalidate that already-owned placement.
+            let mut unavailable_drain_target = None;
             if aggregate.cat.current_action == Some(CatAction::Run) {
                 if let Some(target_node_id) = aggregate.cat.current_action_node_id.clone() {
-                    if target_node_id != source_node_id
-                        && transaction
+                    if target_node_id != source_node_id {
+                        let target_is_available = transaction
                             .query_opt(
                                 "SELECT node_id FROM nodes
-                                  WHERE node_id=$1 AND status='running' FOR SHARE",
+                                  WHERE node_id=$1 AND status IN ('running','draining') FOR SHARE",
                                 &[&target_node_id],
                             )?
-                            .is_some()
-                    {
-                        let claim = SemanticCatRecoveryClaim {
-                            cat: aggregate,
-                            source_node_id: source_node_id.to_owned(),
-                            target_node_id,
-                            target_state,
-                        };
-                        transaction.commit()?;
-                        return Ok(ClaimSemanticCatRecoveryOutcome::AlreadyClaimed(claim));
+                            .is_some();
+                        if target_is_available {
+                            let claim = SemanticCatRecoveryClaim {
+                                cat: aggregate,
+                                source_node_id: source_node_id.to_owned(),
+                                target_node_id,
+                                target_state,
+                            };
+                            transaction.commit()?;
+                            return Ok(ClaimSemanticCatRecoveryOutcome::AlreadyClaimed(claim));
+                        }
+                        // A planned drain may replace only its recognizable
+                        // cross-Node Run reservation after that exact target
+                        // stops accepting placement. The Cat row lock and the
+                        // target-bound settlement predicate prevent a late
+                        // result for the old target from winning.
+                        if required_source == SemanticRelocationSource::Draining {
+                            unavailable_drain_target = Some(target_node_id);
+                        }
                     }
                 }
+            }
+
+            if required_source == SemanticRelocationSource::Draining
+                && aggregate.cat.current_action.is_some()
+                && unavailable_drain_target.is_none()
+            {
+                transaction.commit()?;
+                return Ok(ClaimSemanticCatRecoveryOutcome::Busy(aggregate));
             }
 
             let Some(target_node_id) = ACTIVE_PLACEMENT_STRATEGY
@@ -1400,6 +1544,17 @@ impl Store {
                 transaction.commit()?;
                 return Ok(ClaimSemanticCatRecoveryOutcome::NoRunningTarget(aggregate));
             };
+            if let Some(old_target_node_id) = unavailable_drain_target {
+                // Running drain publishes ingress before settling placement.
+                // Close an exact old-target publication in the same Cat-row
+                // transaction that replaces the reservation. A concurrent or
+                // late publish for the old target observes the new claim and
+                // fails CatNotReady.
+                transaction.execute(
+                    "DELETE FROM cat_ingress_targets WHERE cat_id=$1 AND node_id=$2",
+                    &[&cat_id, &old_target_node_id],
+                )?;
+            }
             let row = transaction.query_one(
                 &format!(
                     "UPDATE cats
@@ -1425,9 +1580,11 @@ impl Store {
         })
     }
 
-    /// Settle only the exact recovery lane and source placement. Success
-    /// publishes the new placement while retaining the pre-failure product
-    /// state; failure records a cleanup-required Cat on the target Node.
+    /// Settle only the exact relocation lane and source placement. Success
+    /// publishes the new placement while retaining the pre-relocation product
+    /// state. A source Cold failure releases only the unused target
+    /// reservation while preserving retryable source state and placement; a
+    /// target start/restore failure remains attached to that target for cleanup.
     pub fn finish_semantic_cat_recovery(
         &self,
         settlement: SemanticCatRecoverySettlement<'_>,
@@ -1435,18 +1592,38 @@ impl Store {
     ) -> Result<Option<CatWithMounts>> {
         self.with(|client| {
             let mut transaction = client.transaction()?;
-            let (state, error_code, error_message) = match result {
-                SemanticCatRecoveryResult::Recovered => {
-                    (settlement.target_state.as_str(), None, None)
-                }
-                SemanticCatRecoveryResult::Failed { code, message } => {
-                    (CatState::Failure.as_str(), Some(code), Some(message))
-                }
+            let source_is_draining: bool = transaction
+                .query_one(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM nodes WHERE node_id=$1 AND status='draining'
+                    )",
+                    &[&settlement.source_node_id],
+                )?
+                .get(0);
+            let (state, final_node_id, error_code, error_message) = match result {
+                SemanticCatRecoveryResult::Recovered => (
+                    settlement.target_state.as_str(),
+                    settlement.target_node_id,
+                    None,
+                    None,
+                ),
+                SemanticCatRecoveryResult::RetrySource { code, message } => (
+                    settlement.target_state.as_str(),
+                    settlement.source_node_id,
+                    Some(code),
+                    Some(message),
+                ),
+                SemanticCatRecoveryResult::Failed { code, message } => (
+                    CatState::Failure.as_str(),
+                    settlement.target_node_id,
+                    Some(code),
+                    Some(message),
+                ),
             };
             let row = transaction.query_opt(
                 &format!(
                     "UPDATE cats
-                        SET state=$5,node_id=$3,
+                        SET state=$5,node_id=$8,
                             current_action=NULL,current_action_started_at=NULL,
                             current_action_node_id=NULL,
                             last_error_code=$6,last_error_message=$7,
@@ -1467,10 +1644,29 @@ impl Store {
                     &state,
                     &error_code,
                     &error_message,
+                    &final_node_id,
                 ],
             )?;
             let aggregate = match row {
                 Some(row) => Some(cat_with_mounts(&mut transaction, row_to_cat(&row))?),
+                None if source_is_draining => {
+                    let current = transaction.query_opt(
+                        &format!("SELECT {CAT_COLUMNS} FROM cats WHERE cat_id=$1 FOR SHARE"),
+                        &[&settlement.cat_id],
+                    )?;
+                    match current.map(|row| row_to_cat(&row)) {
+                        Some(current)
+                            if current.state == Some(CatState::from_db(state))
+                                && current.node_id.as_deref() == Some(final_node_id)
+                                && current.current_action.is_none()
+                                && current.last_error_code.as_deref() == error_code
+                                && current.last_error_message.as_deref() == error_message =>
+                        {
+                            Some(cat_with_mounts(&mut transaction, current)?)
+                        }
+                        _ => None,
+                    }
+                }
                 None => None,
             };
             transaction.commit()?;

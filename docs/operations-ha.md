@@ -17,7 +17,8 @@ inventory settlement 和 HostFenceRecovery 不是当前运维路径。
 - **Control Plane API**：可以运行多个 stateless replica，共享 PostgreSQL。每个请求先在数据库取得
   `current_action`，transaction 提交后同步调用目标 noded。
 - **Node liveness monitor**：与 Control co-deploy；用数据库 heartbeat 接收时间、连续丢失窗口和一次主动
-  health probe 判定 offline，并反复发现未恢复的 Cat。
+  health probe 判定 offline。耗时的 offline recovery/planned drain 由独立周期 worker 反复发现，不能阻塞
+  heartbeat probe cadence；两个循环共享有界 shutdown/cancellation。
 - **Gateway/入口层**：每个 Cat 只消费一个当前 `cat_id -> node_id` 目标；本次协议不定义公网 TLS、hostname
   或缓存细节。
 - **noded**：每台机器一个有效进程；注册 `node_id/node_name/control_endpoint`，按 `cat_id` 串行动作，
@@ -131,9 +132,9 @@ heartbeat window exceeded
 -> old Node later receives reset_required and cleans residues
 ```
 
-恢复是 level-triggered，不依赖一次性内存事件。每个 liveness 周期重新查询 offline Node 上仍有 placement
-或未结束动作的 Cat；Control 重启、目标 Node 临时不可达或一次恢复失败后，后续周期继续从数据库当前事实
-尝试。
+恢复是 level-triggered，不依赖一次性内存事件。独立 recovery 周期重新查询 offline Node 上仍有稳定
+placement 或未结束动作的 Cat；Control 重启、目标 Node 临时不可达或一次恢复失败后，后续周期继续从数据库
+当前事实尝试。这个耗时 worker 不参与 heartbeat probe 的串行路径。
 
 恢复前 withdraw，Ready 后 publish。旧 Node 的迟到 withdraw 不能删除新目标。Suspended/Warm 目标在新 Node
 最终不发布入口；Running 只有 Guest 和全部 mounts Ready 后才发布。
@@ -163,16 +164,35 @@ Automatic cloud/BMC fencing、真实 provider 资格和长期不对称分区处�
 
 ## 7. 正常维护与 drain
 
-正常 Node 退出时：
+fleet administrator 通过以下无 body 管理接口启动正常 Node 退出：
+
+```text
+POST /v1/admin/nodes/{node_id}/actions/drain
+```
+
+Control 执行：
 
 1. 将 Node 置为 `draining`，停止新 placement；
-2. 记录每个 Cat 原状态；
+2. 为每个 Running/Suspended/Warm Cat 记录原状态，并用 Least-Allocated 策略预留另一个 running Node；
 3. 将每个 Cat 转成 Cold，确认数据已经远端持久并关闭本地 writer；
 4. 在其他 running Node run；
 5. 原状态为 Suspended/Warm 时，在目标 Node 再转换到对应状态；
-6. 全部成功后关闭旧 Node。
+6. 返回逐 Cat 的 `migrated/stale/blocked` 结果。
 
-任一 Cat 无法 Cold 时，drain 失败并保留该 Cat，不强制关机。入口依然遵守先撤旧、Ready 后发新。
+`draining` 和 per-Cat relocation claim 都在 PostgreSQL 中持久化。周期任务反复发现仍有 Cat 的 draining
+Node，所以请求取消或 Control 重启不会取消排空。普通生命周期动作不会被 drain 抢占；`busy`、没有目标
+Node、源 Cold 失败或目标恢复失败都会返回顶层 `blocked`。任一 Cat 无法 Cold 时保留在源 Node，不强制
+关机。入口依然遵守先撤旧、Ready 后发新；Suspended/Warm 的目标端瞬时 Running 不发布入口。
+
+源 Cold 只要未确认成功（包括明确 failure/conflict）就不结算 `failure`，而是保留原 state 和 source
+placement；因为 target effect 尚未开始，同一 settlement 释放未使用的 target reservation，后续 pass 重新
+claim。目标端只有明确失败才结算到目标 `failure`，结果不明仍保留 exact claim。预留目标不再可用时，
+后续 pass 在 Cat row lock 内原子改投另一个 running Node，旧目标的迟到 settlement 不能覆盖新
+reservation。planned drain/recovery worker 与 heartbeat/liveness probe 分离，慢迁移不能推迟其他 Node 的
+失联判定。
+
+接口不会自动关机、delete 或 uncordon。只有收到 `drained` 并完成必要的失败清理/检查后，运维才执行独立
+的 Node 停机步骤；Node 保持 `draining`，防止停机前重新接收 placement。
 
 ## 8. 运行监控
 
