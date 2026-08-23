@@ -55,4 +55,28 @@ run "renders_memory_as_decimal_bytes" {
     )
     error_message = "A doubled awk escape reaches worker.env as a literal backslash and systemd turns it into a trailing n."
   }
+
+  assert {
+    condition = strcontains(
+      local.deployment_script,
+      "semantic_node_id=\"node_$identity_node_id\"",
+    )
+    error_message = "The semantic Node ID must be derived from the immutable provisioned identity with the protocol's node_ prefix."
+  }
+
+  assert {
+    condition = strcontains(
+      local.deployment_script,
+      "\"CATS_NODE_ID=$semantic_node_id\"",
+    )
+    error_message = "worker.env must publish the protocol-valid semantic Node ID rather than the legacy identity value."
+  }
+
+  assert {
+    condition = strcontains(
+      aws_ssm_association.worker_deploy["metal-1"].parameters["commands"],
+      "CATS_NODE_NAME=metal-1",
+    )
+    error_message = "The operator-facing Node name must remain independent from the semantic Node ID."
+  }
 }
