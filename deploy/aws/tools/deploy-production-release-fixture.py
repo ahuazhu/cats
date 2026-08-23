@@ -257,6 +257,10 @@ def main() -> int:
         assert "worker-installation-receipt.v1.json" in serialized
         assert "private-key" not in serialized
         assert "CATS_AUTH_TOKEN" not in serialized
+        parameters_index = observed_aws[0].index("--parameters") + 1
+        probe = json.loads(observed_aws[0][parameters_index])["commands"][0]
+        assert probe.startswith("set -eu\n")
+        assert "pipefail" not in probe
 
     print("production release deployment fixture: PASS")
     return 0
