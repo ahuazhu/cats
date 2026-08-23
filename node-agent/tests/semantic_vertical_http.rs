@@ -84,6 +84,8 @@ impl SemanticLifecycleStore for MemoryLifecycleStore {
                     Ok(Admission::Claimed(ActionClaim {
                         cat,
                         action: ControlAction::Create,
+                        started_at_unix_ms: 1,
+                        recovery_started_at_unix_ms: None,
                         node_id: Some(NODE_ID.to_owned()),
                     }))
                 }
@@ -97,6 +99,8 @@ impl SemanticLifecycleStore for MemoryLifecycleStore {
                         node_id: cat.current_action_node_id.clone(),
                         cat,
                         action: ControlAction::Create,
+                        started_at_unix_ms: 1,
+                        recovery_started_at_unix_ms: None,
                     }))
                 }
                 CreateDecision::Busy => Ok(Admission::Busy(
@@ -146,6 +150,8 @@ impl SemanticLifecycleStore for MemoryLifecycleStore {
                     Ok(Admission::Claimed(ActionClaim {
                         cat,
                         action,
+                        started_at_unix_ms: 1,
+                        recovery_started_at_unix_ms: None,
                         node_id: selected_node,
                     }))
                 }
@@ -157,6 +163,8 @@ impl SemanticLifecycleStore for MemoryLifecycleStore {
                     node_id: existing.current_action_node_id.clone(),
                     cat: existing,
                     action,
+                    started_at_unix_ms: 1,
+                    recovery_started_at_unix_ms: None,
                 })),
                 ActionDecision::Busy => Ok(Admission::Busy(existing)),
                 ActionDecision::InvalidState => Ok(Admission::InvalidState(existing)),
@@ -610,6 +618,7 @@ impl SemanticNodeRecoveryStore for MemoryRecoveryStore {
                 source_node_id: state.source_node_id.clone(),
                 target_node_id: state.target_node_id.clone(),
                 target_state: ControlState::Running,
+                started_at_unix_ms: 1,
             };
             Ok(if already {
                 RecoveryAdmission::AlreadyClaimed(claim)
