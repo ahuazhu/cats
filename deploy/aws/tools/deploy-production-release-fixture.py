@@ -181,8 +181,15 @@ def main() -> int:
         )
         worker_joined = "\n".join(worker_plan)
         assert "-var=metal_worker_enabled=true" in worker_joined
-        assert "-var-json=metal_worker_instances=" in worker_joined
-        assert "-var-json=metal_worker_deploy_instances=" in worker_joined
+        assert (
+            '-var=metal_worker_instances={"metal-1":"i-0123456789abcdef0",'
+            '"metal-2":"i-0123456789abcdef1"}'
+            in worker_joined
+        )
+        assert (
+            '-var=metal_worker_deploy_instances=["metal-1","metal-2"]'
+            in worker_joined
+        )
         assert manifest["artifacts"]["worker"]["bundle_sha256"][7:] in worker_joined
 
         original_run = deployer.run
