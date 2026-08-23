@@ -1,6 +1,6 @@
 # 场景语义 Control/Node 协议实施计划
 
-- 状态：最终验证中
+- 状态：已完成
 - 开始日期：2026-08-22
 - 设计合同：[Control Plane 与 noded 同步协议设计](control-node-semantic-protocol.md)
 - 决策：[ADR-0059](decisions/0059-semantic-control-node-synchronous-protocol.md)
@@ -34,7 +34,7 @@
 | HTTP composition | Control router、AppState、controld/noded main | 新路由和服务接线，旧路由退出 | Control/noded 已完成；生产 Kubernetes 不再传入旧 Route 监听，也不再部署旧 Gateway |
 | 切换清理 | schema、router、旧模块和测试 | 删除旧表、旧入口、旧 runner 和只验证旧协议的测试 | 旧 HTTP/Store/schema、Node authority 模块、Route validator/launcher、worker Route artifact 与专属测试已删除；适用场景已迁入新协议测试 |
 | 纵向联调 | FakeVmm/PostgreSQL | Disk→Cat→状态动作→跨 Node→destroy→slug 复用 | 已完成：production metal-1→metal-2 恢复、目标物理实例、源 reset/re-register 和最终清理通过 |
-| 最终门禁 | 全仓库与 Linux | 完整门禁、Linux Node/真实 VMM 冒烟 | `5cc9723e` 的真实 VMM E2E 已通过；迁移旧 Node ID 部署断言后的精确 main `6daae688` 正在重跑本机 full 与 production x86_64 native full |
+| 最终门禁 | 全仓库与 Linux | 完整门禁、Linux Node/真实 VMM 冒烟 | 最终发布候选 `7d03e879` 的本机 full 与 production x86_64 native full 全部通过；冻结日志已内容寻址发布 |
 
 ## 3. 集成顺序
 
@@ -89,8 +89,8 @@
 - [x] Control 响应丢失后查询 noded 恢复。
 - [x] offline Node 下一次心跳触发 reset，关闭 placement、清理本地 Cat 后重新注册。
 - [x] `cargo test`/Clippy 的相关定向回归全部通过；本轮 `quality.sh fast` 已通过。
-- [ ] 运行当前切换提交的 `./scripts/quality.sh full`。（早期 clean commit 已通过；精确 main `6daae688` 正在最终重跑。）
-- [ ] 运行当前切换提交适用的 production x86_64 native full 门禁。（早期 release 已通过；精确 main `6daae688` 正在最终重跑。）
+- [x] 运行当前切换提交的 `./scripts/quality.sh full`。（最终发布候选 `7d03e879` 全阶段通过。）
+- [x] 运行当前切换提交适用的 production x86_64 native full 门禁。（最终发布候选 `7d03e879` 全阶段通过；build receipt `job.iyrdZQ`，冻结日志 SHA-256 `c1d92c79506cc9dbfdf8f323a7cb88cf714d8207c8fc421e556b658f6fc93f4c`。）
 
 ## 4. 已合入提交
 
@@ -137,7 +137,7 @@
 | `75290b5b` | Guest 为 PersistentDisk 安全创建缺失 mount target，descriptor-relative 拒绝 symlink 与 `/` | Guest 31/31、Guest all-target Clippy `-D warnings`、diff check 通过；production Worker-only 发布与双 Node 安装探针通过，物理 E2E 待执行 |
 | `99c62282` | 受信 native Golden Root 独立构建、ext4/镜像内 Guest Agent 精确校验和 immutable build receipt | build-host 23/23、Control 定向 deployment contract 2/2、bash syntax、fmt/diff check 通过；production 构建/发布待执行 |
 | `5cc9723e` | Guest 按内核设备号认证 mountinfo source alias，并归一化为已证明的 `/dev/vdX` | Guest 31/31、all-target Clippy `-D warnings`、fmt/diff check；production PersistentDisk 全生命周期与双 Node 恢复通过 |
-| `6daae688` | 将 worker 部署合同从退役的直接 Node ID 字面量迁到 immutable Host identity 派生的 `node_*` ID 和独立 `node_name` | 原失败的 deployment contract 精确回归通过，fmt/diff check 通过；最终 full 门禁正在重跑 |
+| `6daae688` | 将 worker 部署合同从退役的直接 Node ID 字面量迁到 immutable Host identity 派生的 `node_*` ID 和独立 `node_name` | 原失败的 deployment contract 精确回归通过，fmt/diff check 通过；随后 `7d03e879` 双 full 门禁通过 |
 
 ## 5. 进度更新规则
 
@@ -219,3 +219,4 @@
 - exact main `5cc9723e` source bundle 已内容寻址发布；Golden Root-only production build SSM `ca41ec78-b64f-49a5-97ca-53de090b7795` 正在执行，不涉及 Control/Gateway/Worker 部署。
 - exact main `5cc9723e` 的 Golden Root `sha256:d38d959f3fe1e2387a8a6313b3db7a8bf1c591ec5715a86c2dcc95c630e419e3` 已发布。保留的旧 PersistentDisk 在新 Guest 中达到 `/data` mount-ready；Suspend/Warm/Cold、Cold detach/attach、同盘重挂及全部语义重放通过。Running Cat 随 metal-1 停服恢复到 metal-2，目标实体为 1 CH + 2 blockd + 2 nbd-client；metal-1 返回后 reset/re-register 且 local Cat/CH/blockd 均为 0，目标仍可 Suspend/Run。最终 Cat/Disk 列表均为 0，两台 Worker active 且无残留物理进程。production E2E 证据在 `dist/deploy-5cc9723e/private-work/golden-root-r1/`。
 - `5cc9723e` 的首次最终 full 门禁只发现一项部署合同仍要求退役字面量 `CATS_NODE_ID=$node_id`；生产脚本实际已由 immutable identity 派生 `semantic_node_id=node_$identity_node_id` 并独立写入 `CATS_NODE_NAME`。该测试没有删除，而是迁到新身份合同；PR #369 合入 exact main `6daae688`，原失败精确回归、fmt 和 diff check 已通过，双 full 门禁将在该提交重跑。
+- 最终发布候选 `7d03e879` 的本机 `./scripts/quality.sh full` 已通过全部阶段。相同精确 source/manifest/bundle 的 production x86_64 native full 也已通过，immutable build receipt 为 `job.iyrdZQ`，receipt SHA-256 `3d9f3efae2624578679a8b855d8a39d845ef815135df501471d80efd163a6c55`；冻结完整日志已发布到 `evidence/sha256/c1d92c79506cc9dbfdf8f323a7cb88cf714d8207c8fc421e556b658f6fc93f4c`。本计划至此完成。
