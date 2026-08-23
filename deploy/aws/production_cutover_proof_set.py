@@ -26,6 +26,7 @@ from typing import Any, Protocol
 
 PROOF_SET_FILE = "production-cutover-proof-set.v1.json"
 PROOF_SET_KIND = "cats.production-cutover-proof-set.v1"
+CONTROL_SCHEMA_VERSION = 19
 USAGE_TERMINAL_VERIFIER = Path(
     "/opt/cats/bin/cats-usage-terminal-receipt-verifier"
 )
@@ -2009,7 +2010,7 @@ class VerifiedProofSet:
             "deployment_id": fresh["deployment_id"],
             "release_id": release["release_id"],
             "source_commit_sha": release["source_commit_sha"],
-            "control_schema_version": 18,
+            "control_schema_version": CONTROL_SCHEMA_VERSION,
             "source_manifest_sha256": self.source_manifest_sha256,
             "source_bundle_sha256": self.source_bundle_sha256,
             "release_manifest_sha256": self.release_manifest_sha256,
@@ -3320,7 +3321,7 @@ def _validate_qualification_final_support(
         or binding["workspace_id"] != begin["workspace_id"]
         or binding["release_id"] != begin["release_id"]
         or binding["source_commit_sha"] != context.release_commit
-        or binding["control_schema_version"] != 18
+        or binding["control_schema_version"] != CONTROL_SCHEMA_VERSION
         or binding["worker_bundle_sha256"] != context.worker_bundle_sha256
         or binding["release_manifest_sha256"] != context.release_manifest_sha256
         or binding["qualification_catalog_sha256"]
@@ -3649,7 +3650,7 @@ def _validate_qualification(
         or manifest.get("state") != "passed"
         or type(manifest.get("exit_code")) is not int
         or manifest.get("exit_code") != 0
-        or manifest.get("schema_version") != 18
+        or manifest.get("schema_version") != CONTROL_SCHEMA_VERSION
         or manifest.get("block_path") != block_path
         or manifest.get("exact_commit") != context.release_commit
         or release_manifest.get("sha256") != context.release_manifest_sha256
@@ -4154,7 +4155,7 @@ def verify(
             or AWS_REGION.fullmatch(fresh["aws_region"]) is None
             or not isinstance(fresh["cell_namespace"], str)
             or DNS_LABEL.fullmatch(fresh["cell_namespace"]) is None
-            or fresh["control_schema_version"] != 18
+            or fresh["control_schema_version"] != CONTROL_SCHEMA_VERSION
         ):
             raise ProofSetError("fresh cell/release scope is invalid")
         fresh_targets = _validate_targets(fresh["targets"], "fresh targets")

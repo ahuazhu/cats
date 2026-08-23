@@ -1118,7 +1118,7 @@ def admission_chain_fixture(context: Any) -> Any:
         "deployment_id": "dep_a",
         "release_id": context.release_id,
         "source_commit_sha": context.release_commit,
-        "control_schema_version": 18,
+        "control_schema_version": ADMISSION.CONTROL_SCHEMA_VERSION,
         "source_manifest_sha256": SHA_A,
         "source_bundle_sha256": SHA_B,
         "build_receipt_sha256": SHA_C,
@@ -1246,6 +1246,15 @@ def admission_chain_fixture(context: Any) -> Any:
 def validate_qualification_admission_verifier() -> None:
     context = fixture()[5]
     chain = admission_chain_fixture(context)
+    ADMISSION.validate_qualification_binding(chain.binding)
+    retired_schema = dict(chain.binding)
+    retired_schema["control_schema_version"] = 18
+    try:
+        ADMISSION.validate_qualification_binding(retired_schema)
+    except ADMISSION.AdmissionError:
+        pass
+    else:
+        raise AssertionError("retired Control schema v18 binding was accepted")
     verifier = PROOF.QualificationAdmissionEvidenceVerifier(
         ADMISSION, chain.trust_data
     )

@@ -39,7 +39,7 @@ def authority() -> Any:
             "deployment_id": "deployment-stageb-01",
             "release_id": "release-stageb-01",
             "source_commit_sha": "a" * 40,
-            "control_schema_version": 18,
+            "control_schema_version": OPEN.ADMISSION.CONTROL_SCHEMA_VERSION,
             "reset_complete_receipt_sha256": "sha256:" + "2" * 64,
         }
     )

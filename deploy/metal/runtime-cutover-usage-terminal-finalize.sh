@@ -180,6 +180,8 @@ import re
 import stat
 import sys
 
+CONTROL_SCHEMA_VERSION = 19
+
 (
     exact_commit,
     kernel_dir_raw,
@@ -860,7 +862,7 @@ def validate_qualification_closed_support(
         or binding["workspace_id"] != workspace_id
         or binding["release_id"] != begin["release_id"]
         or binding["source_commit_sha"] != exact_commit
-        or binding["control_schema_version"] != 18
+        or binding["control_schema_version"] != CONTROL_SCHEMA_VERSION
         or binding["release_manifest_sha256"] != release_sha256
         or binding["worker_bundle_sha256"] != worker_bundle_sha256
         or binding["qualification_catalog_sha256"] != qualification_catalog_sha256
@@ -918,8 +920,10 @@ def verify_run(raw_dir, expected_block_path):
     run_id = manifest.get("run_id")
     if not isinstance(run_id, str) or RUN_ID.fullmatch(run_id) is None:
         raise ValueError("qualification run ID is not canonical")
-    if manifest.get("schema_version") != 18:
-        raise ValueError("qualification did not run exact schema v18")
+    if manifest.get("schema_version") != CONTROL_SCHEMA_VERSION:
+        raise ValueError(
+            f"qualification did not run exact schema v{CONTROL_SCHEMA_VERSION}"
+        )
     if manifest.get("qualification_catalog", {}).get("sha256") != qualification_catalog_sha256:
         raise ValueError("qualification manifest catalog digest differs")
     if manifest.get("qualification_catalog", {}).get("size_bytes") != len(catalog_raw):

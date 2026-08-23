@@ -58,6 +58,7 @@ MAX_BINDING_BYTES = 65_536
 MAX_KEY_BYTES = 16_384
 MAX_COMMAND_LIFETIME_MS = 5 * 60 * 1_000
 MAX_QUALIFICATION_LIFETIME_MS = 24 * 60 * 60 * 1_000
+CONTROL_SCHEMA_VERSION = 19
 DEFAULT_COMMAND_LIFETIME_MS = 4 * 60 * 1_000
 DEFAULT_RESOLUTION_SECONDS = 120
 QUALIFICATION_BEGIN_RECEIPT_FILE = (
@@ -408,8 +409,10 @@ def validate_open_binding(value: Any) -> dict[str, Any]:
     for field in ("reset_id", "deployment_id", "release_id"):
         require_string(binding[field], ID, f"binding.{field}")
     require_string(binding["source_commit_sha"], COMMIT, "binding.source_commit_sha")
-    if binding["control_schema_version"] != 18:
-        raise AdmissionError("binding.control_schema_version must be 18")
+    if binding["control_schema_version"] != CONTROL_SCHEMA_VERSION:
+        raise AdmissionError(
+            f"binding.control_schema_version must be {CONTROL_SCHEMA_VERSION}"
+        )
     for field in OPEN_BINDING_FIELDS - {
         "reset_id",
         "deployment_id",
@@ -437,8 +440,11 @@ def validate_qualification_binding(value: Any) -> dict[str, Any]:
     require_string(
         binding["source_commit_sha"], COMMIT, "qualification binding.source_commit_sha"
     )
-    if binding["control_schema_version"] != 18:
-        raise AdmissionError("qualification binding.control_schema_version must be 18")
+    if binding["control_schema_version"] != CONTROL_SCHEMA_VERSION:
+        raise AdmissionError(
+            "qualification binding.control_schema_version must be "
+            f"{CONTROL_SCHEMA_VERSION}"
+        )
     for field in (
         "source_manifest_sha256",
         "source_bundle_sha256",
