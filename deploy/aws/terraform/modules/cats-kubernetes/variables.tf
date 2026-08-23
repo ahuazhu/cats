@@ -71,9 +71,10 @@ variable "runtime_secret_data" {
         "CATS_BILLING_ENFORCEMENT_ENABLED",
         "CATS_OBJECT_STORE_ADAPTER",
         "CATS_OBJECT_STORE_OPTIONS",
+        "CATS_NODED_SERVICE_TOKEN",
       ])
     )) == 0
-    error_message = "runtime_secret_data cannot override Terraform-managed storage or usage database settings."
+    error_message = "runtime_secret_data cannot override Terraform-managed storage, usage database, or derived Node service settings."
   }
 
   validation {
