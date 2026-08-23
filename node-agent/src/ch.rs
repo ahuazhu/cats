@@ -2667,7 +2667,16 @@ pub struct ChSpawn<'a> {
     pub network: Option<&'a ChNetwork>,
 }
 
-pub fn spawn_vmm(s: &ChSpawn<'_>) -> Result<Child> {
+pub(crate) struct SpawnedVmm {
+    pub(crate) child: Child,
+    /// Fresh launches pass verified boot artifacts through inherited
+    /// `/proc/self/fd/<n>` paths. Cloud Hypervisor persists those paths in a
+    /// Warm snapshot, so the Node must retain the exact descriptors until the
+    /// Warm runtime is either restored or discarded.
+    pub(crate) boot_descriptors: Option<cats_api::runtime_artifacts::VerifiedGuestRuntimeLaunch>,
+}
+
+pub(crate) fn spawn_vmm_retaining_boot(s: &ChSpawn<'_>) -> Result<SpawnedVmm> {
     let _ = std::fs::remove_file(s.api_sock);
     let _ = std::fs::remove_file(s.vsock_sock);
     let mut cmd = Command::new(&s.cfg.ch_bin);
@@ -2749,7 +2758,15 @@ pub fn spawn_vmm(s: &ChSpawn<'_>) -> Result<Child> {
     let log =
         std::fs::File::create(s.serial_log.with_file_name("vmm.log")).context("create vmm log")?;
     cmd.stdout(Stdio::null()).stderr(log);
-    cmd.spawn().context("spawn cloud-hypervisor")
+    let child = cmd.spawn().context("spawn cloud-hypervisor")?;
+    Ok(SpawnedVmm {
+        child,
+        boot_descriptors: verified_boot,
+    })
+}
+
+pub fn spawn_vmm(s: &ChSpawn<'_>) -> Result<Child> {
+    Ok(spawn_vmm_retaining_boot(s)?.child)
 }
 
 fn inherited_fd_path(file: &File) -> PathBuf {
