@@ -48,6 +48,7 @@ use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
+use rustls_ring as rustls;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -3933,7 +3934,7 @@ fn build_server_config(
     for certificate in strict_certificates(ca, "Gateway client CA")? {
         roots.add(certificate).context("add Gateway client CA")?;
     }
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier =
         WebPkiClientVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&provider))
             .build()
@@ -3974,7 +3975,7 @@ fn build_client_config(
     validate_pem_sequence(private_key, "PRIVATE KEY", true)?;
     let key =
         PrivatePkcs8KeyDer::from_pem_slice(private_key).context("decode Gateway client key")?;
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .context("build TLS 1.3 client")?

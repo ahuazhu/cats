@@ -3,7 +3,12 @@ name = "cats-api"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-publish = false
+description = "Shared API and protocol types for the Cats microVM platform"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["microvm", "virtualization", "api"]
+publish = ["crates-io"]
 
 [features]
 default = ["proposed-node-residue-reclamation"]

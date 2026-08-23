@@ -27,6 +27,7 @@ mod runtime_provisioner;
 mod runtime_provisioner_unsupported_compile_shape;
 #[cfg(unix)]
 mod stable_unix_fs;
+mod workos_client;
 
 use std::time::Duration;
 
