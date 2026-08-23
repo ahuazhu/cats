@@ -7,6 +7,7 @@ use super::*;
 pub enum SingletonRole {
     UsageProjector,
     SemanticDestroyRecovery,
+    SemanticActionRecovery,
 }
 
 impl SingletonRole {
@@ -14,6 +15,7 @@ impl SingletonRole {
         match self {
             Self::UsageProjector => 420_203,
             Self::SemanticDestroyRecovery => 420_204,
+            Self::SemanticActionRecovery => 420_205,
         }
     }
 
@@ -21,6 +23,7 @@ impl SingletonRole {
         match self {
             Self::UsageProjector => "usage-projector",
             Self::SemanticDestroyRecovery => "semantic-destroy-recovery",
+            Self::SemanticActionRecovery => "semantic-action-recovery",
         }
     }
 }

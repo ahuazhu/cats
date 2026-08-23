@@ -29,6 +29,7 @@
 - noded 按 Cat 串行、destroy 清理、Node registration/heartbeat/reset；Control 的管理接口先 cordon Node，
   再以可重试的 Cold-based drain 迁移其 Running/Suspended/Warm Cat；
 - offline Node 的 level-triggered Cat 恢复，以及 `withdraw old -> Ready -> publish new`；
+- `controld` 对普通 `current_action` 的单例超时恢复扫描，按 noded 实际状态收敛而不使用 heartbeat 结算；
 - 真实 Control→noded HTTP 的 Cat 全状态机和重复调用语义；
 - 已接入 production composition 的 Strict PersistentDisk provision/delete backend，包括 volume/disk authority 和 BlobStore delete postcondition；
 - production Control 只挂载 semantic resource/Node 主监听，旧 lifecycle Operation、AgentSession、

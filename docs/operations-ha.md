@@ -60,6 +60,7 @@ Guest 不持有 S3、MetadataStore、Control 或 WorkOS 凭据。已经 Running 
 state
 current_action
 current_action_started_at
+current_action_recovery_started_at
 current_action_node_id
 node_id
 last_error
@@ -79,7 +80,8 @@ transaction 之外：
 
 相同动作的重复请求查询/等待同一目标；不同动作返回 `busy`。如果 noded 已完成而 Control 在写回前
 退出，新 replica 读取 `current_action_node_id` 并查询 `GET /v1/cats/{cat_id}`。heartbeat、日志和 runtime
-inventory 不能结算动作。
+inventory 不能结算动作。`controld` 的 120 秒前台 deadline 覆盖 claim 后的 ingress 等待；相同 action 重试刷新数据库活动时钟但不改变 occurrence 身份。scanner 与重试在 Cat 行锁下原子竞争 recovery lease，lease owner 也进入精确终态 CAS；至少 135 秒没有前台活动、越过 deadline 和最长 10 秒 Create 清理窗口后的动作扫描、单例选举和精确终态 CAS 见
+[Control–Node 语义协议 §10](control-node-semantic-protocol.md#10-control-plane-异常后的恢复)。
 
 Create Cat 和 Create Disk 依靠当前 slug 的部分唯一索引串行化。destroy/delete 后历史行退出索引，slug
 可立即创建新的内部 ID。Disk attach/detach/destroy 在同一 transaction 锁定目标 Disk 和 Cat；

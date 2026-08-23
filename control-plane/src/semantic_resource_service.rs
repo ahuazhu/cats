@@ -555,7 +555,7 @@ impl lifecycle::SemanticLifecycleStore for PostgresSemanticLifecycleStore {
             let limit = i64::try_from(limit).unwrap_or(i64::MAX);
             store
                 .execute(move |store| {
-                    store.list_pending_semantic_destroy_claims(minimum_age_ms, limit)
+                    store.claim_pending_semantic_destroy_claims(minimum_age_ms, limit)
                 })
                 .await
                 .map_err(lifecycle_store_error)?
@@ -572,10 +572,23 @@ impl lifecycle::SemanticLifecycleStore for PostgresSemanticLifecycleStore {
         let store = Arc::clone(&self.store);
         let cat_id = claim.cat.cat_id.clone();
         let node_id = claim.node_id.clone();
+        let started_at_unix_ms = claim.started_at_unix_ms;
+        let Some(recovery_started_at_unix_ms) = claim.recovery_started_at_unix_ms else {
+            return Box::pin(async {
+                Err(lifecycle::StoreError::new(
+                    "Destroy recovery rotation omitted its recovery lease",
+                ))
+            });
+        };
         Box::pin(async move {
             store
                 .execute(move |store| {
-                    store.rotate_pending_semantic_destroy_claim(&cat_id, node_id.as_deref())
+                    store.rotate_pending_semantic_destroy_claim(
+                        &cat_id,
+                        node_id.as_deref(),
+                        started_at_unix_ms,
+                        recovery_started_at_unix_ms,
+                    )
                 })
                 .await
                 .map_err(lifecycle_store_error)
@@ -649,6 +662,8 @@ impl PostgresSemanticLifecycleStore {
                         &claim.cat.cat_id,
                         db::FinishCatAction {
                             expected_action: lifecycle_action_to_db(claim.action),
+                            expected_action_started_at: claim.started_at_unix_ms,
+                            expected_recovery_started_at: claim.recovery_started_at_unix_ms,
                             expected_node_id: claim.node_id.as_deref(),
                             final_state: lifecycle_state_to_db(state),
                             final_node_id: final_node_id.as_deref(),
@@ -748,9 +763,15 @@ fn action_claim(
     action: lifecycle::CatAction,
 ) -> Result<lifecycle::ActionClaim, lifecycle::StoreError> {
     let node_id = cat.cat.current_action_node_id.clone();
+    let started_at_unix_ms = cat.cat.current_action_started_at.ok_or_else(|| {
+        lifecycle::StoreError::new("claimed semantic Cat action omitted its start time")
+    })?;
+    let recovery_started_at_unix_ms = cat.cat.current_action_recovery_started_at;
     Ok(lifecycle::ActionClaim {
         cat: db_aggregate_to_lifecycle(cat)?,
         action,
+        started_at_unix_ms,
+        recovery_started_at_unix_ms,
         node_id,
     })
 }
@@ -1904,6 +1925,7 @@ mod tests {
             state: Some(db::CatState::Cold),
             current_action: None,
             current_action_started_at: None,
+            current_action_recovery_started_at: None,
             current_action_node_id: None,
             node_id: None,
             cpu_count: 2,

@@ -912,7 +912,8 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             running_cat_count, suspended_cat_count, warm_cat_count
        FROM node_heartbeats WHERE FALSE",
     "SELECT cat_id, workspace_id, cat_slug, state, current_action,
-            current_action_started_at, current_action_node_id, node_id,
+            current_action_started_at, current_action_recovery_started_at,
+            current_action_node_id, node_id,
             cpu_count, memory_bytes, boot_image, last_error_code,
             last_error_message, created_at, updated_at, destroyed_at
        FROM cats WHERE FALSE",
@@ -1818,6 +1819,8 @@ CREATE TABLE IF NOT EXISTS cats (
     current_action TEXT
         CHECK (current_action IN ('create','run','suspend','warm','cold','destroy')),
     current_action_started_at BIGINT CHECK (current_action_started_at >= 0),
+    current_action_recovery_started_at BIGINT
+        CHECK (current_action_recovery_started_at >= current_action_started_at),
     current_action_node_id TEXT REFERENCES nodes(node_id),
     node_id TEXT REFERENCES nodes(node_id),
     cpu_count BIGINT NOT NULL CHECK (cpu_count > 0),
@@ -1838,6 +1841,7 @@ CREATE TABLE IF NOT EXISTS cats (
     CONSTRAINT cats_current_action_shape_check CHECK (
         (current_action IS NULL
             AND current_action_started_at IS NULL
+            AND current_action_recovery_started_at IS NULL
             AND current_action_node_id IS NULL) OR
         (current_action IS NOT NULL
             AND current_action_started_at IS NOT NULL
@@ -1855,7 +1859,8 @@ CREATE TABLE IF NOT EXISTS cats (
 CREATE UNIQUE INDEX IF NOT EXISTS cats_current_slug_unique
 ON cats(workspace_id, cat_slug) WHERE destroyed_at IS NULL;
 CREATE INDEX IF NOT EXISTS cats_current_action_scan
-ON cats(current_action_started_at) WHERE current_action IS NOT NULL;
+ON cats(updated_at, current_action_recovery_started_at)
+WHERE current_action IS NOT NULL;
 CREATE INDEX IF NOT EXISTS cats_node_placement
 ON cats(node_id) WHERE node_id IS NOT NULL;
 -- One row is the complete serving target for new traffic to a Cat. Absence
@@ -4283,6 +4288,7 @@ mod semantic_protocol_schema_tests {
         assert!(SCHEMA.contains("CONSTRAINT disk_bindings_disk_unique UNIQUE (disk_id)"));
         assert!(SCHEMA.contains("control_endpoint TEXT NOT NULL"));
         assert!(SCHEMA.contains("last_heartbeat_at BIGINT NOT NULL"));
+        assert!(SCHEMA.contains("current_action_recovery_started_at BIGINT"));
         assert!(SCHEMA.contains("cat_id TEXT PRIMARY KEY REFERENCES cats(cat_id)"));
     }
 
