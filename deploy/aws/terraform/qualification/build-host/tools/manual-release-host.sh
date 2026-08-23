@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# Prepare, verify, or run the trusted root-only native manual-release lane.
+# Prepare, verify, or run the trusted root-only native release lanes.
 set -Eeuo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: manual-release-host.sh <prepare|verify|build> <40hex-commit> <64hex-manifest-sha256> <64hex-bundle-sha256> <control-repository:tag> <credential-refresher-repository:tag> <gateway-repository:tag>
+usage: manual-release-host.sh <prepare|verify|build|golden-root> <40hex-commit> <64hex-manifest-sha256> <64hex-bundle-sha256> <control-repository:tag> <credential-refresher-repository:tag> <gateway-repository:tag>
 
 The exact source must already have been delivered by cats-checkout-exact-sha.
 prepare installs only the version-locked Guest/buildx/Rust prerequisites.
 verify is read-only. build produces a frozen --export-images release and the
 ordinary qualification build receipt; it never pushes or logs in to a registry.
+golden-root builds only the Guest Agent and ext4 Golden Root, proves the image
+contains that exact Agent, and emits a separately publishable frozen artifact.
 EOF
 }
 
@@ -18,7 +20,7 @@ if [[ $# -ne 7 || ! $2 =~ ^[0-9a-f]{40}$ || ! $3 =~ ^[0-9a-f]{64}$ || ! $4 =~ ^[
   exit 64
 fi
 case "$1" in
-  prepare|verify|build) readonly operation="$1" ;;
+  prepare|verify|build|golden-root) readonly operation="$1" ;;
   *) usage; exit 64 ;;
 esac
 if [[ $(id -u) != 0 ]]; then
@@ -566,8 +568,174 @@ EOF
   return "${status}"
 }
 
+run_golden_root_build() {
+  verify_manual_tools
+  verify_preparation_receipt
+
+  local target_base job_dir job_id output_dir build_dir guest_release build_log
+  local cargo_target installed_agent status systemd_unit
+  target_base="${target_parent}/${source_sha}-${manifest_sha256}-${bundle_sha256}"
+  install -d -m 0755 -o root -g root "${target_base}"
+  job_dir="$(mktemp -d "${target_base}/job.XXXXXX")"
+  job_id="$(basename -- "${job_dir}")"
+  output_dir="${job_dir}/output"
+  build_dir="${output_dir}/guest-build"
+  guest_release="${output_dir}/guest-runtime-release.v1"
+  build_log="${output_dir}/golden-root-build.log"
+  cargo_target="${job_dir}/cargo-target"
+  installed_agent="${job_dir}/installed-cats-guest-agent"
+  install -d -m 0700 -o root -g root \
+    "${job_dir}/home" "${job_dir}/cargo-home" "${job_dir}/tmp" \
+    "${cargo_target}" "${output_dir}"
+
+  status=0
+  systemd_unit="cats-golden-root-${job_id//./-}"
+  set +e
+  systemd-run --quiet --wait --collect --pipe \
+    --unit "${systemd_unit}" \
+    --service-type=exec \
+    --property=KillMode=control-group \
+    --property=SendSIGKILL=yes \
+    --property=PrivateIPC=true \
+    --property=LimitNOFILE=65536 \
+    --property=TasksMax=infinity \
+    /usr/bin/env -i \
+      HOME="${job_dir}/home" \
+      USER=root \
+      LOGNAME=root \
+      PATH="${tool_root}/cargo/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin" \
+      CARGO_HOME="${job_dir}/cargo-home" \
+      CARGO_TARGET_DIR="${cargo_target}" \
+      RUSTUP_HOME="${tool_root}/rustup" \
+      RUSTUP_TOOLCHAIN="${rust_toolchain}" \
+      TMPDIR="${job_dir}/tmp" \
+      GIT_CONFIG_NOSYSTEM=1 \
+      GIT_CONFIG_GLOBAL=/dev/null \
+      GIT_TERMINAL_PROMPT=0 \
+      bash -c 'set -Eeuo pipefail
+cd /srv/cats-build/source
+cargo build --locked --release -p cats-guest-agent --target x86_64-unknown-linux-musl
+env GUEST_AGENT_BIN="$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/cats-guest-agent" OUT="$1" RELEASE_OUT="$2" deploy/metal/build-guest-image.sh' \
+      cats-golden-root "${build_dir}" "${guest_release}" \
+    2>&1 | tee "${build_log}"
+  local -a pipeline_status=("${PIPESTATUS[@]}")
+  status=${pipeline_status[0]}
+  if (( status == 0 && pipeline_status[1] != 0 )); then
+    status=${pipeline_status[1]}
+  fi
+  set -e
+
+  local rootfs rootfs_sha256 rootfs_size agent_sha256 guest_sums_sha256
+  local rootfs_manifest_sha256 golden_root golden_root_receipt
+  rootfs="${build_dir}/rootfs.ext4"
+  golden_root="${output_dir}/cats-golden-root.ext4"
+  golden_root_receipt="${output_dir}/cats-golden-root.v1.json"
+  if (( status == 0 )); then
+    set +e
+    (
+      cd "${build_dir}"
+      sha256sum --check SHA256SUMS
+      e2fsck -fn rootfs.ext4
+      debugfs -R "dump /usr/bin/cats-guest-agent ${installed_agent}" rootfs.ext4 >/dev/null
+      cmp --silent \
+        "${cargo_target}/x86_64-unknown-linux-musl/release/cats-guest-agent" \
+        "${installed_agent}"
+    )
+    status=$?
+    set -e
+  fi
+  if (( status == 0 )); then
+    rootfs_sha256="$(hash_file "${rootfs}")"
+    rootfs_size="$(stat -c '%s' "${rootfs}")"
+    agent_sha256="$(hash_file "${installed_agent}")"
+    guest_sums_sha256="$(hash_file "${build_dir}/SHA256SUMS")"
+    rootfs_manifest_sha256="$(hash_file "${build_dir}/rootfs.manifest")"
+    jq -cnS \
+      --arg guest_agent_sha256 "${agent_sha256}" \
+      --arg guest_build_sums_sha256 "${guest_sums_sha256}" \
+      --arg rootfs_manifest_sha256 "${rootfs_manifest_sha256}" \
+      --arg rootfs_name "cats-golden-root.ext4" \
+      --arg rootfs_sha256 "${rootfs_sha256}" \
+      --argjson rootfs_size_bytes "${rootfs_size}" \
+      --arg source_commit "${source_sha}" \
+      --arg source_tree "${tree_sha}" \
+      '{schema_version:1,source_commit:$source_commit,source_tree:$source_tree,
+        rootfs_name:$rootfs_name,rootfs_sha256:$rootfs_sha256,
+        rootfs_size_bytes:$rootfs_size_bytes,guest_agent_sha256:$guest_agent_sha256,
+        guest_build_sums_sha256:$guest_build_sums_sha256,
+        rootfs_manifest_sha256:$rootfs_manifest_sha256}' \
+      >"${golden_root_receipt}"
+    mv -- "${rootfs}" "${golden_root}"
+    rm -rf -- "${build_dir}" "${guest_release}"
+  fi
+
+  chown -R root:root "${output_dir}"
+  find -P "${output_dir}" -xdev -type d -exec chmod 0555 {} +
+  find -P "${output_dir}" -xdev -type f -exec chmod 0444 {} +
+  chown root:root "${job_dir}"
+  chmod 0555 "${job_dir}"
+
+  install -d -m 0755 -o root -g root "${build_receipt_dir}"
+  local prepared_build_receipt build_receipt_path command_json
+  prepared_build_receipt="$(mktemp "${build_receipt_dir}/.${job_id}.XXXXXX")"
+  build_receipt_path="${build_receipt_dir}/${job_id}.json"
+  command_json="$(printf '%s\0' \
+    deploy/metal/build-guest-image.sh \
+    --source-sha "${source_sha}" \
+    | jq -Rs 'split("\u0000")[:-1]')"
+  jq -nS \
+    --arg source_sha "${source_sha}" \
+    --arg tree_sha "${tree_sha}" \
+    --arg manifest_sha256 "${manifest_sha256}" \
+    --arg bundle_sha256 "${bundle_sha256}" \
+    --arg job_id "${job_id}" \
+    --arg job_dir "${job_dir}" \
+    --arg output_dir "${output_dir}" \
+    --arg source_receipt "${source_receipt}" \
+    --arg bootstrap_payload_sha256 "$(jq -er '.bootstrap_payload_sha256' "${identity_file}")" \
+    --arg preparation_receipt "${preparation_receipt}" \
+    --arg preparation_receipt_sha256 "$(hash_file "${preparation_receipt}")" \
+    --arg manual_release_lock_sha256 "${manual_lock_sha256}" \
+    --arg helper_sha256 "${helper_sha256}" \
+    --argjson command "${command_json}" \
+    --argjson exit_status "${status}" \
+    '{schema_version:1,source_sha:$source_sha,tree_sha:$tree_sha,
+      manifest_sha256:$manifest_sha256,bundle_sha256:$bundle_sha256,
+      job_id:$job_id,job_dir:$job_dir,output_dir:$output_dir,
+      source_receipt:$source_receipt,command:$command,with_postgres:false,
+      exit_status:$exit_status,bootstrap_payload_sha256:$bootstrap_payload_sha256,
+      build_kind:"golden-root",preparation_receipt:$preparation_receipt,
+      preparation_receipt_sha256:$preparation_receipt_sha256,
+      manual_release_lock_sha256:$manual_release_lock_sha256,
+      helper_sha256:$helper_sha256,aws_environment_forwarded:false,
+      registry_credentials_used:false,reusable_home:false,
+      job_cgroup_drained:true,output_frozen:true}' \
+    >"${prepared_build_receipt}"
+  write_immutable_receipt "${prepared_build_receipt}" "${build_receipt_path}"
+  chown root:root "${build_receipt_path}"
+  printf 'build receipt: %s\n' "${build_receipt_path}"
+  if (( status == 0 )); then
+    jq -cnS \
+      --arg source_sha "${source_sha}" \
+      --arg job_id "${job_id}" \
+      --arg output_dir "${output_dir}" \
+      --arg rootfs "${golden_root}" \
+      --arg rootfs_sha256 "${rootfs_sha256}" \
+      --argjson rootfs_size_bytes "${rootfs_size}" \
+      --arg golden_root_receipt "${golden_root_receipt}" \
+      --arg build_receipt "${build_receipt_path}" \
+      --arg build_receipt_sha256 "$(hash_file "${build_receipt_path}")" \
+      '{schema_version:1,status:"built",source_sha:$source_sha,job_id:$job_id,
+        output_dir:$output_dir,rootfs:$rootfs,rootfs_sha256:$rootfs_sha256,
+        rootfs_size_bytes:$rootfs_size_bytes,golden_root_receipt:$golden_root_receipt,
+        build_receipt:$build_receipt,build_receipt_sha256:$build_receipt_sha256}'
+  fi
+  return "${status}"
+}
+
 case "${operation}" in
   prepare) prepare_host ;;
   verify) verify_and_report ;;
   build) run_build ;;
+  golden-root) run_golden_root_build ;;
 esac

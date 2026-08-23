@@ -138,6 +138,24 @@ cats-publish-content-addressed artifacts \
 $JOB_ID/output/cats-manual-release-$EXACT_40_HEX_COMMIT.tar.zst
 ```
 
+A Guest Agent change also requires a new Golden Root: the Agent is installed inside the ext4 image,
+not only in the Host worker bundle. Build that artifact through the same prepared native lane without
+rebuilding the unrelated OCI images:
+
+```sh
+/bin/bash /srv/cats-build/source/deploy/aws/terraform/qualification/build-host/tools/manual-release-host.sh \
+  golden-root "$EXACT_40_HEX_COMMIT" "$MANIFEST_SHA256" "$BUNDLE_SHA256" \
+  "$CONTROL_IMAGE_REFERENCE" "$CREDENTIAL_REFRESHER_IMAGE_REFERENCE" \
+  "$GATEWAY_IMAGE_REFERENCE"
+cats-publish-content-addressed artifacts \
+  /srv/cats-build/target/$EXACT_40_HEX_COMMIT-$MANIFEST_SHA256-$BUNDLE_SHA256/\
+$JOB_ID/output/cats-golden-root.ext4
+```
+
+The lane checks the image with `e2fsck`, extracts `/usr/bin/cats-guest-agent` with `debugfs`, compares
+it byte-for-byte with the exact native build, and freezes both the ext4 file and its provenance
+receipt before publication.
+
 Do not run `prepare` until the exact source, helper SHA-256 and
 `manual-release-toolchain-lock-v1.json` versions have been reviewed. Do not retry a timed-out build:
 retain the SSM command id and inspect the immutable receipt/output first.
