@@ -181,6 +181,15 @@ pub enum ActionDecision {
 
 /// Classifies an action from a locked Cat row.
 pub fn classify_action(cat: &CatRecord, action: CatAction) -> ActionDecision {
+    if cat.current_action == Some(CatAction::Run)
+        && cat
+            .node_id
+            .as_deref()
+            .zip(cat.current_action_node_id.as_deref())
+            .is_some_and(|(source, target)| source != target)
+    {
+        return ActionDecision::Busy;
+    }
     if cat.state == Some(action.target()) {
         return ActionDecision::AlreadyDone;
     }
@@ -1588,6 +1597,12 @@ mod tests {
         assert_eq!(
             classify_action(&cat(Some(CatState::Failure), None), CatAction::Destroy),
             ActionDecision::Claim
+        );
+        let mut relocation = cat(Some(CatState::Warm), Some(CatAction::Run));
+        relocation.current_action_node_id = Some("node-2".to_owned());
+        assert_eq!(
+            classify_action(&relocation, CatAction::Run),
+            ActionDecision::Busy
         );
     }
 

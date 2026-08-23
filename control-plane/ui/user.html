@@ -191,8 +191,6 @@
         <label class="span-2"><span data-i18n="user.catDialog.image">Boot image digest</span><input name="boot_image_digest" placeholder="sha256:…" pattern="sha256:[0-9a-f]{64}" required></label>
         <label><span>CPU</span><input name="vcpus" type="number" min="1" max="64" value="2" required></label>
         <label><span data-i18n="user.catDialog.memory">Memory (MiB)</span><input name="memory_mib" type="number" min="128" value="2048" required></label>
-        <label class="span-2"><span data-i18n="user.catDialog.rootDisk">RootDisk (GiB)</span><input name="root_gib" type="number" min="0.0625" step="0.0625" value="1" required></label>
-        <label class="span-2"><span>Durability</span><select name="durability"><option value="strict" selected>strict</option><option value="relaxed">relaxed</option></select></label>
       </div>
       <p class="form-error" data-form-error></p>
       <footer><button class="button button-quiet" value="cancel" data-i18n="common.cancel">Cancel</button><button class="button button-primary" value="default" data-i18n="user.catDialog.submit">Create and start</button></footer>
@@ -202,7 +200,7 @@
   <dialog id="create-disk-dialog" class="modal">
     <form method="dialog" id="create-disk-form">
       <header><div><small data-i18n="user.diskDialog.eyebrow">NEW STORAGE</small><h2 data-i18n="user.diskDialog.title">Create PersistentDisk</h2></div><button class="icon-button" value="cancel" data-i18n-aria-label="common.close" aria-label="Close">×</button></header>
-      <div class="form-grid"><label class="span-2"><span data-i18n="common.name">Name</span><input name="name" placeholder="workspace-data" required></label><label class="span-2"><span data-i18n="user.diskDialog.size">Capacity (GiB)</span><input name="size_gib" type="number" min="0.0625" step="0.0625" value="1" required></label><input name="durability" type="hidden" value="strict"></div>
+      <div class="form-grid"><label class="span-2"><span data-i18n="common.name">Name</span><input name="name" placeholder="workspace-data" required></label><label class="span-2"><span data-i18n="user.diskDialog.size">Capacity (GiB)</span><input name="size_gib" type="number" min="0.0625" step="0.0625" value="1" required></label></div>
       <p class="form-error" data-form-error></p>
       <footer><button class="button button-quiet" value="cancel" data-i18n="common.cancel">Cancel</button><button class="button button-primary" value="default" data-i18n="user.diskDialog.submit">Create disk</button></footer>
     </form>

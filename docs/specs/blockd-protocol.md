@@ -472,6 +472,9 @@ target由请求以外的既有immutable事实纯确定计算，步骤固定如�
    exact canonical manifest bytes、32 MiB cap、唯一shared DTO/reader与closed read error以
    [Immutable Image Manifest Read v1](immutable-image-manifest-read-v1.md)为准；blockd不保留第二个JSON
    decoder/validator，也不接受旧member-order/whitespace兼容artifact。
+   安装模式可按[ADR-0061](../decisions/0061-node-local-golden-root-provision-validation.md)使用独立的Node共享
+   单槽cache替代每次remote body下载，但cache必须重建同一image id/manifest，且每次命中仍确认全部远端key
+   存在；cache miss/failure不能绕过本步骤的remote body校验或改变closed error分类。
 2. 建立`request.size_bytes / CHUNK_SIZE`项的Map，默认Hole；每个manifest chunk变为§3的image Base：
    `object_id`和decoded SHA-256取该chunk object ID，`len=CHUNK_SIZE`，`image_id`取上述image-id。
 3. 每256个ChunkRef按§3.1编码Leaf；全Hole leaf使用EmptyLeaf，其余只在内存中编码、hash并派生本卷

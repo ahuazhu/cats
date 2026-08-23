@@ -74,6 +74,8 @@ struct Args {
     host_lock: PathBuf,
     #[arg(long, default_value = "/run/cats/blockd-v1")]
     blockd_socket_root: PathBuf,
+    #[arg(long, default_value = "/var/lib/cats/golden-root-cache/rootfs.ext4")]
+    golden_root_cache_image: PathBuf,
     #[arg(long, default_value = "/opt/cats/bin/cats-blockd")]
     blockd_bin: PathBuf,
     #[arg(long)]
@@ -234,6 +236,7 @@ fn semantic_effects(args: &Args, node_id: &Id) -> anyhow::Result<Arc<dyn Semanti
                     host_lock: args.host_lock.clone(),
                     blockd_binary: args.blockd_bin.clone(),
                     blockd_socket_root: socket_root,
+                    golden_root_cache_image: args.golden_root_cache_image.clone(),
                     metadata_store: AdapterSelection::new(metadata_name, metadata_config),
                     object_store: AdapterSelection::new(object_name, object_config),
                     ch,

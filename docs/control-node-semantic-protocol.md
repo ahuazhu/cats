@@ -429,7 +429,12 @@ POST /v1/workspaces/{workspace_id}/disks
 POST /v1/workspaces/{workspace_id}/disks/{disk_slug}/actions/attach
 POST /v1/workspaces/{workspace_id}/disks/{disk_slug}/actions/detach
 POST /v1/workspaces/{workspace_id}/disks/{disk_slug}/actions/destroy
+
+POST /v1/admin/nodes/{node_id}/actions/drain
 ```
+
+Node drain 是 fleet administrator 管理路由，不接受 Workspace automation/service principal，也没有请求
+body。认证和 Node 状态错误使用通用错误响应；已经 `draining` 的相同 Node 请求会继续当前排空。
 
 Create Cat 请求：
 
@@ -846,12 +851,58 @@ Node running
 -> 在目标Node上run
 -> 原状态是suspended时再suspend
 -> 原状态是warm时再warm
--> 全部完成后关闭旧Node
+-> 返回逐Cat结果
+-> 运维确认完成后另行关闭旧Node
 ```
 
 跨 Node 不搬运 Suspended/Warm 的本地内存状态。原来是 Suspended 或 Warm 的 Cat 会在目标 Node 上先正常 run，再转换回对应状态。
 
-任一 Cat 无法 Cold 时，Node drain 失败并保留该 Cat，不强制关机。
+管理入口为：
+
+```text
+POST /v1/admin/nodes/{node_id}/actions/drain
+```
+
+Control 在接受任何 Cat 迁移前先把 Node 提交为 `draining`。每个 Cat 的原 state、源 placement 和目标
+reservation 保存在 Cat 当前行；独立 recovery 周期会重新发现仍有 Cat 的 draining Node，因此请求取消、
+Control 重启或重复调用都继续同一排空。耗时迁移不在 heartbeat/liveness probe 的串行路径上。已有普通
+`current_action` 返回 `blocked/busy`，不会被排空抢占。
+
+成功响应为 HTTP 200：
+
+```json
+{
+  "status": "blocked",
+  "source_node_id": "node_source",
+  "cats": [
+    {
+      "status": "migrated",
+      "cat_id": "cat_web",
+      "target_node_id": "node_target",
+      "state": "running"
+    },
+    {
+      "status": "blocked",
+      "cat_id": "cat_worker",
+      "code": "busy",
+      "message": "Cat has another lifecycle action in progress"
+    }
+  ]
+}
+```
+
+顶层只有 `drained/blocked`；逐 Cat 只有 `migrated/stale/blocked`。任一 Cat 无法 Cold 时，排空阻塞并保留
+Cat 的原 state 和 source placement，不强制关机；包括 noded 明确返回 failure/conflict，也不能在未越过
+Cold 数据屏障时清掉重试 authority。由于目标端尚未执行，此时原子释放 exact target reservation，下一
+周期重新选择 running Node；这样旧目标随后被 cordon 时不会被一个源端失败的迁移永久占住。目标恢复明确
+失败的 Cat 留在目标 Node 的 `failure` 状态供显式清理。接口不会自动关闭或 uncordon Node；Node 保持
+`draining`。
+
+源 Cold 的 timeout、transport/protocol ambiguity 或无法完成 postcondition query 遵守相同 release/reclaim
+规则；源命令结果不明不等于目标端已开始。若 target 阶段的 reserved Node 已经
+offline/reset_required/deleted 或不存在，源仍 draining 时在 Cat row lock 内以 Least-Allocated 策略选择
+新 target，并在同一事务撤销可能已经发布的 exact 旧目标入口、替换 reservation；旧 target 的迟到
+publish/settlement 因 exact target 不匹配而不能提交。
 
 ### 14.2 异常退出
 
@@ -884,6 +935,9 @@ retry_interval
 - noded 每次都先检查目标结果是否已经满足；
 - create 最终超时后，Control 额外调用一次 noded DELETE 清理本地资源；
 - 其他动作最终超时后，Control 查询一次 Cat 状态；无法确定时写 `failure`；
+- planned drain 是上一条的窄例外：源 Cold 未成功（包括明确失败）时保留源 state/placement、释放未使用
+  的 target reservation，由独立周期 worker 重新 claim；目标恢复结果不明时保留 exact claim。两者都不写
+  `failure`；
 - destroy 超时保持 `failure`，允许用户再次 destroy；
 - timeout 不自动选择另一台 Node，Node 迁移只走 Node offline 流程。
 
@@ -978,6 +1032,12 @@ internal_error
 - reset完成前不接受新Cat。
 - draining Node不接受新placement。
 - planned drain保持每个Cat最终产品状态。
+- planned drain在迁移前持久化目标 reservation，Control 重启后继续，且不抢占普通Cat动作。
+- planned drain要求源端先完成Cold；源端未成功时保留原状态和源placement、释放未使用的target
+  reservation，目标端明确失败留目标清理。
+- planned drain的目标结果不明时也保留原状态和claim；reserved target失联时能exact retarget，旧结果不能
+  覆盖新target。
+- 慢planned drain或offline recovery不能阻塞heartbeat probe cadence，shutdown会取消当前周期工作。
 - offline Node 上的 Cat 在跨 Node 恢复前先撤掉旧入口，新实例 Ready 前不发布新入口。
 - 入口切换后只把新进入的流量发送到新 Node。
 - offline Node 的下一次成功心跳返回 `reset_required`，noded 不等待下一个心跳周期，立即停止和清理残留 Cat。

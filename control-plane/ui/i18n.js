@@ -189,6 +189,7 @@ const messages = {
     "user.empty.recentOperations": "No operations yet.",
     "user.refreshFailed": "Refresh failed",
     "user.operation.accepted": "Operation accepted",
+    "user.cat.created": "Cat created",
     "user.disk.created": "PersistentDisk created",
     "user.authConfigFailed": "Could not load sign-in configuration: {message}",
 
@@ -526,6 +527,7 @@ const messages = {
     "user.empty.recentOperations": "暂无操作记录。",
     "user.refreshFailed": "刷新失败",
     "user.operation.accepted": "操作已接受",
+    "user.cat.created": "Cat 已创建",
     "user.disk.created": "PersistentDisk 已创建",
     "user.authConfigFailed": "读取登录配置失败：{message}",
 

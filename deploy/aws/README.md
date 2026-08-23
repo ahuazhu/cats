@@ -193,16 +193,18 @@ The existing worker release machinery uses the Terraform-managed artifact bucket
 Secrets Manager secret and SSM State Manager association. The bundle digest is
 verified before installing `cats-noded`, `cats-blockd`, `cats-guest-agent`,
 `render-postgres-url` and the worker systemd units. The same bundle carries the Guest Agent and standalone
-Guest systemd units as a golden-root payload. The association patches them
+Guest systemd units as a release-owned Guest seed payload. The association patches them
 into a private copy of `rootfs.ext4`, verifies the ext4 image, preserves
 `rootfs.ext4.previous`, atomically replaces the seed and immediately restarts
 `cats-worker`. The updater also normalizes release-owned Guest invariants that
 must be repaired in already-built seeds, including a world-readable
 `/etc/resolv.conf` for APT's unprivileged resolver worker. The restart is
-required, not cosmetic:
-`ensure_image_published` caches the golden root's image id for the life of the
-node process, so an updated image is otherwise ignored. Existing Cats keep
-their current root until they are recreated. This installer behavior predates
+required, not cosmetic, because subsequent Guests must use one internally
+consistent release receipt and Guest payload. This seed is not the product
+Golden Root cache: Root provision uses the independent, digest-checked
+`/var/lib/cats/golden-root-cache/rootfs.ext4` single slot and fills it only from
+the immutable remote image namespace. Existing Cats keep their current root
+until they are recreated. This installer behavior predates
 the clean-slate exact-SHA qualification; the association must not be enabled as
 a rolling current-runtime upgrade until the gate below is green.
 

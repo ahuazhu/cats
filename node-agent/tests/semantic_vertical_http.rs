@@ -657,6 +657,10 @@ impl SemanticNodeRecoveryStore for MemoryRecoveryStore {
                     state.cat.state = Some(claim.target_state);
                     state.cat.node_id = Some(claim.target_node_id.clone());
                 }
+                RecoveryFinish::RetrySource { .. } => {
+                    state.cat.state = Some(claim.target_state);
+                    state.cat.node_id = Some(claim.source_node_id.clone());
+                }
                 RecoveryFinish::Failed { .. } => {
                     state.cat.state = Some(ControlState::Failure);
                     state.cat.node_id = None;
