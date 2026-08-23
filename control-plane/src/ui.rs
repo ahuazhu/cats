@@ -6,6 +6,8 @@ use axum::body::Body;
 use axum::extract::{OriginalUri, Path};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
+use axum::routing::get;
+use axum::Router;
 use serde_json::json;
 
 const USER_HTML: &str = include_str!("../ui/user.html");
@@ -883,6 +885,27 @@ pub async fn admin_console() -> Response {
     console_asset("text/html; charset=utf-8", ADMIN_HTML)
 }
 
+pub(crate) fn console_asset_routes<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    Router::new()
+        .route("/ui/styles.css", get(styles))
+        .route("/ui/i18n.js", get(i18n_script))
+        .route("/ui/common.js", get(common_script))
+        .route("/ui/user.js", get(user_script))
+        .route("/ui/admin.js", get(admin_script))
+        .route("/ui/cat-create-v2.mjs", get(cat_create_v2_script))
+        .route(
+            "/ui/persistent-disk-create-v1.mjs",
+            get(persistent_disk_create_v1_script),
+        )
+        .route(
+            "/ui/runtime-product-load.mjs",
+            get(runtime_product_load_script),
+        )
+}
+
 pub async fn styles() -> Response {
     console_asset("text/css; charset=utf-8", STYLES_CSS)
 }
@@ -989,14 +1012,58 @@ mod tests {
 
     use axum::body::to_bytes;
     use axum::extract::OriginalUri;
+    use axum::http::{header, StatusCode};
     use cats_api::runtime_reconciliation::{
         RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY, RUNTIME_INTERNAL_ROUTE_NOT_FOUND_ROBOTS,
     };
 
     use super::{
-        not_found, ADMIN_GUIDE, ADMIN_HTML, ADMIN_JS, CAT_CREATE_V2_JS, COMMON_JS, DOCS, I18N_JS,
-        LANDING_EN, LANDING_ZH, RUNTIME_PRODUCT_LOAD_JS, USER_HTML, USER_JS,
+        console_asset_routes, not_found, ADMIN_GUIDE, ADMIN_HTML, ADMIN_JS, CAT_CREATE_V2_JS,
+        COMMON_JS, DOCS, I18N_JS, LANDING_EN, LANDING_ZH, PERSISTENT_DISK_CREATE_V1_JS,
+        RUNTIME_PRODUCT_LOAD_JS, USER_HTML, USER_JS,
     };
+
+    #[tokio::test]
+    async fn console_serves_every_user_entry_module_dependency() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind console asset fixture");
+        let address = listener
+            .local_addr()
+            .expect("console asset fixture address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, console_asset_routes::<()>())
+                .await
+                .expect("serve console asset fixture");
+        });
+
+        for (path, expected) in [
+            ("/ui/cat-create-v2.mjs", CAT_CREATE_V2_JS),
+            (
+                "/ui/persistent-disk-create-v1.mjs",
+                PERSISTENT_DISK_CREATE_V1_JS,
+            ),
+            ("/ui/runtime-product-load.mjs", RUNTIME_PRODUCT_LOAD_JS),
+        ] {
+            let response = reqwest::get(format!("http://{address}{path}"))
+                .await
+                .unwrap_or_else(|error| panic!("GET {path}: {error}"));
+            assert_eq!(response.status(), StatusCode::OK, "GET {path}");
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                "text/javascript; charset=utf-8",
+                "GET {path}",
+            );
+            assert_eq!(
+                response.text().await.expect("read console module"),
+                expected,
+                "GET {path}",
+            );
+        }
+
+        server.abort();
+        let _ = server.await;
+    }
 
     #[tokio::test]
     async fn runtime_unmatched_route_fallback_has_the_shared_exact_shape() {
