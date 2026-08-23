@@ -3733,26 +3733,39 @@ impl BlobStore for ImageValidationCountingBlob {
     }
 }
 
-struct LocalSeedProvisionFixture {
+struct LocalCacheProvisionFixture {
     _dir: tempfile::TempDir,
-    seed_image: PathBuf,
+    source_image: PathBuf,
+    cache_image: PathBuf,
+    manifest: format::ImageManifest,
     engine: Arc<ChunkEngine>,
     blob: Arc<ImageValidationCountingBlob>,
     request: cats_api::runtime_reconciliation::ProvisionRootImageRequest,
 }
 
-fn local_seed_provision_fixture() -> LocalSeedProvisionFixture {
+fn local_cache_provision_fixture() -> LocalCacheProvisionFixture {
+    local_cache_provision_fixture_with_source(|seed| {
+        for byte in [211, 37, 89, 151] {
+            seed.write_all(&pattern(CHUNK_SIZE as usize, byte)).unwrap();
+        }
+    })
+}
+
+fn local_cache_provision_fixture_with_source(
+    write_source: impl FnOnce(&mut File),
+) -> LocalCacheProvisionFixture {
     let dir = tempfile::tempdir().unwrap();
     let inner = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
-    let seed_image = dir.path().join("root.img");
-    let mut seed = File::create(&seed_image).unwrap();
-    for byte in [211, 37, 89, 151] {
-        seed.write_all(&pattern(CHUNK_SIZE as usize, byte)).unwrap();
-    }
+    let source_image = dir.path().join("source-root.img");
+    let mut seed = File::create(&source_image).unwrap();
+    write_source(&mut seed);
     seed.sync_all().unwrap();
-    let manifest = crate::image::publish(inner.as_ref(), &seed_image)
+    let manifest = crate::image::publish(inner.as_ref(), &source_image)
         .unwrap()
         .manifest;
+    let cache_directory = dir.path().join("golden-root-cache");
+    fs::create_dir(&cache_directory).unwrap();
+    let cache_image = cache_directory.join("rootfs.ext4");
     let blob = Arc::new(ImageValidationCountingBlob {
         inner,
         image_data_gets: AtomicU64::new(0),
@@ -3776,9 +3789,11 @@ fn local_seed_provision_fixture() -> LocalSeedProvisionFixture {
         epoch,
         "2468ace013579bdf2468ace013579bdf",
     );
-    LocalSeedProvisionFixture {
+    LocalCacheProvisionFixture {
         _dir: dir,
-        seed_image,
+        source_image,
+        cache_image,
+        manifest,
         engine,
         blob,
         request,
@@ -3786,12 +3801,29 @@ fn local_seed_provision_fixture() -> LocalSeedProvisionFixture {
 }
 
 #[test]
-fn exact_local_seed_provisions_without_getting_remote_image_data() {
-    let fixture = local_seed_provision_fixture();
+fn a_cold_local_cache_is_filled_and_the_replay_gets_no_remote_image_data() {
+    let fixture = local_cache_provision_fixture();
 
     fixture
         .engine
-        .provision_root_image_from_local_seed(&fixture.request, &fixture.seed_image)
+        .provision_root_image_with_local_cache(&fixture.request, &fixture.cache_image)
+        .unwrap();
+
+    assert_eq!(fixture.blob.image_data_gets.load(Ordering::SeqCst), 4);
+    assert_eq!(fixture.blob.image_data_exists.load(Ordering::SeqCst), 0);
+    let (cached_image_id, cached_manifest, _) = crate::image::scan(&fixture.cache_image).unwrap();
+    assert_eq!(cached_image_id, fixture.manifest.image_id.as_str());
+    assert_eq!(cached_manifest, fixture.manifest);
+
+    fixture.blob.image_data_gets.store(0, Ordering::SeqCst);
+    fixture.blob.image_data_exists.store(0, Ordering::SeqCst);
+    fixture
+        .blob
+        .image_data_exists_peak
+        .store(0, Ordering::SeqCst);
+    fixture
+        .engine
+        .provision_root_image_with_local_cache(&fixture.request, &fixture.cache_image)
         .unwrap();
 
     assert_eq!(fixture.blob.image_data_gets.load(Ordering::SeqCst), 0);
@@ -3803,23 +3835,26 @@ fn exact_local_seed_provisions_without_getting_remote_image_data() {
 }
 
 #[test]
-fn a_nonmatching_local_seed_falls_back_to_remote_body_validation() {
-    let fixture = local_seed_provision_fixture();
-    let wrong_seed = fixture._dir.path().join("wrong-root.img");
-    fs::write(&wrong_seed, pattern(CHUNK_SIZE as usize, 99)).unwrap();
+fn a_nonmatching_local_cache_is_replaced_after_remote_body_validation() {
+    let fixture = local_cache_provision_fixture();
+    fs::write(&fixture.cache_image, pattern(CHUNK_SIZE as usize, 99)).unwrap();
 
     fixture
         .engine
-        .provision_root_image_from_local_seed(&fixture.request, &wrong_seed)
+        .provision_root_image_with_local_cache(&fixture.request, &fixture.cache_image)
         .unwrap();
 
     assert_eq!(fixture.blob.image_data_gets.load(Ordering::SeqCst), 4);
     assert_eq!(fixture.blob.image_data_exists.load(Ordering::SeqCst), 0);
+    let (cached_image_id, cached_manifest, _) = crate::image::scan(&fixture.cache_image).unwrap();
+    assert_eq!(cached_image_id, fixture.manifest.image_id.as_str());
+    assert_eq!(cached_manifest, fixture.manifest);
 }
 
 #[test]
-fn an_exact_local_seed_cannot_publish_a_map_when_a_remote_object_is_missing() {
-    let fixture = local_seed_provision_fixture();
+fn an_exact_local_cache_cannot_publish_a_map_when_a_remote_object_is_missing() {
+    let fixture = local_cache_provision_fixture();
+    fs::copy(&fixture.source_image, &fixture.cache_image).unwrap();
     let missing = fixture
         .blob
         .list("images/")
@@ -3832,11 +3867,63 @@ fn an_exact_local_seed_cannot_publish_a_map_when_a_remote_object_is_missing() {
     assert_retryable_problem(
         fixture
             .engine
-            .provision_root_image_from_local_seed(&fixture.request, &fixture.seed_image)
+            .provision_root_image_with_local_cache(&fixture.request, &fixture.cache_image)
             .unwrap_err(),
         cats_api::runtime_reconciliation::ProvisionRootImageRetryableProblem::ImageUnavailable,
     );
     assert!(volume_objects(fixture.blob.as_ref()).is_empty());
+}
+
+#[test]
+fn an_unwritable_local_cache_does_not_weaken_remote_body_provision() {
+    let fixture = local_cache_provision_fixture();
+    let non_directory = fixture._dir.path().join("not-a-directory");
+    fs::write(&non_directory, b"file").unwrap();
+    let unavailable_cache = non_directory.join("rootfs.ext4");
+
+    fixture
+        .engine
+        .provision_root_image_with_local_cache(&fixture.request, &unavailable_cache)
+        .unwrap();
+
+    assert_eq!(fixture.blob.image_data_gets.load(Ordering::SeqCst), 4);
+    assert_eq!(fixture.blob.image_data_exists.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn an_unaligned_image_is_validated_but_not_published_as_a_different_cache_file() {
+    let fixture = local_cache_provision_fixture_with_source(|source| {
+        source.write_all(&pattern(4_096, 73)).unwrap();
+    });
+
+    fixture
+        .engine
+        .provision_root_image_with_local_cache(&fixture.request, &fixture.cache_image)
+        .unwrap();
+
+    assert_eq!(fixture.blob.image_data_gets.load(Ordering::SeqCst), 1);
+    assert!(!fixture.cache_image.exists());
+    assert!(!volume_objects(fixture.blob.as_ref()).is_empty());
+}
+
+#[test]
+fn cache_fill_reconstructs_duplicate_chunks_and_sparse_holes() {
+    let fixture = local_cache_provision_fixture_with_source(|source| {
+        let repeated = pattern(CHUNK_SIZE as usize, 41);
+        source.write_all(&repeated).unwrap();
+        source.write_all(&vec![0_u8; CHUNK_SIZE as usize]).unwrap();
+        source.write_all(&repeated).unwrap();
+    });
+
+    fixture
+        .engine
+        .provision_root_image_with_local_cache(&fixture.request, &fixture.cache_image)
+        .unwrap();
+
+    assert_eq!(fixture.blob.image_data_gets.load(Ordering::SeqCst), 1);
+    let (cached_image_id, cached_manifest, _) = crate::image::scan(&fixture.cache_image).unwrap();
+    assert_eq!(cached_image_id, fixture.manifest.image_id.as_str());
+    assert_eq!(cached_manifest, fixture.manifest);
 }
 
 fn root_provision_request(

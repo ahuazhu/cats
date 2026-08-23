@@ -111,9 +111,11 @@ create-time existence/shape判断的边界。`cats-blockd`在真正 provision �
 
 1. 默认路径读取每个唯一 referenced data object，验证 exact 4 MiB length 与 object-id SHA-256；
 2. [ADR-0061](../decisions/0061-node-local-golden-root-provision-validation.md) 的安装模式 fast path 每次按
-   publisher 同一规则扫描 Node 本地 seed，要求完整文件 digest 和重建 manifest 同时精确匹配 request/remote
-   manifest，然后并发确认每个唯一远端 data-object key 当次存在。local mismatch/I/O 自动回退路径 1；
-   remote missing/backend error 在首次 volume object PUT 前 fail closed。
+   publisher 同一规则扫描独立的 Node 共享 cache，要求完整文件 digest 和重建 manifest 同时精确匹配
+   request/remote manifest，然后并发确认每个唯一远端 data-object key 当次存在。cache miss/mismatch 时走
+   路径 1，并用同一批已经验证的 body 重建 sparse 临时文件；完整文件与 manifest 再次 exact 后才原子发布到
+   单槽 cache。cache 本地 I/O 失败只放弃缓存，不弱化或否定已完成的远端验证；remote missing/backend error
+   仍在首次 volume object PUT 前 fail closed。
 
 路径 2 依赖 production backend 已通过的 manifest-last 和 immutable-key 合同；它不把本地文件写入 Map 或直接
 提供给 Guest。若一个已发布对象在违反 immutable 合同后保留 key 但静默改变 body，错误由首次 hydrate 的 Map

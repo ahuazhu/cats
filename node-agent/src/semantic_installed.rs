@@ -69,6 +69,7 @@ pub struct InstalledCatConfig {
     pub host_lock: PathBuf,
     pub blockd_binary: PathBuf,
     pub blockd_socket_root: ManagedBlockdSocketRoot,
+    pub golden_root_cache_image: PathBuf,
     pub metadata_store: AdapterSelection,
     pub object_store: AdapterSelection,
     pub ch: ChConfig,
@@ -85,6 +86,10 @@ impl InstalledCatConfig {
             ("runtime directory", self.runtime_directory.as_path()),
             ("Host lock", self.host_lock.as_path()),
             ("blockd binary", self.blockd_binary.as_path()),
+            (
+                "Golden Root cache image",
+                self.golden_root_cache_image.as_path(),
+            ),
             ("Cloud Hypervisor binary", self.ch.ch_bin.as_path()),
             ("Guest kernel", self.ch.kernel.as_path()),
         ] {
@@ -255,6 +260,12 @@ impl InstalledSemanticCatEffects {
         create_private_directory(&config.state_directory)?;
         create_private_directory(&config.runtime_directory)?;
         create_private_directory(Path::new(config.blockd_socket_root.path().as_str()))?;
+        create_private_directory(
+            config
+                .golden_root_cache_image
+                .parent()
+                .context("Golden Root cache image has no parent directory")?,
+        )?;
         Ok(Self {
             inner: Arc::new(InstalledInner {
                 config,
@@ -628,14 +639,9 @@ impl InstalledInner {
             expected_provisioned_head: expected.clone(),
         };
         let provision_started = Instant::now();
-        let (validation_preference, result) = match self.config.ch.seed_image.as_deref() {
-            Some(seed_image) => (
-                "local_seed",
-                engine.provision_root_image_from_local_seed(&request, seed_image),
-            ),
-            None => ("remote_body", engine.provision_root_image(&request)),
-        };
-        let result = result
+        let validation_preference = "node_shared_cache";
+        let result = engine
+            .provision_root_image_with_local_cache(&request, &self.config.golden_root_cache_image)
             .map_err(|error| anyhow::anyhow!(error))
             .context("provision Root image")?;
         tracing::info!(
@@ -1853,6 +1859,7 @@ mod tests {
     fn missing_root_manifest_releases_the_new_attachment() {
         let directory = tempfile::tempdir_in("/tmp").expect("temporary installed directory");
         let socket_root = directory.path().join("sockets");
+        let golden_root_cache_directory = directory.path().join("golden-root-cache");
         let host_lock = directory.path().join("host.lock");
         drop(
             OpenOptions::new()
@@ -1872,6 +1879,7 @@ mod tests {
                 HostPath::new(socket_root.to_string_lossy().into_owned()).expect("socket root"),
             )
             .expect("managed socket root"),
+            golden_root_cache_image: golden_root_cache_directory.join("rootfs.ext4"),
             metadata_store: AdapterSelection::new(
                 "postgres",
                 cats_storage::AdapterConfig::from_cli(Vec::<String>::new())
@@ -1910,6 +1918,7 @@ mod tests {
             Arc::new(MissingBlob),
         )
         .expect("installed effects");
+        assert!(golden_root_cache_directory.is_dir());
         let request = NodedCatConfig {
             workspace_id: Id::new("ws_cleanup").expect("workspace ID"),
             cpu: 1,
