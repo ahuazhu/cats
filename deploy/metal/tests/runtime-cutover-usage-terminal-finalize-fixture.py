@@ -35,6 +35,7 @@ except IndexError as error:
 
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 ID = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
+CONTROL_SCHEMA_VERSION = 19
 QUALIFICATION_BEGIN_FILE = "production-mutation-qualification-begin.receipt.json"
 QUALIFICATION_TERMINAL_FILE = "production-mutation-qualification-terminal.receipt.json"
 QUALIFICATION_BEGIN_COMMAND_RECEIPT_FILE = (
@@ -159,7 +160,7 @@ with tempfile.TemporaryDirectory() as temporary:
         "deployment_id": "deployment-a",
         "release_id": "release-a",
         "source_commit_sha": exact_commit,
-        "control_schema_version": 18,
+        "control_schema_version": CONTROL_SCHEMA_VERSION,
         "source_manifest_sha256": digest("1"),
         "source_bundle_sha256": digest("2"),
         "build_receipt_sha256": digest("3"),
