@@ -35,4 +35,9 @@ run "the_apply_blocks_on_the_components_that_can_become_ready" {
     condition     = nonsensitive(kubernetes_secret_v1.runtime.data["CATS_NODED_SERVICE_TOKEN"]) == var.runtime_secret_data["CATS_AUTH_TOKEN"]
     error_message = "Control must receive the same direct Node service token installed as CATS_AUTH_TOKEN on every Node."
   }
+
+  assert {
+    condition     = kubernetes_deployment_v1.control_plane.spec[0].template[0].metadata[0].annotations["cats.run/production-cutover-operator-trust-sha256"] == sha256(var.production_cutover_operator_trust_bundle_json)
+    error_message = "changing production operator trust must trigger a Control rollout."
+  }
 }

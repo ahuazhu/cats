@@ -533,11 +533,19 @@ def send_worker_probe(config: dict[str, Any], instance_ids: list[str], digest: s
     command = (
         "set -eu\n"
         "receipt=/opt/cats/release/worker-installation-receipt.v1.json\n"
-        "test -f \"$receipt\"\n"
-        f"test \"$(jq -er .worker_bundle_sha256 \"$receipt\")\" = {json.dumps(digest)}\n"
-        "systemctl is-active --quiet cats-worker.service\n"
-        f"jq -cnS --arg digest {json.dumps(digest)} "
+        "deadline=$(( $(date +%s) + 600 ))\n"
+        "while [ \"$(date +%s)\" -lt \"$deadline\" ]; do\n"
+        "  if test -f \"$receipt\" \\\n"
+        f"    && test \"$(jq -er .worker_bundle_sha256 \"$receipt\" 2>/dev/null || true)\" = {json.dumps(digest)} \\\n"
+        "    && systemctl is-active --quiet cats-worker.service; then\n"
+        f"    jq -cnS --arg digest {json.dumps(digest)} "
         "'{status:\"installed\",worker_bundle_sha256:$digest}'\n"
+        "    exit 0\n"
+        "  fi\n"
+        "  sleep 5\n"
+        "done\n"
+        "echo 'worker installation did not converge before the probe deadline' >&2\n"
+        "exit 1\n"
     )
     response = aws_json(
         config,
@@ -548,7 +556,7 @@ def send_worker_probe(config: dict[str, Any], instance_ids: list[str], digest: s
         "--document-name",
         "AWS-RunShellScript",
         "--parameters",
-        json.dumps({"commands": [command], "executionTimeout": ["300"]}, separators=(",", ":")),
+        json.dumps({"commands": [command], "executionTimeout": ["660"]}, separators=(",", ":")),
     )
     command_id = response.get("Command", {}).get("CommandId") if isinstance(response, dict) else None
     if not isinstance(command_id, str) or not command_id:

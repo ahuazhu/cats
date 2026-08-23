@@ -217,9 +217,10 @@ resource "kubernetes_deployment_v1" "control_plane" {
           "app.kubernetes.io/name" = "cats-controld"
         })
         annotations = {
-          "cats.run/runtime-secret-sha256"            = sha256(jsonencode(local.runtime_secret_data))
-          "cats.run/runtime-provisioner-trust-sha256" = sha256(var.runtime_provisioner_trust_bundle_json)
-          "cats.run/rds-ca-sha256"                    = sha256(local.rds_ca_pem)
+          "cats.run/runtime-secret-sha256"                    = sha256(jsonencode(local.runtime_secret_data))
+          "cats.run/runtime-provisioner-trust-sha256"         = sha256(var.runtime_provisioner_trust_bundle_json)
+          "cats.run/production-cutover-operator-trust-sha256" = sha256(var.production_cutover_operator_trust_bundle_json)
+          "cats.run/rds-ca-sha256"                            = sha256(local.rds_ca_pem)
         }
       }
 
