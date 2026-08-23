@@ -850,10 +850,14 @@ impl Store {
                     transaction.commit()?;
                     return Ok(AdmitCatActionOutcome::SameAction(aggregate));
                 }
-                Some(_) => {
+                Some(_) if action != CatAction::Destroy => {
                     transaction.commit()?;
                     return Ok(AdmitCatActionOutcome::Busy(aggregate));
                 }
+                // Destroy replaces an unresolved action in this locked row.
+                // Its noded target remains the replaced action's selected
+                // Node, where the physical work must be cancelled and joined.
+                Some(_) => {}
                 None => {}
             }
             if !semantic_action_allowed(action, aggregate.cat.state) {
@@ -865,6 +869,11 @@ impl Store {
                 (CatAction::Run, Some(CatState::Cold)) => {
                     ACTIVE_PLACEMENT_STRATEGY.select_running_node(&mut transaction, None)?
                 }
+                (CatAction::Destroy, _) => aggregate
+                    .cat
+                    .current_action_node_id
+                    .clone()
+                    .or_else(|| aggregate.cat.node_id.clone()),
                 _ => aggregate.cat.node_id.clone(),
             };
             let action_node_id = selected_node_id.as_deref();
@@ -888,7 +897,11 @@ impl Store {
             let row = transaction.query_one(
                 &format!(
                     "UPDATE cats
-                        SET current_action=$2,current_action_started_at={DB_NOW_MS},
+                        SET state=CASE
+                                WHEN $2='destroy' AND state IS NULL THEN 'failure'
+                                ELSE state
+                            END,
+                            current_action=$2,current_action_started_at={DB_NOW_MS},
                             current_action_node_id=$3,updated_at={DB_NOW_MS},
                             last_error_code=NULL,last_error_message=NULL
                       WHERE cat_id=$1
@@ -2029,7 +2042,7 @@ const fn semantic_action_allowed(action: CatAction, state: Option<CatState>) -> 
         (CatAction::Suspend, Some(CatState::Running)) => true,
         (CatAction::Warm, Some(CatState::Running | CatState::Suspended)) => true,
         (CatAction::Cold, Some(CatState::Running | CatState::Suspended | CatState::Warm)) => true,
-        (CatAction::Destroy, Some(state)) => !matches!(state, CatState::Destroyed),
+        (CatAction::Destroy, state) => !matches!(state, Some(CatState::Destroyed)),
         _ => false,
     }
 }

@@ -148,8 +148,10 @@ Node 有内部 `node_id`、不可变展示名 `node_name` 和 Control 可达的 
 | 任意未销毁状态 | `destroy` | `destroyed` |
 | `failure` | `destroy` | `destroyed` |
 
-同一目标已经满足时返回 `already_*`，不调用 noded。相同动作进行中时查询并等待它；不同动作返回
-`busy`。Control 以 Cat 行条件更新取得 `current_action`，提交后才同步调用目标 noded。
+同一目标已经满足时返回 `already_*`，不调用 noded。相同动作进行中时查询并等待它；不同的非 destroy
+动作返回 `busy`。destroy 是唯一抢占例外：Control 在 Cat 行锁内把未完成动作替换为 destroy，并继承
+它的目标 Node；旧动作的迟到写回因 exact action/Node 不匹配而失效。Control 提交后才同步调用目标
+noded。
 
 noded 每个 `cat_id` 一个串行执行单元，不同 Cat 可以并行。destroy 可以要求当前动作退出，但必须在
 返回前等待退出并清理。noded 对同一 `cat_id` 保留本注册周期的 destroyed marker，防止旧内部 create

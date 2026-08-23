@@ -226,6 +226,72 @@ fn atomic_create_uses_committed_shape_and_skips_non_running_nodes() {
 }
 
 #[test]
+fn destroy_preempts_an_in_progress_create_on_its_reserved_node() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    let creating = admit_cat(
+        &store,
+        "cat-destroy-creating",
+        "destroy-creating",
+        2,
+        1 << 30,
+    );
+    assert_eq!(creating.cat.state, None);
+    assert_eq!(creating.cat.current_action, Some(CatAction::Create));
+    assert_eq!(
+        creating.cat.current_action_node_id.as_deref(),
+        Some("node-a")
+    );
+
+    let AdmitCatActionOutcome::Acquired(destroy) = store
+        .admit_semantic_cat_action(
+            SemanticCatSelector::Id("cat-destroy-creating"),
+            CatAction::Destroy,
+        )
+        .unwrap()
+    else {
+        panic!("destroy must replace the in-progress create claim")
+    };
+    assert_eq!(destroy.cat.state, Some(CatState::Failure));
+    assert_eq!(destroy.cat.current_action, Some(CatAction::Destroy));
+    assert_eq!(
+        destroy.cat.current_action_node_id.as_deref(),
+        Some("node-a")
+    );
+
+    assert!(store
+        .finish_semantic_cat_action(
+            "cat-destroy-creating",
+            FinishCatAction {
+                expected_action: CatAction::Create,
+                expected_node_id: Some("node-a"),
+                final_state: CatState::Running,
+                final_node_id: Some("node-a"),
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .unwrap()
+        .is_none());
+
+    let destroyed = store
+        .finish_semantic_cat_action(
+            "cat-destroy-creating",
+            FinishCatAction {
+                expected_action: CatAction::Destroy,
+                expected_node_id: Some("node-a"),
+                final_state: CatState::Destroyed,
+                final_node_id: None,
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .unwrap()
+        .expect("destroy owns the replacement claim");
+    assert_eq!(destroyed.state, Some(CatState::Destroyed));
+}
+
+#[test]
 fn cold_run_and_offline_recovery_share_the_least_loaded_policy() {
     let (store, _) = store_and_url();
     register_node(&store);

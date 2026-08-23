@@ -185,7 +185,11 @@ pub fn classify_action(cat: &CatRecord, action: CatAction) -> ActionDecision {
     }
     match cat.current_action {
         Some(current) if current == action => return ActionDecision::SameAction,
-        Some(_) => return ActionDecision::Busy,
+        Some(_) if action != CatAction::Destroy => return ActionDecision::Busy,
+        // Destroy is the one product action allowed to replace an unresolved
+        // action. The Store must preserve that action's selected Node so noded
+        // can cancel it and clean the same physical execution lane.
+        Some(_) => {}
         None => {}
     }
     let allowed = match action {
@@ -748,6 +752,10 @@ where
                 Ok(NodeCatStatus::Present {
                     active_action: Some(_),
                     ..
+                }) if claim.action == CatAction::Destroy => return Ok(Discovery::Execute),
+                Ok(NodeCatStatus::Present {
+                    active_action: Some(_),
+                    ..
                 }) => {
                     return Ok(Discovery::Failed {
                         code: "node_busy".to_owned(),
@@ -1217,6 +1225,17 @@ mod tests {
             ActionDecision::Busy
         );
         assert_eq!(
+            classify_action(
+                &cat(Some(CatState::Running), Some(CatAction::Warm)),
+                CatAction::Destroy
+            ),
+            ActionDecision::Claim
+        );
+        assert_eq!(
+            classify_action(&cat(None, Some(CatAction::Create)), CatAction::Destroy),
+            ActionDecision::Claim
+        );
+        assert_eq!(
             classify_action(&cat(Some(CatState::Failure), None), CatAction::Run),
             ActionDecision::InvalidState
         );
@@ -1405,6 +1424,43 @@ mod tests {
         assert_eq!(outcome.cat.state, Some(CatState::Destroyed));
         assert_eq!(store.state.lock().expect("store").endpoint_reads, 0);
         assert!(noded.state.lock().expect("noded").commands.is_empty());
+    }
+
+    #[tokio::test]
+    async fn repeated_destroy_preempts_the_node_action_seen_during_recovery() {
+        let original = cat(Some(CatState::Running), Some(CatAction::Destroy));
+        let action_claim = claim(original.clone(), CatAction::Destroy);
+        let store = MockStore::new(original, Admission::SameAction(action_claim));
+        let noded = MockNoded::new(
+            store.clone(),
+            [Ok(NodeCommandResult::Succeeded(CatState::Destroyed))],
+            [Ok(NodeCatStatus::Present {
+                state: Some(CatState::Running),
+                active_action: Some(CatAction::Warm),
+            })],
+        );
+        let ingress = MockIngress::new(&noded);
+        let service =
+            SemanticLifecycleService::new(store.clone(), noded.clone(), ingress, fast_timeouts());
+
+        let outcome = service
+            .destroy(CatSelector::Id("cat-1".to_owned()))
+            .await
+            .expect("destroy must preempt the stale Node action");
+
+        assert_eq!(outcome.cat.state, Some(CatState::Destroyed));
+        assert_eq!(
+            noded
+                .state
+                .lock()
+                .expect("noded")
+                .commands
+                .iter()
+                .map(|command| command.action)
+                .collect::<Vec<_>>(),
+            [CatAction::Destroy]
+        );
+        assert_eq!(store.state.lock().expect("store").failures, 0);
     }
 
     #[tokio::test]

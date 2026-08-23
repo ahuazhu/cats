@@ -42,8 +42,11 @@ Control Plane 在 Cat 行上通过 `current_action` 和 `current_action_node_id`
 - attach：`cat_id + disk_id + mount_path`；
 - detach/destroy：资源当前事实和目标不存在状态。
 
-相同动作进行中时查询并等待同一动作；不同动作返回 `busy`。Control 在 noded 已完成、数据库尚未更新
-时退出，恢复者使用 `current_action_node_id` 调用 `GET /v1/cats/{cat_id}`，再按实际终态完成或失败该行。
+相同动作进行中时查询并等待同一动作；不同的非 destroy 动作返回 `busy`。`destroy` 是唯一例外：它在
+锁住 Cat 行时替换未完成动作，并继承该动作的 `current_action_node_id`，使 noded 取消并等待同一物理
+执行 lane 后清理。被替换动作的迟到结果因不再匹配当前 action/Node 而不能写回。Control 在 noded 已
+完成、数据库尚未更新时退出，恢复者使用 `current_action_node_id` 调用 `GET /v1/cats/{cat_id}`，再按实际
+终态完成或失败该行。若恢复时 Node 仍在执行被替换动作，Control 重发 destroy，而不是结算为 `busy`。
 heartbeat、日志和 metrics 不结算动作。
 
 ### 当前资源行就是产品 authority

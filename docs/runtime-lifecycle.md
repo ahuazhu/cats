@@ -65,8 +65,10 @@ Control 对每个动作执行同一顺序：
 6. 在 transaction 外同步调用目标 noded。
 7. 写稳定结果、placement 和错误，并清除动作字段。
 
-相同动作正在进行时，重复调用查询目标 noded并等待同一结果；不同动作返回 `busy`。多 Control
-replica 依靠数据库条件更新串行化，而不是依靠进程内锁。
+相同动作正在进行时，重复调用查询目标 noded并等待同一结果；不同的非 destroy 动作返回 `busy`。
+destroy 是唯一例外：它在数据库行锁内替换当前动作，并继承被替换动作的目标 Node，使 noded 取消、
+等待并清理同一个物理执行 lane。被替换动作的迟到结果不能覆盖 destroy。多 Control replica 依靠
+数据库条件更新串行化，而不是依靠进程内锁。
 
 Control 在 noded 已完成、数据库尚未更新时退出，恢复者读取 `current_action_node_id`，调用
 `GET /v1/cats/{cat_id}`，再按实际结果更新当前行。heartbeat、日志和 metrics 都不能完成动作。
@@ -235,7 +237,8 @@ Control 崩溃恢复动作只查询保存的目标 Node 和 Cat 实际状态。
 - 同一 Workspace 并发 create 同一 slug 只产生一个当前 Cat；destroy 后同 slug 新建得到新 `cat_id`。
 - 相同配置 create、相同目标动作和相同 attach 不产生第二次效果；参数不同返回 conflict。
 - 多 Control replica 只能取得一个 `current_action`；noded 同一 Cat 动作串行，不同 Cat 可以并行。
-- destroy 能终止进行中的 create，并阻止同一旧 `cat_id` 再启动。
+- destroy 能从任意未销毁稳定态、failure 或首次 create 进行中取得执行权；它终止进行中的动作，并
+  阻止同一旧 `cat_id` 再启动。
 - noded 成功、Control 写回前退出，恢复后查询 Node完成当前行。
 - Running 发布入口前 Guest 和 mounts Ready；离开 Running 先撤入口。
 - offline 恢复先撤旧入口，新 Node Ready 后发布；旧 Node 返回时 reset 并最终收敛到单实例。
