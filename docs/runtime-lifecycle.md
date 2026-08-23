@@ -172,6 +172,11 @@ attach 的场景语义为 `(cat_id, disk_id, mount_path)`：
 计划维护先将 Cat 变为 Cold，再在目标 Node run，最后按原目标恢复为 Running/Suspended/Warm。
 Suspended/Warm 的本地状态不跨 Node 搬运。
 
+create、Cold run 和失联恢复按
+[ADR-0061](decisions/0061-semantic-least-allocated-placement.md)使用同一个事务内 Least-Allocated
+策略。Heartbeat 利用率只作诊断；进行中的目标由 `current_action_node_id` 立即形成 placement reservation。
+该策略平衡 PostgreSQL 已分配 shape，不是物理容量准入，也不会自动迁移已有 Cat。
+
 ## 6. 入口屏障
 
 当前 Control/Node 合同只管理每个 Cat 的唯一当前新流量目标：

@@ -53,6 +53,10 @@ HostFenceRecovery 组织生命周期。幂等身份直接来自业务场景：
 
 通知、缓存和监控只用于降低延迟或发现异常，不能结算产品动作。
 
+需要新 Node 的 create、Cold run 和失联恢复使用
+[ADR-0061](decisions/0061-semantic-least-allocated-placement.md)的事务内 Least-Allocated 策略；Node
+heartbeat 利用率不成为 placement authority。
+
 ## 3. 当前实现边界
 
 当前分支正在执行空数据、单协议切换。下面只描述已组成的代码事实，不代表完整物理上线门已通过：

@@ -66,11 +66,6 @@ impl SemanticLifecycleStore for SemanticStoreAdapter {
         Box::pin(async move {
             store
                 .execute(move |store| {
-                    let selected_node_id = store
-                        .list_running_semantic_nodes()?
-                        .into_iter()
-                        .next()
-                        .map(|node| node.node_id);
                     let cat_id = new_id("cat_");
                     let owned_mounts = request
                         .config
@@ -96,7 +91,6 @@ impl SemanticLifecycleStore for SemanticStoreAdapter {
                         cat_id: &cat_id,
                         workspace_id: &request.workspace_id,
                         cat_slug: &request.cat_slug,
-                        node_id: selected_node_id.as_deref(),
                         cpu_count: i64::from(request.config.cpu_count),
                         memory_bytes: i64::try_from(request.config.memory_bytes).map_err(|_| {
                             ApiError::invalid("Cat memory does not fit PostgreSQL BIGINT")
@@ -121,15 +115,6 @@ impl SemanticLifecycleStore for SemanticStoreAdapter {
         Box::pin(async move {
             store
                 .execute(move |store| {
-                    let selected_node_id = if action == CatAction::Run {
-                        store
-                            .list_running_semantic_nodes()?
-                            .into_iter()
-                            .next()
-                            .map(|node| node.node_id)
-                    } else {
-                        None
-                    };
                     let stored_selector = match &selector {
                         CatSelector::Id(cat_id) => SemanticCatSelector::Id(cat_id),
                         CatSelector::Slug {
@@ -143,7 +128,6 @@ impl SemanticLifecycleStore for SemanticStoreAdapter {
                     let outcome = store.admit_semantic_cat_action(
                         stored_selector,
                         core_action_to_stored(action),
-                        selected_node_id.as_deref(),
                     )?;
                     map_action_admission(outcome, action)
                 })

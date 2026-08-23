@@ -7,7 +7,10 @@
 
 use postgres::Row;
 
+use self::placement::{LeastAllocatedPlacement, SemanticPlacementStrategy};
 use super::{Result, Store};
+
+mod placement;
 
 const DB_NOW_MS: &str = "CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT)";
 
@@ -204,7 +207,6 @@ pub struct AtomicCatCreate<'a> {
     pub cat_id: &'a str,
     pub workspace_id: &'a str,
     pub cat_slug: &'a str,
-    pub node_id: Option<&'a str>,
     pub cpu_count: i64,
     pub memory_bytes: i64,
     pub boot_image: &'a str,
@@ -634,10 +636,9 @@ impl Store {
     /// Atomically decides a semantic create and, for a new Cat, records the
     /// complete immutable configuration and all initial disk bindings.
     ///
-    /// The caller may pass no selected Node when placement currently has no
-    /// candidate. An already-existing slug is still classified from its full
-    /// configuration; only a genuinely new create returns
-    /// `NodeNotSchedulable`.
+    /// Placement is selected and reserved in this transaction. An
+    /// already-existing slug is still classified from its full configuration;
+    /// only a genuinely new create returns `NodeNotSchedulable`.
     pub fn admit_semantic_cat_create(
         &self,
         request: AtomicCatCreate<'_>,
@@ -684,21 +685,12 @@ impl Store {
                 });
             }
 
-            let Some(node_id) = request.node_id else {
+            let Some(node_id) =
+                ACTIVE_PLACEMENT_STRATEGY.select_running_node(&mut transaction, None)?
+            else {
                 transaction.rollback()?;
                 return Ok(AdmitCatCreateOutcome::NodeNotSchedulable);
             };
-            if transaction
-                .query_opt(
-                    "SELECT node_id FROM nodes
-                      WHERE node_id=$1 AND status='running' FOR SHARE",
-                    &[&node_id],
-                )?
-                .is_none()
-            {
-                transaction.rollback()?;
-                return Ok(AdmitCatCreateOutcome::NodeNotSchedulable);
-            }
 
             let inserted = transaction.query_opt(
                 &format!(
@@ -823,7 +815,6 @@ impl Store {
         &self,
         selector: SemanticCatSelector<'_>,
         action: CatAction,
-        selected_node_id: Option<&str>,
     ) -> Result<AdmitCatActionOutcome> {
         self.with(|client| {
             let mut transaction = client.transaction()?;
@@ -870,10 +861,13 @@ impl Store {
                 return Ok(AdmitCatActionOutcome::InvalidState(aggregate));
             }
 
-            let action_node_id = match (action, aggregate.cat.state) {
-                (CatAction::Run, Some(CatState::Cold)) => selected_node_id,
-                _ => aggregate.cat.node_id.as_deref(),
+            let selected_node_id = match (action, aggregate.cat.state) {
+                (CatAction::Run, Some(CatState::Cold)) => {
+                    ACTIVE_PLACEMENT_STRATEGY.select_running_node(&mut transaction, None)?
+                }
+                _ => aggregate.cat.node_id.clone(),
             };
+            let action_node_id = selected_node_id.as_deref();
             if action == CatAction::Run {
                 let Some(node_id) = action_node_id else {
                     transaction.commit()?;
@@ -1135,9 +1129,8 @@ impl Store {
         })
     }
 
-    /// Deterministic placement snapshot. The caller may apply capacity policy,
-    /// and `admit_semantic_cat_create` rechecks the selected row under the
-    /// create transaction before committing authority.
+    /// Deterministic snapshot for Node management and diagnostics. Lifecycle
+    /// placement is selected and reserved inside its mutation transaction.
     pub fn list_running_semantic_nodes(&self) -> Result<Vec<NodeRecord>> {
         self.with(|client| {
             client
@@ -1333,17 +1326,12 @@ impl Store {
                 }
             }
 
-            let target = transaction.query_opt(
-                "SELECT node_id FROM nodes
-                  WHERE status='running' AND node_id<>$1
-                  ORDER BY node_id LIMIT 1 FOR SHARE",
-                &[&source_node_id],
-            )?;
-            let Some(target) = target else {
+            let Some(target_node_id) = ACTIVE_PLACEMENT_STRATEGY
+                .select_running_node(&mut transaction, Some(source_node_id))?
+            else {
                 transaction.commit()?;
                 return Ok(ClaimSemanticCatRecoveryOutcome::NoRunningTarget(aggregate));
             };
-            let target_node_id: String = target.get(0);
             let row = transaction.query_one(
                 &format!(
                     "UPDATE cats
@@ -2022,6 +2010,8 @@ fn cat_create_configuration_matches(
     requested_mounts.sort_unstable();
     existing_mounts == requested_mounts
 }
+
+const ACTIVE_PLACEMENT_STRATEGY: LeastAllocatedPlacement = LeastAllocatedPlacement;
 
 const fn action_target(action: CatAction) -> CatState {
     match action {

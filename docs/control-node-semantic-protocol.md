@@ -597,6 +597,9 @@ DELETE /v1/cats/{cat_id}
 - 同一更新同时写入 `current_action_node_id`，使其他 Control replica知道应该查询哪台 Node。
 - 相同 `current_action` 的重复调用不创建第二个执行；它查询 `noded` 并等待当前动作结束。
 - Disk attach/detach/destroy 在一个数据库 transaction 中锁定目标 Disk 和相关 Cat。
+- create、Cold run 和失联恢复使用 [ADR-0061](decisions/0061-semantic-least-allocated-placement.md)
+  的同一个事务内 Least-Allocated 策略；负载读取和 `current_action_node_id` reservation 由
+  schema-scoped transaction advisory lock 串行。
 - 网络调用发生在提交 `current_action` 之后，不持有数据库锁。
 
 ### 9.2 noded
