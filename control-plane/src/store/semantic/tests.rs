@@ -1380,6 +1380,18 @@ fn atomic_create_persists_full_mount_config_and_retries_by_semantics() {
     assert!(matches!(
         store
             .admit_semantic_cat_create(AtomicCatCreate {
+                cat_id: "cat-new-default-is-ignored",
+                boot_image: "sha256:new-default",
+                mounts: &retry_mounts,
+                ..request.clone()
+            })
+            .unwrap(),
+        AdmitCatCreateOutcome::SameAction(CatWithMounts { cat, .. })
+            if cat.cat_id == "cat-atomic" && cat.boot_image == "sha256:image"
+    ));
+    assert!(matches!(
+        store
+            .admit_semantic_cat_create(AtomicCatCreate {
                 cat_id: "cat-conflict",
                 cpu_count: 4,
                 mounts: &retry_mounts,

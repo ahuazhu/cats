@@ -13,6 +13,8 @@
   ACK 协调；新 Node 注册以 `running/offline/reset_required` 当前状态闭合
 - 修正：[ADR-0041](0041-node-verified-route-admission.md) 的失联恢复边界；新协议只要求唯一当前
   入口先撤旧、后发布新目标，不以旧 Host 已被 fence 为恢复前置条件
+- 后续修正：[ADR-0063](0063-control-owned-default-boot-image.md) 把 boot image 改为 Control 部署默认值；
+  public create 身份只比较用户选择的 CPU、内存和初始 mounts
 
 ## 背景
 
@@ -36,7 +38,7 @@ Control Plane 在 Cat 行上通过 `current_action` 和 `current_action_node_id`
 
 协议不接收 `request_id`、Idempotency-Key 或 lifecycle Operation ID。幂等只由场景语义决定：
 
-- Cat create：`workspace_id + cat_slug + 完整创建配置`；
+- Cat create：`workspace_id + cat_slug + 用户选择的完整创建配置`；
 - Disk create：`workspace_id + disk_slug + size_bytes`；
 - 状态动作：`cat_id + 目标状态`；
 - attach：`cat_id + disk_id + mount_path`；

@@ -318,7 +318,7 @@ deploy/aws/tools/package-production-release.py \
 
 `tools/deploy-production-release.py` consumes only that completed package. Its
 canonical config names the exact AWS cell, EKS context, separate Terraform
-state keys, Control schema, both ordered tfvars lists and the complete
+state keys, Control schema, current qualified default Golden Root digest, both ordered tfvars lists and the complete
 worker-name-to-instance map. Secret tfvars remain external root-only files;
 the deployer records their config digest but never copies their bytes into a
 receipt. The application tfvars must already contain the current immutable
@@ -331,7 +331,7 @@ The config is canonical JSON with this exact shape (replace every example
 value and use resolved absolute file paths):
 
 ```json
-{"application_state_key":"cats/production/application.tfstate","application_tfvars":["/approved/root-only/application.tfvars.json","/approved/root-only/application-secrets.tfvars.json"],"aws_region":"us-east-1","control_postgres_schema":"cats_r26","eks_cluster_name":"cats-production","expected_account_id":"123456789012","expected_aws_partition":"aws","infrastructure_state_key":"cats/production/infrastructure.tfstate","infrastructure_tfvars":["/approved/root-only/infrastructure.tfvars.json"],"kubeconfig_context":"cats-production","kubeconfig_path":"/approved/root-only/kubeconfig","namespace":"cats","schema_version":1,"terraform_state_bucket":"cats-terraform-state-123456789012-us-east-1","worker_instances":{"metal-1":"i-0123456789abcdef0","metal-2":"i-0123456789abcdef1"}}
+{"application_state_key":"cats/production/application.tfstate","application_tfvars":["/approved/root-only/application.tfvars.json","/approved/root-only/application-secrets.tfvars.json"],"aws_region":"us-east-1","control_postgres_schema":"cats_r26","default_boot_image_digest":"sha256:<CURRENT_QUALIFIED_GOLDEN_ROOT_DIGEST>","eks_cluster_name":"cats-production","expected_account_id":"123456789012","expected_aws_partition":"aws","infrastructure_state_key":"cats/production/infrastructure.tfstate","infrastructure_tfvars":["/approved/root-only/infrastructure.tfvars.json"],"kubeconfig_context":"cats-production","kubeconfig_path":"/approved/root-only/kubeconfig","namespace":"cats","schema_version":1,"terraform_state_bucket":"cats-terraform-state-123456789012-us-east-1","worker_instances":{"metal-1":"i-0123456789abcdef0","metal-2":"i-0123456789abcdef1"}}
 ```
 
 The controller deliberately separates saved-plan creation from apply. Both
@@ -375,7 +375,6 @@ deploy/aws/tools/production-cat-lifecycle-e2e.py \
   --token-file /approved/root-only/e2e-workspace-token \
   --qualification-begin-receipt /approved/evidence/qualification/production-mutation-qualification-begin.receipt.json \
   --workspace-id <EXACT_WS_ID> \
-  --boot-image-digest sha256:<GOLDEN_ROOT_DIGEST> \
   --cat-name release-e2e-<CUTOVER_ID> \
   --disk-name release-disk-<CUTOVER_ID> \
   --disk-size 1GiB \

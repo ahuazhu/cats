@@ -13,12 +13,12 @@ POST /v1/workspaces/{workspace_id}/cats/{cat_id}/actions/cold
 POST /v1/workspaces/{workspace_id}/cats/{cat_id}/actions/destroy</code></pre>
 <pre><code>{
   "name": "dev",
-  "boot_image_digest": "sha256:&lt;64-lowercase-hex&gt;",
   "vcpus": 2,
   "memory_bytes": 2147483648,
   "root_size_bytes": 1073741824,
   "durability": "strict"
 }</code></pre>
+<p>Control 会自动为新 Cat 绑定部署当前已资格化的 Boot Image。Request 不接受镜像覆盖，已有 Cat 始终保留创建时的精确 Digest。</p>
 <p>Create 精确返回 <code>202 application/json</code> 和 <code>{"cat_id":"…","operation_id":"…"}</code>。Collection Read 只接受有界 <code>limit</code> 与 opaque <code>cursor</code>；Item Read 和 Lifecycle Action 只接受不可变 <code>cat_…</code> ID。</p>
 <p>每个 Lifecycle Action 都要求且只要求一个 <code>Idempotency-Key</code>、空 Body，并且不能发送 <code>Content-Type</code>；成功时精确返回 <code>202 application/json</code> 和 <code>{"operation_id":"op_…"}</code>。不明确响应保持 Pending，必须逐字节重放；已退役的 <code>start</code>、<code>stop</code>、<code>delete</code> 与 <code>resume</code> Route 不是兼容别名。Exec、Deployment、Endpoint、Expiry 与 Work Policy Mutation 仍不属于本 release router。</p>
 

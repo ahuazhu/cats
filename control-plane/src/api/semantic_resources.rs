@@ -840,7 +840,6 @@ mod tests {
             cat_slug: slug("web"),
             cpu: 2,
             memory_bytes: 1024,
-            boot_image: "ubuntu".to_owned(),
             mounts: Vec::new(),
         };
         let response = create_cat_after_auth(&api, "ws_01", create)
@@ -918,13 +917,21 @@ mod tests {
         let request = Request::builder()
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
-                r#"{"cat_slug":"web","cpu":2,"memory_bytes":1024,"boot_image":"ubuntu","mounts":[],"request_id":"old"}"#,
+                r#"{"cat_slug":"web","cpu":2,"memory_bytes":1024,"mounts":[],"request_id":"old"}"#,
             ))
             .expect("request");
         let error = parse_json::<CreateCatRequest>(request)
             .await
             .expect_err("request_id is not accepted");
         assert_eq!(error.0.code, SemanticErrorCode::InvalidRequest);
+
+        let request = Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"cat_slug":"web","cpu":2,"memory_bytes":1024,"mounts":[],"boot_image":"ubuntu"}"#,
+            ))
+            .expect("request");
+        assert!(parse_json::<CreateCatRequest>(request).await.is_err());
 
         let request = Request::builder()
             .header(header::CONTENT_TYPE, "application/json")

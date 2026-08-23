@@ -17,12 +17,13 @@
 
     {
       "name": "dev",
-      "boot_image_digest": "sha256:<64-lowercase-hex>",
       "vcpus": 2,
       "memory_bytes": 2147483648,
       "root_size_bytes": 1073741824,
       "durability": "strict"
     }
+
+Control 会自动为新 Cat 绑定部署当前已资格化的 Boot Image。Request 不接受镜像覆盖，已有 Cat 始终保留创建时的精确 Digest。
 
 Create 精确返回 `202 application/json` 和 `{"cat_id":"…","operation_id":"…"}`。Collection Read 只接受有界 `limit` 与 opaque `cursor`；Item Read 和 Lifecycle Action 只接受不可变 `cat_…` ID。
 

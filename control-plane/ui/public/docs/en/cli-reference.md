@@ -24,8 +24,7 @@
 
 ## Current Cat commands
 
-    cats create NAME --boot-image-digest sha256:DIGEST
-                     [--cpus N] [--memory SIZE]
+    cats create NAME [--cpus N] [--memory SIZE]
                      [--root-size SIZE]
                      [--durability strict|relaxed]
     cats ls
@@ -36,7 +35,7 @@
     cats cold CAT_ID
     cats destroy CAT_ID
 
-`create` requires one digest-pinned boot image. It defaults to 2 CPUs, 2 GiB memory, a 1 GiB RootDisk, and Strict durability. List follows bounded cursors; item lookup accepts only immutable `cat_…` IDs.
+`create` automatically uses the deployment's current qualified boot image. It defaults to 2 CPUs, 2 GiB memory, a 1 GiB RootDisk, and Strict durability. List follows bounded cursors; item lookup accepts only immutable `cat_…` IDs.
 
 The five lifecycle commands for an existing Cat also require an immutable `cat_…` ID. The CLI persists the exact empty request and Idempotency-Key before sending it, and replays both after an ambiguous response. By default it waits on the returned Operation; `--no-wait` prints the Operation ID immediately. The retired `start`, `stop`, `delete`, and `resume` commands are not compatibility aliases.
 

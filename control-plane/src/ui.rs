@@ -1277,7 +1277,6 @@ mod tests {
             "createSemanticCat",
             "buildSemanticDiskCreateRequest",
             "createSemanticDisk",
-            "bootImage: values.get(\"boot_image_digest\")",
         ] {
             assert!(
                 USER_JS.contains(contract),
@@ -1288,7 +1287,6 @@ mod tests {
             "cat_slug:",
             "disk_slug:",
             "memory_bytes:",
-            "boot_image:",
             "already_exists",
             "assertSemanticConsoleRequestSupported",
         ] {
@@ -1298,7 +1296,6 @@ mod tests {
             );
         }
         for contract in [
-            "name=\"boot_image_digest\"",
             "name=\"vcpus\"",
             "name=\"memory_mib\"",
             "data-view=\"cats\">",
@@ -1310,6 +1307,8 @@ mod tests {
                 "missing cutover UI contract {contract:?}"
             );
         }
+        assert!(!USER_HTML.contains("name=\"boot_image_digest\""));
+        assert!(!SEMANTIC_RESOURCE_CLIENT_JS.contains("boot_image:"));
         let create_handler = USER_JS
             .split("document.querySelector(\"#create-cat-form\")")
             .nth(1)
@@ -1525,7 +1524,6 @@ mod tests {
         for current_contract in [
             "cats login",
             "CATS_WORKSPACE",
-            "boot_image_digest",
             "size_bytes",
             "Idempotency-Key",
         ] {

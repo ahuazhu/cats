@@ -153,8 +153,6 @@ def validate_arguments(arguments: argparse.Namespace) -> tuple[str, dict[str, An
     validate_origin(arguments.api_url)
     if WORKSPACE.fullmatch(arguments.workspace_id) is None:
         raise E2eError("--workspace-id must be one immutable ws_ ID")
-    if DIGEST.fullmatch(arguments.boot_image_digest) is None:
-        raise E2eError("--boot-image-digest is invalid")
     if RESOURCE_SLUG.fullmatch(arguments.cat_name) is None:
         raise E2eError("--cat-name is invalid")
     if RESOURCE_SLUG.fullmatch(arguments.disk_name) is None:
@@ -404,8 +402,6 @@ def run_e2e(
         "cat-created",
         "create",
         arguments.cat_name,
-        "--boot-image",
-        arguments.boot_image_digest,
         "--cpu",
         str(arguments.cpus),
         "--memory",
@@ -424,6 +420,9 @@ def run_e2e(
     running = require_cat_response(
         created, cat_id, arguments.cat_name, "running", "ok", "cat_created"
     )
+    boot_image_digest = running.get("boot_image")
+    if not isinstance(boot_image_digest, str) or DIGEST.fullmatch(boot_image_digest) is None:
+        raise E2eError("Control did not bind one exact default boot image digest")
     if running.get("mounts") != [
         {
             "disk_id": disk_id,
@@ -438,8 +437,6 @@ def run_e2e(
             "cat-create-replay",
             "create",
             arguments.cat_name,
-            "--boot-image",
-            arguments.boot_image_digest,
             "--cpu",
             str(arguments.cpus),
             "--memory",
@@ -623,8 +620,6 @@ def run_e2e(
         "cat-slug-reused",
         "create",
         arguments.cat_name,
-        "--boot-image",
-        arguments.boot_image_digest,
         "--cpu",
         str(arguments.cpus),
         "--memory",
@@ -661,7 +656,7 @@ def run_e2e(
     )
     return {
         "api_url": arguments.api_url,
-        "boot_image_digest": arguments.boot_image_digest,
+        "boot_image_digest": boot_image_digest,
         "cat_id": cat_id,
         "cat_name": arguments.cat_name,
         "disk_id": disk_id,
@@ -684,7 +679,6 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--token-file", required=True, type=Path)
     parser.add_argument("--qualification-begin-receipt", required=True, type=Path)
     parser.add_argument("--workspace-id", required=True)
-    parser.add_argument("--boot-image-digest", required=True)
     parser.add_argument("--cat-name", required=True)
     parser.add_argument("--disk-name", required=True)
     parser.add_argument("--disk-size", default="1GiB")

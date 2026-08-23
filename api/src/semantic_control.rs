@@ -390,7 +390,6 @@ pub struct CreateCatRequest {
     pub cat_slug: ResourceSlug,
     pub cpu: u32,
     pub memory_bytes: u64,
-    pub boot_image: String,
     #[serde(default)]
     pub mounts: Vec<CatMountRequest>,
 }
@@ -402,12 +401,6 @@ impl CreateCatRequest {
         }
         if self.memory_bytes == 0 || self.memory_bytes > i64::MAX as u64 {
             return Err(SemanticValidationError::Memory);
-        }
-        if self.boot_image.is_empty()
-            || self.boot_image.len() > MAX_BOOT_IMAGE_BYTES
-            || self.boot_image.bytes().any(|byte| byte.is_ascii_control())
-        {
-            return Err(SemanticValidationError::BootImage);
         }
         validate_mounts_by_slug(&self.mounts)
     }
@@ -1141,7 +1134,6 @@ mod tests {
             "cat_slug":"web",
             "cpu":2,
             "memory_bytes":4294967296,
-            "boot_image":"ubuntu-24.04",
             "mounts":[{"disk_slug":"data-disk","mount_path":"/data"}]
         }"#;
         let request: CreateCatRequest = serde_json::from_slice(body).unwrap();
@@ -1150,7 +1142,11 @@ mod tests {
         assert!(!encoded.contains("request_id"));
         assert!(!encoded.contains("operation"));
         assert!(serde_json::from_slice::<CreateCatRequest>(
-            br#"{"cat_slug":"web","cpu":2,"memory_bytes":4,"boot_image":"image","request_id":"req_1"}"#
+            br#"{"cat_slug":"web","cpu":2,"memory_bytes":4,"request_id":"req_1"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_slice::<CreateCatRequest>(
+            br#"{"cat_slug":"web","cpu":2,"memory_bytes":4,"boot_image":"image"}"#
         )
         .is_err());
     }
@@ -1158,7 +1154,7 @@ mod tests {
     #[test]
     fn create_cat_rejects_duplicate_disks_and_mount_paths() {
         let duplicate_disk: CreateCatRequest = serde_json::from_slice(
-            br#"{"cat_slug":"web","cpu":1,"memory_bytes":1,"boot_image":"image","mounts":[{"disk_slug":"data","mount_path":"/data"},{"disk_slug":"data","mount_path":"/other"}]}"#,
+            br#"{"cat_slug":"web","cpu":1,"memory_bytes":1,"mounts":[{"disk_slug":"data","mount_path":"/data"},{"disk_slug":"data","mount_path":"/other"}]}"#,
         )
         .unwrap();
         assert_eq!(
@@ -1167,7 +1163,7 @@ mod tests {
         );
 
         let duplicate_path: CreateCatRequest = serde_json::from_slice(
-            br#"{"cat_slug":"web","cpu":1,"memory_bytes":1,"boot_image":"image","mounts":[{"disk_slug":"data","mount_path":"/data"},{"disk_slug":"logs","mount_path":"/data"}]}"#,
+            br#"{"cat_slug":"web","cpu":1,"memory_bytes":1,"mounts":[{"disk_slug":"data","mount_path":"/data"},{"disk_slug":"logs","mount_path":"/data"}]}"#,
         )
         .unwrap();
         assert_eq!(

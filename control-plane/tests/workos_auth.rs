@@ -601,6 +601,7 @@ impl Ctx {
             usage_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
             credit_store: Arc::new(SqliteUsageStore::open(&dir.path().join("control.db")).unwrap()),
             image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
+            default_boot_image: cats_control_plane::testsupport::test_boot_image(),
             auth_token: "service-token".into(),
             noded_service_token: "semantic-node-test-token-00000000".into(),
             guest_runtime_profile_receipt:

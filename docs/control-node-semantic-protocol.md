@@ -311,7 +311,7 @@ Control Plane 不在网络调用期间持有数据库 transaction。
 
 - 当前不存在未 `destroyed` 的同 slug Cat：创建新的 `cat_id` 并执行 create，历史同 slug Cat 不影响创建；
 - 已存在、未销毁且 create 配置完全相同：返回 `already_exists` 和已有 Cat；
-- 已存在但 CPU、内存、镜像或初始 mounts 不同：返回 `cat_configuration_conflict`；
+- 已存在但用户选择的 CPU、内存或初始 mounts 不同：返回 `cat_configuration_conflict`；
 - 同一 create 正在进行：等待当前 create 的结果；
 - 其他动作正在进行：返回 `busy`。
 
@@ -319,9 +319,12 @@ Control Plane 不在网络调用期间持有数据库 transaction。
 
 - CPU；
 - 内存；
-- boot image；
 - 按 `disk_id` 排序后的完整 mount 集合；
 - 每个 mount 的 `disk_id` 和 `mount_path`。
+
+Boot image 由 [ADR-0063](decisions/0063-control-owned-default-boot-image.md) 的 Control 部署默认值选择。
+只有插入新 Cat row 时才固化当时的 exact digest；已存在 Cat 的 create replay 不用后来更新的默认值与
+已存 digest 比较。
 
 ### 6.3 状态动作
 
@@ -443,7 +446,6 @@ Create Cat 请求：
   "cat_slug": "web",
   "cpu": 2,
   "memory_bytes": 4294967296,
-  "boot_image": "ubuntu-24.04",
   "mounts": [
     {
       "disk_slug": "data-disk",

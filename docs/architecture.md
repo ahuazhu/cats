@@ -43,7 +43,8 @@ heartbeat -> offline/reset_required 判断
 poll/result、不使用 per-Cat command journal，也不以 AgentSession、typed predecessor 或
 HostFenceRecovery 组织生命周期。幂等身份直接来自业务场景：
 
-- Cat create：`workspace_id + cat_slug + 完整创建配置`；
+- Cat create：`workspace_id + cat_slug + 用户选择的 CPU/内存/初始 mounts`；Control 只在新建时绑定
+  部署选择的当前默认 Golden Root digest；
 - Disk create：`workspace_id + disk_slug + size_bytes`；
 - 状态动作：`cat_id + 目标状态`；
 - attach：`cat_id + disk_id + mount_path`；
@@ -94,6 +95,10 @@ heartbeat 利用率不成为 placement authority。
 
 Cat 有不可变 `cat_id` 和 Workspace 内用户指定的 `cat_slug`。当前行保存稳定 `state`、
 `current_action`、动作目标 Node、当前 `node_id`、完整创建配置和错误信息。
+
+Boot image 不是用户输入。Control 按 [ADR-0063](decisions/0063-control-owned-default-boot-image.md)
+只在分配新 Cat 时把部署的当前 qualified default 固化为精确 digest；已有 Cat、重试、run 和恢复继续
+使用行内 digest，默认升级不修改已有 RootDisk。
 
 稳定状态为 `running/suspended/warm/cold/failure/destroyed`。首次 create 进行中时 state 可以为空。
 `destroyed` 是历史终点，不是第五个可恢复 runtime 状态；`failure` 只允许 destroy。

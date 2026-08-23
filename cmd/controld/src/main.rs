@@ -107,6 +107,11 @@ struct Args {
     auth_token: String,
     #[arg(long, env = "CATS_NODED_SERVICE_TOKEN", hide_env_values = true)]
     noded_service_token: String,
+    /// Current deployment-selected Golden Root. Public Cat create requests do
+    /// not accept an image override; Control freezes this exact digest on each
+    /// newly allocated Cat.
+    #[arg(long = "default-boot-image", env = "CATS_BOOT_IMAGE")]
+    default_boot_image: String,
     /// Exact qualified Guest runtime release receipt. Production has one
     /// immutable install path shared with Node registration and Cat placement.
     #[arg(
@@ -477,6 +482,7 @@ async fn main() -> anyhow::Result<()> {
         usage_store,
         credit_store,
         image_blob,
+        default_boot_image: args.default_boot_image,
         auth_token: args.auth_token,
         noded_service_token: args.noded_service_token,
         guest_runtime_profile_receipt: guest_runtime_profile_receipt.receipt().clone(),
