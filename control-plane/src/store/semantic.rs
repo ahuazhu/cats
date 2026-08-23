@@ -2362,7 +2362,7 @@ fn refresh_current_action_activity(
     let row = client.query_one(
         &format!(
             "UPDATE cats
-                SET updated_at=GREATEST({DB_NOW_MS}, updated_at + 1)
+                SET updated_at={DB_NOW_MS}
               WHERE cat_id=$1
               RETURNING {CAT_COLUMNS}"
         ),

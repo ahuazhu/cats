@@ -1362,6 +1362,43 @@ fn same_action_retry_refreshes_activity_without_changing_occurrence_identity() {
         .list_stale_semantic_cat_actions(135_000, 64)
         .unwrap()
         .is_empty());
+
+    store
+        .with(|client| {
+            client
+                .execute(
+                    &format!(
+                        "UPDATE cats SET updated_at={DB_NOW_MS} + 10000
+                          WHERE cat_id='cat-stale-retry'"
+                    ),
+                    &[],
+                )
+                .map(|_| ())
+        })
+        .unwrap();
+    let AdmitCatCreateOutcome::SameAction(normalized) = store
+        .admit_semantic_cat_create(AtomicCatCreate {
+            cat_id: "cat-stale-retry",
+            workspace_id: "ws_semantic",
+            cat_slug: "stale-retry",
+            cpu_count: 2,
+            memory_bytes: 1 << 30,
+            boot_image: "sha256:image",
+            mounts: &[],
+        })
+        .unwrap()
+    else {
+        panic!("matching retry must normalize the activity timestamp")
+    };
+    let database_now: i64 = store
+        .with(|client| {
+            client
+                .query_one(&format!("SELECT {DB_NOW_MS}"), &[])
+                .map(|row| row.get(0))
+        })
+        .unwrap();
+    assert!(normalized.cat.updated_at <= database_now);
+    assert_eq!(normalized.cat.current_action_started_at, Some(started_at));
 }
 
 #[test]
