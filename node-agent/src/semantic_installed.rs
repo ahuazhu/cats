@@ -324,6 +324,19 @@ struct LocalVolume {
     nbd_device: Option<String>,
 }
 
+#[derive(Default)]
+struct FreshStartTimings {
+    root_setup_ms: u64,
+    root_provision_ms: u64,
+    persistent_attach_ms: u64,
+    block_frontends_ms: u64,
+    memory_backing_ms: u64,
+    vmm_spawn_ms: u64,
+    guest_agent_health_ms: u64,
+    persistent_prepare_ms: u64,
+    runtime_ready_ms: u64,
+}
+
 impl InstalledInner {
     fn start_fresh(
         &self,
@@ -331,6 +344,9 @@ impl InstalledInner {
         config: &NodedCatConfig,
         cancellation: &SemanticActionCancellation,
     ) -> Result<ManagedCat> {
+        let create_started = Instant::now();
+        let mut timings = FreshStartTimings::default();
+        let mut root_provisioned = false;
         config.validate().context("validate installed Cat config")?;
         let runtime_directory = self.config.runtime_directory.join(cat_id.as_str());
         create_private_directory(&runtime_directory)?;
@@ -352,14 +368,20 @@ impl InstalledInner {
 
         let result = (|| {
             check_cancellation(cancellation, CatAction::Run)?;
+            let stage_started = Instant::now();
             let root = self.ensure_root(cat_id, config)?;
             let root = self.attach(root)?;
             let root = self.local_volume(&cat, None, root, 0)?;
             cat.volumes.push(root);
+            timings.root_setup_ms = elapsed_millis(stage_started);
             if cat.volumes[0].attached.volume.head.generation.get() == 0 {
+                let stage_started = Instant::now();
                 self.provision_root(config, &mut cat.volumes[0])?;
+                timings.root_provision_ms = elapsed_millis(stage_started);
+                root_provisioned = true;
             }
 
+            let stage_started = Instant::now();
             for (index, requested) in config.mounts.iter().enumerate() {
                 check_cancellation(cancellation, CatAction::Run)?;
                 let mount_path = HostPath::new(requested.mount_path.as_str().to_owned())
@@ -383,11 +405,17 @@ impl InstalledInner {
                     u16::try_from(index + 1).context("too many PersistentDisk devices")?,
                 )?);
             }
+            timings.persistent_attach_ms = elapsed_millis(stage_started);
 
             check_cancellation(cancellation, CatAction::Run)?;
+            let stage_started = Instant::now();
             let disks = self.start_block_frontends(&mut cat, false)?;
+            timings.block_frontends_ms = elapsed_millis(stage_started);
+            let stage_started = Instant::now();
             ch::prepare_memory_backing(&cat.memory_file, bytes_to_mib(cat.config.memory_bytes)?)
                 .context("prepare Guest memory backing")?;
+            timings.memory_backing_ms = elapsed_millis(stage_started);
+            let stage_started = Instant::now();
             let spawned = ch::spawn_vmm_retaining_boot(&ChSpawn {
                 cfg: &self.config.ch,
                 api_sock: &cat.api_socket,
@@ -403,13 +431,55 @@ impl InstalledInner {
             .context("spawn Cloud Hypervisor")?;
             cat.vmm = Some(spawned.child);
             cat.boot_descriptors = spawned.boot_descriptors;
+            timings.vmm_spawn_ms = elapsed_millis(stage_started);
+            let stage_started = Instant::now();
             self.wait_for_guest(&mut cat)?;
+            timings.guest_agent_health_ms = elapsed_millis(stage_started);
+            let stage_started = Instant::now();
             self.prepare_persistent_volumes(&mut cat)?;
+            timings.persistent_prepare_ms = elapsed_millis(stage_started);
+            let stage_started = Instant::now();
             self.confirm_guest_ready(&mut cat)?;
+            timings.runtime_ready_ms = elapsed_millis(stage_started);
             cat.state = CatState::Running;
             check_cancellation(cancellation, CatAction::Run)?;
             Ok(())
         })();
+
+        let total_ms = elapsed_millis(create_started);
+        match &result {
+            Ok(()) => tracing::info!(
+                cat_id = cat_id.as_str(),
+                root_provisioned,
+                root_setup_ms = timings.root_setup_ms,
+                root_provision_ms = timings.root_provision_ms,
+                persistent_attach_ms = timings.persistent_attach_ms,
+                block_frontends_ms = timings.block_frontends_ms,
+                memory_backing_ms = timings.memory_backing_ms,
+                vmm_spawn_ms = timings.vmm_spawn_ms,
+                guest_agent_health_ms = timings.guest_agent_health_ms,
+                persistent_prepare_ms = timings.persistent_prepare_ms,
+                runtime_ready_ms = timings.runtime_ready_ms,
+                total_ms,
+                "installed Cat fresh start completed"
+            ),
+            Err(error) => tracing::warn!(
+                cat_id = cat_id.as_str(),
+                root_provisioned,
+                root_setup_ms = timings.root_setup_ms,
+                root_provision_ms = timings.root_provision_ms,
+                persistent_attach_ms = timings.persistent_attach_ms,
+                block_frontends_ms = timings.block_frontends_ms,
+                memory_backing_ms = timings.memory_backing_ms,
+                vmm_spawn_ms = timings.vmm_spawn_ms,
+                guest_agent_health_ms = timings.guest_agent_health_ms,
+                persistent_prepare_ms = timings.persistent_prepare_ms,
+                runtime_ready_ms = timings.runtime_ready_ms,
+                total_ms,
+                %error,
+                "installed Cat fresh start failed"
+            ),
+        }
 
         if let Err(error) = result {
             self.stop_cat_without_release(&mut cat);
@@ -547,19 +617,34 @@ impl InstalledInner {
             Arc::clone(&self.volume_data),
         )
         .context("open Root control-only engine")?;
-        let result = engine
-            .provision_root_image(&ProvisionRootImageRequest {
-                provision_transition_id,
-                volume_id: root.attached.volume.volume_id.clone(),
-                attachment_id: root.attached.serving.identity.attachment_id.clone(),
-                attachment_epoch: root.attached.serving.identity.attachment_epoch,
-                size_bytes: root.attached.volume.size_bytes,
-                boot_image_digest: digest,
-                expected_blank_head: root.attached.volume.head.clone(),
-                expected_provisioned_head: expected.clone(),
-            })
+        let request = ProvisionRootImageRequest {
+            provision_transition_id,
+            volume_id: root.attached.volume.volume_id.clone(),
+            attachment_id: root.attached.serving.identity.attachment_id.clone(),
+            attachment_epoch: root.attached.serving.identity.attachment_epoch,
+            size_bytes: root.attached.volume.size_bytes,
+            boot_image_digest: digest,
+            expected_blank_head: root.attached.volume.head.clone(),
+            expected_provisioned_head: expected.clone(),
+        };
+        let provision_started = Instant::now();
+        let (validation_preference, result) = match self.config.ch.seed_image.as_deref() {
+            Some(seed_image) => (
+                "local_seed",
+                engine.provision_root_image_from_local_seed(&request, seed_image),
+            ),
+            None => ("remote_body", engine.provision_root_image(&request)),
+        };
+        let result = result
             .map_err(|error| anyhow::anyhow!(error))
             .context("provision Root image")?;
+        tracing::info!(
+            volume_id = root.attached.volume.volume_id.as_str(),
+            boot_image_digest = request.boot_image_digest.as_str(),
+            validation_preference,
+            elapsed_ms = elapsed_millis(provision_started),
+            "installed Root image provision completed"
+        );
         anyhow::ensure!(
             result.resulting_head == expected,
             "Root provision head changed"
@@ -1406,6 +1491,10 @@ fn deadline_after(duration: Duration) -> Result<Instant> {
     Instant::now()
         .checked_add(duration)
         .context("installed effect deadline overflow")
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn open_host_lock(path: &Path) -> Result<File> {

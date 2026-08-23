@@ -1,6 +1,9 @@
 use std::collections::HashSet;
 use std::fs;
-use std::sync::atomic::Ordering;
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex as StdMutex;
+use std::time::Instant;
 
 use cats_api::chunk::{self, CHUNK_SIZE};
 use cats_api::runtime_reconciliation::{
@@ -45,6 +48,30 @@ impl ChunkEngine {
         &self,
         request: &ProvisionRootImageRequest,
     ) -> EffectResult<ProvisionRootImageResult> {
+        self.provision_root_image_with_local_seed(request, None)
+    }
+
+    /// Provision from the immutable remote image namespace while preferring
+    /// an exact local copy as the content-validation source.
+    ///
+    /// The local file is never attached to the Guest and never becomes volume
+    /// authority. It must reproduce the requested digest and canonical remote
+    /// manifest exactly. A missing or different local file falls back to the
+    /// existing remote-body validation path.
+    pub fn provision_root_image_from_local_seed(
+        &self,
+        request: &ProvisionRootImageRequest,
+        local_seed: &Path,
+    ) -> EffectResult<ProvisionRootImageResult> {
+        self.provision_root_image_with_local_seed(request, Some(local_seed))
+    }
+
+    fn provision_root_image_with_local_seed(
+        &self,
+        request: &ProvisionRootImageRequest,
+        local_seed: Option<&Path>,
+    ) -> EffectResult<ProvisionRootImageResult> {
+        let provision_started = Instant::now();
         self.validate_request_binding(request)?;
         if self.is_fenced() {
             return Err(ProvisionRootImageEffectError::ResultUnknown(
@@ -65,12 +92,34 @@ impl ChunkEngine {
             .map_err(|_| ProvisionRootImageEffectError::ResultUnknown("I/O gate was poisoned"))?;
 
         self.validate_local_state(request)?;
-        let manifest = self.load_and_validate_manifest(request)?;
+        let stage_started = Instant::now();
+        let manifest = self.load_and_validate_manifest(request, local_seed)?;
+        let image_validation_ms = elapsed_millis(stage_started);
+        let stage_started = Instant::now();
         let (new_map, prepared, chunks) = self.compute_target(request, &manifest)?;
+        let map_prepare_ms = elapsed_millis(stage_started);
 
+        let stage_started = Instant::now();
         let head = self.load_authority(request)?;
+        let authority_load_ms = elapsed_millis(stage_started);
         if same_target(&head, &request.expected_provisioned_head) {
+            let stage_started = Instant::now();
             self.reload_target_map(request)?;
+            tracing::info!(
+                volume_id = request.volume_id.as_str(),
+                boot_image_digest = request.boot_image_digest.as_str(),
+                outcome = "idempotent_replay",
+                image_validation_ms,
+                map_prepare_ms,
+                authority_load_ms,
+                map_publish_ms = 0,
+                provision_object_puts = 0,
+                cas_ms = 0,
+                local_state_install_ms = elapsed_millis(stage_started),
+                final_authority_load_ms = 0,
+                total_ms = elapsed_millis(provision_started),
+                "Root image provision completed"
+            );
             return Ok(effect_result(request));
         }
         if !is_blank(&head) {
@@ -80,6 +129,7 @@ impl ChunkEngine {
         }
 
         let volume_id = request.volume_id.as_str();
+        let map_publish_started = Instant::now();
         for (hash, bytes) in &prepared.leaf_nodes {
             let key = chunk::keys::map_node(volume_id, &hex::encode(hash));
             self.put_provision_object(request, &key, bytes)?;
@@ -97,7 +147,9 @@ impl ChunkEngine {
         self.put_provision_object(request, &commit_key, &record)?;
         crashpoint::maybe_crash(crashpoint::AFTER_PROVISION_COMMIT_PUT);
         crashpoint::maybe_crash(crashpoint::BEFORE_CAS);
+        let map_publish_ms = elapsed_millis(map_publish_started);
 
+        let cas_started = Instant::now();
         let cas = self.authority.compare_and_swap_head(
             volume_id,
             self.size,
@@ -140,12 +192,14 @@ impl ChunkEngine {
                 ));
             }
         }
+        let cas_ms = elapsed_millis(cas_started);
         crashpoint::maybe_crash(crashpoint::AFTER_CAS);
 
         // The head is the authority, but this process must also load the exact
         // committed map before it can truthfully report the control effect. It
         // still cannot expose Guest I/O; the later reconciler phase restarts a
         // serving frontend under the same grant.
+        let state_install_started = Instant::now();
         {
             let mut state = self.state.lock().map_err(|_| {
                 ProvisionRootImageEffectError::ResultUnknown("engine state lock was poisoned")
@@ -162,16 +216,33 @@ impl ChunkEngine {
                 ProvisionRootImageEffectError::ResultUnknown("staged queue lock was poisoned")
             })?
             .next_base = 1;
+        let local_state_install_ms = elapsed_millis(state_install_started);
 
         // Close the response race as far as a hint can: a later owner change
         // never becomes a closed blockd error. The Node rereads authority after
         // every response regardless.
+        let final_authority_started = Instant::now();
         let observed = self.load_authority(request)?;
         if !same_target(&observed, &request.expected_provisioned_head) {
             return Err(ProvisionRootImageEffectError::ResultUnknown(
                 "authority changed after the generation-one CAS",
             ));
         }
+        tracing::info!(
+            volume_id = request.volume_id.as_str(),
+            boot_image_digest = request.boot_image_digest.as_str(),
+            outcome = "generation_one_committed",
+            image_validation_ms,
+            map_prepare_ms,
+            authority_load_ms,
+            map_publish_ms,
+            provision_object_puts = prepared.leaf_nodes.len().saturating_add(2),
+            cas_ms,
+            local_state_install_ms,
+            final_authority_load_ms = elapsed_millis(final_authority_started),
+            total_ms = elapsed_millis(provision_started),
+            "Root image provision completed"
+        );
         Ok(effect_result(request))
     }
 
@@ -260,7 +331,10 @@ impl ChunkEngine {
     fn load_and_validate_manifest(
         &self,
         request: &ProvisionRootImageRequest,
+        local_seed: Option<&Path>,
     ) -> EffectResult<ImageManifest> {
+        let validation_started = Instant::now();
+        let manifest_started = Instant::now();
         let image_id = &request.boot_image_digest.as_str()["sha256:".len()..];
         let manifest =
             crate::image::load(self.blob.as_ref(), image_id).map_err(|error| match error {
@@ -283,6 +357,7 @@ impl ChunkEngine {
                     ProvisionRootImageRetryableProblem::LocalIoUnavailable,
                 ),
             })?;
+        let manifest_ms = elapsed_millis(manifest_started);
 
         // The cats-storage reader has already completed the shared canonical
         // and structural pass. This request-local fit check is the only
@@ -296,6 +371,78 @@ impl ChunkEngine {
 
         // Only after the shared structural pass succeeds may availability of an
         // individual object affect the outcome.
+        let object_keys = unique_image_object_keys(image_id, &manifest);
+        let mut local_seed_ms = 0;
+        let remote_validation_started;
+        let (validation_source, remote_get_objects, remote_head_objects) = if let Some(local_seed) =
+            local_seed
+        {
+            let local_started = Instant::now();
+            let local = crate::image::scan(local_seed);
+            local_seed_ms = elapsed_millis(local_started);
+            match local {
+                Ok((local_image_id, local_manifest, _))
+                    if local_image_id == image_id && local_manifest == manifest =>
+                {
+                    remote_validation_started = Instant::now();
+                    self.validate_remote_image_object_existence(request, &object_keys)?;
+                    ("local_seed", 0, object_keys.len())
+                }
+                Ok((local_image_id, _, _)) => {
+                    tracing::warn!(
+                        volume_id = request.volume_id.as_str(),
+                        boot_image_digest = request.boot_image_digest.as_str(),
+                        local_seed = %local_seed.display(),
+                        local_image_id,
+                        "local Golden Root does not match the requested manifest; falling back to remote body validation"
+                    );
+                    remote_validation_started = Instant::now();
+                    self.validate_remote_image_object_bodies(request, image_id, &manifest)?;
+                    ("remote_body_fallback", object_keys.len(), 0)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        volume_id = request.volume_id.as_str(),
+                        boot_image_digest = request.boot_image_digest.as_str(),
+                        local_seed = %local_seed.display(),
+                        %error,
+                        "local Golden Root is unavailable; falling back to remote body validation"
+                    );
+                    remote_validation_started = Instant::now();
+                    self.validate_remote_image_object_bodies(request, image_id, &manifest)?;
+                    ("remote_body_fallback", object_keys.len(), 0)
+                }
+            }
+        } else {
+            remote_validation_started = Instant::now();
+            self.validate_remote_image_object_bodies(request, image_id, &manifest)?;
+            ("remote_body", object_keys.len(), 0)
+        };
+        let remote_validation_ms = elapsed_millis(remote_validation_started);
+        tracing::info!(
+            volume_id = request.volume_id.as_str(),
+            boot_image_digest = request.boot_image_digest.as_str(),
+            validation_source,
+            manifest_ms,
+            local_seed_ms,
+            remote_validation_ms,
+            validation_total_ms = elapsed_millis(validation_started),
+            manifest_chunks = manifest.chunks.len(),
+            unique_image_objects = object_keys.len(),
+            remote_get_objects,
+            remote_head_objects,
+            remote_get_bytes = remote_get_objects.saturating_mul(CHUNK_SIZE as usize),
+            "Root image validation completed"
+        );
+        Ok(manifest)
+    }
+
+    fn validate_remote_image_object_bodies(
+        &self,
+        request: &ProvisionRootImageRequest,
+        image_id: &str,
+        manifest: &ImageManifest,
+    ) -> EffectResult<()> {
         let mut verified_objects = HashSet::new();
         for entry in &manifest.chunks {
             if !verified_objects.insert(entry.object_id.as_str()) {
@@ -322,7 +469,52 @@ impl ChunkEngine {
                 ));
             }
         }
-        Ok(manifest)
+        Ok(())
+    }
+
+    fn validate_remote_image_object_existence(
+        &self,
+        request: &ProvisionRootImageRequest,
+        object_keys: &[String],
+    ) -> EffectResult<()> {
+        let next = AtomicUsize::new(0);
+        let failure = StdMutex::new(None);
+        std::thread::scope(|scope| {
+            for _ in 0..object_keys.len().clamp(1, 16) {
+                scope.spawn(|| loop {
+                    if failure.lock().unwrap().is_some() {
+                        return;
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(key) = object_keys.get(index) else {
+                        return;
+                    };
+                    let result = match self.blob.exists(key) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Err(BlobError::NotFound(key.clone())),
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = result {
+                        let mut slot = failure.lock().unwrap();
+                        if slot.is_none() {
+                            *slot = Some(error);
+                        }
+                        return;
+                    }
+                });
+            }
+        });
+        match failure.into_inner().unwrap() {
+            None => Ok(()),
+            Some(BlobError::NotFound(_)) => Err(retryable(
+                request,
+                ProvisionRootImageRetryableProblem::ImageUnavailable,
+            )),
+            Some(_) => Err(retryable(
+                request,
+                ProvisionRootImageRetryableProblem::ObjectStoreUnavailable,
+            )),
+        }
     }
 
     fn compute_target(
@@ -433,6 +625,20 @@ impl ChunkEngine {
             ),
         })
     }
+}
+
+fn unique_image_object_keys(image_id: &str, manifest: &ImageManifest) -> Vec<String> {
+    let mut seen = HashSet::new();
+    manifest
+        .chunks
+        .iter()
+        .filter(|entry| seen.insert(entry.object_id.as_str()))
+        .map(|entry| chunk::keys::image_data(image_id, entry.object_id.as_str()))
+        .collect()
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn effect_result(request: &ProvisionRootImageRequest) -> ProvisionRootImageResult {

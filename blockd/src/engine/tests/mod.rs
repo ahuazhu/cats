@@ -3680,6 +3680,165 @@ struct RootProvisionFixture {
     _dir: tempfile::TempDir,
 }
 
+struct ImageValidationCountingBlob {
+    inner: Arc<dyn BlobStore>,
+    image_data_gets: AtomicU64,
+    image_data_exists: AtomicU64,
+    image_data_exists_in_flight: AtomicU64,
+    image_data_exists_peak: AtomicU64,
+}
+
+impl ImageValidationCountingBlob {
+    fn is_image_data(key: &str) -> bool {
+        key.starts_with("images/") && key.contains("/data/")
+    }
+}
+
+impl BlobStore for ImageValidationCountingBlob {
+    fn put_immutable(&self, key: &str, data: &[u8]) -> cats_storage::blob::Result<()> {
+        self.inner.put_immutable(key, data)
+    }
+
+    fn get(&self, key: &str) -> cats_storage::blob::Result<Vec<u8>> {
+        if Self::is_image_data(key) {
+            self.image_data_gets.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.get(key)
+    }
+
+    fn exists(&self, key: &str) -> cats_storage::blob::Result<bool> {
+        if Self::is_image_data(key) {
+            self.image_data_exists.fetch_add(1, Ordering::SeqCst);
+            let in_flight = self
+                .image_data_exists_in_flight
+                .fetch_add(1, Ordering::SeqCst)
+                + 1;
+            self.image_data_exists_peak
+                .fetch_max(in_flight, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(20));
+            let result = self.inner.exists(key);
+            self.image_data_exists_in_flight
+                .fetch_sub(1, Ordering::SeqCst);
+            return result;
+        }
+        self.inner.exists(key)
+    }
+
+    fn delete(&self, key: &str) -> cats_storage::blob::Result<()> {
+        self.inner.delete(key)
+    }
+
+    fn list(&self, prefix: &str) -> cats_storage::blob::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+}
+
+struct LocalSeedProvisionFixture {
+    _dir: tempfile::TempDir,
+    seed_image: PathBuf,
+    engine: Arc<ChunkEngine>,
+    blob: Arc<ImageValidationCountingBlob>,
+    request: cats_api::runtime_reconciliation::ProvisionRootImageRequest,
+}
+
+fn local_seed_provision_fixture() -> LocalSeedProvisionFixture {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let seed_image = dir.path().join("root.img");
+    let mut seed = File::create(&seed_image).unwrap();
+    for byte in [211, 37, 89, 151] {
+        seed.write_all(&pattern(CHUNK_SIZE as usize, byte)).unwrap();
+    }
+    seed.sync_all().unwrap();
+    let manifest = crate::image::publish(inner.as_ref(), &seed_image)
+        .unwrap()
+        .manifest;
+    let blob = Arc::new(ImageValidationCountingBlob {
+        inner,
+        image_data_gets: AtomicU64::new(0),
+        image_data_exists: AtomicU64::new(0),
+        image_data_exists_in_flight: AtomicU64::new(0),
+        image_data_exists_peak: AtomicU64::new(0),
+    });
+    let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+    meta.create_volume(VOL, SIZE).unwrap();
+    let epoch = install_test_grant_at(dir.path().join("meta.db"), "attA");
+    let engine = ChunkEngine::attach_control_only(
+        EngineConfig::new(VOL, dir.path().join("control-data"), "attA"),
+        epoch,
+        blob.clone(),
+        target_authority(meta),
+    )
+    .unwrap();
+    let request = root_provision_request(
+        &engine,
+        &manifest,
+        epoch,
+        "2468ace013579bdf2468ace013579bdf",
+    );
+    LocalSeedProvisionFixture {
+        _dir: dir,
+        seed_image,
+        engine,
+        blob,
+        request,
+    }
+}
+
+#[test]
+fn exact_local_seed_provisions_without_getting_remote_image_data() {
+    let fixture = local_seed_provision_fixture();
+
+    fixture
+        .engine
+        .provision_root_image_from_local_seed(&fixture.request, &fixture.seed_image)
+        .unwrap();
+
+    assert_eq!(fixture.blob.image_data_gets.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.blob.image_data_exists.load(Ordering::SeqCst), 4);
+    assert!(
+        fixture.blob.image_data_exists_peak.load(Ordering::SeqCst) > 1,
+        "remote object existence checks must overlap"
+    );
+}
+
+#[test]
+fn a_nonmatching_local_seed_falls_back_to_remote_body_validation() {
+    let fixture = local_seed_provision_fixture();
+    let wrong_seed = fixture._dir.path().join("wrong-root.img");
+    fs::write(&wrong_seed, pattern(CHUNK_SIZE as usize, 99)).unwrap();
+
+    fixture
+        .engine
+        .provision_root_image_from_local_seed(&fixture.request, &wrong_seed)
+        .unwrap();
+
+    assert_eq!(fixture.blob.image_data_gets.load(Ordering::SeqCst), 4);
+    assert_eq!(fixture.blob.image_data_exists.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn an_exact_local_seed_cannot_publish_a_map_when_a_remote_object_is_missing() {
+    let fixture = local_seed_provision_fixture();
+    let missing = fixture
+        .blob
+        .list("images/")
+        .unwrap()
+        .into_iter()
+        .find(|key| ImageValidationCountingBlob::is_image_data(key))
+        .unwrap();
+    fixture.blob.delete(&missing).unwrap();
+
+    assert_retryable_problem(
+        fixture
+            .engine
+            .provision_root_image_from_local_seed(&fixture.request, &fixture.seed_image)
+            .unwrap_err(),
+        cats_api::runtime_reconciliation::ProvisionRootImageRetryableProblem::ImageUnavailable,
+    );
+    assert!(volume_objects(fixture.blob.as_ref()).is_empty());
+}
+
 fn root_provision_request(
     engine: &ChunkEngine,
     manifest: &format::ImageManifest,

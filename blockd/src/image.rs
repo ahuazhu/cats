@@ -74,7 +74,7 @@ fn publish_workers(objects: usize) -> usize {
 /// Chunks are content-addressed and all-zero chunks are dropped, so a sparse
 /// image publishes only the chunks it actually uses and an image containing the
 /// same chunk twice stores it once.
-fn scan(path: &Path) -> Result<(String, ImageManifest, Vec<u64>)> {
+pub(crate) fn scan(path: &Path) -> Result<(String, ImageManifest, Vec<u64>)> {
     let file = File::open(path)?;
     let file_len = file.metadata()?.len();
     if file_len == 0 {
