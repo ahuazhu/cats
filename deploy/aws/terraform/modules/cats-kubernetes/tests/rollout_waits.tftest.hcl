@@ -30,4 +30,9 @@ run "the_apply_blocks_on_the_components_that_can_become_ready" {
     condition     = kubernetes_deployment_v1.control_plane.wait_for_rollout
     error_message = "the control plane must block the apply: a deploy that does not wait cannot report a failed rollout."
   }
+
+  assert {
+    condition     = nonsensitive(kubernetes_secret_v1.runtime.data["CATS_NODED_SERVICE_TOKEN"]) == var.runtime_secret_data["CATS_AUTH_TOKEN"]
+    error_message = "Control must receive the same direct Node service token installed as CATS_AUTH_TOKEN on every Node."
+  }
 }
