@@ -817,6 +817,58 @@ fn completed_node_reset_stays_closed_until_current_cats_are_recovered() {
 }
 
 #[test]
+fn completed_node_reset_reopens_when_only_failed_cats_remain() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    let CreateCatOutcome::Created(created) = store
+        .create_semantic_cat(NewCat {
+            cat_id: "cat-reset-failure",
+            workspace_id: "ws_semantic",
+            cat_slug: "reset-failure",
+            node_id: "node-a",
+            cpu_count: 2,
+            memory_bytes: 1 << 30,
+            boot_image: "sha256:image",
+        })
+        .unwrap()
+    else {
+        panic!("new semantic Cat must be created")
+    };
+    assert_eq!(created.current_action, Some(CatAction::Create));
+    let failed = store
+        .finish_semantic_cat_action(
+            "cat-reset-failure",
+            FinishCatAction {
+                expected_action: CatAction::Create,
+                expected_node_id: Some("node-a"),
+                final_state: CatState::Failure,
+                final_node_id: Some("node-a"),
+                error_code: Some("image_unavailable"),
+                error_message: Some("image unavailable"),
+            },
+        )
+        .unwrap()
+        .expect("settle failed Cat on its selected Node");
+    assert_eq!(failed.state, Some(CatState::Failure));
+
+    let mut completed = registration("node-a", "http://10.0.0.1:8443");
+    completed.reset_completed = true;
+    assert!(matches!(
+        store.register_semantic_node(completed).unwrap(),
+        RegisterNodeOutcome::RegistrationUpdated(NodeRecord {
+            status: NodeStatus::Running,
+            ..
+        })
+    ));
+    let retained = store
+        .find_semantic_cat_by_id("cat-reset-failure")
+        .unwrap()
+        .expect("failed Cat remains available for explicit destroy");
+    assert_eq!(retained.state, Some(CatState::Failure));
+    assert_eq!(retained.node_id.as_deref(), Some("node-a"));
+}
+
+#[test]
 fn offline_recovery_claim_replaces_old_lane_and_exactly_moves_placement() {
     let (store, _) = store_and_url();
     register_node(&store);

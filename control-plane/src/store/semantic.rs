@@ -1780,16 +1780,22 @@ fn register_node_transaction(
         transaction.rollback()?;
         return Ok(RegisterNodeOutcome::Deleted(record));
     }
-    let has_current_cats: bool = transaction
+    // A failed Cat has no runnable physical state to recover.  Keeping its
+    // placement on the reset Node lets the user issue the only useful next
+    // action (`destroy`) after that Node has reopened.  Treating it as a
+    // recovery blocker deadlocks registration because Failure deliberately
+    // has no cross-Node Run transition.
+    let has_recovery_blocking_cats: bool = transaction
         .query_one(
             "SELECT EXISTS (
                 SELECT 1 FROM cats
                  WHERE node_id=$1 AND destroyed_at IS NULL
+                   AND state IS DISTINCT FROM 'failure'
             )",
             &[&request.node_id],
         )?
         .get(0);
-    if request.reset_completed && has_current_cats {
+    if request.reset_completed && has_recovery_blocking_cats {
         let row = transaction.query_one(
             &format!(
                 "UPDATE nodes
