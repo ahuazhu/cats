@@ -2004,6 +2004,7 @@ mod tests {
     #[test]
     fn explicit_admin_token_does_not_acquire_session_state() {
         let cli = Cli {
+            color: crate::ColorChoice::Never,
             api_url: Some("https://control.example:8443".to_owned()),
             token: Some("explicit-short-lived-token".to_owned()),
             workspace: None,
