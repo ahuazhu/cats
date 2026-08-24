@@ -111,10 +111,10 @@ impl Context {
                      );
                      INSERT INTO cats (
                         cat_id,workspace_id,cat_slug,state,node_id,cpu_count,memory_bytes,
-                        boot_image,created_at,updated_at
+                        boot_image,created_at,updated_at,last_running_at
                      ) VALUES (
                         '{CAT_ID}','{WORKSPACE_ID}','shell','running','{NODE_ID}',2,
-                        2147483648,'sha256:image',1,1
+                        2147483648,'sha256:image',1,1,1
                      );"
                 ))
                 .expect("seed billing owners and a running Cat");
@@ -620,10 +620,10 @@ async fn a_claimed_node_identity_is_bounded_by_placement_not_proven() {
                      );
                      INSERT INTO cats (
                         cat_id,workspace_id,cat_slug,state,node_id,cpu_count,memory_bytes,
-                        boot_image,created_at,updated_at
+                        boot_image,created_at,updated_at,last_running_at
                      ) VALUES (
                         'cat_onmetaltwo01','{OTHER_WORKSPACE_ID}','other','running',
-                        'node_metal-2',2,2147483648,'sha256:image',1,1
+                        'node_metal-2',2,2147483648,'sha256:image',1,1,1
                      );"
                 ))
                 .expect("a second Node with its own Cat");
