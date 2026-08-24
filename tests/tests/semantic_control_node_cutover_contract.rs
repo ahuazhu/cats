@@ -219,3 +219,52 @@ fn production_composition_has_only_the_semantic_lifecycle_protocol() {
         "production composition",
     );
 }
+
+/// The atomic-lifecycle cutover retired the Node usage producer and the Control
+/// ingestion route together. Nothing failed: the ledger stayed empty and every
+/// billing read returned a well-formed zero. This test is the tripwire for that
+/// exact silence — the producer, the transport and the ingress must all stay
+/// wired to each other.
+#[test]
+fn compute_usage_has_a_producer_a_transport_and_an_ingress() {
+    let node_main = read_workspace_file("cmd/noded/src/main.rs");
+    let node_effects = read_workspace_file("node-agent/src/semantic_installed.rs");
+    let node_client = read_workspace_file("node-agent/src/semantic_node_client.rs");
+    let control_router = read_workspace_file("control-plane/src/api/mod.rs");
+    let control_ingest = read_workspace_file("control-plane/src/api/semantic_usage.rs");
+
+    assert_contains_all(
+        &node_main,
+        &["run_usage_sampler", "run_usage_delivery", "CatUsageMeters"],
+        "noded composition",
+    );
+    assert_contains_all(
+        &node_effects,
+        &[
+            "self.open_meter(&cat)",
+            "self.meter_vmm(",
+            "self.meters.close(",
+        ],
+        "installed Cat effects",
+    );
+    assert_contains_all(
+        &node_client,
+        &["fn report_usage", "USAGE_CHECKPOINTS_PATH"],
+        "Node Control transport",
+    );
+    assert_contains_all(
+        &control_router,
+        &["semantic_usage::routes"],
+        "Control router",
+    );
+    assert_contains_all(
+        &control_ingest,
+        &[
+            "USAGE_CHECKPOINTS_PATH",
+            "source_epoch_attribution",
+            "billing_ledger_for_workspace",
+            "usage.ingest",
+        ],
+        "Control usage ingress",
+    );
+}

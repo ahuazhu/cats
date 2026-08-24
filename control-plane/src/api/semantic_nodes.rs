@@ -36,6 +36,10 @@ impl SemanticNodeHttpState {
             service_token,
         }
     }
+
+    pub(super) fn service_token(&self) -> &NodedServiceToken {
+        &self.service_token
+    }
 }
 
 pub fn routes(state: SemanticNodeHttpState) -> Router<AppState> {
@@ -147,7 +151,7 @@ async fn heartbeat(
         .map_err(Into::into)
 }
 
-fn authenticate(
+pub(super) fn authenticate(
     headers: &HeaderMap,
     expected: &NodedServiceToken,
 ) -> Result<(), SemanticNodeHttpFailure> {
@@ -162,7 +166,7 @@ fn authenticate(
     }
 }
 
-struct SemanticNodeHttpFailure(ApiError);
+pub(super) struct SemanticNodeHttpFailure(ApiError);
 
 impl From<ApiError> for SemanticNodeHttpFailure {
     fn from(error: ApiError) -> Self {

@@ -39,6 +39,7 @@ pub(crate) mod runtime_node_authority;
 mod runtime_usage;
 pub mod semantic_nodes;
 pub mod semantic_resources;
+mod semantic_usage;
 mod usage;
 
 use accounts::*;
@@ -354,6 +355,7 @@ fn metering_failure(error: cats_metering::MeteringError) -> Failure {
 pub fn router(state: AppState) -> Router {
     let semantic_resources = semantic_resources::routes(Arc::clone(&state.semantic_resources));
     let semantic_nodes = semantic_nodes::routes(state.semantic_node_http.clone());
+    let semantic_usage = semantic_usage::routes(state.semantic_node_http.clone());
     Router::new()
         .route("/", get(crate::ui::portal))
         .route("/zh-CN", get(crate::ui::zh_home_redirect))
@@ -474,6 +476,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/admin/workspaces", get(admin_list_workspaces))
         .merge(semantic_resources)
         .merge(semantic_nodes)
+        .merge(semantic_usage)
         .fallback(crate::ui::not_found)
         .with_state(state)
 }

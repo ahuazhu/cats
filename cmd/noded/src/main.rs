@@ -18,7 +18,11 @@ use cats_node_agent::semantic_lifecycle::{
 };
 use cats_node_agent::semantic_node_client::{
     HttpSemanticNodeTransport, NodeClientFuture, NodeHeartbeatSource, NodePlacementGate,
-    SemanticNodeSupervisor,
+    SemanticNodeSupervisor, SemanticNodeTransport,
+};
+use cats_node_agent::semantic_usage::{
+    detect_delegated_cgroup, run_usage_delivery, run_usage_sampler, CatUsageMeters,
+    MeteringCgroupRoot,
 };
 use cats_object_store_aws_s3::AwsS3BlobStoreFactory;
 use cats_object_store_file::FileBlobStoreFactory;
@@ -118,6 +122,11 @@ struct Args {
     ch_nbd_devices: u32,
     #[arg(long, default_value = "/usr/sbin/ip")]
     ch_ip_bin: PathBuf,
+    /// Delegated cgroup v2 subtree the Node meters Cats in. Defaults to the
+    /// subtree systemd delegated to this unit. `off` disables billing
+    /// observation; the runtime is unaffected either way.
+    #[arg(long, env = "CATS_METERING_CGROUP_ROOT", default_value = "auto")]
+    metering_cgroup_root: String,
 }
 
 #[derive(Default)]
@@ -164,7 +173,44 @@ impl SemanticCatEffects for FakeSemanticEffects {
     }
 }
 
-fn semantic_effects(args: &Args, node_id: &Id) -> anyhow::Result<Arc<dyn SemanticCatEffects>> {
+/// Prepare the Host's billing meter root.
+///
+/// Metering is observation, not authority. An explicitly configured root that
+/// cannot be prepared is an operator error and fails startup; auto-detection
+/// that cannot be satisfied leaves the Node serving with metering off and says
+/// so loudly, because refusing to run would be the larger outage.
+fn metering_cgroup_root(setting: &str) -> anyhow::Result<Option<MeteringCgroupRoot>> {
+    match setting {
+        "off" => {
+            tracing::warn!("Cat usage metering is disabled by configuration");
+            Ok(None)
+        }
+        "auto" => {
+            let prepared = detect_delegated_cgroup()
+                .and_then(|delegated| MeteringCgroupRoot::initialize(&delegated));
+            match prepared {
+                Ok(root) => Ok(Some(root)),
+                Err(error) => {
+                    tracing::error!(
+                        error = %format!("{error:#}"),
+                        "could not prepare the delegated metering cgroup; compute usage on this \
+                         Node will not be billed"
+                    );
+                    Ok(None)
+                }
+            }
+        }
+        explicit => MeteringCgroupRoot::initialize(std::path::Path::new(explicit))
+            .with_context(|| format!("prepare the configured metering cgroup root {explicit}"))
+            .map(Some),
+    }
+}
+
+fn semantic_effects(
+    args: &Args,
+    node_id: &Id,
+    meters: Arc<CatUsageMeters>,
+) -> anyhow::Result<Arc<dyn SemanticCatEffects>> {
     match args.vmm.as_str() {
         "fake" => Ok(Arc::new(FakeSemanticEffects::default())),
         "ch" => {
@@ -248,6 +294,7 @@ fn semantic_effects(args: &Args, node_id: &Id) -> anyhow::Result<Arc<dyn Semanti
                 volume_store,
                 volume_data,
                 blob,
+                meters,
             )?))
         }
         unsupported => anyhow::bail!("unsupported --vmm {unsupported}; expected fake or ch"),
@@ -328,7 +375,15 @@ async fn main() -> anyhow::Result<()> {
     );
     let node_id = Id::new(args.node_id.clone()).context("invalid node_id")?;
     let vmm_mode = args.vmm.clone();
-    let effects = semantic_effects(&args, &node_id)?;
+    let meters = Arc::new(CatUsageMeters::new(
+        node_id.clone(),
+        if args.vmm == "ch" {
+            metering_cgroup_root(&args.metering_cgroup_root)?
+        } else {
+            None
+        },
+    )?);
+    let effects = semantic_effects(&args, &node_id, Arc::clone(&meters))?;
 
     let token = NodedServiceToken::new(args.service_token)
         .context("service token must satisfy the shared noded token contract")?;
@@ -357,6 +412,7 @@ async fn main() -> anyhow::Result<()> {
         args.control_plane_url,
         token.clone(),
     )?);
+    let usage_transport: Arc<dyn SemanticNodeTransport> = Arc::clone(&transport) as Arc<_>;
     let supervisor =
         SemanticNodeSupervisor::new(transport, reset, Arc::clone(&placement_gate), registration)?;
     let heartbeat_source: Arc<dyn NodeHeartbeatSource> = Arc::new(ServiceHeartbeatSource {
@@ -372,6 +428,7 @@ async fn main() -> anyhow::Result<()> {
     let addr = listener.local_addr()?;
     let router = semantic_node_router(service, token);
     let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+    let usage_shutdown_rx = shutdown_rx.clone();
     let mut server_shutdown = shutdown_rx.clone();
     let mut server_task = tokio::spawn(async move {
         axum::serve(listener, router)
@@ -385,6 +442,17 @@ async fn main() -> anyhow::Result<()> {
     });
     let mut supervisor_task =
         tokio::spawn(async move { supervisor.run(heartbeat_source, shutdown_rx).await });
+    // Billing observation runs beside the runtime, never inside it: neither
+    // task can fail an effect, and neither failure stops the Node.
+    let sampler_task = tokio::spawn(run_usage_sampler(
+        Arc::clone(&meters),
+        usage_shutdown_rx.clone(),
+    ));
+    let delivery_task = tokio::spawn(run_usage_delivery(
+        meters,
+        usage_transport,
+        usage_shutdown_rx,
+    ));
     tracing::info!(%addr, vmm = %vmm_mode, "semantic noded listener is ready; placement opens after registration");
 
     enum Stop {
@@ -398,6 +466,12 @@ async fn main() -> anyhow::Result<()> {
         result = &mut supervisor_task => Stop::Supervisor(result),
     };
     shutdown.send_replace(true);
+    if let Err(error) = join_task(sampler_task.await, "Cat usage sampler") {
+        tracing::warn!(error = %format!("{error:#}"), "Cat usage sampler stopped early");
+    }
+    if let Err(error) = join_task(delivery_task.await, "Cat usage delivery") {
+        tracing::warn!(error = %format!("{error:#}"), "Cat usage delivery stopped early");
+    }
     match stop {
         Stop::Signal(signal) => signal
             .and(join_task(server_task.await, "semantic noded server"))
@@ -504,9 +578,13 @@ mod tests {
         ])
         .expect("parse fake noded arguments");
         let node_id = Id::new("node_01").unwrap();
-        assert!(super::semantic_effects(&args, &node_id).is_ok());
+        let meters = std::sync::Arc::new(
+            cats_node_agent::semantic_usage::CatUsageMeters::new(node_id.clone(), None)
+                .expect("meters"),
+        );
+        assert!(super::semantic_effects(&args, &node_id, meters.clone()).is_ok());
         args.vmm = "other".to_owned();
-        let error = match super::semantic_effects(&args, &node_id) {
+        let error = match super::semantic_effects(&args, &node_id, meters) {
             Ok(_) => panic!("unknown VMM must be rejected"),
             Err(error) => error,
         };

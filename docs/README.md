@@ -91,6 +91,7 @@ AgentSession 或 HostFenceRecovery 协调的段落，都由 ADR-0059 supersede�
 - [0062 Destroy 抢占进行中的 Cat 动作](decisions/0062-destroy-preempts-in-progress-cat-actions.md)
 - [0061 场景语义 Least-Allocated Placement](decisions/0061-semantic-least-allocated-placement.md)
 - [0062 Level-Triggered Planned Node Drain](decisions/0062-level-triggered-planned-node-drain.md)
+- [0063 语义协议下的 Cat 用量计量](decisions/0063-semantic-node-usage-metering.md)
 - [0002 四态生命周期](decisions/0002-lifecycle-states-running-suspended-warm-cold.md)
 - [0031 PostgreSQL control store](decisions/0031-control-store-on-postgresql.md)
 - [0032 Control Plane 多副本](decisions/0032-control-plane-multi-replica-and-postgresql-leadership.md)

@@ -11,6 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
+use cats_api::metering::{
+    IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse, USAGE_CHECKPOINTS_PATH,
+};
 use cats_api::semantic_control::{
     NodeHeartbeatRequest, NodeHeartbeatResponse, NodeHeartbeatStatus, NodeRegistrationRequest,
     NodeRegistrationResponse, NodeRegistrationStatus, NodeStatus, NodedServiceToken,
@@ -31,6 +34,16 @@ pub trait SemanticNodeTransport: Send + Sync {
     ) -> NodeClientFuture<NodeRegistrationResponse>;
 
     fn heartbeat(&self, request: NodeHeartbeatRequest) -> NodeClientFuture<NodeHeartbeatResponse>;
+
+    /// Deliver one ordered batch of cumulative usage checkpoints.
+    ///
+    /// Usage is observation, never authority: a failure here is retried by the
+    /// producer and must not affect registration, heartbeat or any runtime
+    /// effect.
+    fn report_usage(
+        &self,
+        request: IngestUsageCheckpointsRequest,
+    ) -> NodeClientFuture<IngestUsageCheckpointsResponse>;
 }
 
 #[derive(Clone)]
@@ -113,6 +126,14 @@ impl SemanticNodeTransport for HttpSemanticNodeTransport {
             request.validate().context("validate Node registration")?;
             client.post(CONTROL_NODE_REGISTER_PATH, &request).await
         })
+    }
+
+    fn report_usage(
+        &self,
+        request: IngestUsageCheckpointsRequest,
+    ) -> NodeClientFuture<IngestUsageCheckpointsResponse> {
+        let client = self.clone();
+        Box::pin(async move { client.post(USAGE_CHECKPOINTS_PATH, &request).await })
     }
 
     fn heartbeat(&self, request: NodeHeartbeatRequest) -> NodeClientFuture<NodeHeartbeatResponse> {
@@ -376,6 +397,31 @@ mod tests {
         ) -> NodeClientFuture<NodeHeartbeatResponse> {
             let response = self.heartbeats.lock().expect("lock heartbeats").pop_front();
             Box::pin(async move { Ok(response.expect("heartbeat response")) })
+        }
+
+        fn report_usage(
+            &self,
+            request: IngestUsageCheckpointsRequest,
+        ) -> NodeClientFuture<IngestUsageCheckpointsResponse> {
+            let results = request
+                .checkpoints
+                .iter()
+                .map(
+                    |checkpoint| cats_api::metering::UsageCheckpointIngestResult {
+                        event_id: checkpoint.event_id.clone(),
+                        outcome: cats_api::metering::UsageCheckpointIngestOutcome::Accepted,
+                        reason: None,
+                    },
+                )
+                .collect::<Vec<_>>();
+            Box::pin(async move {
+                Ok(IngestUsageCheckpointsResponse {
+                    accepted: results.len() as u64,
+                    duplicates: 0,
+                    rejected: Vec::new(),
+                    results,
+                })
+            })
         }
     }
 

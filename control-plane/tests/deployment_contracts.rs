@@ -4158,3 +4158,28 @@ fn guest_release_shell_entrypoints_parse() {
         );
     }
 }
+
+/// ADR-0011 meters each Cat runtime from its own cgroup v2 counters. That is
+/// only possible inside a delegated subtree with the CPU and memory controllers
+/// available to children, so every unit that runs `cats-noded` must ask systemd
+/// for it. Without this the Node still serves and every bill is a silent zero.
+#[test]
+fn every_node_unit_delegates_the_cpu_and_memory_controllers() {
+    for unit_path in [
+        "deploy/aws/metal/cats-worker.service",
+        "deploy/metal/systemd/cats-noded.service",
+    ] {
+        let unit = read_workspace_file(unit_path);
+        assert!(
+            unit.contains("cats-noded"),
+            "{unit_path} is expected to run the Node agent"
+        );
+        assert!(
+            unit.lines().any(|line| {
+                let line = line.trim();
+                line.starts_with("Delegate=") && line.contains("cpu") && line.contains("memory")
+            }),
+            "{unit_path} must delegate the cpu and memory controllers for per-Cat metering"
+        );
+    }
+}

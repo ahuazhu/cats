@@ -1302,6 +1302,7 @@ dependencies = [
  "cats-api",
  "cats-blockd",
  "cats-control-plane",
+ "cats-metering",
  "cats-storage",
  "cats-test-support",
  "hex",

@@ -1,0 +1,491 @@
+//! Real PostgreSQL plus HTTP acceptance coverage for Node usage ingestion.
+//!
+//! The regression these guard is a silent one: with no producer wired to the
+//! ledger, every billing read is a well-formed zero. Each test therefore ends
+//! on the customer-visible number, not on an internal counter.
+
+use std::sync::Arc;
+
+use cats_api::metering::{
+    CatUsageCheckpoint, IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse, UsageMetric,
+    USAGE_CHECKPOINTS_PATH,
+};
+use cats_api::runtime_reconciliation::{Epoch, Id, NodeBootId, RandomId128, SessionBinding};
+use cats_api::semantic_control::{NodedServiceToken, NODED_AUTHORIZATION_HEADER};
+use cats_control_plane::server::{Config, Handle};
+use cats_control_plane::store::DsnSource;
+use cats_control_plane::testsupport::spawn_control_plane_for_test as spawn;
+use cats_metering::{deterministic_event_id, SqliteUsageStore};
+use reqwest::StatusCode;
+
+const SERVICE_TOKEN: &str = "semantic-usage-service-token";
+const ADMIN_TOKEN: &str = "semantic-usage-admin-token";
+const NODED_TOKEN: &str = "semantic-usage-noded-token-000000";
+const NODE_ID: &str = "node_metal-1";
+const CAT_ID: &str = "cat_d207de919a91";
+const WORKSPACE_ID: &str = "ws_usage";
+const OTHER_WORKSPACE_ID: &str = "ws_usage_other";
+const BILLING_ACCOUNT_ID: &str = "billing_usage";
+const SOURCE_EPOCH: &str = "0f7a2c1d9b3e4f5061728394a5b6c7d8";
+
+struct Context {
+    _dir: tempfile::TempDir,
+    server: Handle,
+    http: reqwest::Client,
+    dsn: String,
+}
+
+async fn context() -> Context {
+    let dir = tempfile::tempdir().unwrap();
+    let usage = Arc::new(SqliteUsageStore::open(&dir.path().join("usage.db")).unwrap());
+    let dsn = cats_control_plane::testsupport::isolated_control_store_url();
+    let server = spawn(Config {
+        listen: "127.0.0.1:0".into(),
+        control_store_dsn: DsnSource::Literal(dsn.clone()),
+        control_store_ca_file: None,
+        usage_store: usage.clone(),
+        credit_store: usage,
+        image_blob: cats_control_plane::testsupport::unavailable_image_blob(),
+        auth_token: SERVICE_TOKEN.into(),
+        noded_service_token: NODED_TOKEN.into(),
+        guest_runtime_profile_receipt:
+            cats_control_plane::testsupport::test_guest_runtime_profile_receipt(),
+        runtime_provisioner_trust_bundle:
+            cats_control_plane::testsupport::test_runtime_provisioner_trust_bundle(),
+        production_cutover_operator_trust_bundle:
+            cats_control_plane::testsupport::test_production_cutover_operator_trust_bundle(),
+        admin_token: ADMIN_TOKEN.into(),
+        workos: None,
+        stripe: None,
+        billing_enforcement_enabled: false,
+    })
+    .await
+    .unwrap();
+    let context = Context {
+        _dir: dir,
+        server,
+        http: reqwest::Client::new(),
+        dsn,
+    };
+    context.seed();
+    context
+}
+
+impl Context {
+    fn with_db<T: Send>(&self, operation: impl FnOnce(&mut postgres::Client) -> T + Send) -> T {
+        let dsn = self.dsn.clone();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    let mut client =
+                        postgres::Client::connect(&dsn, postgres::NoTls).expect("connect");
+                    operation(&mut client)
+                })
+                .join()
+                .unwrap()
+        })
+    }
+
+    fn seed(&self) {
+        self.with_db(|client| {
+            client
+                .batch_execute(&format!(
+                    "INSERT INTO accounts (
+                        id,slug,display_name,kind,workos_organization_id,billing_account_id,
+                        personal_owner_user_id,status,created_at
+                     ) VALUES (
+                        'acct_usage','usage','Usage','organization','org_usage',
+                        '{BILLING_ACCOUNT_ID}',NULL,'active',1
+                     );
+                     INSERT INTO workspaces (id,account_id,slug,display_name,is_default,created_at)
+                     VALUES ('{WORKSPACE_ID}','acct_usage','default','Default',TRUE,1),
+                            ('{OTHER_WORKSPACE_ID}','acct_usage','other','Other',FALSE,1);
+                     INSERT INTO nodes (
+                        node_id,node_name,control_endpoint,vendor,region,zone,instance_id,
+                        machine_type,node_version,status,created_at,updated_at
+                     ) VALUES (
+                        '{NODE_ID}','metal-1','http://10.0.0.1:7301','aws','us-east-1',
+                        'us-east-1a','i-usage','c5d.metal','1.0.0','running',1,1
+                     );
+                     INSERT INTO cats (
+                        cat_id,workspace_id,cat_slug,state,node_id,cpu_count,memory_bytes,
+                        boot_image,created_at,updated_at
+                     ) VALUES (
+                        '{CAT_ID}','{WORKSPACE_ID}','shell','running','{NODE_ID}',2,
+                        2147483648,'sha256:image',1,1
+                     );"
+                ))
+                .expect("seed billing owners and a running Cat");
+        });
+    }
+
+    async fn ingest(
+        &self,
+        token: &str,
+        checkpoints: Vec<CatUsageCheckpoint>,
+    ) -> (StatusCode, Option<IngestUsageCheckpointsResponse>) {
+        let request = IngestUsageCheckpointsRequest {
+            session: producer(),
+            node_id: NODE_ID.to_owned(),
+            checkpoints,
+        };
+        let response = self
+            .http
+            .post(format!(
+                "{}{USAGE_CHECKPOINTS_PATH}",
+                self.server.base_url()
+            ))
+            .header(
+                NODED_AUTHORIZATION_HEADER,
+                NodedServiceToken::new(token.to_owned())
+                    .expect("service token")
+                    .authorization_value(),
+            )
+            .json(&request)
+            .send()
+            .await
+            .expect("usage ingestion request");
+        let status = response.status();
+        let body = response.json::<IngestUsageCheckpointsResponse>().await.ok();
+        (status, body)
+    }
+
+    async fn usage_report(&self, workspace: &str) -> cats_api::metering::UsageReport {
+        self.http
+            .get(format!(
+                "{}/v1/workspaces/{workspace}/billing/usage?from_ms=0&to_ms=99999999999999",
+                self.server.base_url()
+            ))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {ADMIN_TOKEN}"),
+            )
+            .send()
+            .await
+            .expect("usage report request")
+            .json::<cats_api::metering::UsageReport>()
+            .await
+            .expect("usage report body")
+    }
+
+    async fn provisional_usage_nanos(&self, workspace: &str) -> u128 {
+        let balance = self
+            .http
+            .get(format!(
+                "{}/v1/workspaces/{workspace}/billing/balance",
+                self.server.base_url()
+            ))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {ADMIN_TOKEN}"),
+            )
+            .send()
+            .await
+            .expect("balance request")
+            .json::<cats_api::billing::BillingBalance>()
+            .await
+            .expect("balance body");
+        balance
+            .provisional_usage_nanos
+            .parse()
+            .expect("provisional usage is an integer")
+    }
+}
+
+fn producer() -> SessionBinding {
+    SessionBinding {
+        node_id: Id::new(NODE_ID).expect("node id"),
+        node_boot_id: NodeBootId::new("aaaaaaaabbbbbbbbccccccccdddddddd").expect("boot id"),
+        agent_instance_id: RandomId128::new("11111111222222223333333344444444")
+            .expect("instance id"),
+        agent_session_epoch: Epoch::new(1_700_000_000).expect("session epoch"),
+    }
+}
+
+fn checkpoint(
+    cat_id: &str,
+    source_epoch: &str,
+    sequence: u64,
+    metric: UsageMetric,
+    cumulative_quantity: u128,
+) -> CatUsageCheckpoint {
+    let mut checkpoint = CatUsageCheckpoint {
+        event_id: String::new(),
+        source_id: format!("node/{NODE_ID}/cat/{cat_id}"),
+        source_epoch: source_epoch.to_owned(),
+        sequence,
+        observed_at_unix_ms: 1_000 + (sequence as i64) * 10_000,
+        cat_id: cat_id.to_owned(),
+        cat_generation: 1,
+        metric,
+        epoch_marker: cats_api::metering::UsageEpochMarker::Open,
+        cumulative_quantity,
+    };
+    checkpoint.event_id = deterministic_event_id(&checkpoint);
+    checkpoint
+}
+
+/// One CPU-hour and one GiB-hour, so the rated total is exactly the published
+/// Rate Card figures and a silent zero cannot pass.
+fn one_cpu_hour_and_one_gib_hour(sequence: u64) -> Vec<CatUsageCheckpoint> {
+    vec![
+        checkpoint(
+            CAT_ID,
+            SOURCE_EPOCH,
+            sequence,
+            UsageMetric::CpuUsec,
+            3_600_000_000,
+        ),
+        checkpoint(
+            CAT_ID,
+            SOURCE_EPOCH,
+            sequence,
+            UsageMetric::MemoryByteMillis,
+            1_073_741_824 * 3_600_000,
+        ),
+    ]
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn node_checkpoints_become_the_workspace_bill() {
+    let context = context().await;
+    assert_eq!(
+        context.provisional_usage_nanos(WORKSPACE_ID).await,
+        0,
+        "a Workspace with no delivered usage starts at zero"
+    );
+
+    // The baseline checkpoint establishes the counter; it is not yet an
+    // interval, so it must not move money on its own.
+    let (status, body) = context
+        .ingest(NODED_TOKEN, one_cpu_hour_and_one_gib_hour(0))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let body = body.expect("ingest body");
+    assert_eq!(body.accepted, 2);
+    assert_eq!(body.rejected.len(), 0);
+    assert_eq!(context.provisional_usage_nanos(WORKSPACE_ID).await, 0);
+
+    // The next cumulative sample closes one interval of exactly one CPU-hour
+    // and one GiB-hour: $0.07 + $0.045 = 115_000_000 nanos.
+    let (status, body) = context
+        .ingest(
+            NODED_TOKEN,
+            vec![
+                checkpoint(
+                    CAT_ID,
+                    SOURCE_EPOCH,
+                    1,
+                    UsageMetric::CpuUsec,
+                    2 * 3_600_000_000,
+                ),
+                checkpoint(
+                    CAT_ID,
+                    SOURCE_EPOCH,
+                    1,
+                    UsageMetric::MemoryByteMillis,
+                    2 * 1_073_741_824 * 3_600_000,
+                ),
+            ],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body.expect("ingest body").accepted, 2);
+    assert_eq!(
+        context.provisional_usage_nanos(WORKSPACE_ID).await,
+        115_000_000,
+        "the rated bill is the Rate Card applied to the delivered interval"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replayed_checkpoints_never_bill_twice() {
+    let context = context().await;
+    let (status, _) = context
+        .ingest(NODED_TOKEN, one_cpu_hour_and_one_gib_hour(0))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = context
+        .ingest(
+            NODED_TOKEN,
+            vec![
+                checkpoint(
+                    CAT_ID,
+                    SOURCE_EPOCH,
+                    1,
+                    UsageMetric::CpuUsec,
+                    2 * 3_600_000_000,
+                ),
+                checkpoint(
+                    CAT_ID,
+                    SOURCE_EPOCH,
+                    1,
+                    UsageMetric::MemoryByteMillis,
+                    2 * 1_073_741_824 * 3_600_000,
+                ),
+            ],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let billed = context.provisional_usage_nanos(WORKSPACE_ID).await;
+    assert_eq!(billed, 115_000_000);
+
+    // A durable producer redelivers an already-settled prefix after a
+    // transport failure. It must settle as a replay, not as new money.
+    let (status, body) = context
+        .ingest(
+            NODED_TOKEN,
+            vec![
+                checkpoint(
+                    CAT_ID,
+                    SOURCE_EPOCH,
+                    1,
+                    UsageMetric::CpuUsec,
+                    2 * 3_600_000_000,
+                ),
+                checkpoint(
+                    CAT_ID,
+                    SOURCE_EPOCH,
+                    1,
+                    UsageMetric::MemoryByteMillis,
+                    2 * 1_073_741_824 * 3_600_000,
+                ),
+            ],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let body = body.expect("ingest body");
+    assert_eq!(body.duplicates, 2);
+    assert_eq!(body.accepted, 0);
+    assert_eq!(context.provisional_usage_nanos(WORKSPACE_ID).await, billed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_source_epoch_keeps_the_owner_it_was_frozen_with() {
+    let context = context().await;
+    let (status, _) = context
+        .ingest(NODED_TOKEN, one_cpu_hour_and_one_gib_hour(0))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Whatever happens to the Cat afterwards, the epoch's money stays with the
+    // owner that was frozen when the epoch opened.
+    context.with_db(|client| {
+        client
+            .execute(
+                "UPDATE cats SET workspace_id=$1 WHERE cat_id=$2",
+                &[&OTHER_WORKSPACE_ID, &CAT_ID],
+            )
+            .expect("move the Cat to another Workspace");
+    });
+
+    let (status, body) = context
+        .ingest(
+            NODED_TOKEN,
+            vec![checkpoint(
+                CAT_ID,
+                SOURCE_EPOCH,
+                1,
+                UsageMetric::CpuUsec,
+                2 * 3_600_000_000,
+            )],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body.expect("ingest body").accepted, 1);
+    let frozen = context.usage_report(WORKSPACE_ID).await;
+    assert_eq!(
+        frozen.amount_nanos, "70000000",
+        "the frozen Workspace still owns the epoch: {frozen:?}"
+    );
+    let moved = context.usage_report(OTHER_WORKSPACE_ID).await;
+    assert_eq!(
+        moved.amount_nanos, "0",
+        "the Cat's new Workspace must not inherit the frozen epoch: {moved:?}"
+    );
+    assert!(moved.cats.is_empty(), "{moved:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unownable_checkpoint_is_named_and_does_not_block_the_batch() {
+    let context = context().await;
+    let (status, body) = context
+        .ingest(
+            NODED_TOKEN,
+            vec![
+                checkpoint(
+                    "cat_000000000001",
+                    SOURCE_EPOCH,
+                    0,
+                    UsageMetric::CpuUsec,
+                    1_000,
+                ),
+                checkpoint(CAT_ID, SOURCE_EPOCH, 0, UsageMetric::CpuUsec, 3_600_000_000),
+            ],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let body = body.expect("ingest body");
+    assert_eq!(body.rejected.len(), 1, "{body:?}");
+    assert_eq!(body.rejected[0].event_id, {
+        let unknown = checkpoint(
+            "cat_000000000001",
+            SOURCE_EPOCH,
+            0,
+            UsageMetric::CpuUsec,
+            1_000,
+        );
+        unknown.event_id
+    });
+    assert_eq!(body.accepted, 1, "the owned checkpoint behind it settles");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn usage_ingestion_requires_the_node_service_token() {
+    let context = context().await;
+    let (status, _) = context
+        .ingest(
+            "semantic-usage-wrong-token-000000",
+            one_cpu_hour_and_one_gib_hour(0),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(context.provisional_usage_nanos(WORKSPACE_ID).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_checkpoint_may_not_claim_another_producer() {
+    let context = context().await;
+    let request = IngestUsageCheckpointsRequest {
+        session: producer(),
+        node_id: NODE_ID.to_owned(),
+        checkpoints: vec![checkpoint(
+            CAT_ID,
+            SOURCE_EPOCH,
+            0,
+            UsageMetric::CpuUsec,
+            1_000,
+        )],
+    };
+    let mut forged = request.clone();
+    forged.checkpoints[0].source_id = format!("node/node_metal-2/cat/{CAT_ID}");
+    forged.checkpoints[0].event_id = deterministic_event_id(&forged.checkpoints[0]);
+    let response = context
+        .http
+        .post(format!(
+            "{}{USAGE_CHECKPOINTS_PATH}",
+            context.server.base_url()
+        ))
+        .header(
+            NODED_AUTHORIZATION_HEADER,
+            NodedServiceToken::new(NODED_TOKEN.to_owned())
+                .expect("service token")
+                .authorization_value(),
+        )
+        .json(&forged)
+        .send()
+        .await
+        .expect("forged ingestion request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(context.provisional_usage_nanos(WORKSPACE_ID).await, 0);
+}

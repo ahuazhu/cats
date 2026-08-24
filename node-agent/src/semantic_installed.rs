@@ -49,6 +49,7 @@ use crate::semantic_lifecycle::{
 use crate::semantic_mounts::{
     confirm_complete_mount_set, ExpectedPersistentMount, ExpectedPersistentMountSet,
 };
+use crate::semantic_usage::CatUsageMeters;
 
 const ROOT_DEVICE_SERIAL: &str = "cats-root";
 const ROOT_DISK_SCOPE: &[u8] = b"cats.direct.root-disk.v1\0";
@@ -138,6 +139,9 @@ struct InstalledInner {
     volumes: Arc<dyn CatVolumeStore>,
     volume_data: Arc<dyn VolumeDataAuthority>,
     blob: Arc<dyn BlobStore>,
+    /// Billing observation only. A metering failure is logged and skipped; it
+    /// never fails a lifecycle effect.
+    meters: Arc<CatUsageMeters>,
     cats: Mutex<BTreeMap<String, Arc<PhysicalCatLane>>>,
 }
 
@@ -254,6 +258,7 @@ impl InstalledSemanticCatEffects {
         volumes: Arc<dyn CatVolumeStore>,
         volume_data: Arc<dyn VolumeDataAuthority>,
         blob: Arc<dyn BlobStore>,
+        meters: Arc<CatUsageMeters>,
     ) -> Result<Self> {
         config.validate()?;
         let host_lock = open_host_lock(&config.host_lock)?;
@@ -273,6 +278,7 @@ impl InstalledSemanticCatEffects {
                 volumes,
                 volume_data,
                 blob,
+                meters,
                 cats: Mutex::new(BTreeMap::new()),
             }),
         })
@@ -427,6 +433,7 @@ impl InstalledInner {
                 .context("prepare Guest memory backing")?;
             timings.memory_backing_ms = elapsed_millis(stage_started);
             let stage_started = Instant::now();
+            self.open_meter(&cat);
             let spawned = ch::spawn_vmm_retaining_boot(&ChSpawn {
                 cfg: &self.config.ch,
                 api_sock: &cat.api_socket,
@@ -442,6 +449,7 @@ impl InstalledInner {
             .context("spawn Cloud Hypervisor")?;
             cat.vmm = Some(spawned.child);
             cat.boot_descriptors = spawned.boot_descriptors;
+            self.meter_vmm(&cat);
             timings.vmm_spawn_ms = elapsed_millis(stage_started);
             let stage_started = Instant::now();
             self.wait_for_guest(&mut cat)?;
@@ -1159,6 +1167,7 @@ impl InstalledInner {
             })
             .context("restore Cloud Hypervisor from Warm snapshot")?,
         );
+        self.meter_vmm(cat);
         let deadline = deadline_after(self.config.effect_timeout)?;
         loop {
             if let Some(status) = cat
@@ -1215,6 +1224,7 @@ impl InstalledInner {
             self.stop_vmm(cat);
         }
         self.stop_frontends(cat, true)?;
+        self.meters.close(cat.cat_id.as_str());
         cat.state = CatState::Cold;
         if release_volumes {
             for volume in &cat.volumes {
@@ -1236,11 +1246,40 @@ impl InstalledInner {
         }
         self.stop_vmm(cat);
         let _ = self.stop_frontends(cat, false);
+        self.meters.close(cat.cat_id.as_str());
     }
 
     fn stop_vmm(&self, cat: &mut ManagedCat) {
         if let Some(mut child) = cat.vmm.take() {
             stop_child(&mut child, Duration::from_secs(2));
+        }
+    }
+
+    /// Open the billing meter for this Cat runtime. The runtime incarnation is
+    /// the usage source epoch: a replaced runtime bills from its own baseline
+    /// and can never continue an older epoch's counters.
+    fn open_meter(&self, cat: &ManagedCat) {
+        if let Err(error) = self.meters.open(&cat.cat_id, &cat.runtime_incarnation) {
+            tracing::error!(
+                cat_id = cat.cat_id.as_str(),
+                error = %format!("{error:#}"),
+                "could not open the Cat usage meter; this runtime will not be billed"
+            );
+        }
+    }
+
+    /// Charge the live VMM to the Cat's meter. Called for the fresh launch and
+    /// again for every Warm restore into the same runtime epoch.
+    fn meter_vmm(&self, cat: &ManagedCat) {
+        let Some(vmm) = cat.vmm.as_ref() else {
+            return;
+        };
+        if let Err(error) = self.meters.place(cat.cat_id.as_str(), vmm.id()) {
+            tracing::error!(
+                cat_id = cat.cat_id.as_str(),
+                error = %format!("{error:#}"),
+                "could not charge the Guest VMM to the Cat usage meter"
+            );
         }
     }
 
@@ -1916,6 +1955,10 @@ mod tests {
             Arc::clone(&volumes) as Arc<dyn CatVolumeStore>,
             Arc::new(UnusedVolumeData),
             Arc::new(MissingBlob),
+            Arc::new(
+                CatUsageMeters::new(Id::new("node_test").expect("node id"), None)
+                    .expect("unmetered test Node"),
+            ),
         )
         .expect("installed effects");
         assert!(golden_root_cache_directory.is_dir());
