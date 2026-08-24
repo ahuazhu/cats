@@ -5,6 +5,7 @@
 - 相关：[ADR-0014](0014-account-workspace-identity-billing-and-switching.md)、
   [ADR-0018](0018-remove-the-v1-project-compatibility-layer.md)、
   [ADR-0040](0040-level-triggered-runtime-reconciliation.md)
+- 当前生产者与投递权威：[ADR-0063](0063-semantic-node-usage-metering.md)
 
 ## 背景
 

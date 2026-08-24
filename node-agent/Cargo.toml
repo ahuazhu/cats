@@ -17,6 +17,7 @@ proposed-node-residue-reclamation = [
 [dependencies]
 cats-api = { workspace = true }
 cats-blockd = { workspace = true }
+cats-metering = { workspace = true }
 cats-storage = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }

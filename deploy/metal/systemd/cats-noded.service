@@ -4,6 +4,10 @@ After=cats-controld.service
 Wants=cats-controld.service
 
 [Service]
+# Per-Cat cgroup v2 billing (ADR-0011) needs a delegated subtree with these two
+# controllers available to children. Without it the Node serves normally and
+# meters nothing.
+Delegate=cpu memory
 # Registration identity and reachable address are explicit root-only
 # environment values. The provisioned Host lock prevents a second noded.
 # Controlled stop/restart is permitted only at state=cordoned cats=0/orphans=0.
