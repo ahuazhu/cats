@@ -7,9 +7,7 @@
 use cats_api::metering::{UsageMetric, UsageReport};
 use cats_api::semantic_control::{CatAction, CatState, CatView, DiskView};
 
-use crate::term::{
-    format_age, format_bytes, format_duration, format_timestamp, Align, Cell, Style, Table, Term,
-};
+use crate::term::{format_age, format_bytes, format_timestamp, Align, Cell, Style, Table, Term};
 
 /// Widest detail-card key (`workspace`) plus a space, so every value starts in
 /// the same column.
@@ -248,16 +246,25 @@ fn state_detail(term: Term, cat: &CatView, display: &StateDisplay, now_ms: i64) 
     let updated = i64_from_ms(cat.updated_at_unix_ms);
     let held = now_ms.saturating_sub(updated);
     let rendered = display.cell(term).into_text();
-    // While an action is in flight `updated_at` *is* its start: every
-    // `UPDATE cats` that sets `current_action` writes
-    // `current_action_started_at` and `updated_at` from the same statement
-    // clock, and no other write can touch the row until the action settles.
-    // Once `current_action_started_at` reaches `CatView`, read it directly.
+    // What `updated_at` means depends on whether an action is in flight.
+    //
+    // Settled: the settling write is the last one to touch the row, so it is
+    // exactly when the Cat entered this state.
+    //
+    // In flight: it is an *activity* clock, not the action start.
+    // `refresh_current_action_activity` and the retry rotations bump it while
+    // the same action occurrence continues, deliberately leaving
+    // `current_action_started_at` alone because that timestamp is the
+    // settlement identity. Reporting it as "in flight for" would report a small
+    // number for a long-stuck retried action -- backwards from what a reader
+    // needs. Report what it is until `current_action_started_at` reaches
+    // `CatView`.
     let elapsed = if display.in_flight() {
         format!(
-            "{} {}",
-            term.paint("in flight for", Style::Dim),
-            format_duration(held)
+            "{} {} {}",
+            term.paint("in flight, last activity", Style::Dim),
+            format_age(held),
+            term.paint("ago", Style::Dim),
         )
     } else {
         format!("{} {}", term.paint("for", Style::Dim), format_age(held))
@@ -553,12 +560,20 @@ mod tests {
         assert!(card.contains("sha256:9f2c1d84...8899ab"), "{card}");
         assert!(!card.contains("persistent disks"), "no mounts, no section");
 
+        // An in-flight action reports its last activity, not an invented
+        // action duration: the retry rotations advance `updated_at` while the
+        // same occurrence continues, so calling this the action's age would
+        // under-report a stuck retry.
         let mut moving = cat("web", Some(CatState::Cold), Some(CatAction::Run));
-        moving.updated_at_unix_ms = (NOW - 1_420) as u64;
+        moving.updated_at_unix_ms = (NOW - 90_000) as u64;
         let card = cat_card(term, &moving, None, &[], None, NOW);
         assert!(
-            card.contains("cold -> running in flight for 1.420s"),
+            card.contains("cold -> running in flight, last activity 1m ago"),
             "{card}"
+        );
+        assert!(
+            !card.contains("in flight for"),
+            "`updated_at` is an activity clock while an action runs: {card}"
         );
     }
 

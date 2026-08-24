@@ -1519,9 +1519,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 return Ok(());
             }
             if cats.is_empty() {
-                println!(
-                    "No cats yet. Create one with:\n  cats create NAME --boot-image sha256:DIGEST"
-                );
+                println!("No cats yet. Create one with:\n  cats create NAME");
                 return Ok(());
             }
             println!(
@@ -1914,7 +1912,7 @@ mod tests {
             "node_name": null,
             "cpu": 2,
             "memory_bytes": 2147483648u64,
-            "boot_image": TEST_BOOT_IMAGE,
+            "boot_image": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             "mounts": [],
             "last_error": null,
             "created_at_unix_ms": 1,
