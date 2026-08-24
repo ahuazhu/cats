@@ -1206,6 +1206,9 @@ mod tests {
                 current_action: action,
                 current_action_started_at: action.map(|_| 1),
                 current_action_recovery_started_at: None,
+                last_running_at: state
+                    .is_some_and(|state| matches!(state, StoredCatState::Running))
+                    .then_some(1),
                 current_action_node_id: action.map(|_| "node_01".to_owned()),
                 node_id: state
                     .is_some_and(|state| {

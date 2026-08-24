@@ -1579,6 +1579,167 @@ fn unresolved_stale_actions_rotate_behind_an_untried_claim() {
     assert_eq!(second[0].cat.cat_id, untried);
 }
 
+/// Placement required by `cats_placement_shape_check` for a settled state.
+const fn final_node_for(state: CatState) -> Option<&'static str> {
+    match state {
+        CatState::Running | CatState::Suspended | CatState::Warm | CatState::Failure => {
+            Some("node-a")
+        }
+        CatState::Cold | CatState::Destroyed => None,
+    }
+}
+
+/// Settles the Cat's current action into `final_state`.
+fn settle(store: &Store, cat_id: &str, action: CatAction, final_state: CatState) -> CatRecord {
+    let current = store
+        .find_semantic_cat_by_id(cat_id)
+        .unwrap()
+        .expect("Cat is present");
+    store
+        .finish_semantic_cat_action(
+            cat_id,
+            FinishCatAction {
+                expected_action: action,
+                expected_recovery_started_at: None,
+                expected_node_id: current.current_action_node_id.as_deref(),
+                expected_action_started_at: current
+                    .current_action_started_at
+                    .expect("claim has a start time"),
+                final_state,
+                final_node_id: final_node_for(final_state),
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .unwrap()
+        .expect("exact claim settles")
+}
+
+fn begin(store: &Store, cat_id: &str, action: CatAction) {
+    let BeginCatActionOutcome::Acquired(_) = store
+        .try_begin_semantic_cat_action(cat_id, action, Some("node-a"))
+        .unwrap()
+    else {
+        panic!("{action:?} must be acquired")
+    };
+}
+
+#[test]
+fn last_running_at_records_the_newest_run_and_survives_later_transitions() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+
+    // A Cat still being created has never run.
+    let request = NewCat {
+        cat_id: "cat-last-run",
+        workspace_id: "ws_semantic",
+        cat_slug: "last-run",
+        node_id: "node-a",
+        cpu_count: 2,
+        memory_bytes: 1 << 30,
+        boot_image: "sha256:image",
+    };
+    let CreateCatOutcome::Created(created) = store.create_semantic_cat(request).unwrap() else {
+        panic!("new semantic Cat must be created")
+    };
+    assert_eq!(
+        created.last_running_at, None,
+        "a Cat that has not settled into Running has never run"
+    );
+
+    // Settling create into Running records the run.
+    let running = settle(&store, "cat-last-run", CatAction::Create, CatState::Running);
+    let first_run = running
+        .last_running_at
+        .expect("settling into Running records the run");
+    assert!(first_run >= running.created_at);
+
+    // Leaving Running records when it stopped, which must be later than the
+    // start: this is the field's whole purpose.
+    begin(&store, "cat-last-run", CatAction::Suspend);
+    let suspended = settle(
+        &store,
+        "cat-last-run",
+        CatAction::Suspend,
+        CatState::Suspended,
+    );
+    let stopped = suspended
+        .last_running_at
+        .expect("leaving Running records when it stopped");
+    assert!(
+        stopped >= first_run,
+        "leaving Running advances the stamp: {stopped} < {first_run}"
+    );
+
+    // A transition that touches neither side of Running leaves it alone. This
+    // is what `updated_at` cannot do -- it moves on every change -- and it is
+    // why a Cat that walked running -> suspended -> warm -> cold still reports
+    // when it actually ran.
+    begin(&store, "cat-last-run", CatAction::Warm);
+    let warm = settle(&store, "cat-last-run", CatAction::Warm, CatState::Warm);
+    assert_eq!(warm.last_running_at, Some(stopped));
+    assert!(
+        warm.updated_at >= stopped,
+        "updated_at keeps moving while last_running_at holds"
+    );
+    begin(&store, "cat-last-run", CatAction::Cold);
+    let cold = settle(&store, "cat-last-run", CatAction::Cold, CatState::Cold);
+    assert_eq!(cold.last_running_at, Some(stopped));
+
+    // Running again advances it.
+    begin(&store, "cat-last-run", CatAction::Run);
+    let rerun = settle(&store, "cat-last-run", CatAction::Run, CatState::Running);
+    let second_run = rerun.last_running_at.expect("the second run is recorded");
+    assert!(
+        second_run >= stopped,
+        "a new run advances the stamp: {second_run} < {stopped}"
+    );
+}
+
+#[test]
+fn a_failed_action_that_never_reached_running_records_no_run() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    let request = NewCat {
+        cat_id: "cat-never-ran",
+        workspace_id: "ws_semantic",
+        cat_slug: "never-ran",
+        node_id: "node-a",
+        cpu_count: 2,
+        memory_bytes: 1 << 30,
+        boot_image: "sha256:image",
+    };
+    let CreateCatOutcome::Created(_) = store.create_semantic_cat(request).unwrap() else {
+        panic!("new semantic Cat must be created")
+    };
+    let failed = store
+        .finish_semantic_cat_action(
+            "cat-never-ran",
+            FinishCatAction {
+                expected_action: CatAction::Create,
+                expected_recovery_started_at: None,
+                expected_node_id: Some("node-a"),
+                expected_action_started_at: store
+                    .find_semantic_cat_by_id("cat-never-ran")
+                    .unwrap()
+                    .unwrap()
+                    .current_action_started_at
+                    .unwrap(),
+                final_state: CatState::Failure,
+                final_node_id: Some("node-a"),
+                error_code: Some("guest_start_failed"),
+                error_message: Some("guest never started"),
+            },
+        )
+        .unwrap()
+        .expect("failure settles");
+    assert_eq!(failed.state, Some(CatState::Failure));
+    assert_eq!(
+        failed.last_running_at, None,
+        "a Cat that failed before Running has no run to report"
+    );
+}
+
 #[test]
 fn action_settlement_requires_the_exact_claim_start_time() {
     let (store, _) = store_and_url();

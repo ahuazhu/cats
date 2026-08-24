@@ -424,6 +424,28 @@ pub(crate) fn format_age(elapsed_ms: i64) -> String {
     format!("{}d", hours / 24)
 }
 
+/// Two-unit duration, with millisecond precision below 10s because that is the
+/// range the lifecycle latency targets live in.
+pub(crate) fn format_duration(elapsed_ms: i64) -> String {
+    let millis = elapsed_ms.max(0);
+    if millis < 10_000 {
+        return format!("{}.{:03}s", millis / 1_000, millis % 1_000);
+    }
+    let seconds = millis / 1_000;
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let (minutes, seconds) = (seconds / 60, seconds % 60);
+    if minutes < 60 {
+        return format!("{minutes}m {seconds}s");
+    }
+    let (hours, minutes) = (minutes / 60, minutes % 60);
+    if hours < 24 {
+        return format!("{hours}h {minutes}m");
+    }
+    format!("{}d {}h", hours / 24, hours % 24)
+}
+
 /// Binary byte size. One decimal only when it carries information.
 pub(crate) fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -673,6 +695,22 @@ mod tests {
         assert_eq!(format_age(86_400_000 - 1), "23h");
         assert_eq!(format_age(86_400_000), "1d");
         assert_eq!(format_age(-5), "0s", "clock skew must not print a negative");
+    }
+
+    #[test]
+    fn durations_keep_millisecond_precision_where_the_targets_live() {
+        assert_eq!(format_duration(480), "0.480s");
+        assert_eq!(format_duration(1_420), "1.420s");
+        assert_eq!(format_duration(9_999), "9.999s");
+        assert_eq!(format_duration(10_000), "10s");
+        assert_eq!(format_duration(75_000), "1m 15s");
+        assert_eq!(format_duration(3_600_000 + 720_000), "1h 12m");
+        assert_eq!(format_duration(86_400_000 * 3 + 3_600_000 * 4), "3d 4h");
+        assert_eq!(
+            format_duration(-5),
+            "0.000s",
+            "clock skew must not go negative"
+        );
     }
 
     #[test]

@@ -476,6 +476,23 @@ pub struct CatView {
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
     pub destroyed_at_unix_ms: Option<u64>,
+    /// When the in-flight action started, present exactly while
+    /// `current_action` is.
+    ///
+    /// This is the action's own clock, not `updated_at`: the retry rotations
+    /// and the foreground activity refresh advance `updated_at` while the same
+    /// action occurrence continues, deliberately leaving the start alone
+    /// because it is the settlement identity. A reader that wants "how long has
+    /// this been stuck" must read this field.
+    pub current_action_started_at_unix_ms: Option<u64>,
+    /// Newest time this Cat was recorded settled in Running, or `None` if it
+    /// has never run.
+    ///
+    /// For a Cat running now this is when the current run began. For any other
+    /// state it is when it stopped running, and it survives later transitions,
+    /// so a Cat that went running -> suspended -> warm still reports when it
+    /// last actually ran.
+    pub last_running_at_unix_ms: Option<u64>,
 }
 
 impl CatView {
@@ -492,6 +509,26 @@ impl CatView {
             return Err(SemanticValidationError::Resources);
         }
         if self.updated_at_unix_ms < self.created_at_unix_ms {
+            return Err(SemanticValidationError::Timestamp);
+        }
+        // The action clock is present exactly while the action is, mirroring the
+        // stored `cats_current_action_shape_check`.
+        if self.current_action_started_at_unix_ms.is_some() != self.current_action.is_some() {
+            return Err(SemanticValidationError::Timestamp);
+        }
+        if self
+            .current_action_started_at_unix_ms
+            .is_some_and(|started| started < self.created_at_unix_ms)
+            || self
+                .last_running_at_unix_ms
+                .is_some_and(|ran| ran < self.created_at_unix_ms)
+        {
+            return Err(SemanticValidationError::Timestamp);
+        }
+        // A settled Running Cat has by definition been recorded running, so an
+        // absent stamp is a missed store write rather than a Cat that has never
+        // run. Mirrors `cats_running_records_its_run_check`.
+        if self.state == Some(CatState::Running) && self.last_running_at_unix_ms.is_none() {
             return Err(SemanticValidationError::Timestamp);
         }
         match self.state {
@@ -1221,6 +1258,8 @@ mod tests {
             created_at_unix_ms: 100,
             updated_at_unix_ms: 101,
             destroyed_at_unix_ms: None,
+            current_action_started_at_unix_ms: None,
+            last_running_at_unix_ms: Some(101),
         };
         cat.validate().unwrap();
         let body = serde_json::to_string(&cat).unwrap();
