@@ -36,9 +36,15 @@ ADR-0040 的签名 Runtime spine 写的：Node 侧 usage spool 与签名投递�
    一样以共享 noded service token 认证，不再有 per-request Ed25519 proof、AgentSession fence 或
    Desired revision 校验。理由是这些校验在语义协议下没有可校验的权威可绑定，而账本的幂等性来自
    确定性 `event_id` 与累计量本身。
-4. **归属仍然只由 Control 冻结。** 生产者只报告 Cat、meter 与累计量。Control 用 exact `cats` 行解析
-   Workspace 与 Billing Account，并在该 source epoch 的首个检查点上冻结；同一 epoch 的后续检查点重用
-   冻结结果，因此已销毁或已改属的 Cat 的尾部仍记在原所有者名下，Node 永远不能改变金额的归属。
+4. **归属仍然只由 Control 冻结，并绑定 placement。** 生产者只报告 Cat、meter 与累计量。Control 用
+   exact `cats` 行解析 Workspace 与 Billing Account，并在该 source epoch 的首个检查点上冻结；同一
+   epoch 的后续检查点重用冻结结果，因此已销毁或已改属的 Cat 的尾部仍记在原所有者名下，Node 永远不能
+   改变金额的归属。
+   开启一个新 epoch 还必须证明报告方确实在跑这个 Cat：service token 是 Node fleet 级共享的，所以
+   「认证为某个 Node」不能证明可以给哪些 Cat 记账。Control 因此要求 `cats.node_id` 或
+   `cats.current_action_node_id` 之一等于报告 Node —— 前者是已落定的 placement，后者覆盖首个检查点
+   早于 create 动作结束、以及 planned drain 期间源已落定而目标持有动作这两种真实情况。两者都不匹配的
+   检查点被点名拒绝；这不会伤害 epoch，因为下一条累计样本会重新解析归属。
 5. **计量是观测，不是权威。** 任何 cgroup 建立、采样或投递失败只记录并跳过，绝不影响 Cat 的启动、
    停止或任何物理效果。未投递的检查点在 Node 内存中有界排队；队列溢出丢弃最旧的一条，
    因为累计计数器让后一条携带同样的总量，只可能少计、不可能重复计费。
@@ -48,8 +54,9 @@ ADR-0040 的签名 Runtime spine 写的：Node 侧 usage spool 与签名投递�
 ## 后果
 
 - 计量精度不变：仍然是实际消耗的 cgroup 计数器，而不是 desired allocation 或瞬时 telemetry。
-- 计量的传输权威被削弱为 Node fleet 级共享 token。持有该 token 的 Node 可以为本 Node 上的任意 Cat
-  上报用量；它不能选择付款方，也不能改写已冻结的归属，也不能重复计费同一 `event_id`。
+- 计量的传输权威被削弱为 Node fleet 级共享 token。持有该 token 的 Node 只能为 Control 认定在它上面的
+  Cat 开启用量 epoch；它不能选择付款方，不能给别的 Node 上的 Cat 记账，不能改写已冻结的归属，也不能
+  重复计费同一 `event_id`。
 - Suspended 与 Warm 期间 CPU 计数器自然停止增长，内存按该 cgroup 实际保留的字节继续积分。两个状态都是
   Host-bound 且真的占着本机内存，因此这不是多计，而是与 ADR-0002 的状态语义一致。
 - Node 进程崩溃会丢失尚未投递的尾部（秒级到分钟级），并使下一个 epoch 从新 baseline 开始。这是

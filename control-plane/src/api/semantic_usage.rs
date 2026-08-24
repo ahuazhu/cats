@@ -47,6 +47,18 @@ struct CatAttribution {
     billing_account_id: String,
 }
 
+/// Why a Cat can or cannot open a usage epoch on the reporting Node.
+#[derive(Debug, Clone)]
+enum CatAttributionLookup {
+    Owned(CatAttribution),
+    /// No such Cat in this deployment.
+    Unknown,
+    /// The Cat exists but Control has it somewhere else. The service token is
+    /// shared by the whole Node fleet, so identity alone proves nothing about
+    /// which Cats a caller may charge; placement is what binds the two.
+    NotPlacedHere,
+}
+
 async fn ingest(
     State(app): State<AppState>,
     Extension(state): Extension<Arc<SemanticNodeHttpState>>,
@@ -82,7 +94,7 @@ async fn ingest(
         rejected: Vec::new(),
         results: Vec::with_capacity(request.checkpoints.len()),
     };
-    let mut resolved = BTreeMap::<String, Option<CatAttribution>>::new();
+    let mut resolved = BTreeMap::<String, CatAttributionLookup>::new();
     for checkpoint in request.checkpoints {
         let expected_source = format!("node/{node_id}/cat/{}", checkpoint.cat_id);
         if checkpoint.source_id != expected_source {
@@ -119,27 +131,47 @@ async fn ingest(
                 let current = match resolved.get(&checkpoint.cat_id) {
                     Some(cached) => cached.clone(),
                     None => {
-                        let attribution = resolve_cat_attribution(&app, &checkpoint.cat_id).await?;
-                        resolved.insert(checkpoint.cat_id.clone(), attribution.clone());
-                        attribution
+                        let lookup =
+                            resolve_cat_attribution(&app, &checkpoint.cat_id, &node_id).await?;
+                        resolved.insert(checkpoint.cat_id.clone(), lookup.clone());
+                        lookup
                     }
                 };
-                let Some(current) = current else {
-                    // Permanently unacceptable: without an owner there is no
-                    // account to bill, and no retry can produce one. Naming it
-                    // lets the producer drop it instead of blocking the queue.
-                    let reason =
-                        "checkpoint Cat has no billing owner in this deployment".to_owned();
-                    response.rejected.push(RejectedCheckpoint {
-                        event_id: checkpoint.event_id.clone(),
-                        reason: reason.clone(),
-                    });
-                    response.results.push(UsageCheckpointIngestResult {
-                        event_id: checkpoint.event_id,
-                        outcome: UsageCheckpointIngestOutcome::Rejected,
-                        reason: Some(reason),
-                    });
-                    continue;
+                let current = match current {
+                    CatAttributionLookup::Owned(attribution) => attribution,
+                    // Named, not retried: the ordered batch behind it still
+                    // settles and the producer stops resending this event. A
+                    // Node whose placement row has not caught up yet loses one
+                    // checkpoint, not the epoch, because the next cumulative
+                    // sample resolves attribution again from scratch.
+                    other => {
+                        let reason = match other {
+                            CatAttributionLookup::Unknown => {
+                                "checkpoint Cat has no billing owner in this deployment"
+                            }
+                            CatAttributionLookup::NotPlacedHere => {
+                                "checkpoint Cat is not placed on the reporting Node"
+                            }
+                            CatAttributionLookup::Owned(_) => unreachable!("handled above"),
+                        }
+                        .to_owned();
+                        tracing::warn!(
+                            node_id = node_id.as_str(),
+                            cat_id = checkpoint.cat_id.as_str(),
+                            reason = reason.as_str(),
+                            "refused a usage checkpoint"
+                        );
+                        response.rejected.push(RejectedCheckpoint {
+                            event_id: checkpoint.event_id.clone(),
+                            reason: reason.clone(),
+                        });
+                        response.results.push(UsageCheckpointIngestResult {
+                            event_id: checkpoint.event_id,
+                            outcome: UsageCheckpointIngestOutcome::Rejected,
+                            reason: Some(reason),
+                        });
+                        continue;
+                    }
                 };
                 UsageAttribution {
                     billing_account_id: current.billing_account_id,
@@ -198,19 +230,33 @@ async fn ingest(
     Ok(Json(response))
 }
 
+/// Resolve who pays for a Cat, and prove the reporting Node may charge it.
+///
+/// `node_id` is accepted from either the settled placement or the Node that
+/// currently owns an in-progress action on the Cat: a create publishes its
+/// first checkpoint while `cats.node_id` is still NULL, and a planned drain
+/// leaves the source settled while the target owns the action. Both of those
+/// Nodes really are running the Cat.
 async fn resolve_cat_attribution(
     app: &AppState,
     cat_id: &str,
-) -> Result<Option<CatAttribution>, SemanticNodeHttpFailure> {
+    node_id: &str,
+) -> Result<CatAttributionLookup, SemanticNodeHttpFailure> {
     let lookup = cat_id.to_owned();
+    let reporter = node_id.to_owned();
     let resolved = app
         .store
         .execute(move |store| {
             let Some(cat) = store.find_semantic_cat_by_id(&lookup)? else {
-                return Ok(None);
+                return Ok(CatAttributionLookup::Unknown);
             };
+            let placed_here = cat.node_id.as_deref() == Some(reporter.as_str())
+                || cat.current_action_node_id.as_deref() == Some(reporter.as_str());
+            if !placed_here {
+                return Ok(CatAttributionLookup::NotPlacedHere);
+            }
             let ledger = store.billing_ledger_for_workspace(&cat.workspace_id)?;
-            Ok(Some(CatAttribution {
+            Ok(CatAttributionLookup::Owned(CatAttribution {
                 workspace_id: cat.workspace_id,
                 billing_account_id: ledger.billing_account_id,
             }))

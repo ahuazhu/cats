@@ -67,26 +67,27 @@ async fn context() -> Context {
         http: reqwest::Client::new(),
         dsn,
     };
-    context.seed();
+    context.seed().await;
     context
 }
 
 impl Context {
-    fn with_db<T: Send>(&self, operation: impl FnOnce(&mut postgres::Client) -> T + Send) -> T {
+    /// The control store client is synchronous, so every statement goes through
+    /// Tokio's blocking boundary rather than holding an async worker.
+    async fn with_db<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut postgres::Client) -> T + Send + 'static,
+    ) -> T {
         let dsn = self.dsn.clone();
-        std::thread::scope(|scope| {
-            scope
-                .spawn(move || {
-                    let mut client =
-                        postgres::Client::connect(&dsn, postgres::NoTls).expect("connect");
-                    operation(&mut client)
-                })
-                .join()
-                .unwrap()
+        tokio::task::spawn_blocking(move || {
+            let mut client = postgres::Client::connect(&dsn, postgres::NoTls).expect("connect");
+            operation(&mut client)
         })
+        .await
+        .expect("join control store statement")
     }
 
-    fn seed(&self) {
+    async fn seed(&self) {
         self.with_db(|client| {
             client
                 .batch_execute(&format!(
@@ -116,7 +117,8 @@ impl Context {
                      );"
                 ))
                 .expect("seed billing owners and a running Cat");
-        });
+        })
+        .await;
     }
 
     async fn ingest(
@@ -370,14 +372,16 @@ async fn a_source_epoch_keeps_the_owner_it_was_frozen_with() {
 
     // Whatever happens to the Cat afterwards, the epoch's money stays with the
     // owner that was frozen when the epoch opened.
-    context.with_db(|client| {
-        client
-            .execute(
-                "UPDATE cats SET workspace_id=$1 WHERE cat_id=$2",
-                &[&OTHER_WORKSPACE_ID, &CAT_ID],
-            )
-            .expect("move the Cat to another Workspace");
-    });
+    context
+        .with_db(|client| {
+            client
+                .execute(
+                    "UPDATE cats SET workspace_id=$1 WHERE cat_id=$2",
+                    &[&OTHER_WORKSPACE_ID, &CAT_ID],
+                )
+                .expect("move the Cat to another Workspace");
+        })
+        .await;
 
     let (status, body) = context
         .ingest(
@@ -438,6 +442,116 @@ async fn an_unownable_checkpoint_is_named_and_does_not_block_the_batch() {
         unknown.event_id
     });
     assert_eq!(body.accepted, 1, "the owned checkpoint behind it settles");
+}
+
+/// The noded service token is shared by the whole Node fleet, so authenticating
+/// as *a* Node proves nothing about which Cats the caller may charge. Without a
+/// placement binding, any Node could inflate any customer's bill.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_cannot_charge_a_cat_placed_on_another_node() {
+    let context = context().await;
+    context
+        .with_db(|client| {
+            client
+                .batch_execute(&format!(
+                    "INSERT INTO nodes (
+                        node_id,node_name,control_endpoint,vendor,region,zone,instance_id,
+                        machine_type,node_version,status,created_at,updated_at
+                     ) VALUES (
+                        'node_metal-2','metal-2','http://10.0.0.2:7301','aws','us-east-1',
+                        'us-east-1b','i-usage-2','c5d.metal','1.0.0','running',1,1
+                     );
+                     UPDATE cats SET node_id='node_metal-2' WHERE cat_id='{CAT_ID}';"
+                ))
+                .expect("place the Cat on the other Node");
+        })
+        .await;
+
+    let (status, body) = context
+        .ingest(NODED_TOKEN, one_cpu_hour_and_one_gib_hour(0))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let body = body.expect("ingest body");
+    assert_eq!(body.accepted, 0);
+    assert_eq!(body.rejected.len(), 2, "{body:?}");
+    assert!(
+        body.rejected[0]
+            .reason
+            .contains("not placed on the reporting Node"),
+        "{body:?}"
+    );
+    assert_eq!(context.provisional_usage_nanos(WORKSPACE_ID).await, 0);
+}
+
+/// A fresh Cat publishes its first checkpoint about a second after the VMM
+/// starts, while `cats.node_id` is still NULL and the create action holds the
+/// placement. Rejecting that would silently un-bill every Cat's first seconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cat_mid_action_on_the_reporting_node_still_bills() {
+    let context = context().await;
+    context
+        .with_db(|client| {
+            client
+                .execute(
+                    "UPDATE cats
+                        SET state=NULL, node_id=NULL, current_action='create',
+                            current_action_started_at=1, current_action_node_id=$1
+                      WHERE cat_id=$2",
+                    &[&NODE_ID, &CAT_ID],
+                )
+                .expect("leave the Cat mid-create on the reporting Node");
+        })
+        .await;
+
+    let (status, body) = context
+        .ingest(NODED_TOKEN, one_cpu_hour_and_one_gib_hour(0))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body.expect("ingest body").accepted, 2);
+}
+
+/// The epoch's closing sample arrives after the Cat has left the Node. It must
+/// still settle: the frozen attribution answers before placement is consulted,
+/// which is what makes the placement check safe to add.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_final_sample_of_a_departed_cat_still_bills_its_owner() {
+    let context = context().await;
+    let (status, _) = context
+        .ingest(NODED_TOKEN, one_cpu_hour_and_one_gib_hour(0))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    context
+        .with_db(|client| {
+            client
+                .execute(
+                    "UPDATE cats
+                        SET state='destroyed', node_id=NULL, destroyed_at=2
+                      WHERE cat_id=$1",
+                    &[&CAT_ID],
+                )
+                .expect("destroy the Cat");
+        })
+        .await;
+
+    let (status, body) = context
+        .ingest(
+            NODED_TOKEN,
+            vec![checkpoint(
+                CAT_ID,
+                SOURCE_EPOCH,
+                1,
+                UsageMetric::CpuUsec,
+                2 * 3_600_000_000,
+            )],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body.expect("ingest body").accepted, 1);
+    assert_eq!(
+        context.provisional_usage_nanos(WORKSPACE_ID).await,
+        70_000_000,
+        "the closed epoch's CPU interval still bills the frozen owner"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
