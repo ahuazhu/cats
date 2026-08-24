@@ -2,7 +2,7 @@
 
 1. Sign in at [the user console](/user/).
 2. Choose the Workspace that will own the resource.
-3. Create a Cat with a lowercase name, exact `sha256:` boot-image digest, CPU, memory, RootDisk size, and durability.
+3. Create a Cat with a lowercase name, CPU, memory, RootDisk size, and durability. Control automatically selects the current qualified boot image.
 4. Keep the returned Cat and Operation IDs. The console can list and inspect the current projection.
 
 Cat create is browser-persistent. If the server commits but the response is lost, reload or refresh replays the exact path, canonical body, and Idempotency-Key.
@@ -12,7 +12,7 @@ The console also creates PersistentDisks. Its closed durability default is Stric
 ## Create with the CLI
 
     cats login
-    cats create dev --boot-image-digest sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --cpus 2 --memory 2GiB --root-size 1GiB --durability strict
+    cats create dev --cpus 2 --memory 2GiB --root-size 1GiB --durability strict
     cats ls
     cats get cat_…
     cats operation wait op_…

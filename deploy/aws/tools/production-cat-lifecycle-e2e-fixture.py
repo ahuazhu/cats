@@ -112,7 +112,6 @@ def main() -> int:
             token_file=token_file,
             qualification_begin_receipt=qualification_file,
             workspace_id="ws_fixture",
-            boot_image_digest="sha256:" + "1" * 64,
             cat_name="release-e2e",
             disk_name="release-disk",
             disk_size="1GiB",

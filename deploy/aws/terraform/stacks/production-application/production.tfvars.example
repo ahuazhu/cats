@@ -16,6 +16,7 @@ maintenance_mode = false
 enable_public_ingress = false
 
 control_plane_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/cats-control-plane@sha256:REPLACE_WITH_64_HEX_CHARACTERS"
+default_boot_image_digest = "sha256:REPLACE_WITH_CURRENT_QUALIFIED_GOLDEN_ROOT_DIGEST"
 
 chunkstore_bucket_name   = "REPLACE_WITH_PLATFORM_CHUNKSTORE_BUCKET_OUTPUT"
 chunkstore_prefix        = "cats-fresh"

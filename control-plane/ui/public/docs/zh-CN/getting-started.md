@@ -2,7 +2,7 @@
 
 1. 在[用户控制台](/user/)登录。
 2. 选择拥有该资源的 Workspace。
-3. 使用小写名称、精确 `sha256:` Boot-image Digest、CPU、Memory、RootDisk Size 与 Durability 创建 Cat。
+3. 使用小写名称、CPU、Memory、RootDisk Size 与 Durability 创建 Cat；Control 会自动选择当前已资格化的 Boot Image。
 4. 保存返回的 Cat 与 Operation ID。控制台可以 List 并 Inspect 当前 Projection。
 
 Cat Create 使用浏览器持久化。若服务端已 Commit 但响应丢失，Reload 或 Refresh 会重放完全相同的 Path、Canonical Body 与 Idempotency-Key。
@@ -12,7 +12,7 @@ Cat Create 使用浏览器持久化。若服务端已 Commit 但响应丢失，R
 ## 使用 CLI Create
 
     cats login
-    cats create dev --boot-image-digest sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --cpus 2 --memory 2GiB --root-size 1GiB --durability strict
+    cats create dev --cpus 2 --memory 2GiB --root-size 1GiB --durability strict
     cats ls
     cats get cat_…
     cats operation wait op_…

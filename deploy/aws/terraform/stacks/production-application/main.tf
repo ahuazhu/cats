@@ -32,6 +32,7 @@ module "cats_kubernetes" {
 
   namespace                                     = "cats"
   control_plane_image                           = var.control_plane_image
+  default_boot_image_digest                     = var.default_boot_image_digest
   control_plane_replicas                        = var.control_plane_replicas
   maintenance_mode                              = var.maintenance_mode
   enable_public_ingress                         = var.enable_public_ingress

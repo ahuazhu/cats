@@ -1,6 +1,7 @@
 # Control Plane 与 noded 同步协议设计
 
-- 状态：ADR-0059 已接受，正在实施
+- 状态：ADR-0059 已接受，并由 [ADR-0062](decisions/0062-destroy-preempts-in-progress-cat-actions.md)
+  修正 Destroy 抢占与崩溃恢复；正在实施
 - 范围：Cat、Node、PersistentDisk 的控制面数据模型、同步接口、状态转换与场景语义幂等
 - 切换方式：空数据、单协议直接替换旧 lifecycle 协调；不提供兼容层或数据迁移，实施进度见[执行计划](semantic-control-node-implementation-plan.md)
 
@@ -102,6 +103,7 @@ cats
 - state                     # running/suspended/warm/cold/failure/destroyed；首次create进行中可为空
 - current_action            # create/run/suspend/warm/cold/destroy；空表示没有动作
 - current_action_started_at
+- current_action_recovery_started_at # 后台 scanner 对该 occurrence 的有界恢复 lease；通常为空
 - current_action_node_id    # 本次动作选中的Node；动作结束后清空
 - node_id                   # running/suspended/warm时必填；cold/destroyed时为空
 - cpu_count
@@ -290,7 +292,7 @@ Control Plane 对每个请求按以下顺序处理：
 4. 已满足则返回 `already_done`，不调用 `noded`。
 5. 同一语义资源存在但参数不同则返回 `conflict`。
 6. 同一个动作正在进行时，同步等待它结束，最长不超过本次接口 timeout。
-7. 另一个动作正在进行时返回 `busy`。
+7. 另一个非 destroy 动作正在进行时返回 `busy`；destroy 原子替换当前动作并继承它的目标 Node。
 8. 记录 `current_action` 后提交数据库 transaction。
 9. 在 transaction 外同步调用 `noded`。
 10. 根据结果更新 `state`、`node_id`、`current_action` 和错误字段。
@@ -310,7 +312,7 @@ Control Plane 不在网络调用期间持有数据库 transaction。
 
 - 当前不存在未 `destroyed` 的同 slug Cat：创建新的 `cat_id` 并执行 create，历史同 slug Cat 不影响创建；
 - 已存在、未销毁且 create 配置完全相同：返回 `already_exists` 和已有 Cat；
-- 已存在但 CPU、内存、镜像或初始 mounts 不同：返回 `cat_configuration_conflict`；
+- 已存在但用户选择的 CPU、内存或初始 mounts 不同：返回 `cat_configuration_conflict`；
 - 同一 create 正在进行：等待当前 create 的结果；
 - 其他动作正在进行：返回 `busy`。
 
@@ -318,9 +320,12 @@ Control Plane 不在网络调用期间持有数据库 transaction。
 
 - CPU；
 - 内存；
-- boot image；
 - 按 `disk_id` 排序后的完整 mount 集合；
 - 每个 mount 的 `disk_id` 和 `mount_path`。
+
+Boot image 由 [ADR-0063](decisions/0063-control-owned-default-boot-image.md) 的 Control 部署默认值选择。
+只有插入新 Cat row 时才固化当时的 exact digest；已存在 Cat 的 create replay 不用后来更新的默认值与
+已存 digest 比较。
 
 ### 6.3 状态动作
 
@@ -340,6 +345,10 @@ destroy -> destroyed
 - Cat 正在执行 `run`：等待同一个动作；
 - Cat 为 `suspended/warm/cold`：执行 run；
 - Cat 为 `failure/destroyed`：返回 `invalid_state`。
+
+`destroy` 是唯一可以替换其他进行中动作的状态动作。被替换动作的迟到结果必须用 exact
+`current_action + current_action_node_id` 条件更新拒绝，不能把 Cat 从 destroy lane 写回旧目标或
+`failure`。
 
 ### 6.4 Create Disk
 
@@ -442,7 +451,12 @@ POST /v1/workspaces/{workspace_id}/disks
 POST /v1/workspaces/{workspace_id}/disks/{disk_slug}/actions/attach
 POST /v1/workspaces/{workspace_id}/disks/{disk_slug}/actions/detach
 POST /v1/workspaces/{workspace_id}/disks/{disk_slug}/actions/destroy
+
+POST /v1/admin/nodes/{node_id}/actions/drain
 ```
+
+Node drain 是 fleet administrator 管理路由，不接受 Workspace automation/service principal，也没有请求
+body。认证和 Node 状态错误使用通用错误响应；已经 `draining` 的相同 Node 请求会继续当前排空。
 
 Create Cat 请求：
 
@@ -451,7 +465,6 @@ Create Cat 请求：
   "cat_slug": "web",
   "cpu": 2,
   "memory_bytes": 4294967296,
-  "boot_image": "ubuntu-24.04",
   "mounts": [
     {
       "disk_slug": "data-disk",
@@ -611,10 +624,17 @@ DELETE /v1/cats/{cat_id}
 
 - Create Cat 使用 `(workspace_id, cat_slug)` 唯一约束串行化。
 - Create Disk 使用 `(workspace_id, disk_slug)` 唯一约束串行化。
-- Cat action 更新 `current_action` 时使用 Cat 行条件更新；只有 `current_action IS NULL` 的请求可以取得执行权。
-- 同一更新同时写入 `current_action_node_id`，使其他 Control replica知道应该查询哪台 Node。
+- Cat action 更新 `current_action` 时锁住 Cat 行；通常只有 `current_action IS NULL` 的请求可以取得
+  执行权，destroy 可以原子替换其他未完成动作。
+- 同一更新同时写入 `current_action_node_id` 和 PostgreSQL 分配的 `current_action_started_at`，使其他
+  Control replica知道应该查询哪台 Node，并使终态 CAS 只结算同一次 claim。
+- destroy 替换动作时继承旧 `current_action_node_id`；首次 create 尚未形成稳定 state 时先投影为
+  `failure + current_action=destroy`，保持“state 为空只属于未完成 create”的数据库约束。
 - 相同 `current_action` 的重复调用不创建第二个执行；它查询 `noded` 并等待当前动作结束。
 - Disk attach/detach/destroy 在一个数据库 transaction 中锁定目标 Disk 和相关 Cat。
+- create、Cold run 和失联恢复使用 [ADR-0061](decisions/0061-semantic-least-allocated-placement.md)
+  的同一个事务内 Least-Allocated 策略；负载读取和 `current_action_node_id` reservation 由
+  schema-scoped transaction advisory lock 串行。
 - 网络调用发生在提交 `current_action` 之后，不持有数据库锁。
 
 ### 9.2 noded
@@ -632,11 +652,27 @@ Control Plane 可能在 `noded` 已经完成动作、但数据库尚未更新时
 1. 新 Control Plane 发现 Cat 的 `current_action` 不为空。
 2. 使用 `current_action_node_id` 调用 `GET /v1/cats/{cat_id}` 查询实际状态。
 3. 如果已经达到目标状态，更新 Cat row并清除 `current_action`。
-4. 如果 `noded` 报告动作仍在执行，继续等待到动作 deadline。
+4. 如果 `noded` 报告同一动作仍在执行，继续等待到动作 deadline；若数据库动作是 destroy、Node 仍在
+   执行被替换动作，则重发 destroy 触发取消和清理。
 5. 如果 `noded` 报告明确失败，写 `failure`。
 6. 如果 Node 不可达，进入 Node 失联流程。
 
-Control Plane 可以周期扫描超时的 `current_action`，但扫描器和用户重试必须使用同一套状态判断，不能各自定义恢复规则。
+生产 Control 为普通动作和 Destroy 分别使用 schema-scoped PostgreSQL advisory lock 选举一个恢复任务。
+两者都只扫描至少 135 秒没有前台活动、已经越过正常 120 秒同步请求 deadline 和最长 10 秒 Create 清理窗口的 claim；相同 action 的重试只刷新数据库 `updated_at` 活动时钟，不改变 `current_action_started_at` 精确 occurrence 身份。前台 deadline 从 ingress withdraw/publish 等 claim 后效果之前开始并约束这些等待。scanner 在同一个 Cat 行锁事务内复核 inactivity 并写入 `current_action_recovery_started_at` lease：重试先提交时该行不再 eligible，scanner 先提交时后续相同 action 请求返回 `busy` 而不驱动物理效果。每批和并发都有上限，
+并执行上述同一套 discovery-first 与 exact settlement 规则；普通动作扫描排除由独立多步骤循环负责的
+跨 Node 失联恢复 `run` lane，也排除专用 Destroy lane。
+
+选举会话丢失会取消本轮恢复并在退避后重新参选；其他 replica 也可继续扫描，shutdown 才终止重选循环。
+扫描器和用户重试不能各自定义恢复规则，也不成为新的 lifecycle authority。两类扫描都按
+`updated_at, cat_id` 取最旧批次；单项失败以 Cat ID、action、目标 Node、
+`current_action_started_at` 和 recovery lease 的 exact CAS 清除 lease 并刷新 `updated_at`，把它轮转到未尝试 claim 之后，失败满批次
+不能饿死后续动作。
+
+scanner crash 后，未清除的 lease 超过同一 135 秒界限即可由后继 scanner 精确重新领取；旧 owner 的终态 CAS
+不能结算新 lease。该 lease 只串行化同一 Node 上的 Control 恢复驱动，不是跨 Node fencing 证据。
+135 秒只是触发精确查询/恢复的无前台活动时间，不是 Node 失联判断，也不是 fencing 证据。heartbeat、日志、
+metrics 和 runtime inventory 仍然不能结算动作；扫描器必须向 `current_action_node_id` 对应的 noded
+确认实际状态。
 
 ## 11. 核心流程
 
@@ -707,8 +743,9 @@ Control检查Cat为running/suspended/warm
 
 ```text
 Control检查Cat未destroyed
--> 写current_action=destroy和current_action_node_id
--> 如果有node_id，同步调用noded DELETE
+-> 锁住Cat行；若有当前动作则替换它，否则直接写current_action=destroy
+-> current_action_node_id优先继承被替换动作的目标Node，否则使用稳定node_id
+-> 如果有current_action_node_id，同步调用noded DELETE
 -> noded停止当前动作并清理本地Cat
 -> Control删除disk bindings
 -> PersistentDisk保持normal
@@ -837,12 +874,58 @@ Node running
 -> 在目标Node上run
 -> 原状态是suspended时再suspend
 -> 原状态是warm时再warm
--> 全部完成后关闭旧Node
+-> 返回逐Cat结果
+-> 运维确认完成后另行关闭旧Node
 ```
 
 跨 Node 不搬运 Suspended/Warm 的本地内存状态。原来是 Suspended 或 Warm 的 Cat 会在目标 Node 上先正常 run，再转换回对应状态。
 
-任一 Cat 无法 Cold 时，Node drain 失败并保留该 Cat，不强制关机。
+管理入口为：
+
+```text
+POST /v1/admin/nodes/{node_id}/actions/drain
+```
+
+Control 在接受任何 Cat 迁移前先把 Node 提交为 `draining`。每个 Cat 的原 state、源 placement 和目标
+reservation 保存在 Cat 当前行；独立 recovery 周期会重新发现仍有 Cat 的 draining Node，因此请求取消、
+Control 重启或重复调用都继续同一排空。耗时迁移不在 heartbeat/liveness probe 的串行路径上。已有普通
+`current_action` 返回 `blocked/busy`，不会被排空抢占。
+
+成功响应为 HTTP 200：
+
+```json
+{
+  "status": "blocked",
+  "source_node_id": "node_source",
+  "cats": [
+    {
+      "status": "migrated",
+      "cat_id": "cat_web",
+      "target_node_id": "node_target",
+      "state": "running"
+    },
+    {
+      "status": "blocked",
+      "cat_id": "cat_worker",
+      "code": "busy",
+      "message": "Cat has another lifecycle action in progress"
+    }
+  ]
+}
+```
+
+顶层只有 `drained/blocked`；逐 Cat 只有 `migrated/stale/blocked`。任一 Cat 无法 Cold 时，排空阻塞并保留
+Cat 的原 state 和 source placement，不强制关机；包括 noded 明确返回 failure/conflict，也不能在未越过
+Cold 数据屏障时清掉重试 authority。由于目标端尚未执行，此时原子释放 exact target reservation，下一
+周期重新选择 running Node；这样旧目标随后被 cordon 时不会被一个源端失败的迁移永久占住。目标恢复明确
+失败的 Cat 留在目标 Node 的 `failure` 状态供显式清理。接口不会自动关闭或 uncordon Node；Node 保持
+`draining`。
+
+源 Cold 的 timeout、transport/protocol ambiguity 或无法完成 postcondition query 遵守相同 release/reclaim
+规则；源命令结果不明不等于目标端已开始。若 target 阶段的 reserved Node 已经
+offline/reset_required/deleted 或不存在，源仍 draining 时在 Cat row lock 内以 Least-Allocated 策略选择
+新 target，并在同一事务撤销可能已经发布的 exact 旧目标入口、替换 reservation；旧 target 的迟到
+publish/settlement 因 exact target 不匹配而不能提交。
 
 ### 14.2 异常退出
 
@@ -875,6 +958,9 @@ retry_interval
 - noded 每次都先检查目标结果是否已经满足；
 - create 最终超时后，Control 额外调用一次 noded DELETE 清理本地资源；
 - 其他动作最终超时后，Control 查询一次 Cat 状态；无法确定时写 `failure`；
+- planned drain 是上一条的窄例外：源 Cold 未成功（包括明确失败）时保留源 state/placement、释放未使用
+  的 target reservation，由独立周期 worker 重新 claim；目标恢复结果不明时保留 exact claim。两者都不写
+  `failure`；
 - destroy 超时保持 `failure`，允许用户再次 destroy；
 - timeout 不自动选择另一台 Node，Node 迁移只走 Node offline 流程。
 
@@ -935,6 +1021,8 @@ internal_error
 - Cat destroyed 后可用相同 slug 创建新的 `cat_id`，slug 查询只返回新的未 destroyed Cat。
 - 对已经到达目标状态的 run/suspend/warm/cold重复调用不执行第二次物理动作。
 - failure只允许destroy。
+- destroy从任意未destroyed稳定态、failure和进行中的首次create取得执行权，不返回busy。
+- 被destroy替换的动作迟到完成时不能覆盖destroy claim或最终destroyed状态。
 - destroy重复调用返回already_destroyed。
 
 ### 18.2 Disk
@@ -967,6 +1055,12 @@ internal_error
 - reset完成前不接受新Cat。
 - draining Node不接受新placement。
 - planned drain保持每个Cat最终产品状态。
+- planned drain在迁移前持久化目标 reservation，Control 重启后继续，且不抢占普通Cat动作。
+- planned drain要求源端先完成Cold；源端未成功时保留原状态和源placement、释放未使用的target
+  reservation，目标端明确失败留目标清理。
+- planned drain的目标结果不明时也保留原状态和claim；reserved target失联时能exact retarget，旧结果不能
+  覆盖新target。
+- 慢planned drain或offline recovery不能阻塞heartbeat probe cadence，shutdown会取消当前周期工作。
 - offline Node 上的 Cat 在跨 Node 恢复前先撤掉旧入口，新实例 Ready 前不发布新入口。
 - 入口切换后只把新进入的流量发送到新 Node。
 - offline Node 的下一次成功心跳返回 `reset_required`，noded 不等待下一个心跳周期，立即停止和清理残留 Cat。
@@ -978,6 +1072,7 @@ internal_error
 - noded成功但Control在更新Cat前退出，恢复后能通过查询noded完成状态更新。
 - noded明确失败但Control在写failure前退出，恢复后写入failure。
 - current_action超时扫描与用户重试不会产生两个noded动作。
+- Control在destroy替换动作后退出，恢复者看到Node仍执行旧动作时会重发destroy并完成清理。
 
 ## 19. 已知取舍
 

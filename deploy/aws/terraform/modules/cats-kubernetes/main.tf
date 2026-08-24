@@ -23,6 +23,9 @@ locals {
       # CATS_AUTH_TOKEN. Control names the same credential by its purpose so
       # it cannot be confused with the client-facing API token argument.
       CATS_NODED_SERVICE_TOKEN     = var.runtime_secret_data["CATS_AUTH_TOKEN"]
+      CATS_BOOT_IMAGE              = var.default_boot_image_digest
+      CATS_USER_SITE_URL           = "https://cats.run/user/"
+      CATS_ADMIN_SITE_URL          = "https://ops.cats.run/"
       CATS_POSTGRES_URL            = var.storage_postgres_url
       CATS_USAGE_STORE_ADAPTER     = "postgres"
       CATS_USAGE_POSTGRES_URL      = var.usage_postgres_url

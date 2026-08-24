@@ -10,7 +10,7 @@ import {
   toast,
 } from "/ui/common.js";
 import { initI18n, onLocaleChange, t } from "/ui/i18n.js";
-import { assertRuntimeCutoverClientRequestSupported } from "/ui/cat-create-v2.mjs";
+import { assertSemanticConsoleRequestSupported } from "/ui/semantic-resource-client.mjs";
 
 initI18n();
 
@@ -37,7 +37,7 @@ const switchView = initNavigation({
 });
 
 async function authenticatedRequest(path, options) {
-  assertRuntimeCutoverClientRequestSupported(path, options?.method || "GET");
+  assertSemanticConsoleRequestSupported(path, options?.method || "GET");
   try {
     return await request(path, options);
   } catch (error) {

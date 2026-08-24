@@ -5,6 +5,7 @@ mock_provider "kubernetes" {}
 
 variables {
   control_plane_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/cats/control-plane@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  default_boot_image_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
   runtime_secret_data = {
     CATS_AUTH_TOKEN  = "0000000000000000000000000000000000000000"
     CATS_ADMIN_TOKEN = "1111111111111111111111111111111111111111"
@@ -34,6 +35,21 @@ run "the_apply_blocks_on_the_components_that_can_become_ready" {
   assert {
     condition     = nonsensitive(kubernetes_secret_v1.runtime.data["CATS_NODED_SERVICE_TOKEN"]) == var.runtime_secret_data["CATS_AUTH_TOKEN"]
     error_message = "Control must receive the same direct Node service token installed as CATS_AUTH_TOKEN on every Node."
+  }
+
+  assert {
+    condition     = nonsensitive(kubernetes_secret_v1.runtime.data["CATS_BOOT_IMAGE"]) == var.default_boot_image_digest
+    error_message = "Control must receive the deployment-selected default Golden Root digest."
+  }
+
+  assert {
+    condition     = nonsensitive(kubernetes_secret_v1.runtime.data["CATS_USER_SITE_URL"]) == "https://cats.run/user/"
+    error_message = "WorkOS user login must return to the user console rather than the public landing page."
+  }
+
+  assert {
+    condition     = nonsensitive(kubernetes_secret_v1.runtime.data["CATS_ADMIN_SITE_URL"]) == "https://ops.cats.run/"
+    error_message = "WorkOS administrator login must return to the administrator console."
   }
 
   assert {

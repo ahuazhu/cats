@@ -36,6 +36,7 @@ variables {
   expected_aws_partition                        = "aws"
   aws_region                                    = "us-east-1"
   control_plane_image                           = "123456789012.dkr.ecr.us-east-1.amazonaws.com/cats/control@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  default_boot_image_digest                     = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
   runtime_secret_data                           = {}
   production_cutover_operator_trust_bundle_json = "{}"
   runtime_provisioner_trust_bundle_json         = "{}"

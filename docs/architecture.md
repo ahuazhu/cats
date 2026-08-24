@@ -1,8 +1,9 @@
 # Cats 技术架构
 
 - 状态：目标架构 + 当前实现边界；Control/Node 生命周期以
-  [ADR-0059](decisions/0059-semantic-control-node-synchronous-protocol.md) 为当前唯一协议
-- 更新：2026-08-22
+  [ADR-0059](decisions/0059-semantic-control-node-synchronous-protocol.md) 及其
+  [ADR-0062 Destroy 修正](decisions/0062-destroy-preempts-in-progress-cat-actions.md) 为当前协议
+- 更新：2026-08-23
 - 适用范围：产品资源、控制面、Node、网络入口、microVM 与块存储
 
 ## 1. 大目标
@@ -42,7 +43,8 @@ heartbeat -> offline/reset_required 判断
 poll/result、不使用 per-Cat command journal，也不以 AgentSession、typed predecessor 或
 HostFenceRecovery 组织生命周期。幂等身份直接来自业务场景：
 
-- Cat create：`workspace_id + cat_slug + 完整创建配置`；
+- Cat create：`workspace_id + cat_slug + 用户选择的 CPU/内存/初始 mounts`；Control 只在新建时绑定
+  部署选择的当前默认 Golden Root digest；
 - Disk create：`workspace_id + disk_slug + size_bytes`；
 - 状态动作：`cat_id + 目标状态`；
 - attach：`cat_id + disk_id + mount_path`；
@@ -53,6 +55,10 @@ HostFenceRecovery 组织生命周期。幂等身份直接来自业务场景：
 
 通知、缓存和监控只用于降低延迟或发现异常，不能结算产品动作。
 
+需要新 Node 的 create、Cold run 和失联恢复使用
+[ADR-0061](decisions/0061-semantic-least-allocated-placement.md)的事务内 Least-Allocated 策略；Node
+heartbeat 利用率不成为 placement authority。
+
 ## 3. 当前实现边界
 
 当前分支正在执行空数据、单协议切换。下面只描述已组成的代码事实，不代表完整物理上线门已通过：
@@ -61,7 +67,7 @@ HostFenceRecovery 组织生命周期。幂等身份直接来自业务场景：
 |---|---|---|
 | 公共协议 | Cat/Disk/Node 同步 DTO、稳定错误码、内部 Bearer 认证已组成；严格拒绝旧幂等和 Operation 字段 | 最终全仓协议残留检查待门禁 |
 | PostgreSQL | v19 当前资源表、可复用 slug 的部分唯一索引、Disk binding RWO、Cat 动作 CAS、数据库接收时间心跳和当前入口目标已组成；旧 lifecycle/Route settlement schema 已删除 | 最终 PostgreSQL 全仓门待跑 |
-| Control | 同步 lifecycle、超时后 Node 查询、资源 API、入口先撤后发、Node 注册/心跳/reset/drain 和失联恢复已接入生产进程；真实 Control→noded HTTP 的 Cat 全状态机与重复语义已通过 | PersistentDisk/CH 完整纵向联调和最终门禁待完成 |
+| Control | 同步 lifecycle、超时后 Node 查询、资源 API、入口先撤后发、Node 注册/心跳/reset、管理面 planned drain 和失联恢复已接入生产进程；真实 Control→noded HTTP 的 Cat 全状态机与重复语义已通过 | PersistentDisk/CH 完整纵向联调和最终门禁待完成 |
 | noded | 同步 HTTP server、按 Cat 串行、destroy 清理、reset gate、注册和 heartbeat supervisor已组成 | Cloud Hypervisor 的完整实际 effects 尚未接入；当前 CH bridge 在缺少精确输入时会在物理副作用前失败 |
 | PersistentDisk | slug、目录、binding 语义、精确卷/文件系统身份、Guest mount-ready 校验器和 Strict provision/delete backend 已组成；backend 已接入 production composition | Guest/CH 物理挂载链和产品 E2E 尚未完成 |
 | Node 失联恢复 | offline 后按数据库当前事实反复发现未迁走 Cat，先撤入口、在其他 running Node 恢复、Ready 后发布；旧 Node 回来要求 reset | 双跑窗口的真实两 Node 验证待完成；协议本身不承诺严格物理单实例 |
@@ -89,6 +95,10 @@ HostFenceRecovery 组织生命周期。幂等身份直接来自业务场景：
 
 Cat 有不可变 `cat_id` 和 Workspace 内用户指定的 `cat_slug`。当前行保存稳定 `state`、
 `current_action`、动作目标 Node、当前 `node_id`、完整创建配置和错误信息。
+
+Boot image 不是用户输入。Control 按 [ADR-0063](decisions/0063-control-owned-default-boot-image.md)
+只在分配新 Cat 时把部署的当前 qualified default 固化为精确 digest；已有 Cat、重试、run 和恢复继续
+使用行内 digest，默认升级不修改已有 RootDisk。
 
 稳定状态为 `running/suspended/warm/cold/failure/destroyed`。首次 create 进行中时 state 可以为空。
 `destroyed` 是历史终点，不是第五个可恢复 runtime 状态；`failure` 只允许 destroy。
@@ -144,8 +154,10 @@ Node 有内部 `node_id`、不可变展示名 `node_name` 和 Control 可达的 
 | 任意未销毁状态 | `destroy` | `destroyed` |
 | `failure` | `destroy` | `destroyed` |
 
-同一目标已经满足时返回 `already_*`，不调用 noded。相同动作进行中时查询并等待它；不同动作返回
-`busy`。Control 以 Cat 行条件更新取得 `current_action`，提交后才同步调用目标 noded。
+同一目标已经满足时返回 `already_*`，不调用 noded。相同动作进行中时查询并等待它；不同的非 destroy
+动作返回 `busy`。destroy 是唯一抢占例外：Control 在 Cat 行锁内把未完成动作替换为 destroy，并继承
+它的目标 Node；旧动作的迟到写回因 exact action/Node 不匹配而失效。Control 提交后才同步调用目标
+noded。
 
 noded 每个 `cat_id` 一个串行执行单元，不同 Cat 可以并行。destroy 可以要求当前动作退出，但必须在
 返回前等待退出并清理。noded 对同一 `cat_id` 保留本注册周期的 destroyed marker，防止旧内部 create
@@ -212,8 +224,16 @@ running -> draining -> 停止新 placement
         -> 转为 Cold
         -> 在目标 Node 从远端启动
         -> 恢复原 Running/Suspended/Warm 目标
-        -> 关闭旧 Node
+        -> 返回逐 Cat drained/blocked 报告
+        -> 运维确认 drained 后另行关闭旧 Node
 ```
+
+fleet administrator 调用 `POST /v1/admin/nodes/{node_id}/actions/drain` 启动该流程。Control 先提交
+`draining`，再为每个 Cat 持久化 exact 目标 reservation；请求取消或 Control 重启后，周期任务会从
+PostgreSQL 当前行继续。已有生命周期动作不会被抢占，没有其他 running Node、源端不能安全 Cold 或目标
+恢复失败都会返回 `blocked`。源 Cold 未成功时保留源 state/placement 并释放尚未使用的目标 reservation，
+下一周期重新 claim；目标恢复结果不明时保留 exact claim。预留目标失联时在 row lock 内 exact retarget，
+旧目标的迟到 settlement 不能覆盖新目标。接口不自动关闭或重新开放 Node，完成后 Node 仍保持 `draining`。
 
 异常失联的目标流程是：
 
@@ -228,8 +248,9 @@ running -> draining -> 停止新 placement
 -> reset 完成后重新注册，才允许 placement
 ```
 
-恢复扫描是 level-triggered：每个 liveness 周期按 PostgreSQL 当前状态重新发现 offline Node 上尚未迁走
-的 Cat，因此 Control 重启或一次临时错误不会永久丢失恢复工作。
+恢复扫描是 level-triggered：独立 recovery 周期按 PostgreSQL 当前状态重新发现 offline Node 上尚未迁走
+的 Cat，因此 Control 重启或一次临时错误不会永久丢失恢复工作。它与 heartbeat/liveness probe 循环并行，
+慢 lifecycle 网络调用不会延迟其他 Node 的失联判定。
 
 本协议假设旧 Node 会在允许的心跳窗口内重新联系 Control。双跑通常上限为允许的心跳窗口加停止清理
 时间；唯一入口只保护新流量，旧连接、后台任务、主动出站请求和旧实例写盘仍可能继续。长期不对称

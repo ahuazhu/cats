@@ -17,12 +17,13 @@ The two create collections require exact `Content-Type: application/json`, exact
 
     {
       "name": "dev",
-      "boot_image_digest": "sha256:<64-lowercase-hex>",
       "vcpus": 2,
       "memory_bytes": 2147483648,
       "root_size_bytes": 1073741824,
       "durability": "strict"
     }
+
+Control automatically binds the deployment's current qualified boot image to a newly created Cat. The request does not accept an image override, and existing Cats keep their original exact digest.
 
 Create returns exact `202 application/json` with `{"cat_id":"…","operation_id":"…"}`. Collection reads accept only bounded `limit` and opaque `cursor` fields. Item reads and lifecycle actions accept immutable `cat_…` IDs only.
 

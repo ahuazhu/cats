@@ -36,6 +36,7 @@ def fixture_config(root: Path) -> dict:
         "application_tfvars": [str(application)],
         "aws_region": "us-east-1",
         "control_postgres_schema": "cats_r26",
+        "default_boot_image_digest": "sha256:" + "8" * 64,
         "eks_cluster_name": "cats-production",
         "expected_account_id": "123456789012",
         "expected_aws_partition": "aws",
@@ -166,6 +167,7 @@ def main() -> int:
         images = deployer.image_refs(manifest)
         for required in (
             f"-var=control_plane_image={images['control_plane']}",
+            f"-var=default_boot_image_digest={config['default_boot_image_digest']}",
             f"-var=credential_refresher_image={images['credential_refresher']}",
         ):
             assert required in joined

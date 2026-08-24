@@ -3680,6 +3680,252 @@ struct RootProvisionFixture {
     _dir: tempfile::TempDir,
 }
 
+struct ImageValidationCountingBlob {
+    inner: Arc<dyn BlobStore>,
+    image_data_gets: AtomicU64,
+    image_data_exists: AtomicU64,
+    image_data_exists_in_flight: AtomicU64,
+    image_data_exists_peak: AtomicU64,
+}
+
+impl ImageValidationCountingBlob {
+    fn is_image_data(key: &str) -> bool {
+        key.starts_with("images/") && key.contains("/data/")
+    }
+}
+
+impl BlobStore for ImageValidationCountingBlob {
+    fn put_immutable(&self, key: &str, data: &[u8]) -> cats_storage::blob::Result<()> {
+        self.inner.put_immutable(key, data)
+    }
+
+    fn get(&self, key: &str) -> cats_storage::blob::Result<Vec<u8>> {
+        if Self::is_image_data(key) {
+            self.image_data_gets.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.get(key)
+    }
+
+    fn exists(&self, key: &str) -> cats_storage::blob::Result<bool> {
+        if Self::is_image_data(key) {
+            self.image_data_exists.fetch_add(1, Ordering::SeqCst);
+            let in_flight = self
+                .image_data_exists_in_flight
+                .fetch_add(1, Ordering::SeqCst)
+                + 1;
+            self.image_data_exists_peak
+                .fetch_max(in_flight, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(20));
+            let result = self.inner.exists(key);
+            self.image_data_exists_in_flight
+                .fetch_sub(1, Ordering::SeqCst);
+            return result;
+        }
+        self.inner.exists(key)
+    }
+
+    fn delete(&self, key: &str) -> cats_storage::blob::Result<()> {
+        self.inner.delete(key)
+    }
+
+    fn list(&self, prefix: &str) -> cats_storage::blob::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+}
+
+struct LocalCacheProvisionFixture {
+    _dir: tempfile::TempDir,
+    source_image: PathBuf,
+    cache_image: PathBuf,
+    manifest: format::ImageManifest,
+    engine: Arc<ChunkEngine>,
+    blob: Arc<ImageValidationCountingBlob>,
+    request: cats_api::runtime_reconciliation::ProvisionRootImageRequest,
+}
+
+fn local_cache_provision_fixture() -> LocalCacheProvisionFixture {
+    local_cache_provision_fixture_with_source(|seed| {
+        for byte in [211, 37, 89, 151] {
+            seed.write_all(&pattern(CHUNK_SIZE as usize, byte)).unwrap();
+        }
+    })
+}
+
+fn local_cache_provision_fixture_with_source(
+    write_source: impl FnOnce(&mut File),
+) -> LocalCacheProvisionFixture {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
+    let source_image = dir.path().join("source-root.img");
+    let mut seed = File::create(&source_image).unwrap();
+    write_source(&mut seed);
+    seed.sync_all().unwrap();
+    let manifest = crate::image::publish(inner.as_ref(), &source_image)
+        .unwrap()
+        .manifest;
+    let cache_directory = dir.path().join("golden-root-cache");
+    fs::create_dir(&cache_directory).unwrap();
+    let cache_image = cache_directory.join("rootfs.ext4");
+    let blob = Arc::new(ImageValidationCountingBlob {
+        inner,
+        image_data_gets: AtomicU64::new(0),
+        image_data_exists: AtomicU64::new(0),
+        image_data_exists_in_flight: AtomicU64::new(0),
+        image_data_exists_peak: AtomicU64::new(0),
+    });
+    let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
+    meta.create_volume(VOL, SIZE).unwrap();
+    let epoch = install_test_grant_at(dir.path().join("meta.db"), "attA");
+    let engine = ChunkEngine::attach_control_only(
+        EngineConfig::new(VOL, dir.path().join("control-data"), "attA"),
+        epoch,
+        blob.clone(),
+        target_authority(meta),
+    )
+    .unwrap();
+    let request = root_provision_request(
+        &engine,
+        &manifest,
+        epoch,
+        "2468ace013579bdf2468ace013579bdf",
+    );
+    LocalCacheProvisionFixture {
+        _dir: dir,
+        source_image,
+        cache_image,
+        manifest,
+        engine,
+        blob,
+        request,
+    }
+}
+
+#[test]
+fn a_cold_local_cache_is_filled_and_the_replay_gets_no_remote_image_data() {
+    let fixture = local_cache_provision_fixture();
+
+    fixture
+        .engine
+        .provision_root_image_with_local_cache(&fixture.request, &fixture.cache_image)
+        .unwrap();
+
+    assert_eq!(fixture.blob.image_data_gets.load(Ordering::SeqCst), 4);
+    assert_eq!(fixture.blob.image_data_exists.load(Ordering::SeqCst), 0);
+    let (cached_image_id, cached_manifest, _) = crate::image::scan(&fixture.cache_image).unwrap();
+    assert_eq!(cached_image_id, fixture.manifest.image_id.as_str());
+    assert_eq!(cached_manifest, fixture.manifest);
+
+    fixture.blob.image_data_gets.store(0, Ordering::SeqCst);
+    fixture.blob.image_data_exists.store(0, Ordering::SeqCst);
+    fixture
+        .blob
+        .image_data_exists_peak
+        .store(0, Ordering::SeqCst);
+    fixture
+        .engine
+        .provision_root_image_with_local_cache(&fixture.request, &fixture.cache_image)
+        .unwrap();
+
+    assert_eq!(fixture.blob.image_data_gets.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.blob.image_data_exists.load(Ordering::SeqCst), 4);
+    assert!(
+        fixture.blob.image_data_exists_peak.load(Ordering::SeqCst) > 1,
+        "remote object existence checks must overlap"
+    );
+}
+
+#[test]
+fn a_nonmatching_local_cache_is_replaced_after_remote_body_validation() {
+    let fixture = local_cache_provision_fixture();
+    fs::write(&fixture.cache_image, pattern(CHUNK_SIZE as usize, 99)).unwrap();
+
+    fixture
+        .engine
+        .provision_root_image_with_local_cache(&fixture.request, &fixture.cache_image)
+        .unwrap();
+
+    assert_eq!(fixture.blob.image_data_gets.load(Ordering::SeqCst), 4);
+    assert_eq!(fixture.blob.image_data_exists.load(Ordering::SeqCst), 0);
+    let (cached_image_id, cached_manifest, _) = crate::image::scan(&fixture.cache_image).unwrap();
+    assert_eq!(cached_image_id, fixture.manifest.image_id.as_str());
+    assert_eq!(cached_manifest, fixture.manifest);
+}
+
+#[test]
+fn an_exact_local_cache_cannot_publish_a_map_when_a_remote_object_is_missing() {
+    let fixture = local_cache_provision_fixture();
+    fs::copy(&fixture.source_image, &fixture.cache_image).unwrap();
+    let missing = fixture
+        .blob
+        .list("images/")
+        .unwrap()
+        .into_iter()
+        .find(|key| ImageValidationCountingBlob::is_image_data(key))
+        .unwrap();
+    fixture.blob.delete(&missing).unwrap();
+
+    assert_retryable_problem(
+        fixture
+            .engine
+            .provision_root_image_with_local_cache(&fixture.request, &fixture.cache_image)
+            .unwrap_err(),
+        cats_api::runtime_reconciliation::ProvisionRootImageRetryableProblem::ImageUnavailable,
+    );
+    assert!(volume_objects(fixture.blob.as_ref()).is_empty());
+}
+
+#[test]
+fn an_unwritable_local_cache_does_not_weaken_remote_body_provision() {
+    let fixture = local_cache_provision_fixture();
+    let non_directory = fixture._dir.path().join("not-a-directory");
+    fs::write(&non_directory, b"file").unwrap();
+    let unavailable_cache = non_directory.join("rootfs.ext4");
+
+    fixture
+        .engine
+        .provision_root_image_with_local_cache(&fixture.request, &unavailable_cache)
+        .unwrap();
+
+    assert_eq!(fixture.blob.image_data_gets.load(Ordering::SeqCst), 4);
+    assert_eq!(fixture.blob.image_data_exists.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn an_unaligned_image_is_validated_but_not_published_as_a_different_cache_file() {
+    let fixture = local_cache_provision_fixture_with_source(|source| {
+        source.write_all(&pattern(4_096, 73)).unwrap();
+    });
+
+    fixture
+        .engine
+        .provision_root_image_with_local_cache(&fixture.request, &fixture.cache_image)
+        .unwrap();
+
+    assert_eq!(fixture.blob.image_data_gets.load(Ordering::SeqCst), 1);
+    assert!(!fixture.cache_image.exists());
+    assert!(!volume_objects(fixture.blob.as_ref()).is_empty());
+}
+
+#[test]
+fn cache_fill_reconstructs_duplicate_chunks_and_sparse_holes() {
+    let fixture = local_cache_provision_fixture_with_source(|source| {
+        let repeated = pattern(CHUNK_SIZE as usize, 41);
+        source.write_all(&repeated).unwrap();
+        source.write_all(&vec![0_u8; CHUNK_SIZE as usize]).unwrap();
+        source.write_all(&repeated).unwrap();
+    });
+
+    fixture
+        .engine
+        .provision_root_image_with_local_cache(&fixture.request, &fixture.cache_image)
+        .unwrap();
+
+    assert_eq!(fixture.blob.image_data_gets.load(Ordering::SeqCst), 1);
+    let (cached_image_id, cached_manifest, _) = crate::image::scan(&fixture.cache_image).unwrap();
+    assert_eq!(cached_image_id, fixture.manifest.image_id.as_str());
+    assert_eq!(cached_manifest, fixture.manifest);
+}
+
 fn root_provision_request(
     engine: &ChunkEngine,
     manifest: &format::ImageManifest,

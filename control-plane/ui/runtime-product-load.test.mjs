@@ -4,6 +4,8 @@ import test from "node:test";
 
 import {
   loadAll,
+  runtimeCatView,
+  runtimeDiskView,
   setRuntimeProductLoadingShell,
 } from "./runtime-product-load.mjs";
 
@@ -34,7 +36,7 @@ test("workspace switch removes stale rows while the next Workspace pages are pau
     signal: new AbortController().signal,
     requestPage: async () => {
       await pausedB;
-      return { items: [], next_cursor: null };
+      return [];
     },
   });
 
@@ -54,13 +56,11 @@ test("workspace switch removes stale rows while the next Workspace pages are pau
   assert.ok(controls.every((control) => !control.disabled));
 });
 
-test("loadAll captures one workspace and fetches every Cat and Disk page", async () => {
+test("loadAll captures one workspace and calls the exact semantic collection paths", async () => {
   const requested = [];
-  const pages = new Map([
-    ["/v1/workspaces/ws_A/cats?limit=100", { items: [{ id: "cat_01" }], next_cursor: "cat_next" }],
-    ["/v1/workspaces/ws_A/cats?limit=100&cursor=cat_next", { items: [{ id: "cat_02" }], next_cursor: null }],
-    ["/v1/workspaces/ws_A/disks?limit=100", { items: [{ id: "disk_01" }], next_cursor: "disk_next" }],
-    ["/v1/workspaces/ws_A/disks?limit=100&cursor=disk_next", { items: [{ id: "disk_02" }], next_cursor: null }],
+  const collections = new Map([
+    ["/v1/workspaces/ws_A/cats", [{ cat_id: "cat_01" }, { cat_id: "cat_02" }]],
+    ["/v1/workspaces/ws_A/disks", [{ disk_id: "disk_01" }, { disk_id: "disk_02" }]],
   ]);
   const controller = new AbortController();
 
@@ -70,19 +70,19 @@ test("loadAll captures one workspace and fetches every Cat and Disk page", async
     requestPage: async (path, options) => {
       requested.push(path);
       assert.equal(options.signal, controller.signal);
-      return pages.get(path);
+      return collections.get(path);
     },
   });
 
   assert.deepEqual(result, {
     workspaceId: "ws_A",
-    cats: [{ id: "cat_01" }, { id: "cat_02" }],
-    disks: [{ id: "disk_01" }, { id: "disk_02" }],
+    cats: [{ cat_id: "cat_01" }, { cat_id: "cat_02" }],
+    disks: [{ disk_id: "disk_01" }, { disk_id: "disk_02" }],
   });
-  assert.deepEqual(new Set(requested), new Set(pages.keys()));
+  assert.deepEqual(new Set(requested), new Set(collections.keys()));
 });
 
-test("aborting workspace A prevents its delayed pagination from completing after B", async () => {
+test("aborting workspace A prevents its delayed collections from completing after B", async () => {
   const aController = new AbortController();
   let releaseA;
   const aPage = new Promise((resolve) => { releaseA = resolve; });
@@ -92,7 +92,7 @@ test("aborting workspace A prevents its delayed pagination from completing after
     requestPage: async (_path, { signal }) => {
       await aPage;
       if (signal.aborted) throw new DOMException("aborted", "AbortError");
-      return { items: [{ id: "from_A" }], next_cursor: null };
+      return [{ id: "from_A" }];
     },
   });
 
@@ -100,7 +100,7 @@ test("aborting workspace A prevents its delayed pagination from completing after
   const loadB = loadAll({
     workspaceId: "ws_B",
     signal: new AbortController().signal,
-    requestPage: async () => ({ items: [{ id: "from_B" }], next_cursor: null }),
+    requestPage: async () => [{ id: "from_B" }],
   });
   releaseA();
 
@@ -110,6 +110,81 @@ test("aborting workspace A prevents its delayed pagination from completing after
     cats: [{ id: "from_B" }],
     disks: [{ id: "from_B" }],
   });
+});
+
+test("semantic Cat and Disk views map directly into the shipped console rows", () => {
+  assert.deepEqual(runtimeCatView({
+    cat_id: "cat_01",
+    workspace_id: "ws_A",
+    cat_slug: "app",
+    state: "running",
+    current_action: null,
+    node_id: "node_01",
+    node_name: "metal-1",
+    cpu: 2,
+    memory_bytes: 2147483648,
+    boot_image: "sha256:abc",
+    mounts: [],
+    last_error: null,
+    created_at_unix_ms: 1700000000123,
+    updated_at_unix_ms: 1700000000456,
+    destroyed_at_unix_ms: null,
+  }), {
+    cat_id: "cat_01",
+    workspace_id: "ws_A",
+    cat_slug: "app",
+    state: "running",
+    current_action: null,
+    node_id: "node_01",
+    node_name: "metal-1",
+    cpu: 2,
+    memory_bytes: 2147483648,
+    boot_image: "sha256:abc",
+    mounts: [],
+    last_error: null,
+    created_at_unix_ms: 1700000000123,
+    updated_at_unix_ms: 1700000000456,
+    destroyed_at_unix_ms: null,
+    id: "cat_01",
+    name: "app",
+    spec: { cpus: 2, memory_mib: 2048 },
+    desired_state: "running",
+    observed_state: "running",
+    created_at_unix: 1700000000,
+    auto_suspend: false,
+    expires_at_unix: null,
+  });
+  assert.deepEqual(runtimeDiskView({
+    disk_id: "disk_01",
+    workspace_id: "ws_A",
+    disk_slug: "data",
+    size_bytes: 107374182400,
+    status: "normal",
+    binding: { cat_id: "cat_01", cat_slug: "app", mount_path: "/data" },
+    created_at_unix_ms: 1700000000123,
+    deleted_at_unix_ms: null,
+  }), {
+    disk_id: "disk_01",
+    workspace_id: "ws_A",
+    disk_slug: "data",
+    size_bytes: 107374182400,
+    status: "normal",
+    binding: { cat_id: "cat_01", cat_slug: "app", mount_path: "/data" },
+    created_at_unix_ms: 1700000000123,
+    deleted_at_unix_ms: null,
+    id: "disk_01",
+    name: "data",
+    kind: "persistent",
+    state: "bound",
+    bound_cat_id: "cat_01",
+    created_at_unix: 1700000000,
+  });
+});
+
+test("semantic Cat transition names are readable", () => {
+  assert.equal(runtimeCatView({ current_action: "create" }).observed_state, "creating");
+  assert.equal(runtimeCatView({ state: "cold", current_action: "run" }).observed_state, "starting");
+  assert.equal(runtimeCatView({ current_action: "cold" }).observed_state, "cooling");
 });
 
 test("release user console exposes create and read controls without retired mutations", async () => {

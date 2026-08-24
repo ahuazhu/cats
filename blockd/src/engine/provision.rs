@@ -1,6 +1,11 @@
-use std::collections::HashSet;
-use std::fs;
-use std::sync::atomic::Ordering;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io;
+use std::os::unix::fs::{FileExt as _, OpenOptionsExt as _};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex as StdMutex, TryLockError};
+use std::time::Instant;
 
 use cats_api::chunk::{self, CHUNK_SIZE};
 use cats_api::runtime_reconciliation::{
@@ -33,6 +38,11 @@ pub enum ProvisionRootImageEffectError {
 
 type EffectResult<T> = std::result::Result<T, ProvisionRootImageEffectError>;
 
+// The installed Node has one shared cache slot. A process-wide cold-fill lock
+// prevents concurrent Cat creates from downloading the same image repeatedly;
+// cache hits do not take this lock and may scan concurrently.
+static LOCAL_IMAGE_CACHE_FILL_LOCK: StdMutex<()> = StdMutex::new(());
+
 impl ChunkEngine {
     /// Publish the deterministic generation-one image root under an already
     /// granted owner/epoch, with every Guest data path disabled.
@@ -45,6 +55,30 @@ impl ChunkEngine {
         &self,
         request: &ProvisionRootImageRequest,
     ) -> EffectResult<ProvisionRootImageResult> {
+        self.provision_root_image_with_optional_local_cache(request, None)
+    }
+
+    /// Provision from the immutable remote image namespace while preferring
+    /// an exact Node-shared local copy as the content-validation source.
+    ///
+    /// The local file is never attached to the Guest and never becomes volume
+    /// authority. It must reproduce the requested digest and canonical remote
+    /// manifest exactly. A missing or different cache falls back to remote-body
+    /// validation and opportunistically replaces the cache with verified bytes.
+    pub fn provision_root_image_with_local_cache(
+        &self,
+        request: &ProvisionRootImageRequest,
+        local_cache: &Path,
+    ) -> EffectResult<ProvisionRootImageResult> {
+        self.provision_root_image_with_optional_local_cache(request, Some(local_cache))
+    }
+
+    fn provision_root_image_with_optional_local_cache(
+        &self,
+        request: &ProvisionRootImageRequest,
+        local_cache: Option<&Path>,
+    ) -> EffectResult<ProvisionRootImageResult> {
+        let provision_started = Instant::now();
         self.validate_request_binding(request)?;
         if self.is_fenced() {
             return Err(ProvisionRootImageEffectError::ResultUnknown(
@@ -65,12 +99,34 @@ impl ChunkEngine {
             .map_err(|_| ProvisionRootImageEffectError::ResultUnknown("I/O gate was poisoned"))?;
 
         self.validate_local_state(request)?;
-        let manifest = self.load_and_validate_manifest(request)?;
+        let stage_started = Instant::now();
+        let manifest = self.load_and_validate_manifest(request, local_cache)?;
+        let image_validation_ms = elapsed_millis(stage_started);
+        let stage_started = Instant::now();
         let (new_map, prepared, chunks) = self.compute_target(request, &manifest)?;
+        let map_prepare_ms = elapsed_millis(stage_started);
 
+        let stage_started = Instant::now();
         let head = self.load_authority(request)?;
+        let authority_load_ms = elapsed_millis(stage_started);
         if same_target(&head, &request.expected_provisioned_head) {
+            let stage_started = Instant::now();
             self.reload_target_map(request)?;
+            tracing::info!(
+                volume_id = request.volume_id.as_str(),
+                boot_image_digest = request.boot_image_digest.as_str(),
+                outcome = "idempotent_replay",
+                image_validation_ms,
+                map_prepare_ms,
+                authority_load_ms,
+                map_publish_ms = 0,
+                provision_object_puts = 0,
+                cas_ms = 0,
+                local_state_install_ms = elapsed_millis(stage_started),
+                final_authority_load_ms = 0,
+                total_ms = elapsed_millis(provision_started),
+                "Root image provision completed"
+            );
             return Ok(effect_result(request));
         }
         if !is_blank(&head) {
@@ -80,6 +136,7 @@ impl ChunkEngine {
         }
 
         let volume_id = request.volume_id.as_str();
+        let map_publish_started = Instant::now();
         for (hash, bytes) in &prepared.leaf_nodes {
             let key = chunk::keys::map_node(volume_id, &hex::encode(hash));
             self.put_provision_object(request, &key, bytes)?;
@@ -97,7 +154,9 @@ impl ChunkEngine {
         self.put_provision_object(request, &commit_key, &record)?;
         crashpoint::maybe_crash(crashpoint::AFTER_PROVISION_COMMIT_PUT);
         crashpoint::maybe_crash(crashpoint::BEFORE_CAS);
+        let map_publish_ms = elapsed_millis(map_publish_started);
 
+        let cas_started = Instant::now();
         let cas = self.authority.compare_and_swap_head(
             volume_id,
             self.size,
@@ -140,12 +199,14 @@ impl ChunkEngine {
                 ));
             }
         }
+        let cas_ms = elapsed_millis(cas_started);
         crashpoint::maybe_crash(crashpoint::AFTER_CAS);
 
         // The head is the authority, but this process must also load the exact
         // committed map before it can truthfully report the control effect. It
         // still cannot expose Guest I/O; the later reconciler phase restarts a
         // serving frontend under the same grant.
+        let state_install_started = Instant::now();
         {
             let mut state = self.state.lock().map_err(|_| {
                 ProvisionRootImageEffectError::ResultUnknown("engine state lock was poisoned")
@@ -162,16 +223,33 @@ impl ChunkEngine {
                 ProvisionRootImageEffectError::ResultUnknown("staged queue lock was poisoned")
             })?
             .next_base = 1;
+        let local_state_install_ms = elapsed_millis(state_install_started);
 
         // Close the response race as far as a hint can: a later owner change
         // never becomes a closed blockd error. The Node rereads authority after
         // every response regardless.
+        let final_authority_started = Instant::now();
         let observed = self.load_authority(request)?;
         if !same_target(&observed, &request.expected_provisioned_head) {
             return Err(ProvisionRootImageEffectError::ResultUnknown(
                 "authority changed after the generation-one CAS",
             ));
         }
+        tracing::info!(
+            volume_id = request.volume_id.as_str(),
+            boot_image_digest = request.boot_image_digest.as_str(),
+            outcome = "generation_one_committed",
+            image_validation_ms,
+            map_prepare_ms,
+            authority_load_ms,
+            map_publish_ms,
+            provision_object_puts = prepared.leaf_nodes.len().saturating_add(2),
+            cas_ms,
+            local_state_install_ms,
+            final_authority_load_ms = elapsed_millis(final_authority_started),
+            total_ms = elapsed_millis(provision_started),
+            "Root image provision completed"
+        );
         Ok(effect_result(request))
     }
 
@@ -260,7 +338,10 @@ impl ChunkEngine {
     fn load_and_validate_manifest(
         &self,
         request: &ProvisionRootImageRequest,
+        local_cache: Option<&Path>,
     ) -> EffectResult<ImageManifest> {
+        let validation_started = Instant::now();
+        let manifest_started = Instant::now();
         let image_id = &request.boot_image_digest.as_str()["sha256:".len()..];
         let manifest =
             crate::image::load(self.blob.as_ref(), image_id).map_err(|error| match error {
@@ -283,6 +364,7 @@ impl ChunkEngine {
                     ProvisionRootImageRetryableProblem::LocalIoUnavailable,
                 ),
             })?;
+        let manifest_ms = elapsed_millis(manifest_started);
 
         // The cats-storage reader has already completed the shared canonical
         // and structural pass. This request-local fit check is the only
@@ -296,6 +378,233 @@ impl ChunkEngine {
 
         // Only after the shared structural pass succeeds may availability of an
         // individual object affect the outcome.
+        let object_keys = unique_image_object_keys(image_id, &manifest);
+        let mut local_cache_scan_ms = 0;
+        let (
+            validation_source,
+            remote_get_objects,
+            remote_head_objects,
+            cache_fill_outcome,
+            cache_io_ms,
+            remote_validation_ms,
+        ) = if let Some(local_cache) = local_cache {
+            let local_started = Instant::now();
+            let initial_probe = probe_local_image_cache(local_cache, image_id, &manifest);
+            local_cache_scan_ms = elapsed_millis(local_started);
+            if matches!(initial_probe, LocalImageCacheProbe::Exact) {
+                let remote_validation_started = Instant::now();
+                self.validate_remote_image_object_existence(request, &object_keys)?;
+                (
+                    "local_cache",
+                    0,
+                    object_keys.len(),
+                    "not_needed",
+                    0,
+                    elapsed_millis(remote_validation_started),
+                )
+            } else {
+                // If another create is already filling the slot, wait for it and
+                // rescan. In the uncontended case, retain the first scan so a
+                // large stale cache is not hashed twice.
+                let (fill_guard, rescan_after_wait) = match LOCAL_IMAGE_CACHE_FILL_LOCK.try_lock() {
+                    Ok(guard) => (guard, false),
+                    Err(TryLockError::Poisoned(poisoned)) => (poisoned.into_inner(), false),
+                    Err(TryLockError::WouldBlock) => {
+                        let guard = LOCAL_IMAGE_CACHE_FILL_LOCK
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        (guard, true)
+                    }
+                };
+                let effective_probe = if rescan_after_wait {
+                    let local_started = Instant::now();
+                    let probe = probe_local_image_cache(local_cache, image_id, &manifest);
+                    local_cache_scan_ms =
+                        local_cache_scan_ms.saturating_add(elapsed_millis(local_started));
+                    probe
+                } else {
+                    initial_probe
+                };
+                if matches!(effective_probe, LocalImageCacheProbe::Exact) {
+                    let remote_validation_started = Instant::now();
+                    self.validate_remote_image_object_existence(request, &object_keys)?;
+                    drop(fill_guard);
+                    (
+                        "local_cache",
+                        0,
+                        object_keys.len(),
+                        "filled_by_concurrent_create",
+                        0,
+                        elapsed_millis(remote_validation_started),
+                    )
+                } else {
+                    log_local_cache_miss(request, &effective_probe);
+                    let remote_validation_started = Instant::now();
+                    let fill = self.validate_remote_image_object_bodies_and_fill_cache(
+                        request,
+                        image_id,
+                        &manifest,
+                        local_cache,
+                    )?;
+                    drop(fill_guard);
+                    (
+                        if fill.outcome == "published" {
+                            "remote_body_cache_fill"
+                        } else {
+                            "remote_body_cache_unavailable"
+                        },
+                        object_keys.len(),
+                        0,
+                        fill.outcome,
+                        fill.io_ms,
+                        elapsed_millis(remote_validation_started),
+                    )
+                }
+            }
+        } else {
+            let remote_validation_started = Instant::now();
+            self.validate_remote_image_object_bodies(request, image_id, &manifest)?;
+            (
+                "remote_body",
+                object_keys.len(),
+                0,
+                "not_configured",
+                0,
+                elapsed_millis(remote_validation_started),
+            )
+        };
+        tracing::info!(
+            volume_id = request.volume_id.as_str(),
+            boot_image_digest = request.boot_image_digest.as_str(),
+            validation_source,
+            manifest_ms,
+            local_cache_scan_ms,
+            cache_fill_outcome,
+            cache_io_ms,
+            remote_validation_ms,
+            validation_total_ms = elapsed_millis(validation_started),
+            manifest_chunks = manifest.chunks.len(),
+            unique_image_objects = object_keys.len(),
+            remote_get_objects,
+            remote_head_objects,
+            remote_get_bytes = remote_get_objects.saturating_mul(CHUNK_SIZE as usize),
+            "Root image validation completed"
+        );
+        Ok(manifest)
+    }
+
+    fn validate_remote_image_object_bodies_and_fill_cache(
+        &self,
+        request: &ProvisionRootImageRequest,
+        image_id: &str,
+        manifest: &ImageManifest,
+        local_cache: &Path,
+    ) -> EffectResult<LocalCacheFillReport> {
+        let cache_started = Instant::now();
+        let mut fill = match LocalImageCacheFill::start(local_cache, manifest.size_bytes) {
+            Ok(fill) => Some(fill),
+            Err(error) => {
+                tracing::warn!(
+                    volume_id = request.volume_id.as_str(),
+                    boot_image_digest = request.boot_image_digest.as_str(),
+                    %error,
+                    "Node Golden Root cache cannot be prepared; remote validation will continue"
+                );
+                None
+            }
+        };
+        let mut cache_io_ms = elapsed_millis(cache_started);
+        let cache_positions = fill.as_ref().map(|_| {
+            let mut positions = HashMap::<&str, Vec<u64>>::new();
+            for entry in &manifest.chunks {
+                positions
+                    .entry(entry.object_id.as_str())
+                    .or_default()
+                    .push(entry.chunk_idx);
+            }
+            positions
+        });
+        let mut verified_objects = HashSet::new();
+        for entry in &manifest.chunks {
+            if !verified_objects.insert(entry.object_id.as_str()) {
+                continue;
+            }
+            let key = chunk::keys::image_data(image_id, entry.object_id.as_str());
+            let bytes = self.blob.get(&key).map_err(|error| match error {
+                BlobError::NotFound(_) => retryable(
+                    request,
+                    ProvisionRootImageRetryableProblem::ImageUnavailable,
+                ),
+                _ => retryable(
+                    request,
+                    ProvisionRootImageRetryableProblem::ObjectStoreUnavailable,
+                ),
+            })?;
+            let expected_digest = format::decode_sha256_hex(entry.object_id.as_str());
+            if bytes.len() != CHUNK_SIZE as usize
+                || expected_digest.is_none_or(|digest| format::sha256(&bytes) != digest)
+            {
+                return Err(definite(
+                    request,
+                    ProvisionRootImageDefiniteConflictProblem::ImageManifest,
+                ));
+            }
+            if let Some(active_fill) = fill.as_mut() {
+                let write_started = Instant::now();
+                let write_result = cache_positions
+                    .as_ref()
+                    .and_then(|positions| positions.get(entry.object_id.as_str()))
+                    .expect("cache positions cover every manifest object")
+                    .iter()
+                    .try_for_each(|chunk_idx| active_fill.write_chunk(*chunk_idx, &bytes));
+                cache_io_ms = cache_io_ms.saturating_add(elapsed_millis(write_started));
+                if let Err(error) = write_result {
+                    tracing::warn!(
+                        volume_id = request.volume_id.as_str(),
+                        boot_image_digest = request.boot_image_digest.as_str(),
+                        %error,
+                        "Node Golden Root cache write failed; remote validation will continue"
+                    );
+                    fill.take();
+                }
+            }
+        }
+
+        let Some(mut fill) = fill else {
+            return Ok(LocalCacheFillReport {
+                outcome: "unavailable",
+                io_ms: cache_io_ms,
+            });
+        };
+        let publish_started = Instant::now();
+        let publish = fill.publish(image_id, manifest);
+        cache_io_ms = cache_io_ms.saturating_add(elapsed_millis(publish_started));
+        match publish {
+            Ok(()) => Ok(LocalCacheFillReport {
+                outcome: "published",
+                io_ms: cache_io_ms,
+            }),
+            Err(error) => {
+                tracing::warn!(
+                    volume_id = request.volume_id.as_str(),
+                    boot_image_digest = request.boot_image_digest.as_str(),
+                    %error,
+                    "Node Golden Root cache did not reproduce the requested image; remote validation remains authoritative"
+                );
+                Ok(LocalCacheFillReport {
+                    outcome: "unavailable",
+                    io_ms: cache_io_ms,
+                })
+            }
+        }
+    }
+
+    fn validate_remote_image_object_bodies(
+        &self,
+        request: &ProvisionRootImageRequest,
+        image_id: &str,
+        manifest: &ImageManifest,
+    ) -> EffectResult<()> {
         let mut verified_objects = HashSet::new();
         for entry in &manifest.chunks {
             if !verified_objects.insert(entry.object_id.as_str()) {
@@ -322,7 +631,52 @@ impl ChunkEngine {
                 ));
             }
         }
-        Ok(manifest)
+        Ok(())
+    }
+
+    fn validate_remote_image_object_existence(
+        &self,
+        request: &ProvisionRootImageRequest,
+        object_keys: &[String],
+    ) -> EffectResult<()> {
+        let next = AtomicUsize::new(0);
+        let failure = StdMutex::new(None);
+        std::thread::scope(|scope| {
+            for _ in 0..object_keys.len().clamp(1, 16) {
+                scope.spawn(|| loop {
+                    if failure.lock().unwrap().is_some() {
+                        return;
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(key) = object_keys.get(index) else {
+                        return;
+                    };
+                    let result = match self.blob.exists(key) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Err(BlobError::NotFound(key.clone())),
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = result {
+                        let mut slot = failure.lock().unwrap();
+                        if slot.is_none() {
+                            *slot = Some(error);
+                        }
+                        return;
+                    }
+                });
+            }
+        });
+        match failure.into_inner().unwrap() {
+            None => Ok(()),
+            Some(BlobError::NotFound(_)) => Err(retryable(
+                request,
+                ProvisionRootImageRetryableProblem::ImageUnavailable,
+            )),
+            Some(_) => Err(retryable(
+                request,
+                ProvisionRootImageRetryableProblem::ObjectStoreUnavailable,
+            )),
+        }
     }
 
     fn compute_target(
@@ -433,6 +787,141 @@ impl ChunkEngine {
             ),
         })
     }
+}
+
+fn unique_image_object_keys(image_id: &str, manifest: &ImageManifest) -> Vec<String> {
+    let mut seen = HashSet::new();
+    manifest
+        .chunks
+        .iter()
+        .filter(|entry| seen.insert(entry.object_id.as_str()))
+        .map(|entry| chunk::keys::image_data(image_id, entry.object_id.as_str()))
+        .collect()
+}
+
+enum LocalImageCacheProbe {
+    Exact,
+    Different { observed_image_id: String },
+    Unavailable { error: ImageError },
+}
+
+fn probe_local_image_cache(
+    path: &Path,
+    image_id: &str,
+    manifest: &ImageManifest,
+) -> LocalImageCacheProbe {
+    match crate::image::scan(path) {
+        Ok((observed_image_id, observed_manifest, _))
+            if observed_image_id == image_id && observed_manifest == *manifest =>
+        {
+            LocalImageCacheProbe::Exact
+        }
+        Ok((observed_image_id, _, _)) => LocalImageCacheProbe::Different { observed_image_id },
+        Err(error) => LocalImageCacheProbe::Unavailable { error },
+    }
+}
+
+fn log_local_cache_miss(request: &ProvisionRootImageRequest, probe: &LocalImageCacheProbe) {
+    match probe {
+        LocalImageCacheProbe::Exact => {}
+        LocalImageCacheProbe::Different { observed_image_id } => tracing::warn!(
+            volume_id = request.volume_id.as_str(),
+            boot_image_digest = request.boot_image_digest.as_str(),
+            observed_image_id,
+            "Node Golden Root cache does not match the requested manifest; falling back to remote body validation"
+        ),
+        LocalImageCacheProbe::Unavailable { error } => tracing::warn!(
+            volume_id = request.volume_id.as_str(),
+            boot_image_digest = request.boot_image_digest.as_str(),
+            %error,
+            "Node Golden Root cache is unavailable; falling back to remote body validation"
+        ),
+    }
+}
+
+struct LocalCacheFillReport {
+    outcome: &'static str,
+    io_ms: u64,
+}
+
+struct LocalImageCacheFill {
+    target: PathBuf,
+    temporary: PathBuf,
+    file: File,
+    published: bool,
+}
+
+impl LocalImageCacheFill {
+    fn start(target: &Path, size_bytes: u64) -> io::Result<Self> {
+        let parent = target.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "cache path has no parent")
+        })?;
+        let file_name = target.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "cache path has no file name")
+        })?;
+        let mut temporary_name = file_name.to_os_string();
+        temporary_name.push(".fill");
+        let temporary = parent.join(temporary_name);
+        match fs::remove_file(&temporary) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&temporary)?;
+        if let Err(error) = file.set_len(size_bytes) {
+            drop(file);
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        Ok(Self {
+            target: target.to_path_buf(),
+            temporary,
+            file,
+            published: false,
+        })
+    }
+
+    fn write_chunk(&self, chunk_idx: u64, bytes: &[u8]) -> io::Result<()> {
+        let offset = chunk_idx.checked_mul(CHUNK_SIZE as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "cache chunk offset overflow")
+        })?;
+        self.file.write_all_at(bytes, offset)
+    }
+
+    fn publish(&mut self, image_id: &str, manifest: &ImageManifest) -> crate::image::Result<()> {
+        self.file.sync_all()?;
+        let (observed_image_id, observed_manifest, _) = crate::image::scan(&self.temporary)?;
+        if observed_image_id != image_id || observed_manifest != *manifest {
+            return Err(ImageError::Invalid {
+                path: self.temporary.display().to_string(),
+                message: "reconstructed cache does not match the requested image".into(),
+            });
+        }
+        fs::rename(&self.temporary, &self.target)?;
+        self.published = true;
+        if let Some(parent) = self.target.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for LocalImageCacheFill {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = fs::remove_file(&self.temporary);
+        }
+    }
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn effect_result(request: &ProvisionRootImageRequest) -> ProvisionRootImageResult {

@@ -166,7 +166,6 @@ const messages = {
     "user.operations.emptyTitle": "No operations yet",
     "user.catDialog.eyebrow": "NEW COMPUTE",
     "user.catDialog.title": "Create Cat",
-    "user.catDialog.image": "Image",
     "user.catDialog.memory": "Memory (MiB)",
     "user.catDialog.rootDisk": "RootDisk (GiB)",
     "user.catDialog.nameHint": "Letters, numbers, and hyphens",
@@ -189,6 +188,7 @@ const messages = {
     "user.empty.recentOperations": "No operations yet.",
     "user.refreshFailed": "Refresh failed",
     "user.operation.accepted": "Operation accepted",
+    "user.cat.created": "Cat created",
     "user.disk.created": "PersistentDisk created",
     "user.authConfigFailed": "Could not load sign-in configuration: {message}",
 
@@ -503,7 +503,6 @@ const messages = {
     "user.operations.emptyTitle": "暂无操作记录",
     "user.catDialog.eyebrow": "新建计算资源",
     "user.catDialog.title": "创建 Cat",
-    "user.catDialog.image": "镜像",
     "user.catDialog.memory": "内存 (MiB)",
     "user.catDialog.rootDisk": "RootDisk (GiB)",
     "user.catDialog.nameHint": "字母、数字和连字符",
@@ -526,6 +525,7 @@ const messages = {
     "user.empty.recentOperations": "暂无操作记录。",
     "user.refreshFailed": "刷新失败",
     "user.operation.accepted": "操作已接受",
+    "user.cat.created": "Cat 已创建",
     "user.disk.created": "PersistentDisk 已创建",
     "user.authConfigFailed": "读取登录配置失败：{message}",
 

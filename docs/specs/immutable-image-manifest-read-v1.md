@@ -107,9 +107,20 @@ canonical bytes 通过后，validator 按固定顺序验证全部结构，任一
 6. 每项 `len == 4194304`，`object_id`是64位 lowercase hex。
 
 reader 不读取每个 data object；manifest-last publication 与 immutable namespace 是 Control Plane
-create-time existence/shape判断的边界。`cats-blockd`在真正 provision 前继续读取每个唯一 referenced data
-object，验证 exact 4 MiB length 与 object-id SHA-256，缺失或内容错误仍按 blockd §6.3.1 fail closed。
-Control Plane 的 manifest read 成功不承诺未来 object availability，也不创建 capacity/image reservation。
+create-time existence/shape判断的边界。`cats-blockd`在真正 provision 前使用以下二选一的完整边界：
+
+1. 默认路径读取每个唯一 referenced data object，验证 exact 4 MiB length 与 object-id SHA-256；
+2. [ADR-0061](../decisions/0061-node-local-golden-root-provision-validation.md) 的安装模式 fast path 每次按
+   publisher 同一规则扫描独立的 Node 共享 cache，要求完整文件 digest 和重建 manifest 同时精确匹配
+   request/remote manifest，然后并发确认每个唯一远端 data-object key 当次存在。cache miss/mismatch 时走
+   路径 1，并用同一批已经验证的 body 重建 sparse 临时文件；完整文件与 manifest 再次 exact 后才原子发布到
+   单槽 cache。cache 本地 I/O 失败只放弃缓存，不弱化或否定已完成的远端验证；remote missing/backend error
+   仍在首次 volume object PUT 前 fail closed。
+
+路径 2 依赖 production backend 已通过的 manifest-last 和 immutable-key 合同；它不把本地文件写入 Map 或直接
+提供给 Guest。若一个已发布对象在违反 immutable 合同后保留 key 但静默改变 body，错误由首次 hydrate 的 Map
+SHA-256 校验 fail closed，而非在 create 阶段发现。Control Plane 的 manifest read 成功不承诺未来 object
+availability，也不创建 capacity/image reservation。
 
 ## 5. Closed outcomes 与 replay
 
@@ -202,7 +213,9 @@ scan/migration/dual reader。V1也不保留旧noncanonical parser、legacy key�
 - duplicate/unknown/missing/wrong-kind字段、version、digest大小写/长度、zero/非对齐/>1TiB size；
 - 262144项上界、重复/倒序/越界index、wrong len/object digest；
 - `NotFound/TooLarge/Corrupt/BackendUnavailable`映射不混淆且error不泄漏provider secret；
-- reader不GET data objects；blockd仍逐唯一object验证length+digest；Cat fast replay零manifest GET；
+- reader不GET data objects；blockd默认逐唯一object验证length+digest；Node local-seed fast path证明 exact
+  file digest+manifest、逐唯一object确认远端存在且image data GET 为零；local mismatch回退body验证；remote
+  missing在volume PUT前失败；Cat fast replay零manifest GET；
 - 同key不同bytes的第二次`put_immutable`在adapter重启前后都拒绝；不具备conditional create/WORM的backend不Ready；
 - Control resolver用2 active/32 queued/10秒absolute deadline做slow/trickle和32 MiB并发测试：active、queued和
   retained memory有界，queue overflow/timeout映射正确，health仍响应，cancel/shutdown释放queue且late result丢弃；

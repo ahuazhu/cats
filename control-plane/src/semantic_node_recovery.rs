@@ -36,6 +36,7 @@ pub struct RecoveryClaim {
     pub source_node_id: String,
     pub target_node_id: String,
     pub target_state: CatState,
+    pub started_at_unix_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +46,9 @@ pub enum RecoveryAdmission {
     ColdNoAction(CatRecord),
     UnsupportedState(CatRecord),
     NoRunningTarget(CatRecord),
+    Busy(CatRecord),
     SourceNotOffline,
+    SourceNotDraining,
     Stale,
 }
 
@@ -55,16 +58,38 @@ pub trait SemanticNodeRecoveryStore: Send + Sync {
         source_node_id: &'a str,
     ) -> RecoveryFuture<'a, Result<Vec<RecoveryCandidate>, StoreError>>;
 
+    fn list_drain_source_cats<'a>(
+        &'a self,
+        source_node_id: &'a str,
+    ) -> RecoveryFuture<'a, Result<Vec<RecoveryCandidate>, StoreError>> {
+        self.list_source_cats(source_node_id)
+    }
+
     fn claim<'a>(
         &'a self,
         source_node_id: &'a str,
         cat_id: &'a str,
     ) -> RecoveryFuture<'a, Result<RecoveryAdmission, StoreError>>;
 
+    fn claim_drain<'a>(
+        &'a self,
+        source_node_id: &'a str,
+        cat_id: &'a str,
+    ) -> RecoveryFuture<'a, Result<RecoveryAdmission, StoreError>> {
+        self.claim(source_node_id, cat_id)
+    }
+
     fn node_control_endpoint<'a>(
         &'a self,
         node_id: &'a str,
     ) -> RecoveryFuture<'a, Result<NodeControlEndpoint, StoreError>>;
+
+    fn draining_node_control_endpoint<'a>(
+        &'a self,
+        node_id: &'a str,
+    ) -> RecoveryFuture<'a, Result<NodeControlEndpoint, StoreError>> {
+        self.node_control_endpoint(node_id)
+    }
 
     fn finish<'a>(
         &'a self,
@@ -76,6 +101,7 @@ pub trait SemanticNodeRecoveryStore: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryFinish<'a> {
     Recovered,
+    RetrySource { code: &'a str, message: &'a str },
     Failed { code: &'a str, message: &'a str },
 }
 
@@ -120,6 +146,39 @@ pub struct CatRecoveryResult {
 pub struct NodeRecoveryReport {
     pub source_node_id: String,
     pub cats: Vec<CatRecoveryResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatDrainStatus {
+    Migrated {
+        target_node_id: String,
+        state: CatState,
+    },
+    Stale,
+    Blocked {
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatDrainResult {
+    pub cat_id: String,
+    pub status: CatDrainStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeDrainReport {
+    pub source_node_id: String,
+    pub cats: Vec<CatDrainResult>,
+}
+
+impl NodeDrainReport {
+    pub fn is_drained(&self) -> bool {
+        self.cats
+            .iter()
+            .all(|cat| !matches!(cat.status, CatDrainStatus::Blocked { .. }))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +231,170 @@ where
         })
     }
 
+    /// Performs a planned, retryable drain. The Store keeps each Cat's source
+    /// placement and original stable state while reserving the target. This
+    /// lets a later request resume after a Control restart without a separate
+    /// lifecycle Operation or a process-local drain plan.
+    pub async fn drain_node(
+        &self,
+        source_node_id: &str,
+    ) -> Result<NodeDrainReport, NodeRecoveryError> {
+        let candidates = self.store.list_drain_source_cats(source_node_id).await?;
+        let mut results = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            results.push(self.drain_cat(source_node_id, candidate).await?);
+        }
+        Ok(NodeDrainReport {
+            source_node_id: source_node_id.to_owned(),
+            cats: results,
+        })
+    }
+
+    async fn drain_cat(
+        &self,
+        source_node_id: &str,
+        candidate: RecoveryCandidate,
+    ) -> Result<CatDrainResult, NodeRecoveryError> {
+        let claim = match self
+            .store
+            .claim_drain(source_node_id, &candidate.cat_id)
+            .await?
+        {
+            RecoveryAdmission::Claimed(claim) | RecoveryAdmission::AlreadyClaimed(claim) => claim,
+            RecoveryAdmission::UnsupportedState(_) => {
+                return Ok(blocked_drain_cat(
+                    &candidate.cat_id,
+                    "drain_state_unsupported",
+                    "only running, suspended, or warm Cats can be drained".to_owned(),
+                ));
+            }
+            RecoveryAdmission::NoRunningTarget(_) => {
+                return Ok(blocked_drain_cat(
+                    &candidate.cat_id,
+                    "node_unavailable",
+                    "no other running Node accepts drain placement".to_owned(),
+                ));
+            }
+            RecoveryAdmission::Busy(_) => {
+                return Ok(blocked_drain_cat(
+                    &candidate.cat_id,
+                    "busy",
+                    "Cat has another lifecycle action in progress".to_owned(),
+                ));
+            }
+            RecoveryAdmission::SourceNotDraining => {
+                return Ok(blocked_drain_cat(
+                    &candidate.cat_id,
+                    "source_node_not_draining",
+                    "source Node is no longer draining".to_owned(),
+                ));
+            }
+            RecoveryAdmission::Stale | RecoveryAdmission::ColdNoAction(_) => {
+                return Ok(CatDrainResult {
+                    cat_id: candidate.cat_id,
+                    status: CatDrainStatus::Stale,
+                });
+            }
+            RecoveryAdmission::SourceNotOffline => {
+                return Ok(blocked_drain_cat(
+                    &candidate.cat_id,
+                    "source_node_not_draining",
+                    "source Node is not draining".to_owned(),
+                ));
+            }
+        };
+
+        // Claim first: the ingress Store permits a planned move only after
+        // the exact cross-Node run reservation is durable.
+        if let Err(error) = self
+            .ingress
+            .withdraw(&candidate.cat_id, source_node_id)
+            .await
+        {
+            return Ok(blocked_drain_cat(
+                &candidate.cat_id,
+                "ingress_withdraw_failed",
+                error.message,
+            ));
+        }
+
+        if let Err(failure) = self.make_source_cold(&claim).await {
+            // The source has not crossed the Cold data-safety barrier. Keep
+            // its original product state and placement, but release the exact
+            // unused target reservation. No target effect starts before this
+            // barrier, so a later pass can safely choose a currently running
+            // target after the source is repaired. This also prevents the old
+            // target's own drain from being pinned by a retryable source.
+            let settled = self
+                .store
+                .finish(
+                    &claim,
+                    RecoveryFinish::RetrySource {
+                        code: &failure.code,
+                        message: &failure.message,
+                    },
+                )
+                .await?;
+            if settled.is_none() {
+                return Err(NodeRecoveryError {
+                    message: "blocked source Cold claim is no longer current".to_owned(),
+                });
+            }
+            return Ok(blocked_drain_cat(
+                &candidate.cat_id,
+                &failure.code,
+                failure.message,
+            ));
+        }
+
+        match self.drive(&claim).await {
+            Ok(()) => {
+                let settled = self.store.finish(&claim, RecoveryFinish::Recovered).await?;
+                if settled.is_none() {
+                    return Err(NodeRecoveryError {
+                        message: "semantic Cat drain claim is no longer current".to_owned(),
+                    });
+                }
+                Ok(CatDrainResult {
+                    cat_id: candidate.cat_id,
+                    status: CatDrainStatus::Migrated {
+                        target_node_id: claim.target_node_id,
+                        state: claim.target_state,
+                    },
+                })
+            }
+            Err(failure) => {
+                if failure.class == RecoveryFailureClass::Retryable {
+                    return Ok(blocked_drain_cat(
+                        &candidate.cat_id,
+                        &failure.code,
+                        failure.message,
+                    ));
+                }
+                let settled = self
+                    .store
+                    .finish(
+                        &claim,
+                        RecoveryFinish::Failed {
+                            code: &failure.code,
+                            message: &failure.message,
+                        },
+                    )
+                    .await?;
+                if settled.is_none() {
+                    return Err(NodeRecoveryError {
+                        message: "failed target drain claim is no longer current".to_owned(),
+                    });
+                }
+                Ok(blocked_drain_cat(
+                    &candidate.cat_id,
+                    &failure.code,
+                    failure.message,
+                ))
+            }
+        }
+    }
+
     async fn recover_cat(
         &self,
         source_node_id: &str,
@@ -211,11 +434,25 @@ where
                     "no other running Node accepts recovery placement".to_owned(),
                 ));
             }
+            RecoveryAdmission::Busy(_) => {
+                return Ok(failed_cat(
+                    &candidate.cat_id,
+                    "busy",
+                    "Cat has another lifecycle action in progress".to_owned(),
+                ));
+            }
             RecoveryAdmission::SourceNotOffline => {
                 return Ok(failed_cat(
                     &candidate.cat_id,
                     "source_node_not_offline",
                     "source Node is no longer offline/reset_required".to_owned(),
+                ));
+            }
+            RecoveryAdmission::SourceNotDraining => {
+                return Ok(failed_cat(
+                    &candidate.cat_id,
+                    "source_node_not_draining",
+                    "source Node is not draining".to_owned(),
                 ));
             }
             RecoveryAdmission::Stale => {
@@ -268,6 +505,67 @@ where
         }
     }
 
+    async fn make_source_cold(&self, claim: &RecoveryClaim) -> Result<(), RecoveryFailure> {
+        let command = NodeCommand {
+            cat_id: claim.cat.cat_id.clone(),
+            workspace_id: claim.cat.workspace_id.clone(),
+            action: CatAction::Cold,
+            config: None,
+        };
+        let mut last_transport = "source noded Cold request timed out".to_owned();
+        for attempt in 0..=self.timeouts.retry_count {
+            let endpoint = self.draining_endpoint(claim).await?;
+            if self
+                .inspect_expected(&endpoint, claim, CatState::Cold)
+                .await?
+            {
+                return Ok(());
+            }
+            let executed = tokio::time::timeout(
+                self.timeouts.node_request,
+                self.noded.execute(&endpoint, &command),
+            )
+            .await;
+            match executed {
+                Ok(Ok(
+                    NodeCommandResult::Succeeded(CatState::Cold)
+                    | NodeCommandResult::AlreadyDone(CatState::Cold),
+                )) => return Ok(()),
+                Ok(Ok(NodeCommandResult::Succeeded(_) | NodeCommandResult::AlreadyDone(_))) => {
+                    return Err(RecoveryFailure::retryable(
+                        "node_protocol_error",
+                        "source noded returned success without reaching Cold",
+                    ));
+                }
+                Ok(Ok(
+                    NodeCommandResult::Failed { code, message }
+                    | NodeCommandResult::Conflict { code, message },
+                )) => return Err(RecoveryFailure::definitive(code, message)),
+                Ok(Ok(NodeCommandResult::Busy)) => {
+                    last_transport = "source noded remained busy during drain".to_owned();
+                }
+                Ok(Err(NodeClientError::Protocol(message))) => {
+                    return Err(RecoveryFailure::retryable("node_protocol_error", message));
+                }
+                Ok(Err(NodeClientError::Unavailable(message))) => last_transport = message,
+                Ok(Err(NodeClientError::Timeout)) | Err(_) => {}
+            }
+            if self
+                .inspect_expected(&endpoint, claim, CatState::Cold)
+                .await?
+            {
+                return Ok(());
+            }
+            if attempt < self.timeouts.retry_count {
+                tokio::time::sleep(self.timeouts.retry_interval).await;
+            }
+        }
+        Err(RecoveryFailure::retryable(
+            "drain_source_timeout",
+            last_transport,
+        ))
+    }
+
     async fn drive(&self, claim: &RecoveryClaim) -> Result<(), RecoveryFailure> {
         // A Control restart after physical completion can settle directly.
         if self.target_is_complete(claim).await? {
@@ -318,7 +616,7 @@ where
                 .await?;
             }
             CatState::Cold | CatState::Failure | CatState::Destroyed => {
-                return Err(RecoveryFailure::new(
+                return Err(RecoveryFailure::definitive(
                     "recovery_state_unsupported",
                     "recovery claim has an unsupported target state",
                 ));
@@ -331,7 +629,7 @@ where
         self.ingress
             .publish(&claim.cat.cat_id, &claim.target_node_id)
             .await
-            .map_err(|error| RecoveryFailure::new("ingress_publish_failed", error.message))
+            .map_err(|error| RecoveryFailure::retryable("ingress_publish_failed", error.message))
     }
 
     async fn target_is_complete(&self, claim: &RecoveryClaim) -> Result<bool, RecoveryFailure> {
@@ -347,10 +645,10 @@ where
                 active_action: None,
             })) => Ok(state == claim.target_state),
             Ok(Ok(NodeCatStatus::Failed { code, message })) => {
-                Err(RecoveryFailure::new(code, message))
+                Err(RecoveryFailure::definitive(code, message))
             }
             Ok(Err(NodeClientError::Protocol(message))) => {
-                Err(RecoveryFailure::new("node_protocol_error", message))
+                Err(RecoveryFailure::retryable("node_protocol_error", message))
             }
             Ok(Ok(NodeCatStatus::Absent | NodeCatStatus::Present { .. }))
             | Ok(Err(NodeClientError::Timeout | NodeClientError::Unavailable(_)))
@@ -379,7 +677,7 @@ where
                     return Ok(());
                 }
                 Ok(Ok(NodeCommandResult::Succeeded(_) | NodeCommandResult::AlreadyDone(_))) => {
-                    return Err(RecoveryFailure::new(
+                    return Err(RecoveryFailure::retryable(
                         "node_protocol_error",
                         "noded returned success without the requested recovery state",
                     ));
@@ -387,12 +685,12 @@ where
                 Ok(Ok(
                     NodeCommandResult::Failed { code, message }
                     | NodeCommandResult::Conflict { code, message },
-                )) => return Err(RecoveryFailure::new(code, message)),
+                )) => return Err(RecoveryFailure::definitive(code, message)),
                 Ok(Ok(NodeCommandResult::Busy)) => {
                     last_transport = "noded remained busy during recovery".to_owned();
                 }
                 Ok(Err(NodeClientError::Protocol(message))) => {
-                    return Err(RecoveryFailure::new("node_protocol_error", message));
+                    return Err(RecoveryFailure::retryable("node_protocol_error", message));
                 }
                 Ok(Err(NodeClientError::Unavailable(message))) => last_transport = message,
                 Ok(Err(NodeClientError::Timeout)) | Err(_) => {}
@@ -405,7 +703,10 @@ where
                 tokio::time::sleep(self.timeouts.retry_interval).await;
             }
         }
-        Err(RecoveryFailure::new("recovery_timeout", last_transport))
+        Err(RecoveryFailure::retryable(
+            "recovery_timeout",
+            last_transport,
+        ))
     }
 
     async fn inspect_expected(
@@ -425,10 +726,10 @@ where
                 active_action: None,
             })) => Ok(state == expected),
             Ok(Ok(NodeCatStatus::Failed { code, message })) => {
-                Err(RecoveryFailure::new(code, message))
+                Err(RecoveryFailure::definitive(code, message))
             }
             Ok(Err(NodeClientError::Protocol(message))) => {
-                Err(RecoveryFailure::new("node_protocol_error", message))
+                Err(RecoveryFailure::retryable("node_protocol_error", message))
             }
             Ok(Ok(NodeCatStatus::Absent | NodeCatStatus::Present { .. }))
             | Ok(Err(NodeClientError::Timeout | NodeClientError::Unavailable(_)))
@@ -443,7 +744,17 @@ where
         self.store
             .node_control_endpoint(&claim.target_node_id)
             .await
-            .map_err(|error| RecoveryFailure::new("node_unavailable", error.message))
+            .map_err(|error| RecoveryFailure::retryable("node_unavailable", error.message))
+    }
+
+    async fn draining_endpoint(
+        &self,
+        claim: &RecoveryClaim,
+    ) -> Result<NodeControlEndpoint, RecoveryFailure> {
+        self.store
+            .draining_node_control_endpoint(&claim.source_node_id)
+            .await
+            .map_err(|error| RecoveryFailure::retryable("source_node_not_draining", error.message))
     }
 }
 
@@ -457,19 +768,45 @@ fn failed_cat(cat_id: &str, code: &str, message: String) -> CatRecoveryResult {
     }
 }
 
+fn blocked_drain_cat(cat_id: &str, code: &str, message: String) -> CatDrainResult {
+    CatDrainResult {
+        cat_id: cat_id.to_owned(),
+        status: CatDrainStatus::Blocked {
+            code: code.to_owned(),
+            message,
+        },
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RecoveryFailure {
     code: String,
     message: String,
+    class: RecoveryFailureClass,
 }
 
 impl RecoveryFailure {
-    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+    fn definitive(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
             message: message.into(),
+            class: RecoveryFailureClass::Definitive,
         }
     }
+
+    fn retryable(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            class: RecoveryFailureClass::Retryable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryFailureClass {
+    Definitive,
+    Retryable,
 }
 
 /// PostgreSQL adapter for the atomic recovery methods. It deliberately uses
@@ -482,6 +819,44 @@ pub struct PostgresSemanticNodeRecoveryStore {
 impl PostgresSemanticNodeRecoveryStore {
     pub fn new(store: Arc<Store>) -> Self {
         Self { store }
+    }
+
+    fn finish_owned<'a>(
+        &'a self,
+        claim: &'a RecoveryClaim,
+        owned_result: OwnedRecoveryFinish,
+    ) -> RecoveryFuture<'a, Result<Option<CatRecord>, StoreError>> {
+        let store = Arc::clone(&self.store);
+        let claim = claim.clone();
+        Box::pin(async move {
+            store
+                .execute(move |store| {
+                    let result = match &owned_result {
+                        OwnedRecoveryFinish::Recovered => SemanticCatRecoveryResult::Recovered,
+                        OwnedRecoveryFinish::RetrySource { code, message } => {
+                            SemanticCatRecoveryResult::RetrySource { code, message }
+                        }
+                        OwnedRecoveryFinish::Failed { code, message } => {
+                            SemanticCatRecoveryResult::Failed { code, message }
+                        }
+                    };
+                    store
+                        .finish_semantic_cat_recovery(
+                            SemanticCatRecoverySettlement {
+                                cat_id: &claim.cat.cat_id,
+                                source_node_id: &claim.source_node_id,
+                                target_node_id: &claim.target_node_id,
+                                target_state: core_state_to_stored(claim.target_state),
+                                expected_action_started_at: claim.started_at_unix_ms,
+                            },
+                            result,
+                        )?
+                        .map(stored_cat_to_core)
+                        .transpose()
+                })
+                .await
+                .map_err(store_error)
+        })
     }
 }
 
@@ -497,6 +872,28 @@ impl SemanticNodeRecoveryStore for PostgresSemanticNodeRecoveryStore {
                 .execute(move |store| {
                     Ok(store
                         .list_semantic_node_cats(&source_node_id)?
+                        .into_iter()
+                        .map(|cat| RecoveryCandidate {
+                            cat_id: cat.cat.cat_id,
+                        })
+                        .collect())
+                })
+                .await
+                .map_err(store_error)
+        })
+    }
+
+    fn list_drain_source_cats<'a>(
+        &'a self,
+        source_node_id: &'a str,
+    ) -> RecoveryFuture<'a, Result<Vec<RecoveryCandidate>, StoreError>> {
+        let store = Arc::clone(&self.store);
+        let source_node_id = source_node_id.to_owned();
+        Box::pin(async move {
+            store
+                .execute(move |store| {
+                    Ok(store
+                        .list_semantic_node_drain_cats(&source_node_id)?
                         .into_iter()
                         .map(|cat| RecoveryCandidate {
                             cat_id: cat.cat.cat_id,
@@ -526,6 +923,24 @@ impl SemanticNodeRecoveryStore for PostgresSemanticNodeRecoveryStore {
         })
     }
 
+    fn claim_drain<'a>(
+        &'a self,
+        source_node_id: &'a str,
+        cat_id: &'a str,
+    ) -> RecoveryFuture<'a, Result<RecoveryAdmission, StoreError>> {
+        let store = Arc::clone(&self.store);
+        let source_node_id = source_node_id.to_owned();
+        let cat_id = cat_id.to_owned();
+        Box::pin(async move {
+            store
+                .execute(move |store| {
+                    map_admission(store.claim_semantic_cat_drain(&source_node_id, &cat_id)?)
+                })
+                .await
+                .map_err(store_error)
+        })
+    }
+
     fn node_control_endpoint<'a>(
         &'a self,
         node_id: &'a str,
@@ -538,8 +953,33 @@ impl SemanticNodeRecoveryStore for PostgresSemanticNodeRecoveryStore {
                 .await
                 .map_err(store_error)?
                 .ok_or_else(|| StoreError::new("recovery target Node does not exist"))?;
-            if node.status != crate::store::semantic::NodeStatus::Running {
-                return Err(StoreError::new("recovery target Node is not running"));
+            if !matches!(
+                node.status,
+                crate::store::semantic::NodeStatus::Running
+                    | crate::store::semantic::NodeStatus::Draining
+            ) {
+                return Err(StoreError::new(
+                    "recovery target Node is not running or draining",
+                ));
+            }
+            NodeControlEndpoint::new(node.control_endpoint)
+        })
+    }
+
+    fn draining_node_control_endpoint<'a>(
+        &'a self,
+        node_id: &'a str,
+    ) -> RecoveryFuture<'a, Result<NodeControlEndpoint, StoreError>> {
+        let store = Arc::clone(&self.store);
+        let node_id = node_id.to_owned();
+        Box::pin(async move {
+            let node = store
+                .execute(move |store| store.find_semantic_node(&node_id))
+                .await
+                .map_err(store_error)?
+                .ok_or_else(|| StoreError::new("drain source Node does not exist"))?;
+            if node.status != crate::store::semantic::NodeStatus::Draining {
+                return Err(StoreError::new("drain source Node is not draining"));
             }
             NodeControlEndpoint::new(node.control_endpoint)
         })
@@ -550,45 +990,24 @@ impl SemanticNodeRecoveryStore for PostgresSemanticNodeRecoveryStore {
         claim: &'a RecoveryClaim,
         result: RecoveryFinish<'a>,
     ) -> RecoveryFuture<'a, Result<Option<CatRecord>, StoreError>> {
-        let store = Arc::clone(&self.store);
-        let claim = claim.clone();
         let owned_result = match result {
             RecoveryFinish::Recovered => OwnedRecoveryFinish::Recovered,
+            RecoveryFinish::RetrySource { code, message } => OwnedRecoveryFinish::RetrySource {
+                code: code.to_owned(),
+                message: message.to_owned(),
+            },
             RecoveryFinish::Failed { code, message } => OwnedRecoveryFinish::Failed {
                 code: code.to_owned(),
                 message: message.to_owned(),
             },
         };
-        Box::pin(async move {
-            store
-                .execute(move |store| {
-                    let result = match &owned_result {
-                        OwnedRecoveryFinish::Recovered => SemanticCatRecoveryResult::Recovered,
-                        OwnedRecoveryFinish::Failed { code, message } => {
-                            SemanticCatRecoveryResult::Failed { code, message }
-                        }
-                    };
-                    store
-                        .finish_semantic_cat_recovery(
-                            SemanticCatRecoverySettlement {
-                                cat_id: &claim.cat.cat_id,
-                                source_node_id: &claim.source_node_id,
-                                target_node_id: &claim.target_node_id,
-                                target_state: core_state_to_stored(claim.target_state),
-                            },
-                            result,
-                        )?
-                        .map(stored_cat_to_core)
-                        .transpose()
-                })
-                .await
-                .map_err(store_error)
-        })
+        self.finish_owned(claim, owned_result)
     }
 }
 
 enum OwnedRecoveryFinish {
     Recovered,
+    RetrySource { code: String, message: String },
     Failed { code: String, message: String },
 }
 
@@ -611,17 +1030,26 @@ fn map_admission(
         ClaimSemanticCatRecoveryOutcome::NoRunningTarget(cat) => {
             RecoveryAdmission::NoRunningTarget(stored_cat_to_core(cat)?)
         }
+        ClaimSemanticCatRecoveryOutcome::Busy(cat) => {
+            RecoveryAdmission::Busy(stored_cat_to_core(cat)?)
+        }
         ClaimSemanticCatRecoveryOutcome::SourceNotOffline => RecoveryAdmission::SourceNotOffline,
+        ClaimSemanticCatRecoveryOutcome::SourceNotDraining => RecoveryAdmission::SourceNotDraining,
         ClaimSemanticCatRecoveryOutcome::Stale => RecoveryAdmission::Stale,
     })
 }
 
 fn stored_claim_to_core(claim: StoredRecoveryClaim) -> crate::store::Result<RecoveryClaim> {
+    let started_at_unix_ms =
+        claim.cat.cat.current_action_started_at.ok_or_else(|| {
+            ApiError::internal("stored recovery claim omitted its action start time")
+        })?;
     Ok(RecoveryClaim {
         cat: stored_cat_to_core(claim.cat)?,
         source_node_id: claim.source_node_id,
         target_node_id: claim.target_node_id,
         target_state: stored_state_to_core(claim.target_state),
+        started_at_unix_ms,
     })
 }
 
@@ -710,6 +1138,7 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum OwnedFinish {
         Recovered,
+        RetrySource { code: String, message: String },
         Failed { code: String, message: String },
     }
 
@@ -730,7 +1159,21 @@ mod tests {
                     .lock()
                     .expect("observed")
                     .events
-                    .push("list".to_owned());
+                    .push("list_source".to_owned());
+                Ok(self.candidates.clone())
+            })
+        }
+
+        fn list_drain_source_cats<'a>(
+            &'a self,
+            _source_node_id: &'a str,
+        ) -> RecoveryFuture<'a, Result<Vec<RecoveryCandidate>, StoreError>> {
+            Box::pin(async move {
+                self.observed
+                    .lock()
+                    .expect("observed")
+                    .events
+                    .push("list_drain".to_owned());
                 Ok(self.candidates.clone())
             })
         }
@@ -755,6 +1198,14 @@ mod tests {
             })
         }
 
+        fn claim_drain<'a>(
+            &'a self,
+            source_node_id: &'a str,
+            cat_id: &'a str,
+        ) -> RecoveryFuture<'a, Result<RecoveryAdmission, StoreError>> {
+            self.claim(source_node_id, cat_id)
+        }
+
         fn node_control_endpoint<'a>(
             &'a self,
             _node_id: &'a str,
@@ -769,6 +1220,20 @@ mod tests {
             })
         }
 
+        fn draining_node_control_endpoint<'a>(
+            &'a self,
+            _node_id: &'a str,
+        ) -> RecoveryFuture<'a, Result<NodeControlEndpoint, StoreError>> {
+            Box::pin(async move {
+                self.observed
+                    .lock()
+                    .expect("observed")
+                    .events
+                    .push("source_endpoint".to_owned());
+                NodeControlEndpoint::new("http://source.test:8443")
+            })
+        }
+
         fn finish<'a>(
             &'a self,
             _claim: &'a RecoveryClaim,
@@ -777,6 +1242,10 @@ mod tests {
             Box::pin(async move {
                 let result = match result {
                     RecoveryFinish::Recovered => OwnedFinish::Recovered,
+                    RecoveryFinish::RetrySource { code, message } => OwnedFinish::RetrySource {
+                        code: code.to_owned(),
+                        message: message.to_owned(),
+                    },
                     RecoveryFinish::Failed { code, message } => OwnedFinish::Failed {
                         code: code.to_owned(),
                         message: message.to_owned(),
@@ -909,6 +1378,7 @@ mod tests {
             source_node_id: "node-source".to_owned(),
             target_node_id: "node-target".to_owned(),
             target_state: state,
+            started_at_unix_ms: 1,
         }
     }
 
@@ -977,7 +1447,7 @@ mod tests {
         assert_eq!(
             observed.events,
             [
-                "list",
+                "list_source",
                 "withdraw:node-source",
                 "claim",
                 "endpoint",
@@ -1082,7 +1552,10 @@ mod tests {
 
         assert_eq!(report.cats[0].status, CatRecoveryStatus::ColdNoAction);
         let observed = observed.lock().expect("observed");
-        assert_eq!(observed.events, ["list", "withdraw:node-source", "claim"]);
+        assert_eq!(
+            observed.events,
+            ["list_source", "withdraw:node-source", "claim"]
+        );
         assert!(observed.commands.is_empty());
         assert!(observed.finishes.is_empty());
     }
@@ -1130,7 +1603,298 @@ mod tests {
             CatRecoveryStatus::Failed { code, .. } if code == "recovery_state_unsupported"
         ));
         let observed = observed.lock().expect("observed");
-        assert_eq!(observed.events, ["list", "withdraw:node-source", "claim"]);
+        assert_eq!(
+            observed.events,
+            ["list_source", "withdraw:node-source", "claim"]
+        );
+        assert!(observed.commands.is_empty());
+        assert!(observed.finishes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn planned_running_drain_colds_source_before_running_and_publishing_target() {
+        let drain_claim = claim(CatState::Running);
+        let expected_config = drain_claim.cat.config.clone();
+        let (service, observed) = service(
+            RecoveryAdmission::Claimed(drain_claim),
+            [
+                Ok(NodeCommandResult::Succeeded(CatState::Cold)),
+                Ok(NodeCommandResult::Succeeded(CatState::Running)),
+            ],
+            [Ok(NodeCatStatus::Absent), Ok(NodeCatStatus::Absent)],
+        );
+
+        let report = service
+            .drain_node("node-source")
+            .await
+            .expect("drain running Cat");
+
+        assert!(report.is_drained());
+        assert!(matches!(
+            report.cats[0].status,
+            CatDrainStatus::Migrated {
+                state: CatState::Running,
+                ..
+            }
+        ));
+        let observed = observed.lock().expect("observed");
+        assert_eq!(
+            observed.events,
+            [
+                "list_drain",
+                "claim",
+                "withdraw:node-source",
+                "source_endpoint",
+                "inspect",
+                "execute:Cold",
+                "endpoint",
+                "inspect",
+                "endpoint",
+                "execute:Run",
+                "publish:node-target",
+                "finish",
+            ]
+        );
+        assert_eq!(observed.commands[0].action, CatAction::Cold);
+        assert_eq!(observed.commands[0].config, None);
+        assert_eq!(observed.commands[1].action, CatAction::Run);
+        assert_eq!(observed.commands[1].config, Some(expected_config));
+        assert_eq!(observed.finishes, [OwnedFinish::Recovered]);
+    }
+
+    #[tokio::test]
+    async fn planned_warm_drain_restores_warm_without_publishing_transient_running() {
+        let (service, observed) = service(
+            RecoveryAdmission::Claimed(claim(CatState::Warm)),
+            [
+                Ok(NodeCommandResult::Succeeded(CatState::Cold)),
+                Ok(NodeCommandResult::Succeeded(CatState::Running)),
+                Ok(NodeCommandResult::Succeeded(CatState::Warm)),
+            ],
+            [Ok(NodeCatStatus::Absent), Ok(NodeCatStatus::Absent)],
+        );
+
+        let report = service
+            .drain_node("node-source")
+            .await
+            .expect("drain warm Cat");
+
+        assert!(report.is_drained());
+        let observed = observed.lock().expect("observed");
+        assert_eq!(
+            observed
+                .commands
+                .iter()
+                .map(|command| command.action)
+                .collect::<Vec<_>>(),
+            [CatAction::Cold, CatAction::Run, CatAction::Warm]
+        );
+        assert!(!observed
+            .events
+            .iter()
+            .any(|event| event.starts_with("publish:")));
+    }
+
+    #[tokio::test]
+    async fn planned_drain_retry_joins_claim_and_discovers_both_completed_sides() {
+        let (service, observed) = service(
+            RecoveryAdmission::AlreadyClaimed(claim(CatState::Suspended)),
+            [],
+            [
+                Ok(NodeCatStatus::Present {
+                    state: Some(CatState::Cold),
+                    active_action: None,
+                }),
+                Ok(NodeCatStatus::Present {
+                    state: Some(CatState::Suspended),
+                    active_action: None,
+                }),
+            ],
+        );
+
+        let report = service
+            .drain_node("node-source")
+            .await
+            .expect("resume completed drain");
+
+        assert!(report.is_drained());
+        let observed = observed.lock().expect("observed");
+        assert!(observed.commands.is_empty());
+        assert_eq!(observed.finishes, [OwnedFinish::Recovered]);
+    }
+
+    #[tokio::test]
+    async fn planned_drain_cold_failure_releases_the_target_but_preserves_source_retry() {
+        let (service, observed) = service(
+            RecoveryAdmission::Claimed(claim(CatState::Running)),
+            [Ok(NodeCommandResult::Failed {
+                code: "flush_failed".to_owned(),
+                message: "retained volume did not reach R=L".to_owned(),
+            })],
+            [Ok(NodeCatStatus::Absent)],
+        );
+
+        let report = service
+            .drain_node("node-source")
+            .await
+            .expect("report blocked source Cold");
+
+        assert!(!report.is_drained());
+        assert!(matches!(
+            &report.cats[0].status,
+            CatDrainStatus::Blocked { code, .. } if code == "flush_failed"
+        ));
+        let observed = observed.lock().expect("observed");
+        assert_eq!(
+            observed.finishes,
+            [OwnedFinish::RetrySource {
+                code: "flush_failed".to_owned(),
+                message: "retained volume did not reach R=L".to_owned(),
+            }]
+        );
+        assert!(!observed.events.iter().any(|event| event == "endpoint"));
+    }
+
+    #[tokio::test]
+    async fn planned_drain_ambiguous_source_releases_the_target_but_preserves_source_retry() {
+        let (service, observed) = service(
+            RecoveryAdmission::Claimed(claim(CatState::Running)),
+            [Err(NodeClientError::Timeout)],
+            [Ok(NodeCatStatus::Absent), Ok(NodeCatStatus::Absent)],
+        );
+
+        let report = service
+            .drain_node("node-source")
+            .await
+            .expect("report ambiguous source Cold");
+
+        assert!(!report.is_drained());
+        assert!(matches!(
+            &report.cats[0].status,
+            CatDrainStatus::Blocked { code, .. } if code == "drain_source_timeout"
+        ));
+        let observed = observed.lock().expect("observed");
+        assert_eq!(
+            observed.finishes,
+            [OwnedFinish::RetrySource {
+                code: "drain_source_timeout".to_owned(),
+                message: "source noded Cold request timed out".to_owned(),
+            }]
+        );
+        assert!(!observed.events.iter().any(|event| event == "endpoint"));
+    }
+
+    #[tokio::test]
+    async fn planned_drain_target_failure_settles_cleanup_on_target() {
+        let (service, observed) = service(
+            RecoveryAdmission::Claimed(claim(CatState::Running)),
+            [
+                Ok(NodeCommandResult::Succeeded(CatState::Cold)),
+                Ok(NodeCommandResult::Failed {
+                    code: "guest_start_failed".to_owned(),
+                    message: "target did not become Ready".to_owned(),
+                }),
+            ],
+            [Ok(NodeCatStatus::Absent), Ok(NodeCatStatus::Absent)],
+        );
+
+        let report = service
+            .drain_node("node-source")
+            .await
+            .expect("report blocked target restore");
+
+        assert!(!report.is_drained());
+        assert!(matches!(
+            &report.cats[0].status,
+            CatDrainStatus::Blocked { code, .. } if code == "guest_start_failed"
+        ));
+        let observed = observed.lock().expect("observed");
+        assert_eq!(
+            observed.finishes,
+            [OwnedFinish::Failed {
+                code: "guest_start_failed".to_owned(),
+                message: "target did not become Ready".to_owned(),
+            }]
+        );
+        assert!(!observed
+            .events
+            .iter()
+            .any(|event| event.starts_with("publish:")));
+    }
+
+    #[tokio::test]
+    async fn planned_drain_ambiguous_target_timeout_retains_the_relocation_claim() {
+        let (service, observed) = service(
+            RecoveryAdmission::Claimed(claim(CatState::Running)),
+            [
+                Ok(NodeCommandResult::Succeeded(CatState::Cold)),
+                Err(NodeClientError::Timeout),
+            ],
+            [
+                Ok(NodeCatStatus::Absent),
+                Ok(NodeCatStatus::Absent),
+                Ok(NodeCatStatus::Absent),
+            ],
+        );
+
+        let report = service
+            .drain_node("node-source")
+            .await
+            .expect("report ambiguous target Run");
+
+        assert!(!report.is_drained());
+        assert!(matches!(
+            &report.cats[0].status,
+            CatDrainStatus::Blocked { code, .. } if code == "recovery_timeout"
+        ));
+        let observed = observed.lock().expect("observed");
+        assert!(observed.finishes.is_empty());
+        assert!(!observed
+            .events
+            .iter()
+            .any(|event| event.starts_with("publish:")));
+    }
+
+    #[tokio::test]
+    async fn planned_drain_without_target_blocks_before_source_effects() {
+        let (service, observed) = service(
+            RecoveryAdmission::NoRunningTarget(cat(Some(CatState::Running))),
+            [],
+            [],
+        );
+
+        let report = service
+            .drain_node("node-source")
+            .await
+            .expect("report missing drain target");
+
+        assert!(!report.is_drained());
+        let observed = observed.lock().expect("observed");
+        assert_eq!(observed.events, ["list_drain", "claim"]);
+        assert!(observed.commands.is_empty());
+        assert!(observed.finishes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn planned_drain_does_not_preempt_an_existing_lifecycle_action() {
+        let (service, observed) = service(
+            RecoveryAdmission::Busy(cat(Some(CatState::Running))),
+            [],
+            [],
+        );
+
+        let report = service
+            .drain_node("node-source")
+            .await
+            .expect("report busy Cat");
+
+        assert!(!report.is_drained());
+        assert!(matches!(
+            &report.cats[0].status,
+            CatDrainStatus::Blocked { code, .. } if code == "busy"
+        ));
+        let observed = observed.lock().expect("observed");
+        assert_eq!(observed.events, ["list_drain", "claim"]);
         assert!(observed.commands.is_empty());
         assert!(observed.finishes.is_empty());
     }

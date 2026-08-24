@@ -16,6 +16,7 @@ pub const NODED_AUTHORIZATION_HEADER: &str = "authorization";
 pub const NODED_BEARER_SCHEME: &str = "Bearer";
 pub const NODED_HEALTH_PATH: &str = "/v1/health";
 pub const NODED_CATS_PATH: &str = "/v1/cats";
+pub const CONTROL_NODE_DRAIN_PATH: &str = "/v1/admin/nodes/{node_id}/actions/drain";
 
 const MAX_BOOT_IMAGE_BYTES: usize = 512;
 const MAX_NODE_TEXT_BYTES: usize = 255;
@@ -389,7 +390,6 @@ pub struct CreateCatRequest {
     pub cat_slug: ResourceSlug,
     pub cpu: u32,
     pub memory_bytes: u64,
-    pub boot_image: String,
     #[serde(default)]
     pub mounts: Vec<CatMountRequest>,
 }
@@ -401,12 +401,6 @@ impl CreateCatRequest {
         }
         if self.memory_bytes == 0 || self.memory_bytes > i64::MAX as u64 {
             return Err(SemanticValidationError::Memory);
-        }
-        if self.boot_image.is_empty()
-            || self.boot_image.len() > MAX_BOOT_IMAGE_BYTES
-            || self.boot_image.bytes().any(|byte| byte.is_ascii_control())
-        {
-            return Err(SemanticValidationError::BootImage);
         }
         validate_mounts_by_slug(&self.mounts)
     }
@@ -618,6 +612,93 @@ pub struct NodeResponse {
     pub status: SemanticStatus,
     pub code: SemanticSuccessCode,
     pub node: NodeView,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeDrainStatus {
+    Drained,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum NodeDrainCatResult {
+    Migrated {
+        cat_id: Id,
+        target_node_id: Id,
+        state: CatState,
+    },
+    Stale {
+        cat_id: Id,
+    },
+    Blocked {
+        cat_id: Id,
+        code: String,
+        message: String,
+    },
+}
+
+impl NodeDrainCatResult {
+    fn cat_id(&self) -> &Id {
+        match self {
+            Self::Migrated { cat_id, .. }
+            | Self::Stale { cat_id }
+            | Self::Blocked { cat_id, .. } => cat_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeDrainResponse {
+    pub status: NodeDrainStatus,
+    pub source_node_id: Id,
+    pub cats: Vec<NodeDrainCatResult>,
+}
+
+impl NodeDrainResponse {
+    pub fn validate(&self) -> Result<(), SemanticValidationError> {
+        validate_prefixed_id(&self.source_node_id, "node_")?;
+        let mut cat_ids = HashSet::with_capacity(self.cats.len());
+        let mut blocked = false;
+        for result in &self.cats {
+            validate_prefixed_id(result.cat_id(), "cat_")?;
+            if !cat_ids.insert(result.cat_id().as_str()) {
+                return Err(SemanticValidationError::DuplicateCat);
+            }
+            match result {
+                NodeDrainCatResult::Migrated {
+                    target_node_id,
+                    state,
+                    ..
+                } => {
+                    validate_prefixed_id(target_node_id, "node_")?;
+                    if !matches!(
+                        state,
+                        CatState::Running | CatState::Suspended | CatState::Warm
+                    ) {
+                        return Err(SemanticValidationError::ResponseShape);
+                    }
+                }
+                NodeDrainCatResult::Blocked { code, message, .. } => {
+                    blocked = true;
+                    if code.is_empty()
+                        || code.len() > 128
+                        || message.is_empty()
+                        || message.len() > 4096
+                    {
+                        return Err(SemanticValidationError::ResponseShape);
+                    }
+                }
+                NodeDrainCatResult::Stale { .. } => {}
+            }
+        }
+        if (self.status == NodeDrainStatus::Blocked) != blocked {
+            return Err(SemanticValidationError::ResponseShape);
+        }
+        Ok(())
+    }
 }
 
 /// The current Node selected for new traffic to one Cat. Absence of this DTO
@@ -1053,7 +1134,6 @@ mod tests {
             "cat_slug":"web",
             "cpu":2,
             "memory_bytes":4294967296,
-            "boot_image":"ubuntu-24.04",
             "mounts":[{"disk_slug":"data-disk","mount_path":"/data"}]
         }"#;
         let request: CreateCatRequest = serde_json::from_slice(body).unwrap();
@@ -1062,7 +1142,11 @@ mod tests {
         assert!(!encoded.contains("request_id"));
         assert!(!encoded.contains("operation"));
         assert!(serde_json::from_slice::<CreateCatRequest>(
-            br#"{"cat_slug":"web","cpu":2,"memory_bytes":4,"boot_image":"image","request_id":"req_1"}"#
+            br#"{"cat_slug":"web","cpu":2,"memory_bytes":4,"request_id":"req_1"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_slice::<CreateCatRequest>(
+            br#"{"cat_slug":"web","cpu":2,"memory_bytes":4,"boot_image":"image"}"#
         )
         .is_err());
     }
@@ -1070,7 +1154,7 @@ mod tests {
     #[test]
     fn create_cat_rejects_duplicate_disks_and_mount_paths() {
         let duplicate_disk: CreateCatRequest = serde_json::from_slice(
-            br#"{"cat_slug":"web","cpu":1,"memory_bytes":1,"boot_image":"image","mounts":[{"disk_slug":"data","mount_path":"/data"},{"disk_slug":"data","mount_path":"/other"}]}"#,
+            br#"{"cat_slug":"web","cpu":1,"memory_bytes":1,"mounts":[{"disk_slug":"data","mount_path":"/data"},{"disk_slug":"data","mount_path":"/other"}]}"#,
         )
         .unwrap();
         assert_eq!(
@@ -1079,7 +1163,7 @@ mod tests {
         );
 
         let duplicate_path: CreateCatRequest = serde_json::from_slice(
-            br#"{"cat_slug":"web","cpu":1,"memory_bytes":1,"boot_image":"image","mounts":[{"disk_slug":"data","mount_path":"/data"},{"disk_slug":"logs","mount_path":"/data"}]}"#,
+            br#"{"cat_slug":"web","cpu":1,"memory_bytes":1,"mounts":[{"disk_slug":"data","mount_path":"/data"},{"disk_slug":"logs","mount_path":"/data"}]}"#,
         )
         .unwrap();
         assert_eq!(
@@ -1193,6 +1277,45 @@ mod tests {
         ] {
             assert!(serde_json::from_slice::<CatIngressTarget>(retired).is_err());
         }
+    }
+
+    #[test]
+    fn node_drain_response_is_closed_and_status_matches_blocked_cats() {
+        let response = NodeDrainResponse {
+            status: NodeDrainStatus::Blocked,
+            source_node_id: id("node_source"),
+            cats: vec![
+                NodeDrainCatResult::Migrated {
+                    cat_id: id("cat_ok"),
+                    target_node_id: id("node_target"),
+                    state: CatState::Warm,
+                },
+                NodeDrainCatResult::Blocked {
+                    cat_id: id("cat_blocked"),
+                    code: "flush_failed".to_owned(),
+                    message: "retained volume did not reach R=L".to_owned(),
+                },
+            ],
+        };
+        response.validate().unwrap();
+        let encoded = serde_json::to_string(&response).unwrap();
+        let decoded: NodeDrainResponse = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, response);
+
+        let mut invalid = response;
+        invalid.status = NodeDrainStatus::Drained;
+        assert_eq!(
+            invalid.validate(),
+            Err(SemanticValidationError::ResponseShape)
+        );
+        assert!(serde_json::from_str::<NodeDrainResponse>(
+            r#"{"status":"drained","source_node_id":"node_source","cats":[],"operation_id":"op_1"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<NodeDrainResponse>(
+            r#"{"status":"drained","source_node_id":"node_source","cats":[{"status":"stale","cat_id":"cat_gone","operation_id":"op_1"}]}"#
+        )
+        .is_err());
     }
 
     #[test]

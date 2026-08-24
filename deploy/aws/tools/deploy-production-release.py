@@ -27,6 +27,7 @@ CONFIG_FIELDS = {
     "application_tfvars",
     "aws_region",
     "control_postgres_schema",
+    "default_boot_image_digest",
     "eks_cluster_name",
     "expected_account_id",
     "expected_aws_partition",
@@ -151,6 +152,8 @@ def load_config(path: Path) -> tuple[dict[str, Any], bytes]:
     require_real_file(config["kubeconfig_path"], "kubeconfig")
     if SCHEMA.fullmatch(str(config["control_postgres_schema"])) is None:
         raise DeploymentError("deployment Control PostgreSQL schema is invalid")
+    if DIGEST.fullmatch(str(config["default_boot_image_digest"])) is None:
+        raise DeploymentError("deployment default boot image digest is invalid")
     state_bucket = config["terraform_state_bucket"]
     if not isinstance(state_bucket, str) or not state_bucket.startswith("cats-"):
         raise DeploymentError("Terraform state bucket is invalid")
@@ -382,6 +385,7 @@ def terraform_plan_command(
                 f"-var=kubeconfig_path={config['kubeconfig_path']}",
                 f"-var=kubeconfig_context={config['kubeconfig_context']}",
                 f"-var=control_plane_image={images['control_plane']}",
+                f"-var=default_boot_image_digest={config['default_boot_image_digest']}",
                 f"-var=credential_refresher_image={images['credential_refresher']}",
             ]
         )

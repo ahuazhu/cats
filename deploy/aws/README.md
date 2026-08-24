@@ -193,16 +193,18 @@ The existing worker release machinery uses the Terraform-managed artifact bucket
 Secrets Manager secret and SSM State Manager association. The bundle digest is
 verified before installing `cats-noded`, `cats-blockd`, `cats-guest-agent`,
 `render-postgres-url` and the worker systemd units. The same bundle carries the Guest Agent and standalone
-Guest systemd units as a golden-root payload. The association patches them
+Guest systemd units as a release-owned Guest seed payload. The association patches them
 into a private copy of `rootfs.ext4`, verifies the ext4 image, preserves
 `rootfs.ext4.previous`, atomically replaces the seed and immediately restarts
 `cats-worker`. The updater also normalizes release-owned Guest invariants that
 must be repaired in already-built seeds, including a world-readable
 `/etc/resolv.conf` for APT's unprivileged resolver worker. The restart is
-required, not cosmetic:
-`ensure_image_published` caches the golden root's image id for the life of the
-node process, so an updated image is otherwise ignored. Existing Cats keep
-their current root until they are recreated. This installer behavior predates
+required, not cosmetic, because subsequent Guests must use one internally
+consistent release receipt and Guest payload. This seed is not the product
+Golden Root cache: Root provision uses the independent, digest-checked
+`/var/lib/cats/golden-root-cache/rootfs.ext4` single slot and fills it only from
+the immutable remote image namespace. Existing Cats keep their current root
+until they are recreated. This installer behavior predates
 the clean-slate exact-SHA qualification; the association must not be enabled as
 a rolling current-runtime upgrade until the gate below is green.
 
@@ -316,7 +318,7 @@ deploy/aws/tools/package-production-release.py \
 
 `tools/deploy-production-release.py` consumes only that completed package. Its
 canonical config names the exact AWS cell, EKS context, separate Terraform
-state keys, Control schema, both ordered tfvars lists and the complete
+state keys, Control schema, current qualified default Golden Root digest, both ordered tfvars lists and the complete
 worker-name-to-instance map. Secret tfvars remain external root-only files;
 the deployer records their config digest but never copies their bytes into a
 receipt. The application tfvars must already contain the current immutable
@@ -329,7 +331,7 @@ The config is canonical JSON with this exact shape (replace every example
 value and use resolved absolute file paths):
 
 ```json
-{"application_state_key":"cats/production/application.tfstate","application_tfvars":["/approved/root-only/application.tfvars.json","/approved/root-only/application-secrets.tfvars.json"],"aws_region":"us-east-1","control_postgres_schema":"cats_r26","eks_cluster_name":"cats-production","expected_account_id":"123456789012","expected_aws_partition":"aws","infrastructure_state_key":"cats/production/infrastructure.tfstate","infrastructure_tfvars":["/approved/root-only/infrastructure.tfvars.json"],"kubeconfig_context":"cats-production","kubeconfig_path":"/approved/root-only/kubeconfig","namespace":"cats","schema_version":1,"terraform_state_bucket":"cats-terraform-state-123456789012-us-east-1","worker_instances":{"metal-1":"i-0123456789abcdef0","metal-2":"i-0123456789abcdef1"}}
+{"application_state_key":"cats/production/application.tfstate","application_tfvars":["/approved/root-only/application.tfvars.json","/approved/root-only/application-secrets.tfvars.json"],"aws_region":"us-east-1","control_postgres_schema":"cats_r26","default_boot_image_digest":"sha256:<CURRENT_QUALIFIED_GOLDEN_ROOT_DIGEST>","eks_cluster_name":"cats-production","expected_account_id":"123456789012","expected_aws_partition":"aws","infrastructure_state_key":"cats/production/infrastructure.tfstate","infrastructure_tfvars":["/approved/root-only/infrastructure.tfvars.json"],"kubeconfig_context":"cats-production","kubeconfig_path":"/approved/root-only/kubeconfig","namespace":"cats","schema_version":1,"terraform_state_bucket":"cats-terraform-state-123456789012-us-east-1","worker_instances":{"metal-1":"i-0123456789abcdef0","metal-2":"i-0123456789abcdef1"}}
 ```
 
 The controller deliberately separates saved-plan creation from apply. Both
@@ -373,7 +375,6 @@ deploy/aws/tools/production-cat-lifecycle-e2e.py \
   --token-file /approved/root-only/e2e-workspace-token \
   --qualification-begin-receipt /approved/evidence/qualification/production-mutation-qualification-begin.receipt.json \
   --workspace-id <EXACT_WS_ID> \
-  --boot-image-digest sha256:<GOLDEN_ROOT_DIGEST> \
   --cat-name release-e2e-<CUTOVER_ID> \
   --disk-name release-disk-<CUTOVER_ID> \
   --disk-size 1GiB \

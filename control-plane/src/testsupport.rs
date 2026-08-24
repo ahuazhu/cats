@@ -66,6 +66,10 @@ pub fn unavailable_image_blob() -> Arc<dyn cats_storage::BlobStore> {
     Arc::new(UnavailableImageBlob)
 }
 
+pub fn test_boot_image() -> String {
+    format!("sha256:{}", "0".repeat(64))
+}
+
 /// Explicit typed receipt injection for tests that never exercise the
 /// production fixed-path filesystem reader.
 pub fn test_guest_runtime_profile_receipt(

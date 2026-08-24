@@ -1,8 +1,9 @@
 //! Clean-slate semantic Control assembly.
 //!
 //! The public HTTP server owns only workspace/auth/billing, semantic resource
-//! operations and semantic Node registration/liveness. Retired lifecycle,
-//! inventory, AgentSession and Route Operation workers are not composed.
+//! operations, committed-action recovery and semantic Node
+//! registration/liveness. Retired lifecycle, inventory, AgentSession and
+//! Route Operation workers are not composed.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -10,7 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use cats_api::runtime_reconciliation::{GuestRuntimeProfileReceipt, RuntimeProvisionerTrustBundle};
+use cats_api::runtime_reconciliation::{
+    GuestRuntimeProfileReceipt, RuntimeProvisionerTrustBundle, Sha256Digest,
+};
 use cats_metering::{CreditStore, UsageStore};
 use cats_storage::BlobStore;
 
@@ -18,6 +21,14 @@ use crate::store::{DsnSource, SingletonRole, Store};
 
 const SINGLETON_ELECTION_RETRY: Duration = Duration::from_millis(500);
 const SINGLETON_HEALTH_INTERVAL: Duration = Duration::from_secs(1);
+const DESTROY_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
+// A live request owns its claim through the default 120-second lifecycle
+// deadline and a possible ten-second failed-Create cleanup. Waiting beyond
+// both prevents the recovery task from racing the ordinary response path
+// while still bounding crash recovery.
+const DESTROY_RECOVERY_MINIMUM_AGE: Duration = crate::semantic_lifecycle::DEFAULT_STALE_ACTION_AGE;
+const DESTROY_RECOVERY_BATCH_SIZE: usize = 32;
+const DESTROY_RECOVERY_MAX_IN_FLIGHT: usize = 4;
 
 #[derive(Clone)]
 pub struct Config {
@@ -29,6 +40,9 @@ pub struct Config {
     /// Retained as a storage-provider boundary for independently composed
     /// volume/object-write workers. Semantic lifecycle does not read it.
     pub image_blob: Arc<dyn BlobStore>,
+    /// Exact deployment-selected Golden Root used for every newly allocated
+    /// Cat. The public create API never accepts an image override.
+    pub default_boot_image: String,
     pub auth_token: String,
     pub noded_service_token: String,
     /// Retained in configuration until Node effect composition consumes the
@@ -60,8 +74,10 @@ pub struct Handle {
     pub addr: std::net::SocketAddr,
     pub state: AppState,
     server_task: tokio::task::JoinHandle<()>,
+    semantic_destroy_recovery_task: ManagedSingletonTask,
     semantic_node_liveness_shutdown: tokio::sync::watch::Sender<bool>,
     semantic_node_liveness_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    semantic_action_recovery_task: ManagedSingletonTask,
     server_shutdown: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
@@ -95,16 +111,26 @@ impl Handle {
         {
             let _ = shutdown.send(());
         }
+        self.semantic_destroy_recovery_task.begin_shutdown();
         self.semantic_node_liveness_shutdown.send_replace(true);
+        self.semantic_action_recovery_task.begin_shutdown();
         self.state.runtime_node_authority.begin_shutdown();
     }
 
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         self.begin_shutdown();
+        self.semantic_destroy_recovery_task
+            .shutdown()
+            .await
+            .context("semantic Destroy recovery task failed")?;
         let mut task = self.semantic_node_liveness_task.lock().await;
         if let Some(task) = task.take() {
             task.await.context("semantic Node liveness task failed")?;
         }
+        self.semantic_action_recovery_task
+            .shutdown()
+            .await
+            .context("semantic action recovery task failed")?;
         self.state
             .runtime_node_authority
             .shutdown_commit_resolutions()
@@ -133,6 +159,8 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         cfg.auth_token != cfg.admin_token,
         "service and admin tokens must be different"
     );
+    Sha256Digest::new(cfg.default_boot_image.clone())
+        .context("CATS_BOOT_IMAGE must be an exact lowercase sha256 digest")?;
     let cfg = Arc::new(cfg);
     let ca_file = cfg
         .control_store_ca_file
@@ -187,6 +215,7 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
             crate::semantic_node_recovery::RecoveryTimeouts::default(),
         ),
     );
+    let planned_drain_recovery = Arc::clone(&recovery);
     let offline_recovery: crate::semantic_node::OfflineNodeRecovery = Arc::new(move |node_id| {
         let recovery = Arc::clone(&recovery);
         Box::pin(async move {
@@ -205,6 +234,15 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
             Ok(())
         })
     });
+    let planned_drain: crate::semantic_node::PlannedNodeDrain = Arc::new(move |node_id| {
+        let recovery = Arc::clone(&planned_drain_recovery);
+        Box::pin(async move {
+            recovery
+                .drain_node(&node_id)
+                .await
+                .map_err(|error| cats_api::error::ApiError::internal(error.message))
+        })
+    });
     let semantic_node_repository: Arc<dyn crate::semantic_node::NodeRepository> =
         Arc::new(crate::semantic_adapters::SemanticNodeRepositoryAdapter::new(Arc::clone(&store)));
     let semantic_node_probe: Arc<dyn crate::semantic_node::NodeHealthProbe> = Arc::new(
@@ -215,7 +253,8 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
             semantic_node_repository,
             semantic_node_probe,
         )
-        .with_offline_recovery(offline_recovery),
+        .with_offline_recovery(offline_recovery)
+        .with_planned_drain(planned_drain),
     );
     let semantic_node_http = crate::api::semantic_nodes::SemanticNodeHttpState::new(
         Arc::clone(&semantic_node_service),
@@ -227,6 +266,41 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         semantic_ingress,
         crate::semantic_lifecycle::LifecycleTimeouts::default(),
     );
+    let semantic_action_recovery = semantic_lifecycle.clone();
+    let destroy_recovery_lifecycle = semantic_lifecycle.clone();
+    let semantic_destroy_recovery_task = spawn_managed_singleton_task(
+        Arc::clone(&store),
+        SingletonRole::SemanticDestroyRecovery,
+        move || {
+            let lifecycle = destroy_recovery_lifecycle.clone();
+            async move {
+                let mut interval = tokio::time::interval(DESTROY_RECOVERY_INTERVAL);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    interval.tick().await;
+                    match lifecycle
+                        .recover_pending_destroys(
+                            DESTROY_RECOVERY_MINIMUM_AGE,
+                            DESTROY_RECOVERY_BATCH_SIZE,
+                            DESTROY_RECOVERY_MAX_IN_FLIGHT,
+                        )
+                        .await
+                    {
+                        Ok(report) if report.discovered > 0 => tracing::info!(
+                            discovered = report.discovered,
+                            completed = report.completed,
+                            failed = report.failed,
+                            "pending Destroy recovery pass completed"
+                        ),
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(?error, "pending Destroy discovery failed");
+                        }
+                    }
+                }
+            }
+        },
+    );
     let semantic_resources: Arc<dyn crate::api::semantic_resources::SemanticResourceApi> = Arc::new(
         crate::semantic_resource_service::ProductionSemanticResourceApi::with_disk_backend(
             semantic_lifecycle,
@@ -237,6 +311,7 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
                 Arc::clone(&store),
                 Arc::clone(&cfg.image_blob),
             ),
+            cfg.default_boot_image.clone(),
         ),
     );
     let (semantic_node_liveness_shutdown, semantic_node_liveness_rx) =
@@ -269,6 +344,20 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         .await
         .with_context(|| format!("bind {}", state.cfg.listen))?;
     let addr = listener.local_addr()?;
+    let semantic_action_recovery_task = spawn_managed_singleton_task(
+        Arc::clone(&state.store),
+        SingletonRole::SemanticActionRecovery,
+        move || {
+            let semantic_action_recovery = semantic_action_recovery.clone();
+            async move {
+                semantic_action_recovery
+                    .run_stale_action_recovery(
+                        crate::semantic_lifecycle::ActionRecoveryPolicy::default(),
+                    )
+                    .await;
+            }
+        },
+    );
     let app = crate::api::router(state.clone());
     let (server_shutdown, server_shutdown_rx) = tokio::sync::oneshot::channel();
     let server_task = tokio::spawn(async move {
@@ -286,8 +375,10 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         addr,
         state,
         server_task,
+        semantic_destroy_recovery_task,
         semantic_node_liveness_shutdown,
         semantic_node_liveness_task: tokio::sync::Mutex::new(Some(semantic_node_liveness_task)),
+        semantic_action_recovery_task,
         server_shutdown: std::sync::Mutex::new(Some(server_shutdown)),
     })
 }
@@ -414,7 +505,10 @@ async fn run_singleton_election<F, Fut>(
                             tracing::warn!(role = role.name(), %error, "singleton session lost");
                             task.abort();
                             let _ = task.await;
-                            return;
+                            if retry_or_shutdown(&mut shutdown).await {
+                                return;
+                            }
+                            continue 'election;
                         }
                     }
                 }
@@ -485,5 +579,66 @@ async fn close_singleton(session: crate::store::SingletonSession) {
     if let Err(error) = crate::store::execute_leadership_cleanup(move || session.close_now()).await
     {
         tracing::error!(%error, "singleton session cleanup failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn singleton_reenters_election_after_its_postgres_session_is_lost() {
+        let store = Arc::new(
+            Store::connect(&crate::testsupport::isolated_control_store_url(), None)
+                .expect("test Store"),
+        );
+        let starts = Arc::new(AtomicUsize::new(0));
+        let task_starts = Arc::clone(&starts);
+        let role = SingletonRole::SemanticDestroyRecovery;
+        let task = spawn_managed_singleton_task(Arc::clone(&store), role, move || {
+            let task_starts = Arc::clone(&task_starts);
+            async move {
+                task_starts.fetch_add(1, Ordering::AcqRel);
+                std::future::pending::<()>().await;
+            }
+        });
+
+        cats_test_support::wait_until_async("first singleton leadership", || async {
+            starts.load(Ordering::Acquire) == 1
+        })
+        .await;
+
+        let role_key = role.lock_key();
+        let terminated: bool = store
+            .execute(move |store| {
+                store.with(|client| {
+                    let rows = client.query(
+                        "SELECT pid FROM pg_catalog.pg_locks
+                          WHERE locktype='advisory'
+                            AND classid=hashtext(current_schema())::oid
+                            AND objid=$1::int4::oid
+                            AND objsubid=2
+                            AND granted
+                            AND pid<>pg_backend_pid()",
+                        &[&role_key],
+                    )?;
+                    assert_eq!(rows.len(), 1, "calibrate exact singleton lock lookup");
+                    let pid: i32 = rows[0].get(0);
+                    client
+                        .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+                        .map(|row| row.get(0))
+                })
+            })
+            .await
+            .expect("terminate elected singleton session");
+        assert!(terminated);
+
+        cats_test_support::wait_until_async("singleton leadership after session loss", || async {
+            starts.load(Ordering::Acquire) >= 2
+        })
+        .await;
+        task.shutdown().await.expect("singleton shutdown");
     }
 }

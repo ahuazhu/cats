@@ -29,11 +29,11 @@ mod runtime_provisioner_unsupported_compile_shape;
 mod stable_unix_fs;
 mod term;
 mod view;
+mod workos_client;
 
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
-use cats_api::runtime_reconciliation::Sha256Digest;
 use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 
@@ -104,9 +104,6 @@ pub enum Command {
         /// Workspace-local Cat slug.
         #[arg(value_name = "CAT_SLUG")]
         name: String,
-        /// Boot image understood by the Control Plane.
-        #[arg(long = "boot-image", value_name = "sha256:DIGEST")]
-        boot_image_digest: String,
         #[arg(long = "cpu", default_value_t = 2)]
         cpus: u32,
         #[arg(long, default_value = "2GiB")]
@@ -1498,18 +1495,14 @@ pub fn run(cli: Cli) -> Result<()> {
         },
         Command::Create {
             name,
-            boot_image_digest,
             cpus,
             memory,
             mounts,
         } => {
-            let boot_image = Sha256Digest::new(boot_image_digest.clone())
-                .context("--boot-image must be an exact sha256 digest")?;
             let request = CreateCatRequest {
                 cat_slug: resource_slug("cat", name)?,
                 cpu: *cpus,
                 memory_bytes: parse_size(memory)?,
-                boot_image: boot_image.as_str().to_owned(),
                 mounts: parse_mounts(mounts)?,
             };
             request.validate().context("invalid Cat create request")?;
@@ -1892,9 +1885,6 @@ fn run_disk(client: &Client, cli: &Cli, cmd: &DiskCommand) -> Result<()> {
 mod tests {
     use super::*;
 
-    const TEST_BOOT_IMAGE: &str =
-        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
     #[test]
     fn watch_intervals_reject_unbounded_and_unitless_values() {
         assert_eq!(parse_interval("250ms").unwrap(), Duration::from_millis(250));
@@ -2035,26 +2025,14 @@ mod tests {
     }
 
     #[test]
-    fn create_rejects_a_boot_image_alias_before_http() {
+    fn create_rejects_a_user_boot_image_override() {
         use clap::Parser as _;
 
-        let error = run(Cli::parse_from([
-            "cats",
-            "--api-url",
-            "http://127.0.0.1:1",
-            "--token",
-            "test-token",
-            "--workspace",
-            "ws_01",
-            "create",
-            "app",
-            "--boot-image",
-            "ubuntu-24.04",
-        ]))
-        .expect_err("boot image aliases are not installed-mode identities");
+        let error = Cli::try_parse_from(["cats", "create", "app", "--boot-image", "ubuntu-24.04"])
+            .expect_err("the Control-owned boot image cannot be overridden");
         assert!(error
             .to_string()
-            .contains("--boot-image must be an exact sha256 digest"));
+            .contains("unexpected argument '--boot-image'"));
     }
 
     #[test]
@@ -2077,8 +2055,6 @@ mod tests {
             "cats",
             "create",
             "dev",
-            "--boot-image",
-            TEST_BOOT_IMAGE,
             "--cpu",
             "4",
             "--memory",
@@ -2087,29 +2063,14 @@ mod tests {
             "data:/data",
         ]);
         match cli.command {
-            Command::Create {
-                name,
-                cpus,
-                boot_image_digest,
-                ..
-            } => {
+            Command::Create { name, cpus, .. } => {
                 assert_eq!(name, "dev");
                 assert_eq!(cpus, 4);
-                assert_eq!(boot_image_digest, TEST_BOOT_IMAGE);
             }
             _ => panic!("wrong parse"),
         }
-        assert!(Cli::try_parse_from(["cats", "create", "x"]).is_err());
-        assert!(Cli::try_parse_from([
-            "cats",
-            "create",
-            "x",
-            "--boot-image",
-            TEST_BOOT_IMAGE,
-            "--disk",
-            "legacy",
-        ])
-        .is_err());
+        assert!(Cli::try_parse_from(["cats", "create", "x"]).is_ok());
+        assert!(Cli::try_parse_from(["cats", "create", "x", "--disk", "legacy",]).is_err());
         for action in ["run", "suspend", "warm", "cold", "destroy"] {
             let parsed = Cli::try_parse_from(["cats", action, "cat_01"])
                 .unwrap_or_else(|error| panic!("{action} did not parse: {error}"));
@@ -2784,8 +2745,6 @@ mod tests {
             "ws_01",
             "create",
             "app",
-            "--boot-image",
-            TEST_BOOT_IMAGE,
             "--cpu",
             "3",
             "--memory",
@@ -2810,7 +2769,6 @@ mod tests {
                 "cat_slug": "app",
                 "cpu": 3,
                 "memory_bytes": 2_147_483_648_u64,
-                "boot_image": TEST_BOOT_IMAGE,
                 "mounts": [
                     {"disk_slug": "data", "mount_path": "/srv/data"},
                     {"disk_slug": "logs", "mount_path": "/srv/logs"},
@@ -3164,14 +3122,20 @@ mod tests {
             .expect("create command")
             .clone();
         let create_help = create.render_long_help().to_string();
-        for flag in ["--boot-image", "--cpu", "--memory", "--mount"] {
+        for flag in ["--cpu", "--memory", "--mount"] {
             assert!(
                 create_help.contains(flag),
                 "missing semantic create flag {flag}"
             );
         }
-        assert!(!create_help.contains("--boot-image-digest"));
-        for retired in ["--image", "--disk", "--no-auto-suspend", "--expires-in"] {
+        for retired in [
+            "--boot-image",
+            "--boot-image-digest",
+            "--image",
+            "--disk",
+            "--no-auto-suspend",
+            "--expires-in",
+        ] {
             assert!(
                 !create_help.contains(retired),
                 "legacy create flag {retired:?}"

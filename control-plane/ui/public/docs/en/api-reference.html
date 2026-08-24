@@ -13,12 +13,12 @@ POST /v1/workspaces/{workspace_id}/cats/{cat_id}/actions/cold
 POST /v1/workspaces/{workspace_id}/cats/{cat_id}/actions/destroy</code></pre>
 <pre><code>{
   "name": "dev",
-  "boot_image_digest": "sha256:&lt;64-lowercase-hex&gt;",
   "vcpus": 2,
   "memory_bytes": 2147483648,
   "root_size_bytes": 1073741824,
   "durability": "strict"
 }</code></pre>
+<p>Control automatically binds the deployment's current qualified boot image to a newly created Cat. The request does not accept an image override, and existing Cats keep their original exact digest.</p>
 <p>Create returns exact <code>202 application/json</code> with <code>{"cat_id":"…","operation_id":"…"}</code>. Collection reads accept only bounded <code>limit</code> and opaque <code>cursor</code> fields. Item reads and lifecycle actions accept immutable <code>cat_…</code> IDs only.</p>
 <p>Each lifecycle action takes exactly one <code>Idempotency-Key</code>, an empty body, and no <code>Content-Type</code>; success is exact <code>202 application/json</code> with <code>{"operation_id":"op_…"}</code>. An ambiguous response remains pending and must be replayed byte-for-byte. The retired <code>start</code>, <code>stop</code>, <code>delete</code>, and <code>resume</code> routes are not aliases. Exec, deployment, Endpoint, expiry, and work-policy mutations remain outside this release router.</p>
 

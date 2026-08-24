@@ -70,7 +70,11 @@ fn create_running_cat(store: &Store, cat_id: &str, slug: &str) -> CatRecord {
             cat_id,
             FinishCatAction {
                 expected_action: CatAction::Create,
+                expected_recovery_started_at: None,
                 expected_node_id: Some("node-a"),
+                expected_action_started_at: created
+                    .current_action_started_at
+                    .expect("Create claim has a start time"),
                 final_state: CatState::Running,
                 final_node_id: Some("node-a"),
                 error_code: None,
@@ -102,6 +106,770 @@ fn register_second_node(store: &Store) {
             .unwrap(),
         RegisterNodeOutcome::Registered(_)
     ));
+}
+
+fn register_third_node(store: &Store) {
+    assert!(matches!(
+        store
+            .register_semantic_node(registration_with_identity(
+                "node-c",
+                "http://10.0.0.3:8443",
+                "worker-c",
+                "i-semantic-c",
+            ))
+            .unwrap(),
+        RegisterNodeOutcome::Registered(_)
+    ));
+}
+
+fn admit_cat(
+    store: &Store,
+    cat_id: &str,
+    cat_slug: &str,
+    cpu_count: i64,
+    memory_bytes: i64,
+) -> CatWithMounts {
+    let AdmitCatCreateOutcome::Created(cat) = store
+        .admit_semantic_cat_create(AtomicCatCreate {
+            cat_id,
+            workspace_id: "ws_semantic",
+            cat_slug,
+            cpu_count,
+            memory_bytes,
+            boot_image: "sha256:image",
+            mounts: &[],
+        })
+        .unwrap()
+    else {
+        panic!("new atomic Cat must be admitted")
+    };
+    cat
+}
+
+fn create_running_cat_on(
+    store: &Store,
+    cat_id: &str,
+    slug: &str,
+    node_id: &str,
+    cpu_count: i64,
+    memory_bytes: i64,
+) -> CatRecord {
+    let CreateCatOutcome::Created(created) = store
+        .create_semantic_cat(NewCat {
+            cat_id,
+            workspace_id: "ws_semantic",
+            cat_slug: slug,
+            node_id,
+            cpu_count,
+            memory_bytes,
+            boot_image: "sha256:image",
+        })
+        .unwrap()
+    else {
+        panic!("new semantic Cat must be created")
+    };
+    assert_eq!(created.current_action, Some(CatAction::Create));
+    store
+        .finish_semantic_cat_action(
+            cat_id,
+            FinishCatAction {
+                expected_action: CatAction::Create,
+                expected_recovery_started_at: None,
+                expected_node_id: Some(node_id),
+                expected_action_started_at: created
+                    .current_action_started_at
+                    .expect("Create claim has a start time"),
+                final_state: CatState::Running,
+                final_node_id: Some(node_id),
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .unwrap()
+        .unwrap()
+}
+
+#[test]
+fn atomic_create_balances_equal_shapes_and_counts_in_progress_reservations() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    register_second_node(&store);
+
+    let placements = (0..4)
+        .map(|index| {
+            let cat_id = format!("cat-balanced-{index}");
+            let slug = format!("balanced-{index}");
+            admit_cat(&store, &cat_id, &slug, 2, 1 << 30)
+                .cat
+                .current_action_node_id
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(placements, ["node-a", "node-b", "node-a", "node-b"]);
+}
+
+#[test]
+fn atomic_create_uses_committed_shape_and_skips_non_running_nodes() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    register_second_node(&store);
+    create_running_cat_on(&store, "cat-heavy-a", "heavy-a", "node-a", 8, 8 << 30);
+
+    let selected = admit_cat(&store, "cat-light", "light", 1, 1 << 30);
+    assert_eq!(
+        selected.cat.current_action_node_id.as_deref(),
+        Some("node-b")
+    );
+
+    store
+        .transition_semantic_node_status("node-b", &[NodeStatus::Running], NodeStatus::Draining)
+        .unwrap()
+        .unwrap();
+    let selected = admit_cat(&store, "cat-after-drain", "after-drain", 1, 1 << 30);
+    assert_eq!(
+        selected.cat.current_action_node_id.as_deref(),
+        Some("node-a")
+    );
+}
+
+#[test]
+fn destroy_preempts_an_in_progress_create_on_its_reserved_node() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    let creating = admit_cat(
+        &store,
+        "cat-destroy-creating",
+        "destroy-creating",
+        2,
+        1 << 30,
+    );
+    assert_eq!(creating.cat.state, None);
+    assert_eq!(creating.cat.current_action, Some(CatAction::Create));
+    assert_eq!(
+        creating.cat.current_action_node_id.as_deref(),
+        Some("node-a")
+    );
+
+    let AdmitCatActionOutcome::Acquired(destroy) = store
+        .admit_semantic_cat_action(
+            SemanticCatSelector::Id("cat-destroy-creating"),
+            CatAction::Destroy,
+        )
+        .unwrap()
+    else {
+        panic!("destroy must replace the in-progress create claim")
+    };
+    assert_eq!(destroy.cat.state, Some(CatState::Failure));
+    assert_eq!(destroy.cat.current_action, Some(CatAction::Destroy));
+    assert_eq!(
+        destroy.cat.current_action_node_id.as_deref(),
+        Some("node-a")
+    );
+
+    // Simulate Control exiting after the replacement claim commits but
+    // before it dispatches to noded. A later elected scanner must rediscover
+    // the exact Destroy lane and its inherited Node.
+    let pending = store.claim_pending_semantic_destroy_claims(0, 32).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].cat.cat_id, "cat-destroy-creating");
+    assert_eq!(pending[0].cat.current_action, Some(CatAction::Destroy));
+    assert_eq!(
+        pending[0].cat.current_action_node_id.as_deref(),
+        Some("node-a")
+    );
+    assert!(matches!(
+        store
+            .admit_semantic_cat_action(
+                SemanticCatSelector::Id("cat-destroy-creating"),
+                CatAction::Destroy,
+            )
+            .unwrap(),
+        AdmitCatActionOutcome::Busy(_)
+    ));
+
+    assert!(store
+        .finish_semantic_cat_action(
+            "cat-destroy-creating",
+            FinishCatAction {
+                expected_action: CatAction::Create,
+                expected_recovery_started_at: None,
+                expected_node_id: Some("node-a"),
+                expected_action_started_at: creating
+                    .cat
+                    .current_action_started_at
+                    .expect("create claim has a start time"),
+                final_state: CatState::Running,
+                final_node_id: Some("node-a"),
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .unwrap()
+        .is_none());
+
+    let destroyed = store
+        .finish_semantic_cat_action(
+            "cat-destroy-creating",
+            FinishCatAction {
+                expected_action: CatAction::Destroy,
+                expected_recovery_started_at: pending[0].cat.current_action_recovery_started_at,
+                expected_node_id: Some("node-a"),
+                expected_action_started_at: pending[0]
+                    .cat
+                    .current_action_started_at
+                    .expect("destroy claim has a start time"),
+                final_state: CatState::Destroyed,
+                final_node_id: None,
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .unwrap()
+        .expect("destroy owns the replacement claim");
+    assert_eq!(destroyed.state, Some(CatState::Destroyed));
+    assert!(store
+        .claim_pending_semantic_destroy_claims(0, 32)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn failed_destroy_recovery_rotates_behind_an_untried_claim() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    let cat_ids = ["cat-rotate-a", "cat-rotate-b", "cat-rotate-c"];
+    for cat_id in cat_ids {
+        let slug = cat_id.trim_start_matches("cat-");
+        admit_cat(&store, cat_id, slug, 1, 1 << 30);
+        assert!(matches!(
+            store
+                .admit_semantic_cat_action(SemanticCatSelector::Id(cat_id), CatAction::Destroy,)
+                .unwrap(),
+            AdmitCatActionOutcome::Acquired(_)
+        ));
+    }
+    store
+        .with(|client| {
+            client
+                .execute(
+                    "UPDATE cats SET updated_at=(SELECT MAX(created_at) FROM cats)",
+                    &[],
+                )
+                .map(|_| ())
+        })
+        .unwrap();
+
+    let first = store.claim_pending_semantic_destroy_claims(0, 2).unwrap();
+    assert_eq!(first.len(), 2);
+    let first_ids = first
+        .iter()
+        .map(|cat| cat.cat.cat_id.as_str())
+        .collect::<Vec<_>>();
+    let untried = cat_ids
+        .into_iter()
+        .find(|cat_id| !first_ids.contains(cat_id))
+        .expect("one claim must remain outside the first bounded page");
+    for cat in first {
+        assert!(store
+            .rotate_pending_semantic_destroy_claim(
+                &cat.cat.cat_id,
+                cat.cat.current_action_node_id.as_deref(),
+                cat.cat
+                    .current_action_started_at
+                    .expect("Destroy claim has a start time"),
+                cat.cat
+                    .current_action_recovery_started_at
+                    .expect("Destroy recovery claim has a lease"),
+            )
+            .unwrap());
+    }
+
+    let second = store.claim_pending_semantic_destroy_claims(0, 2).unwrap();
+    assert_eq!(second[0].cat.cat_id, untried);
+}
+
+#[test]
+fn cold_run_and_offline_recovery_share_the_least_loaded_policy() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    register_second_node(&store);
+    register_third_node(&store);
+    create_running_cat_on(&store, "cat-load-a", "load-a", "node-a", 4, 1 << 30);
+    create_running_cat_on(&store, "cat-load-b", "load-b", "node-b", 4, 1 << 30);
+    create_running_cat_on(&store, "cat-cold", "cold", "node-a", 1, 1 << 30);
+
+    let AdmitCatActionOutcome::Acquired(cold) = store
+        .admit_semantic_cat_action(SemanticCatSelector::Id("cat-cold"), CatAction::Cold)
+        .unwrap()
+    else {
+        panic!("running Cat must acquire Cold")
+    };
+    store
+        .finish_semantic_cat_action(
+            "cat-cold",
+            FinishCatAction {
+                expected_action: CatAction::Cold,
+                expected_recovery_started_at: None,
+                expected_node_id: cold.cat.current_action_node_id.as_deref(),
+                expected_action_started_at: cold
+                    .cat
+                    .current_action_started_at
+                    .expect("Cold claim has a start time"),
+                final_state: CatState::Cold,
+                final_node_id: None,
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+    let AdmitCatActionOutcome::Acquired(run) = store
+        .admit_semantic_cat_action(SemanticCatSelector::Id("cat-cold"), CatAction::Run)
+        .unwrap()
+    else {
+        panic!("Cold Cat must acquire Run")
+    };
+    assert_eq!(run.cat.current_action_node_id.as_deref(), Some("node-c"));
+
+    create_running_cat_on(
+        &store,
+        "cat-recovery-source",
+        "recovery-source",
+        "node-a",
+        1,
+        1 << 30,
+    );
+    store
+        .transition_semantic_node_status("node-a", &[NodeStatus::Running], NodeStatus::Offline)
+        .unwrap()
+        .unwrap();
+    let ClaimSemanticCatRecoveryOutcome::Claimed(claim) = store
+        .claim_semantic_cat_recovery("node-a", "cat-recovery-source")
+        .unwrap()
+    else {
+        panic!("offline Cat must receive a recovery claim")
+    };
+    assert_eq!(claim.target_node_id, "node-c");
+}
+
+#[test]
+fn planned_drain_claims_are_retryable_balanced_and_settle_exact_target_failures() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    register_second_node(&store);
+    register_third_node(&store);
+    for index in 0..3 {
+        create_running_cat_on(
+            &store,
+            &format!("cat-drain-{index}"),
+            &format!("drain-{index}"),
+            "node-a",
+            2,
+            1 << 30,
+        );
+    }
+    store
+        .transition_semantic_node_status("node-a", &[NodeStatus::Running], NodeStatus::Draining)
+        .unwrap()
+        .unwrap();
+
+    let ClaimSemanticCatRecoveryOutcome::Claimed(source_blocked) = store
+        .claim_semantic_cat_drain("node-a", "cat-drain-0")
+        .unwrap()
+    else {
+        panic!("draining Cat must receive a relocation claim")
+    };
+    assert_eq!(source_blocked.target_node_id, "node-b");
+    assert_eq!(source_blocked.cat.cat.state, Some(CatState::Running));
+    assert_eq!(source_blocked.cat.cat.node_id.as_deref(), Some("node-a"));
+    assert_eq!(
+        source_blocked.cat.cat.current_action_node_id.as_deref(),
+        Some("node-b")
+    );
+    assert!(matches!(
+        store
+            .admit_semantic_cat_action(SemanticCatSelector::Id("cat-drain-0"), CatAction::Run,)
+            .unwrap(),
+        AdmitCatActionOutcome::Busy(_)
+    ));
+    assert!(matches!(
+        store
+            .claim_semantic_cat_drain("node-a", "cat-drain-0")
+            .unwrap(),
+        ClaimSemanticCatRecoveryOutcome::AlreadyClaimed(ref retry)
+            if retry.target_node_id == "node-b"
+    ));
+
+    let ClaimSemanticCatRecoveryOutcome::Claimed(target_failure) = store
+        .claim_semantic_cat_drain("node-a", "cat-drain-1")
+        .unwrap()
+    else {
+        panic!("second draining Cat must receive a relocation claim")
+    };
+    assert_eq!(target_failure.target_node_id, "node-c");
+    let ClaimSemanticCatRecoveryOutcome::Claimed(recovered) = store
+        .claim_semantic_cat_drain("node-a", "cat-drain-2")
+        .unwrap()
+    else {
+        panic!("third draining Cat must receive a relocation claim")
+    };
+    assert_eq!(recovered.target_node_id, "node-b");
+    store
+        .transition_semantic_node_status("node-b", &[NodeStatus::Running], NodeStatus::Draining)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        store
+            .claim_semantic_cat_drain("node-a", "cat-drain-2")
+            .unwrap(),
+        ClaimSemanticCatRecoveryOutcome::AlreadyClaimed(ref retry)
+            if retry.target_node_id == "node-b"
+    ));
+
+    assert!(matches!(
+        store
+            .claim_semantic_cat_drain("node-a", "cat-drain-0")
+            .unwrap(),
+        ClaimSemanticCatRecoveryOutcome::AlreadyClaimed(ref retry)
+            if retry.target_node_id == "node-b"
+                && retry.cat.cat.state == Some(CatState::Running)
+                && retry.cat.cat.node_id.as_deref() == Some("node-a")
+    ));
+
+    let target_failed = store
+        .finish_semantic_cat_recovery(
+            SemanticCatRecoverySettlement {
+                cat_id: "cat-drain-1",
+                source_node_id: "node-a",
+                target_node_id: "node-c",
+                target_state: CatState::Running,
+                expected_action_started_at: target_failure
+                    .cat
+                    .cat
+                    .current_action_started_at
+                    .expect("drain claim has a start time"),
+            },
+            SemanticCatRecoveryResult::Failed {
+                code: "guest_start_failed",
+                message: "target did not become Ready",
+            },
+        )
+        .unwrap()
+        .expect("target failure settlement");
+    assert_eq!(target_failed.cat.state, Some(CatState::Failure));
+    assert_eq!(target_failed.cat.node_id.as_deref(), Some("node-c"));
+
+    let settled = store
+        .finish_semantic_cat_recovery(
+            SemanticCatRecoverySettlement {
+                cat_id: "cat-drain-2",
+                source_node_id: "node-a",
+                target_node_id: "node-b",
+                target_state: CatState::Running,
+                expected_action_started_at: recovered
+                    .cat
+                    .cat
+                    .current_action_started_at
+                    .expect("drain claim has a start time"),
+            },
+            SemanticCatRecoveryResult::Recovered,
+        )
+        .unwrap()
+        .expect("successful drain settlement");
+    assert_eq!(settled.cat.state, Some(CatState::Running));
+    assert_eq!(settled.cat.node_id.as_deref(), Some("node-b"));
+    let replayed = store
+        .finish_semantic_cat_recovery(
+            SemanticCatRecoverySettlement {
+                cat_id: "cat-drain-2",
+                source_node_id: "node-a",
+                target_node_id: "node-b",
+                target_state: CatState::Running,
+                expected_action_started_at: recovered
+                    .cat
+                    .cat
+                    .current_action_started_at
+                    .expect("drain claim has a start time"),
+            },
+            SemanticCatRecoveryResult::Recovered,
+        )
+        .unwrap()
+        .expect("exact drain settlement replay");
+    assert_eq!(replayed.cat, settled.cat);
+}
+
+#[test]
+fn planned_drain_does_not_replace_an_existing_lifecycle_action() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    register_second_node(&store);
+    create_running_cat(&store, "cat-drain-busy", "drain-busy");
+    assert!(matches!(
+        store
+            .try_begin_semantic_cat_action("cat-drain-busy", CatAction::Suspend, Some("node-a"),)
+            .unwrap(),
+        BeginCatActionOutcome::Acquired(_)
+    ));
+    store
+        .transition_semantic_node_status("node-a", &[NodeStatus::Running], NodeStatus::Draining)
+        .unwrap()
+        .unwrap();
+
+    let ClaimSemanticCatRecoveryOutcome::Busy(busy) = store
+        .claim_semantic_cat_drain("node-a", "cat-drain-busy")
+        .unwrap()
+    else {
+        panic!("planned drain must not replace a live lifecycle action")
+    };
+    assert_eq!(busy.cat.current_action, Some(CatAction::Suspend));
+    assert_eq!(busy.cat.current_action_node_id.as_deref(), Some("node-a"));
+
+    let current = store
+        .find_semantic_cat_by_id("cat-drain-busy")
+        .unwrap()
+        .expect("busy Cat remains present");
+    assert_eq!(current.current_action, Some(CatAction::Suspend));
+    assert_eq!(current.current_action_node_id.as_deref(), Some("node-a"));
+}
+
+#[test]
+fn planned_drain_retargets_an_offline_reserved_node_with_an_exact_claim() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    register_second_node(&store);
+    register_third_node(&store);
+    create_running_cat_on(
+        &store,
+        "cat-drain-retarget",
+        "drain-retarget",
+        "node-a",
+        2,
+        1 << 30,
+    );
+    store
+        .transition_semantic_node_status("node-a", &[NodeStatus::Running], NodeStatus::Draining)
+        .unwrap()
+        .unwrap();
+
+    let ClaimSemanticCatRecoveryOutcome::Claimed(old_claim) = store
+        .claim_semantic_cat_drain("node-a", "cat-drain-retarget")
+        .unwrap()
+    else {
+        panic!("draining Cat must receive its first relocation claim")
+    };
+    assert_eq!(old_claim.target_node_id, "node-b");
+    assert!(matches!(
+        store
+            .publish_semantic_cat_ingress("cat-drain-retarget", "node-b")
+            .unwrap(),
+        PublishCatIngressOutcome::Published(_)
+    ));
+    store
+        .transition_semantic_node_status("node-b", &[NodeStatus::Running], NodeStatus::Offline)
+        .unwrap()
+        .unwrap();
+
+    let ClaimSemanticCatRecoveryOutcome::Claimed(replacement) = store
+        .claim_semantic_cat_drain("node-a", "cat-drain-retarget")
+        .unwrap()
+    else {
+        panic!("offline reserved target must be replaced")
+    };
+    assert_eq!(replacement.target_node_id, "node-c");
+    assert_eq!(
+        store
+            .resolve_semantic_cat_ingress("cat-drain-retarget")
+            .unwrap(),
+        None
+    );
+    assert!(matches!(
+        store
+            .publish_semantic_cat_ingress("cat-drain-retarget", "node-b")
+            .unwrap(),
+        PublishCatIngressOutcome::CatNotReady
+    ));
+    assert!(store
+        .finish_semantic_cat_recovery(
+            SemanticCatRecoverySettlement {
+                cat_id: "cat-drain-retarget",
+                source_node_id: "node-a",
+                target_node_id: "node-b",
+                target_state: CatState::Running,
+                expected_action_started_at: old_claim
+                    .cat
+                    .cat
+                    .current_action_started_at
+                    .expect("old drain claim has a start time"),
+            },
+            SemanticCatRecoveryResult::Recovered,
+        )
+        .unwrap()
+        .is_none());
+    let current = store
+        .find_semantic_cat_by_id("cat-drain-retarget")
+        .unwrap()
+        .expect("retargeted Cat remains current");
+    assert_eq!(current.current_action, Some(CatAction::Run));
+    assert_eq!(current.current_action_node_id.as_deref(), Some("node-c"));
+}
+
+#[test]
+fn blocked_source_releases_a_draining_target_and_reclaims_elsewhere() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    register_second_node(&store);
+    register_third_node(&store);
+    create_running_cat_on(
+        &store,
+        "cat-drain-release-target",
+        "drain-release-target",
+        "node-a",
+        2,
+        1 << 30,
+    );
+    store
+        .transition_semantic_node_status("node-a", &[NodeStatus::Running], NodeStatus::Draining)
+        .unwrap()
+        .unwrap();
+
+    let ClaimSemanticCatRecoveryOutcome::Claimed(first) = store
+        .claim_semantic_cat_drain("node-a", "cat-drain-release-target")
+        .unwrap()
+    else {
+        panic!("draining source must receive its first relocation claim")
+    };
+    assert_eq!(first.target_node_id, "node-b");
+    store
+        .transition_semantic_node_status("node-b", &[NodeStatus::Running], NodeStatus::Draining)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .list_semantic_node_drain_cats("node-b")
+            .unwrap()
+            .into_iter()
+            .map(|cat| cat.cat.cat_id)
+            .collect::<Vec<_>>(),
+        ["cat-drain-release-target"]
+    );
+
+    let released = store
+        .finish_semantic_cat_recovery(
+            SemanticCatRecoverySettlement {
+                cat_id: "cat-drain-release-target",
+                source_node_id: "node-a",
+                target_node_id: "node-b",
+                target_state: CatState::Running,
+                expected_action_started_at: first
+                    .cat
+                    .cat
+                    .current_action_started_at
+                    .expect("drain claim has a start time"),
+            },
+            SemanticCatRecoveryResult::RetrySource {
+                code: "flush_failed",
+                message: "source did not reach Cold",
+            },
+        )
+        .unwrap()
+        .expect("blocked source releases the exact unused target");
+    assert_eq!(released.cat.state, Some(CatState::Running));
+    assert_eq!(released.cat.node_id.as_deref(), Some("node-a"));
+    assert_eq!(released.cat.current_action, None);
+    assert_eq!(released.cat.current_action_node_id, None);
+    assert_eq!(
+        released.cat.last_error_code.as_deref(),
+        Some("flush_failed")
+    );
+    assert!(store
+        .list_semantic_node_drain_cats("node-b")
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store.list_semantic_draining_nodes_with_cats().unwrap(),
+        ["node-a"]
+    );
+
+    let ClaimSemanticCatRecoveryOutcome::Claimed(retry) = store
+        .claim_semantic_cat_drain("node-a", "cat-drain-release-target")
+        .unwrap()
+    else {
+        panic!("source retry must reclaim on another running target")
+    };
+    assert_eq!(retry.target_node_id, "node-c");
+}
+
+#[test]
+fn planned_drain_blocks_on_an_inflight_placement_reserved_before_cordon() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    register_second_node(&store);
+    let admitted = admit_cat(&store, "cat-drain-reserved", "drain-reserved", 2, 1 << 30);
+    assert_eq!(admitted.cat.state, None);
+    assert_eq!(admitted.cat.current_action, Some(CatAction::Create));
+    assert_eq!(
+        admitted.cat.current_action_node_id.as_deref(),
+        Some("node-a")
+    );
+    assert_eq!(admitted.cat.node_id, None);
+
+    store
+        .transition_semantic_node_status("node-a", &[NodeStatus::Running], NodeStatus::Draining)
+        .unwrap()
+        .unwrap();
+
+    let candidates = store.list_semantic_node_drain_cats("node-a").unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].cat.cat_id, "cat-drain-reserved");
+    assert_eq!(
+        store.list_semantic_draining_nodes_with_cats().unwrap(),
+        ["node-a"]
+    );
+    let ClaimSemanticCatRecoveryOutcome::Busy(busy) = store
+        .claim_semantic_cat_drain("node-a", "cat-drain-reserved")
+        .unwrap()
+    else {
+        panic!("drain must wait for the placement admitted before cordon")
+    };
+    assert_eq!(busy.cat.current_action, Some(CatAction::Create));
+    assert_eq!(busy.cat.current_action_node_id.as_deref(), Some("node-a"));
+}
+
+#[test]
+fn concurrent_atomic_creates_reserve_an_even_distribution() {
+    let (store, url) = store_and_url();
+    register_node(&store);
+    register_second_node(&store);
+    let barrier = Arc::new(Barrier::new(9));
+    let stores = (0..8)
+        .map(|_| Store::connect(&url, None).unwrap())
+        .collect::<Vec<_>>();
+    let handles = stores
+        .into_iter()
+        .enumerate()
+        .map(|(index, store)| {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let cat_id = format!("cat-concurrent-{index}");
+                let slug = format!("concurrent-{index}");
+                barrier.wait();
+                admit_cat(&store, &cat_id, &slug, 2, 1 << 30)
+                    .cat
+                    .current_action_node_id
+                    .unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let mut placements = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    placements.sort_unstable();
+
+    assert_eq!(placements[..4], ["node-a"; 4]);
+    assert_eq!(placements[4..], ["node-b"; 4]);
 }
 
 #[test]
@@ -168,7 +936,11 @@ fn ingress_publish_and_withdraw_are_scenario_idempotent() {
             "cat-ingress",
             FinishCatAction {
                 expected_action: CatAction::Create,
+                expected_recovery_started_at: None,
                 expected_node_id: Some("node-a"),
+                expected_action_started_at: created
+                    .current_action_started_at
+                    .expect("Create claim has a start time"),
                 final_state: CatState::Running,
                 final_node_id: Some("node-a"),
                 error_code: None,
@@ -183,12 +955,12 @@ fn ingress_publish_and_withdraw_are_scenario_idempotent() {
             .unwrap(),
         WithdrawCatIngressOutcome::CatNotWithdrawing
     );
-    assert!(matches!(
-        store
-            .try_begin_semantic_cat_action("cat-ingress", CatAction::Suspend, Some("node-a"),)
-            .unwrap(),
-        BeginCatActionOutcome::Acquired(_)
-    ));
+    let BeginCatActionOutcome::Acquired(suspend) = store
+        .try_begin_semantic_cat_action("cat-ingress", CatAction::Suspend, Some("node-a"))
+        .unwrap()
+    else {
+        panic!("Running Cat must acquire Suspend")
+    };
     assert_eq!(
         store
             .withdraw_semantic_cat_ingress("cat-ingress", "node-a")
@@ -211,7 +983,11 @@ fn ingress_publish_and_withdraw_are_scenario_idempotent() {
             "cat-ingress",
             FinishCatAction {
                 expected_action: CatAction::Suspend,
+                expected_recovery_started_at: None,
                 expected_node_id: Some("node-a"),
+                expected_action_started_at: suspend
+                    .current_action_started_at
+                    .expect("Suspend claim has a start time"),
                 final_state: CatState::Suspended,
                 final_node_id: Some("node-a"),
                 error_code: None,
@@ -220,18 +996,22 @@ fn ingress_publish_and_withdraw_are_scenario_idempotent() {
         )
         .unwrap()
         .unwrap();
-    assert!(matches!(
-        store
-            .try_begin_semantic_cat_action("cat-ingress", CatAction::Run, Some("node-a"))
-            .unwrap(),
-        BeginCatActionOutcome::Acquired(_)
-    ));
+    let BeginCatActionOutcome::Acquired(run) = store
+        .try_begin_semantic_cat_action("cat-ingress", CatAction::Run, Some("node-a"))
+        .unwrap()
+    else {
+        panic!("Suspended Cat must acquire Run")
+    };
     store
         .finish_semantic_cat_action(
             "cat-ingress",
             FinishCatAction {
                 expected_action: CatAction::Run,
+                expected_recovery_started_at: None,
                 expected_node_id: Some("node-a"),
+                expected_action_started_at: run
+                    .current_action_started_at
+                    .expect("Run claim has a start time"),
                 final_state: CatState::Running,
                 final_node_id: Some("node-a"),
                 error_code: None,
@@ -379,18 +1159,22 @@ fn destroyed_cat_releases_slug_without_changing_historical_identity() {
     register_node(&store);
     create_running_cat(&store, "cat-old", "web");
 
-    assert!(matches!(
-        store
-            .try_begin_semantic_cat_action("cat-old", CatAction::Destroy, Some("node-a"))
-            .unwrap(),
-        BeginCatActionOutcome::Acquired(_)
-    ));
+    let BeginCatActionOutcome::Acquired(destroy) = store
+        .try_begin_semantic_cat_action("cat-old", CatAction::Destroy, Some("node-a"))
+        .unwrap()
+    else {
+        panic!("Running Cat must acquire Destroy")
+    };
     let destroyed = store
         .finish_semantic_cat_action(
             "cat-old",
             FinishCatAction {
                 expected_action: CatAction::Destroy,
+                expected_recovery_started_at: None,
                 expected_node_id: Some("node-a"),
+                expected_action_started_at: destroy
+                    .current_action_started_at
+                    .expect("Destroy claim has a start time"),
                 final_state: CatState::Destroyed,
                 final_node_id: None,
                 error_code: None,
@@ -476,6 +1260,385 @@ fn cat_action_claim_is_one_winner_across_store_connections() {
 }
 
 #[test]
+fn stale_action_scan_uses_database_age_and_excludes_special_recovery_lanes() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    register_second_node(&store);
+
+    let CreateCatOutcome::Created(stale) = store
+        .create_semantic_cat(NewCat {
+            cat_id: "cat-stale-action",
+            workspace_id: "ws_semantic",
+            cat_slug: "stale-action",
+            node_id: "node-a",
+            cpu_count: 2,
+            memory_bytes: 1 << 30,
+            boot_image: "sha256:image",
+        })
+        .unwrap()
+    else {
+        panic!("new semantic Cat must be created")
+    };
+    let CreateCatOutcome::Created(fresh) = store
+        .create_semantic_cat(NewCat {
+            cat_id: "cat-fresh-action",
+            workspace_id: "ws_semantic",
+            cat_slug: "fresh-action",
+            node_id: "node-a",
+            cpu_count: 2,
+            memory_bytes: 1 << 30,
+            boot_image: "sha256:image",
+        })
+        .unwrap()
+    else {
+        panic!("new semantic Cat must be created")
+    };
+    assert!(stale.current_action_started_at.is_some());
+    assert!(fresh.current_action_started_at.is_some());
+
+    admit_cat(&store, "cat-stale-destroy", "stale-destroy", 2, 1 << 30);
+    let AdmitCatActionOutcome::Acquired(destroy) = store
+        .admit_semantic_cat_action(
+            SemanticCatSelector::Id("cat-stale-destroy"),
+            CatAction::Destroy,
+        )
+        .unwrap()
+    else {
+        panic!("Destroy must replace the pending Create")
+    };
+    assert_eq!(destroy.cat.current_action, Some(CatAction::Destroy));
+
+    create_running_cat(&store, "cat-offline-recovery", "offline-recovery");
+    store
+        .transition_semantic_node_status("node-a", &[NodeStatus::Running], NodeStatus::Offline)
+        .unwrap()
+        .expect("Node must become Offline");
+    let ClaimSemanticCatRecoveryOutcome::Claimed(recovery) = store
+        .claim_semantic_cat_recovery("node-a", "cat-offline-recovery")
+        .unwrap()
+    else {
+        panic!("offline Cat must receive one recovery claim")
+    };
+    assert_eq!(recovery.cat.cat.current_action, Some(CatAction::Run));
+
+    store
+        .with(|client| {
+            client.execute(
+                "UPDATE cats SET created_at=1,current_action_started_at=1,updated_at=1
+                   WHERE cat_id = ANY($1::TEXT[])",
+                &[&vec![
+                    "cat-stale-action",
+                    "cat-stale-destroy",
+                    "cat-offline-recovery",
+                ]],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let stale = store.claim_stale_semantic_cat_actions(135_000, 64).unwrap();
+    assert_eq!(stale.len(), 1);
+    assert_eq!(stale[0].cat.cat_id, "cat-stale-action");
+    assert_eq!(stale[0].cat.current_action, Some(CatAction::Create));
+    assert_eq!(stale[0].cat.current_action_started_at, Some(1));
+    let recovery_started_at = stale[0]
+        .cat
+        .current_action_recovery_started_at
+        .expect("scanner must persist its recovery lease before returning");
+
+    let AdmitCatCreateOutcome::Busy(busy) = store
+        .admit_semantic_cat_create(AtomicCatCreate {
+            cat_id: "cat-stale-action",
+            workspace_id: "ws_semantic",
+            cat_slug: "stale-action",
+            cpu_count: 2,
+            memory_bytes: 1 << 30,
+            boot_image: "sha256:image",
+            mounts: &[],
+        })
+        .unwrap()
+    else {
+        panic!("a retry after scanner handoff must not drive the leased occurrence")
+    };
+    assert_eq!(
+        busy.cat.current_action_recovery_started_at,
+        Some(recovery_started_at)
+    );
+
+    // Simulate the elected scanner dying with its lease. Once the same
+    // bounded lease age has elapsed, a successor takes a new exact token.
+    store
+        .with(|client| {
+            client.execute(
+                "UPDATE cats
+                    SET current_action_recovery_started_at=
+                        current_action_recovery_started_at - 135001
+                  WHERE cat_id='cat-stale-action'",
+                &[],
+            )?;
+            client.query_one("SELECT pg_sleep(0.005)", &[]).map(|_| ())
+        })
+        .unwrap();
+    let reclaimed = store.claim_stale_semantic_cat_actions(135_000, 64).unwrap();
+    assert_eq!(reclaimed.len(), 1);
+    let successor_recovery_started_at = reclaimed[0]
+        .cat
+        .current_action_recovery_started_at
+        .expect("successor scanner must replace the expired lease");
+    assert_ne!(successor_recovery_started_at, recovery_started_at);
+
+    assert!(store
+        .finish_semantic_cat_action(
+            "cat-stale-action",
+            FinishCatAction {
+                expected_action: CatAction::Create,
+                expected_action_started_at: 1,
+                expected_recovery_started_at: Some(recovery_started_at),
+                expected_node_id: Some("node-a"),
+                final_state: CatState::Running,
+                final_node_id: Some("node-a"),
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .unwrap()
+        .is_none());
+    assert!(store
+        .finish_semantic_cat_action(
+            "cat-stale-action",
+            FinishCatAction {
+                expected_action: CatAction::Create,
+                expected_action_started_at: 1,
+                expected_recovery_started_at: Some(successor_recovery_started_at),
+                expected_node_id: Some("node-a"),
+                final_state: CatState::Running,
+                final_node_id: Some("node-a"),
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn same_action_retry_refreshes_activity_without_changing_occurrence_identity() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    let admitted = admit_cat(&store, "cat-stale-retry", "stale-retry", 2, 1 << 30);
+    let started_at = admitted
+        .cat
+        .current_action_started_at
+        .expect("Create claim has a start time");
+    store
+        .with(|client| {
+            client
+                .execute(
+                    "UPDATE cats SET created_at=1,updated_at=1
+                      WHERE cat_id='cat-stale-retry'",
+                    &[],
+                )
+                .map(|_| ())
+        })
+        .unwrap();
+
+    let AdmitCatCreateOutcome::SameAction(retry) = store
+        .admit_semantic_cat_create(AtomicCatCreate {
+            cat_id: "cat-stale-retry",
+            workspace_id: "ws_semantic",
+            cat_slug: "stale-retry",
+            cpu_count: 2,
+            memory_bytes: 1 << 30,
+            boot_image: "sha256:image",
+            mounts: &[],
+        })
+        .unwrap()
+    else {
+        panic!("matching Create retry must resume the current occurrence")
+    };
+    assert_eq!(retry.cat.current_action_started_at, Some(started_at));
+    assert!(store
+        .claim_stale_semantic_cat_actions(135_000, 64)
+        .unwrap()
+        .is_empty());
+
+    store
+        .with(|client| {
+            client
+                .execute(
+                    &format!(
+                        "UPDATE cats SET updated_at={DB_NOW_MS} + 10000
+                          WHERE cat_id='cat-stale-retry'"
+                    ),
+                    &[],
+                )
+                .map(|_| ())
+        })
+        .unwrap();
+    let AdmitCatCreateOutcome::SameAction(normalized) = store
+        .admit_semantic_cat_create(AtomicCatCreate {
+            cat_id: "cat-stale-retry",
+            workspace_id: "ws_semantic",
+            cat_slug: "stale-retry",
+            cpu_count: 2,
+            memory_bytes: 1 << 30,
+            boot_image: "sha256:image",
+            mounts: &[],
+        })
+        .unwrap()
+    else {
+        panic!("matching retry must normalize the activity timestamp")
+    };
+    let database_now: i64 = store
+        .with(|client| {
+            client
+                .query_one(&format!("SELECT {DB_NOW_MS}"), &[])
+                .map(|row| row.get(0))
+        })
+        .unwrap();
+    assert!(normalized.cat.updated_at <= database_now);
+    assert_eq!(normalized.cat.current_action_started_at, Some(started_at));
+}
+
+#[test]
+fn unresolved_stale_actions_rotate_behind_an_untried_claim() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    let cat_ids = ["cat-stale-a", "cat-stale-b", "cat-stale-c"];
+    for cat_id in cat_ids {
+        let CreateCatOutcome::Created(_) = store
+            .create_semantic_cat(NewCat {
+                cat_id,
+                workspace_id: "ws_semantic",
+                cat_slug: cat_id.trim_start_matches("cat-"),
+                node_id: "node-a",
+                cpu_count: 1,
+                memory_bytes: 1 << 30,
+                boot_image: "sha256:image",
+            })
+            .unwrap()
+        else {
+            panic!("new semantic Cat must be created")
+        };
+    }
+    store
+        .with(|client| {
+            client
+                .execute(
+                    "UPDATE cats
+                        SET created_at=1,
+                            current_action_started_at=1,
+                            updated_at=1",
+                    &[],
+                )
+                .map(|_| ())
+        })
+        .unwrap();
+
+    let first = store.claim_stale_semantic_cat_actions(135_000, 2).unwrap();
+    assert_eq!(first.len(), 2);
+    let first_ids = first
+        .iter()
+        .map(|cat| cat.cat.cat_id.as_str())
+        .collect::<Vec<_>>();
+    let untried = cat_ids
+        .into_iter()
+        .find(|cat_id| !first_ids.contains(cat_id))
+        .expect("one claim must remain outside the first bounded page");
+    for cat in first {
+        let action = cat.cat.current_action.expect("stale claim has an action");
+        let started_at = cat
+            .cat
+            .current_action_started_at
+            .expect("stale claim has a start time");
+        let recovery_started_at = cat
+            .cat
+            .current_action_recovery_started_at
+            .expect("stale recovery claim has a lease");
+        assert!(!store
+            .rotate_stale_semantic_cat_action(
+                &cat.cat.cat_id,
+                action,
+                cat.cat.current_action_node_id.as_deref(),
+                started_at + 1,
+                recovery_started_at,
+            )
+            .unwrap());
+        assert!(store
+            .rotate_stale_semantic_cat_action(
+                &cat.cat.cat_id,
+                action,
+                cat.cat.current_action_node_id.as_deref(),
+                started_at,
+                recovery_started_at,
+            )
+            .unwrap());
+    }
+
+    let second = store.claim_stale_semantic_cat_actions(135_000, 2).unwrap();
+    assert_eq!(second[0].cat.cat_id, untried);
+}
+
+#[test]
+fn action_settlement_requires_the_exact_claim_start_time() {
+    let (store, _) = store_and_url();
+    register_node(&store);
+    create_running_cat(&store, "cat-exact-action", "exact-action");
+
+    let BeginCatActionOutcome::Acquired(suspend) = store
+        .try_begin_semantic_cat_action("cat-exact-action", CatAction::Suspend, Some("node-a"))
+        .unwrap()
+    else {
+        panic!("Running Cat must acquire Suspend")
+    };
+    let started_at = suspend
+        .current_action_started_at
+        .expect("Suspend claim has a start time");
+
+    assert!(store
+        .finish_semantic_cat_action(
+            "cat-exact-action",
+            FinishCatAction {
+                expected_action: CatAction::Suspend,
+                expected_recovery_started_at: None,
+                expected_node_id: Some("node-a"),
+                expected_action_started_at: started_at + 1,
+                final_state: CatState::Suspended,
+                final_node_id: Some("node-a"),
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .unwrap()
+        .is_none());
+    let still_current = store
+        .find_semantic_cat_by_id("cat-exact-action")
+        .unwrap()
+        .expect("Cat remains present");
+    assert_eq!(still_current.current_action, Some(CatAction::Suspend));
+    assert_eq!(still_current.current_action_started_at, Some(started_at));
+
+    let settled = store
+        .finish_semantic_cat_action(
+            "cat-exact-action",
+            FinishCatAction {
+                expected_action: CatAction::Suspend,
+                expected_recovery_started_at: None,
+                expected_node_id: Some("node-a"),
+                expected_action_started_at: started_at,
+                final_state: CatState::Suspended,
+                final_node_id: Some("node-a"),
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .unwrap()
+        .expect("exact claim must settle");
+    assert_eq!(settled.state, Some(CatState::Suspended));
+    assert_eq!(settled.current_action, None);
+}
+
+#[test]
 fn heartbeat_uses_database_receipt_time_and_cannot_mutate_control_endpoint() {
     let (store, _) = store_and_url();
     register_node(&store);
@@ -524,18 +1687,22 @@ fn persistent_disk_is_rwo_and_slug_is_reusable_after_delete() {
     let (store, _) = store_and_url();
     register_node(&store);
     create_running_cat(&store, "cat-disk", "disk-owner");
-    assert!(matches!(
-        store
-            .try_begin_semantic_cat_action("cat-disk", CatAction::Cold, Some("node-a"))
-            .unwrap(),
-        BeginCatActionOutcome::Acquired(_)
-    ));
+    let BeginCatActionOutcome::Acquired(cold) = store
+        .try_begin_semantic_cat_action("cat-disk", CatAction::Cold, Some("node-a"))
+        .unwrap()
+    else {
+        panic!("Running Cat must acquire Cold")
+    };
     store
         .finish_semantic_cat_action(
             "cat-disk",
             FinishCatAction {
                 expected_action: CatAction::Cold,
+                expected_recovery_started_at: None,
                 expected_node_id: Some("node-a"),
+                expected_action_started_at: cold
+                    .current_action_started_at
+                    .expect("Cold claim has a start time"),
                 final_state: CatState::Cold,
                 final_node_id: None,
                 error_code: None,
@@ -642,7 +1809,6 @@ fn atomic_create_persists_full_mount_config_and_retries_by_semantics() {
         cat_id: "cat-atomic",
         workspace_id: "ws_semantic",
         cat_slug: "atomic",
-        node_id: Some("node-a"),
         cpu_count: 2,
         memory_bytes: 1 << 30,
         boot_image: "sha256:image",
@@ -676,6 +1842,18 @@ fn atomic_create_persists_full_mount_config_and_retries_by_semantics() {
     assert!(matches!(
         store
             .admit_semantic_cat_create(AtomicCatCreate {
+                cat_id: "cat-new-default-is-ignored",
+                boot_image: "sha256:new-default",
+                mounts: &retry_mounts,
+                ..request.clone()
+            })
+            .unwrap(),
+        AdmitCatCreateOutcome::SameAction(CatWithMounts { cat, .. })
+            if cat.cat_id == "cat-atomic" && cat.boot_image == "sha256:image"
+    ));
+    assert!(matches!(
+        store
+            .admit_semantic_cat_create(AtomicCatCreate {
                 cat_id: "cat-conflict",
                 cpu_count: 4,
                 mounts: &retry_mounts,
@@ -701,7 +1879,6 @@ fn rejected_atomic_mount_rolls_back_cat_and_binding_together() {
                 cat_id: "cat-rollback",
                 workspace_id: "ws_semantic",
                 cat_slug: "rollback",
-                node_id: Some("node-a"),
                 cpu_count: 2,
                 memory_bytes: 1 << 30,
                 boot_image: "sha256:image",
@@ -801,6 +1978,11 @@ fn completed_node_reset_stays_closed_until_current_cats_are_recovered() {
                 source_node_id: "node-a",
                 target_node_id: "node-b",
                 target_state: CatState::Running,
+                expected_action_started_at: claim
+                    .cat
+                    .cat
+                    .current_action_started_at
+                    .expect("recovery claim has a start time"),
             },
             SemanticCatRecoveryResult::Recovered,
         )
@@ -840,7 +2022,11 @@ fn completed_node_reset_reopens_when_only_failed_cats_remain() {
             "cat-reset-failure",
             FinishCatAction {
                 expected_action: CatAction::Create,
+                expected_recovery_started_at: None,
                 expected_node_id: Some("node-a"),
+                expected_action_started_at: created
+                    .current_action_started_at
+                    .expect("Create claim has a start time"),
                 final_state: CatState::Failure,
                 final_node_id: Some("node-a"),
                 error_code: Some("image_unavailable"),
@@ -891,12 +2077,15 @@ fn offline_recovery_claim_replaces_old_lane_and_exactly_moves_placement() {
     ));
     create_running_cat(&store, "cat-recovery", "recovery");
 
-    assert!(matches!(
-        store
-            .try_begin_semantic_cat_action("cat-recovery", CatAction::Cold, Some("node-a"))
-            .unwrap(),
-        BeginCatActionOutcome::Acquired(_)
-    ));
+    let BeginCatActionOutcome::Acquired(cold) = store
+        .try_begin_semantic_cat_action("cat-recovery", CatAction::Cold, Some("node-a"))
+        .unwrap()
+    else {
+        panic!("Running Cat must acquire Cold")
+    };
+    let cold_started_at = cold
+        .current_action_started_at
+        .expect("Cold claim has a start time");
     assert!(store
         .transition_semantic_node_status("node-a", &[NodeStatus::Running], NodeStatus::Offline,)
         .unwrap()
@@ -916,6 +2105,11 @@ fn offline_recovery_claim_replaces_old_lane_and_exactly_moves_placement() {
         claim.cat.cat.current_action_node_id.as_deref(),
         Some("node-b")
     );
+    let recovery_started_at = claim
+        .cat
+        .cat
+        .current_action_started_at
+        .expect("recovery claim has a start time");
 
     assert!(matches!(
         store
@@ -929,7 +2123,9 @@ fn offline_recovery_claim_replaces_old_lane_and_exactly_moves_placement() {
             "cat-recovery",
             FinishCatAction {
                 expected_action: CatAction::Cold,
+                expected_recovery_started_at: None,
                 expected_node_id: Some("node-a"),
+                expected_action_started_at: cold_started_at,
                 final_state: CatState::Cold,
                 final_node_id: None,
                 error_code: None,
@@ -946,6 +2142,7 @@ fn offline_recovery_claim_replaces_old_lane_and_exactly_moves_placement() {
                 source_node_id: "node-a",
                 target_node_id: "node-b",
                 target_state: CatState::Running,
+                expected_action_started_at: recovery_started_at,
             },
             SemanticCatRecoveryResult::Recovered,
         )
@@ -962,6 +2159,7 @@ fn offline_recovery_claim_replaces_old_lane_and_exactly_moves_placement() {
                 source_node_id: "node-a",
                 target_node_id: "node-b",
                 target_state: CatState::Running,
+                expected_action_started_at: recovery_started_at,
             },
             SemanticCatRecoveryResult::Recovered,
         )

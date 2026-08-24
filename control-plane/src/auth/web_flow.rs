@@ -196,14 +196,16 @@ pub async fn callback(
         .ok_or_else(|| ApiError::invalid("missing WorkOS state"))?;
     let flow = [Site::User, Site::Admin]
         .into_iter()
-        .filter_map(|site| {
-            cookie_value(&headers, site.flow_cookie()).and_then(|sealed| {
-                unseal::<LoginFlow>(&sealed, &config.cookie_password)
-                    .ok()
-                    .filter(|flow| flow.site == site && flow.state == returned_state)
-            })
+        .find_map(|site| {
+            cookie_values(&headers, site.flow_cookie())
+                .into_iter()
+                .rev()
+                .find_map(|sealed| {
+                    unseal::<LoginFlow>(&sealed, &config.cookie_password)
+                        .ok()
+                        .filter(|flow| flow.site == site && flow.state == returned_state)
+                })
         })
-        .next()
         .ok_or_else(|| {
             ApiError::new(
                 cats_api::error::ErrorCode::Unauthenticated,

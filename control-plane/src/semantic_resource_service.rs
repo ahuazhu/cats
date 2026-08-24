@@ -5,6 +5,7 @@
 //! lifecycle Operation, or compatibility protocol enters this adapter.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use cats_api::runtime_reconciliation::Id;
 use cats_api::semantic_control as wire;
@@ -483,11 +484,6 @@ impl lifecycle::SemanticLifecycleStore for PostgresSemanticLifecycleStore {
         Box::pin(async move {
             store
                 .execute(move |store| {
-                    let node_id = store
-                        .list_running_semantic_nodes()?
-                        .into_iter()
-                        .next()
-                        .map(|node| node.node_id);
                     let db_mounts = mounts
                         .iter()
                         .map(|(binding_id, mount)| db::NewCatMount {
@@ -507,7 +503,6 @@ impl lifecycle::SemanticLifecycleStore for PostgresSemanticLifecycleStore {
                         cat_id: &cat_id,
                         workspace_id: &request.workspace_id,
                         cat_slug: &request.cat_slug,
-                        node_id: node_id.as_deref(),
                         cpu_count,
                         memory_bytes,
                         boot_image: &request.config.boot_image,
@@ -530,15 +525,6 @@ impl lifecycle::SemanticLifecycleStore for PostgresSemanticLifecycleStore {
         Box::pin(async move {
             store
                 .execute(move |store| {
-                    let selected_node = if action == lifecycle::CatAction::Run {
-                        store
-                            .list_running_semantic_nodes()?
-                            .into_iter()
-                            .next()
-                            .map(|node| node.node_id)
-                    } else {
-                        None
-                    };
                     let selector = match &selector {
                         lifecycle::CatSelector::Id(cat_id) => db::SemanticCatSelector::Id(cat_id),
                         lifecycle::CatSelector::Slug {
@@ -549,15 +535,63 @@ impl lifecycle::SemanticLifecycleStore for PostgresSemanticLifecycleStore {
                             cat_slug,
                         },
                     };
-                    store.admit_semantic_cat_action(
-                        selector,
-                        lifecycle_action_to_db(action),
-                        selected_node.as_deref(),
-                    )
+                    store.admit_semantic_cat_action(selector, lifecycle_action_to_db(action))
                 })
                 .await
                 .map_err(lifecycle_store_error)
                 .and_then(map_action_admission)
+        })
+    }
+
+    fn pending_destroy_claims<'a>(
+        &'a self,
+        minimum_age: Duration,
+        limit: usize,
+    ) -> lifecycle::SemanticFuture<'a, Result<Vec<lifecycle::ActionClaim>, lifecycle::StoreError>>
+    {
+        let store = Arc::clone(&self.store);
+        Box::pin(async move {
+            let minimum_age_ms = i64::try_from(minimum_age.as_millis()).unwrap_or(i64::MAX);
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            store
+                .execute(move |store| {
+                    store.claim_pending_semantic_destroy_claims(minimum_age_ms, limit)
+                })
+                .await
+                .map_err(lifecycle_store_error)?
+                .into_iter()
+                .map(|cat| action_claim(cat, lifecycle::CatAction::Destroy))
+                .collect()
+        })
+    }
+
+    fn rotate_pending_destroy<'a>(
+        &'a self,
+        claim: &'a lifecycle::ActionClaim,
+    ) -> lifecycle::SemanticFuture<'a, Result<bool, lifecycle::StoreError>> {
+        let store = Arc::clone(&self.store);
+        let cat_id = claim.cat.cat_id.clone();
+        let node_id = claim.node_id.clone();
+        let started_at_unix_ms = claim.started_at_unix_ms;
+        let Some(recovery_started_at_unix_ms) = claim.recovery_started_at_unix_ms else {
+            return Box::pin(async {
+                Err(lifecycle::StoreError::new(
+                    "Destroy recovery rotation omitted its recovery lease",
+                ))
+            });
+        };
+        Box::pin(async move {
+            store
+                .execute(move |store| {
+                    store.rotate_pending_semantic_destroy_claim(
+                        &cat_id,
+                        node_id.as_deref(),
+                        started_at_unix_ms,
+                        recovery_started_at_unix_ms,
+                    )
+                })
+                .await
+                .map_err(lifecycle_store_error)
         })
     }
 
@@ -628,6 +662,8 @@ impl PostgresSemanticLifecycleStore {
                         &claim.cat.cat_id,
                         db::FinishCatAction {
                             expected_action: lifecycle_action_to_db(claim.action),
+                            expected_action_started_at: claim.started_at_unix_ms,
+                            expected_recovery_started_at: claim.recovery_started_at_unix_ms,
                             expected_node_id: claim.node_id.as_deref(),
                             final_state: lifecycle_state_to_db(state),
                             final_node_id: final_node_id.as_deref(),
@@ -727,9 +763,15 @@ fn action_claim(
     action: lifecycle::CatAction,
 ) -> Result<lifecycle::ActionClaim, lifecycle::StoreError> {
     let node_id = cat.cat.current_action_node_id.clone();
+    let started_at_unix_ms = cat.cat.current_action_started_at.ok_or_else(|| {
+        lifecycle::StoreError::new("claimed semantic Cat action omitted its start time")
+    })?;
+    let recovery_started_at_unix_ms = cat.cat.current_action_recovery_started_at;
     Ok(lifecycle::ActionClaim {
         cat: db_aggregate_to_lifecycle(cat)?,
         action,
+        started_at_unix_ms,
+        recovery_started_at_unix_ms,
         node_id,
     })
 }
@@ -835,24 +877,32 @@ pub struct ProductionSemanticResourceApi<L, R, B = UnavailablePersistentDiskBack
     lifecycle: L,
     resources: R,
     disk_backend: B,
+    default_boot_image: String,
 }
 
 impl<L, R> ProductionSemanticResourceApi<L, R, UnavailablePersistentDiskBackend> {
-    pub fn new(lifecycle: L, resources: R) -> Self {
+    pub fn new(lifecycle: L, resources: R, default_boot_image: impl Into<String>) -> Self {
         Self {
             lifecycle,
             resources,
             disk_backend: UnavailablePersistentDiskBackend,
+            default_boot_image: default_boot_image.into(),
         }
     }
 }
 
 impl<L, R, B> ProductionSemanticResourceApi<L, R, B> {
-    pub fn with_disk_backend(lifecycle: L, resources: R, disk_backend: B) -> Self {
+    pub fn with_disk_backend(
+        lifecycle: L,
+        resources: R,
+        disk_backend: B,
+        default_boot_image: impl Into<String>,
+    ) -> Self {
         Self {
             lifecycle,
             resources,
             disk_backend,
+            default_boot_image: default_boot_image.into(),
         }
     }
 }
@@ -956,7 +1006,7 @@ where
                     config: lifecycle::CatCreateConfig {
                         cpu_count: request.cpu,
                         memory_bytes: request.memory_bytes,
-                        boot_image: request.boot_image,
+                        boot_image: self.default_boot_image.clone(),
                         mounts,
                     },
                 })
@@ -1569,6 +1619,9 @@ mod tests {
 
     use super::*;
 
+    const DEFAULT_BOOT_IMAGE: &str =
+        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     struct MockLifecycle {
         creates: Mutex<Vec<lifecycle::CreateCatRequest>>,
     }
@@ -1872,6 +1925,7 @@ mod tests {
             state: Some(db::CatState::Cold),
             current_action: None,
             current_action_started_at: None,
+            current_action_recovery_started_at: None,
             current_action_node_id: None,
             node_id: None,
             cpu_count: 2,
@@ -1902,8 +1956,11 @@ mod tests {
 
     #[tokio::test]
     async fn create_cat_resolves_mount_slug_to_immutable_disk_id() {
-        let api =
-            ProductionSemanticResourceApi::new(MockLifecycle::new(), MockResources::populated());
+        let api = ProductionSemanticResourceApi::new(
+            MockLifecycle::new(),
+            MockResources::populated(),
+            DEFAULT_BOOT_IMAGE,
+        );
 
         let response = api
             .create_cat(
@@ -1912,7 +1969,6 @@ mod tests {
                     cat_slug: wire::ResourceSlug::new("worker").unwrap(),
                     cpu: 2,
                     memory_bytes: 1024,
-                    boot_image: "image".to_owned(),
                     mounts: vec![wire::CatMountRequest {
                         disk_slug: wire::ResourceSlug::new("data").unwrap(),
                         mount_path: wire::PersistentMountPath::new("/data").unwrap(),
@@ -1923,6 +1979,7 @@ mod tests {
             .unwrap();
 
         let creates = api.lifecycle.creates.lock().unwrap();
+        assert_eq!(creates[0].config.boot_image, DEFAULT_BOOT_IMAGE);
         assert_eq!(creates[0].config.mounts[0].disk_id, "disk_current");
         assert_eq!(response.status, wire::SemanticStatus::Ok);
         assert_eq!(response.cat.mounts[0].disk_id.as_str(), "disk_current");
@@ -1930,8 +1987,11 @@ mod tests {
 
     #[tokio::test]
     async fn disk_create_retries_by_current_slug_and_fails_closed_without_backend() {
-        let api =
-            ProductionSemanticResourceApi::new(MockLifecycle::new(), MockResources::populated());
+        let api = ProductionSemanticResourceApi::new(
+            MockLifecycle::new(),
+            MockResources::populated(),
+            DEFAULT_BOOT_IMAGE,
+        );
 
         let existing = api
             .create_disk(
@@ -1983,6 +2043,7 @@ mod tests {
             MockLifecycle::new(),
             resources,
             backend,
+            DEFAULT_BOOT_IMAGE,
         );
         let request = || wire::CreateDiskRequest {
             disk_slug: wire::ResourceSlug::new("recoverable-data").unwrap(),
@@ -2007,8 +2068,11 @@ mod tests {
 
     #[tokio::test]
     async fn attach_resolves_both_slugs_before_mutation() {
-        let api =
-            ProductionSemanticResourceApi::new(MockLifecycle::new(), MockResources::populated());
+        let api = ProductionSemanticResourceApi::new(
+            MockLifecycle::new(),
+            MockResources::populated(),
+            DEFAULT_BOOT_IMAGE,
+        );
 
         let response = api
             .attach_disk(
@@ -2047,7 +2111,8 @@ mod tests {
             },
             cat_slug: "worker".to_owned(),
         });
-        let api = ProductionSemanticResourceApi::new(MockLifecycle::new(), resources);
+        let api =
+            ProductionSemanticResourceApi::new(MockLifecycle::new(), resources, DEFAULT_BOOT_IMAGE);
 
         let in_use = api
             .destroy_disk("ws_test", wire::ResourceSlug::new("data").unwrap())
