@@ -39,12 +39,19 @@ running → suspended → warm → cold 走完之后它已经被后续转换覆�
    一条 CASE 就能同时覆盖进入和离开 Running 两侧，无需额外往返。
 4. `CHECK (state IS DISTINCT FROM 'running' OR last_running_at IS NOT NULL)`。一只已落定为 running
    的 Cat 按定义被记录过运行，为空说明漏了写入点——让它在写入时失败，而不是静默投影出一个
-   "从未运行过"的 running Cat。`CatView::validate` 镜像同一条规则。
-5. 列变更沿用本仓库既有立场，不引入增量迁移：`AUTHORITY_SCHEMA_PROBES` 里的 `cats` 探针加上新列，
+   "从未运行过"的 running Cat。
+5. **`CatView::validate` 只校验这两个观测的先后，不校验存在性。** 上面的 CHECK 已经让拥有该
+   schema 的 Control 无法漏发，所以 DTO 上再加一条存在性规则在正确的服务端什么也没保护；它唯一的
+   作用是把版本偏斜变成整条读的失败——缺失的 optional 反序列化成 `None`，于是一个比部署的 Control
+   更新的客户端会让每一只 running 或动作进行中的 Cat 校验失败，连 `cats ls` 一起挂掉，而不是降级到
+   它仍然能给出的读数。缺失是关于对端的事实；早于 `created_at` 的值才是损坏。
+   相应地，展示层把缺失渲染成 `not recorded` 而不是 `never`：真的从未运行过的 Cat 和不报告该字段的
+   Control 在这里都是同一个 `None`，"从未"是这个投影做不出的断言。
+6. 列变更沿用本仓库既有立场，不引入增量迁移：`AUTHORITY_SCHEMA_PROBES` 里的 `cats` 探针加上新列，
    于是形状过期的库在**启动时**大声失败并要求重建，而不是在用户下一次动作时才在 SQL 层报错。
    `SCHEMA_VERSION` 不变，与 2026-08-23 加入 `current_action_recovery_started_at` 的做法一致：
    同一次 clean-slate 重建覆盖两列。
-6. `CatView` 保留 `deny_unknown_fields`。`cats-cli` 既不发布到 crates.io 也没有安装脚本，只随
+7. `CatView` 保留 `deny_unknown_fields`。`cats-cli` 既不发布到 crates.io 也没有安装脚本，只随
    release 分发，不存在需要兼容的旧客户端群；为一个不存在的兼容面放弃闭合形状不划算，而闭合形状
    在 request DTO 上是有价值的（ADR-0063 正是靠它拒绝 `boot_image` 覆盖）。
 

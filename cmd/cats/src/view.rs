@@ -276,8 +276,9 @@ fn state_detail(term: Term, cat: &CatView, display: &StateDisplay, now_ms: i64) 
     // Reading the activity clock as the duration would report a small, freshly
     // reset number for an action that has been stuck for minutes.
     let Some(started) = cat.current_action_started_at_unix_ms.map(i64_from_ms) else {
-        // `validate` rejects an in-flight action without its clock, so this is
-        // a Control that predates the field, not a duration to invent.
+        // A Control that predates the field. Say what is known and stop: the
+        // activity clock is the wrong answer to "how long", and there is no
+        // other source for the right one.
         return format!("{rendered} {}", term.paint("in flight", Style::Dim));
     };
     let running_for = format!(
@@ -309,8 +310,12 @@ fn state_detail(term: Term, cat: &CatView, display: &StateDisplay, now_ms: i64) 
 /// When this Cat last actually ran, for any Cat that is not running now.
 ///
 /// A running Cat needs no such line: its state line already says how long the
-/// current run has held. `None` is not missing data -- it is a Cat that has
-/// never run.
+/// current run has held.
+///
+/// An absent stamp is rendered "not recorded" rather than "never", because the
+/// two are indistinguishable here: a Cat that has genuinely never run and a
+/// Control that predates the field both report `None`. "Never" would be a claim
+/// this projection cannot make.
 fn last_run_field(term: Term, cat: &CatView, now_ms: i64) -> Option<(&'static str, String)> {
     if cat.state == Some(CatState::Running) {
         return None;
@@ -325,7 +330,7 @@ fn last_run_field(term: Term, cat: &CatView, now_ms: i64) -> Option<(&'static st
                 term.paint(&format!("(until {})", format_timestamp(ran)), Style::Dim),
             ),
         ),
-        None => ("last ran", term.paint("never", Style::Dim)),
+        None => ("last ran", term.paint("not recorded", Style::Dim)),
     })
 }
 
@@ -682,12 +687,15 @@ mod tests {
             "the age survives running -> suspended -> warm: {card}"
         );
 
-        // `None` is not missing data.
-        let mut never = cat("web", Some(CatState::Cold), None);
-        never.last_running_at_unix_ms = None;
-        let card = cat_card(term, &never, None, &[], None, NOW);
+        // An absent stamp cannot be reported as "never": a Cat that has truly
+        // never run and a Control that predates the field are the same `None`
+        // here, and only one of them has never run.
+        let mut unrecorded = cat("web", Some(CatState::Cold), None);
+        unrecorded.last_running_at_unix_ms = None;
+        let card = cat_card(term, &unrecorded, None, &[], None, NOW);
         assert!(card.contains("last ran"), "{card}");
-        assert!(card.contains("never"), "{card}");
+        assert!(card.contains("not recorded"), "{card}");
+        assert!(!card.contains("never"), "{card}");
     }
 
     #[test]

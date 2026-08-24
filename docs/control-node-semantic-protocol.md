@@ -129,6 +129,9 @@ cats
 - `failure` 可以保留 `node_id`，表示仍需要向该 Node 执行 destroy 清理；
 - `state = running` 时 `last_running_at` 必须存在（`cats_running_records_its_run_check`）：一只
   已落定为 running 的 Cat 按定义被记录过运行，为空说明漏了写入点，而不是"从未运行过"。
+  这条由数据库保证；`CatView::validate` 刻意**不**复制它（见
+  [ADR-0064](decisions/0064-cat-run-and-action-clocks.md) 决策 5），否则一个比部署的 Control 更新的
+  客户端会把版本偏斜变成整条读的失败。
 
 `state` 表示最后一次完成的产品状态。动作进行中时同时返回 `state` 和 `current_action`，不能把旧 `state` 解释为物理转换已经完成。
 
@@ -452,8 +455,9 @@ cats disk ls
 
 `cats show` 的三个时间读数分别来自 §4.1 的三个字段：落定态用 `updated_at`，进行中动作用
 `current_action_started_at`（并在活动时钟已经走过起点时补一句 `last activity`），非 running 的
-Cat 用 `last_running_at` 显示 `last ran`。`last ran` 为 `never` 表示这只 Cat 从未运行过，不是
-数据缺失。
+Cat 用 `last_running_at` 显示 `last ran`。字段缺失时渲染成 `not recorded` 而不是 `never`——
+真的从未运行过和 Control 不报告该字段在这里是同一个 `None`；同理，动作进行中而没有动作时钟时
+只显示 `in flight`，不编造时长。
 
 ### 7.3 REST 路由
 
