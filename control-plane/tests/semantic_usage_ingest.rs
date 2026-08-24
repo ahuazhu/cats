@@ -126,9 +126,28 @@ impl Context {
         token: &str,
         checkpoints: Vec<CatUsageCheckpoint>,
     ) -> (StatusCode, Option<IngestUsageCheckpointsResponse>) {
+        self.post_usage(token, NODE_ID, checkpoints).await
+    }
+
+    /// Report as an arbitrary claimed Node, which is all the wire allows.
+    async fn ingest_as(
+        &self,
+        claimed_node_id: &str,
+        checkpoints: Vec<CatUsageCheckpoint>,
+    ) -> (StatusCode, Option<IngestUsageCheckpointsResponse>) {
+        self.post_usage(NODED_TOKEN, claimed_node_id, checkpoints)
+            .await
+    }
+
+    async fn post_usage(
+        &self,
+        token: &str,
+        claimed_node_id: &str,
+        checkpoints: Vec<CatUsageCheckpoint>,
+    ) -> (StatusCode, Option<IngestUsageCheckpointsResponse>) {
         let request = IngestUsageCheckpointsRequest {
-            session: producer(),
-            node_id: NODE_ID.to_owned(),
+            session: producer_for(claimed_node_id),
+            node_id: claimed_node_id.to_owned(),
             checkpoints,
         };
         let response = self
@@ -195,8 +214,12 @@ impl Context {
 }
 
 fn producer() -> SessionBinding {
+    producer_for(NODE_ID)
+}
+
+fn producer_for(node_id: &str) -> SessionBinding {
     SessionBinding {
-        node_id: Id::new(NODE_ID).expect("node id"),
+        node_id: Id::new(node_id).expect("node id"),
         node_boot_id: NodeBootId::new("aaaaaaaabbbbbbbbccccccccdddddddd").expect("boot id"),
         agent_instance_id: RandomId128::new("11111111222222223333333344444444")
             .expect("instance id"),
@@ -211,9 +234,27 @@ fn checkpoint(
     metric: UsageMetric,
     cumulative_quantity: u128,
 ) -> CatUsageCheckpoint {
+    checkpoint_from(
+        NODE_ID,
+        cat_id,
+        source_epoch,
+        sequence,
+        metric,
+        cumulative_quantity,
+    )
+}
+
+fn checkpoint_from(
+    node_id: &str,
+    cat_id: &str,
+    source_epoch: &str,
+    sequence: u64,
+    metric: UsageMetric,
+    cumulative_quantity: u128,
+) -> CatUsageCheckpoint {
     let mut checkpoint = CatUsageCheckpoint {
         event_id: String::new(),
-        source_id: format!("node/{NODE_ID}/cat/{cat_id}"),
+        source_id: format!("node/{node_id}/cat/{cat_id}"),
         source_epoch: source_epoch.to_owned(),
         sequence,
         observed_at_unix_ms: 1_000 + (sequence as i64) * 10_000,
@@ -551,6 +592,93 @@ async fn the_final_sample_of_a_departed_cat_still_bills_its_owner() {
         context.provisional_usage_nanos(WORKSPACE_ID).await,
         70_000_000,
         "the closed epoch's CPU interval still bills the frozen owner"
+    );
+}
+
+/// Characterizes what the fleet-shared token is and is not worth, so the
+/// boundary is pinned rather than assumed.
+///
+/// ADR-0059 identifies a Node by a body field under one shared token, the same
+/// way `register` and `heartbeat` do, so a token holder can claim to be another
+/// Node. Placement still bounds the claim to that Node's Cats, and everything
+/// that decides money stays with Control. If a per-Node identity ever lands,
+/// this test should start failing on its first assertion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_claimed_node_identity_is_bounded_by_placement_not_proven() {
+    let context = context().await;
+    context
+        .with_db(|client| {
+            client
+                .batch_execute(&format!(
+                    "INSERT INTO nodes (
+                        node_id,node_name,control_endpoint,vendor,region,zone,instance_id,
+                        machine_type,node_version,status,created_at,updated_at
+                     ) VALUES (
+                        'node_metal-2','metal-2','http://10.0.0.2:7301','aws','us-east-1',
+                        'us-east-1b','i-usage-2','c5d.metal','1.0.0','running',1,1
+                     );
+                     INSERT INTO cats (
+                        cat_id,workspace_id,cat_slug,state,node_id,cpu_count,memory_bytes,
+                        boot_image,created_at,updated_at
+                     ) VALUES (
+                        'cat_onmetaltwo01','{OTHER_WORKSPACE_ID}','other','running',
+                        'node_metal-2',2,2147483648,'sha256:image',1,1
+                     );"
+                ))
+                .expect("a second Node with its own Cat");
+        })
+        .await;
+
+    // Claiming to be metal-2 is accepted for metal-2's own Cat: the identity is
+    // asserted, not proven.
+    let (status, body) = context
+        .ingest_as(
+            "node_metal-2",
+            vec![checkpoint_from(
+                "node_metal-2",
+                "cat_onmetaltwo01",
+                SOURCE_EPOCH,
+                0,
+                UsageMetric::CpuUsec,
+                3_600_000_000,
+            )],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(
+        body.expect("ingest body").accepted,
+        1,
+        "a claimed Node identity is not verified today"
+    );
+
+    // The claim buys nothing beyond that Node's placements: metal-2 still
+    // cannot reach a Cat Control places on metal-1.
+    let (status, body) = context
+        .ingest_as(
+            "node_metal-2",
+            vec![checkpoint_from(
+                "node_metal-2",
+                CAT_ID,
+                SOURCE_EPOCH,
+                0,
+                UsageMetric::CpuUsec,
+                3_600_000_000,
+            )],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let body = body.expect("ingest body");
+    assert_eq!(body.accepted, 0);
+    assert!(
+        body.rejected[0]
+            .reason
+            .contains("not placed on the reporting Node"),
+        "{body:?}"
+    );
+    assert_eq!(
+        context.provisional_usage_nanos(WORKSPACE_ID).await,
+        0,
+        "the impersonated report never reaches another Node's Cat owner"
     );
 }
 

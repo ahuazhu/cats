@@ -31,6 +31,25 @@ use crate::server::AppState;
 /// `resource_type` for compute metered against a Cat runtime.
 const CAT_RESOURCE_TYPE: &str = "cat";
 
+/// The Node a report claims to come from.
+///
+/// This is asserted by the caller, not proven. ADR-0059 gives the whole
+/// Control/Node surface one fleet-shared service token and carries `node_id` in
+/// the body -- `register` and `heartbeat` identify a Node exactly this way --
+/// so there is no per-Node identity here to bind against, and comparing two
+/// body fields cannot manufacture one.
+///
+/// What the claim is worth is therefore bounded elsewhere, and only by things
+/// Control owns: a token holder can charge only Cats that Control already
+/// places on the Node it names, can never choose the payer, can never rewrite
+/// an epoch's frozen attribution, and can never bill one `event_id` twice.
+/// Narrowing it further needs a per-Node identity across the whole semantic
+/// surface, which is a protocol change and separate work; ADR-0063 records the
+/// residual exposure rather than implying this function closes it.
+fn reported_node_id(request: &IngestUsageCheckpointsRequest) -> String {
+    request.session.node_id.as_str().to_owned()
+}
+
 pub(super) fn routes(state: SemanticNodeHttpState) -> Router<AppState> {
     Router::<AppState>::new()
         .route(USAGE_CHECKPOINTS_PATH, post(ingest))
@@ -72,12 +91,16 @@ async fn ingest(
         ))
         .into());
     }
+    // Well-formedness, not authentication. Both fields come from the request
+    // body, so agreeing with each other proves only that the producer built
+    // one coherent report. See `reported_node_id` for what actually bounds it.
     if request.node_id != request.session.node_id.as_str() {
-        return Err(
-            ApiError::conflict("usage checkpoint node_id does not match its producer").into(),
-        );
+        return Err(ApiError::invalid(
+            "usage checkpoint node_id disagrees with its own producer identity",
+        )
+        .into());
     }
-    let node_id = request.node_id.clone();
+    let node_id = reported_node_id(&request);
     let known_node = {
         let lookup = node_id.clone();
         app.store
