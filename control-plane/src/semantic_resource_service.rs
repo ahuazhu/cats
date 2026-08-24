@@ -1356,6 +1356,11 @@ fn cat_view(projection: CatProjection) -> Result<wire::CatView, ResourceStoreErr
         created_at_unix_ms: nonnegative_time(cat.created_at)?,
         updated_at_unix_ms: nonnegative_time(cat.updated_at)?,
         destroyed_at_unix_ms: cat.destroyed_at.map(nonnegative_time).transpose()?,
+        current_action_started_at_unix_ms: cat
+            .current_action_started_at
+            .map(nonnegative_time)
+            .transpose()?,
+        last_running_at_unix_ms: cat.last_running_at.map(nonnegative_time).transpose()?,
     })
 }
 
@@ -1936,6 +1941,7 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             destroyed_at: None,
+            last_running_at: None,
         }
     }
 

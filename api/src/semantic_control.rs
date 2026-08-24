@@ -476,6 +476,23 @@ pub struct CatView {
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
     pub destroyed_at_unix_ms: Option<u64>,
+    /// When the in-flight action started, present exactly while
+    /// `current_action` is.
+    ///
+    /// This is the action's own clock, not `updated_at`: the retry rotations
+    /// and the foreground activity refresh advance `updated_at` while the same
+    /// action occurrence continues, deliberately leaving the start alone
+    /// because it is the settlement identity. A reader that wants "how long has
+    /// this been stuck" must read this field.
+    pub current_action_started_at_unix_ms: Option<u64>,
+    /// Newest time this Cat was recorded settled in Running, or `None` if it
+    /// has never run.
+    ///
+    /// For a Cat running now this is when the current run began. For any other
+    /// state it is when it stopped running, and it survives later transitions,
+    /// so a Cat that went running -> suspended -> warm still reports when it
+    /// last actually ran.
+    pub last_running_at_unix_ms: Option<u64>,
 }
 
 impl CatView {
@@ -492,6 +509,27 @@ impl CatView {
             return Err(SemanticValidationError::Resources);
         }
         if self.updated_at_unix_ms < self.created_at_unix_ms {
+            return Err(SemanticValidationError::Timestamp);
+        }
+        // Only the ordering of these two observations is checked, never their
+        // presence.
+        //
+        // `cats_current_action_shape_check` and `cats_running_records_its_run_check`
+        // already make a Control that has this schema unable to omit either one,
+        // so a presence rule here would guard nothing on a correct server. What
+        // it would do is turn a Control that predates the fields into a total
+        // read failure: absent optionals deserialize to `None`, and a client
+        // built from a newer commit than the deployed Control would fail every
+        // Cat that is Running or mid-action instead of degrading to the reading
+        // it can still make. Absence is a fact about the peer, not a corrupt
+        // Cat; a value before `created_at` is corruption.
+        if self
+            .current_action_started_at_unix_ms
+            .is_some_and(|started| started < self.created_at_unix_ms)
+            || self
+                .last_running_at_unix_ms
+                .is_some_and(|ran| ran < self.created_at_unix_ms)
+        {
             return Err(SemanticValidationError::Timestamp);
         }
         match self.state {
@@ -1204,6 +1242,48 @@ mod tests {
     }
 
     #[test]
+    fn a_cat_read_from_a_control_without_the_run_clocks_still_validates() {
+        // A client built from a newer commit than the deployed Control gets
+        // these optionals as absent. That is a fact about the peer, so the read
+        // must survive and let the renderer degrade -- not fail every Running
+        // or mid-action Cat and take the whole list with it.
+        let running: CatView = serde_json::from_slice(
+            br#"{"cat_id":"cat_01","workspace_id":"ws_01","cat_slug":"web",
+                 "state":"running","current_action":null,"node_id":"node_01",
+                 "node_name":"worker-a","cpu":2,"memory_bytes":1024,
+                 "boot_image":"sha256:abc","mounts":[],"last_error":null,
+                 "created_at_unix_ms":100,"updated_at_unix_ms":101,
+                 "destroyed_at_unix_ms":null}"#,
+        )
+        .expect("an older Control's body still deserializes");
+        assert_eq!(running.last_running_at_unix_ms, None);
+        running
+            .validate()
+            .expect("absent observations are not a corrupt Cat");
+
+        let in_flight: CatView = serde_json::from_slice(
+            br#"{"cat_id":"cat_01","workspace_id":"ws_01","cat_slug":"web",
+                 "state":"cold","current_action":"run","node_id":null,
+                 "node_name":null,"cpu":2,"memory_bytes":1024,
+                 "boot_image":"sha256:abc","mounts":[],"last_error":null,
+                 "created_at_unix_ms":100,"updated_at_unix_ms":101,
+                 "destroyed_at_unix_ms":null}"#,
+        )
+        .expect("an in-flight body without the action clock deserializes");
+        assert_eq!(in_flight.current_action_started_at_unix_ms, None);
+        in_flight.validate().expect("and validates");
+
+        // A stamp before the Cat existed is corruption, and still rejected.
+        let mut corrupt = running;
+        corrupt.last_running_at_unix_ms = Some(99);
+        assert_eq!(
+            corrupt.validate(),
+            Err(SemanticValidationError::Timestamp),
+            "a run recorded before the Cat was created is not a skew case"
+        );
+    }
+
+    #[test]
     fn cat_display_carries_node_name_with_node_id() {
         let cat = CatView {
             cat_id: id("cat_01"),
@@ -1221,6 +1301,8 @@ mod tests {
             created_at_unix_ms: 100,
             updated_at_unix_ms: 101,
             destroyed_at_unix_ms: None,
+            current_action_started_at_unix_ms: None,
+            last_running_at_unix_ms: Some(101),
         };
         cat.validate().unwrap();
         let body = serde_json::to_string(&cat).unwrap();

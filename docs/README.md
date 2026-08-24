@@ -88,6 +88,7 @@ AgentSession 或 HostFenceRecovery 协调的段落，都由 ADR-0059 supersede�
 ### 当前协调决策
 
 - [0059 Control/Node 场景语义同步协议](decisions/0059-semantic-control-node-synchronous-protocol.md)
+- [0064 Cat 动作时钟与运行时钟](decisions/0064-cat-run-and-action-clocks.md)
 - [0063 Control-owned 默认 Boot Image](decisions/0063-control-owned-default-boot-image.md)
 - [0062 Destroy 抢占进行中的 Cat 动作](decisions/0062-destroy-preempts-in-progress-cat-actions.md)
 - [0061 场景语义 Least-Allocated Placement](decisions/0061-semantic-least-allocated-placement.md)

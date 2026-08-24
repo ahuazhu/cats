@@ -797,6 +797,8 @@ mod tests {
                 created_at_unix_ms: 1,
                 updated_at_unix_ms: 2,
                 destroyed_at_unix_ms: None,
+                current_action_started_at_unix_ms: None,
+                last_running_at_unix_ms: Some(2),
             },
         }
     }

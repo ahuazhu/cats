@@ -137,6 +137,11 @@ pub struct CatRecord {
     /// Non-null only while a background scanner exclusively owns recovery of
     /// this exact action occurrence.
     pub current_action_recovery_started_at: Option<i64>,
+    /// Newest DB time at which this Cat was recorded settled in Running, or
+    /// `None` if it has never run. For a Cat that is running now this is when
+    /// the current run began; for any other state it is when it stopped
+    /// running, preserved across later transitions.
+    pub last_running_at: Option<i64>,
 }
 
 impl CatRecord {
@@ -1266,6 +1271,7 @@ impl Store {
     ) -> Result<Option<CatRecord>> {
         self.with(|client| {
             let mut transaction = client.transaction()?;
+            let settle_last_running_at = last_running_at_on_settle();
             let row = transaction.query_opt(
                 &format!(
                     "UPDATE cats
@@ -1278,6 +1284,7 @@ impl Store {
                             last_error_code=$8,
                             last_error_message=$9,
                             destroyed_at=CASE WHEN $6='destroyed' THEN {DB_NOW_MS} ELSE NULL END,
+                            {settle_last_running_at},
                             updated_at={DB_NOW_MS}
                       WHERE cat_id=$1
                         AND current_action=$2
@@ -1791,6 +1798,7 @@ impl Store {
                     Some(message),
                 ),
             };
+            let settle_last_running_at = last_running_at_on_settle();
             let row = transaction.query_opt(
                 &format!(
                     "UPDATE cats
@@ -1799,6 +1807,7 @@ impl Store {
                             current_action_recovery_started_at=NULL,
                             current_action_node_id=NULL,
                             last_error_code=$7,last_error_message=$8,
+                            {settle_last_running_at},
                             updated_at={DB_NOW_MS}
                       WHERE cat_id=$1
                         AND node_id=$2
@@ -2494,10 +2503,28 @@ const fn semantic_action_allowed(action: CatAction, state: Option<CatState>) -> 
     }
 }
 
+/// `last_running_at` maintenance for a settle write, as a `SET` assignment.
+///
+/// Both settle statements take the resulting state as `$6`. A bare column
+/// reference in a `SET` expression reads the pre-update row, so `state` here is
+/// the state being left: writing on either side of Running is what makes the
+/// column mean "newest time this Cat was running" rather than "newest time it
+/// started running", and is what survives a later
+/// running -> suspended -> warm -> cold walk.
+fn last_running_at_on_settle() -> String {
+    format!(
+        "last_running_at=CASE
+                                WHEN $6='running' OR state='running'
+                                    THEN {DB_NOW_MS}
+                                ELSE last_running_at
+                            END"
+    )
+}
+
 const CAT_COLUMNS: &str = "cat_id,workspace_id,cat_slug,state,current_action,
     current_action_started_at,current_action_node_id,node_id,cpu_count,memory_bytes,
     boot_image,last_error_code,last_error_message,created_at,updated_at,destroyed_at,
-    current_action_recovery_started_at";
+    current_action_recovery_started_at,last_running_at";
 const NODE_COLUMNS: &str = "node_id,node_name,control_endpoint,vendor,region,zone,instance_id,
     machine_type,node_version,status,created_at,updated_at";
 const HEARTBEAT_COLUMNS: &str = "node_id,last_heartbeat_at,node_reported_at,reported_status,
@@ -2526,6 +2553,7 @@ fn row_to_cat(row: &Row) -> CatRecord {
         updated_at: row.get(14),
         destroyed_at: row.get(15),
         current_action_recovery_started_at: row.get(16),
+        last_running_at: row.get(17),
     }
 }
 

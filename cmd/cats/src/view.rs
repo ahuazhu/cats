@@ -7,7 +7,9 @@
 use cats_api::metering::{UsageMetric, UsageReport};
 use cats_api::semantic_control::{CatAction, CatState, CatView, DiskView};
 
-use crate::term::{format_age, format_bytes, format_timestamp, Align, Cell, Style, Table, Term};
+use crate::term::{
+    format_age, format_bytes, format_duration, format_timestamp, Align, Cell, Style, Table, Term,
+};
 
 /// Widest detail-card key (`workspace`) plus a space, so every value starts in
 /// the same column.
@@ -197,6 +199,13 @@ pub(crate) fn cat_card(
     if let Some(workspace) = workspace {
         fields.insert(1, ("workspace", workspace.to_owned()));
     }
+    if let Some(last_run) = last_run_field(term, cat, now_ms) {
+        let after_state = fields
+            .iter()
+            .position(|(key, _)| *key == "state")
+            .map_or(fields.len(), |state| state + 1);
+        fields.insert(after_state, last_run);
+    }
     if let Some(destroyed) = cat.destroyed_at_unix_ms {
         fields.push(("destroyed", format_timestamp(i64_from_ms(destroyed))));
     }
@@ -246,36 +255,83 @@ fn state_detail(term: Term, cat: &CatView, display: &StateDisplay, now_ms: i64) 
     let updated = i64_from_ms(cat.updated_at_unix_ms);
     let held = now_ms.saturating_sub(updated);
     let rendered = display.cell(term).into_text();
-    // What `updated_at` means depends on whether an action is in flight.
-    //
-    // Settled: the settling write is the last one to touch the row, so it is
-    // exactly when the Cat entered this state.
-    //
-    // In flight: it is an *activity* clock, not the action start.
-    // `refresh_current_action_activity` and the retry rotations bump it while
-    // the same action occurrence continues, deliberately leaving
-    // `current_action_started_at` alone because that timestamp is the
-    // settlement identity. Reporting it as "in flight for" would report a small
-    // number for a long-stuck retried action -- backwards from what a reader
-    // needs. Report what it is until `current_action_started_at` reaches
-    // `CatView`.
-    let elapsed = if display.in_flight() {
-        format!(
-            "{} {} {}",
-            term.paint("in flight, last activity", Style::Dim),
+    if !display.in_flight() {
+        // Settled: the settling write is the last one to touch the row, so
+        // `updated_at` is exactly when the Cat entered this state.
+        return format!(
+            "{rendered} {} {}  {}",
+            term.paint("for", Style::Dim),
             format_age(held),
-            term.paint("ago", Style::Dim),
+            term.paint(
+                &format!("(since {})", format_timestamp(updated)),
+                Style::Dim
+            ),
+        );
+    }
+
+    // In flight, the two clocks answer different questions and both matter.
+    // `current_action_started_at` is how long this has been going;
+    // `updated_at` is an activity clock that the retry rotations and the
+    // foreground activity refresh advance while the same occurrence continues.
+    // Reading the activity clock as the duration would report a small, freshly
+    // reset number for an action that has been stuck for minutes.
+    let Some(started) = cat.current_action_started_at_unix_ms.map(i64_from_ms) else {
+        // A Control that predates the field. Say what is known and stop: the
+        // activity clock is the wrong answer to "how long", and there is no
+        // other source for the right one.
+        return format!("{rendered} {}", term.paint("in flight", Style::Dim));
+    };
+    let running_for = format!(
+        "{rendered} {} {}",
+        term.paint("in flight for", Style::Dim),
+        format_duration(now_ms.saturating_sub(started)),
+    );
+    // The activity clause is only worth a line once that clock has actually
+    // moved past the start; on a fresh action they are the same instant.
+    if updated.saturating_sub(started) >= 1_000 {
+        format!(
+            "{running_for}  {}",
+            term.paint(
+                &format!("(last activity {} ago)", format_age(held)),
+                Style::Dim,
+            ),
         )
     } else {
-        format!("{} {}", term.paint("for", Style::Dim), format_age(held))
-    };
-    format!(
-        "{rendered} {elapsed}  {}",
-        term.paint(
-            &format!("(since {})", format_timestamp(updated)),
-            Style::Dim
+        format!(
+            "{running_for}  {}",
+            term.paint(
+                &format!("(since {})", format_timestamp(started)),
+                Style::Dim
+            ),
         )
-    )
+    }
+}
+
+/// When this Cat last actually ran, for any Cat that is not running now.
+///
+/// A running Cat needs no such line: its state line already says how long the
+/// current run has held.
+///
+/// An absent stamp is rendered "not recorded" rather than "never", because the
+/// two are indistinguishable here: a Cat that has genuinely never run and a
+/// Control that predates the field both report `None`. "Never" would be a claim
+/// this projection cannot make.
+fn last_run_field(term: Term, cat: &CatView, now_ms: i64) -> Option<(&'static str, String)> {
+    if cat.state == Some(CatState::Running) {
+        return None;
+    }
+    Some(match cat.last_running_at_unix_ms.map(i64_from_ms) {
+        Some(ran) => (
+            "last ran",
+            format!(
+                "{} {}  {}",
+                format_age(now_ms.saturating_sub(ran)),
+                term.paint("ago", Style::Dim),
+                term.paint(&format!("(until {})", format_timestamp(ran)), Style::Dim),
+            ),
+        ),
+        None => ("last ran", term.paint("not recorded", Style::Dim)),
+    })
 }
 
 /// PersistentDisk mounts only. The RootDisk follows the Cat and has no product
@@ -466,6 +522,10 @@ mod tests {
             created_at_unix_ms: (NOW - 3 * 86_400_000) as u64,
             updated_at_unix_ms: (NOW - 3_600_000) as u64,
             destroyed_at_unix_ms: None,
+            // A fresh action: its own clock and the activity clock are the
+            // same instant, which is what the store writes on admission.
+            current_action_started_at_unix_ms: action.map(|_| (NOW - 3_600_000) as u64),
+            last_running_at_unix_ms: Some((NOW - 3_600_000) as u64),
         }
     }
 
@@ -560,21 +620,82 @@ mod tests {
         assert!(card.contains("sha256:9f2c1d84...8899ab"), "{card}");
         assert!(!card.contains("persistent disks"), "no mounts, no section");
 
-        // An in-flight action reports its last activity, not an invented
-        // action duration: the retry rotations advance `updated_at` while the
-        // same occurrence continues, so calling this the action's age would
-        // under-report a stuck retry.
         let mut moving = cat("web", Some(CatState::Cold), Some(CatAction::Run));
-        moving.updated_at_unix_ms = (NOW - 90_000) as u64;
+        moving.updated_at_unix_ms = (NOW - 1_420) as u64;
+        moving.current_action_started_at_unix_ms = Some((NOW - 1_420) as u64);
         let card = cat_card(term, &moving, None, &[], None, NOW);
         assert!(
-            card.contains("cold -> running in flight, last activity 1m ago"),
+            card.contains("cold -> running in flight for 1.420s"),
             "{card}"
         );
         assert!(
-            !card.contains("in flight for"),
-            "`updated_at` is an activity clock while an action runs: {card}"
+            card.contains("(since "),
+            "a fresh action names its start, not an activity age: {card}"
         );
+    }
+
+    #[test]
+    fn a_stuck_action_reports_its_own_age_and_its_activity_separately() {
+        let term = Term::fixed(false, None);
+        // The retry rotations and the foreground activity refresh advance
+        // `updated_at` while the same occurrence continues. Reading that clock
+        // as the action's age would report seconds for an action stuck for
+        // minutes -- backwards from what a reader needs, and wrong exactly when
+        // someone is watching because something is stuck.
+        let mut stuck = cat("web", Some(CatState::Cold), Some(CatAction::Run));
+        stuck.current_action_started_at_unix_ms = Some((NOW - 300_000) as u64);
+        stuck.updated_at_unix_ms = (NOW - 3_000) as u64;
+        let card = cat_card(term, &stuck, None, &[], None, NOW);
+        assert!(
+            card.contains("in flight for 5m 0s"),
+            "the action's own clock decides the duration: {card}"
+        );
+        assert!(
+            card.contains("(last activity 3s ago)"),
+            "the activity clock still answers whether anything is working: {card}"
+        );
+    }
+
+    #[test]
+    fn an_action_clock_the_control_plane_omitted_invents_no_duration() {
+        let term = Term::fixed(false, None);
+        let mut moving = cat("web", Some(CatState::Cold), Some(CatAction::Run));
+        moving.current_action_started_at_unix_ms = None;
+        let card = cat_card(term, &moving, None, &[], None, NOW);
+        assert!(card.contains("cold -> running in flight"), "{card}");
+        assert!(
+            !card.contains("in flight for"),
+            "an absent clock must not become a fabricated duration: {card}"
+        );
+    }
+
+    #[test]
+    fn only_a_stopped_cat_reports_when_it_last_ran() {
+        let term = Term::fixed(false, None);
+        let running = cat("web", Some(CatState::Running), None);
+        assert!(
+            !cat_card(term, &running, None, &[], None, NOW).contains("last ran"),
+            "a running Cat's state line already covers the current run"
+        );
+
+        let mut stopped = cat("web", Some(CatState::Warm), None);
+        stopped.last_running_at_unix_ms = Some((NOW - 2 * 3_600_000) as u64);
+        let card = cat_card(term, &stopped, None, &[], None, NOW);
+        assert!(card.contains("last ran"), "{card}");
+        assert!(
+            card.contains("2h ago"),
+            "the age survives running -> suspended -> warm: {card}"
+        );
+
+        // An absent stamp cannot be reported as "never": a Cat that has truly
+        // never run and a Control that predates the field are the same `None`
+        // here, and only one of them has never run.
+        let mut unrecorded = cat("web", Some(CatState::Cold), None);
+        unrecorded.last_running_at_unix_ms = None;
+        let card = cat_card(term, &unrecorded, None, &[], None, NOW);
+        assert!(card.contains("last ran"), "{card}");
+        assert!(card.contains("not recorded"), "{card}");
+        assert!(!card.contains("never"), "{card}");
     }
 
     #[test]

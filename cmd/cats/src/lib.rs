@@ -2713,10 +2713,46 @@ mod tests {
     }
 
     #[test]
+    fn a_list_from_a_control_without_the_run_clocks_still_renders() {
+        use clap::Parser as _;
+
+        // The skew a merged CLI hits before its Control is deployed: the new
+        // observations are absent, and a Running Cat must still list. Rejecting
+        // the shape here would fail the whole command, not one column.
+        let body = br#"[{"cat_id":"cat_01","workspace_id":"ws_01","cat_slug":"app","state":"running","current_action":null,"node_id":"node_01","node_name":"worker-a","cpu":1,"memory_bytes":536870912,"boot_image":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","mounts":[],"last_error":null,"created_at_unix_ms":1,"updated_at_unix_ms":2,"destroyed_at_unix_ms":null}]"#;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (headers, _) = read_request(&mut stream);
+            assert_eq!(
+                headers.lines().next().unwrap(),
+                "GET /v1/workspaces/ws_01/cats HTTP/1.1"
+            );
+            write_json_response(&mut stream, body.as_slice());
+        });
+        run(Cli::parse_from([
+            "cats",
+            "--api-url",
+            &base,
+            "--token",
+            "test-token",
+            "--workspace",
+            "ws_01",
+            "--color",
+            "never",
+            "ls",
+        ]))
+        .expect("an older Control's list must render, not fail");
+        server.join().unwrap();
+    }
+
+    #[test]
     fn usage_is_read_for_one_cat_over_a_bounded_window() {
         use clap::Parser as _;
 
-        let cat = br#"{"cat_id":"cat_01","workspace_id":"ws_01","cat_slug":"app","state":"running","current_action":null,"node_id":"node_01","node_name":"worker-a","cpu":1,"memory_bytes":536870912,"boot_image":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","mounts":[],"last_error":null,"created_at_unix_ms":1,"updated_at_unix_ms":2,"destroyed_at_unix_ms":null}"#;
+        let cat = br#"{"cat_id":"cat_01","workspace_id":"ws_01","cat_slug":"app","state":"running","current_action":null,"node_id":"node_01","node_name":"worker-a","cpu":1,"memory_bytes":536870912,"boot_image":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","mounts":[],"last_error":null,"created_at_unix_ms":1,"updated_at_unix_ms":2,"destroyed_at_unix_ms":null,"current_action_started_at_unix_ms":null,"last_running_at_unix_ms":2}"#;
         let report = br#"{"billing_account_id":"ba_01","workspace_id":"ws_01","interval_start_unix_ms":1,"interval_end_unix_ms":2,"status":"provisional","currency":"usd","rate_card_id":"rc_01","latest_interval_end_unix_ms":2,"items":[{"metric":"cpu_usec","quantity":"3600000000","unit":"microsecond","amount_nanos":"42100000"}],"cats":[],"amount_nanos":"42100000"}"#;
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2774,7 +2810,7 @@ mod tests {
             (
                 vec!["get", "app"],
                 "GET /v1/workspaces/ws_01/cats/app HTTP/1.1",
-                br#"{"cat_id":"cat_01","workspace_id":"ws_01","cat_slug":"app","state":"running","current_action":null,"node_id":"node_01","node_name":"worker-a","cpu":1,"memory_bytes":536870912,"boot_image":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","mounts":[],"last_error":null,"created_at_unix_ms":1,"updated_at_unix_ms":2,"destroyed_at_unix_ms":null}"#.as_slice(),
+                br#"{"cat_id":"cat_01","workspace_id":"ws_01","cat_slug":"app","state":"running","current_action":null,"node_id":"node_01","node_name":"worker-a","cpu":1,"memory_bytes":536870912,"boot_image":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","mounts":[],"last_error":null,"created_at_unix_ms":1,"updated_at_unix_ms":2,"destroyed_at_unix_ms":null,"current_action_started_at_unix_ms":null,"last_running_at_unix_ms":2}"#.as_slice(),
             ),
             (
                 vec!["disk", "ls"],
@@ -2821,7 +2857,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let captured = read_request(&mut stream);
-            let response = br#"{"status":"ok","code":"cat_created","cat":{"cat_id":"cat_01","workspace_id":"ws_01","cat_slug":"app","state":"running","current_action":null,"node_id":"node_01","node_name":"worker-a","cpu":3,"memory_bytes":2147483648,"boot_image":"ubuntu-24.04","mounts":[],"last_error":null,"created_at_unix_ms":1,"updated_at_unix_ms":2,"destroyed_at_unix_ms":null}}"#;
+            let response = br#"{"status":"ok","code":"cat_created","cat":{"cat_id":"cat_01","workspace_id":"ws_01","cat_slug":"app","state":"running","current_action":null,"node_id":"node_01","node_name":"worker-a","cpu":3,"memory_bytes":2147483648,"boot_image":"ubuntu-24.04","mounts":[],"last_error":null,"created_at_unix_ms":1,"updated_at_unix_ms":2,"destroyed_at_unix_ms":null,"current_action_started_at_unix_ms":null,"last_running_at_unix_ms":2}}"#;
             write!(
                 stream,
                 "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -2893,7 +2929,7 @@ mod tests {
             let server = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
                 let captured = read_request(&mut stream);
-                let response = br#"{"status":"ok","code":"cat_running","cat":{"cat_id":"cat_01","workspace_id":"ws_01","cat_slug":"app","state":"running","current_action":null,"node_id":"node_01","node_name":"worker-a","cpu":2,"memory_bytes":2147483648,"boot_image":"ubuntu-24.04","mounts":[],"last_error":null,"created_at_unix_ms":1,"updated_at_unix_ms":2,"destroyed_at_unix_ms":null}}"#;
+                let response = br#"{"status":"ok","code":"cat_running","cat":{"cat_id":"cat_01","workspace_id":"ws_01","cat_slug":"app","state":"running","current_action":null,"node_id":"node_01","node_name":"worker-a","cpu":2,"memory_bytes":2147483648,"boot_image":"ubuntu-24.04","mounts":[],"last_error":null,"created_at_unix_ms":1,"updated_at_unix_ms":2,"destroyed_at_unix_ms":null,"current_action_started_at_unix_ms":null,"last_running_at_unix_ms":2}}"#;
                 write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",

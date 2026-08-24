@@ -112,8 +112,9 @@ cats
 - last_error_code
 - last_error_message
 - created_at
-- updated_at
+- updated_at                # 最后一次行变更；动作进行中时是活动时钟，不是动作开始时间
 - destroyed_at              # 未destroyed时为空
+- last_running_at           # 最近一次被记录为 settled Running 的时刻；从未运行过为空
 ```
 
 约束：
@@ -125,9 +126,26 @@ cats
 - `current_action IS NULL` 时 `current_action_node_id` 必须为空；
 - `running`、`suspended`、`warm` 时 `node_id` 必须存在；
 - `cold` 时 `node_id` 为空；
-- `failure` 可以保留 `node_id`，表示仍需要向该 Node 执行 destroy 清理。
+- `failure` 可以保留 `node_id`，表示仍需要向该 Node 执行 destroy 清理；
+- `state = running` 时 `last_running_at` 必须存在（`cats_running_records_its_run_check`）：一只
+  已落定为 running 的 Cat 按定义被记录过运行，为空说明漏了写入点，而不是"从未运行过"。
+  这条由数据库保证；`CatView::validate` 刻意**不**复制它（见
+  [ADR-0064](decisions/0064-cat-run-and-action-clocks.md) 决策 5），否则一个比部署的 Control 更新的
+  客户端会把版本偏斜变成整条读的失败。
 
 `state` 表示最后一次完成的产品状态。动作进行中时同时返回 `state` 和 `current_action`，不能把旧 `state` 解释为物理转换已经完成。
+
+三个时间字段回答三个不同的问题，不可互相替代：
+
+- `current_action_started_at` —— **这个动作跑了多久**。它是 settlement identity，重试轮转
+  (`rotate_stale_semantic_cat_action`) 和前台活动刷新 (`refresh_current_action_activity`) 都
+  刻意不动它。
+- `updated_at` —— **最后一次有任何变更**。动作落定后它就是进入该状态的时刻；动作进行中它是
+  活动时钟，会被上面两条路径推进。把它当动作年龄读，会让一个卡了几分钟的重试显示成刚刚重置的
+  小数字。
+- `last_running_at` —— **最近一次真的在运行**。每一次 settle，只要结果状态或前一个状态是
+  `running`，就写入语句时钟；其余转换不动它。所以 running → suspended → warm → cold 走完之后，
+  它仍然是"停止运行的时刻"，而 `updated_at` 已经被后续转换覆盖掉了。
 
 Cat slug 的有效时间段是 `[created_at, destroyed_at)`；`destroyed_at` 为空表示当前仍有效。PostgreSQL 使用只覆盖当前实体的部分唯一索引：
 
@@ -435,7 +453,11 @@ cats disk ls
 - **`--usage` 是选择加入的。** 它多打一次计费读；该读失败（例如 Workspace 还没有 billing ledger）只渲染成一行 `unavailable`，绝不让 `cats show` 失败。
 - **`cats get` 已弃用**，是 `cats show` 的隐藏别名，仍然接受以免打断既有脚本。
 
-一条真正的"最后运行时间"目前不存在：`updated_at` 是最后一次状态变更（进行中动作时它就是该动作的开始时刻），而 v19 schema 没有生命周期事件日志。补它的正确做法是在离开 `running` 的那次 UPDATE 里写一列 `last_running_at`，不是从计费区间反推。
+`cats show` 的三个时间读数分别来自 §4.1 的三个字段：落定态用 `updated_at`，进行中动作用
+`current_action_started_at`（并在活动时钟已经走过起点时补一句 `last activity`），非 running 的
+Cat 用 `last_running_at` 显示 `last ran`。字段缺失时渲染成 `not recorded` 而不是 `never`——
+真的从未运行过和 Control 不报告该字段在这里是同一个 `None`；同理，动作进行中而没有动作时钟时
+只显示 `in flight`，不编造时长。
 
 ### 7.3 REST 路由
 

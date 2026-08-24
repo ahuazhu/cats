@@ -915,7 +915,8 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             current_action_started_at, current_action_recovery_started_at,
             current_action_node_id, node_id,
             cpu_count, memory_bytes, boot_image, last_error_code,
-            last_error_message, created_at, updated_at, destroyed_at
+            last_error_message, created_at, updated_at, destroyed_at,
+            last_running_at
        FROM cats WHERE FALSE",
     "SELECT disk_id, workspace_id, disk_slug, size_bytes, status,
             created_at, deleted_at
@@ -1831,7 +1832,20 @@ CREATE TABLE IF NOT EXISTS cats (
     created_at BIGINT NOT NULL CHECK (created_at >= 0),
     updated_at BIGINT NOT NULL CHECK (updated_at >= created_at),
     destroyed_at BIGINT CHECK (destroyed_at >= created_at),
+    -- Newest DB time at which this Cat was recorded settled in Running. NULL
+    -- means it has never run. Every settle whose resulting *or* previous state
+    -- is Running writes it, so a Cat that moved running -> suspended -> warm
+    -- still reports when it actually stopped running -- which `updated_at`
+    -- cannot, because that is the last change of any kind and, while an action
+    -- is in flight, an activity clock.
+    last_running_at BIGINT CHECK (last_running_at >= created_at),
     CONSTRAINT cats_workspace_identity_unique UNIQUE (workspace_id, cat_id),
+    -- A settled Running Cat has, by definition, been recorded running. The
+    -- constraint makes a missed write site fail at the write instead of
+    -- silently projecting NULL for a Cat that is demonstrably running.
+    CONSTRAINT cats_running_records_its_run_check CHECK (
+        state IS DISTINCT FROM 'running' OR last_running_at IS NOT NULL
+    ),
     CONSTRAINT cats_destroyed_shape_check CHECK (
         ((state = 'destroyed') IS TRUE) = (destroyed_at IS NOT NULL)
     ),
