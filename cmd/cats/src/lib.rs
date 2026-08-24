@@ -798,7 +798,8 @@ impl Client {
     }
 
     fn from_user_session(session: auth::UserSession) -> Result<Self> {
-        let workspace_label = session.config.current_workspace.clone();
+        let workspace_label =
+            session_workspace_label(&session.config.workspaces, &session.workspace);
         Ok(Self {
             workspace_label,
             http: reqwest::blocking::Client::builder()
@@ -911,6 +912,24 @@ impl Client {
 
 fn workspace_override(cli: &Cli) -> Option<String> {
     cli.workspace.clone()
+}
+
+/// Display label for the Workspace this invocation is actually addressing.
+///
+/// It must be looked up by the resolved ID, not read from the saved default:
+/// `--workspace OTHER` changes what every route addresses while
+/// `config.current_workspace` still names the default, so labelling from the
+/// default would put another Workspace's name on this Cat's card. An
+/// unresolvable ID yields no label at all -- omitting the line is honest, a
+/// wrong one is not.
+fn session_workspace_label(
+    workspaces: &[cats_api::auth::Workspace],
+    workspace_id: &str,
+) -> Option<String> {
+    workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .map(|workspace| workspace.locator.clone())
 }
 
 /// Machine tokens have no WorkOS identity to enumerate workspaces from, so a
@@ -1144,6 +1163,9 @@ fn watch_cat(
     let mut last_success = Instant::now();
     let mut cached_usage: Option<(Instant, UsageOutcome)> = None;
     let mut disks: Vec<DiskView> = Vec::new();
+    // Mount sizes come from a second request that can fail on its own. Retry it
+    // until it succeeds rather than once per signature change.
+    let mut disks_are_stale = false;
     // The last snapshot that was read successfully. A failed poll keeps drawing
     // it under a stale banner rather than freezing or clearing the screen.
     let mut last_cat: Option<CatView> = None;
@@ -1173,7 +1195,10 @@ fn watch_cat(
                         }
                     }
                     signature = Some(current);
-                    disks = mounted_disks(client, &cat).unwrap_or_default();
+                    disks_are_stale = true;
+                }
+                if disks_are_stale {
+                    (disks, disks_are_stale) = refresh_disks(disks, mounted_disks(client, &cat));
                 }
                 if usage
                     && cached_usage
@@ -1219,6 +1244,19 @@ fn watch_cat(
             printed_lines = draw_frame(term, &frame, printed_lines);
         }
         std::thread::sleep(interval);
+    }
+}
+
+/// Applies a mounted-disk refresh, keeping the previous set when it failed.
+///
+/// Returns the set to display and whether it still needs a refresh. Replacing
+/// the cache with an empty vector on a transient `/disks` error would print `-`
+/// for every mount size for the rest of the watch, with nothing on screen
+/// saying the sizes are missing rather than absent.
+fn refresh_disks(previous: Vec<DiskView>, fetched: Result<Vec<DiskView>>) -> (Vec<DiskView>, bool) {
+    match fetched {
+        Ok(disks) => (disks, false),
+        Err(_) => (previous, true),
     }
 }
 
@@ -1882,6 +1920,75 @@ fn run_disk(client: &Client, cli: &Cli, cmd: &DiskCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_workspace_label_names_the_workspace_being_addressed() {
+        let workspaces = vec![
+            workspace_entry("ws_default", "acct/default"),
+            workspace_entry("ws_other", "acct/other"),
+        ];
+        // `--workspace acct/other` resolves into the session's workspace while
+        // the saved default is unchanged. Labelling from the default would put
+        // another Workspace's name on this Cat's card.
+        assert_eq!(
+            session_workspace_label(&workspaces, "ws_other").as_deref(),
+            Some("acct/other")
+        );
+        assert_eq!(
+            session_workspace_label(&workspaces, "ws_default").as_deref(),
+            Some("acct/default")
+        );
+        assert_eq!(
+            session_workspace_label(&workspaces, "ws_vanished"),
+            None,
+            "an unresolvable workspace is left unlabelled, never mislabelled"
+        );
+    }
+
+    #[test]
+    fn a_failed_disk_refresh_keeps_the_last_sizes_and_stays_due() {
+        let disks = vec![disk_view("data", 20 << 30)];
+        let (kept, stale) = refresh_disks(disks.clone(), Err(anyhow!("control plane unreachable")));
+        assert_eq!(
+            kept.len(),
+            1,
+            "a transient /disks failure must not blank the sizes"
+        );
+        assert!(stale, "and must leave the refresh due for the next tick");
+
+        let (replaced, stale) = refresh_disks(disks, Ok(vec![disk_view("data", 40 << 30)]));
+        assert_eq!(replaced[0].size_bytes, 40 << 30);
+        assert!(!stale);
+    }
+
+    fn workspace_entry(id: &str, locator: &str) -> cats_api::auth::Workspace {
+        cats_api::auth::Workspace {
+            id: id.to_owned(),
+            account_id: "acct_01".to_owned(),
+            account_slug: "acct".to_owned(),
+            account_display_name: "Acct".to_owned(),
+            slug: locator.rsplit('/').next().unwrap_or(locator).to_owned(),
+            locator: locator.to_owned(),
+            display_name: "Workspace".to_owned(),
+            kind: cats_api::auth::AccountKind::Organization,
+            organization_id: "org_01".to_owned(),
+            role: None,
+            is_default: false,
+        }
+    }
+
+    fn disk_view(slug: &str, size_bytes: u64) -> DiskView {
+        DiskView {
+            disk_id: cats_api::runtime_reconciliation::Id::new(format!("disk_{slug}")).unwrap(),
+            workspace_id: cats_api::runtime_reconciliation::Id::new("ws_01").unwrap(),
+            disk_slug: ResourceSlug::new(slug).unwrap(),
+            size_bytes,
+            status: cats_api::semantic_control::DiskStatus::Normal,
+            binding: None,
+            created_at_unix_ms: 1,
+            deleted_at_unix_ms: None,
+        }
+    }
 
     #[test]
     fn watch_intervals_reject_unbounded_and_unitless_values() {
