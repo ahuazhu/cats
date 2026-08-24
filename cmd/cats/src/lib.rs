@@ -27,9 +27,11 @@ mod runtime_provisioner;
 mod runtime_provisioner_unsupported_compile_shape;
 #[cfg(unix)]
 mod stable_unix_fs;
+mod term;
+mod view;
 mod workos_client;
 
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -46,6 +48,10 @@ use cats_api::semantic_control::{
     DetachDiskRequest, DiskResponse, DiskView, PersistentMountPath, ResourceSlug,
     SemanticErrorBody,
 };
+
+pub use term::ColorChoice;
+use term::{format_bytes, format_clock, truncate_visible, Align, Cell, Style, Table, Term};
+use view::UsageOutcome;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -67,6 +73,9 @@ pub struct Cli {
     /// Print raw JSON instead of human-readable output.
     #[arg(long, global = true)]
     pub json: bool,
+    /// Colorize human-readable output.
+    #[arg(long, value_enum, default_value_t = ColorChoice::Auto, global = true)]
+    pub color: ColorChoice,
 
     #[command(subcommand)]
     pub command: Command,
@@ -105,8 +114,28 @@ pub enum Command {
     },
     /// List cats.
     Ls,
-    /// Show the current Cat selected by its Workspace-local slug.
-    Get { id: String },
+    /// Show one Cat in detail.
+    Show {
+        /// Workspace-local Cat slug.
+        #[arg(value_name = "CAT_SLUG")]
+        cat_id: String,
+        /// Redraw as the Cat changes instead of printing once and exiting.
+        #[arg(long, short = 'w')]
+        watch: bool,
+        /// Poll interval while watching: `500ms`, `2s` or `1m`.
+        #[arg(long, value_name = "DURATION", default_value = "1s")]
+        interval: String,
+        /// Add the metered usage block. Costs one extra billing read.
+        #[arg(long)]
+        usage: bool,
+    },
+    /// Deprecated alias for `cats show`.
+    #[command(hide = true)]
+    Get {
+        /// Workspace-local Cat slug.
+        #[arg(value_name = "CAT_SLUG")]
+        id: String,
+    },
     /// Converge a Cold, Suspended, or Warm Cat to Running.
     Run {
         #[arg(value_name = "CAT_SLUG")]
@@ -735,6 +764,9 @@ struct Client {
     token: String,
     /// Immutable workspace ID; resource routes never key on a mutable slug.
     workspace_id: String,
+    /// `account/workspace` when this invocation knows it, for display only.
+    /// Never used to address a route.
+    workspace_label: Option<String>,
 }
 
 impl Client {
@@ -751,11 +783,13 @@ impl Client {
             let base = canonical_api_origin(&auth::configured_api_url(cli.api_url.as_deref())?)?;
             let selector = workspace_override(cli).unwrap_or_else(|| "default".to_string());
             let workspace_id = resolve_workspace_id(&http, &base, token, &selector)?;
+            let workspace_label = (selector != workspace_id).then_some(selector);
             return Ok(Self {
                 http,
                 base,
                 token: token.clone(),
                 workspace_id,
+                workspace_label,
             });
         }
         let session =
@@ -764,7 +798,10 @@ impl Client {
     }
 
     fn from_user_session(session: auth::UserSession) -> Result<Self> {
+        let workspace_label =
+            session_workspace_label(&session.config.workspaces, &session.workspace);
         Ok(Self {
+            workspace_label,
             http: reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(120))
                 .redirect(reqwest::redirect::Policy::none())
@@ -802,7 +839,10 @@ impl Client {
         }
     }
 
-    fn send_with_status_raw(
+    /// The transport result, without turning an unsuccessful status into an
+    /// error. `--watch` has to tell "this Cat is gone" apart from "this request
+    /// failed", and the shared error path flattens both into one message.
+    fn send_raw(
         &self,
         req: reqwest::blocking::RequestBuilder,
     ) -> Result<(reqwest::StatusCode, Vec<u8>)> {
@@ -815,6 +855,14 @@ impl Client {
             .bytes()
             .context("read control-plane response")?
             .to_vec();
+        Ok((status, body))
+    }
+
+    fn send_with_status_raw(
+        &self,
+        req: reqwest::blocking::RequestBuilder,
+    ) -> Result<(reqwest::StatusCode, Vec<u8>)> {
+        let (status, body) = self.send_raw(req)?;
         if !status.is_success() {
             // Surface the structured error body when present.
             if let Ok(err) = serde_json::from_slice::<SemanticErrorBody>(&body) {
@@ -832,6 +880,23 @@ impl Client {
         self.send(self.http.get(self.url(path)))
     }
 
+    /// `get`, mapping an absent resource to `None` instead of an error.
+    fn get_optional(&self, path: &str) -> Result<Option<serde_json::Value>> {
+        let (status, body) = self.send_raw(self.http.get(self.url(path)))?;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            if let Ok(err) = serde_json::from_slice::<SemanticErrorBody>(&body) {
+                bail!("{} ({:?})", err.message, err.code);
+            }
+            bail!("HTTP {status}: {}", String::from_utf8_lossy(&body));
+        }
+        serde_json::from_slice(&body)
+            .map(Some)
+            .context("malformed response")
+    }
+
     fn post(&self, path: &str, body: Option<serde_json::Value>) -> Result<serde_json::Value> {
         let mut req = self
             .http
@@ -847,6 +912,24 @@ impl Client {
 
 fn workspace_override(cli: &Cli) -> Option<String> {
     cli.workspace.clone()
+}
+
+/// Display label for the Workspace this invocation is actually addressing.
+///
+/// It must be looked up by the resolved ID, not read from the saved default:
+/// `--workspace OTHER` changes what every route addresses while
+/// `config.current_workspace` still names the default, so labelling from the
+/// default would put another Workspace's name on this Cat's card. An
+/// unresolvable ID yields no label at all -- omitting the line is honest, a
+/// wrong one is not.
+fn session_workspace_label(
+    workspaces: &[cats_api::auth::Workspace],
+    workspace_id: &str,
+) -> Option<String> {
+    workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .map(|workspace| workspace.locator.clone())
 }
 
 /// Machine tokens have no WorkOS identity to enumerate workspaces from, so a
@@ -889,24 +972,375 @@ fn resolve_workspace_id(
     Ok(matched.id.clone())
 }
 
-fn print_semantic_cat(cat: &CatView, json_mode: bool) {
-    if json_mode {
-        println!("{}", serde_json::to_string_pretty(cat).unwrap());
+/// Wall-clock milliseconds, for ages and durations against wire timestamps.
+///
+/// A clock before the epoch yields 0 rather than an error: every consumer
+/// clamps, and a skewed clock must not stop the CLI from printing.
+fn unix_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+fn list_cats(client: &Client) -> Result<Vec<CatView>> {
+    let cats: Vec<CatView> = serde_json::from_value(client.get("/cats")?)
+        .context("invalid semantic Cat list response")?;
+    for cat in &cats {
+        cat.validate().context("invalid Cat list item")?;
+    }
+    Ok(cats)
+}
+
+fn list_disks(client: &Client) -> Result<Vec<DiskView>> {
+    let disks: Vec<DiskView> = serde_json::from_value(client.get("/disks")?)
+        .context("invalid semantic PersistentDisk list response")?;
+    for disk in &disks {
+        disk.validate()
+            .context("invalid PersistentDisk list item")?;
+    }
+    Ok(disks)
+}
+
+/// One Cat, or `None` once it no longer exists.
+fn fetch_cat(client: &Client, slug: &ResourceSlug) -> Result<Option<CatView>> {
+    let Some(value) = client.get_optional(&format!("/cats/{slug}"))? else {
+        return Ok(None);
+    };
+    let cat: CatView = serde_json::from_value(value).context("invalid semantic Cat response")?;
+    cat.validate().context("invalid Cat response")?;
+    Ok(Some(cat))
+}
+
+/// The Disk reads behind a Cat's mounts, for their sizes.
+///
+/// Skipped entirely when the Cat has no mounts, which is the common case and
+/// saves a request on every `cats show`.
+fn mounted_disks(client: &Client, cat: &CatView) -> Result<Vec<DiskView>> {
+    if cat.mounts.is_empty() {
+        return Ok(Vec::new());
+    }
+    list_disks(client)
+}
+
+/// Trailing usage window shown by `--usage`.
+const USAGE_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+const USAGE_WINDOW_LABEL: &str = "last 24h";
+
+/// Reads one Cat's metered usage, rendering any failure instead of returning
+/// it: a workspace without a billing ledger, or a metering outage, must not
+/// stop `cats show` from reporting lifecycle state.
+fn fetch_usage(client: &Client, cat: &CatView, now_ms: i64) -> UsageOutcome {
+    let from_ms =
+        now_ms.saturating_sub(i64::try_from(USAGE_WINDOW.as_millis()).unwrap_or(i64::MAX));
+    let path = format!(
+        "/billing/usage?cat_id={}&from_ms={from_ms}&to_ms={now_ms}",
+        cat.cat_id
+    );
+    match client.get(&path).and_then(|value| {
+        serde_json::from_value::<cats_api::metering::UsageReport>(value)
+            .context("invalid usage report")
+    }) {
+        Ok(report) => UsageOutcome::Report {
+            window_label: USAGE_WINDOW_LABEL.to_owned(),
+            report: Box::new(report),
+        },
+        Err(error) => UsageOutcome::Unavailable {
+            window_label: USAGE_WINDOW_LABEL.to_owned(),
+            reason: error.to_string(),
+        },
+    }
+}
+
+/// PersistentDisks as a table.
+///
+/// `STATUS` folds the admin status together with whether the Disk is bound,
+/// because "normal" alone does not answer the question a reader has. `ATTACHED
+/// TO` shows the single RWO binding, which is the only attachment V1 allows.
+fn disks_table(term: Term, disks: &[DiskView]) -> String {
+    let mut table = Table::new(
+        term,
+        vec![
+            ("NAME", Align::Left),
+            ("SIZE", Align::Right),
+            ("STATUS", Align::Left),
+            ("ATTACHED TO", Align::Left),
+            ("ID", Align::Left),
+        ],
+    );
+    let mut ordered: Vec<&DiskView> = disks.iter().collect();
+    ordered.sort_by(|left, right| left.disk_slug.as_str().cmp(right.disk_slug.as_str()));
+    for disk in ordered {
+        let (status, style) = match disk.status {
+            cats_api::semantic_control::DiskStatus::Normal => {
+                if disk.binding.is_some() {
+                    ("attached", Style::Green)
+                } else {
+                    ("available", Style::Plain)
+                }
+            }
+            cats_api::semantic_control::DiskStatus::Deleted => ("deleted", Style::Dim),
+        };
+        let attached = disk.binding.as_ref().map_or_else(
+            || "-".to_owned(),
+            |binding| format!("{} {}", binding.cat_slug, binding.mount_path),
+        );
+        table.push(vec![
+            Cell::plain(disk.disk_slug.as_str()),
+            Cell::plain(format_bytes(disk.size_bytes)),
+            Cell::styled(term, status, style),
+            Cell::plain(attached),
+            Cell::styled(term, disk.disk_id.as_str(), Style::Dim),
+        ]);
+    }
+    table.render()
+}
+
+/// Shortest accepted `--interval`.
+///
+/// The control plane serializes its PostgreSQL work, so a fast poll from many
+/// clients is spent on the store rather than on the transitions it is trying to
+/// catch. Sub-second lifecycle transitions are not reliably observable by
+/// polling at any rate; catching them needs an operation read, not a shorter
+/// interval.
+const MIN_WATCH_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_WATCH_INTERVAL: Duration = Duration::from_secs(300);
+
+fn parse_interval(value: &str) -> Result<Duration> {
+    let trimmed = value.trim();
+    let (digits, unit_millis) = if let Some(digits) = trimmed.strip_suffix("ms") {
+        (digits, 1)
+    } else if let Some(digits) = trimmed.strip_suffix('s') {
+        (digits, 1_000)
+    } else if let Some(digits) = trimmed.strip_suffix('m') {
+        (digits, 60_000)
     } else {
-        let state = cat
-            .state
-            .map(|state| format!("{state:?}").to_lowercase())
-            .unwrap_or_else(|| "creating".to_owned());
-        let node = cat.node_name.as_ref().map_or("-", |name| name.as_str());
-        println!(
-            "{:<16} id={:<38} state={:<9} node={} disks={}",
-            cat.cat_slug,
-            cat.cat_id,
-            state,
-            node,
-            cat.mounts.len(),
+        bail!("interval {value:?} needs a unit: 500ms, 2s or 1m");
+    };
+    let amount: u64 = digits
+        .trim()
+        .parse()
+        .with_context(|| format!("interval {value:?} is not a whole number with a unit"))?;
+    let interval = Duration::from_millis(
+        amount
+            .checked_mul(unit_millis)
+            .context("interval overflows")?,
+    );
+    if interval < MIN_WATCH_INTERVAL || interval > MAX_WATCH_INTERVAL {
+        bail!(
+            "interval must be between {}ms and {}s",
+            MIN_WATCH_INTERVAL.as_millis(),
+            MAX_WATCH_INTERVAL.as_secs()
         );
     }
+    Ok(interval)
+}
+
+/// How long a watch tolerates consecutive failed polls before giving up.
+const WATCH_FAILURE_GRACE: Duration = Duration::from_secs(30);
+/// How often a watch refreshes the usage block, which is far more expensive
+/// than a Cat read and changes far more slowly.
+const WATCH_USAGE_REFRESH: Duration = Duration::from_secs(30);
+/// Transitions kept under the card.
+const WATCH_HISTORY: usize = 5;
+
+/// Polls one Cat and redraws it in place.
+///
+/// There is no push transport to prefer: the control plane serves no WebSocket
+/// or SSE route, so this polls. It is written as fetch-then-render so adding a
+/// push transport later replaces the fetch and leaves the rendering alone.
+fn watch_cat(
+    client: &Client,
+    cli: &Cli,
+    slug: &ResourceSlug,
+    interval: Duration,
+    usage: bool,
+) -> Result<()> {
+    let mut history: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut signature: Option<String> = None;
+    let mut printed_lines = 0usize;
+    let mut last_success = Instant::now();
+    let mut cached_usage: Option<(Instant, UsageOutcome)> = None;
+    let mut disks: Vec<DiskView> = Vec::new();
+    // Mount sizes come from a second request that can fail on its own. Retry it
+    // until it succeeds rather than once per signature change.
+    let mut disks_are_stale = false;
+    // The last snapshot that was read successfully. A failed poll keeps drawing
+    // it under a stale banner rather than freezing or clearing the screen.
+    let mut last_cat: Option<CatView> = None;
+
+    loop {
+        // Re-read capabilities every pass so a resized window keeps redrawing
+        // correctly.
+        let term = Term::stdout(cli.color);
+        let now_ms = unix_now_ms();
+        // `Some(reason)` when this pass could not refresh, which turns the
+        // frame's header into a stale banner over the previous snapshot.
+        let stale = match fetch_cat(client, slug) {
+            Ok(Some(cat)) => {
+                last_success = Instant::now();
+                let current = watch_signature(&cat);
+                if signature.as_ref() != Some(&current) {
+                    if signature.is_some() {
+                        // The first observation is the starting point, not a
+                        // change.
+                        history.push_back(format!(
+                            "{}  {}",
+                            format_clock(now_ms),
+                            view::state_summary(term, &cat),
+                        ));
+                        while history.len() > WATCH_HISTORY {
+                            history.pop_front();
+                        }
+                    }
+                    signature = Some(current);
+                    disks_are_stale = true;
+                }
+                if disks_are_stale {
+                    (disks, disks_are_stale) = refresh_disks(disks, mounted_disks(client, &cat));
+                }
+                if usage
+                    && cached_usage
+                        .as_ref()
+                        .is_none_or(|(fetched, _)| fetched.elapsed() >= WATCH_USAGE_REFRESH)
+                {
+                    cached_usage = Some((Instant::now(), fetch_usage(client, &cat, now_ms)));
+                }
+                last_cat = Some(cat);
+                None
+            }
+            // A destroyed Cat is a terminal answer, not a failure.
+            Ok(None) => {
+                println!("cat {slug} no longer exists");
+                return Ok(());
+            }
+            Err(error) => {
+                if last_cat.is_none() {
+                    // Nothing has ever been drawn, so there is no watch to
+                    // degrade: report the failure the way a plain read would.
+                    return Err(error);
+                }
+                if last_success.elapsed() >= WATCH_FAILURE_GRACE {
+                    return Err(error.context(format!(
+                        "watch gave up after {}s without a successful poll",
+                        WATCH_FAILURE_GRACE.as_secs()
+                    )));
+                }
+                Some(error.to_string())
+            }
+        };
+
+        if let Some(cat) = &last_cat {
+            let card = view::cat_card(
+                term,
+                cat,
+                client.workspace_label.as_deref(),
+                &disks,
+                cached_usage.as_ref().map(|(_, usage)| usage),
+                now_ms,
+            );
+            let frame = watch_frame(term, &card, &history, stale.as_deref(), interval, now_ms);
+            printed_lines = draw_frame(term, &frame, printed_lines);
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+/// Applies a mounted-disk refresh, keeping the previous set when it failed.
+///
+/// Returns the set to display and whether it still needs a refresh. Replacing
+/// the cache with an empty vector on a transient `/disks` error would print `-`
+/// for every mount size for the rest of the watch, with nothing on screen
+/// saying the sizes are missing rather than absent.
+fn refresh_disks(previous: Vec<DiskView>, fetched: Result<Vec<DiskView>>) -> (Vec<DiskView>, bool) {
+    match fetched {
+        Ok(disks) => (disks, false),
+        Err(_) => (previous, true),
+    }
+}
+
+/// The fields whose change is worth recording in the transition history.
+fn watch_signature(cat: &CatView) -> String {
+    format!(
+        "{:?}/{:?}/{}/{}",
+        cat.state,
+        cat.current_action,
+        cat.updated_at_unix_ms,
+        cat.mounts.len()
+    )
+}
+
+fn watch_frame(
+    term: Term,
+    card: &str,
+    history: &std::collections::VecDeque<String>,
+    error: Option<&str>,
+    interval: Duration,
+    now_ms: i64,
+) -> String {
+    let mut frame = String::new();
+    let status = match error {
+        Some(error) => term.paint(&format!("stale: {error}"), Style::Red),
+        None => term.paint(
+            &format!(
+                "watching every {}ms  {}",
+                interval.as_millis(),
+                format_clock(now_ms)
+            ),
+            Style::Dim,
+        ),
+    };
+    frame.push_str(&status);
+    frame.push('\n');
+    frame.push_str(card);
+    if !history.is_empty() {
+        frame.push_str(&format!("\n\n  {}", term.paint("changes", Style::Dim)));
+        for entry in history {
+            frame.push_str(&format!("\n    {entry}"));
+        }
+    }
+    frame
+}
+
+/// Reprints `frame` over the previous one and returns the line count it wrote.
+///
+/// Every line is truncated to the terminal width so one logical line is exactly
+/// one physical row; otherwise a wrapped line makes the cursor-up count wrong
+/// and the redraw walks up the scrollback. `\x1b[0J` erases forward from the
+/// cursor only, so completed output above stays in the scrollback -- unlike a
+/// full-screen clear or the alternate screen.
+fn draw_frame(term: Term, frame: &str, previous_lines: usize) -> usize {
+    let (text, lines) = compose_redraw(term, frame, previous_lines);
+    println!("{text}");
+    lines
+}
+
+/// The bytes of one redraw and the number of rows it will occupy.
+///
+/// Split out from the write so the rewind arithmetic is testable: an off-by-one
+/// here walks the cursor into finished output.
+fn compose_redraw(term: Term, frame: &str, previous_lines: usize) -> (String, usize) {
+    let Some(width) = term.width() else {
+        // Not a terminal: append instead of redrawing, so a redirected watch is
+        // a readable log rather than a pile of escape sequences.
+        return (frame.to_owned(), 0);
+    };
+    let mut lines: Vec<String> = frame
+        .lines()
+        .map(|line| truncate_visible(line, width))
+        .collect();
+    if let Some(height) = term.height() {
+        // Keep the frame shorter than the window: a frame taller than the
+        // window scrolls, and then cursor-up lands in the wrong place.
+        lines.truncate(height.saturating_sub(1).max(1));
+    }
+    let mut out = String::new();
+    if previous_lines > 0 {
+        out.push_str(&format!("\x1b[{previous_lines}A\x1b[0J"));
+    }
+    out.push_str(&lines.join("\n"));
+    (out, lines.len())
 }
 
 /// Run the CLI; returns the process exit code.
@@ -1114,28 +1548,73 @@ pub fn run(cli: Cli) -> Result<()> {
             let response: CatResponse =
                 serde_json::from_value(response).context("invalid semantic Cat response")?;
             response.cat.validate().context("invalid Cat response")?;
-            print_cat_response(&response, cli.json)
+            print_cat_response(&response, &cli)
         }
         Command::Ls => {
-            let cats: Vec<CatView> = serde_json::from_value(client.get("/cats")?)
-                .context("invalid semantic Cat list response")?;
+            let cats = list_cats(&client)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&cats)?);
-            } else {
-                for cat in &cats {
-                    cat.validate().context("invalid Cat list item")?;
-                    print_semantic_cat(cat, false);
-                }
+                return Ok(());
             }
+            if cats.is_empty() {
+                println!("No cats yet. Create one with:\n  cats create NAME");
+                return Ok(());
+            }
+            println!(
+                "{}",
+                view::cats_table(Term::stdout(cli.color), &cats, unix_now_ms())
+            );
+            Ok(())
+        }
+        Command::Show {
+            cat_id,
+            watch,
+            interval,
+            usage,
+        } => {
+            let slug = resource_slug("cat", cat_id)?;
+            if *watch {
+                if cli.json {
+                    bail!("--watch has no --json form; poll `cats show --json` instead");
+                }
+                return watch_cat(&client, &cli, &slug, parse_interval(interval)?, *usage);
+            }
+            let cat =
+                fetch_cat(&client, &slug)?.with_context(|| format!("cat {slug} does not exist"))?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&cat)?);
+                return Ok(());
+            }
+            let disks = mounted_disks(&client, &cat)?;
+            let usage = usage.then(|| fetch_usage(&client, &cat, unix_now_ms()));
+            println!(
+                "{}",
+                view::cat_card(
+                    Term::stdout(cli.color),
+                    &cat,
+                    client.workspace_label.as_deref(),
+                    &disks,
+                    usage.as_ref(),
+                    unix_now_ms(),
+                )
+            );
             Ok(())
         }
         Command::Get { id } => {
-            let slug = resource_slug("cat", id)?;
-            let cat: CatView = serde_json::from_value(client.get(&format!("/cats/{slug}"))?)
-                .context("invalid semantic Cat response")?;
-            cat.validate().context("invalid Cat response")?;
-            print_semantic_cat(&cat, cli.json);
-            Ok(())
+            eprintln!("warning: `cats get` is deprecated and will be removed; use `cats show`");
+            run(Cli {
+                command: Command::Show {
+                    cat_id: id.clone(),
+                    watch: false,
+                    interval: "1s".to_owned(),
+                    usage: false,
+                },
+                api_url: cli.api_url.clone(),
+                token: cli.token.clone(),
+                workspace: cli.workspace.clone(),
+                json: cli.json,
+                color: cli.color,
+            })
         }
         Command::Run { cat_id } => run_semantic_cat_action(&client, &cli, cat_id, "run"),
         Command::Suspend { cat_id } => run_semantic_cat_action(&client, &cli, cat_id, "suspend"),
@@ -1298,31 +1777,23 @@ fn run_semantic_cat_action(client: &Client, cli: &Cli, cat_slug: &str, action: &
     let response: CatResponse =
         serde_json::from_value(response).context("invalid semantic Cat response")?;
     response.cat.validate().context("invalid Cat response")?;
-    print_cat_response(&response, cli.json)
+    print_cat_response(&response, cli)
 }
 
-fn print_cat_response(response: &CatResponse, json_mode: bool) -> Result<()> {
-    if json_mode {
+fn print_cat_response(response: &CatResponse, cli: &Cli) -> Result<()> {
+    if cli.json {
         println!("{}", serde_json::to_string_pretty(response)?);
         return Ok(());
     }
-    let state = response
-        .cat
-        .state
-        .map(|state| format!("{state:?}").to_lowercase())
-        .unwrap_or_else(|| "creating".to_owned());
-    let node = response
-        .cat
-        .node_name
-        .as_ref()
-        .map_or("-", |name| name.as_str());
     let code = serde_json::to_value(response.code)?;
     let code = code
         .as_str()
         .context("semantic success code was not a string")?;
     println!(
-        "{}: cat={} id={} state={} node={}",
-        code, response.cat.cat_slug, response.cat.cat_id, state, node
+        "{code}: cat={} id={} state={}",
+        response.cat.cat_slug,
+        response.cat.cat_id,
+        view::state_summary(Term::stdout(cli.color), &response.cat),
     );
     Ok(())
 }
@@ -1366,17 +1837,16 @@ fn run_disk(client: &Client, cli: &Cli, cmd: &DiskCommand) -> Result<()> {
             print_disk_response(&response, cli.json)
         }
         DiskCommand::Ls => {
-            let disks: Vec<DiskView> = serde_json::from_value(client.get("/disks")?)
-                .context("invalid semantic PersistentDisk list response")?;
+            let disks = list_disks(client)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&disks)?);
-            } else {
-                for disk in &disks {
-                    disk.validate()
-                        .context("invalid PersistentDisk list item")?;
-                    print_semantic_disk(disk, false);
-                }
+                return Ok(());
             }
+            if disks.is_empty() {
+                println!("No disks yet. Create one with:\n  cats disk create NAME --size 100GiB");
+                return Ok(());
+            }
+            println!("{}", disks_table(Term::stdout(cli.color), &disks));
             Ok(())
         }
         DiskCommand::Get { id } => {
@@ -1384,7 +1854,14 @@ fn run_disk(client: &Client, cli: &Cli, cmd: &DiskCommand) -> Result<()> {
             let disk: DiskView = serde_json::from_value(client.get(&format!("/disks/{slug}"))?)
                 .context("invalid semantic PersistentDisk response")?;
             disk.validate().context("invalid PersistentDisk response")?;
-            print_semantic_disk(&disk, cli.json);
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&disk)?);
+                return Ok(());
+            }
+            println!(
+                "{}",
+                disks_table(Term::stdout(cli.color), std::slice::from_ref(&disk))
+            );
             Ok(())
         }
         DiskCommand::Attach {
@@ -1440,29 +1917,194 @@ fn run_disk(client: &Client, cli: &Cli, cmd: &DiskCommand) -> Result<()> {
     }
 }
 
-fn print_semantic_disk(disk: &DiskView, json_mode: bool) {
-    if json_mode {
-        println!("{}", serde_json::to_string_pretty(disk).unwrap());
-    } else {
-        let bound_cat = disk
-            .binding
-            .as_ref()
-            .map(|binding| binding.cat_slug.as_str())
-            .unwrap_or("-");
-        println!(
-            "{:<16} id={:<38} {:>8} MiB status={:<8} cat={}",
-            disk.disk_slug,
-            disk.disk_id,
-            disk.size_bytes >> 20,
-            format!("{:?}", disk.status).to_lowercase(),
-            bound_cat,
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_workspace_label_names_the_workspace_being_addressed() {
+        let workspaces = vec![
+            workspace_entry("ws_default", "acct/default"),
+            workspace_entry("ws_other", "acct/other"),
+        ];
+        // `--workspace acct/other` resolves into the session's workspace while
+        // the saved default is unchanged. Labelling from the default would put
+        // another Workspace's name on this Cat's card.
+        assert_eq!(
+            session_workspace_label(&workspaces, "ws_other").as_deref(),
+            Some("acct/other")
+        );
+        assert_eq!(
+            session_workspace_label(&workspaces, "ws_default").as_deref(),
+            Some("acct/default")
+        );
+        assert_eq!(
+            session_workspace_label(&workspaces, "ws_vanished"),
+            None,
+            "an unresolvable workspace is left unlabelled, never mislabelled"
+        );
+    }
+
+    #[test]
+    fn a_failed_disk_refresh_keeps_the_last_sizes_and_stays_due() {
+        let disks = vec![disk_view("data", 20 << 30)];
+        let (kept, stale) = refresh_disks(disks.clone(), Err(anyhow!("control plane unreachable")));
+        assert_eq!(
+            kept.len(),
+            1,
+            "a transient /disks failure must not blank the sizes"
+        );
+        assert!(stale, "and must leave the refresh due for the next tick");
+
+        let (replaced, stale) = refresh_disks(disks, Ok(vec![disk_view("data", 40 << 30)]));
+        assert_eq!(replaced[0].size_bytes, 40 << 30);
+        assert!(!stale);
+    }
+
+    fn workspace_entry(id: &str, locator: &str) -> cats_api::auth::Workspace {
+        cats_api::auth::Workspace {
+            id: id.to_owned(),
+            account_id: "acct_01".to_owned(),
+            account_slug: "acct".to_owned(),
+            account_display_name: "Acct".to_owned(),
+            slug: locator.rsplit('/').next().unwrap_or(locator).to_owned(),
+            locator: locator.to_owned(),
+            display_name: "Workspace".to_owned(),
+            kind: cats_api::auth::AccountKind::Organization,
+            organization_id: "org_01".to_owned(),
+            role: None,
+            is_default: false,
+        }
+    }
+
+    fn disk_view(slug: &str, size_bytes: u64) -> DiskView {
+        DiskView {
+            disk_id: cats_api::runtime_reconciliation::Id::new(format!("disk_{slug}")).unwrap(),
+            workspace_id: cats_api::runtime_reconciliation::Id::new("ws_01").unwrap(),
+            disk_slug: ResourceSlug::new(slug).unwrap(),
+            size_bytes,
+            status: cats_api::semantic_control::DiskStatus::Normal,
+            binding: None,
+            created_at_unix_ms: 1,
+            deleted_at_unix_ms: None,
+        }
+    }
+
+    #[test]
+    fn watch_intervals_reject_unbounded_and_unitless_values() {
+        assert_eq!(parse_interval("250ms").unwrap(), Duration::from_millis(250));
+        assert_eq!(parse_interval("2s").unwrap(), Duration::from_secs(2));
+        assert_eq!(parse_interval(" 1m ").unwrap(), Duration::from_secs(60));
+        for rejected in ["1", "0.5s", "s", "-1s", ""] {
+            assert!(
+                parse_interval(rejected).is_err(),
+                "interval {rejected:?} must not parse"
+            );
+        }
+        // Faster polling cannot catch a sub-second transition and only moves
+        // load onto the control plane's serialized store.
+        assert!(parse_interval("100ms").is_err());
+        assert!(parse_interval("10m").is_err());
+    }
+
+    #[test]
+    fn a_watch_signature_changes_on_every_settled_or_in_flight_move() {
+        let mut cat: CatView = serde_json::from_value(json!({
+            "cat_id": "cat_01",
+            "workspace_id": "ws_01",
+            "cat_slug": "web",
+            "state": "cold",
+            "current_action": null,
+            "node_id": null,
+            "node_name": null,
+            "cpu": 2,
+            "memory_bytes": 2147483648u64,
+            "boot_image": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "mounts": [],
+            "last_error": null,
+            "created_at_unix_ms": 1,
+            "updated_at_unix_ms": 2,
+            "destroyed_at_unix_ms": null,
+        }))
+        .expect("Cat");
+        let cold = watch_signature(&cat);
+        cat.current_action = Some(cats_api::semantic_control::CatAction::Run);
+        cat.updated_at_unix_ms = 3;
+        let starting = watch_signature(&cat);
+        cat.current_action = None;
+        cat.state = Some(cats_api::semantic_control::CatState::Running);
+        cat.updated_at_unix_ms = 4;
+        let running = watch_signature(&cat);
+        assert_ne!(cold, starting);
+        assert_ne!(starting, running);
+        assert_eq!(running, watch_signature(&cat), "a stable Cat is stable");
+    }
+
+    #[test]
+    fn a_watch_frame_reports_staleness_instead_of_hiding_it() {
+        let term = Term::stdout(ColorChoice::Never);
+        let history = std::collections::VecDeque::from(["09:41:00  running".to_owned()]);
+        let live = watch_frame(
+            term,
+            "card",
+            &history,
+            None,
+            Duration::from_millis(500),
+            1_700_000_000_000,
+        );
+        assert!(live.starts_with("watching every 500ms"), "{live}");
+        assert!(live.contains("changes"), "{live}");
+        assert!(live.contains("09:41:00  running"), "{live}");
+
+        let stale = watch_frame(
+            term,
+            "card",
+            &history,
+            Some("control plane unreachable"),
+            Duration::from_secs(1),
+            1_700_000_000_000,
+        );
+        assert!(
+            stale.starts_with("stale: control plane unreachable"),
+            "a failed poll must say so rather than silently freeze: {stale}"
+        );
+        assert!(stale.contains("card"), "the last snapshot stays drawn");
+    }
+
+    #[test]
+    fn a_redraw_rewinds_exactly_the_lines_it_last_printed() {
+        let term = Term::fixed(false, Some(20));
+        let (first, first_lines) = compose_redraw(term, "one\ntwo\nthree", 0);
+        assert_eq!(first_lines, 3);
+        assert!(
+            !first.contains('\x1b'),
+            "the first frame must not rewind into scrollback: {first:?}"
+        );
+        let (second, second_lines) = compose_redraw(term, "one\ntwo", first_lines);
+        assert!(
+            second.starts_with("\x1b[3A\x1b[0J"),
+            "a redraw rewinds the previous line count and erases forward only: {second:?}"
+        );
+        assert_eq!(second_lines, 2);
+
+        // A line longer than the window is truncated, so one logical line stays
+        // one physical row and the rewind count keeps matching.
+        let (wide, wide_lines) = compose_redraw(term, &"x".repeat(80), 0);
+        assert_eq!(wide_lines, 1);
+        assert_eq!(wide.lines().next().map(str::len), Some(20));
+    }
+
+    #[test]
+    fn a_redraw_appends_when_stdout_is_not_a_terminal() {
+        let term = Term::fixed(false, None);
+        let (framed, lines) = compose_redraw(term, "one\ntwo", 7);
+        assert_eq!(
+            lines, 0,
+            "a pipe has no cursor to rewind, so nothing is claimed"
+        );
+        assert_eq!(framed, "one\ntwo");
+        assert!(!framed.contains('\x1b'));
+    }
 
     #[test]
     fn size_parsing() {
@@ -2010,6 +2652,7 @@ mod tests {
 
     fn runtime_test_client(base: String) -> Client {
         Client {
+            workspace_label: None,
             http: reqwest::blocking::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .no_gzip()
@@ -2067,6 +2710,60 @@ mod tests {
         assert_eq!(deployment.app, "web");
         assert_eq!(deployment.service, "web.service");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn usage_is_read_for_one_cat_over_a_bounded_window() {
+        use clap::Parser as _;
+
+        let cat = br#"{"cat_id":"cat_01","workspace_id":"ws_01","cat_slug":"app","state":"running","current_action":null,"node_id":"node_01","node_name":"worker-a","cpu":1,"memory_bytes":536870912,"boot_image":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","mounts":[],"last_error":null,"created_at_unix_ms":1,"updated_at_unix_ms":2,"destroyed_at_unix_ms":null}"#;
+        let report = br#"{"billing_account_id":"ba_01","workspace_id":"ws_01","interval_start_unix_ms":1,"interval_end_unix_ms":2,"status":"provisional","currency":"usd","rate_card_id":"rc_01","latest_interval_end_unix_ms":2,"items":[{"metric":"cpu_usec","quantity":"3600000000","unit":"microsecond","amount_nanos":"42100000"}],"cats":[],"amount_nanos":"42100000"}"#;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut requested = Vec::new();
+            for body in [cat.as_slice(), report.as_slice()] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (headers, request_body) = read_request(&mut stream);
+                assert!(request_body.is_empty());
+                requested.push(headers.lines().next().unwrap().to_owned());
+                write_json_response(&mut stream, body);
+            }
+            requested
+        });
+        run(Cli::parse_from([
+            "cats",
+            "--api-url",
+            &base,
+            "--token",
+            "test-token",
+            "--workspace",
+            "ws_01",
+            "--color",
+            "never",
+            "show",
+            "app",
+            "--usage",
+        ]))
+        .unwrap();
+        let requested = server.join().unwrap();
+        assert_eq!(requested[0], "GET /v1/workspaces/ws_01/cats/app HTTP/1.1");
+        let usage = &requested[1];
+        assert!(
+            usage.starts_with("GET /v1/workspaces/ws_01/billing/usage?cat_id=cat_01&from_ms="),
+            // The immutable ID, not the slug: a renamed or recreated slug must
+            // not silently bill someone else's history into this card.
+            "usage must be scoped to this Cat by ID: {usage}"
+        );
+        let window: Vec<&str> = usage.split(['=', '&', ' ']).collect();
+        let from: i64 = window[4].parse().expect("from_ms");
+        let to: i64 = window[6].parse().expect("to_ms");
+        assert_eq!(
+            to - from,
+            i64::try_from(USAGE_WINDOW.as_millis()).unwrap(),
+            "the usage window must be bounded, not open-ended: {usage}"
+        );
     }
 
     #[test]
@@ -2480,7 +3177,7 @@ mod tests {
             );
         }
         for supported in [
-            "ls", "get", "deploy", "disk", "run", "suspend", "warm", "cold", "destroy",
+            "ls", "show", "deploy", "disk", "run", "suspend", "warm", "cold", "destroy",
         ] {
             assert!(
                 root_help.contains(&format!("\n  {supported} ")),
@@ -2488,6 +3185,30 @@ mod tests {
             );
         }
         assert!(!root_help.contains("--no-wait"));
+        // `get` is a deprecated alias for `show`: still accepted so existing
+        // scripts keep working, but no longer advertised.
+        assert!(
+            !root_help.contains("\n  get "),
+            "the deprecated `get` alias must not be advertised"
+        );
+        assert!(matches!(
+            Cli::parse_from(["cats", "get", "web"]).command,
+            Command::Get { .. }
+        ));
+        let show = Cli::parse_from(["cats", "show", "web"]);
+        assert!(matches!(
+            show.command,
+            Command::Show {
+                watch: false,
+                usage: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            show.color,
+            ColorChoice::Auto,
+            "color must default to following the terminal"
+        );
 
         let mut disk = Cli::command()
             .find_subcommand("disk")

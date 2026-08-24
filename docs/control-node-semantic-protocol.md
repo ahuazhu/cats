@@ -411,15 +411,33 @@ cats warm CAT_SLUG
 cats cold CAT_SLUG
 cats destroy CAT_SLUG
 
+cats ls
+cats show CAT_SLUG [--watch] [--interval 1s] [--usage]
+
 cats disk create DISK_SLUG --size 100GiB
 cats disk attach DISK_SLUG --cat CAT_SLUG --mount /data
 cats disk detach DISK_SLUG --cat CAT_SLUG
 cats disk destroy DISK_SLUG
+cats disk ls
 ```
 
 `--mount` 可以重复出现。CLI 先在当前 Workspace 中把 `DISK_SLUG` 解析为 `disk_id`，再提交结构化请求。
 
-### 7.2 REST 路由
+### 7.2 读命令的展示约定
+
+`cats ls`、`cats show` 和 `cats disk ls` 是同一份语义读的两种排版，没有额外的 API 面：
+
+- **不展示 Node。** 放置是运维事实：用户命令无法寻址它，它会在没有用户动作时变化，把 Node 名字放进产品输出会让它被当成产品的一部分。`node_id`/`node_name` 仍然出现在 `--json` 里，那是原样的 API 响应。
+- **进行中的动作属于状态本身。** 只显示已落定的 `state` 在动作进行时是半真：一只显示 `cold` 的 Cat 可能几秒后就在服务。因此渲染成 `cold -> running`，而不是另开一列。`state` 为空且 `current_action=create` 渲染为 `creating`。
+- **颜色只做加速。** 每个用颜色表达的区分同时由文字承载，所以 `NO_COLOR`、管道或 dumb 终端只损失速度，不损失信息。`--color=auto|always|never` 覆盖自动判定。
+- **只输出 ASCII。** 方框、箭头和状态字形都是 East Asian Ambiguous 宽度，配置为 CJK 的终端会按两列渲染，用它们画的表格一律错位。
+- **`cats show --watch` 是轮询。** 控制面没有对外的 WebSocket/SSE 路由，所以没有可优先选用的推送通道。间隔下限 250ms：控制面的 PostgreSQL 工作是串行的，更快的轮询只是把开销移到 Store 上，而亚秒级的生命周期跃迁在任何轮询频率下都不保证可见——要抓它需要 Operation 读，不是更短的间隔。
+- **`--usage` 是选择加入的。** 它多打一次计费读；该读失败（例如 Workspace 还没有 billing ledger）只渲染成一行 `unavailable`，绝不让 `cats show` 失败。
+- **`cats get` 已弃用**，是 `cats show` 的隐藏别名，仍然接受以免打断既有脚本。
+
+一条真正的"最后运行时间"目前不存在：`updated_at` 是最后一次状态变更（进行中动作时它就是该动作的开始时刻），而 v19 schema 没有生命周期事件日志。补它的正确做法是在离开 `running` 的那次 UPDATE 里写一列 `last_running_at`，不是从计费区间反推。
+
+### 7.3 REST 路由
 
 ```text
 POST /v1/workspaces/{workspace_id}/cats
@@ -465,7 +483,7 @@ Create Disk 请求：
 }
 ```
 
-### 7.3 通用响应
+### 7.4 通用响应
 
 ```json
 {

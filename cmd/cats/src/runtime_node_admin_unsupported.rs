@@ -30,6 +30,7 @@ mod tests {
     #[test]
     fn runtime_node_authority_fails_before_platform_io() {
         let cli = Cli {
+            color: crate::ColorChoice::Never,
             api_url: Some("https://unreachable.invalid".to_owned()),
             token: None,
             workspace: None,
