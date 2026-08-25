@@ -51,9 +51,10 @@ running → suspended → warm → cold 走完之后它已经被后续转换覆�
    于是形状过期的库在**启动时**大声失败并要求重建，而不是在用户下一次动作时才在 SQL 层报错。
    `SCHEMA_VERSION` 不变，与 2026-08-23 加入 `current_action_recovery_started_at` 的做法一致：
    同一次 clean-slate 重建覆盖两列。
-7. `CatView` 保留 `deny_unknown_fields`。`cats-cli` 既不发布到 crates.io 也没有安装脚本，只随
-   release 分发，不存在需要兼容的旧客户端群；为一个不存在的兼容面放弃闭合形状不划算，而闭合形状
-   在 request DTO 上是有价值的（ADR-0063 正是靠它拒绝 `boot_image` 覆盖）。
+7. `CatView` 保留 `deny_unknown_fields`。`cats-cli` 已发布到 crates.io，因此这形成一条真实的前向
+   版本约束：Control 后续不能在同一响应形状里直接增加字段，必须先提供客户端可兼容的形状或显式版本。
+   本次新增字段保持 optional，新 CLI 能读取尚未返回这些字段的旧 Control；闭合 request DTO 仍有价值
+   （ADR-0063 正是靠它拒绝 `boot_image` 覆盖）。
 
 ## 后果
 
