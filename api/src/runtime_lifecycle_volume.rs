@@ -9,15 +9,11 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::runtime_lifecycle::{
-    DiskRole, ExecutionAbsenceProof, PlacementIdentity, RuntimeVolumeConfig,
-    RuntimeVolumeGuestBinding,
-};
 use crate::runtime_reconciliation::{
-    BeginDisposableDeleteConsumedReceipt, ContractVersion, DeleteCompletionReceipt, Epoch,
-    FenceEpoch, Generation, Id, NormalAcquireRequest, NormalAcquireResult, RandomId128,
-    ReleaseRequest, ReleaseResult, RemoteHead, Sequence, SessionBinding, Sha256Digest, UnixMillis,
-    VolumeTransitionSource, WireU64,
+    AsciiText, BeginDisposableDeleteConsumedReceipt, ContractVersion, DeleteCompletionReceipt,
+    Durability, Epoch, FenceEpoch, Generation, Id, NormalAcquireRequest, NormalAcquireResult,
+    RandomId128, ReleaseRequest, ReleaseResult, RemoteHead, Sequence, SessionBinding, Sha256Digest,
+    UnixMillis, VolumeTransitionSource, WireU64,
 };
 
 pub const LIFECYCLE_VOLUME_TRANSITION_METHOD: &str = "POST";
@@ -184,6 +180,58 @@ pub struct LifecycleDeleteVolumeSet {
     pub scope: LifecycleVolumeCommandScope,
     pub root_disposition: LifecycleDefaultRootDiscardDisposition,
     pub persistent_volumes: Vec<LifecycleVolumeIdentity>,
+}
+
+/// One Node placement and the epoch that placement was granted under.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlacementIdentity {
+    pub node_id: Id,
+    pub placement_epoch: Epoch,
+}
+
+/// Whether a volume backs the Cat's Root or an independent PersistentDisk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskRole {
+    Root,
+    Persistent,
+}
+
+/// How the Guest is expected to see one volume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RuntimeVolumeGuestBinding {
+    RootBoot,
+    PersistentExt4 {
+        filesystem_uuid: RandomId128,
+        mount_path: AsciiText,
+    },
+}
+
+/// Complete, immutable description of one volume attached to a runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeVolumeConfig {
+    pub volume_id: Id,
+    pub disk_id: Id,
+    pub disk_role: DiskRole,
+    pub size_bytes: u64,
+    pub durability: Durability,
+    pub guest_device_serial: Id,
+    pub guest_device_slot: u16,
+    pub guest_binding: RuntimeVolumeGuestBinding,
+}
+
+/// The closed receipt set proving no execution path can still reach a runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionAbsenceProof {
+    pub stop_fence_receipt_digest: Sha256Digest,
+    pub admission_closed_receipt_digest: Sha256Digest,
+    pub dedicated_scope_absence_receipt_digest: Sha256Digest,
+    pub frontend_absence_receipt_digest: Sha256Digest,
+    pub restart_source_absence_receipt_digest: Sha256Digest,
 }
 
 /// Session-bound attestation that one complete physical inventory scan was
@@ -1360,7 +1408,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_lifecycle::RuntimeVolumeGuestBinding;
     use crate::runtime_reconciliation::{
         AsciiText, Durability, Epoch, NodeBootId, Sequence, UnixMillis,
     };

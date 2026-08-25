@@ -1,4 +1,4 @@
-use cats_api::runtime_lifecycle::{
+use cats_api::runtime_lifecycle_volume::{
     DiskRole, PlacementIdentity, RuntimeVolumeConfig, RuntimeVolumeGuestBinding,
 };
 use cats_api::runtime_lifecycle_volume::{
