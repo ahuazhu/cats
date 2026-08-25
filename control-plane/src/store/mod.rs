@@ -1,4 +1,5 @@
-//! Control-plane persistence (PostgreSQL implementation of the §17.3 tables).
+//! Control-plane persistence: the PostgreSQL implementation of the §4 data
+//! model in `docs/control-node-semantic-protocol.md`.
 //!
 //! Every user-facing invariant that must hold under concurrency is enforced
 //! here with constraints, not in handler code: unique names per workspace,

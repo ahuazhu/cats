@@ -818,7 +818,6 @@ const CONTROL_TABLES: &[&str] = &[
     "persistent_disks",
     "disk_bindings",
     "account_membership_shadow",
-    "workspace_grants",
     "workspace_tokens",
     "signup_grant_eligibility",
     "account_invitations",
@@ -1936,13 +1935,6 @@ CREATE TABLE IF NOT EXISTS account_membership_shadow (
     updated_at BIGINT NOT NULL,
     UNIQUE (account_id, workos_user_id)
 );
-CREATE TABLE IF NOT EXISTS workspace_grants (
-    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
-    workos_user_id TEXT NOT NULL,
-    access_level TEXT NOT NULL,
-    created_at BIGINT NOT NULL,
-    PRIMARY KEY (workspace_id, workos_user_id)
-);
 CREATE TABLE IF NOT EXISTS workspace_tokens (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
@@ -1977,19 +1969,6 @@ CREATE TABLE IF NOT EXISTS workos_event_receipts (
     event_name TEXT NOT NULL,
     processed_at BIGINT NOT NULL
 );
--- One row per (cat, app, pinned digest): the deployment's identity, so a
--- retried request finds the first attempt instead of starting a second one.
--- The UNIQUE constraint is the idempotency mechanism; handler code only reads
--- what the constraint decided. Registry credentials are deliberately absent --
--- they are transient pull credentials and must never be persisted, which is
--- also why an interrupted deploy cannot be resumed after a restart and is
--- converged to 'failed' instead.
---
--- 'superseded' is what a succeeded row becomes when a later digest is
--- activated for the same app. It matters because a Cat runs exactly one image
--- per app: without it, re-requesting an older digest would replay a record for
--- something no longer running, reporting success while the Guest kept serving
--- the newer image.
 CREATE TABLE IF NOT EXISTS volume_records (
     volume_id TEXT PRIMARY KEY,
     record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),

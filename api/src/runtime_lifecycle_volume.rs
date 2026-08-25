@@ -9,16 +9,15 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::runtime_inventory::RuntimeInventoryAttestation;
 use crate::runtime_lifecycle::{
     DiskRole, ExecutionAbsenceProof, PlacementIdentity, RuntimeVolumeConfig,
     RuntimeVolumeGuestBinding,
 };
 use crate::runtime_reconciliation::{
-    BeginDisposableDeleteConsumedReceipt, ContractVersion, DeleteCompletionReceipt, FenceEpoch,
-    Generation, Id, NormalAcquireRequest, NormalAcquireResult, RandomId128, ReleaseRequest,
-    ReleaseResult, RemoteHead, SessionBinding, Sha256Digest, UnixMillis, VolumeTransitionSource,
-    WireU64,
+    BeginDisposableDeleteConsumedReceipt, ContractVersion, DeleteCompletionReceipt, Epoch,
+    FenceEpoch, Generation, Id, NormalAcquireRequest, NormalAcquireResult, RandomId128,
+    ReleaseRequest, ReleaseResult, RemoteHead, Sequence, SessionBinding, Sha256Digest, UnixMillis,
+    VolumeTransitionSource, WireU64,
 };
 
 pub const LIFECYCLE_VOLUME_TRANSITION_METHOD: &str = "POST";
@@ -185,6 +184,25 @@ pub struct LifecycleDeleteVolumeSet {
     pub scope: LifecycleVolumeCommandScope,
     pub root_disposition: LifecycleDefaultRootDiscardDisposition,
     pub persistent_volumes: Vec<LifecycleVolumeIdentity>,
+}
+
+/// Session-bound attestation that one complete physical inventory scan was
+/// accepted, carried by the disposable Root arm below.
+///
+/// This is the only surviving piece of the retired observation contract: the
+/// disposable Root authorization compares it exactly, including its
+/// AgentSession, and persists its `inventory_digest`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeInventoryAttestation {
+    pub version: ContractVersion,
+    pub session: SessionBinding,
+    pub inventory_epoch: Epoch,
+    pub scan_id: RandomId128,
+    pub inventory_digest: Sha256Digest,
+    pub source_report_id: RandomId128,
+    pub source_sequence: Sequence,
+    pub accepted_at_unix_ms: UnixMillis,
 }
 
 /// Exact evidence used by the reachable-Host disposable Root arm.
