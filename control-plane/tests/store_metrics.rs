@@ -1,8 +1,8 @@
 //! Isolated control-store metrics contract.
 //!
 //! This is deliberately its own integration-test binary: the production
-//! counters are process-global, so unrelated `api_reconcile` tests must not be
-//! able to contribute work while this test measures explicit deltas.
+//! counters are process-global, so no unrelated test may share this process
+//! and contribute work while this test measures explicit deltas.
 
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
