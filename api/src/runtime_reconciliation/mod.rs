@@ -27,6 +27,7 @@ pub const RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY: &[u8] =
 pub const RUNTIME_INTERNAL_ROUTE_NOT_FOUND_ROBOTS: &str = "noindex, nofollow, noarchive";
 
 pub use canonical::value_bytes as canonical_json_value_bytes;
+pub(crate) use canonical::{append_frame, decode_base64url_exact};
 
 #[cfg(feature = "proposed-node-residue-reclamation")]
 pub use canonical::residue_acquisition_digest;

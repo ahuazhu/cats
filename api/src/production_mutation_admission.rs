@@ -6,6 +6,7 @@
 //! authorized it.  Emergency close retains that binding so reopening cannot
 //! substitute a different proof set.
 
+use crate::runtime_reconciliation::decode_base64url_exact;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use ring::signature::{UnparsedPublicKey, ED25519};
@@ -614,11 +615,13 @@ fn verify_production_mutation_admission_command_inner(
     {
         return Err(ProductionMutationAdmissionContractError::Invalid);
     }
-    let spki = decode_base64url_exact::<ED25519_SPKI_LEN>(credential.public_key_spki.as_str())?;
+    let spki = decode_base64url_exact::<ED25519_SPKI_LEN>(credential.public_key_spki.as_str())
+        .map_err(|()| ProductionMutationAdmissionContractError::Invalid)?;
     if spki[..ED25519_SPKI_PREFIX.len()] != ED25519_SPKI_PREFIX {
         return Err(ProductionMutationAdmissionContractError::Invalid);
     }
-    let signature = decode_base64url_exact::<64>(signature)?;
+    let signature = decode_base64url_exact::<64>(signature)
+        .map_err(|()| ProductionMutationAdmissionContractError::Invalid)?;
     let framed = production_mutation_admission_signed_request(trust, credential_id, exact_body);
     UnparsedPublicKey::new(&ED25519, &spki[ED25519_SPKI_PREFIX.len()..])
         .verify(&framed, &signature)
@@ -924,27 +927,6 @@ fn valid_account_id(value: &str) -> bool {
 
 fn valid_arn(value: &str) -> bool {
     (1..=2_048).contains(&value.len()) && value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
-}
-
-fn decode_base64url_exact<const N: usize>(
-    value: &str,
-) -> Result<[u8; N], ProductionMutationAdmissionContractError> {
-    if value.is_empty()
-        || value
-            .bytes()
-            .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'))
-    {
-        return Err(ProductionMutationAdmissionContractError::Invalid);
-    }
-    let decoded = URL_SAFE_NO_PAD
-        .decode(value)
-        .map_err(|_| ProductionMutationAdmissionContractError::Invalid)?;
-    if decoded.len() != N || URL_SAFE_NO_PAD.encode(&decoded) != value {
-        return Err(ProductionMutationAdmissionContractError::Invalid);
-    }
-    decoded
-        .try_into()
-        .map_err(|_| ProductionMutationAdmissionContractError::Invalid)
 }
 
 fn validate_open_binding(

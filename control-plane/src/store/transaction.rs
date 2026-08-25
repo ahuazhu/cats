@@ -307,23 +307,11 @@ pub(super) enum AuthorityRequestDisposition<T> {
 pub(super) enum AuthorityTransactionError {
     Domain(AuthorityError),
     Application(ApiError),
-    #[allow(
-        dead_code,
-        reason = "retained strict disk mutation source awaits the semantic storage adapter"
-    )]
-    CandidateCollision,
-    #[allow(
-        dead_code,
-        reason = "retained strict disk mutation source awaits the semantic storage adapter"
-    )]
-    PlacementStale,
     Postgres(postgres::Error),
 }
 
 pub(super) enum AuthorityExecutionError {
     Store(ApiError),
-    CandidateCollision,
-    PlacementStale,
 }
 
 impl From<AuthorityError> for AuthorityTransactionError {
@@ -347,8 +335,6 @@ impl From<ApiError> for AuthorityTransactionError {
 enum AttemptFailure {
     Domain(AuthorityError),
     Application(ApiError),
-    CandidateCollision,
-    PlacementStale,
     Postgres(postgres::Error),
     Commit(postgres::Error),
     Rollback(postgres::Error),
@@ -359,10 +345,6 @@ enum AttemptFailure {
 enum AuthorityTransactionMode {
     ReadWrite,
     RepeatableRead,
-    #[allow(
-        dead_code,
-        reason = "retained strict storage reads await the semantic storage adapter"
-    )]
     RepeatableReadOnly,
 }
 
@@ -396,45 +378,6 @@ impl Store {
         match self.authority_transaction_outcome(operation) {
             Ok(value) => Ok(value),
             Err(AuthorityExecutionError::Store(error)) => Err(error),
-            Err(AuthorityExecutionError::CandidateCollision) => Err(internal(
-                "unexpected candidate-collision marker outside a covered create",
-            )),
-            Err(AuthorityExecutionError::PlacementStale) => Err(internal(
-                "unexpected placement-stale marker outside a covered create",
-            )),
-        }
-    }
-
-    /// Runs one non-request authority closure with an explicit commit or
-    /// rollback disposition. Callers use the rejected value only for typed,
-    /// candidate-local outcomes that are safe to isolate after PostgreSQL has
-    /// successfully rolled back the candidate transaction. Infrastructure
-    /// and rollback failures remain outer Store errors.
-    #[allow(
-        dead_code,
-        reason = "retained strict storage source awaits the semantic storage adapter"
-    )]
-    pub(super) fn authority_transaction_disposition<T: Send>(
-        &self,
-        operation: impl FnMut(
-                &mut postgres::Transaction<'_>,
-            ) -> AuthorityTxResult<AuthorityRequestDisposition<T>>
-            + Send,
-    ) -> Result<T> {
-        match self.authority_transaction_outcome_with_hook(
-            operation,
-            AuthorityTransactionMode::ReadWrite,
-            None,
-            || {},
-        ) {
-            Ok(value) => Ok(value),
-            Err(AuthorityExecutionError::Store(error)) => Err(error),
-            Err(AuthorityExecutionError::CandidateCollision) => Err(internal(
-                "unexpected candidate-collision marker in a disposition transaction",
-            )),
-            Err(AuthorityExecutionError::PlacementStale) => Err(internal(
-                "unexpected placement-stale marker in a disposition transaction",
-            )),
         }
     }
 
@@ -454,12 +397,6 @@ impl Store {
         ) {
             Ok(value) => Ok(value),
             Err(AuthorityExecutionError::Store(error)) => Err(error),
-            Err(AuthorityExecutionError::CandidateCollision) => Err(internal(
-                "unexpected candidate-collision marker in an authority request",
-            )),
-            Err(AuthorityExecutionError::PlacementStale) => Err(internal(
-                "unexpected placement-stale marker in an authority request",
-            )),
         }
     }
 
@@ -467,10 +404,6 @@ impl Store {
     /// Consumers must receive either the complete mutually-consistent fact set
     /// or no fact set at all, so this deliberately shares the retry and
     /// fail-closed error policy of mutation transactions.
-    #[allow(
-        dead_code,
-        reason = "retained strict storage source awaits the semantic storage adapter"
-    )]
     pub(super) fn authority_read_snapshot<T: Send>(
         &self,
         operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
@@ -482,68 +415,6 @@ impl Store {
         ) {
             Ok(value) => Ok(value),
             Err(AuthorityExecutionError::Store(error)) => Err(error),
-            Err(AuthorityExecutionError::CandidateCollision) => Err(internal(
-                "unexpected candidate-collision marker in an authority read snapshot",
-            )),
-            Err(AuthorityExecutionError::PlacementStale) => Err(internal(
-                "unexpected placement-stale marker in an authority read snapshot",
-            )),
-        }
-    }
-
-    /// Runs an HTTP-request-scoped authority facts loader in one read-only
-    /// repeatable-read snapshot. The explicit rollback disposition prevents a
-    /// read from entering commit ambiguity, while the request context applies
-    /// one absolute deadline to queue admission and PostgreSQL statements.
-    #[allow(
-        dead_code,
-        reason = "retained strict storage source awaits the semantic storage adapter"
-    )]
-    pub(super) fn authority_request_read_snapshot<T: Send>(
-        &self,
-        request: &AuthorityRequestContext,
-        mut operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
-    ) -> Result<T> {
-        match self.authority_transaction_outcome_with_hook(
-            move |transaction| operation(transaction).map(AuthorityRequestDisposition::Reject),
-            AuthorityTransactionMode::RepeatableReadOnly,
-            Some(request),
-            || {},
-        ) {
-            Ok(value) => Ok(value),
-            Err(AuthorityExecutionError::Store(error)) => Err(error),
-            Err(AuthorityExecutionError::CandidateCollision) => Err(internal(
-                "unexpected candidate-collision marker in an authority request read snapshot",
-            )),
-            Err(AuthorityExecutionError::PlacementStale) => Err(internal(
-                "unexpected placement-stale marker in an authority request read snapshot",
-            )),
-        }
-    }
-
-    /// Runs a logically read-only authority closure in one repeatable-read
-    /// snapshot that may acquire `FOR SHARE` locks. PostgreSQL forbids row
-    /// locks in a transaction declared `READ ONLY`, so A22 uses this mode for
-    /// the A23 NodeIdentity/credential-lineage retirement barrier while still
-    /// performing no domain write or session renewal.
-    #[allow(dead_code, reason = "consumed by the A22 authenticated evidence route")]
-    pub(super) fn authority_locking_read_snapshot<T: Send>(
-        &self,
-        operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
-    ) -> Result<T> {
-        match self.authority_transaction_outcome_with(
-            operation,
-            AuthorityTransactionMode::RepeatableRead,
-            None,
-        ) {
-            Ok(value) => Ok(value),
-            Err(AuthorityExecutionError::Store(error)) => Err(error),
-            Err(AuthorityExecutionError::CandidateCollision) => Err(internal(
-                "unexpected candidate-collision marker in a locking authority snapshot",
-            )),
-            Err(AuthorityExecutionError::PlacementStale) => Err(internal(
-                "unexpected placement-stale marker in a locking authority snapshot",
-            )),
         }
     }
 
@@ -564,12 +435,6 @@ impl Store {
         ) {
             Ok(value) => Ok(value),
             Err(AuthorityExecutionError::Store(error)) => Err(error),
-            Err(AuthorityExecutionError::CandidateCollision) => Err(internal(
-                "unexpected candidate-collision marker in an authority request read",
-            )),
-            Err(AuthorityExecutionError::PlacementStale) => Err(internal(
-                "unexpected placement-stale marker in an authority request read",
-            )),
         }
     }
 
@@ -581,28 +446,6 @@ impl Store {
             operation,
             AuthorityTransactionMode::ReadWrite,
             None,
-        )
-    }
-
-    /// Covered Workspace mutations expose their commit-send phase to an async
-    /// cancellation owner. A serialization/deadlock failure is a definite
-    /// non-commit and therefore permits that owner to reset its per-attempt
-    /// phase before the closed transaction is replayed. Connection failures
-    /// stay ambiguous and deliberately do not invoke this hook.
-    #[allow(
-        dead_code,
-        reason = "retained strict storage source awaits the semantic storage adapter"
-    )]
-    pub(super) fn authority_transaction_outcome_with_definite_retry<T: Send>(
-        &self,
-        mut operation: impl FnMut(&mut postgres::Transaction<'_>) -> AuthorityTxResult<T> + Send,
-        on_definite_retry: impl FnMut() + Send,
-    ) -> std::result::Result<T, AuthorityExecutionError> {
-        self.authority_transaction_outcome_with_hook(
-            move |transaction| operation(transaction).map(AuthorityRequestDisposition::Commit),
-            AuthorityTransactionMode::ReadWrite,
-            None,
-            on_definite_retry,
         )
     }
 
@@ -667,14 +510,6 @@ impl Store {
                         metrics::AuthorityOutcome::DomainRejected
                     });
                     return Err(AuthorityExecutionError::Store(error));
-                }
-                Err(AttemptFailure::CandidateCollision) => {
-                    metrics::record_authority_outcome(metrics::AuthorityOutcome::DomainRejected);
-                    return Err(AuthorityExecutionError::CandidateCollision);
-                }
-                Err(AttemptFailure::PlacementStale) => {
-                    metrics::record_authority_outcome(metrics::AuthorityOutcome::DomainRejected);
-                    return Err(AuthorityExecutionError::PlacementStale);
                 }
                 Err(AttemptFailure::Infrastructure(error)) => {
                     metrics::record_authority_outcome(metrics::AuthorityOutcome::BackendFailed);
@@ -839,9 +674,7 @@ fn run_authority_transaction_attempt<T: Send>(
                     return Err(AttemptFailure::Application(error));
                 }
                 AuthorityTransactionError::Postgres(error) => error,
-                AuthorityTransactionError::Domain(_)
-                | AuthorityTransactionError::CandidateCollision
-                | AuthorityTransactionError::PlacementStale => {
+                AuthorityTransactionError::Domain(_) => {
                     unreachable!("request deadline refresh has only application/PostgreSQL errors")
                 }
             };
@@ -905,14 +738,6 @@ fn run_authority_transaction_attempt<T: Send>(
         Err(AuthorityTransactionError::Application(error)) => {
             transaction.rollback().map_err(AttemptFailure::Rollback)?;
             Err(AttemptFailure::Application(error))
-        }
-        Err(AuthorityTransactionError::CandidateCollision) => {
-            transaction.rollback().map_err(AttemptFailure::Rollback)?;
-            Err(AttemptFailure::CandidateCollision)
-        }
-        Err(AuthorityTransactionError::PlacementStale) => {
-            transaction.rollback().map_err(AttemptFailure::Rollback)?;
-            Err(AttemptFailure::PlacementStale)
         }
         Err(AuthorityTransactionError::Postgres(error)) => {
             if let Err(rollback_error) = transaction.rollback() {

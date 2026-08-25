@@ -89,11 +89,6 @@ fn corrupt(message: impl Into<String>) -> AuthorityTransactionError {
     application(ApiError::failed_precondition(message.into()))
 }
 
-#[allow(dead_code, reason = "also used by the gated C3 batch producer")]
-fn pg(value: u64) -> AuthorityTxResult<i64> {
-    i64::try_from(value).map_err(|_| corrupt("Host-fence queue integer exceeds PostgreSQL BIGINT"))
-}
-
 fn wire(value: i64, label: &str) -> AuthorityTxResult<u64> {
     u64::try_from(value).map_err(|_| corrupt(format!("stored {label} is negative")))
 }
@@ -155,17 +150,6 @@ fn decode_canonical_evidence(bytes: &[u8]) -> AuthorityTxResult<HostFenceProvide
     Ok(evidence)
 }
 
-#[allow(dead_code, reason = "used by the gated C3 batch producer")]
-fn validate_request_binding(request: &HostFenceAttemptRequest) -> AuthorityTxResult<()> {
-    if request.binding.provider_scope != request.object_writer.provider_scope {
-        return Err(application(ApiError::invalid(
-            "Host-fence and object-writer provider scopes differ",
-        )));
-    }
-    Ok(())
-}
-
-#[allow(dead_code, reason = "used by the gated C3 batch authority")]
 fn decode_queue_row(row: &Row) -> AuthorityTxResult<HostFenceProviderQueueRecordV1> {
     let request_bytes: Vec<u8> = row.try_get("request_bytes")?;
     let request = decode_canonical_request(&request_bytes)?;
@@ -864,9 +848,7 @@ fn map_authority_decode_error(error: AuthorityTransactionError) -> ApiError {
     match error {
         AuthorityTransactionError::Application(error) => error,
         AuthorityTransactionError::Postgres(error) => internal(error),
-        AuthorityTransactionError::Domain(_)
-        | AuthorityTransactionError::CandidateCollision
-        | AuthorityTransactionError::PlacementStale => ApiError::failed_precondition(
+        AuthorityTransactionError::Domain(_) => ApiError::failed_precondition(
             "stored Host-fence provider record failed domain validation",
         ),
     }

@@ -4,6 +4,7 @@
 //! admission. This module owns the one deployment-provisioner Ed25519 dialect
 //! so clients and the verifier cannot drift on framed bytes.
 
+use crate::runtime_reconciliation::{append_frame, decode_base64url_exact};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use ring::signature::{UnparsedPublicKey, ED25519};
@@ -69,11 +70,13 @@ pub fn verify_runtime_node_authority_request(
     exact_body: &[u8],
     signature: &str,
 ) -> Result<FleetPolicyPrincipal, RuntimeNodeAuthorityProofError> {
-    let spki = decode_base64url_exact::<ED25519_SPKI_LEN>(credential.public_key_spki.as_str())?;
+    let spki = decode_base64url_exact::<ED25519_SPKI_LEN>(credential.public_key_spki.as_str())
+        .map_err(|()| RuntimeNodeAuthorityProofError)?;
     if spki[..ED25519_SPKI_PREFIX.len()] != ED25519_SPKI_PREFIX {
         return Err(RuntimeNodeAuthorityProofError);
     }
-    let signature = decode_base64url_exact::<64>(signature)?;
+    let signature =
+        decode_base64url_exact::<64>(signature).map_err(|()| RuntimeNodeAuthorityProofError)?;
     let signed = runtime_node_authority_signed_request(
         deployment_id.as_str(),
         credential.credential_id.as_str(),
@@ -122,32 +125,6 @@ pub fn runtime_node_authority_signed_request(
     signed.extend_from_slice(&(exact_body.len() as u64).to_be_bytes());
     signed.extend_from_slice(&Sha256::digest(exact_body));
     signed
-}
-
-fn append_frame(output: &mut Vec<u8>, value: &[u8]) {
-    output.extend_from_slice(&(value.len() as u64).to_be_bytes());
-    output.extend_from_slice(value);
-}
-
-fn decode_base64url_exact<const N: usize>(
-    value: &str,
-) -> Result<[u8; N], RuntimeNodeAuthorityProofError> {
-    if value.is_empty()
-        || value
-            .bytes()
-            .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'))
-    {
-        return Err(RuntimeNodeAuthorityProofError);
-    }
-    let decoded = URL_SAFE_NO_PAD
-        .decode(value)
-        .map_err(|_| RuntimeNodeAuthorityProofError)?;
-    if decoded.len() != N || URL_SAFE_NO_PAD.encode(&decoded) != value {
-        return Err(RuntimeNodeAuthorityProofError);
-    }
-    decoded
-        .try_into()
-        .map_err(|_| RuntimeNodeAuthorityProofError)
 }
 
 #[cfg(test)]

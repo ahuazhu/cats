@@ -11,12 +11,6 @@ use cats_api::runtime_reconciliation::{
     Epoch, FenceEpoch, Generation, Revision, Sequence, UnixMillis,
 };
 
-#[allow(
-    dead_code,
-    reason = "retained strict disk codecs await the semantic storage adapter"
-)]
-const POSTGRES_BIGINT_MAX: u64 = i64::MAX.unsigned_abs();
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::store) enum PgIntegerError {
     Negative {
@@ -116,57 +110,12 @@ contract_integer!(Generation, "Generation", 0);
 contract_integer!(FenceEpoch, "FenceEpoch", 0);
 contract_integer!(UnixMillis, "UnixMillis", 0);
 
-macro_rules! positive_integer {
-    ($name:ident, $semantic_type:literal) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        #[allow(
-            dead_code,
-            reason = "retained strict disk codecs await the semantic storage adapter"
-        )]
-        pub(super) struct $name(u64);
-
-        #[allow(
-            dead_code,
-            reason = "retained strict disk codecs await the semantic storage adapter"
-        )]
-        impl $name {
-            pub(super) fn new(value: u64) -> Result<Self, PgIntegerError> {
-                if value == 0 {
-                    return Err(PgIntegerError::Zero {
-                        semantic_type: $semantic_type,
-                    });
-                }
-                if value > POSTGRES_BIGINT_MAX {
-                    return Err(PgIntegerError::AboveMaximum {
-                        semantic_type: $semantic_type,
-                        value,
-                    });
-                }
-                Ok(Self(value))
-            }
-        }
-
-        impl PgBigInt for $name {
-            const SEMANTIC_TYPE: &'static str = $semantic_type;
-            const MINIMUM: u64 = 1;
-
-            fn get(self) -> u64 {
-                self.0
-            }
-
-            fn from_validated(value: u64) -> Option<Self> {
-                (value <= POSTGRES_BIGINT_MAX).then_some(Self(value))
-            }
-        }
-    };
-}
-
-positive_integer!(SizeBytes, "size_bytes");
-positive_integer!(LeaseDurationMs, "lease_duration_ms");
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PostgreSQL's BIGINT ceiling, the boundary these conversions must accept.
+    const POSTGRES_BIGINT_MAX: u64 = i64::MAX.unsigned_abs();
 
     #[test]
     fn every_contract_integer_uses_its_own_zero_rule() {
@@ -176,8 +125,6 @@ mod tests {
         assert_eq!(Generation::from_pg(0).unwrap().get(), 0);
         assert_eq!(FenceEpoch::from_pg(0).unwrap().get(), 0);
         assert_eq!(UnixMillis::from_pg(0).unwrap().get(), 0);
-        assert!(SizeBytes::from_pg(0).is_err());
-        assert!(LeaseDurationMs::from_pg(0).is_err());
     }
 
     #[test]
@@ -185,14 +132,6 @@ mod tests {
         assert!(matches!(
             FenceEpoch::from_pg(-1),
             Err(PgIntegerError::Negative { .. })
-        ));
-        assert!(matches!(
-            SizeBytes::new(POSTGRES_BIGINT_MAX + 1),
-            Err(PgIntegerError::AboveMaximum { .. })
-        ));
-        assert!(matches!(
-            LeaseDurationMs::new(POSTGRES_BIGINT_MAX + 1),
-            Err(PgIntegerError::AboveMaximum { .. })
         ));
     }
 
@@ -220,14 +159,6 @@ mod tests {
         );
         assert_eq!(
             UnixMillis::new(POSTGRES_BIGINT_MAX).unwrap().to_pg(),
-            Ok(i64::MAX)
-        );
-        assert_eq!(
-            SizeBytes::new(POSTGRES_BIGINT_MAX).unwrap().to_pg(),
-            Ok(i64::MAX)
-        );
-        assert_eq!(
-            LeaseDurationMs::new(POSTGRES_BIGINT_MAX).unwrap().to_pg(),
             Ok(i64::MAX)
         );
     }
