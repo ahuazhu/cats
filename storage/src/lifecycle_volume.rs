@@ -13,7 +13,6 @@
 
 use std::collections::BTreeSet;
 
-use cats_api::runtime_lifecycle::{DiskRole, PlacementIdentity};
 use cats_api::runtime_lifecycle_volume::{
     lifecycle_persistent_initialization_original_blank_head,
     persistent_initialization_commit_receipt_digest,
@@ -24,6 +23,7 @@ use cats_api::runtime_lifecycle_volume::{
     LifecyclePersistentInitializationState, LifecycleServingAcquire,
     LifecycleStartVolumeGrantAuthority, LifecycleStoredPersistentInitializationCommit,
 };
+use cats_api::runtime_lifecycle_volume::{DiskRole, PlacementIdentity};
 use cats_api::runtime_reconciliation::{
     AuthorizationConsumedReceipt, AuthorizationRecord, AuthorizationState,
     BeginDisposableDeleteConsumedReceipt, DeleteCompletionReceipt, FenceEpoch, Generation, Id,
@@ -563,7 +563,7 @@ pub fn encode_command_delete_already_unowned_receipt_for_deleting_root(
 pub fn command_start_volume_grant_receipt_digest(
     expected_scope: &LifecycleVolumeCommandScope,
     expected_grant_sequence: WireU64,
-    expected_volume: &cats_api::runtime_lifecycle::RuntimeVolumeConfig,
+    expected_volume: &cats_api::runtime_lifecycle_volume::RuntimeVolumeConfig,
     current_volume: &VolumeRecord,
     receipt: &LifecycleCommandStartVolumeGrantReceipt,
 ) -> Result<Sha256Digest> {
@@ -582,7 +582,7 @@ pub fn command_start_volume_grant_receipt_digest(
 pub fn encode_command_start_volume_grant_receipt(
     expected_scope: &LifecycleVolumeCommandScope,
     expected_grant_sequence: WireU64,
-    expected_volume: &cats_api::runtime_lifecycle::RuntimeVolumeConfig,
+    expected_volume: &cats_api::runtime_lifecycle_volume::RuntimeVolumeConfig,
     current_volume: &VolumeRecord,
     receipt: &LifecycleCommandStartVolumeGrantReceipt,
 ) -> Result<CanonicalLifecycleVolumeReceipt> {
@@ -605,7 +605,7 @@ pub fn encode_command_start_volume_grant_receipt(
 pub fn command_start_volume_grant_receipt_digest_for_current_owner(
     expected_scope: &LifecycleVolumeCommandScope,
     expected_grant_sequence: WireU64,
-    expected_volume: &cats_api::runtime_lifecycle::RuntimeVolumeConfig,
+    expected_volume: &cats_api::runtime_lifecycle_volume::RuntimeVolumeConfig,
     current_volume: &VolumeRecord,
     receipt: &LifecycleCommandStartVolumeGrantReceipt,
 ) -> Result<Sha256Digest> {
@@ -1821,7 +1821,7 @@ fn start_volume_grant_claimed_current_record(
 fn validate_start_volume_grant_receipt(
     expected_scope: &LifecycleVolumeCommandScope,
     expected_grant_sequence: WireU64,
-    expected_volume: &cats_api::runtime_lifecycle::RuntimeVolumeConfig,
+    expected_volume: &cats_api::runtime_lifecycle_volume::RuntimeVolumeConfig,
     current: &VolumeRecord,
     receipt: &LifecycleCommandStartVolumeGrantReceipt,
     current_binding: StartGrantCurrentBinding,

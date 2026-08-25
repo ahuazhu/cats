@@ -28,7 +28,6 @@ pub mod production_mutation_admission;
 pub mod route_grant_v2;
 pub mod route_signing_operator;
 pub mod runtime_artifacts;
-pub mod runtime_lifecycle;
 pub mod runtime_lifecycle_volume;
 pub mod runtime_node_authority;
 pub mod runtime_reconciliation;

@@ -378,7 +378,7 @@ mod tests {
         object_write_private_file_fsync_receipt_id, ObjectWriteCredentialRegisteredArtifact,
         ObjectWriteCredentialRegistration, ObjectWriteCredentialRegistrationReceipt,
     };
-    use cats_api::runtime_lifecycle::{
+    use cats_api::runtime_lifecycle_volume::{
         DiskRole, PlacementIdentity, RuntimeVolumeConfig, RuntimeVolumeGuestBinding,
     };
     use cats_api::runtime_lifecycle_volume::{

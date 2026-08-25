@@ -8,7 +8,7 @@ use std::fs::{self, File};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use cats_api::runtime_lifecycle::{
+use cats_api::runtime_lifecycle_volume::{
     DiskRole, PlacementIdentity, RuntimeVolumeConfig, RuntimeVolumeGuestBinding,
 };
 use cats_api::runtime_lifecycle_volume::{

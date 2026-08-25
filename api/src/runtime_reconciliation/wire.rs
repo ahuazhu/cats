@@ -675,7 +675,6 @@ enum Schema {
     },
     String(StringRule),
     Number(NumberRule),
-    Bool,
     Nullable(Box<Schema>),
 }
 
@@ -686,7 +685,6 @@ impl Schema {
             Self::Array { .. } => Some(PrimitiveKind::Array),
             Self::String(_) => Some(PrimitiveKind::String),
             Self::Number(_) => Some(PrimitiveKind::Number),
-            Self::Bool => Some(PrimitiveKind::Bool),
             Self::Nullable(_) => None,
         }
     }
@@ -775,14 +773,6 @@ fn base64url_no_pad() -> Schema {
 }
 
 fn epoch() -> Schema {
-    number(1, MAX_WIRE_INTEGER)
-}
-
-fn revision() -> Schema {
-    number(1, MAX_WIRE_INTEGER)
-}
-
-fn sequence() -> Schema {
     number(1, MAX_WIRE_INTEGER)
 }
 
@@ -1158,7 +1148,7 @@ fn collect_schema(
                 path.pop();
             }
         }
-        Schema::String(_) | Schema::Number(_) | Schema::Bool => {
+        Schema::String(_) | Schema::Number(_) => {
             if !kind_matches(schema, document.kind(value)) {
                 consider_at(&mut output.shape, path, MalformedProblem::InvalidType);
             }
@@ -1672,14 +1662,6 @@ where
     Ok(bytes)
 }
 
-fn assigned_placement_schema() -> Schema {
-    object(vec![
-        field("kind", closed(&["assigned"])),
-        field("node_id", id()),
-        field("placement_epoch", epoch()),
-    ])
-}
-
 fn credential_binding_schema() -> Schema {
     union(
         "kind",
@@ -1713,399 +1695,6 @@ fn remote_head_schema() -> Schema {
         field("generation", wire_u64()),
         field("root_hash", nullable(digest())),
         field("root_object_id", nullable(string(StringRule::AsciiText))),
-    ])
-}
-
-fn normal_acquire_request_schema() -> Schema {
-    object(vec![
-        field("volume_id", id()),
-        field("transition_id", random_id()),
-        field("attachment_id", id()),
-        field("expected_unowned_epoch", wire_u64()),
-        field("placement_epoch", epoch()),
-        field("lease_duration_ms", number(1, MAX_WIRE_INTEGER)),
-    ])
-}
-
-fn normal_acquire_result_schema() -> Schema {
-    object(vec![
-        field("volume_id", id()),
-        field("transition_id", random_id()),
-        field("attachment_id", id()),
-        field("resulting_epoch", wire_u64()),
-        field("resulting_head", remote_head_schema()),
-        field("lease_expires_at", wire_u64()),
-    ])
-}
-
-fn release_request_schema() -> Schema {
-    object(vec![
-        field("volume_id", id()),
-        field("transition_id", random_id()),
-        field("attachment_id", id()),
-        field("expected_epoch", wire_u64()),
-    ])
-}
-
-fn release_result_schema() -> Schema {
-    object(vec![
-        field("volume_id", id()),
-        field("transition_id", random_id()),
-        field("released_attachment_id", id()),
-        field("resulting_epoch", wire_u64()),
-        field("resulting_head", remote_head_schema()),
-    ])
-}
-
-fn begin_delete_request_schema() -> Schema {
-    object(vec![
-        field("delete_id", id()),
-        field("disk_id", id()),
-        field("volume_id", id()),
-        field("expected_unowned_epoch", wire_u64()),
-        field("expected_head", remote_head_schema()),
-    ])
-}
-
-fn begin_delete_result_schema() -> Schema {
-    object(vec![
-        field("delete_id", id()),
-        field("disk_id", id()),
-        field("volume_id", id()),
-        field("resulting_epoch", wire_u64()),
-        field("resulting_head", remote_head_schema()),
-    ])
-}
-
-fn volume_admin_state_schema() -> Schema {
-    union(
-        "kind",
-        vec![
-            variant("active", vec![]),
-            variant("deleting", vec![field("delete_id", id())]),
-        ],
-    )
-}
-
-fn volume_transition_source_schema() -> Schema {
-    union(
-        "kind",
-        vec![
-            variant("independent", vec![]),
-            variant(
-                "lifecycle",
-                vec![
-                    field("operation_id", id()),
-                    field("request_fingerprint", digest()),
-                ],
-            ),
-        ],
-    )
-}
-
-fn last_volume_transition_schema() -> Schema {
-    union(
-        "kind",
-        vec![
-            variant(
-                "normal_acquire",
-                vec![
-                    field("source", volume_transition_source_schema()),
-                    field("request", normal_acquire_request_schema()),
-                    field("result", normal_acquire_result_schema()),
-                ],
-            ),
-            variant(
-                "release",
-                vec![
-                    field("source", volume_transition_source_schema()),
-                    field("request", release_request_schema()),
-                    field("result", release_result_schema()),
-                ],
-            ),
-            variant(
-                "takeover",
-                vec![
-                    field("source", volume_transition_source_schema()),
-                    field("authorization_id", id()),
-                ],
-            ),
-            variant(
-                "begin_delete",
-                vec![
-                    field("source", volume_transition_source_schema()),
-                    field("request", begin_delete_request_schema()),
-                    field("result", begin_delete_result_schema()),
-                ],
-            ),
-            variant(
-                "begin_disposable_delete",
-                vec![
-                    field("source", volume_transition_source_schema()),
-                    field("authorization_id", id()),
-                ],
-            ),
-        ],
-    )
-}
-
-fn volume_record_schema() -> Schema {
-    object(vec![
-        field("volume_id", id()),
-        field("size_bytes", number(1, MAX_WIRE_INTEGER)),
-        field("durability", closed(&["strict", "relaxed"])),
-        field("admin_state", volume_admin_state_schema()),
-        field("head", remote_head_schema()),
-        field("lease_owner", nullable(id())),
-        field("lease_epoch", wire_u64()),
-        field("lease_expires_at", nullable(wire_u64())),
-        field("last_transition", nullable(last_volume_transition_schema())),
-    ])
-}
-
-fn takeover_authorization_fields() -> Vec<Field> {
-    vec![
-        field("authorization_id", id()),
-        field("operation_id", id()),
-        field("request_fingerprint", digest()),
-        field("authorized_node_id", id()),
-        field("host_fence_event_id", id()),
-        field("interrupted_operation_id", id()),
-        field("host_lost_result_digest", digest()),
-        field("disk_id", id()),
-        field("volume_id", id()),
-        field("cat_id", id()),
-        field("expected_attachment_id", id()),
-        field("expected_epoch", wire_u64()),
-        field("expected_head", remote_head_schema()),
-        field("new_attachment_id", id()),
-        field("new_placement_epoch", epoch()),
-        field("lease_duration_ms", number(1, MAX_WIRE_INTEGER)),
-        field("not_after", wire_u64()),
-    ]
-}
-
-fn disposable_delete_isolation_basis_schema() -> Schema {
-    union(
-        "kind",
-        vec![
-            variant(
-                "lifecycle_strong_stop",
-                vec![
-                    field("node_id", id()),
-                    field("agent_session_epoch", epoch()),
-                    field("strong_stop_operation_id", id()),
-                    field("strong_stop_receipt_digest", digest()),
-                    field("execution_absence_proof_digest", digest()),
-                    field("inventory_attestation_digest", digest()),
-                ],
-            ),
-            variant(
-                "host_fence_event",
-                vec![
-                    field("event_id", id()),
-                    field("interrupted_operation_id", id()),
-                    field("host_lost_result_digest", digest()),
-                ],
-            ),
-        ],
-    )
-}
-
-fn disposable_delete_authorization_fields() -> Vec<Field> {
-    vec![
-        field("authorization_id", id()),
-        field("operation_id", id()),
-        field("request_fingerprint", digest()),
-        field("authorized_node_id", id()),
-        field("delete_id", id()),
-        field("disk_id", id()),
-        field("volume_id", id()),
-        field("cat_id", id()),
-        field("placement_epoch", epoch()),
-        field("expected_attachment_id", id()),
-        field("expected_epoch", wire_u64()),
-        field("expected_head", remote_head_schema()),
-        field("disposition", closed(&["discard_with_cat"])),
-        field("persistent_dispositions_digest", digest()),
-        field(
-            "isolation_basis",
-            disposable_delete_isolation_basis_schema(),
-        ),
-        field("not_after", wire_u64()),
-    ]
-}
-
-fn takeover_consumed_receipt_fields() -> Vec<Field> {
-    vec![
-        field("authorization_id", id()),
-        field("host_fence_event_id", id()),
-        field("volume_id", id()),
-        field("new_attachment_id", id()),
-        field("resulting_epoch", wire_u64()),
-        field("resulting_head", remote_head_schema()),
-        field("consumed_at", wire_u64()),
-    ]
-}
-
-fn disposable_delete_consumed_receipt_fields() -> Vec<Field> {
-    vec![
-        field("authorization_id", id()),
-        field("volume_id", id()),
-        field("disk_id", id()),
-        field("cat_id", id()),
-        field("delete_id", id()),
-        field("prior_attachment_id", id()),
-        field("resulting_epoch", wire_u64()),
-        field("resulting_head", remote_head_schema()),
-        field("consumed_at", wire_u64()),
-    ]
-}
-
-fn volume_authorization_schema() -> Schema {
-    union(
-        "kind",
-        vec![
-            variant("takeover", takeover_authorization_fields()),
-            variant(
-                "disposable_root_delete",
-                disposable_delete_authorization_fields(),
-            ),
-        ],
-    )
-}
-
-fn authorization_consumed_receipt_schema() -> Schema {
-    union(
-        "kind",
-        vec![
-            variant("takeover", takeover_consumed_receipt_fields()),
-            variant(
-                "begin_disposable_delete",
-                disposable_delete_consumed_receipt_fields(),
-            ),
-        ],
-    )
-}
-
-fn authorization_state_schema() -> Schema {
-    union(
-        "kind",
-        vec![
-            variant("unconsumed", vec![]),
-            variant(
-                "consumed",
-                vec![field("receipt", authorization_consumed_receipt_schema())],
-            ),
-        ],
-    )
-}
-
-fn authorization_record_schema() -> Schema {
-    object(vec![
-        field("authorization", volume_authorization_schema()),
-        field("state", authorization_state_schema()),
-    ])
-}
-
-fn delete_completion_receipt_schema() -> Schema {
-    union(
-        "kind",
-        vec![
-            variant(
-                "normal",
-                vec![
-                    field("request", begin_delete_request_schema()),
-                    field("deleting_epoch", wire_u64()),
-                    field("deleting_head", remote_head_schema()),
-                    field("completed_at", wire_u64()),
-                ],
-            ),
-            variant(
-                "disposable_root",
-                vec![
-                    field("disk_id", id()),
-                    field("volume_id", id()),
-                    field("delete_id", id()),
-                    field("authorization_id", id()),
-                    field("prior_attachment_id", id()),
-                    field("deleting_epoch", wire_u64()),
-                    field("deleting_head", remote_head_schema()),
-                    field("completed_at", wire_u64()),
-                ],
-            ),
-        ],
-    )
-}
-
-#[cfg(feature = "proposed-node-residue-reclamation")]
-fn residue_reclaim_proof_schema() -> Schema {
-    union(
-        "kind",
-        vec![
-            variant(
-                "ordinary_release",
-                vec![field("current_volume", volume_record_schema())],
-            ),
-            variant(
-                "normal_delete_completion",
-                vec![field("completion", delete_completion_receipt_schema())],
-            ),
-            variant(
-                "disposable_root_delete_completion",
-                vec![
-                    field("completion", delete_completion_receipt_schema()),
-                    field("consumed_authorization", authorization_record_schema()),
-                ],
-            ),
-        ],
-    )
-}
-
-#[cfg(feature = "proposed-node-residue-reclamation")]
-fn runtime_residue_authority_outcome_schema() -> Schema {
-    union(
-        "kind",
-        vec![
-            variant(
-                "retained",
-                vec![field(
-                    "reason",
-                    closed(&[
-                        "no_authority_record",
-                        "current_or_newer_owner",
-                        "release_not_recorded",
-                        "delete_incomplete",
-                        "lineage_mismatch",
-                        "unique_local_tail",
-                        "unsupported_disk_kind",
-                    ]),
-                )],
-            ),
-            variant(
-                "reclaimable",
-                vec![field("proof", residue_reclaim_proof_schema())],
-            ),
-        ],
-    )
-}
-
-#[cfg(feature = "proposed-node-residue-reclamation")]
-fn runtime_residue_authority_request_schema() -> Schema {
-    object(vec![
-        field("version", version()),
-        field("session", session_binding_schema()),
-        field("lineage", residue_data_directory_lineage_schema()),
-    ])
-}
-
-#[cfg(feature = "proposed-node-residue-reclamation")]
-fn runtime_residue_authority_success_schema() -> Schema {
-    object(vec![
-        field("version", version()),
-        field("session", session_binding_schema()),
-        field("lineage", residue_data_directory_lineage_schema()),
-        field("outcome", runtime_residue_authority_outcome_schema()),
     ])
 }
 
@@ -2171,65 +1760,6 @@ fn provision_root_image_error_schema() -> Schema {
                             "immutable_object",
                         ]),
                     ),
-                ],
-            ),
-        ],
-    )
-}
-
-fn acquire_origin_schema() -> Schema {
-    union(
-        "kind",
-        vec![
-            variant("normal", vec![field("transition_id", random_id())]),
-            variant("takeover", vec![field("authorization_id", id())]),
-        ],
-    )
-}
-
-#[cfg(feature = "proposed-node-residue-reclamation")]
-fn residue_data_directory_lineage_schema() -> Schema {
-    object(vec![
-        field("workspace_id", id()),
-        field("cat_id", id()),
-        field("disk_id", id()),
-        field("disk_kind", closed(&["root", "persistent"])),
-        field("volume_id", id()),
-        field("attachment_id", id()),
-        field("attachment_epoch", wire_u64()),
-        field("acquire_origin", acquire_origin_schema()),
-        field("node_id", id()),
-        field("desired_revision", revision()),
-        field("spec_digest", digest()),
-        field("placement", assigned_placement_schema()),
-        field("placement_epoch", epoch()),
-        field("acquisition", authorized_serving_acquire_schema()),
-        field("acquisition_digest", digest()),
-        field("local_durable_generation", wire_u64()),
-        field("remote_durable_generation", wire_u64()),
-        field("remote_head", remote_head_schema()),
-        field("pending_pack_count", wire_u64()),
-        field("fenced", Schema::Bool),
-    ])
-}
-
-#[cfg(feature = "proposed-node-residue-reclamation")]
-fn authorized_serving_acquire_schema() -> Schema {
-    union(
-        "kind",
-        vec![
-            variant(
-                "normal",
-                vec![
-                    field("request", normal_acquire_request_schema()),
-                    field("result", normal_acquire_result_schema()),
-                ],
-            ),
-            variant(
-                "takeover",
-                vec![
-                    field("authorization", object(takeover_authorization_fields())),
-                    field("receipt", object(takeover_consumed_receipt_fields())),
                 ],
             ),
         ],
@@ -2613,33 +2143,6 @@ fn runtime_provisioner_active_set_schema() -> Schema {
     ])
 }
 
-fn agent_registration_attempt_schema() -> Schema {
-    object(vec![
-        field("version", version()),
-        field("node_id", id()),
-        field("immutable_host_id", id()),
-        field("node_boot_id", random_id()),
-        field("agent_instance_id", random_id()),
-        field("registration_attempt_id", random_id()),
-        field("guest_config_digest", digest()),
-        field("expected_agent_session_epoch", nullable(epoch())),
-    ])
-}
-
-fn agent_session_schema() -> Schema {
-    object(vec![
-        field("version", version()),
-        field("node_id", id()),
-        field("immutable_host_id", id()),
-        field("node_boot_id", random_id()),
-        field("agent_instance_id", random_id()),
-        field("agent_session_epoch", epoch()),
-        field("registration_attempt_id", random_id()),
-        field("guest_config_digest", digest()),
-        field("lease_deadline_unix_ms", wire_u64()),
-    ])
-}
-
 fn guest_runtime_profile_receipt_schema() -> Schema {
     object(vec![
         field("version", version()),
@@ -2647,58 +2150,6 @@ fn guest_runtime_profile_receipt_schema() -> Schema {
         field("initramfs_digest", nullable(digest())),
         field("kernel_cmdline", string(StringRule::AsciiText)),
         field("guest_agent_protocol_version", literal_number(1)),
-    ])
-}
-
-fn admission_attestation_schema() -> Schema {
-    object(vec![
-        field("version", version()),
-        field("node_id", id()),
-        field("agent_session_epoch", epoch()),
-        field("inventory_epoch", epoch()),
-        field("inventory_digest", digest()),
-        field("inventory_read_position", sequence()),
-        field("accepted_at_unix_ms", wire_u64()),
-    ])
-}
-
-fn runtime_spine_error_detail_schema() -> Schema {
-    union(
-        "code",
-        vec![
-            variant("authentication_failed", vec![]),
-            variant("identity_not_eligible", vec![]),
-            variant(
-                "http_request_rejected",
-                vec![field(
-                    "problem",
-                    closed(&[
-                        "method_not_allowed",
-                        "query_not_allowed",
-                        "content_type_not_allowed",
-                        "content_encoding_not_allowed",
-                        "authorization_not_allowed",
-                        "accept_not_allowed",
-                        "semantic_header_not_allowed",
-                    ]),
-                )],
-            ),
-            variant(
-                "contract_error",
-                vec![field("contract_error", contract_error_schema())],
-            ),
-            variant("node_request_in_flight", vec![]),
-            variant("temporarily_unavailable", vec![]),
-            variant("internal", vec![]),
-        ],
-    )
-}
-
-fn runtime_spine_error_schema() -> Schema {
-    object(vec![
-        field("version", version()),
-        field("error", runtime_spine_error_detail_schema()),
-        field("message", string(StringRule::Message)),
     ])
 }
 
@@ -2715,19 +2166,8 @@ static RUNTIME_PROVISIONER_TRUST_BUNDLE_SCHEMA: LazyLock<Schema> =
     LazyLock::new(runtime_provisioner_trust_bundle_schema);
 static RUNTIME_PROVISIONER_ACTIVE_SET_SCHEMA: LazyLock<Schema> =
     LazyLock::new(runtime_provisioner_active_set_schema);
-static AGENT_REGISTRATION_ATTEMPT_SCHEMA: LazyLock<Schema> =
-    LazyLock::new(agent_registration_attempt_schema);
-static AGENT_SESSION_SCHEMA: LazyLock<Schema> = LazyLock::new(agent_session_schema);
 static GUEST_RUNTIME_PROFILE_RECEIPT_SCHEMA: LazyLock<Schema> =
     LazyLock::new(guest_runtime_profile_receipt_schema);
-static ADMISSION_ATTESTATION_SCHEMA: LazyLock<Schema> = LazyLock::new(admission_attestation_schema);
-static RUNTIME_SPINE_ERROR_SCHEMA: LazyLock<Schema> = LazyLock::new(runtime_spine_error_schema);
-#[cfg(feature = "proposed-node-residue-reclamation")]
-static RUNTIME_RESIDUE_AUTHORITY_REQUEST_SCHEMA: LazyLock<Schema> =
-    LazyLock::new(runtime_residue_authority_request_schema);
-#[cfg(feature = "proposed-node-residue-reclamation")]
-static RUNTIME_RESIDUE_AUTHORITY_SUCCESS_SCHEMA: LazyLock<Schema> =
-    LazyLock::new(runtime_residue_authority_success_schema);
 static CONTRACT_ERROR_SCHEMA: LazyLock<Schema> = LazyLock::new(contract_error_schema);
 static PROVISION_ROOT_IMAGE_REQUEST_SCHEMA: LazyLock<Schema> =
     LazyLock::new(provision_root_image_request_schema);
@@ -2867,12 +2307,6 @@ pub fn decode_provision_root_image_error(
     )
 }
 
-pub fn encode_provision_root_image_request(
-    value: &ProvisionRootImageRequest,
-) -> Result<Vec<u8>, ProvisionRootImageWireDecodeError> {
-    encode_provision_payload(value, decode_provision_root_image_request)
-}
-
 pub fn encode_provision_root_image_result(
     value: &ProvisionRootImageResult,
 ) -> Result<Vec<u8>, ProvisionRootImageWireDecodeError> {
@@ -2953,28 +2387,6 @@ pub fn decode_runtime_provisioner_active_set(
     )
 }
 
-pub fn decode_agent_registration_attempt(
-    bytes: &[u8],
-) -> Result<AgentRegistrationAttempt, ContractError> {
-    decode(
-        bytes,
-        ContractName::AgentRegistrationAttempt,
-        AGENT_REGISTRATION_ATTEMPT_MAX_WIRE_BYTES,
-        &AGENT_REGISTRATION_ATTEMPT_SCHEMA,
-        |_| Ok(()),
-    )
-}
-
-pub fn decode_agent_session(bytes: &[u8]) -> Result<AgentSession, ContractError> {
-    decode(
-        bytes,
-        ContractName::AgentSession,
-        AGENT_SESSION_MAX_WIRE_BYTES,
-        &AGENT_SESSION_SCHEMA,
-        |_| Ok(()),
-    )
-}
-
 pub fn decode_guest_runtime_profile_receipt(
     bytes: &[u8],
 ) -> Result<GuestRuntimeProfileReceipt, ContractError> {
@@ -2994,54 +2406,6 @@ pub fn decode_guest_runtime_profile_receipt(
         return Err(malformed_root(contract, MalformedProblem::InvalidValue));
     }
     Ok(decoded)
-}
-
-pub fn decode_admission_inventory_attestation(
-    bytes: &[u8],
-) -> Result<AdmissionInventoryAttestation, ContractError> {
-    decode(
-        bytes,
-        ContractName::AdmissionInventoryAttestation,
-        ADMISSION_INVENTORY_ATTESTATION_MAX_WIRE_BYTES,
-        &ADMISSION_ATTESTATION_SCHEMA,
-        |_| Ok(()),
-    )
-}
-
-pub fn decode_runtime_spine_error(bytes: &[u8]) -> Result<RuntimeSpineError, ContractError> {
-    decode(
-        bytes,
-        ContractName::RuntimeSpineError,
-        RUNTIME_SPINE_ERROR_MAX_WIRE_BYTES,
-        &RUNTIME_SPINE_ERROR_SCHEMA,
-        validate_runtime_spine_error,
-    )
-}
-
-#[cfg(feature = "proposed-node-residue-reclamation")]
-pub fn decode_runtime_residue_authority_request(
-    bytes: &[u8],
-) -> Result<RuntimeResidueAuthorityRequest, ContractError> {
-    decode(
-        bytes,
-        ContractName::RuntimeResidueAuthorityRequest,
-        RUNTIME_RESIDUE_AUTHORITY_REQUEST_MAX_WIRE_BYTES,
-        &RUNTIME_RESIDUE_AUTHORITY_REQUEST_SCHEMA,
-        validate_runtime_residue_authority_request,
-    )
-}
-
-#[cfg(feature = "proposed-node-residue-reclamation")]
-pub fn decode_runtime_residue_authority_success(
-    bytes: &[u8],
-) -> Result<RuntimeResidueAuthoritySuccess, ContractError> {
-    decode(
-        bytes,
-        ContractName::RuntimeResidueAuthoritySuccess,
-        RUNTIME_RESIDUE_AUTHORITY_SUCCESS_MAX_WIRE_BYTES,
-        &RUNTIME_RESIDUE_AUTHORITY_SUCCESS_SCHEMA,
-        validate_runtime_residue_authority_success,
-    )
 }
 
 pub fn decode_contract_error(bytes: &[u8]) -> Result<ContractError, ContractError> {
@@ -3106,20 +2470,6 @@ pub fn encode_runtime_provisioner_active_set(
     )
 }
 
-pub fn encode_agent_registration_attempt(
-    value: &AgentRegistrationAttempt,
-) -> Result<Vec<u8>, ContractError> {
-    encode(
-        value,
-        ContractName::AgentRegistrationAttempt,
-        decode_agent_registration_attempt,
-    )
-}
-
-pub fn encode_agent_session(value: &AgentSession) -> Result<Vec<u8>, ContractError> {
-    encode(value, ContractName::AgentSession, decode_agent_session)
-}
-
 pub fn encode_guest_runtime_profile_receipt(
     value: &GuestRuntimeProfileReceipt,
 ) -> Result<Vec<u8>, ContractError> {
@@ -3127,46 +2477,6 @@ pub fn encode_guest_runtime_profile_receipt(
         value,
         ContractName::GuestRuntimeProfileReceipt,
         decode_guest_runtime_profile_receipt,
-    )
-}
-
-pub fn encode_admission_inventory_attestation(
-    value: &AdmissionInventoryAttestation,
-) -> Result<Vec<u8>, ContractError> {
-    encode(
-        value,
-        ContractName::AdmissionInventoryAttestation,
-        decode_admission_inventory_attestation,
-    )
-}
-
-pub fn encode_runtime_spine_error(value: &RuntimeSpineError) -> Result<Vec<u8>, ContractError> {
-    encode(
-        value,
-        ContractName::RuntimeSpineError,
-        decode_runtime_spine_error,
-    )
-}
-
-#[cfg(feature = "proposed-node-residue-reclamation")]
-pub fn encode_runtime_residue_authority_request(
-    value: &RuntimeResidueAuthorityRequest,
-) -> Result<Vec<u8>, ContractError> {
-    encode(
-        value,
-        ContractName::RuntimeResidueAuthorityRequest,
-        decode_runtime_residue_authority_request,
-    )
-}
-
-#[cfg(feature = "proposed-node-residue-reclamation")]
-pub fn encode_runtime_residue_authority_success(
-    value: &RuntimeResidueAuthoritySuccess,
-) -> Result<Vec<u8>, ContractError> {
-    encode(
-        value,
-        ContractName::RuntimeResidueAuthoritySuccess,
-        decode_runtime_residue_authority_success,
     )
 }
 
@@ -4116,73 +3426,6 @@ pub fn residue_reclaim_proof_is_closed(
                 && valid_next_epoch(lineage.attachment_epoch, *deleting_epoch)
         }
     }
-}
-
-#[cfg(feature = "proposed-node-residue-reclamation")]
-fn validate_runtime_residue_authority_request(
-    request: &RuntimeResidueAuthorityRequest,
-) -> Result<(), ContractError> {
-    let contract = ContractName::RuntimeResidueAuthorityRequest;
-    let mut candidates = Vec::new();
-    if request.session.node_id != request.lineage.node_id
-        || request.session.node_id != request.lineage.placement.node_id
-    {
-        candidates.push(Candidate::at(
-            &path(&["lineage", "node_id"]),
-            MalformedProblem::InvalidValue,
-        ));
-    }
-    if !residue_lineage_valid(&request.lineage) {
-        candidates.push(Candidate::at(
-            &path(&["lineage"]),
-            MalformedProblem::InvalidValue,
-        ));
-    }
-    if let Some(candidate) = choose(candidates) {
-        return Err(malformed(contract, candidate));
-    }
-    Ok(())
-}
-
-#[cfg(feature = "proposed-node-residue-reclamation")]
-fn validate_runtime_residue_authority_success(
-    success: &RuntimeResidueAuthoritySuccess,
-) -> Result<(), ContractError> {
-    let contract = ContractName::RuntimeResidueAuthoritySuccess;
-    let mut candidates = Vec::new();
-    if (success.session.node_id != success.lineage.node_id
-        || success.session.node_id != success.lineage.placement.node_id)
-        || !residue_lineage_valid(&success.lineage)
-    {
-        candidates.push(Candidate::at(
-            &path(&["lineage"]),
-            MalformedProblem::InvalidValue,
-        ));
-    }
-    if let RuntimeResidueAuthorityOutcome::Reclaimable { proof } = &success.outcome {
-        if !residue_reclaim_proof_is_closed(&success.lineage, proof) {
-            candidates.push(Candidate::at(
-                &path(&["outcome", "proof"]),
-                MalformedProblem::InvalidValue,
-            ));
-        }
-    }
-    if let Some(candidate) = choose(candidates) {
-        return Err(malformed(contract, candidate));
-    }
-    Ok(())
-}
-
-fn validate_runtime_spine_error(error: &RuntimeSpineError) -> Result<(), ContractError> {
-    if let RuntimeSpineErrorDetail::ContractError { contract_error } = error.error.as_ref() {
-        validate_contract_error(contract_error).map_err(|nested| {
-            malformed(
-                ContractName::RuntimeSpineError,
-                rebase_contract_candidate(&path(&["error", "contract_error"]), &nested),
-            )
-        })?;
-    }
-    Ok(())
 }
 
 fn rebase_contract_candidate(prefix: &[PathSegment], error: &ContractError) -> Candidate {

@@ -644,19 +644,6 @@ pub struct RuntimeNodeAuthorityApplyRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AgentRegistrationAttempt {
-    pub version: ContractVersion,
-    pub node_id: Id,
-    pub immutable_host_id: Id,
-    pub node_boot_id: NodeBootId,
-    pub agent_instance_id: RandomId128,
-    pub registration_attempt_id: RandomId128,
-    pub guest_config_digest: Sha256Digest,
-    pub expected_agent_session_epoch: Option<Epoch>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AgentSession {
     pub version: ContractVersion,
     pub node_id: Id,
@@ -677,50 +664,6 @@ pub struct GuestRuntimeProfileReceipt {
     pub initramfs_digest: Option<Sha256Digest>,
     pub kernel_cmdline: AsciiText,
     pub guest_agent_protocol_version: ContractVersion,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AdmissionInventoryAttestation {
-    pub version: ContractVersion,
-    pub node_id: Id,
-    pub agent_session_epoch: Epoch,
-    pub inventory_epoch: Epoch,
-    pub inventory_digest: Sha256Digest,
-    pub inventory_read_position: Sequence,
-    pub accepted_at_unix_ms: UnixMillis,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeSpineError {
-    pub version: ContractVersion,
-    pub error: Box<RuntimeSpineErrorDetail>,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "code", rename_all = "snake_case", deny_unknown_fields)]
-pub enum RuntimeSpineErrorDetail {
-    AuthenticationFailed,
-    IdentityNotEligible,
-    HttpRequestRejected { problem: RuntimeSpineHttpProblem },
-    ContractError { contract_error: ContractError },
-    NodeRequestInFlight,
-    TemporarilyUnavailable,
-    Internal,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimeSpineHttpProblem {
-    MethodNotAllowed,
-    QueryNotAllowed,
-    ContentTypeNotAllowed,
-    ContentEncodingNotAllowed,
-    AuthorizationNotAllowed,
-    AcceptNotAllowed,
-    SemanticHeaderNotAllowed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -791,90 +734,6 @@ pub enum HttpProtocol {
     Http,
 }
 
-/// Descriptor-stable identity of the sealed record bridging root provisioning
-/// to serving blockd startup.
-///
-/// The content digest alone is insufficient: device/inode/length bind the
-/// exact no-replace publication and reject rename/recreate ABA.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RootServingHandoffRecordIdentity {
-    pub path: HostPath,
-    pub device: WireU64,
-    pub inode: WireU64,
-    pub length: WireU64,
-    pub content_sha256: Sha256Digest,
-}
-
-/// Durable bridge from the final target-control checkpoint to PrepareDevice.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RootServingHandoff {
-    pub predecessor_checkpoint_content_digest: Sha256Digest,
-    pub record: RootServingHandoffRecordIdentity,
-}
-
-/// Descriptor-stable identity of the exact authorized-serving artifact used
-/// when no root-provision process participates in this attachment.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DirectAuthorizedAttachmentIdentity {
-    pub path: HostPath,
-    pub device: WireU64,
-    pub inode: WireU64,
-    pub length: WireU64,
-    pub content_sha256: Sha256Digest,
-}
-
-/// Closed reason why a direct authorized attachment may enter PrepareDevice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DirectAuthorizedAttachmentPurpose {
-    ExistingRoot,
-    PersistentInitialized,
-    PersistentUninitialized,
-}
-
-/// Exact provenance for the serving authorization consumed by PrepareDevice.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ServingAuthorityProvenance {
-    AfterRootProvision {
-        handoff: RootServingHandoff,
-    },
-    DirectAuthorizedAttachment {
-        authorization: DirectAuthorizedAttachmentIdentity,
-        purpose: DirectAuthorizedAttachmentPurpose,
-    },
-}
-
-/// Exact identity to checkpoint before starting the serving blockd process.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ServingBlockdIdentity {
-    pub scope_id: Id,
-    pub control_socket_path: HostPath,
-    pub data_directory: HostPath,
-    pub executable_path: HostPath,
-    pub process_identity_token: RandomId128,
-}
-
-/// Closed physical frontend plan owned by one PrepareDevice checkpoint.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum PrepareDeviceFrontend {
-    KernelNbd {
-        listener_socket_path: HostPath,
-        device_path: HostPath,
-        direct: bool,
-    },
-    VhostUserBlk {
-        socket_path: HostPath,
-        queues: u16,
-        queue_size: u16,
-    },
-}
-
 /// The durable identity reserved before creating or adopting one Host tap.
 ///
 /// The ownership token is independent from the logical network ID and from
@@ -889,90 +748,14 @@ pub struct RuntimeNetworkIdentity {
     pub ownership_token: RandomId128,
 }
 
-/// Immutable identity of one Host file consumed by a VMM launch.
-///
-/// The path is the canonical installed path selected by the Node's runtime
-/// configuration.  Length and content digest make the checkpoint usable after
-/// an Agent restart without treating that mutable path as sufficient proof.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeLaunchArtifact {
-    pub path: HostPath,
-    pub length: WireU64,
-    pub content_sha256: Sha256Digest,
-}
-
-/// Exact executable and Guest boot bytes selected for one fresh VMM boot.
-///
-/// This is deliberately independent of any particular installer or release
-/// manifest.  The producer records the files actually selected by its
-/// installed runtime configuration and a fixed safe reader must re-open and
-/// compare all members before launch or adoption.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VmmBootProvenance {
-    pub vmm_executable: RuntimeLaunchArtifact,
-    pub kernel: RuntimeLaunchArtifact,
-    pub initramfs: Option<RuntimeLaunchArtifact>,
-    pub kernel_cmdline: AsciiText,
-}
-
-/// Complete, restart-safe identity of one VMM launch journaled by the atomic
-/// lifecycle executor.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeLaunchIdentity {
-    pub runtime_incarnation: RandomId128,
-    pub scope_id: Id,
-    pub launcher_executable: Box<RuntimeLaunchArtifact>,
-    pub boot: Box<VmmBootProvenance>,
-    pub process_identity_token: RandomId128,
-    pub vcpus: u32,
-    pub memory_bytes: u64,
-    pub boot_image_digest: Sha256Digest,
-    pub guest_config_digest: Sha256Digest,
-    pub api_socket_path: HostPath,
-    pub vsock_socket_path: HostPath,
-    pub guest_cid: u32,
-    pub memory_file_path: HostPath,
-    pub serial_log_path: HostPath,
-    pub vmm_log_path: HostPath,
-    pub network: Box<RuntimeNetworkIdentity>,
-    pub devices: Vec<PreparedDeviceInput>,
-}
-
-/// One exact PrepareDevice expectation retained by every later launch phase.
-///
-/// Public process/device observations are only projections of this authority:
-/// direct/queue settings and sealed serving provenance cannot be reconstructed
-/// from them after an Agent restart.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PreparedDeviceInput {
-    pub volume_intent_id: Id,
-    pub disk_id: Id,
-    pub volume_id: Id,
-    pub disk_kind: DiskKind,
-    pub attachment_id: Id,
-    pub attachment_epoch: FenceEpoch,
-    pub acquire_origin: AcquireOrigin,
-    pub expected_head: RemoteHead,
-    pub size_bytes: u64,
-    pub durability: Durability,
-    pub guest_device: GuestDeviceIdentity,
-    pub ownership_token: RandomId128,
-    pub serving_authority: Box<ServingAuthorityProvenance>,
-    pub serving_process: ServingBlockdIdentity,
-    pub frontend: PrepareDeviceFrontend,
-}
-
 /// Exact PersistentDisk filesystem identity retained by every atomic
 /// lifecycle filesystem phase after the VMM has started.
 ///
-/// This is deliberately a projection of one [`PreparedDeviceInput`] plus the
-/// current immutable mount contract. The Node joins it back to the atomic
-/// runtime launch identity before issuing a Guest effect; the Guest echo is
-/// physical evidence, never storage or attachment authority.
+/// This deliberately pairs one attachment's exact identity — runtime
+/// incarnation, volume, attachment epoch and Guest device — with its immutable
+/// mount contract. The Node joins it back to the runtime launch identity
+/// before issuing a Guest effect; the Guest echo is physical evidence, never
+/// storage or attachment authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PersistentFilesystemBinding {
@@ -1333,16 +1116,6 @@ pub struct RuntimeResidueAuthorityRequest {
     pub lineage: ResidueDataDirectoryLineage,
 }
 
-#[cfg(feature = "proposed-node-residue-reclamation")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeResidueAuthoritySuccess {
-    pub version: ContractVersion,
-    pub session: SessionBinding,
-    pub lineage: ResidueDataDirectoryLineage,
-    pub outcome: RuntimeResidueAuthorityOutcome,
-}
-
 /// A read-only Control decision from one repeatable-read authority snapshot.
 /// `Retained` is diagnostic only.  `Reclaimable` contains the complete proof
 /// that a Node must independently validate against its retained descriptor.
@@ -1469,27 +1242,6 @@ pub enum AcquireOrigin {
 pub enum MountAccess {
     ReadWrite,
     ReadOnly,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProcessState {
-    Running,
-    Paused,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RouteGateBinding {
-    pub workspace_id: Id,
-    pub endpoint_id: Id,
-    pub hostname: Hostname,
-    pub cat_id: Id,
-    pub node_id: Id,
-    pub runtime_incarnation: RandomId128,
-    pub route_epoch: Epoch,
-    pub protocol: HttpProtocol,
-    pub target_port: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
