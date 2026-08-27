@@ -1037,10 +1037,6 @@ fn exactly_one(changed: u64) -> AuthorityTxResult<()> {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "used by the retained release mutation gate for semantic resources"
-)]
 fn closed() -> AuthorityTransactionError {
     AuthorityTransactionError::Application(ApiError::unavailable(
         "production product mutations are Closed",

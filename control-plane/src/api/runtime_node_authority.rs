@@ -328,7 +328,6 @@ impl RuntimeNodeAuthorityService {
     }
 
     #[cfg(test)]
-    #[allow(dead_code, reason = "used by focused shutdown fault-injection tests")]
     pub(crate) fn active_commit_resolutions(&self) -> usize {
         self.resolutions.active_count()
     }

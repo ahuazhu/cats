@@ -1,34 +1,27 @@
 //! Shared, framework-neutral Agent registration transport primitives.
 //!
 //! HTTP adapters own route/header admission and bounded body reads. This
-//! module owns the one Ed25519 request-proof dialect and the endpoint-local
-//! typed error envelope consumed by both Control and Node.
+//! module owns the one Ed25519 request-proof dialect shared by Control and
+//! Node. The AgentSession registration envelope it once carried left with
+//! ADR-0059; only the signing dialect remains.
 
 use std::sync::Arc;
 
+use crate::runtime_reconciliation::{append_frame, decode_base64url_exact};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::runtime_reconciliation::{
-    decode_node_identity, encode_contract_error, encode_node_identity, ContractError,
-    ContractVersion, CredentialBinding, Epoch, Id, NodeIdentity, NodeIdentityState, Sha256Digest,
+    decode_node_identity, encode_node_identity, CredentialBinding, Id, NodeIdentity,
+    NodeIdentityState, Sha256Digest,
 };
 
-pub const REGISTRATION_PATH: &str = "/v1/internal/runtime/agent-sessions";
-pub const REGISTRATION_METHOD: &str = "POST";
 pub const JSON_CONTENT_TYPE: &str = "application/json";
-pub const REGISTRATION_REQUEST_MAX_WIRE_BYTES: usize = 16_384;
-pub const REGISTRATION_SUCCESS_MAX_WIRE_BYTES: usize = 16_384;
 pub const NODE_CREDENTIAL_ID_HEADER: &str = "cats-node-credential-id";
 pub const NODE_PUBLIC_KEY_SPKI_HEADER: &str = "cats-node-public-key-spki";
 pub const NODE_SIGNATURE_HEADER: &str = "cats-node-signature";
-pub const NODE_AUTHENTICATE_CHALLENGE: &str = "CatsNodeSignature realm=\"runtime-registration\"";
-pub const REGISTRATION_ERROR_MAX_WIRE_BYTES: usize = 20_480;
-pub const REGISTRATION_ERROR_MESSAGE_MAX_BYTES: usize = 1_024;
-pub const AGENT_SESSION_LEASE_MS: u64 = 60_000;
 
 const SIGNATURE_DOMAIN: &[u8] = b"cats.internal-runtime.request.v1";
 const ED25519_SPKI_PREFIX: [u8; 12] = [
@@ -285,11 +278,12 @@ pub fn verify_request_proof(
     signature: &str,
 ) -> Result<AuthenticatedNodeCredential, RequestProofError> {
     let credential_id = Id::new(credential_id.to_owned()).ok_or(RequestProofError)?;
-    let spki = decode_base64url_exact::<ED25519_SPKI_LEN>(public_key_spki)?;
+    let spki = decode_base64url_exact::<ED25519_SPKI_LEN>(public_key_spki)
+        .map_err(|()| RequestProofError)?;
     if spki[..ED25519_SPKI_PREFIX.len()] != ED25519_SPKI_PREFIX {
         return Err(RequestProofError);
     }
-    let signature = decode_base64url_exact::<64>(signature)?;
+    let signature = decode_base64url_exact::<64>(signature).map_err(|()| RequestProofError)?;
     let signed = signed_request(method, path, credential_id.as_str(), &spki, body);
     UnparsedPublicKey::new(&ED25519, &spki[ED25519_SPKI_PREFIX.len()..])
         .verify(&signed, &signature)
@@ -314,11 +308,12 @@ pub(crate) fn verify_framed_request_proof(
     signature: &str,
 ) -> Result<AuthenticatedNodeCredential, RequestProofError> {
     let credential_id = Id::new(credential_id.to_owned()).ok_or(RequestProofError)?;
-    let spki = decode_base64url_exact::<ED25519_SPKI_LEN>(public_key_spki)?;
+    let spki = decode_base64url_exact::<ED25519_SPKI_LEN>(public_key_spki)
+        .map_err(|()| RequestProofError)?;
     if spki[..ED25519_SPKI_PREFIX.len()] != ED25519_SPKI_PREFIX {
         return Err(RequestProofError);
     }
-    let signature = decode_base64url_exact::<64>(signature)?;
+    let signature = decode_base64url_exact::<64>(signature).map_err(|()| RequestProofError)?;
     UnparsedPublicKey::new(&ED25519, &spki[ED25519_SPKI_PREFIX.len()..])
         .verify(framed, &signature)
         .map_err(|_| RequestProofError)?;
@@ -361,28 +356,6 @@ fn signed_request(
     signed
 }
 
-fn append_frame(output: &mut Vec<u8>, value: &[u8]) {
-    output.extend_from_slice(&(value.len() as u64).to_be_bytes());
-    output.extend_from_slice(value);
-}
-
-fn decode_base64url_exact<const N: usize>(value: &str) -> Result<[u8; N], RequestProofError> {
-    if value.is_empty()
-        || value
-            .bytes()
-            .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'))
-    {
-        return Err(RequestProofError);
-    }
-    let decoded = URL_SAFE_NO_PAD
-        .decode(value)
-        .map_err(|_| RequestProofError)?;
-    if decoded.len() != N || URL_SAFE_NO_PAD.encode(&decoded) != value {
-        return Err(RequestProofError);
-    }
-    decoded.try_into().map_err(|_| RequestProofError)
-}
-
 fn decode_pkcs8_pem(input: &[u8]) -> Result<Vec<u8>, RequestSignerError> {
     let text = std::str::from_utf8(input).map_err(|_| RequestSignerError::InvalidPrivateKeyPem)?;
     let text = text.strip_suffix('\n').unwrap_or(text);
@@ -419,98 +392,16 @@ fn encode_canonical_pkcs8_pem(der: &[u8]) -> Vec<u8> {
     pem
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AgentRegistrationError {
-    pub version: ContractVersion,
-    pub error: AgentRegistrationErrorDetail,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "code", rename_all = "snake_case", deny_unknown_fields)]
-pub enum AgentRegistrationErrorDetail {
-    AuthenticationFailed,
-    IdentityNotEligible,
-    SessionEpochMismatch {
-        current_agent_session_epoch: Option<Epoch>,
-        presented_expected_agent_session_epoch: Option<Epoch>,
-    },
-    HttpRequestRejected {
-        problem: HttpRequestRejection,
-    },
-    ContractError {
-        contract_error: ContractError,
-    },
-    TemporarilyUnavailable,
-    Internal,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HttpRequestRejection {
-    MethodNotAllowed,
-    QueryNotAllowed,
-    ContentTypeNotAllowed,
-    ContentEncodingNotAllowed,
-    AuthorizationNotAllowed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum AgentRegistrationErrorWireError {
-    #[error("Agent registration error wire exceeds its byte limit")]
-    LimitExceeded,
-    #[error("Agent registration error wire is malformed")]
-    Malformed,
-    #[error("Agent registration error wire is not canonical")]
-    NonCanonical,
-}
-
-pub fn encode_agent_registration_error(
-    value: &AgentRegistrationError,
-) -> Result<Vec<u8>, AgentRegistrationErrorWireError> {
-    validate_registration_error(value)?;
-    let json =
-        serde_json::to_value(value).map_err(|_| AgentRegistrationErrorWireError::Malformed)?;
-    let bytes = crate::runtime_reconciliation::canonical_json_value_bytes(&json);
-    if bytes.len() > REGISTRATION_ERROR_MAX_WIRE_BYTES {
-        return Err(AgentRegistrationErrorWireError::LimitExceeded);
-    }
-    Ok(bytes)
-}
-
-pub fn decode_agent_registration_error(
-    bytes: &[u8],
-) -> Result<AgentRegistrationError, AgentRegistrationErrorWireError> {
-    if bytes.len() > REGISTRATION_ERROR_MAX_WIRE_BYTES {
-        return Err(AgentRegistrationErrorWireError::LimitExceeded);
-    }
-    let value: AgentRegistrationError =
-        serde_json::from_slice(bytes).map_err(|_| AgentRegistrationErrorWireError::Malformed)?;
-    let canonical = encode_agent_registration_error(&value)?;
-    if canonical != bytes {
-        return Err(AgentRegistrationErrorWireError::NonCanonical);
-    }
-    Ok(value)
-}
-
-fn validate_registration_error(
-    value: &AgentRegistrationError,
-) -> Result<(), AgentRegistrationErrorWireError> {
-    if value.version != ContractVersion::V1
-        || value.message.len() > REGISTRATION_ERROR_MESSAGE_MAX_BYTES
-    {
-        return Err(AgentRegistrationErrorWireError::Malformed);
-    }
-    if let AgentRegistrationErrorDetail::ContractError { contract_error } = &value.error {
-        encode_contract_error(contract_error)
-            .map_err(|_| AgentRegistrationErrorWireError::Malformed)?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::runtime_reconciliation::ContractVersion;
+
+    /// The method/path pair this module's fixed signature vector is pinned
+    /// against. The dialect signs any pair; these exact strings must not change
+    /// or the pinned signature below stops proving anything.
+    const SIGNED_METHOD: &str = "POST";
+    const SIGNED_PATH: &str = "/v1/internal/runtime/agent-sessions";
+
     use super::*;
     use ring::rand::SystemRandom;
 
@@ -637,7 +528,7 @@ mod tests {
     #[test]
     fn proof_fixed_vector_and_all_bound_fields() {
         let signer = vector_signer();
-        let proof = signer.sign(REGISTRATION_METHOD, REGISTRATION_PATH, BODY);
+        let proof = signer.sign(SIGNED_METHOD, SIGNED_PATH, BODY);
         assert_eq!(BODY.len(), 359);
         assert_eq!(
             proof.public_key_spki,
@@ -652,8 +543,8 @@ mod tests {
             "X0xnGNt7Yux9_i9-T4LaBjP-E0KXsjGmOuGtJ2-ATmYLivVTILs2kD4_mWScT1YNyS1GGjw9_b_rJxmPoziuBg"
         );
         let authenticated = verify_request_proof(
-            REGISTRATION_METHOD,
-            REGISTRATION_PATH,
+            SIGNED_METHOD,
+            SIGNED_PATH,
             BODY,
             &proof.credential_id,
             &proof.public_key_spki,
@@ -673,14 +564,14 @@ mod tests {
         for candidate in [
             verify_request_proof(
                 "GET",
-                REGISTRATION_PATH,
+                SIGNED_PATH,
                 BODY,
                 &proof.credential_id,
                 &proof.public_key_spki,
                 &proof.signature,
             ),
             verify_request_proof(
-                REGISTRATION_METHOD,
+                SIGNED_METHOD,
                 "/v1/internal/runtime/other",
                 BODY,
                 &proof.credential_id,
@@ -688,16 +579,16 @@ mod tests {
                 &proof.signature,
             ),
             verify_request_proof(
-                REGISTRATION_METHOD,
-                REGISTRATION_PATH,
+                SIGNED_METHOD,
+                SIGNED_PATH,
                 BODY,
                 "credential_b",
                 &proof.public_key_spki,
                 &proof.signature,
             ),
             verify_request_proof(
-                REGISTRATION_METHOD,
-                REGISTRATION_PATH,
+                SIGNED_METHOD,
+                SIGNED_PATH,
                 &changed_body,
                 &proof.credential_id,
                 &proof.public_key_spki,
@@ -711,7 +602,7 @@ mod tests {
     #[test]
     fn proof_decoder_rejects_noncanonical_and_wrong_length_values() {
         let signer = vector_signer();
-        let proof = signer.sign(REGISTRATION_METHOD, REGISTRATION_PATH, BODY);
+        let proof = signer.sign(SIGNED_METHOD, SIGNED_PATH, BODY);
         let mut different_canonical_spki = *signer.public_key_spki_der();
         different_canonical_spki[ED25519_SPKI_LEN - 1] ^= 1;
         for spki in [
@@ -721,8 +612,8 @@ mod tests {
             URL_SAFE_NO_PAD.encode(different_canonical_spki),
         ] {
             assert!(verify_request_proof(
-                REGISTRATION_METHOD,
-                REGISTRATION_PATH,
+                SIGNED_METHOD,
+                SIGNED_PATH,
                 BODY,
                 &proof.credential_id,
                 &spki,
@@ -731,49 +622,13 @@ mod tests {
             .is_err());
         }
         assert!(verify_request_proof(
-            REGISTRATION_METHOD,
-            REGISTRATION_PATH,
+            SIGNED_METHOD,
+            SIGNED_PATH,
             BODY,
             &proof.credential_id,
             &proof.public_key_spki,
             &format!("{}=", proof.signature),
         )
         .is_err());
-    }
-
-    #[test]
-    fn endpoint_error_wire_is_closed_and_canonical() {
-        let value = AgentRegistrationError {
-            version: ContractVersion::V1,
-            error: AgentRegistrationErrorDetail::SessionEpochMismatch {
-                current_agent_session_epoch: Epoch::new(7),
-                presented_expected_agent_session_epoch: None,
-            },
-            message: "session epoch did not match".to_owned(),
-        };
-        let encoded = encode_agent_registration_error(&value).unwrap();
-        assert_eq!(decode_agent_registration_error(&encoded).unwrap(), value);
-        let spaced = String::from_utf8(encoded)
-            .unwrap()
-            .replacen('{', "{ ", 1)
-            .into_bytes();
-        assert_eq!(
-            decode_agent_registration_error(&spaced).unwrap_err(),
-            AgentRegistrationErrorWireError::NonCanonical
-        );
-        assert_eq!(
-            decode_agent_registration_error(
-                br#"{"error":{"code":"internal"},"extra":1,"message":"x","version":1}"#,
-            )
-            .unwrap_err(),
-            AgentRegistrationErrorWireError::Malformed
-        );
-        assert_eq!(
-            decode_agent_registration_error(
-                br#"{"error":{"code":"internal"},"message":"x","message":"y","version":1}"#,
-            )
-            .unwrap_err(),
-            AgentRegistrationErrorWireError::Malformed
-        );
     }
 }

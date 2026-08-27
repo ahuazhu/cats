@@ -7,13 +7,10 @@
 //! fence cutoff, neither of which needs an AgentSession row.
 
 use cats_api::error::ApiError;
-use cats_api::runtime_reconciliation::{
-    AsciiText, Id, NodeIdentity, ProviderScope, UnixMillis, WireU64,
-};
+use cats_api::runtime_reconciliation::{AsciiText, Id, NodeIdentity, ProviderScope, WireU64};
 use cats_storage::object_write_authority::{
-    begin_object_writer_cutoff, empty_terminal_prefix_sha256, validate_object_write_authority,
-    ObjectWriteAuthority, ObjectWriteAuthorityState, ObjectWriteCredentialBinding,
-    ObjectWriteCredentialRetirementCause, ObjectWriteCredentialState, ObjectWriterIdentity,
+    empty_terminal_prefix_sha256, validate_object_write_authority, ObjectWriteAuthority,
+    ObjectWriteAuthorityState, ObjectWriterIdentity,
 };
 use postgres::Transaction;
 
@@ -54,27 +51,6 @@ fn load_authority_for_update(
         )?
         .map(|row| decode(row.get("record_json")))
         .transpose()
-}
-
-#[allow(
-    dead_code,
-    reason = "retained for the semantic storage adapter's exact Host-fence cutoff"
-)]
-fn load_authority_credentials_for_update(
-    transaction: &mut Transaction<'_>,
-    writer_authority_id: &Id,
-) -> AuthorityTxResult<Vec<ObjectWriteCredentialBinding>> {
-    transaction
-        .query(
-            "SELECT record::text AS record_json
-               FROM object_write_credentials
-              WHERE writer_authority_id=$1
-              ORDER BY credential_id COLLATE \"C\" FOR UPDATE",
-            &[&writer_authority_id.as_str()],
-        )?
-        .into_iter()
-        .map(|row| decode(row.get("record_json")))
-        .collect()
 }
 
 pub(super) fn open_object_write_authority_in(
@@ -187,149 +163,6 @@ fn insert_authority(
     )?;
     if changed != 1 {
         return Err(corrupt("object-write authority insert changed no row"));
-    }
-    Ok(())
-}
-
-#[allow(
-    dead_code,
-    reason = "retained for the semantic storage adapter's exact Host-fence cutoff"
-)]
-pub(super) fn begin_object_writer_cutoff_in(
-    transaction: &mut Transaction<'_>,
-    writer_authority_id: &Id,
-    fence_attempt_id: &Id,
-    cutoff_effective_at_unix_ms: UnixMillis,
-) -> AuthorityTxResult<ObjectWriteAuthority> {
-    let Some(authority) = load_authority_for_update(transaction, writer_authority_id)? else {
-        return Err(application(ApiError::not_found("ObjectWriteAuthority")));
-    };
-    let credentials = load_authority_credentials_for_update(transaction, writer_authority_id)?;
-    let (updated, retired) = begin_object_writer_cutoff(
-        &authority,
-        &credentials,
-        fence_attempt_id,
-        cutoff_effective_at_unix_ms,
-    )
-    .map_err(|error| application(ApiError::failed_precondition(error.to_string())))?;
-    for credential in &retired {
-        if matches!(credential.state, ObjectWriteCredentialState::Retired { .. })
-            && credentials.iter().any(|stored| {
-                stored.credential.credential_id == credential.credential.credential_id
-                    && matches!(stored.state, ObjectWriteCredentialState::Active)
-            })
-        {
-            persist_retired_credential(transaction, credential)?;
-        }
-    }
-    persist_authority(transaction, &updated)?;
-    Ok(updated)
-}
-
-#[allow(
-    dead_code,
-    reason = "retained for the semantic storage adapter's exact Host-fence cutoff"
-)]
-fn persist_authority(
-    transaction: &mut Transaction<'_>,
-    authority: &ObjectWriteAuthority,
-) -> AuthorityTxResult<()> {
-    let (state, fence_attempt_id, cutoff_at, cutoff_sequence, cutoff_receipt) =
-        match &authority.state {
-            ObjectWriteAuthorityState::Open => ("open", None, None, None, None),
-            ObjectWriteAuthorityState::CutoffPending {
-                fence_attempt_id,
-                cutoff_sequence,
-                cutoff_effective_at_unix_ms,
-            } => (
-                "cutoff_pending",
-                Some(fence_attempt_id.as_str()),
-                Some(pg(cutoff_effective_at_unix_ms.get())?),
-                Some(pg(cutoff_sequence.get())?),
-                None,
-            ),
-            ObjectWriteAuthorityState::CutoffComplete { receipt } => (
-                "cutoff_complete",
-                Some(receipt.fence_attempt_id.as_str()),
-                Some(pg(receipt.cutoff_effective_at_unix_ms.get())?),
-                Some(pg(receipt.cutoff_sequence.get())?),
-                Some(encode(receipt)?),
-            ),
-        };
-    let record = encode(authority)?;
-    let max = pg(authority.max_accepted_sequence.get())?;
-    let terminal = pg(authority.terminal_prefix_sequence.get())?;
-    let changed = transaction.execute(
-        "UPDATE object_write_authorities
-            SET record=$2::TEXT::jsonb, state=$3, max_accepted_sequence=$4,
-                terminal_prefix_sequence=$5, terminal_prefix_sha256=$6,
-                fence_attempt_id=$7, cutoff_effective_at_unix_ms=$8,
-                cutoff_sequence=$9, cutoff_receipt=$10::TEXT::jsonb
-          WHERE writer_authority_id=$1",
-        &[
-            &authority.writer.authority_id.as_str(),
-            &record,
-            &state,
-            &max,
-            &terminal,
-            &authority.terminal_prefix_sha256.as_str(),
-            &fence_attempt_id,
-            &cutoff_at,
-            &cutoff_sequence,
-            &cutoff_receipt,
-        ],
-    )?;
-    if changed != 1 {
-        return Err(corrupt("object-write authority disappeared while locked"));
-    }
-    Ok(())
-}
-
-#[allow(
-    dead_code,
-    reason = "retained for the semantic storage adapter's exact Host-fence cutoff"
-)]
-fn persist_retired_credential(
-    transaction: &mut Transaction<'_>,
-    binding: &ObjectWriteCredentialBinding,
-) -> AuthorityTxResult<()> {
-    let ObjectWriteCredentialState::Retired {
-        cause,
-        retirement_receipt_id,
-        retired_at_unix_ms,
-    } = &binding.state
-    else {
-        return Ok(());
-    };
-    let (kind, transition_id) = match cause {
-        ObjectWriteCredentialRetirementCause::ParentCutoff { fence_attempt_id } => {
-            ("parent_cutoff", fence_attempt_id)
-        }
-        ObjectWriteCredentialRetirementCause::ExactRelease {
-            release_transition_id,
-        } => ("exact_release", release_transition_id),
-    };
-    let record = encode(binding)?;
-    let retired_at = pg(retired_at_unix_ms.get())?;
-    let changed = transaction.execute(
-        "UPDATE object_write_credentials
-            SET record=$2::TEXT::jsonb, state='retired', retirement_kind=$3,
-                retirement_transition_id=$4, retirement_receipt_id=$5,
-                retired_at_unix_ms=$6
-          WHERE credential_id=$1 AND state='active'",
-        &[
-            &binding.credential.credential_id.as_str(),
-            &record,
-            &kind,
-            &transition_id.as_str(),
-            &retirement_receipt_id.as_str(),
-            &retired_at,
-        ],
-    )?;
-    if changed != 1 {
-        return Err(corrupt(
-            "object-write credential changed while its parent was locked",
-        ));
     }
     Ok(())
 }

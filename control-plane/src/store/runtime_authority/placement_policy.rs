@@ -43,7 +43,6 @@ const APPLY_COLUMNS: &str = "
     outcome::text AS outcome_json, outcome_kind, committed_at_unix_ms";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code, reason = "consumed by the A23 admin HTTP composition")]
 pub(crate) enum RuntimeNodeAuthorityApplyStoreOutcome {
     Stored(RuntimeNodeAuthorityStoredOutcome),
     ApplyIdConflict,
@@ -165,7 +164,6 @@ struct TrustRevision {
 impl Store {
     /// Installs or exact-replays the one deployment trust bundle before the
     /// admin listener opens.
-    #[allow(dead_code, reason = "consumed by the A23 Control startup composition")]
     pub(crate) fn install_runtime_provisioner_trust_bundle(
         &self,
         bundle: &RuntimeProvisionerTrustBundle,
@@ -173,22 +171,6 @@ impl Store {
         encode_runtime_provisioner_trust_bundle(bundle)
             .map_err(|_| ApiError::invalid("runtime provisioner trust bundle is invalid"))?;
         self.authority_transaction(|transaction| install_trust_bundle_in(transaction, bundle))
-    }
-
-    /// Applies or exact-replays one provisioner-owned Node authority mutation.
-    #[allow(dead_code, reason = "consumed by the A23 admin HTTP composition")]
-    pub(crate) fn apply_runtime_node_authority(
-        &self,
-        principal: &FleetPolicyPrincipal,
-        apply: &RuntimeNodeAuthorityApply,
-    ) -> Result<RuntimeNodeAuthorityApplyStoreOutcome> {
-        encode_runtime_node_authority_apply(apply)
-            .map_err(|_| ApiError::invalid("runtime Node authority apply is invalid"))?;
-        validate_principal(principal)
-            .map_err(|_| ApiError::invalid("runtime Node authority principal is invalid"))?;
-        self.authority_transaction(|transaction| {
-            apply_runtime_node_authority_in(transaction, principal, apply)
-        })
     }
 
     /// Prove that the locally verified deployment key is still the exact
@@ -1101,19 +1083,6 @@ pub(super) fn load_policy_for_update(
         "SELECT {POLICY_COLUMNS} FROM runtime_node_placement_policies
           WHERE node_id=$1 FOR UPDATE"
     );
-    transaction
-        .query_opt(&sql, &[&node_id.as_str()])?
-        .map(|row| decode_policy(&row))
-        .transpose()
-}
-
-#[allow(dead_code, reason = "consumed by the A23 planner snapshot loader")]
-pub(super) fn load_policy_unlocked(
-    transaction: &mut Transaction<'_>,
-    node_id: &Id,
-) -> AuthorityTxResult<Option<NodePlacementPolicy>> {
-    let sql =
-        format!("SELECT {POLICY_COLUMNS} FROM runtime_node_placement_policies WHERE node_id=$1");
     transaction
         .query_opt(&sql, &[&node_id.as_str()])?
         .map(|row| decode_policy(&row))
