@@ -43,6 +43,8 @@ workos = { workspace = true }
 jsonwebtoken = { workspace = true }
 ring = { workspace = true }
 futures-util = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tungstenite = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

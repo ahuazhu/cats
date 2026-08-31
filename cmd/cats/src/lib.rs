@@ -25,6 +25,7 @@ mod runtime_provisioner;
 #[cfg(all(test, unix))]
 #[path = "runtime_provisioner_unsupported.rs"]
 mod runtime_provisioner_unsupported_compile_shape;
+mod shell;
 #[cfg(unix)]
 mod stable_unix_fs;
 mod term;
@@ -48,10 +49,82 @@ use cats_api::semantic_control::{
     DetachDiskRequest, DiskResponse, DiskView, PersistentMountPath, ResourceSlug,
     SemanticErrorBody,
 };
+use cats_api::sessions::{
+    ExecRequest, ExecResponse, DEFAULT_EXEC_TIMEOUT_MS, MAX_EXEC_ENV_BYTES,
+    MAX_EXEC_RESPONSE_JSON_BYTES, MAX_EXEC_STDIN_BYTES, MAX_EXEC_TIMEOUT_MS,
+};
 
 pub use term::ColorChoice;
 use term::{format_bytes, format_clock, truncate_visible, Align, Cell, Style, Table, Term};
 use view::UsageOutcome;
+
+/// A successfully dispatched remote process reported a non-zero exit. Keeping
+/// it typed lets the binary preserve a conventional 1..=255 code while every
+/// transport, protocol, validation, and local I/O error remains process exit 1.
+#[derive(Debug)]
+struct RemoteExitCode {
+    subject: &'static str,
+    code: i32,
+}
+
+impl std::fmt::Display for RemoteExitCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} exited with {}", self.subject, self.code)
+    }
+}
+
+impl std::error::Error for RemoteExitCode {}
+
+#[derive(Debug)]
+struct SignalExitCode {
+    signal: &'static str,
+    code: i32,
+}
+
+impl std::fmt::Display for SignalExitCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "interactive shell interrupted by {}",
+            self.signal
+        )
+    }
+}
+
+impl std::error::Error for SignalExitCode {}
+
+fn exact_process_exit_code(code: i32) -> i32 {
+    if (1..=255).contains(&code) {
+        code
+    } else {
+        1
+    }
+}
+
+fn remote_exit(subject: &'static str, code: i32) -> Result<()> {
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(RemoteExitCode { subject, code }.into())
+    }
+}
+
+/// Converts the CLI result into its OS process status without flattening an
+/// exact remote command result. Unknown/invalid statuses and ordinary errors
+/// are one; a successful command is zero.
+pub fn process_exit_code(result: &Result<()>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(error) => error.downcast_ref::<RemoteExitCode>().map_or_else(
+            || {
+                error
+                    .downcast_ref::<SignalExitCode>()
+                    .map_or(1, |signal| exact_process_exit_code(signal.code))
+            },
+            |remote| exact_process_exit_code(remote.code),
+        ),
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -158,6 +231,28 @@ pub enum Command {
     },
     /// Destroy a Cat and its RootDisk after retaining PersistentDisks safely.
     Destroy {
+        #[arg(value_name = "CAT_SLUG")]
+        cat_id: String,
+    },
+    /// Run one argv command inside a Cat, waking it if necessary.
+    Exec {
+        #[arg(value_name = "CAT_SLUG")]
+        cat_id: String,
+        /// How long the command may run, in seconds (default 120, maximum 3600).
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u64>,
+        /// Read newline-delimited NAME=VALUE entries for the child process.
+        #[arg(long, value_name = "PATH")]
+        env_file: Option<std::path::PathBuf>,
+        /// Connect the contents of PATH to the command's standard input.
+        #[arg(long, value_name = "PATH")]
+        stdin_file: Option<std::path::PathBuf>,
+        /// Command argv, after `--`; it is never interpreted by a shell.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Open an interactive login shell inside a Cat, waking it if necessary.
+    Shell {
         #[arg(value_name = "CAT_SLUG")]
         cat_id: String,
     },
@@ -769,6 +864,42 @@ struct Client {
     workspace_label: Option<String>,
 }
 
+const MAX_EXEC_ERROR_RESPONSE_BYTES: usize = 16 * 1024;
+// Control may use T + 30 seconds for Node execution and result delivery. The
+// CLI stays outside that envelope so Control, rather than the public HTTP
+// client, owns the terminal timeout reported to the user.
+const EXEC_CONTROL_NODE_ENVELOPE_MARGIN: Duration = Duration::from_secs(30);
+const EXEC_PUBLIC_RESPONSE_MARGIN: Duration = Duration::from_secs(15);
+
+fn read_bounded_http_body(
+    response: reqwest::blocking::Response,
+    max_bytes: usize,
+    label: &str,
+) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    if let Some(content_length) = response.content_length() {
+        anyhow::ensure!(
+            content_length <= u64::try_from(max_bytes).unwrap_or(u64::MAX),
+            "{label} body exceeds the {max_bytes}-byte limit"
+        );
+    }
+    let mut body = Vec::new();
+    response
+        .take(
+            u64::try_from(max_bytes)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        )
+        .read_to_end(&mut body)
+        .with_context(|| format!("read {label} body"))?;
+    anyhow::ensure!(
+        body.len() <= max_bytes,
+        "{label} body exceeds the {max_bytes}-byte limit"
+    );
+    Ok(body)
+}
+
 impl Client {
     fn new(cli: &Cli) -> Result<Self> {
         if let Some(token) = &cli.token {
@@ -874,6 +1005,33 @@ impl Client {
             bail!("HTTP {status}: {}", String::from_utf8_lossy(&body));
         }
         Ok((status, body))
+    }
+
+    fn send_exec(&self, request: reqwest::blocking::RequestBuilder) -> Result<ExecResponse> {
+        let response = request
+            .bearer_auth(&self.token)
+            .send()
+            .context("control plane unreachable")?;
+        let status = response.status();
+        let (max_bytes, label) = if status.is_success() {
+            (MAX_EXEC_RESPONSE_JSON_BYTES, "exec response")
+        } else {
+            (MAX_EXEC_ERROR_RESPONSE_BYTES, "exec error response")
+        };
+        let body = read_bounded_http_body(response, max_bytes, label)?;
+        if !status.is_success() {
+            if let Ok(error) = serde_json::from_slice::<SemanticErrorBody>(&body) {
+                bail!("{} ({:?})", error.message, error.code);
+            }
+            if let Ok(error) = serde_json::from_slice::<cats_api::error::ErrorBody>(&body) {
+                bail!("{} ({:?})", error.message, error.code);
+            }
+            bail!("HTTP {status}: {}", String::from_utf8_lossy(&body));
+        }
+        let response: ExecResponse =
+            serde_json::from_slice(&body).context("invalid exec response")?;
+        response.validate().context("invalid exec response")?;
+        Ok(response)
     }
 
     fn get(&self, path: &str) -> Result<serde_json::Value> {
@@ -1621,6 +1779,67 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Warm { cat_id } => run_semantic_cat_action(&client, &cli, cat_id, "warm"),
         Command::Cold { cat_id } => run_semantic_cat_action(&client, &cli, cat_id, "cold"),
         Command::Destroy { cat_id } => run_semantic_cat_action(&client, &cli, cat_id, "destroy"),
+        Command::Exec {
+            cat_id,
+            timeout,
+            env_file,
+            stdin_file,
+            command,
+        } => {
+            resource_slug("cat", cat_id)?;
+            let env = env_file
+                .as_deref()
+                .map(read_exec_env_file)
+                .transpose()?
+                .unwrap_or_default();
+            let stdin = stdin_file
+                .as_deref()
+                .map(read_exec_stdin_file)
+                .transpose()?
+                .unwrap_or_default();
+            let timeout_ms = timeout.map(exec_timeout_ms).transpose()?;
+            let body = ExecRequest {
+                command: command.clone(),
+                timeout_ms,
+                env,
+                stdin,
+            };
+            body.validate().context("invalid exec request")?;
+
+            // Exec is not idempotent. This is deliberately one HTTP attempt:
+            // an ambiguous transport response is reported, never replayed.
+            let response = client.send_exec(
+                client
+                    .http
+                    .post(client.url(&format!("/cats/{cat_id}/exec")))
+                    .timeout(exec_http_timeout(timeout_ms))
+                    .json(&body),
+            )?;
+            use std::io::Write as _;
+            std::io::stdout()
+                .write_all(response.stdout.as_bytes())
+                .context("write command stdout")?;
+            std::io::stdout().flush().context("flush command stdout")?;
+            std::io::stderr()
+                .write_all(response.stderr.as_bytes())
+                .context("write command stderr")?;
+            std::io::stderr().flush().context("flush command stderr")?;
+            remote_exit("remote command", response.exit_code)
+        }
+        Command::Shell { cat_id } => {
+            resource_slug("cat", cat_id)?;
+            match shell::run(&client.base, &client.workspace_id, &client.token, cat_id)? {
+                shell::ShellExit::Remote(code) => remote_exit("remote shell", code),
+                shell::ShellExit::Interrupted {
+                    signal,
+                    process_exit_code,
+                } => Err(SignalExitCode {
+                    signal,
+                    code: process_exit_code,
+                }
+                .into()),
+            }
+        }
         Command::Deploy {
             name,
             app,
@@ -1737,8 +1956,9 @@ fn follow_oci_deployment(client: &Client, attempt_id: &str, cat: &str) -> Result
 fn read_exec_env_file(
     path: &std::path::Path,
 ) -> Result<std::collections::BTreeMap<String, String>> {
-    let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("read exec environment file {}", path.display()))?;
+    let contents = read_bounded_file(path, MAX_EXEC_ENV_BYTES, "exec environment")?;
+    let contents = String::from_utf8(contents)
+        .with_context(|| format!("exec environment file {} is not UTF-8", path.display()))?;
     let mut env = std::collections::BTreeMap::new();
     for (index, raw) in contents.lines().enumerate() {
         let line = raw.trim();
@@ -1761,6 +1981,49 @@ fn read_exec_env_file(
         env.insert(name.to_string(), value.to_string());
     }
     Ok(env)
+}
+
+fn read_exec_stdin_file(path: &std::path::Path) -> Result<Vec<u8>> {
+    read_bounded_file(path, MAX_EXEC_STDIN_BYTES, "exec stdin")
+}
+
+fn read_bounded_file(path: &std::path::Path, max_bytes: usize, label: &str) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("open {label} file {}", path.display()))?;
+    let mut contents = Vec::new();
+    file.take(
+        u64::try_from(max_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1),
+    )
+    .read_to_end(&mut contents)
+    .with_context(|| format!("read {label} file {}", path.display()))?;
+    anyhow::ensure!(
+        contents.len() <= max_bytes,
+        "{label} file {} exceeds the {max_bytes}-byte limit",
+        path.display()
+    );
+    Ok(contents)
+}
+
+fn exec_timeout_ms(seconds: u64) -> Result<u64> {
+    let timeout_ms = seconds
+        .checked_mul(1_000)
+        .context("exec timeout overflows milliseconds")?;
+    anyhow::ensure!(
+        timeout_ms > 0 && timeout_ms <= MAX_EXEC_TIMEOUT_MS,
+        "exec timeout must be between 1 and {} seconds",
+        MAX_EXEC_TIMEOUT_MS / 1_000
+    );
+    Ok(timeout_ms)
+}
+
+fn exec_http_timeout(timeout_ms: Option<u64>) -> Duration {
+    Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_EXEC_TIMEOUT_MS))
+        .saturating_add(EXEC_CONTROL_NODE_ENVELOPE_MARGIN)
+        .saturating_add(EXEC_PUBLIC_RESPONSE_MARGIN)
 }
 
 fn valid_env_name(name: &str) -> bool {
@@ -2130,6 +2393,73 @@ mod tests {
     }
 
     #[test]
+    fn exec_timeout_is_bounded_and_converted_without_overflow() {
+        assert_eq!(exec_timeout_ms(1).unwrap(), 1_000);
+        assert_eq!(exec_timeout_ms(3_600).unwrap(), MAX_EXEC_TIMEOUT_MS);
+        for rejected in [0, 3_601, u64::MAX] {
+            assert!(
+                exec_timeout_ms(rejected).is_err(),
+                "accepted invalid exec timeout {rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_http_timeout_strictly_contains_the_control_node_envelope() {
+        for execution_ms in [DEFAULT_EXEC_TIMEOUT_MS, MAX_EXEC_TIMEOUT_MS] {
+            let execution = Duration::from_millis(execution_ms);
+            let control_deadline = execution + EXEC_CONTROL_NODE_ENVELOPE_MARGIN;
+            let cli_deadline = exec_http_timeout(Some(execution_ms));
+
+            assert_eq!(cli_deadline, control_deadline + EXEC_PUBLIC_RESPONSE_MARGIN);
+            assert!(cli_deadline > control_deadline);
+        }
+        assert_eq!(
+            exec_http_timeout(None),
+            Duration::from_millis(DEFAULT_EXEC_TIMEOUT_MS)
+                + EXEC_CONTROL_NODE_ENVELOPE_MARGIN
+                + EXEC_PUBLIC_RESPONSE_MARGIN
+        );
+    }
+
+    #[test]
+    fn process_exit_preserves_only_valid_exact_remote_codes() {
+        assert_eq!(process_exit_code(&Ok(())), 0);
+        assert_eq!(process_exit_code(&remote_exit("remote command", 0)), 0);
+        assert_eq!(process_exit_code(&remote_exit("remote command", 1)), 1);
+        assert_eq!(process_exit_code(&remote_exit("remote command", 7)), 7);
+        assert_eq!(process_exit_code(&remote_exit("remote shell", 255)), 255);
+        for invalid in [-9, -1, 256, i32::MAX] {
+            assert_eq!(
+                process_exit_code(&remote_exit("remote command", invalid)),
+                1
+            );
+        }
+        assert_eq!(process_exit_code(&Err(anyhow!("transport failed"))), 1);
+        assert_eq!(
+            process_exit_code(&Err(SignalExitCode {
+                signal: "SIGTERM",
+                code: 143,
+            }
+            .into())),
+            143
+        );
+    }
+
+    #[test]
+    fn exec_stdin_file_is_read_through_the_protocol_bound() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file()
+            .set_len(u64::try_from(MAX_EXEC_STDIN_BYTES + 1).unwrap())
+            .unwrap();
+        let error = read_exec_stdin_file(file.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("exceeds the"),
+            "unexpected oversized-input error: {error:#}"
+        );
+    }
+
+    #[test]
     fn create_rejects_a_user_boot_image_override() {
         use clap::Parser as _;
 
@@ -2192,6 +2522,45 @@ mod tests {
         for retired in ["start", "stop", "delete", "resume"] {
             assert!(Cli::try_parse_from(["cats", retired, "cat_01"]).is_err());
         }
+        let exec = Cli::parse_from([
+            "cats",
+            "exec",
+            "dev",
+            "--timeout",
+            "900",
+            "--env-file",
+            "build.env",
+            "--stdin-file",
+            "request.bin",
+            "--",
+            "cargo",
+            "test",
+            "--workspace",
+        ]);
+        match exec.command {
+            Command::Exec {
+                cat_id,
+                timeout,
+                env_file,
+                stdin_file,
+                command,
+            } => {
+                assert_eq!(cat_id, "dev");
+                assert_eq!(timeout, Some(900));
+                assert_eq!(env_file.unwrap(), std::path::PathBuf::from("build.env"));
+                assert_eq!(stdin_file.unwrap(), std::path::PathBuf::from("request.bin"));
+                assert_eq!(command, ["cargo", "test", "--workspace"]);
+            }
+            other => panic!("expected exec, got {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["cats", "exec", "dev"]).is_err(),
+            "exec without argv must fail before contacting Control"
+        );
+        assert!(matches!(
+            Cli::parse_from(["cats", "shell", "dev"]).command,
+            Command::Shell { cat_id } if cat_id == "dev"
+        ));
         let deploy = Cli::parse_from([
             "cats",
             "deploy",
@@ -2977,6 +3346,258 @@ mod tests {
     }
 
     #[test]
+    fn exec_sends_one_workspace_scoped_argv_request() {
+        use clap::Parser as _;
+
+        let files = tempfile::tempdir().unwrap();
+        let env_path = files.path().join("exec.env");
+        let stdin_path = files.path().join("stdin.bin");
+        std::fs::write(&env_path, "# private input\nMODE=test\n").unwrap();
+        std::fs::write(&stdin_path, b"request bytes").unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let captured = read_request(&mut stream);
+            write_json_response(&mut stream, br#"{"exit_code":0,"stdout":"","stderr":""}"#);
+            drop(stream);
+            listener.set_nonblocking(true).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+            captured
+        });
+        let base = format!("http://{address}");
+        let argv = vec![
+            "cats".to_owned(),
+            "--api-url".to_owned(),
+            base,
+            "--token".to_owned(),
+            "test-token".to_owned(),
+            "--workspace".to_owned(),
+            "ws_01".to_owned(),
+            "exec".to_owned(),
+            "app".to_owned(),
+            "--timeout".to_owned(),
+            "7".to_owned(),
+            "--env-file".to_owned(),
+            env_path.display().to_string(),
+            "--stdin-file".to_owned(),
+            stdin_path.display().to_string(),
+            "--".to_owned(),
+            "/usr/bin/printf".to_owned(),
+            "%s".to_owned(),
+            "literal argument".to_owned(),
+        ];
+        run(Cli::parse_from(argv)).unwrap();
+
+        let (headers, body) = server.join().unwrap();
+        assert_eq!(
+            headers.lines().next().unwrap(),
+            "POST /v1/workspaces/ws_01/cats/app/exec HTTP/1.1"
+        );
+        assert_eq!(
+            request_header(&headers, "authorization"),
+            "Bearer test-token"
+        );
+        let request: ExecRequest = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            request.command,
+            ["/usr/bin/printf", "%s", "literal argument"]
+        );
+        assert_eq!(request.timeout_ms, Some(7_000));
+        assert_eq!(request.env.get("MODE").map(String::as_str), Some("test"));
+        assert_eq!(request.stdin, b"request bytes");
+    }
+
+    fn minimal_exec_request() -> ExecRequest {
+        ExecRequest {
+            command: vec!["true".to_owned()],
+            timeout_ms: None,
+            env: std::collections::BTreeMap::new(),
+            stdin: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn exec_rejects_oversized_declared_success_before_reading_its_body() {
+        use std::io::Write as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_EXEC_RESPONSE_JSON_BYTES + 1
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        let client = runtime_test_client(base);
+        let error = client
+            .send_exec(
+                client
+                    .http
+                    .post(client.url("/cats/app/exec"))
+                    .json(&minimal_exec_request()),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("exec response body exceeds"),
+            "unexpected declared-length error: {error:#}"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn exec_reads_an_exactly_maximum_declared_success_before_parsing_it() {
+        use std::io::Write as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {MAX_EXEC_RESPONSE_JSON_BYTES}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream
+                .write_all(&vec![b' '; MAX_EXEC_RESPONSE_JSON_BYTES])
+                .unwrap();
+            stream.flush().unwrap();
+        });
+        let client = runtime_test_client(base);
+        let error = client
+            .send_exec(
+                client
+                    .http
+                    .post(client.url("/cats/app/exec"))
+                    .json(&minimal_exec_request()),
+            )
+            .unwrap_err();
+        let error_chain = format!("{error:#}");
+        assert!(
+            error_chain.contains("invalid exec response"),
+            "exact-cap body did not reach JSON parsing: {error_chain}"
+        );
+        assert!(
+            !error_chain.contains("body exceeds"),
+            "exact-cap body was rejected by the body limit: {error_chain}"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn exec_rejects_oversized_chunked_success_at_the_stream_bound() {
+        use std::io::Write as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n",
+                MAX_EXEC_RESPONSE_JSON_BYTES + 1
+            )
+            .unwrap();
+            let oversized = vec![b' '; MAX_EXEC_RESPONSE_JSON_BYTES + 1];
+            stream.write_all(&oversized).unwrap();
+            let _ = stream.write_all(b"\r\n0\r\n\r\n");
+            let _ = stream.flush();
+        });
+        let client = runtime_test_client(base);
+        let error = client
+            .send_exec(
+                client
+                    .http
+                    .post(client.url("/cats/app/exec"))
+                    .json(&minimal_exec_request()),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("exec response body exceeds"),
+            "unexpected chunked-length error: {error:#}"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn exec_error_body_uses_its_independent_small_cap() {
+        use std::io::Write as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_EXEC_ERROR_RESPONSE_BYTES + 1
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        let client = runtime_test_client(base);
+        let error = client
+            .send_exec(
+                client
+                    .http
+                    .post(client.url("/cats/app/exec"))
+                    .json(&minimal_exec_request()),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exec error response body exceeds the 16384-byte limit"),
+            "unexpected error-body cap: {error:#}"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn exec_validates_output_after_the_bounded_json_read() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            let response = serde_json::to_vec(&ExecResponse {
+                exit_code: 0,
+                stdout: "x".repeat(cats_api::sessions::MAX_EXEC_OUTPUT_BYTES + 1),
+                stderr: String::new(),
+            })
+            .unwrap();
+            write_json_response(&mut stream, &response);
+        });
+        let client = runtime_test_client(base);
+        let error = client
+            .send_exec(
+                client
+                    .http
+                    .post(client.url("/cats/app/exec"))
+                    .json(&minimal_exec_request()),
+            )
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("stdout and stderr exceed"),
+            "ExecResponse validation was skipped: {error:#}"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
     fn semantic_disk_create_sends_exact_gib_bytes_without_idempotency_key() {
         use clap::Parser as _;
         use std::io::Write as _;
@@ -3135,8 +3756,6 @@ mod tests {
 
         let commands: &[&[&str]] = &[
             &["sync", "app"],
-            &["exec", "app", "--", "true"],
-            &["shell", "app"],
             &["sleep", "on", "app"],
             &["sleep", "off", "app"],
             &["sleep", "status", "app"],
@@ -3197,8 +3816,6 @@ mod tests {
             "delete",
             "resume",
             "sync",
-            "exec",
-            "shell",
             "sleep",
             "expiry",
             "mount",
@@ -3213,7 +3830,8 @@ mod tests {
             );
         }
         for supported in [
-            "ls", "show", "deploy", "disk", "run", "suspend", "warm", "cold", "destroy",
+            "ls", "show", "exec", "shell", "deploy", "disk", "run", "suspend", "warm", "cold",
+            "destroy",
         ] {
             assert!(
                 root_help.contains(&format!("\n  {supported} ")),

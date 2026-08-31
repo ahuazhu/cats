@@ -2,8 +2,9 @@
 
 - 状态：目标架构 + 当前实现边界；Control/Node 生命周期以
   [ADR-0059](decisions/0059-semantic-control-node-synchronous-protocol.md) 及其
-  [ADR-0062 Destroy 修正](decisions/0062-destroy-preempts-in-progress-cat-actions.md) 为当前协议
-- 更新：2026-08-23
+  [ADR-0062 Destroy 修正](decisions/0062-destroy-preempts-in-progress-cat-actions.md) 为当前协议；Exec/Shell
+  live access 以 [ADR-0065](decisions/0065-exec-shell-runtime-access-lane.md) 为目标合同
+- 更新：2026-08-31
 - 适用范围：产品资源、控制面、Node、网络入口、microVM 与块存储
 
 ## 1. 大目标
@@ -55,6 +56,15 @@ HostFenceRecovery 组织生命周期。幂等身份直接来自业务场景：
 
 通知、缓存和监控只用于降低延迟或发现异常，不能结算产品动作。
 
+Exec/Shell 不扩展上面的 lifecycle action lane：Control 在 Workspace auth 后按需调用 normal `run`，
+重新读取当前 placement，再由 noded 的 exact-Running-incarnation access gate admit live session。离开
+Running 和 reset 先 close/cancel/bounded-drain；Exec 模糊结果不使用 lifecycle 重试。精确合同见
+[Exec/Shell Protocol v1](specs/interactive-shell-protocol.md)。
+
+Control 的 public/内部 Exec transport loss 或 shutdown 只使调用方结果未知并回收 Control 本地请求，
+不是已进入 noded handler 的 cancel authority。Node Exec 必须继续持 exact guard，直到 wall timeout、
+Node lifecycle close、Node↔Guest loss 或 terminal result；V1 不增加 request ID/cancel endpoint。
+
 需要新 Node 的 create、Cold run 和失联恢复使用
 [ADR-0061](decisions/0061-semantic-least-allocated-placement.md)的事务内 Least-Allocated 策略；Node
 heartbeat 利用率不成为 placement authority。
@@ -79,9 +89,9 @@ heartbeat 利用率不成为 placement authority。
 
 | 组件 | 负责 | 不负责 |
 |---|---|---|
-| Control Plane | Workspace 授权、资源当前行、`current_action`、placement、同步调用 noded、Node liveness 和当前入口目标 | Running 块 I/O、VMM 是否真实存在、把心跳当动作结果 |
+| Control Plane | Workspace 授权、资源当前行、`current_action`、placement、同步调用 noded、Node liveness、当前入口目标，以及 auth-before-wake 的 Exec/Shell proxy | Running 块 I/O、VMM 是否真实存在、把心跳或 access response 当生命周期结果 |
 | Gateway/入口层 | 把新流量发送到每个 Cat 的唯一当前目标 | 生命周期动作、磁盘写入权限、保证旧连接立即消失 |
-| noded | 一台机器上的 Cat 实际状态、按 `cat_id` 串行动作、VMM/blockd/Guest 效果、reset 清理 | 用户 slug authority、跨 Host 自行选择 placement |
+| noded | 一台机器上的 Cat 实际状态、按 `cat_id` 串行动作、VMM/blockd/Guest 效果、reset 清理，以及 exact-incarnation runtime access gate | 用户 slug authority、跨 Host 自行选择 placement、用 access guard 充当 Host fence |
 | Cloud Hypervisor/Guest Agent | microVM 执行、pause/snapshot/restore、Guest readiness 和 mount readiness | S3/PostgreSQL/WorkOS 凭据与产品调度 |
 | cats-blockd | 标准块协议、cache/delta/commit 和 owner/epoch 检查 | Cat slug、产品状态和入口切换 |
 | PostgreSQL | Cat/Disk/Node 当前资源、动作占用、binding、入口目标及存储 metadata CAS | 判断 VMM 进程是否实际存在 |

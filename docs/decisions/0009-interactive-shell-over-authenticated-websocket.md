@@ -2,6 +2,8 @@
 
 - Status: Accepted
 - Date: 2026-07-22
+- Extended by: [ADR-0065](0065-exec-shell-runtime-access-lane.md), which replaces the
+  retired work-lease/reconcile composition with the semantic Control/Node access lane
 
 ## Context
 

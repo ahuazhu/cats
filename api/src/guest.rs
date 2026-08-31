@@ -982,7 +982,7 @@ impl RuntimeReadyResponseV1 {
 /// the same bounded length-prefixed JSON codec as the control protocol. Raw
 /// PTY bytes remain bytes so terminal escape sequences and UTF-8 fragments
 /// survive without lossy conversion.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GuestShellFrame {
     Input { data: Vec<u8> },
@@ -990,6 +990,46 @@ pub enum GuestShellFrame {
     Output { data: Vec<u8> },
     Exit { exit_code: i32 },
     Close,
+}
+
+impl<'de> Deserialize<'de> for GuestShellFrame {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Serde's internally tagged unit variants ignore extra fields even
+        // under `deny_unknown_fields`. Decode Close as an empty struct variant
+        // so every variant, including `{"type":"close"}`, is actually closed.
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+        enum StrictGuestShellFrame {
+            Input { data: Vec<u8> },
+            Resize { rows: u16, cols: u16 },
+            Output { data: Vec<u8> },
+            Exit { exit_code: i32 },
+            Close {},
+        }
+
+        Ok(match StrictGuestShellFrame::deserialize(deserializer)? {
+            StrictGuestShellFrame::Input { data } => Self::Input { data },
+            StrictGuestShellFrame::Resize { rows, cols } => Self::Resize { rows, cols },
+            StrictGuestShellFrame::Output { data } => Self::Output { data },
+            StrictGuestShellFrame::Exit { exit_code } => Self::Exit { exit_code },
+            StrictGuestShellFrame::Close {} => Self::Close,
+        })
+    }
+}
+
+impl GuestShellFrame {
+    /// Frames that the authenticated Host side may send to the Guest PTY.
+    pub fn is_host_to_guest(&self) -> bool {
+        matches!(self, Self::Input { .. } | Self::Resize { .. } | Self::Close)
+    }
+
+    /// Frames that the Guest PTY may send back to the Host side.
+    pub fn is_guest_to_host(&self) -> bool {
+        matches!(self, Self::Output { .. } | Self::Exit { .. })
+    }
 }
 
 /// JSON body for `POST /v1/work-leases` on the Guest runtime socket.
@@ -1173,6 +1213,137 @@ mod tests {
         let decoded: GuestRequest = read_frame(&mut &bytes[..]).unwrap();
         assert_eq!(decoded.id, 7);
         assert!(matches!(decoded.body, GuestRequestBody::Health));
+    }
+
+    #[test]
+    fn exec_and_shell_guest_envelopes_keep_the_exact_flattened_json_shape() {
+        let exec_request = GuestRequest {
+            id: 8,
+            body: GuestRequestBody::Exec {
+                command: vec!["/bin/sh".into(), "-c".into(), "printf ok".into()],
+                timeout_ms: Some(1_500),
+                env: [("CATS_TEST".into(), "yes".into())].into_iter().collect(),
+                stdin: vec![0, 255],
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&exec_request).unwrap(),
+            serde_json::json!({
+                "id": 8,
+                "op": "exec",
+                "command": ["/bin/sh", "-c", "printf ok"],
+                "timeout_ms": 1500,
+                "env": {"CATS_TEST": "yes"},
+                "stdin": [0, 255]
+            })
+        );
+        let exec_response = GuestResponse {
+            id: 8,
+            body: GuestResponseBody::Exec {
+                exit_code: 7,
+                stdout: "out".into(),
+                stderr: "err".into(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&exec_response).unwrap(),
+            serde_json::json!({
+                "id": 8,
+                "result": "exec",
+                "exit_code": 7,
+                "stdout": "out",
+                "stderr": "err"
+            })
+        );
+
+        let shell_request = GuestRequest {
+            id: 9,
+            body: GuestRequestBody::Shell { rows: 24, cols: 80 },
+        };
+        assert_eq!(
+            serde_json::to_value(&shell_request).unwrap(),
+            serde_json::json!({"id": 9, "op": "shell", "rows": 24, "cols": 80})
+        );
+        let shell_response = GuestResponse {
+            id: 9,
+            body: GuestResponseBody::ShellReady,
+        };
+        assert_eq!(
+            serde_json::to_value(&shell_response).unwrap(),
+            serde_json::json!({"id": 9, "result": "shell_ready"})
+        );
+        assert_eq!(
+            serde_json::to_value(GuestShellFrame::Input { data: vec![0, 255] }).unwrap(),
+            serde_json::json!({"type": "input", "data": [0, 255]})
+        );
+        assert_eq!(
+            serde_json::to_value(GuestShellFrame::Exit { exit_code: -1 }).unwrap(),
+            serde_json::json!({"type": "exit", "exit_code": -1})
+        );
+    }
+
+    #[test]
+    fn guest_shell_frames_are_closed_exact_and_directional() {
+        let host_to_guest = [
+            (
+                GuestShellFrame::Input { data: vec![0, 255] },
+                serde_json::json!({"type": "input", "data": [0, 255]}),
+            ),
+            (
+                GuestShellFrame::Resize {
+                    rows: 40,
+                    cols: 120,
+                },
+                serde_json::json!({"type": "resize", "rows": 40, "cols": 120}),
+            ),
+            (GuestShellFrame::Close, serde_json::json!({"type": "close"})),
+        ];
+        for (frame, exact_json) in host_to_guest {
+            assert_eq!(serde_json::to_value(&frame).unwrap(), exact_json);
+            assert!(frame.is_host_to_guest());
+            assert!(!frame.is_guest_to_host());
+        }
+
+        let guest_to_host = [
+            (
+                GuestShellFrame::Output { data: vec![36, 32] },
+                serde_json::json!({"type": "output", "data": [36, 32]}),
+            ),
+            (
+                GuestShellFrame::Exit { exit_code: -1 },
+                serde_json::json!({"type": "exit", "exit_code": -1}),
+            ),
+        ];
+        for (frame, exact_json) in guest_to_host {
+            assert_eq!(serde_json::to_value(&frame).unwrap(), exact_json);
+            assert!(!frame.is_host_to_guest());
+            assert!(frame.is_guest_to_host());
+        }
+
+        for unknown in [
+            r#"{"type":"input","data":[1],"unknown":false}"#,
+            r#"{"type":"resize","rows":24,"cols":80,"unknown":false}"#,
+            r#"{"type":"output","data":[1],"unknown":false}"#,
+            r#"{"type":"exit","exit_code":0,"unknown":false}"#,
+            r#"{"type":"close","unknown":false}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<GuestShellFrame>(unknown).is_err(),
+                "accepted unknown field in {unknown}"
+            );
+        }
+        for duplicate in [
+            r#"{"type":"input","data":[1],"data":[2]}"#,
+            r#"{"type":"resize","rows":24,"rows":25,"cols":80}"#,
+            r#"{"type":"output","data":[1],"data":[2]}"#,
+            r#"{"type":"exit","exit_code":0,"exit_code":1}"#,
+            r#"{"type":"close","type":"close"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<GuestShellFrame>(duplicate).is_err(),
+                "accepted duplicate field in {duplicate}"
+            );
+        }
     }
 
     #[test]

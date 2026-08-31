@@ -40,6 +40,7 @@ mod runtime_usage;
 pub mod semantic_nodes;
 pub mod semantic_resources;
 mod semantic_usage;
+pub mod sessions;
 mod usage;
 
 use accounts::*;
@@ -204,6 +205,58 @@ async fn check_workspace_auth(
     ))
 }
 
+/// Workspace authorization for non-browser runtime access endpoints.
+///
+/// Unlike [`check_workspace_auth`], this boundary never consults the sealed
+/// web-session cookie. Exec and Shell require an explicit Bearer credential so
+/// a cross-origin browser request cannot wake a Cat or create a Guest process.
+pub(super) async fn check_workspace_bearer_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+    workspace: &str,
+) -> ApiResult<crate::store::WorkspaceScope> {
+    let principal = bearer_principal(state, headers).await?;
+    let mut resolved_scope = None;
+    let allowed = match &principal {
+        Some(Principal::Administrator) => true,
+        Some(Principal::User(identity)) => {
+            let Some(organization_id) = identity.organization_id.as_deref() else {
+                return Err(auth_failure(true));
+            };
+            let workspace_id = workspace.to_string();
+            let scope = state
+                .store
+                .execute(move |store| store.workspace_scope(&workspace_id))
+                .await?;
+            let allowed = scope.account.status == "active"
+                && scope.account.workos_organization_id == organization_id
+                && state
+                    .cfg
+                    .workos
+                    .as_ref()
+                    .expect("a WorkOS user principal requires WorkOS configuration")
+                    .user_has_active_membership(&identity.user_id, organization_id)
+                    .await?;
+            resolved_scope = Some(scope);
+            allowed
+        }
+        Some(Principal::WorkspaceAutomation { workspace_id }) => workspace_id == workspace,
+        Some(Principal::Service) | None => false,
+    };
+    if !allowed {
+        return Err(auth_failure(principal.is_some()));
+    }
+    if let Some(scope) = resolved_scope {
+        return Ok(scope);
+    }
+    let workspace = workspace.to_string();
+    state
+        .store
+        .execute(move |store| store.workspace_scope(&workspace))
+        .await
+        .map_err(Into::into)
+}
+
 async fn check_workspace_token_admin(
     state: &AppState,
     headers: &HeaderMap,
@@ -354,6 +407,7 @@ fn metering_failure(error: cats_metering::MeteringError) -> Failure {
 
 pub fn router(state: AppState) -> Router {
     let semantic_resources = semantic_resources::routes(Arc::clone(&state.semantic_resources));
+    let semantic_sessions = sessions::routes(state.semantic_sessions.clone());
     let semantic_nodes = semantic_nodes::routes(state.semantic_node_http.clone());
     let semantic_usage = semantic_usage::routes(state.semantic_node_http.clone());
     Router::new()
@@ -475,6 +529,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/billing/stripe/webhook", post(stripe_webhook))
         .route("/v1/admin/workspaces", get(admin_list_workspaces))
         .merge(semantic_resources)
+        .merge(semantic_sessions)
         .merge(semantic_nodes)
         .merge(semantic_usage)
         .fallback(crate::ui::not_found)

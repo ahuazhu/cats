@@ -2,7 +2,9 @@
 
 - 状态：Accepted
 - 日期：2026-07-21
-- 协调协议：[ADR-0056](0056-atomic-per-cat-runtime-lifecycle.md)；ADR-0040 coordination已被取代
+- 原协调协议：[ADR-0056](0056-atomic-per-cat-runtime-lifecycle.md)；其 coordination 后由
+  [ADR-0059](0059-semantic-control-node-synchronous-protocol.md)取代；Exec/Shell access 见
+  [ADR-0065](0065-exec-shell-runtime-access-lane.md)
 
 ## 决定
 
