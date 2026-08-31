@@ -900,21 +900,20 @@ fn disk_identity_exact(disk: &StoredDiskAuthority, product: &ProductDisk) -> boo
             canonical.role,
             CanonicalPersistentDiskRole::Persistent { .. }
         )
-        && match (&canonical.role, disk.initialization_kind.as_deref()) {
+        && matches!(
+            (&canonical.role, disk.initialization_kind.as_deref()),
             (
                 CanonicalPersistentDiskRole::Persistent {
                     initialization: CanonicalDiskInitialization::Uninitialized { .. },
                 },
                 Some("uninitialized"),
-            )
-            | (
+            ) | (
                 CanonicalPersistentDiskRole::Persistent {
                     initialization: CanonicalDiskInitialization::Initialized { .. },
                 },
                 Some("initialized"),
-            ) => true,
-            _ => false,
-        }
+            )
+        )
 }
 
 fn disk_is_initialized(disk: &StoredDiskAuthority) -> bool {

@@ -4,6 +4,11 @@ use cats_api::runtime_reconciliation::{Id, RandomId128};
 use super::semantic_persistent_disk::{SemanticStrictDeleteState, SemanticStrictPersistentDisk};
 use crate::store::Store;
 
+const ROOT_HASH: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const ROOT_OBJECT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const COMMIT_RECEIPT_DIGEST: &str =
+    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
 fn candidate() -> SemanticStrictPersistentDisk {
     SemanticStrictPersistentDisk {
         disk_id: Id::new(format!("disk_{}", "1".repeat(32))).unwrap(),
@@ -45,19 +50,106 @@ fn insert_snapshot(store: &Store, candidate: &SemanticStrictPersistentDisk) {
     store
         .with(|client| {
             client.execute(
+                "INSERT INTO disk_snapshots (
+                    snapshot_id,workspace_id,snapshot_slug,disk_id,disk_slug,
+                    volume_id,size_bytes,captured_generation,created_at,deleted_at
+                 ) VALUES (
+                    'snapshot_delete_guard','ws_snapshot_delete','delete-guard',$1,'data',
+                    $2,$3,1,2,NULL
+                 ) ON CONFLICT (snapshot_id) DO NOTHING",
+                &[
+                    &candidate.disk_id.as_str(),
+                    &candidate.volume_id.as_str(),
+                    &i64::try_from(candidate.size_bytes).unwrap(),
+                ],
+            )?;
+            client.execute(
                 "INSERT INTO disk_snapshot_records (
                     snapshot_id,record,disk_id,volume_id,size_bytes,
                     head_generation,head_root_hash,head_root_object_id,created_at
                  ) VALUES (
                     'snapshot_delete_guard',
                     jsonb_build_object('snapshot_id','snapshot_delete_guard',
-                                       'disk_id',$1::TEXT,'volume_id',$2::TEXT),
-                    $1,$2,$3,0,NULL,NULL,2
+                                       'disk_id',$1::TEXT,'volume_id',$2::TEXT,
+                                       'size_bytes',$3::BIGINT,
+                                       'head',jsonb_build_object(
+                                           'generation',1,
+                                           'root_hash',$4::TEXT,
+                                           'root_object_id',$5::TEXT),
+                                       'created_at',2),
+                    $1,$2,$3,1,$4,$5,2
                  )",
                 &[
                     &candidate.disk_id.as_str(),
                     &candidate.volume_id.as_str(),
                     &i64::try_from(candidate.size_bytes).unwrap(),
+                    &ROOT_HASH,
+                    &ROOT_OBJECT_ID,
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn initialize_disk(store: &Store, candidate: &SemanticStrictPersistentDisk) {
+    store
+        .with(|client| {
+            client.execute(
+                "UPDATE volume_records SET
+                    record=jsonb_set(record,'{head}',jsonb_build_object(
+                        'generation',1,
+                        'root_hash',$2::TEXT,
+                        'root_object_id',$3::TEXT)),
+                    head_generation=1,
+                    head_root_hash=$2,
+                    head_root_object_id=$3
+                  WHERE volume_id=$1",
+                &[&candidate.volume_id.as_str(), &ROOT_HASH, &ROOT_OBJECT_ID],
+            )?;
+            client.execute(
+                "UPDATE disk_records SET
+                    record=jsonb_set(record,'{role,initialization}',jsonb_build_object(
+                        'kind','initialized',
+                        'initialization_token',$2::TEXT,
+                        'filesystem_uuid',$3::TEXT,
+                        'expected_blank_head',jsonb_build_object(
+                            'generation',0,'root_hash',NULL,'root_object_id',NULL),
+                        'initialized_head',jsonb_build_object(
+                            'generation',1,
+                            'root_hash',$4::TEXT,
+                            'root_object_id',$5::TEXT),
+                        'initialized_at',2,
+                        'commit_receipt_digest',$6::TEXT)),
+                    initialization_kind='initialized',
+                    initialized_generation=1,
+                    initialized_root_hash=$4,
+                    initialized_root_object_id=$5,
+                    initialized_at=2,
+                    initialization_commit_receipt_bytes=decode('01','hex'),
+                    initialization_commit_receipt_digest=$6
+                  WHERE disk_id=$1",
+                &[
+                    &candidate.disk_id.as_str(),
+                    &candidate.initialization_token.as_str(),
+                    &candidate.filesystem_uuid.as_str(),
+                    &ROOT_HASH,
+                    &ROOT_OBJECT_ID,
+                    &COMMIT_RECEIPT_DIGEST,
+                ],
+            )?;
+            client.execute(
+                "INSERT INTO persistent_disks (
+                    disk_id,workspace_id,disk_slug,size_bytes,volume_id,
+                    filesystem_uuid,disk_format,status,created_at,deleted_at
+                 ) VALUES ($1,$2,$3,$4,$5,$6,'ext4','normal',1,NULL)",
+                &[
+                    &candidate.disk_id.as_str(),
+                    &candidate.workspace_id.as_str(),
+                    &candidate.name.as_str(),
+                    &i64::try_from(candidate.size_bytes).unwrap(),
+                    &candidate.volume_id.as_str(),
+                    &candidate.filesystem_uuid.as_str(),
                 ],
             )?;
             Ok(())
@@ -72,6 +164,7 @@ fn a_live_product_snapshot_blocks_both_disk_delete_phases() {
     store
         .ensure_semantic_strict_disk_created(&candidate)
         .unwrap();
+    initialize_disk(&store, &candidate);
 
     insert_snapshot(&store, &candidate);
     let begin_error = store
