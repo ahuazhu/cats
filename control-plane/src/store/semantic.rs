@@ -11,6 +11,9 @@ use self::placement::{LeastAllocatedPlacement, SemanticPlacementStrategy};
 use super::{Result, Store};
 
 mod placement;
+mod snapshot;
+
+pub use snapshot::*;
 
 const DB_NOW_MS: &str = "CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT)";
 
