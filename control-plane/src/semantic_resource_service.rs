@@ -1511,7 +1511,7 @@ fn semantic_error_code(code: &str) -> wire::SemanticErrorCode {
     }
 }
 
-fn map_lifecycle_error(error: lifecycle::LifecycleError) -> wire::SemanticErrorBody {
+pub(crate) fn map_lifecycle_error(error: lifecycle::LifecycleError) -> wire::SemanticErrorBody {
     match error {
         lifecycle::LifecycleError::Store(error) => {
             semantic_error(wire::SemanticErrorCode::InternalError, error.message)

@@ -2,6 +2,7 @@
 //! transport). Called from `spawn_blocking` contexts in the async server.
 
 use std::io;
+use std::net::Shutdown;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd as _;
 use std::os::unix::net::UnixStream;
@@ -23,14 +24,85 @@ pub struct GuestClient {
     stream: UnixStream,
     next_id: u64,
     hybrid_assigned_port: Option<u32>,
+    /// One absolute deadline retained by bounded hybrid-vsock connects. Shell
+    /// setup consumes the remainder so a trickling ShellReady cannot refresh
+    /// a per-syscall socket timeout after the mux handshake.
+    hybrid_deadline: Option<Instant>,
 }
 
 pub struct GuestShell {
     stream: UnixStream,
 }
 
+/// A clone of one Guest control connection used solely to interrupt a
+/// blocking exec or shell bridge. `shutdown(Both)` is observable as transport
+/// EOF by the Guest, which owns process-group kill and reap semantics.
+pub(crate) struct GuestConnectionCancellation {
+    stream: UnixStream,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum GuestExecError {
+    #[error("{message}")]
+    Timeout { message: String },
+    #[error("{message}")]
+    Cancelled { message: String },
+    #[error("{message}")]
+    RemoteError { message: String },
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum GuestShellStartError {
+    /// Exact Guest Error is terminal: it either rejected before spawn or
+    /// completed its own kill/reap path before replying.
+    #[error("guest error: {message}")]
+    RemoteTerminal { message: String },
+    /// Timeout, EOF, malformed frames and identity mismatch are ambiguous.
+    #[error(transparent)]
+    Ambiguous(#[from] anyhow::Error),
+}
+
+impl GuestConnectionCancellation {
+    /// Half-close Node -> Guest writes while retaining the response direction.
+    /// Exec uses this for graceful lifecycle cancellation: Guest observes EOF,
+    /// kills and reaps the process group, then its terminal response proves the
+    /// cleanup before the Node access guard can drain.
+    pub(crate) fn request_remote_close(&self) {
+        let _ = self.stream.shutdown(Shutdown::Write);
+    }
+
+    /// Force both directions closed. Destroy/reset and result-unknown Host
+    /// deadlines have a physical VMM-stop backstop and may use this stronger
+    /// interruption.
+    pub(crate) fn cancel(&self) {
+        let _ = self.stream.shutdown(Shutdown::Both);
+    }
+}
+
+impl Drop for GuestConnectionCancellation {
+    fn drop(&mut self) {
+        // Dropping an HTTP/WebSocket handler is not itself strong lifecycle
+        // authority. Preserve the Guest -> Node response direction so remote
+        // kill/reap or Shell Exit can still prove cleanup to the retained gate.
+        self.request_remote_close();
+    }
+}
+
 impl GuestShell {
-    pub fn try_clone(&self) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn from_test_stream(stream: UnixStream) -> Self {
+        Self { stream }
+    }
+
+    pub(crate) fn cancellation_handle(&self) -> Result<GuestConnectionCancellation> {
+        Ok(GuestConnectionCancellation {
+            stream: self.stream.try_clone()?,
+        })
+    }
+
+    pub(crate) fn try_clone(&self) -> Result<Self> {
         Ok(Self {
             stream: self.stream.try_clone()?,
         })
@@ -46,6 +118,12 @@ impl GuestShell {
 }
 
 impl GuestClient {
+    pub(crate) fn cancellation_handle(&self) -> Result<GuestConnectionCancellation> {
+        Ok(GuestConnectionCancellation {
+            stream: self.stream.try_clone()?,
+        })
+    }
+
     pub fn connect(path: &Path) -> Result<Self> {
         let stream = UnixStream::connect(path)
             .with_context(|| format!("connect guest agent at {}", path.display()))?;
@@ -55,6 +133,7 @@ impl GuestClient {
             stream,
             next_id: 1,
             hybrid_assigned_port: None,
+            hybrid_deadline: None,
         })
     }
 
@@ -66,6 +145,7 @@ impl GuestClient {
             stream,
             next_id: 1,
             hybrid_assigned_port: None,
+            hybrid_deadline: None,
         })
     }
 
@@ -144,6 +224,7 @@ impl GuestClient {
             stream,
             next_id: 1,
             hybrid_assigned_port: Some(hybrid_assigned_port),
+            hybrid_deadline: Some(deadline),
         })
     }
 
@@ -176,16 +257,32 @@ impl GuestClient {
         Ok(client)
     }
 
-    pub fn connect_hybrid_vsock_shell(path: &Path, port: u32) -> Result<Self> {
-        let client = Self::connect_hybrid_vsock(path, port)?;
-        // Cloud Hypervisor runs on Linux, where an active SO_RCVTIMEO can be
-        // cleared after the bounded mux handshake. Keep the handshake bounded
-        // but let the subsequent interactive session remain silent forever.
+    pub(crate) fn connect_hybrid_vsock_long_running_exact_peer(
+        path: &Path,
+        port: u32,
+        timeout: Duration,
+        expected_vmm_pid: u32,
+    ) -> Result<Self> {
+        let client =
+            Self::connect_hybrid_vsock_bounded_exact_peer(path, port, timeout, expected_vmm_pid)?;
         client
             .stream
             .set_read_timeout(None)
-            .context("clear interactive shell read timeout")?;
+            .context("clear exact-peer exec read timeout")?;
         Ok(client)
+    }
+
+    pub fn connect_hybrid_vsock_shell(path: &Path, port: u32) -> Result<Self> {
+        Self::connect_hybrid_vsock(path, port)
+    }
+
+    pub(crate) fn connect_hybrid_vsock_shell_exact_peer(
+        path: &Path,
+        port: u32,
+        timeout: Duration,
+        expected_vmm_pid: u32,
+    ) -> Result<Self> {
+        Self::connect_hybrid_vsock_bounded_exact_peer(path, port, timeout, expected_vmm_pid)
     }
 
     pub fn request(&mut self, body: GuestRequestBody) -> Result<GuestResponseBody> {
@@ -455,9 +552,19 @@ impl GuestClient {
         env: std::collections::BTreeMap<String, String>,
         stdin: Vec<u8>,
     ) -> Result<(i32, String, String)> {
-        match self.request(GuestRequestBody::Exec {
+        self.exec_with_options(command, None, env, stdin)
+    }
+
+    pub fn exec_with_options(
+        &mut self,
+        command: Vec<String>,
+        timeout_ms: Option<u64>,
+        env: std::collections::BTreeMap<String, String>,
+        stdin: Vec<u8>,
+    ) -> Result<(i32, String, String)> {
+        match self.exec_request(GuestRequestBody::Exec {
             command,
-            timeout_ms: None,
+            timeout_ms,
             env,
             stdin,
         })? {
@@ -470,6 +577,42 @@ impl GuestClient {
         }
     }
 
+    fn exec_request(&mut self, body: GuestRequestBody) -> Result<GuestResponseBody> {
+        let Some(deadline) = self.hybrid_deadline.take() else {
+            return self.request(body);
+        };
+        let id = self.next_id;
+        self.next_id += 1;
+        // The exact connect, mux handshake and complete (up to 5 MiB JSON)
+        // request write share one admission deadline. Only after this returns
+        // does the Guest own its requested execution window.
+        let mut transport = DeadlineGuestTransport {
+            stream: &mut self.stream,
+            deadline,
+        };
+        write_frame(&mut transport, &GuestRequest { id, body })
+            .context("write absolute-deadline Guest Exec request")?;
+        let response: GuestResponse = read_frame(&mut self.stream)?;
+        if response.id != id {
+            bail!("guest response id mismatch");
+        }
+        if let GuestResponseBody::Error { message } = &response.body {
+            bail!("guest error: {message}");
+        }
+        Ok(response.body)
+    }
+
+    pub(crate) fn exec_with_options_classified(
+        &mut self,
+        command: Vec<String>,
+        timeout_ms: Option<u64>,
+        env: std::collections::BTreeMap<String, String>,
+        stdin: Vec<u8>,
+    ) -> std::result::Result<(i32, String, String), GuestExecError> {
+        self.exec_with_options(command, timeout_ms, env, stdin)
+            .map_err(classify_guest_exec_error)
+    }
+
     pub fn deploy_oci(&mut self, deploy: DeployOciRequest) -> Result<OciDeployment> {
         match self.request(GuestRequestBody::DeployOci { deploy })? {
             GuestResponseBody::OciDeployed { deployment } => Ok(deployment),
@@ -477,27 +620,90 @@ impl GuestClient {
         }
     }
 
-    pub fn start_shell(mut self, rows: u16, cols: u16) -> Result<GuestShell> {
+    pub(crate) fn start_shell(
+        mut self,
+        rows: u16,
+        cols: u16,
+    ) -> std::result::Result<GuestShell, GuestShellStartError> {
         let id = self.next_id;
         self.next_id += 1;
-        write_frame(
-            &mut self.stream,
-            &GuestRequest {
-                id,
-                body: GuestRequestBody::Shell { rows, cols },
-            },
-        )?;
-        let response: GuestResponse = read_frame(&mut self.stream)?;
+        let request = GuestRequest {
+            id,
+            body: GuestRequestBody::Shell { rows, cols },
+        };
+        let response: GuestResponse = if let Some(deadline) = self.hybrid_deadline {
+            let mut transport = DeadlineGuestTransport {
+                stream: &mut self.stream,
+                deadline,
+            };
+            write_frame(&mut transport, &request)
+                .context("write absolute-deadline Guest Shell request")
+                .map_err(GuestShellStartError::Ambiguous)?;
+            read_frame(&mut transport)
+                .context("read absolute-deadline Guest ShellReady")
+                .map_err(GuestShellStartError::Ambiguous)?
+        } else {
+            // Direct development transport retains its existing socket-bound
+            // behavior. Production Shell uses the exact hybrid-vsock path.
+            write_frame(&mut self.stream, &request)
+                .context("write Guest Shell request")
+                .map_err(GuestShellStartError::Ambiguous)?;
+            read_frame(&mut self.stream)
+                .context("read Guest ShellReady")
+                .map_err(GuestShellStartError::Ambiguous)?
+        };
         if response.id != id {
-            bail!("guest response id mismatch");
+            return Err(GuestShellStartError::Ambiguous(anyhow::anyhow!(
+                "guest response id mismatch"
+            )));
         }
         match response.body {
-            GuestResponseBody::ShellReady => Ok(GuestShell {
-                stream: self.stream,
-            }),
-            GuestResponseBody::Error { message } => bail!("guest error: {message}"),
-            other => bail!("unexpected shell response: {other:?}"),
+            GuestResponseBody::ShellReady => {
+                // Keep the bounded connection timeout through ShellReady. Only
+                // the established interactive stream may be silent forever.
+                if self
+                    .stream
+                    .read_timeout()
+                    .context("read established shell timeout")
+                    .map_err(GuestShellStartError::Ambiguous)?
+                    .is_some()
+                {
+                    self.stream
+                        .set_read_timeout(None)
+                        .context("clear established shell read timeout")
+                        .map_err(GuestShellStartError::Ambiguous)?;
+                }
+                Ok(GuestShell {
+                    stream: self.stream,
+                })
+            }
+            GuestResponseBody::Error { message } => {
+                Err(GuestShellStartError::RemoteTerminal { message })
+            }
+            other => Err(GuestShellStartError::Ambiguous(anyhow::anyhow!(
+                "unexpected shell response: {other:?}"
+            ))),
         }
+    }
+}
+
+fn classify_guest_exec_error(error: anyhow::Error) -> GuestExecError {
+    const TIMEOUT_PREFIX: &str = "guest error: exec timed out after ";
+    const SUFFIX: &str = " ms";
+    const CANCELLED: &str = "guest error: exec caller disconnected";
+    let message = error.to_string();
+    let is_canonical_timeout = message
+        .strip_prefix(TIMEOUT_PREFIX)
+        .and_then(|value| value.strip_suffix(SUFFIX))
+        .is_some_and(|millis| millis.parse::<u64>().is_ok());
+    if is_canonical_timeout {
+        GuestExecError::Timeout { message }
+    } else if message == CANCELLED {
+        GuestExecError::Cancelled { message }
+    } else if message.starts_with("guest error: ") {
+        GuestExecError::RemoteError { message }
+    } else {
+        GuestExecError::Other(error)
     }
 }
 
@@ -907,7 +1113,37 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     use super::connect_unix_before;
-    use super::{parse_hybrid_vsock_ack, GuestClient};
+    use super::{
+        classify_guest_exec_error, parse_hybrid_vsock_ack, GuestClient, GuestExecError,
+        GuestShellStartError,
+    };
+
+    #[test]
+    fn only_the_canonical_guest_exec_timeout_is_classified_as_timeout() {
+        assert!(matches!(
+            classify_guest_exec_error(anyhow::anyhow!(
+                "guest error: exec timed out after 120000 ms"
+            )),
+            GuestExecError::Timeout { .. }
+        ));
+        assert!(matches!(
+            classify_guest_exec_error(anyhow::anyhow!("guest error: exec caller disconnected")),
+            GuestExecError::Cancelled { .. }
+        ));
+        for remote in [
+            "guest error: exec timed out",
+            "guest error: exec timed out after nope ms",
+        ] {
+            assert!(matches!(
+                classify_guest_exec_error(anyhow::anyhow!(remote)),
+                GuestExecError::RemoteError { .. }
+            ));
+        }
+        assert!(matches!(
+            classify_guest_exec_error(anyhow::anyhow!("exec timed out after 120000 ms")),
+            GuestExecError::Other(_)
+        ));
+    }
 
     #[test]
     fn hybrid_vsock_ack_is_one_exact_canonical_line() {
@@ -983,6 +1219,106 @@ mod tests {
     }
 
     #[test]
+    fn exact_hybrid_shell_keeps_its_read_deadline_until_shell_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shell-vsock.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let peer = thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+
+            let (mut server, _) = listener.accept().unwrap();
+            let mut connect = String::new();
+            BufReader::new(server.try_clone().unwrap())
+                .read_line(&mut connect)
+                .unwrap();
+            assert_eq!(connect, "CONNECT 5000\n");
+            server.write_all(b"OK 1073741824\n").unwrap();
+            let request: GuestRequest = read_frame(&mut server).unwrap();
+            assert!(matches!(
+                request.body,
+                GuestRequestBody::Shell { rows: 24, cols: 80 }
+            ));
+            // ACK is not ShellReady. Retain the socket past the client's bound
+            // to prove it cannot turn into an unbounded interactive wait early.
+            thread::sleep(Duration::from_millis(200));
+        });
+
+        let timeout = Duration::from_millis(50);
+        let started = Instant::now();
+        #[cfg(target_os = "linux")]
+        let client = GuestClient::connect_hybrid_vsock_shell_exact_peer(
+            &path,
+            5_000,
+            timeout,
+            std::process::id(),
+        )
+        .unwrap();
+        #[cfg(not(target_os = "linux"))]
+        let client = GuestClient::connect_hybrid_vsock_bounded(&path, 5_000, timeout).unwrap();
+        let error = match client.start_shell(24, 80) {
+            Ok(_) => panic!("ShellReady wait unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(started.elapsed() < Duration::from_millis(180));
+        let error = format!("{error:#}");
+        assert!(error.contains("timed out") || error.contains("temporarily unavailable"));
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn exact_hybrid_shell_uses_one_absolute_deadline_across_trickled_shell_ready() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trickled-shell-ready-vsock.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let peer = thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+
+            let (mut server, _) = listener.accept().unwrap();
+            let mut connect = String::new();
+            BufReader::new(server.try_clone().unwrap())
+                .read_line(&mut connect)
+                .unwrap();
+            assert_eq!(connect, "CONNECT 5000\n");
+            thread::sleep(Duration::from_millis(20));
+            server.write_all(b"OK 1073741824\n").unwrap();
+            let request: GuestRequest = read_frame(&mut server).unwrap();
+            assert!(matches!(request.body, GuestRequestBody::Shell { .. }));
+            let response = GuestResponse {
+                id: request.id,
+                body: GuestResponseBody::ShellReady,
+            };
+            let mut frame = Vec::new();
+            write_frame(&mut frame, &response).unwrap();
+            for byte in frame {
+                if server.write_all(&[byte]).is_err() {
+                    break;
+                }
+                // Every syscall stays comfortably inside the original socket
+                // timeout; only an absolute deadline rejects this peer.
+                thread::sleep(Duration::from_millis(15));
+            }
+        });
+
+        let timeout = Duration::from_millis(90);
+        let started = Instant::now();
+        #[cfg(target_os = "linux")]
+        let client = GuestClient::connect_hybrid_vsock_shell_exact_peer(
+            &path,
+            5_000,
+            timeout,
+            std::process::id(),
+        )
+        .unwrap();
+        #[cfg(not(target_os = "linux"))]
+        let client = GuestClient::connect_hybrid_vsock_bounded(&path, 5_000, timeout).unwrap();
+        assert!(client.start_shell(24, 80).is_err());
+        assert!(started.elapsed() < Duration::from_millis(250));
+        peer.join().unwrap();
+    }
+
+    #[test]
     fn lifecycle_guest_request_uses_one_absolute_deadline_across_trickled_reads() {
         use std::io::Write as _;
 
@@ -991,6 +1327,7 @@ mod tests {
             stream: client_stream,
             next_id: 1,
             hybrid_assigned_port: Some(1_073_741_824),
+            hybrid_deadline: None,
         };
         let peer = thread::spawn(move || {
             let request: GuestRequest = read_frame(&mut server_stream).unwrap();
@@ -1032,6 +1369,29 @@ mod tests {
         );
         drop(client);
         peer.join().unwrap();
+    }
+
+    #[test]
+    fn exact_exec_request_write_consumes_the_connect_admission_deadline() {
+        let (client_stream, _blocked_peer) = UnixStream::pair().unwrap();
+        let mut client = GuestClient {
+            stream: client_stream,
+            next_id: 1,
+            hybrid_assigned_port: Some(1_073_741_824),
+            hybrid_deadline: Some(Instant::now() + Duration::from_millis(50)),
+        };
+        let started = Instant::now();
+        let error = client
+            .exec_with_options(
+                vec!["true".to_owned()],
+                Some(100),
+                Default::default(),
+                vec![0x5a; cats_api::sessions::MAX_EXEC_STDIN_BYTES],
+            )
+            .expect_err("blocked request write must not refresh its deadline");
+        assert!(started.elapsed() < Duration::from_millis(500));
+        let error = format!("{error:#}");
+        assert!(error.contains("deadline") || error.contains("timed out"));
     }
 
     #[cfg(target_os = "linux")]
@@ -1263,6 +1623,38 @@ mod tests {
             .start_shell(24, 80)
             .unwrap();
         assert_eq!(shell.stream.read_timeout().unwrap(), None);
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn exact_guest_shell_error_is_a_terminal_start_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("guest-shell-error.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let peer = thread::spawn(move || {
+            let (mut server, _) = listener.accept().unwrap();
+            let request: GuestRequest = read_frame(&mut server).unwrap();
+            write_frame(
+                &mut server,
+                &GuestResponse {
+                    id: request.id,
+                    body: GuestResponseBody::Error {
+                        message: "shell is unavailable".to_owned(),
+                    },
+                },
+            )
+            .unwrap();
+        });
+        let client = GuestClient::connect_shell(&path).unwrap();
+        let error = match client.start_shell(24, 80) {
+            Ok(_) => panic!("Guest Error unexpectedly started a shell"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            GuestShellStartError::RemoteTerminal { message }
+                if message == "shell is unavailable"
+        ));
         peer.join().unwrap();
     }
 }

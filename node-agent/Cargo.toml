@@ -35,7 +35,9 @@ hex = { workspace = true }
 [dev-dependencies]
 cats-test-support = { workspace = true }
 cats-control-plane = { workspace = true, features = ["test-support"] }
+futures-util = { workspace = true }
 tempfile = { workspace = true }
+tokio-tungstenite = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 cats-blockd = { workspace = true, features = ["test-vhost-user-frontend"] }

@@ -1,7 +1,8 @@
 # Control Plane 与 noded 同步协议设计
 
 - 状态：ADR-0059 已接受，并由 [ADR-0062](decisions/0062-destroy-preempts-in-progress-cat-actions.md)
-  修正 Destroy 抢占与崩溃恢复；正在实施
+  修正 Destroy 抢占与崩溃恢复；[ADR-0065](decisions/0065-exec-shell-runtime-access-lane.md)增加不进入
+  CatAction 的 Exec/Shell live access lane；正在实施
 - 范围：Cat、Node、PersistentDisk 的控制面数据模型、同步接口、状态转换与场景语义幂等
 - 切换方式：空数据、单协议直接替换旧 lifecycle 协调；不提供兼容层或数据迁移，实施进度见[执行计划](semantic-control-node-implementation-plan.md)
 
@@ -17,6 +18,8 @@
 6. PersistentDisk 与 Cat 一样具有用户指定的 slug；内部 ID 不暴露为主要用户定位方式。
 7. 同一个 Cat 的动作串行执行；同一块 PersistentDisk 同时最多绑定一个 Cat。
 8. Node 正常退出时先迁走 Cat；Node 异常退出后，先撤掉旧实例的流量入口，再从其他 Node 恢复并把唯一入口切到新实例。
+9. Exec/Shell 先认证、按需走普通 run，再由 Node exact-Running-incarnation gate admit；它们不写
+   `current_action`，也不复用 lifecycle 的模糊结果重试。
 
 本设计优先保证接口简单和常见重试可预测。它不试图处理任意延迟、任意乱序和长期不对称网络下的所有情况。
 
@@ -428,6 +431,8 @@ cats suspend CAT_SLUG
 cats warm CAT_SLUG
 cats cold CAT_SLUG
 cats destroy CAT_SLUG
+cats exec CAT_SLUG [--timeout SECONDS] [--env-file PATH] [--stdin-file PATH] -- ARGV...
+cats shell CAT_SLUG
 
 cats ls
 cats show CAT_SLUG [--watch] [--interval 1s] [--usage]
@@ -468,6 +473,8 @@ POST /v1/workspaces/{workspace_id}/cats/{cat_slug}/actions/suspend
 POST /v1/workspaces/{workspace_id}/cats/{cat_slug}/actions/warm
 POST /v1/workspaces/{workspace_id}/cats/{cat_slug}/actions/cold
 POST /v1/workspaces/{workspace_id}/cats/{cat_slug}/actions/destroy
+POST /v1/workspaces/{workspace_id}/cats/{cat_slug}/exec
+GET  /v1/workspaces/{workspace_id}/cats/{cat_slug}/shell?rows=24&cols=80
 
 POST /v1/workspaces/{workspace_id}/disks
 POST /v1/workspaces/{workspace_id}/disks/{disk_slug}/actions/attach
@@ -640,6 +647,23 @@ DELETE /v1/cats/{cat_id}
 
 `noded` 返回前必须完成该动作要求的本地处理；不能先返回成功再异步完成主要步骤。
 
+### 8.5 Exec/Shell live access
+
+```text
+POST /v1/cats/{cat_id}/exec
+GET  /v1/cats/{cat_id}/shell?rows=24&cols=80   # WebSocket
+```
+
+这两个内部 route 接受现有 noded service Bearer，只使用 immutable `cat_id`。它们不是 §8.3 状态动作，
+不参加 noded lifecycle `CatAction` 串行枚举；Node 用独立 per-Cat access gate 在同一 semantic lane lock
+下验证 placement/reset gate、stable Running、无 active lifecycle/destroy 和 exact runtime incarnation。
+
+Control 必须在 public auth、可选 normal run 和 fresh placement read 后调用。Exec 只 dispatch 一次；
+一旦尝试 dispatch，Guest EOF、transport loss、malformed/incomplete noded success 等 `NodeUnavailable`
+都可能表示命令结果未知，Control/CLI 不得自动重试。Shell public upgrade 前先完成 noded/Guest
+handshake。wire、quota、10 秒 close/cancel/drain 和错误映射只在
+[Exec/Shell Protocol v1](specs/interactive-shell-protocol.md)展开。
+
 ## 9. 并发规则
 
 ### 9.1 Control Plane
@@ -666,6 +690,9 @@ DELETE /v1/cats/{cat_id}
 - 同一 Cat 的非 destroy 动作不能并行。
 - destroy 可以通知当前动作退出，但 destroy 返回前必须等待当前动作退出并完成清理。
 - 同一块 Disk 的 attach/detach在 Node 内也必须串行。
+- Exec/Shell 使用独立 access registry；离开 Running 的 lifecycle action 和 reset 在物理 effect 前先
+  close gate、取消 active session 并有界 drain。access guard 不允许生命周期物理动作跨过仍存活的
+  旧-incarnation worker。
 
 ## 10. Control Plane 异常后的恢复
 
@@ -1018,6 +1045,11 @@ internal_error
 
 错误响应必须包含稳定 `code`。`message` 面向人类，可以随版本改善，客户端不能解析 message 判断分支。
 
+Exec/Shell 不新增第二套 error enum：复用 `invalid_request`、`busy`、`invalid_state`、
+`node_unavailable`、`timeout` 和 `internal_error`。其中 Exec dispatch 后的 `node_unavailable` 是结果
+可能未知，绝不能套用 lifecycle 的
+状态查询/自动重试。精确映射见 [Exec/Shell Protocol §4.3](specs/interactive-shell-protocol.md#43-现有-semantic-error-映射)。
+
 ## 17. 日志与监控
 
 至少记录：
@@ -1095,6 +1127,22 @@ internal_error
 - noded明确失败但Control在写failure前退出，恢复后写入failure。
 - current_action超时扫描与用户重试不会产生两个noded动作。
 - Control在destroy替换动作后退出，恢复者看到Node仍执行旧动作时会重发destroy并完成清理。
+
+### 18.6 Exec/Shell access
+
+- 无认证/授权请求在 wake 和 Node/Guest side effect 前失败。
+- 非 Running Cat 只通过 normal run 唤醒；run 后重新解析 current placement。
+- Exec/Shell 不写 `CatAction/current_action`，只在 exact Running incarnation admission。
+- concurrent suspend/warm/cold/destroy/reset 与 access admission 线性化；离开 Running 先
+  close/cancel/drain，late old-incarnation connect fail closed。
+- Exec timeout、output overflow、Node↔Guest transport loss 和 gate cancel kill/reap 完整 process group；
+  普通 public HTTP disconnect、Control→noded loss 和 Control shutdown 不取消已经进入的 noded handler，
+  Node 继续持 guard 到 effective wall timeout/本地 cancel/terminal；response loss 不自动执行第二次命令。
+- Shell abnormal close 不伪造 exit 0，且不支持平台 detach/reconnect。
+- Control shutdown 关闭并回收 public/noded Shell WebSocket；CLI 对合法远端 exit `1..=255` 精确透传，
+  其他远端/transport/protocol 异常归一为 1。
+- Exec 活跃时 Control shutdown 只回收本地 inflight future 并关闭 internal TCP，不增加 request ID/cancel
+  authority；验收同时证明 Control 本地 drain 和 Node session 仍有界且不会脱离 guard。
 
 ## 19. 已知取舍
 

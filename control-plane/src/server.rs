@@ -61,6 +61,7 @@ pub struct Config {
 pub struct AppState {
     pub store: Arc<Store>,
     pub(crate) semantic_resources: Arc<dyn crate::api::semantic_resources::SemanticResourceApi>,
+    pub(crate) semantic_sessions: crate::api::sessions::SemanticSessionHttpState,
     pub(crate) semantic_node_http: crate::api::semantic_nodes::SemanticNodeHttpState,
     pub usage: Arc<dyn UsageStore>,
     pub credits: Arc<dyn CreditStore>,
@@ -103,6 +104,7 @@ impl Handle {
     }
 
     fn begin_shutdown(&self) {
+        self.state.semantic_sessions.begin_shutdown();
         if let Some(shutdown) = self
             .server_shutdown
             .lock()
@@ -119,6 +121,7 @@ impl Handle {
 
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         self.begin_shutdown();
+        let runtime_session_shutdown = self.state.semantic_sessions.drain_shutdown().await;
         self.semantic_destroy_recovery_task
             .shutdown()
             .await
@@ -137,7 +140,7 @@ impl Handle {
             .await
             .map_err(anyhow::Error::from)?;
         self.server_task.abort();
-        Ok(())
+        runtime_session_shutdown.context("active runtime sessions did not shut down")
     }
 }
 
@@ -150,6 +153,21 @@ impl Drop for Handle {
 
 /// Start the one semantic Control listener.
 pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
+    spawn_with_session_override(cfg, None).await
+}
+
+#[cfg(test)]
+pub(crate) async fn spawn_with_sessions_for_test(
+    cfg: Config,
+    sessions: crate::api::sessions::SemanticSessionHttpState,
+) -> anyhow::Result<Handle> {
+    spawn_with_session_override(cfg, Some(sessions)).await
+}
+
+async fn spawn_with_session_override(
+    cfg: Config,
+    session_override: Option<crate::api::sessions::SemanticSessionHttpState>,
+) -> anyhow::Result<Handle> {
     anyhow::ensure!(
         !cfg.auth_token.is_empty(),
         "service token must not be empty"
@@ -266,6 +284,7 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
         semantic_ingress,
         crate::semantic_lifecycle::LifecycleTimeouts::default(),
     );
+    let semantic_session_lifecycle = semantic_lifecycle.clone();
     let semantic_action_recovery = semantic_lifecycle.clone();
     let destroy_recovery_lifecycle = semantic_lifecycle.clone();
     let semantic_destroy_recovery_task = spawn_managed_singleton_task(
@@ -314,6 +333,16 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
             cfg.default_boot_image.clone(),
         ),
     );
+    let semantic_sessions = match session_override {
+        Some(sessions) => sessions,
+        None => crate::api::sessions::SemanticSessionHttpState::new(
+            Arc::new(crate::semantic_session::ProductionSessionAccess::new(
+                semantic_session_lifecycle,
+                crate::semantic_session::PostgresSessionStore::new(Arc::clone(&store)),
+            )),
+            crate::semantic_session::SemanticNodedSessionClient::new(noded_service_token)?,
+        ),
+    };
     let (semantic_node_liveness_shutdown, semantic_node_liveness_rx) =
         tokio::sync::watch::channel(false);
     let semantic_node_liveness_task = tokio::spawn(async move {
@@ -333,6 +362,7 @@ pub async fn spawn(cfg: Config) -> anyhow::Result<Handle> {
     let state = AppState {
         store,
         semantic_resources,
+        semantic_sessions,
         semantic_node_http,
         usage: Arc::clone(&cfg.usage_store),
         credits: Arc::clone(&cfg.credit_store),

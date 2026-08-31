@@ -14,9 +14,10 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::Shutdown;
+use std::os::fd::RawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -34,6 +35,7 @@ use cats_api::guest::{
 };
 use cats_block_client::NbdClient;
 
+mod exec;
 mod filesystem_control;
 mod oci;
 mod qualification_fault;
@@ -337,8 +339,102 @@ struct WorkRegistry {
 enum ShellEvent {
     Client(GuestShellFrame),
     ClientClosed,
+    InputFailed,
     Output(Vec<u8>),
     OutputClosed,
+}
+
+const SHELL_IO_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const SHELL_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+const SHELL_CHANNEL_CAPACITY: usize = 32;
+
+fn send_shell_event_cancellable(
+    sender: &mpsc::SyncSender<ShellEvent>,
+    mut event: ShellEvent,
+    cancel: &AtomicBool,
+) -> bool {
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return false;
+        }
+        match sender.try_send(event) {
+            Ok(()) => return true,
+            Err(mpsc::TrySendError::Full(returned)) => {
+                event = returned;
+                std::thread::sleep(SHELL_IO_POLL_INTERVAL);
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => return false,
+        }
+    }
+}
+
+fn write_shell_input_cancellable(
+    mut writer: impl Write,
+    receiver: mpsc::Receiver<Vec<u8>>,
+    cancel: &AtomicBool,
+) -> std::io::Result<()> {
+    while !cancel.load(Ordering::Acquire) {
+        let data = match receiver.recv_timeout(SHELL_IO_POLL_INTERVAL) {
+            Ok(data) => data,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        };
+        let mut written = 0usize;
+        while written < data.len() {
+            if cancel.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            match writer.write(&data[written..]) {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(count) => written += count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(SHELL_IO_POLL_INTERVAL);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn set_shell_nonblocking(fd: RawFd) -> std::io::Result<()> {
+    // SAFETY: `fd` is the live PTY master descriptor. These fcntl operations
+    // retain neither the descriptor nor any Rust memory.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor remains live and existing flags are preserved.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn join_shell_worker<T>(handle: std::thread::JoinHandle<T>, label: &str) -> Result<T> {
+    let deadline = Instant::now() + SHELL_WORKER_JOIN_TIMEOUT;
+    while !handle.is_finished() {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "{label} did not stop within one second"
+        );
+        std::thread::sleep(SHELL_IO_POLL_INTERVAL);
+    }
+    handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("{label} thread panicked"))
+}
+
+fn kill_shell_process_group(process_group: Option<u32>, child: &mut dyn portable_pty::Child) {
+    if let Some(process_group) = process_group.and_then(|pid| i32::try_from(pid).ok()) {
+        // SAFETY: portable-pty creates the shell as a fresh session and process
+        // group leader. The negative PID therefore targets this shell group.
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -718,52 +814,18 @@ impl GuestAgent {
             }
             GuestRequestBody::Exec {
                 command,
-                timeout_ms: _,
+                timeout_ms,
                 env,
                 stdin,
-            } => {
-                let (argv0, rest) = command
-                    .split_first()
-                    .context("command must be a non-empty argv array")?;
-                let mut child = std::process::Command::new(argv0);
-                child.args(rest).envs(env);
-                if stdin.is_empty() {
-                    child.stdin(std::process::Stdio::null());
-                } else {
-                    child.stdin(std::process::Stdio::piped());
-                }
-                child
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped());
-                let mut child = match child.spawn() {
-                    Ok(child) => child,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        return Ok(GuestResponseBody::Exec {
-                            exit_code: 127,
-                            stdout: String::new(),
-                            stderr: format!("{argv0}: command not found\n"),
-                        });
-                    }
-                    Err(error) => return Err(error).with_context(|| format!("spawn {argv0}")),
-                };
-                if !stdin.is_empty() {
-                    use std::io::Write as _;
-                    child
-                        .stdin
-                        .take()
-                        .context("child stdin was not piped")?
-                        .write_all(&stdin)
-                        .with_context(|| format!("write stdin for {argv0}"))?;
-                }
-                let out = child
-                    .wait_with_output()
-                    .with_context(|| format!("wait for {argv0}"))?;
-                Ok(GuestResponseBody::Exec {
-                    exit_code: out.status.code().unwrap_or(-1),
-                    stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-                })
-            }
+            } => exec::execute(
+                cats_api::sessions::ExecRequest {
+                    command,
+                    timeout_ms,
+                    env,
+                    stdin,
+                },
+                peer_fd,
+            ),
             GuestRequestBody::DeployOci { deploy } => {
                 let deployment = self.oci.lock().unwrap().deploy(deploy)?;
                 Ok(GuestResponseBody::OciDeployed { deployment })
@@ -1074,83 +1136,156 @@ impl GuestAgent {
             .slave
             .spawn_command(command)
             .with_context(|| format!("spawn shell {shell} in {home}"))?;
+        let shell_process_group = child.process_id();
         drop(pair.slave);
-        let mut pty_reader = pair
-            .master
-            .try_clone_reader()
-            .context("clone shell pty reader")?;
-        let mut pty_writer = pair.master.take_writer().context("take shell pty writer")?;
+        let Some(master_fd) = pair.master.as_raw_fd() else {
+            kill_shell_process_group(shell_process_group, child.as_mut());
+            let _ = child.wait();
+            anyhow::bail!("PTY master does not expose a file descriptor");
+        };
+        if let Err(error) = set_shell_nonblocking(master_fd) {
+            kill_shell_process_group(shell_process_group, child.as_mut());
+            let _ = child.wait();
+            return Err(error).context("make shell PTY nonblocking");
+        }
+        let mut pty_reader = match pair.master.try_clone_reader() {
+            Ok(reader) => reader,
+            Err(error) => {
+                kill_shell_process_group(shell_process_group, child.as_mut());
+                let _ = child.wait();
+                return Err(error).context("clone shell pty reader");
+            }
+        };
+        let mut pty_writer = match pair.master.take_writer() {
+            Ok(writer) => writer,
+            Err(error) => {
+                kill_shell_process_group(shell_process_group, child.as_mut());
+                let _ = child.wait();
+                return Err(error).context("take shell pty writer");
+            }
+        };
 
-        write_frame(
+        if let Err(error) = write_frame(
             stream,
             &GuestResponse {
                 id,
                 body: GuestResponseBody::ShellReady,
             },
-        )?;
+        ) {
+            kill_shell_process_group(shell_process_group, child.as_mut());
+            let _ = child.wait();
+            return Err(error).context("write shell ready response");
+        }
 
-        // Both producer threads are bounded so a stalled client cannot make
-        // the guest agent buffer unbounded PTY output or input frames.
-        let (events_tx, events_rx) = mpsc::sync_channel::<ShellEvent>(32);
-        let mut input_stream = stream.try_clone()?;
+        // Every producer is bounded and cancellation-aware so neither a
+        // stalled PTY nor a stalled transport can pin lifecycle teardown.
+        let worker_cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let (events_tx, events_rx) = mpsc::sync_channel::<ShellEvent>(SHELL_CHANNEL_CAPACITY);
+        let mut input_stream = match stream.try_clone() {
+            Ok(stream) => stream,
+            Err(error) => {
+                kill_shell_process_group(shell_process_group, child.as_mut());
+                let _ = child.wait();
+                return Err(error).context("clone shell control stream");
+            }
+        };
         let input_tx = events_tx.clone();
+        let input_cancel = std::sync::Arc::clone(&worker_cancel);
         let input_thread = std::thread::spawn(move || {
             while let Ok(frame) = read_frame::<_, GuestShellFrame>(&mut input_stream) {
-                if input_tx.send(ShellEvent::Client(frame)).is_err() {
+                if !send_shell_event_cancellable(
+                    &input_tx,
+                    ShellEvent::Client(frame),
+                    &input_cancel,
+                ) {
                     return;
                 }
             }
-            let _ = input_tx.send(ShellEvent::ClientClosed);
+            let _ =
+                send_shell_event_cancellable(&input_tx, ShellEvent::ClientClosed, &input_cancel);
         });
         let output_tx = events_tx.clone();
+        let output_cancel = std::sync::Arc::clone(&worker_cancel);
         let output_thread = std::thread::spawn(move || {
             let mut buffer = vec![0u8; 16 * 1024];
-            loop {
+            while !output_cancel.load(Ordering::Acquire) {
                 match pty_reader.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(count) => {
-                        if output_tx
-                            .send(ShellEvent::Output(buffer[..count].to_vec()))
-                            .is_err()
-                        {
+                        if !send_shell_event_cancellable(
+                            &output_tx,
+                            ShellEvent::Output(buffer[..count].to_vec()),
+                            &output_cancel,
+                        ) {
                             return;
                         }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(SHELL_IO_POLL_INTERVAL);
                     }
                     // PTY masters commonly report EIO after the slave closes.
                     Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
                     Err(_) => break,
                 }
             }
-            let _ = output_tx.send(ShellEvent::OutputClosed);
+            let _ =
+                send_shell_event_cancellable(&output_tx, ShellEvent::OutputClosed, &output_cancel);
+        });
+        let (pty_input_tx, pty_input_rx) = mpsc::sync_channel::<Vec<u8>>(SHELL_CHANNEL_CAPACITY);
+        let writer_tx = events_tx.clone();
+        let writer_cancel = std::sync::Arc::clone(&worker_cancel);
+        let writer_thread = std::thread::spawn(move || {
+            let result =
+                write_shell_input_cancellable(&mut pty_writer, pty_input_rx, &writer_cancel);
+            if result.is_err() {
+                let _ = send_shell_event_cancellable(
+                    &writer_tx,
+                    ShellEvent::InputFailed,
+                    &writer_cancel,
+                );
+            }
+            result
         });
         drop(events_tx);
 
         let mut exit_status = None;
         let mut transport_open = true;
+        let mut explicit_close_requested = false;
         while exit_status.is_none() && transport_open {
             match events_rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(ShellEvent::Client(GuestShellFrame::Input { data })) => {
-                    pty_writer.write_all(&data)?;
-                    pty_writer.flush()?;
-                }
-                Ok(ShellEvent::Client(GuestShellFrame::Resize { rows, cols })) => {
-                    if (1..=1_000).contains(&rows) && (1..=1_000).contains(&cols) {
-                        pair.master.resize(PtySize {
-                            rows,
-                            cols,
-                            pixel_width: 0,
-                            pixel_height: 0,
-                        })?;
+                    if pty_input_tx.try_send(data).is_err() {
+                        transport_open = false;
                     }
                 }
-                Ok(ShellEvent::Client(GuestShellFrame::Close)) | Ok(ShellEvent::ClientClosed) => {
-                    transport_open = false
+                Ok(ShellEvent::Client(GuestShellFrame::Resize { rows, cols })) => {
+                    if (1..=1_000).contains(&rows)
+                        && (1..=1_000).contains(&cols)
+                        && pair
+                            .master
+                            .resize(PtySize {
+                                rows,
+                                cols,
+                                pixel_width: 0,
+                                pixel_height: 0,
+                            })
+                            .is_err()
+                    {
+                        transport_open = false;
+                    }
                 }
+                Ok(ShellEvent::Client(GuestShellFrame::Close)) => {
+                    explicit_close_requested = true;
+                    transport_open = false;
+                }
+                Ok(ShellEvent::ClientClosed) => transport_open = false,
                 Ok(ShellEvent::Client(
                     GuestShellFrame::Output { .. } | GuestShellFrame::Exit { .. },
                 )) => {
                     transport_open = false;
                 }
+                Ok(ShellEvent::InputFailed) => transport_open = false,
                 Ok(ShellEvent::Output(data)) => {
                     if write_frame(stream, &GuestShellFrame::Output { data }).is_err() {
                         transport_open = false;
@@ -1159,27 +1294,52 @@ impl GuestAgent {
                 Ok(ShellEvent::OutputClosed) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => transport_open = false,
             }
-            exit_status = child.try_wait()?;
+            match child.try_wait() {
+                Ok(status) => exit_status = status,
+                Err(_) => transport_open = false,
+            }
         }
         if exit_status.is_none() {
-            let _ = child.kill();
-            exit_status = Some(child.wait()?);
+            kill_shell_process_group(shell_process_group, child.as_mut());
+            match child.wait() {
+                Ok(status) => exit_status = Some(status),
+                Err(_) => transport_open = false,
+            }
+        }
+        // Close is a protocol request, not transport loss. A successful reap
+        // is the exact cleanup proof Node waits for, so preserve the still-open
+        // Guest->Node direction long enough to return the terminal Exit frame.
+        // EOF/write failure never reaches this branch and remains silent.
+        if explicit_close_requested && exit_status.is_some() {
+            transport_open = true;
         }
 
         // Drain output emitted just before exit, then publish the terminal
         // status as the final frame.
-        let drain_deadline = Instant::now() + Duration::from_secs(1);
-        while Instant::now() < drain_deadline {
-            match events_rx.recv_timeout(Duration::from_millis(20)) {
-                Ok(ShellEvent::Output(data)) => {
-                    if write_frame(stream, &GuestShellFrame::Output { data }).is_err() {
+        if transport_open {
+            let drain_deadline = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < drain_deadline {
+                match events_rx.recv_timeout(Duration::from_millis(20)) {
+                    Ok(ShellEvent::Output(data)) => {
+                        if write_frame(stream, &GuestShellFrame::Output { data }).is_err() {
+                            transport_open = false;
+                            break;
+                        }
+                    }
+                    Ok(ShellEvent::OutputClosed) => break,
+                    Ok(ShellEvent::InputFailed) => break,
+                    Ok(ShellEvent::ClientClosed) => {
                         transport_open = false;
                         break;
                     }
+                    Ok(ShellEvent::Client(GuestShellFrame::Close))
+                    | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Ok(ShellEvent::Client(_)) => {
+                        transport_open = false;
+                        break;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
-                Ok(ShellEvent::OutputClosed) => break,
-                Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
         if transport_open {
@@ -1189,9 +1349,14 @@ impl GuestAgent {
                 .unwrap_or(1);
             let _ = write_frame(stream, &GuestShellFrame::Exit { exit_code });
         }
+        worker_cancel.store(true, Ordering::Release);
         let _ = stream.shutdown(Shutdown::Both);
-        let _ = input_thread.join();
-        let _ = output_thread.join();
+        drop(pty_input_tx);
+        drop(events_rx);
+        drop(pair.master);
+        join_shell_worker(input_thread, "shell control reader")?;
+        join_shell_worker(output_thread, "shell PTY reader")?;
+        drop(join_shell_worker(writer_thread, "shell PTY writer")?);
         Ok(())
     }
 
@@ -1501,6 +1666,484 @@ mod tests {
             String::from_utf8_lossy(&output).contains("cats-shell-ready"),
             "PTY output: {}",
             String::from_utf8_lossy(&output)
+        );
+    }
+
+    #[test]
+    fn explicit_shell_close_reaps_child_and_returns_exact_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let map_path = dir.path().join("disks.json");
+        let started_path = dir.path().join("shell-close-started");
+        let shell_pid_path = dir.path().join("shell-close.pid");
+        std::fs::write(&map_path, b"{}").unwrap();
+        let agent = std::sync::Arc::new(GuestAgent::new(map_path, None));
+        let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        agent.serve_control_stream(server, None);
+
+        write_frame(
+            &mut client,
+            &GuestRequest {
+                id: 45,
+                body: GuestRequestBody::Shell { rows: 24, cols: 80 },
+            },
+        )
+        .unwrap();
+        let ready: GuestResponse = read_frame(&mut client).unwrap();
+        assert!(matches!(ready.body, GuestResponseBody::ShellReady));
+        write_frame(
+            &mut client,
+            &GuestShellFrame::Input {
+                data: format!(
+                    "printf '%s' \"$$\" > '{}'; printf started > '{}'; sleep 30\n",
+                    shell_pid_path.display(),
+                    started_path.display()
+                )
+                .into_bytes(),
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !started_path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            started_path.exists(),
+            "long-running shell command did not start"
+        );
+
+        let close_started = Instant::now();
+        write_frame(&mut client, &GuestShellFrame::Close).unwrap();
+        let exit_code = loop {
+            match read_frame::<_, GuestShellFrame>(&mut client).unwrap() {
+                GuestShellFrame::Output { .. } => {}
+                GuestShellFrame::Exit { exit_code } => break exit_code,
+                other => panic!("unexpected frame after explicit Close: {other:?}"),
+            }
+        };
+        assert_eq!(exit_code, 1, "SIGKILL is normalized by portable-pty");
+        assert!(
+            close_started.elapsed() < Duration::from_secs(2),
+            "explicit Close did not promptly return exact Exit proof"
+        );
+        let shell_pid = std::fs::read_to_string(&shell_pid_path)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        // SAFETY: the shell wrote its own PID, and signal zero only observes
+        // whether that exact process still exists.
+        let shell_exists = unsafe { libc::kill(shell_pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+        assert!(
+            !shell_exists,
+            "Exit was sent before shell {shell_pid} was reaped"
+        );
+        assert!(
+            read_frame::<_, GuestShellFrame>(&mut client).is_err(),
+            "Guest kept the shell transport open after terminal Exit"
+        );
+    }
+
+    #[test]
+    fn shell_flooded_input_disconnect_stops_workers_and_reaps_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let map_path = dir.path().join("disks.json");
+        let started_path = dir.path().join("shell-flood-started");
+        let survivor_path = dir.path().join("shell-flood-survivor");
+        std::fs::write(&map_path, b"{}").unwrap();
+        let agent = std::sync::Arc::new(GuestAgent::new(map_path, None));
+        let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        agent.serve_control_stream(server, None);
+
+        write_frame(
+            &mut client,
+            &GuestRequest {
+                id: 44,
+                body: GuestRequestBody::Shell { rows: 24, cols: 80 },
+            },
+        )
+        .unwrap();
+        let ready: GuestResponse = read_frame(&mut client).unwrap();
+        assert!(matches!(ready.body, GuestResponseBody::ShellReady));
+        write_frame(
+            &mut client,
+            &GuestShellFrame::Input {
+                data: format!(
+                    concat!(
+                        "stty -echo; printf started > '{}'; ",
+                        "sleep 0.7; printf survived > '{}'\n"
+                    ),
+                    started_path.display(),
+                    survivor_path.display()
+                )
+                .into_bytes(),
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !started_path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(started_path.exists(), "shell command did not start");
+
+        let mut flood = client.try_clone().unwrap();
+        let flood_thread = std::thread::spawn(move || {
+            for _ in 0..512 {
+                if write_frame(
+                    &mut flood,
+                    &GuestShellFrame::Input {
+                        data: vec![b'x'; 16 * 1024],
+                    },
+                )
+                .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = client.shutdown(Shutdown::Both);
+        drop(client);
+
+        let join_deadline = Instant::now() + Duration::from_secs(2);
+        while !flood_thread.is_finished() && Instant::now() < join_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            flood_thread.is_finished(),
+            "flood writer remained blocked after shell disconnect"
+        );
+        flood_thread.join().unwrap();
+        std::thread::sleep(Duration::from_millis(800));
+        assert!(
+            !survivor_path.exists(),
+            "shell survived flooded input after transport disconnect"
+        );
+    }
+
+    #[test]
+    fn exec_timeout_kills_descendant_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let map_path = dir.path().join("disks.json");
+        let survivor_path = dir.path().join("timeout-survivor");
+        std::fs::write(&map_path, b"{}").unwrap();
+        let agent = GuestAgent::new(map_path, None);
+
+        exec::reset_process_group_termination_count();
+        let started = Instant::now();
+        let response = agent.handle(GuestRequestBody::Exec {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "(sleep 0.5; printf survived > \"$SURVIVOR\") & wait".into(),
+            ],
+            timeout_ms: Some(50),
+            env: [("SURVIVOR".into(), survivor_path.display().to_string())]
+                .into_iter()
+                .collect(),
+            stdin: Vec::new(),
+        });
+        let GuestResponseBody::Error { message } = response else {
+            panic!("timed-out exec returned {response:?}")
+        };
+        assert!(message.contains("timed out after 50 ms"), "{message}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            exec::process_group_termination_count(),
+            1,
+            "timeout signaled the numeric process group more than once"
+        );
+        std::thread::sleep(Duration::from_millis(650));
+        assert!(
+            !survivor_path.exists(),
+            "a timed-out exec descendant survived its process-group kill"
+        );
+    }
+
+    #[test]
+    fn exec_post_spawn_error_kills_and_reaps_process_group_before_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let map_path = dir.path().join("disks.json");
+        let process_group_path = dir.path().join("post-spawn-error.pgid");
+        let survivor_path = dir.path().join("post-spawn-error-survivor");
+        std::fs::write(&map_path, b"{}").unwrap();
+        let agent = GuestAgent::new(map_path, None);
+
+        // Delay the injected error just long enough to calibrate that the
+        // command and its descendant really started before unwind reaches the
+        // spawn-scope cleanup guard.
+        exec::reset_process_group_termination_count();
+        exec::inject_post_spawn_error_once(Duration::from_millis(200));
+        let response = agent.handle(GuestRequestBody::Exec {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                concat!(
+                    "printf '%s' \"$$\" > \"$PROCESS_GROUP\"; ",
+                    "(sleep 0.8; printf survived > \"$SURVIVOR\") & wait"
+                )
+                .into(),
+            ],
+            timeout_ms: Some(10_000),
+            env: [
+                (
+                    "PROCESS_GROUP".into(),
+                    process_group_path.display().to_string(),
+                ),
+                ("SURVIVOR".into(), survivor_path.display().to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            stdin: Vec::new(),
+        });
+        let GuestResponseBody::Error { message } = response else {
+            panic!("post-spawn fault returned {response:?}")
+        };
+        assert!(
+            message.contains("injected post-spawn Exec failure"),
+            "{message}"
+        );
+        assert_eq!(
+            exec::process_group_termination_count(),
+            1,
+            "post-spawn Error signaled the numeric process group more than once"
+        );
+        let process_group = std::fs::read_to_string(&process_group_path)
+            .expect("injected failure occurred before the command started")
+            .parse::<i32>()
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: the command wrote its own process-group leader PID, and
+            // signal zero observes existence without changing process state.
+            let group_exists = unsafe { libc::kill(-process_group, 0) } == 0
+                || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+            if !group_exists {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Exec returned Error while process group {process_group} still existed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(850));
+        assert!(
+            !survivor_path.exists(),
+            "an Exec descendant survived a post-spawn error"
+        );
+    }
+
+    #[test]
+    fn exec_signal_exit_preserves_frozen_negative_one_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let map_path = dir.path().join("disks.json");
+        std::fs::write(&map_path, b"{}").unwrap();
+        let agent = GuestAgent::new(map_path, None);
+
+        exec::reset_process_group_termination_count();
+        let response = agent.handle(GuestRequestBody::Exec {
+            command: vec!["/bin/sh".into(), "-c".into(), "kill -TERM $$".into()],
+            timeout_ms: Some(10_000),
+            env: Default::default(),
+            stdin: Vec::new(),
+        });
+        let GuestResponseBody::Exec { exit_code, .. } = response else {
+            panic!("signal-terminated exec returned {response:?}")
+        };
+        assert_eq!(exit_code, -1);
+        assert_eq!(
+            exec::process_group_termination_count(),
+            0,
+            "a normal terminal status must not trigger cleanup signaling"
+        );
+    }
+
+    #[test]
+    fn exec_does_not_join_a_blocked_stdin_writer_after_direct_child_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let map_path = dir.path().join("disks.json");
+        let descendant_pid_path = dir.path().join("stdin-holder.pid");
+        std::fs::write(&map_path, b"{}").unwrap();
+        let agent = GuestAgent::new(map_path, None);
+
+        let started = Instant::now();
+        let response = agent.handle(GuestRequestBody::Exec {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                concat!(
+                    "sleep 30 <&0 >/dev/null 2>&1 & ",
+                    "printf '%s' \"$!\" > \"$DESCENDANT_PID\""
+                )
+                .into(),
+            ],
+            timeout_ms: Some(10_000),
+            env: [(
+                "DESCENDANT_PID".into(),
+                descendant_pid_path.display().to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            stdin: vec![b'x'; cats_api::sessions::MAX_EXEC_STDIN_BYTES],
+        });
+        let GuestResponseBody::Exec { exit_code, .. } = response else {
+            panic!("exec with inherited unread stdin returned {response:?}")
+        };
+        assert_eq!(exit_code, 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "Exec waited for a descendant-held stdin pipe"
+        );
+
+        let descendant_pid = std::fs::read_to_string(&descendant_pid_path)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        // SAFETY: the PID came from the child just spawned by this test. The
+        // signal prevents a detached test helper from surviving the test.
+        unsafe {
+            libc::kill(descendant_pid, libc::SIGKILL);
+        }
+    }
+
+    #[test]
+    fn exec_transport_disconnect_kills_descendant_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let map_path = dir.path().join("disks.json");
+        let started_path = dir.path().join("disconnect-started");
+        let survivor_path = dir.path().join("disconnect-survivor");
+        std::fs::write(&map_path, b"{}").unwrap();
+        let agent = std::sync::Arc::new(GuestAgent::new(map_path, None));
+        let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        agent.serve_control_stream(server, None);
+
+        write_frame(
+            &mut client,
+            &GuestRequest {
+                id: 42,
+                body: GuestRequestBody::Exec {
+                    command: vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        concat!(
+                            "printf started > \"$STARTED\"; ",
+                            "(sleep 0.5; printf survived > \"$SURVIVOR\") & wait"
+                        )
+                        .into(),
+                    ],
+                    timeout_ms: Some(10_000),
+                    env: [
+                        ("STARTED".into(), started_path.display().to_string()),
+                        ("SURVIVOR".into(), survivor_path.display().to_string()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    stdin: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !started_path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            started_path.exists(),
+            "exec did not start before test deadline"
+        );
+        // Leave a complete pipelined frame unread before EOF. Cancellation
+        // must observe transport HUP rather than mistaking readable bytes for
+        // a still-live caller.
+        write_frame(
+            &mut client,
+            &GuestRequest {
+                id: 43,
+                body: GuestRequestBody::Health,
+            },
+        )
+        .unwrap();
+        client.shutdown(Shutdown::Both).unwrap();
+        drop(client);
+
+        std::thread::sleep(Duration::from_millis(650));
+        assert!(
+            !survivor_path.exists(),
+            "an exec descendant survived after the control transport closed"
+        );
+    }
+
+    #[test]
+    fn exec_disconnected_transport_terminates_process_group_only_once() {
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        client.shutdown(Shutdown::Both).unwrap();
+        exec::reset_process_group_termination_count();
+
+        let result = exec::execute(
+            cats_api::sessions::ExecRequest {
+                command: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+                timeout_ms: Some(10_000),
+                env: Default::default(),
+                stdin: Vec::new(),
+            },
+            Some(std::os::fd::AsRawFd::as_raw_fd(&server)),
+        );
+        let error = result.expect_err("disconnected Exec unexpectedly succeeded");
+        assert!(format!("{error:#}").contains("caller disconnected"));
+        assert_eq!(
+            exec::process_group_termination_count(),
+            1,
+            "disconnect signaled the numeric process group more than once"
+        );
+    }
+
+    #[test]
+    fn exec_rejects_oversized_output_and_invalid_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let map_path = dir.path().join("disks.json");
+        std::fs::write(&map_path, b"{}").unwrap();
+        let agent = GuestAgent::new(map_path, None);
+
+        let invalid = agent.handle(GuestRequestBody::Exec {
+            command: Vec::new(),
+            timeout_ms: None,
+            env: Default::default(),
+            stdin: Vec::new(),
+        });
+        let GuestResponseBody::Error { message } = invalid else {
+            panic!("invalid exec returned {invalid:?}")
+        };
+        assert!(message.contains("non-empty argv array"), "{message}");
+
+        exec::reset_process_group_termination_count();
+        let oversized = agent.handle(GuestRequestBody::Exec {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!(
+                    "dd if=/dev/zero bs={} count=1 2>/dev/null",
+                    cats_api::sessions::MAX_EXEC_OUTPUT_BYTES + 1
+                ),
+            ],
+            timeout_ms: Some(10_000),
+            env: Default::default(),
+            stdin: Vec::new(),
+        });
+        let GuestResponseBody::Error { message } = oversized else {
+            panic!("oversized exec output returned {oversized:?}")
+        };
+        assert!(
+            message.contains("combined") && message.contains("byte limit"),
+            "{message}"
+        );
+        assert_eq!(
+            exec::process_group_termination_count(),
+            1,
+            "output-cap failure signaled the numeric process group more than once"
         );
     }
 

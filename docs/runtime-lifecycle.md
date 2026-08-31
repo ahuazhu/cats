@@ -1,18 +1,23 @@
 # Runtime 生命周期
 
-- 状态：ADR-0059 + ADR-0062 + ADR-0063 当前产品合同；实现和物理资格边界见
+- 状态：ADR-0059 + ADR-0062 + ADR-0063 + ADR-0065 当前产品合同；实现和物理资格边界见
   [Architecture §3](architecture.md#3-当前实现边界)
 - 决策：[ADR-0002](decisions/0002-lifecycle-states-running-suspended-warm-cold.md)、
   [ADR-0022](decisions/0022-relaxed-local-first-dual-watermark.md)、
   [ADR-0059](decisions/0059-semantic-control-node-synchronous-protocol.md)、
   [ADR-0062](decisions/0062-destroy-preempts-in-progress-cat-actions.md)、
-  [ADR-0063](decisions/0063-control-owned-default-boot-image.md)
+  [ADR-0063](decisions/0063-control-owned-default-boot-image.md)、
+  [ADR-0065](decisions/0065-exec-shell-runtime-access-lane.md)
 - 精确协议：[Control Plane 与 noded 同步协议设计](control-node-semantic-protocol.md)
 
 本文组合产品状态、同步动作、入口屏障和数据屏障。用户面只有
 `create/run/suspend/warm/cold/destroy` 六个动作。旧 `Start/Stop/Delete/Killed`、lifecycle
 Operation、command poll/result、Node command journal、typed predecessor、AgentSession 和
 HostFenceRecovery 不属于当前协议。
+
+`exec` 和 `shell` 是独立 live runtime access lane，不是第七、第八个 Cat action，不写
+`current_action` 或稳定 state。它们只在 normal `run` 后由 Node exact-Running-incarnation gate admit；
+精确合同见 [Exec/Shell Protocol v1](specs/interactive-shell-protocol.md)。
 
 ## 1. 产品状态
 
@@ -120,7 +125,7 @@ create 最终失败或超时时，Control 可以对同一 `cat_id` 调用一次 
 成功前必须：
 
 1. 撤掉新的外部流量入口；
-2. 停止接受新工作并处理当前连接的有界 drain；
+2. 关闭 ADR-0065 Node access gate，取消并在 10 秒内 drain/join 当前 Exec/Shell；
 3. pause Guest；
 4. 验证 VMM 仍存在且 Guest 不再执行新的块请求。
 
@@ -208,6 +213,10 @@ create/run -> Guest 与 mounts Ready -> publish(cat_id, node_id)
 该入口只限制新进入的流量。已有连接、后台任务和主动出站请求不因此停止。公网 Gateway、TLS 和
 Endpoint 协议不在 ADR-0059 范围；旧 Route Operation/AgentSession lane 不是当前 lifecycle 的依赖。
 
+Exec/Shell access gate 与公网入口是两个不同边界。离开 Running 除了 withdraw 新公网流量，还必须在
+同一 Node 上先 close/cancel/drain access session；入口撤销不能替代该动作。相反，Node access guard 也
+不是跨 Host fence，不能消除 ADR-0059 offline 双跑窗口。
+
 ## 7. Node 失联
 
 连续 heartbeat 丢失后，Control 再主动探测 `control_endpoint`；仍失败才把 Node 标记 offline。
@@ -255,6 +264,8 @@ Control 崩溃恢复动作只查询保存的目标 Node 和 Cat 实际状态。
   阻止同一旧 `cat_id` 再启动。
 - noded 成功、Control 写回前退出，恢复后查询 Node完成当前行。
 - Running 发布入口前 Guest 和 mounts Ready；离开 Running 先撤入口。
+- Exec/Shell 只绑定 exact Running incarnation；离开 Running 和 reset 都先 close/cancel/bounded-drain，
+  且它们不进入 `CatAction/current_action`。
 - offline 恢复先撤旧入口，新 Node Ready 后发布；旧 Node 返回时 reset 并最终收敛到单实例。
 - `disk_bindings` 的 RWO、MetadataStore writer epoch 和 Host fence 三个边界不互相冒充。
 - 已通过的真实 Control→noded HTTP Cat 状态机、PersistentDisk backend、PostgreSQL composition 和 Cloud

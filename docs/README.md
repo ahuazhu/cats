@@ -66,7 +66,7 @@
 | [Control/Node semantic protocol](control-node-semantic-protocol.md) | Current accepted target | Cat/Disk/Node 同步协议和验收 |
 | [blockd protocol](specs/blockd-protocol.md) | Implemented data plane | Chunk/Map/FLUSH；生命周期只使用远端持久模式 |
 | [Guest Runtime API](specs/guest-runtime-api.md) | Frozen v1 | Guest-local `/run/cats/runtime.sock` 能力 |
-| [Interactive Shell](specs/interactive-shell-protocol.md) | Implemented v1 | WorkOS 鉴权 WebSocket PTY |
+| [Exec / Interactive Shell](specs/interactive-shell-protocol.md) | Accepted target, implementation in progress | 认证 wake、exact-incarnation access gate、bounded Exec 与 WebSocket PTY；不属于 CatAction |
 | [Volume Authority](specs/volume-authority.md) | Storage authority retained; lifecycle composition sections superseded | owner/epoch/remote root 和数据安全；旧 Operation/AgentSession 接线不再是当前 wire |
 | [Atomic Runtime Lifecycle v1](specs/atomic-runtime-lifecycle-v1.md) | Superseded by ADR-0059 | 历史 Operation/poll/journal 协议资料，不是当前目标 |
 | [Runtime Reconciliation v1](specs/runtime-reconciliation-v1.md) | Superseded by ADR-0059 for lifecycle | 历史 Desired/AgentSession/inventory 协议；不进入当前 lifecycle |
@@ -88,6 +88,7 @@ AgentSession 或 HostFenceRecovery 协调的段落，都由 ADR-0059 supersede�
 ### 当前协调决策
 
 - [0059 Control/Node 场景语义同步协议](decisions/0059-semantic-control-node-synchronous-protocol.md)
+- [0065 Exec/Shell Runtime Access Lane](decisions/0065-exec-shell-runtime-access-lane.md)
 - [0064 Cat 动作时钟与运行时钟](decisions/0064-cat-run-and-action-clocks.md)
 - [0063 Control-owned 默认 Boot Image](decisions/0063-control-owned-default-boot-image.md)
 - [0062 Destroy 抢占进行中的 Cat 动作](decisions/0062-destroy-preempts-in-progress-cat-actions.md)
@@ -132,7 +133,8 @@ AgentSession 或 HostFenceRecovery 协调的段落，都由 ADR-0059 supersede�
 ### 其他保留决策索引
 
 - [0004 Rust 技术栈](decisions/0004-implementation-stack-and-dev-environment.md)
-- [0009 Interactive Shell](decisions/0009-interactive-shell-over-authenticated-websocket.md)
+- [0009 Interactive Shell](decisions/0009-interactive-shell-over-authenticated-websocket.md)（由 ADR-0065
+  接入当前 semantic Control/Node）
 - [0011 累计 usage ledger](decisions/0011-cumulative-usage-metering-and-billing-ledger.md)
 - [0012 Terraform AWS](decisions/0012-terraform-managed-aws-resources-and-deployments.md)
 - [0013 Prepaid credit/Stripe](decisions/0013-prepaid-credit-ledger-and-stripe-checkout.md)

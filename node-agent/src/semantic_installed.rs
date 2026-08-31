@@ -43,8 +43,8 @@ use sha2::{Digest as _, Sha256};
 use crate::ch::{self, BlockPath, ChConfig, ChSpawn, GUEST_MEMORY_FILE};
 use crate::guest_client::GuestClient;
 use crate::semantic_lifecycle::{
-    SemanticActionCancellation, SemanticCatEffects, SemanticEffectError, SemanticEffectFuture,
-    SemanticEffectRequest,
+    RuntimeAccessTarget, SemanticActionCancellation, SemanticCatEffects, SemanticEffectError,
+    SemanticEffectFuture, SemanticEffectRequest,
 };
 use crate::semantic_mounts::{
     confirm_complete_mount_set, ExpectedPersistentMount, ExpectedPersistentMountSet,
@@ -213,8 +213,7 @@ impl InstalledInner {
             }
             CatAction::Destroy => {
                 if let Some(cat) = managed.as_mut() {
-                    self.stop_cat(cat, true, &cancellation)
-                        .context("stop installed Cat for destroy")?;
+                    self.stop_cat_for_destroy(cat, &cancellation)?;
                     managed.take();
                 }
                 self.destroy_root(&cat_id, &request.config)
@@ -308,6 +307,38 @@ impl SemanticCatEffects for InstalledSemanticCatEffects {
                 .map_err(|error| installed_error(format!("join installed reset: {error}")))?
                 .map_err(format_installed_error)
         })
+    }
+
+    fn running_access_target(
+        &self,
+        cat_id: &str,
+    ) -> Result<Option<RuntimeAccessTarget>, SemanticEffectError> {
+        let lane = self
+            .inner
+            .cats()
+            .get(cat_id)
+            .cloned()
+            .ok_or_else(|| installed_error("installed Cat is absent"))?;
+        let managed = lane.cat();
+        let cat = managed
+            .as_ref()
+            .ok_or_else(|| installed_error("installed Cat is absent"))?;
+        if cat.state != CatState::Running {
+            return Err(SemanticEffectError::new(
+                cats_api::semantic_control::SemanticErrorCode::InvalidState,
+                "installed Cat is not Running",
+            ));
+        }
+        let vmm = cat
+            .vmm
+            .as_ref()
+            .ok_or_else(|| installed_error("Running Cat has no VMM"))?;
+        Ok(Some(RuntimeAccessTarget {
+            runtime_incarnation: cat.runtime_incarnation.clone(),
+            vsock_socket: cat.vsock_socket.clone(),
+            guest_port: ch::GUEST_VSOCK_PORT,
+            vmm_pid: vmm.id(),
+        }))
     }
 }
 
@@ -1240,6 +1271,33 @@ impl InstalledInner {
         Ok(())
     }
 
+    fn stop_cat_for_destroy(
+        &self,
+        cat: &mut ManagedCat,
+        cancellation: &SemanticActionCancellation,
+    ) -> Result<()> {
+        let result = self
+            .stop_cat(cat, true, cancellation)
+            .context("stop installed Cat for destroy");
+        if let Err(graceful_error) = &result {
+            // Destroy is strong stop authority for this exact installed Cat.
+            // A failed Guest resume/readiness/quiesce cannot leave its VMM
+            // or dedicated frontends running, but the failed graceful stop
+            // must not continue into volume release or RootDisk deletion.
+            self.stop_vmm(cat);
+            if let Err(cleanup_error) = self.stop_frontends(cat, false) {
+                tracing::error!(
+                    cat_id = cat.cat_id.as_str(),
+                    graceful_error = %format!("{graceful_error:#}"),
+                    cleanup_error = %format!("{cleanup_error:#}"),
+                    "Destroy strong-stop frontend cleanup failed"
+                );
+            }
+            self.meters.close(cat.cat_id.as_str());
+        }
+        result
+    }
+
     fn stop_cat_without_release(&self, cat: &mut ManagedCat) {
         if cat.state == CatState::Suspended {
             let _ = ch::resume(&cat.api_socket);
@@ -1732,6 +1790,7 @@ mod tests {
         root: CatVolume,
         attached: AttachedVolume,
         detach_calls: AtomicUsize,
+        begin_delete_calls: AtomicUsize,
     }
 
     impl CatVolumeStore for RecordingRootStore {
@@ -1783,6 +1842,7 @@ mod tests {
             &self,
             _volume: &CatVolume,
         ) -> cats_storage::authority::Result<RootDeleteState> {
+            self.begin_delete_calls.fetch_add(1, Ordering::SeqCst);
             Err(AuthorityError::BackendUnknown)
         }
 
@@ -1891,7 +1951,200 @@ mod tests {
                 serving,
             },
             detach_calls: AtomicUsize::new(0),
+            begin_delete_calls: AtomicUsize::new(0),
         })
+    }
+
+    #[test]
+    fn destroy_stops_fake_vmm_when_guest_is_unavailable_and_preserves_root() {
+        let directory = tempfile::tempdir_in("/tmp").expect("temporary installed directory");
+        let socket_root = directory.path().join("sockets");
+        let host_lock = directory.path().join("host.lock");
+        drop(
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&host_lock)
+                .expect("provision Host lock"),
+        );
+        let config = InstalledCatConfig {
+            node_id: Id::new("node_cleanup").expect("Node ID"),
+            state_directory: directory.path().join("state"),
+            runtime_directory: directory.path().join("runtime"),
+            host_lock,
+            blockd_binary: PathBuf::from("/unused/cats-blockd"),
+            blockd_socket_root: ManagedBlockdSocketRoot::from_canonical_path(
+                HostPath::new(socket_root.to_string_lossy().into_owned()).expect("socket root"),
+            )
+            .expect("managed socket root"),
+            golden_root_cache_image: directory.path().join("golden-root-cache/rootfs.ext4"),
+            metadata_store: AdapterSelection::new(
+                "postgres",
+                cats_storage::AdapterConfig::from_cli(Vec::<String>::new())
+                    .expect("empty metadata config"),
+            ),
+            object_store: AdapterSelection::new(
+                "file",
+                cats_storage::AdapterConfig::from_cli(Vec::<String>::new())
+                    .expect("empty object config"),
+            ),
+            ch: ChConfig {
+                block_direct: false,
+                ch_bin: PathBuf::from("/unused/cloud-hypervisor"),
+                kernel: PathBuf::from("/unused/vmlinuz"),
+                initramfs: None,
+                boot_contract: None,
+                cmdline: String::new(),
+                seed_image: None,
+                block_path: BlockPath::VhostUser,
+                vhost_user_queues: 1,
+                vhost_user_queue_size: 256,
+                nbd_client_bin: PathBuf::from("/unused/nbd-client"),
+                nbd_devices: 1,
+                ip_bin: PathBuf::from("/unused/ip"),
+            },
+            root_size_bytes: 4 << 20,
+            lease_duration_ms: 5_000,
+            effect_timeout: Duration::from_millis(50),
+            guest_ready_timeout: Duration::from_millis(50),
+        };
+        let volumes = root_store();
+        let effects = InstalledSemanticCatEffects::new(
+            config,
+            Arc::clone(&volumes) as Arc<dyn CatVolumeStore>,
+            Arc::new(UnusedVolumeData),
+            Arc::new(MissingBlob),
+            Arc::new(
+                CatUsageMeters::new(Id::new("node_test").expect("node id"), None)
+                    .expect("unmetered test Node"),
+            ),
+        )
+        .expect("installed effects");
+        let request_config = NodedCatConfig {
+            workspace_id: Id::new("ws_cleanup").expect("workspace ID"),
+            cpu: 1,
+            memory_bytes: 1 << 30,
+            boot_image: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .to_owned(),
+            mounts: Vec::new(),
+        };
+        let runtime_directory = effects.inner.config.runtime_directory.join("cat_cleanup");
+        create_private_directory(&runtime_directory).expect("create Cat runtime directory");
+        let volume_data_directory = effects
+            .inner
+            .config
+            .state_directory
+            .join("data/cat_cleanup/vol_cleanup");
+        create_private_directory(&volume_data_directory).expect("create volume data directory");
+        let fake_vmm = Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn fake VMM");
+        let fake_vmm_pid = fake_vmm.id();
+        let fake_frontend = Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn fake block frontend");
+        let fake_frontend_pid = fake_frontend.id();
+        let lane = effects.inner.lane("cat_cleanup");
+        *lane.cat() = Some(ManagedCat {
+            cat_id: Id::new("cat_cleanup").expect("Cat ID"),
+            config: request_config.clone(),
+            state: CatState::Running,
+            runtime_incarnation: RandomId128::new("22222222222222222222222222222222")
+                .expect("runtime incarnation"),
+            api_socket: runtime_directory.join("vmm-api.sock"),
+            // No listener exists: the fake VMM models an unavailable Guest.
+            vsock_socket: runtime_directory.join("missing-vmm-vsock.sock"),
+            serial_log: runtime_directory.join("guest-serial.log"),
+            memory_file: runtime_directory.join(GUEST_MEMORY_FILE),
+            snapshot_directory: runtime_directory.join("warm-snapshot"),
+            runtime_directory,
+            volumes: vec![LocalVolume {
+                requested: None,
+                attached: volumes.attached.clone(),
+                data_directory: volume_data_directory.clone(),
+                authorization_file: directory.path().join("unused-authorization.json"),
+                process_identity_token: RandomId128::new("33333333333333333333333333333333")
+                    .expect("process identity"),
+                device_ownership_token: RandomId128::new("44444444444444444444444444444444")
+                    .expect("device ownership"),
+                guest_device: GuestDeviceIdentity {
+                    serial: Id::new(ROOT_DEVICE_SERIAL).expect("Root device serial"),
+                    slot: 0,
+                },
+                control_socket: directory.path().join("unused-control.sock"),
+                io_socket: directory.path().join("unused-io.sock"),
+                blockd: Some(fake_frontend),
+                nbd_device: None,
+            }],
+            vmm: Some(fake_vmm),
+            boot_descriptors: None,
+        });
+
+        let error = effects
+            .inner
+            .apply(
+                SemanticEffectRequest {
+                    cat_id: "cat_cleanup".to_owned(),
+                    action: CatAction::Destroy,
+                    config: request_config,
+                },
+                SemanticActionCancellation::new(),
+            )
+            .expect_err("unavailable Guest must fail graceful destroy");
+
+        let error_chain = format!("{error:#}");
+        assert!(error_chain.contains("stop installed Cat for destroy"));
+        assert!(error_chain.contains("connect Guest for syncfs"));
+        let mut managed = lane.cat();
+        let cat = managed.as_mut().expect("failed destroy retains Cat state");
+        let vmm_was_stopped = cat.vmm.is_none();
+        let frontend_was_stopped = cat.volumes[0].blockd.is_none();
+        if let Some(mut leaked_vmm) = cat.vmm.take() {
+            let _ = leaked_vmm.kill();
+            let _ = leaked_vmm.wait();
+        }
+        if let Some(mut leaked_frontend) = cat.volumes[0].blockd.take() {
+            let _ = leaked_frontend.kill();
+            let _ = leaked_frontend.wait();
+        }
+        assert!(vmm_was_stopped, "Destroy must stop the exact retained VMM");
+        assert!(
+            frontend_was_stopped,
+            "Destroy must stop the retained Cat's dedicated frontends"
+        );
+        // SAFETY: kill with signal zero only probes the checked positive PID;
+        // stop_vmm has already waited for that exact child.
+        let probe = unsafe {
+            libc::kill(
+                i32::try_from(fake_vmm_pid).expect("fake VMM PID fits pid_t"),
+                0,
+            )
+        };
+        assert_eq!(probe, -1, "fake VMM must no longer exist");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        // SAFETY: as above, this only probes the checked positive PID of the
+        // exact frontend child retained by this Cat.
+        let frontend_probe = unsafe {
+            libc::kill(
+                i32::try_from(fake_frontend_pid).expect("fake frontend PID fits pid_t"),
+                0,
+            )
+        };
+        assert_eq!(frontend_probe, -1, "fake frontend must no longer exist");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        assert_eq!(cat.volumes.len(), 1);
+        assert!(volume_data_directory.is_dir());
+        assert_eq!(volumes.detach_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(volumes.begin_delete_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

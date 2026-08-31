@@ -15,6 +15,8 @@
   入口先撤旧、后发布新目标，不以旧 Host 已被 fence 为恢复前置条件
 - 后续修正：[ADR-0063](0063-control-owned-default-boot-image.md) 把 boot image 改为 Control 部署默认值；
   public create 身份只比较用户选择的 CPU、内存和初始 mounts
+- 后续扩展：[ADR-0065](0065-exec-shell-runtime-access-lane.md)增加独立 Exec/Shell live access lane；它不
+  增加 CatAction、不写 `current_action`，也不改变本文有界网络和 offline 双跑风险
 
 ## 背景
 
