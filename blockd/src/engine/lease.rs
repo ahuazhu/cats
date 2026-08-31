@@ -107,9 +107,6 @@ impl ChunkEngine {
         if let Some(handle) = self.renew_thread.lock().unwrap().take() {
             let _ = handle.join();
         }
-        if let Some(handle) = self.gc_thread.lock().unwrap().take() {
-            let _ = handle.join();
-        }
         if let Some(handle) = self.committer_thread.lock().unwrap().take() {
             let _ = handle.join();
         }

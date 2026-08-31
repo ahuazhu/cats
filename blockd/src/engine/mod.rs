@@ -36,7 +36,8 @@ use cats_storage::authority::{
 use cats_storage::MetadataStore;
 use cats_storage::{BlobError, BlobStore, MetaError, VolumeHead};
 
-mod gc;
+#[cfg(test)]
+mod gc_fixture;
 mod hydrate;
 mod lease;
 mod pack;
@@ -47,7 +48,6 @@ mod quota;
 mod recovery;
 mod status;
 
-pub use gc::GcStats;
 #[cfg(test)]
 use pack::StageWriteFailureGuard;
 use pack::{apply_local_entry, merge_dirty_range, DirtyByteRange, StagedPack, StagedQueue};
@@ -282,7 +282,6 @@ pub struct ChunkEngine {
     /// the timer).
     committer_signal: Arc<(Mutex<CommitterSignal>, Condvar)>,
     renew_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
-    gc_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     committer_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Most recent asynchronous publication failure. It is cleared only after a
     /// later batch reaches the remote watermark.
@@ -1060,7 +1059,6 @@ impl ChunkEngine {
                 Condvar::new(),
             )),
             renew_thread: Mutex::new(None),
-            gc_thread: Mutex::new(None),
             committer_thread: Mutex::new(None),
             last_publish_error: Mutex::new(None),
             evicted_cache_chunks: AtomicU64::new(0),

@@ -3176,7 +3176,10 @@ fn gc_keeps_every_layer_of_a_live_chain_and_drops_superseded_objects() {
     assert_eq!(stats.data_objects_live, 4);
     assert_eq!(stats.data_objects_deleted, 1);
     assert_eq!(after, before - 1);
-    assert!(stats.map_nodes_deleted > 0, "superseded map nodes survived");
+    assert!(
+        stats.map_objects_deleted > 0,
+        "superseded map nodes survived"
+    );
 
     // The volume still reads correctly from a host with nothing cached.
     e.detach().unwrap();
@@ -3352,37 +3355,6 @@ fn a_partial_discard_writes_zeros_and_a_later_write_cancels_a_discard() {
         "the discard still applied"
     );
     e.detach().unwrap();
-}
-
-#[test]
-fn the_gc_thread_sweeps_on_its_own_and_does_not_delay_detach() {
-    let env = env();
-    let e = attach(&env, "attA");
-    // Two dense generations of one chunk: the first object becomes garbage.
-    e.write(0, &pattern(CHUNK_SIZE as usize, 1)).unwrap();
-    e.flush().unwrap();
-    e.write(0, &pattern(CHUNK_SIZE as usize, 2)).unwrap();
-    e.flush().unwrap();
-    assert_eq!(env.blob.list("volumes/vol_test/data/").unwrap().len(), 2);
-
-    e.start_gc_thread(Duration::from_millis(50));
-    let deadline = std::time::Instant::now() + poll_bound();
-    while env.blob.list("volumes/vol_test/data/").unwrap().len() > 1 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "gc thread never swept"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-
-    // And it must not hold up a stop, the way lease renewal used to.
-    let started = std::time::Instant::now();
-    e.detach().unwrap();
-    assert!(
-        started.elapsed() < Duration::from_millis(500),
-        "detach waited {:?} on the gc thread",
-        started.elapsed()
-    );
 }
 
 #[test]
