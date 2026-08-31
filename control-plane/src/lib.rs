@@ -11,6 +11,7 @@ pub mod semantic_node_recovery;
 pub mod semantic_noded_client;
 pub mod semantic_resource_service;
 pub mod semantic_session;
+pub mod semantic_snapshot_gc;
 pub mod semantic_strict_disk_backend;
 pub mod server;
 pub mod store;
