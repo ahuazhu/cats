@@ -6,8 +6,8 @@
 
 use cats_api::error::ApiError;
 use cats_api::runtime_reconciliation::{
-    FenceEpoch, Generation, Id, RandomId128, RemoteHead, Sha256Digest,
-    SnapshotRestoreRequest, SnapshotRestoreResult,
+    Generation, Id, RandomId128, RemoteHead, Sha256Digest, SnapshotRestoreRequest,
+    SnapshotRestoreResult,
 };
 use cats_storage::authority::{
     project_volume_record, restore_snapshot, AuthorityError, LastVolumeTransition,
@@ -27,10 +27,12 @@ const SNAPSHOT_COLUMNS: &str = "
 
 const VOLUME_COLUMNS: &str = "
     volume_id, record::text AS record_json, size_bytes, durability,
-    admin_state, delete_id, head_generation, head_root_hash,
-    head_root_object_id, lease_owner, lease_epoch, lease_expires_at,
+    admin_state, delete_id, gc_required, gc_id, gc_roots_digest,
+    gc_started_at, head_generation, head_root_hash, head_root_object_id,
+    lease_owner, lease_epoch, lease_expires_at,
     last_transition_kind, last_transition_id,
-    transition_placement_epoch, transition_lease_duration_ms";
+    transition_placement_epoch, transition_lease_duration_ms,
+    owner_binding::text AS owner_binding_json, owner_node_id";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -222,7 +224,8 @@ impl Store {
         snapshot_id: &str,
     ) -> Result<Option<DiskSnapshotRecord>> {
         self.authority_read_snapshot(|transaction| {
-            load_snapshot_by_id(transaction, snapshot_id, false).map(|value| value.map(|(row, _)| row))
+            load_snapshot_by_id(transaction, snapshot_id, false)
+                .map(|value| value.map(|(row, _)| row))
         })
     }
 
@@ -238,12 +241,9 @@ impl Store {
             return Ok(None);
         }
         self.authority_read_snapshot(|transaction| {
-            let Some(current) = load_product_disk(
-                transaction,
-                &product.workspace_id,
-                &product.disk_id,
-                false,
-            )? else {
+            let Some(current) =
+                load_product_disk(transaction, &product.workspace_id, &product.disk_id, false)?
+            else {
                 return Err(corrupt());
             };
             if current.disk_slug != product.disk_slug
@@ -291,12 +291,9 @@ impl Store {
                 });
             }
             lock_semantic_disk(transaction, request.disk_id)?;
-            let Some(product) = load_product_disk(
-                transaction,
-                request.workspace_id,
-                request.disk_id,
-                true,
-            )? else {
+            let Some(product) =
+                load_product_disk(transaction, request.workspace_id, request.disk_id, true)?
+            else {
                 return Ok(CreateDiskSnapshotOutcome::DiskNotFound);
             };
             if product.status != "normal" {
@@ -394,14 +391,16 @@ impl Store {
                 "SELECT snapshot_slug,disk_id FROM disk_snapshots
                   WHERE snapshot_id=$1 AND workspace_id=$2",
                 &[&snapshot_id, &workspace_id],
-            )? else {
+            )?
+            else {
                 return Ok(DeleteDiskSnapshotOutcome::NotFound);
             };
             let snapshot_slug: String = identity.get(0);
             let original_disk_id: String = identity.get(1);
             lock_snapshot_slug(transaction, workspace_id, &snapshot_slug)?;
             lock_semantic_disk(transaction, &original_disk_id)?;
-            let Some((identity, live_head)) = load_snapshot_by_id(transaction, snapshot_id, true)? else {
+            let Some((identity, live_head)) = load_snapshot_by_id(transaction, snapshot_id, true)?
+            else {
                 return Ok(DeleteDiskSnapshotOutcome::NotFound);
             };
             if identity.workspace_id != workspace_id {
@@ -412,12 +411,9 @@ impl Store {
             }
             let live_head = live_head.ok_or_else(corrupt)?;
 
-            let Some(product) = load_product_disk(
-                transaction,
-                workspace_id,
-                &original_disk_id,
-                true,
-            )? else {
+            let Some(product) =
+                load_product_disk(transaction, workspace_id, &original_disk_id, true)?
+            else {
                 return Err(corrupt());
             };
             if product.status != "normal" {
@@ -462,14 +458,9 @@ impl Store {
                 "DELETE FROM disk_snapshot_records WHERE snapshot_id=$1",
                 &[&snapshot_id],
             )?)?;
-            // v20 GC contract: removing a live root makes objects potentially
-            // unreachable. The canonical VolumeRecord gains the same field in
-            // the GC authority lane; until that shared type lands, keep the
-            // scalar work bit exact and do not invent a second GC job here.
-            exactly_one(transaction.execute(
-                "UPDATE volume_records SET gc_required=TRUE WHERE volume_id=$1",
-                &[&product.volume_id],
-            )?)?;
+            let mut updated_volume = volume;
+            updated_volume.gc_required = true;
+            update_volume_record(transaction, &updated_volume)?;
             let deleted = load_snapshot_by_id(transaction, snapshot_id, true)?
                 .map(|(record, _)| record)
                 .ok_or_else(corrupt)?;
@@ -492,7 +483,8 @@ impl Store {
                 "SELECT disk_id FROM disk_snapshots
                   WHERE snapshot_id=$1 AND workspace_id=$2 AND deleted_at IS NULL",
                 &[&snapshot_id, &workspace_id],
-            )? else {
+            )?
+            else {
                 return Ok(RestoreDiskSnapshotOutcome::NotFound);
             };
             let disk_id: String = lock_row.get(0);
@@ -506,7 +498,8 @@ impl Store {
                 return Ok(RestoreDiskSnapshotOutcome::NotFound);
             }
             let snapshot_head = snapshot_head.ok_or_else(corrupt)?;
-            let Some(product) = load_product_disk(transaction, workspace_id, &disk_id, true)? else {
+            let Some(product) = load_product_disk(transaction, workspace_id, &disk_id, true)?
+            else {
                 return Err(corrupt());
             };
             if product.status != "normal" {
@@ -579,7 +572,7 @@ impl Store {
                 }
                 Err(_) => return Err(corrupt()),
             };
-            update_volume_after_restore(transaction, &updated)?;
+            update_volume_record(transaction, &updated)?;
             Ok(RestoreDiskSnapshotOutcome::Restored { snapshot, result })
         })
     }
@@ -775,7 +768,8 @@ fn load_disk_authority(
 ) -> AuthorityTxResult<StoredDiskAuthority> {
     let suffix = if lock { "FOR UPDATE" } else { "" };
     let row = transaction.query_one(
-        &format!("SELECT record::text AS record_json,disk_id,workspace_id,name,volume_id,
+        &format!(
+            "SELECT record::text AS record_json,disk_id,workspace_id,name,volume_id,
                 size_bytes,durability,created_at,admin_state,delete_id,
                 role_kind,initialization_kind,
                 initialization_token,filesystem_uuid,expected_blank_generation,
@@ -784,7 +778,8 @@ fn load_disk_authority(
                 initialized_root_object_id,initialized_at,
                 initialization_commit_receipt_bytes,
                 initialization_commit_receipt_digest
-           FROM disk_records WHERE disk_id=$1 {suffix}"),
+           FROM disk_records WHERE disk_id=$1 {suffix}"
+        ),
         &[&disk_id],
     )?;
     let record_json: String = row.try_get("record_json")?;
@@ -837,7 +832,10 @@ fn disk_identity_exact(disk: &StoredDiskAuthority, product: &ProductDisk) -> boo
         && canonical.durability == VolumeDurability::Strict
         && i64::try_from(canonical.created_at).ok() == Some(disk.created_at)
         && matches!(canonical.admin_state, CanonicalDiskAdminState::Active)
-        && matches!(canonical.role, CanonicalPersistentDiskRole::Persistent { .. })
+        && matches!(
+            canonical.role,
+            CanonicalPersistentDiskRole::Persistent { .. }
+        )
         && match (&canonical.role, disk.initialization_kind.as_deref()) {
             (
                 CanonicalPersistentDiskRole::Persistent {
@@ -877,14 +875,25 @@ fn disk_is_initialized(disk: &StoredDiskAuthority) -> bool {
         && expected_blank_head.generation.get() == 0
         && expected_blank_head.root_hash.is_none()
         && expected_blank_head.root_object_id.is_none()
-        && disk.initialized_generation.and_then(|value| u64::try_from(value).ok())
+        && disk
+            .initialized_generation
+            .and_then(|value| u64::try_from(value).ok())
             == Some(initialized_head.generation.get())
         && disk.initialized_root_hash.as_deref()
-            == initialized_head.root_hash.as_ref().map(Sha256Digest::as_str)
+            == initialized_head
+                .root_hash
+                .as_ref()
+                .map(Sha256Digest::as_str)
         && disk.initialized_root_object_id.as_deref()
-            == initialized_head.root_object_id.as_ref().map(|value| value.as_str())
+            == initialized_head
+                .root_object_id
+                .as_ref()
+                .map(|value| value.as_str())
         && initialized_head.generation.get() > 0
-        && disk.initialized_at.and_then(|value| u64::try_from(value).ok()) == Some(*initialized_at)
+        && disk
+            .initialized_at
+            .and_then(|value| u64::try_from(value).ok())
+            == Some(*initialized_at)
         && disk
             .initialization_commit_receipt_bytes
             .as_ref()
@@ -904,9 +913,11 @@ fn initialized_head(disk: &StoredDiskAuthority) -> AuthorityTxResult<RemoteHead>
 fn load_volume(
     transaction: &mut Transaction<'_>,
     volume_id: &str,
+    lock: bool,
 ) -> AuthorityTxResult<VolumeRecord> {
+    let suffix = if lock { "FOR UPDATE" } else { "" };
     let row = transaction.query_one(
-        &format!("SELECT {VOLUME_COLUMNS} FROM volume_records WHERE volume_id=$1 FOR UPDATE"),
+        &format!("SELECT {VOLUME_COLUMNS} FROM volume_records WHERE volume_id=$1 {suffix}"),
         &[&volume_id],
     )?;
     let record_json: String = row.try_get("record_json")?;
@@ -921,39 +932,150 @@ fn volume_projection_matches(row: &Row, record: &VolumeRecord) -> bool {
         return false;
     };
     row.try_get::<_, String>("volume_id").ok().as_deref() == Some(&projection.volume_id)
-        && row.try_get::<_, i64>("size_bytes").ok().and_then(|v| u64::try_from(v).ok())
+        && row
+            .try_get::<_, i64>("size_bytes")
+            .ok()
+            .and_then(|v| u64::try_from(v).ok())
             == Some(projection.size_bytes)
-        && row.try_get::<_, String>("durability").ok().as_deref()
-            == Some(projection.durability)
-        && row.try_get::<_, String>("admin_state").ok().as_deref()
-            == Some(projection.admin_state)
+        && row.try_get::<_, String>("durability").ok().as_deref() == Some(projection.durability)
+        && row.try_get::<_, String>("admin_state").ok().as_deref() == Some(projection.admin_state)
         && row.try_get::<_, Option<String>>("delete_id").ok().flatten() == projection.delete_id
+        && row.try_get::<_, bool>("gc_required").ok() == Some(projection.gc_required)
+        && row.try_get::<_, Option<String>>("gc_id").ok().flatten() == projection.gc_id
+        && row
+            .try_get::<_, Option<String>>("gc_roots_digest")
+            .ok()
+            .flatten()
+            == projection.gc_roots_digest
+        && row
+            .try_get::<_, Option<i64>>("gc_started_at")
+            .ok()
+            .flatten()
+            == projection
+                .gc_started_at
+                .and_then(|value| i64::try_from(value.get()).ok())
         && row.try_get::<_, i64>("head_generation").ok()
             == i64::try_from(projection.head_generation.get()).ok()
-        && row.try_get::<_, Option<String>>("head_root_hash").ok().flatten()
+        && row
+            .try_get::<_, Option<String>>("head_root_hash")
+            .ok()
+            .flatten()
             == projection.head_root_hash
-        && row.try_get::<_, Option<String>>("head_root_object_id").ok().flatten()
+        && row
+            .try_get::<_, Option<String>>("head_root_object_id")
+            .ok()
+            .flatten()
             == projection.head_root_object_id
-        && row.try_get::<_, Option<String>>("lease_owner").ok().flatten()
+        && row
+            .try_get::<_, Option<String>>("lease_owner")
+            .ok()
+            .flatten()
             == projection.lease_owner
         && row.try_get::<_, i64>("lease_epoch").ok()
             == i64::try_from(projection.lease_epoch.get()).ok()
-        && row.try_get::<_, Option<i64>>("lease_expires_at").ok().flatten()
+        && row
+            .try_get::<_, Option<i64>>("lease_expires_at")
+            .ok()
+            .flatten()
             == projection
                 .lease_expires_at
                 .and_then(|value| i64::try_from(value.get()).ok())
-        && row.try_get::<_, Option<String>>("last_transition_kind").ok().flatten().as_deref()
+        && row
+            .try_get::<_, Option<String>>("last_transition_kind")
+            .ok()
+            .flatten()
+            .as_deref()
             == projection.last_transition_kind
-        && row.try_get::<_, Option<String>>("last_transition_id").ok().flatten()
+        && row
+            .try_get::<_, Option<String>>("last_transition_id")
+            .ok()
+            .flatten()
             == projection.last_transition_id
-        && row.try_get::<_, Option<i64>>("transition_placement_epoch").ok().flatten()
+        && row
+            .try_get::<_, Option<i64>>("transition_placement_epoch")
+            .ok()
+            .flatten()
             == projection
                 .transition_placement_epoch
                 .and_then(|value| i64::try_from(value.get()).ok())
-        && row.try_get::<_, Option<i64>>("transition_lease_duration_ms").ok().flatten()
+        && row
+            .try_get::<_, Option<i64>>("transition_lease_duration_ms")
+            .ok()
+            .flatten()
             == projection
                 .transition_lease_duration_ms
                 .and_then(|value| i64::try_from(value).ok())
+        && row
+            .try_get::<_, Option<String>>("owner_binding_json")
+            .ok()
+            .flatten()
+            .is_none()
+        && row
+            .try_get::<_, Option<String>>("owner_node_id")
+            .ok()
+            .flatten()
+            .is_none()
+}
+
+fn update_volume_record(
+    transaction: &mut Transaction<'_>,
+    record: &VolumeRecord,
+) -> AuthorityTxResult<()> {
+    let projection = project_volume_record(record).map_err(|_| corrupt())?;
+    let record_json = serde_json::to_string(record).map_err(|_| corrupt())?;
+    let size_bytes = i64::try_from(projection.size_bytes).map_err(|_| corrupt())?;
+    let head_generation = generation_to_i64(projection.head_generation)?;
+    let lease_epoch = i64::try_from(projection.lease_epoch.get()).map_err(|_| corrupt())?;
+    let lease_expires_at = projection
+        .lease_expires_at
+        .map(|value| i64::try_from(value.get()).map_err(|_| corrupt()))
+        .transpose()?;
+    let gc_started_at = projection
+        .gc_started_at
+        .map(|value| i64::try_from(value.get()).map_err(|_| corrupt()))
+        .transpose()?;
+    let transition_placement_epoch = projection
+        .transition_placement_epoch
+        .map(|value| i64::try_from(value.get()).map_err(|_| corrupt()))
+        .transpose()?;
+    let transition_lease_duration_ms = projection
+        .transition_lease_duration_ms
+        .map(|value| i64::try_from(value).map_err(|_| corrupt()))
+        .transpose()?;
+    exactly_one(transaction.execute(
+        "UPDATE volume_records SET
+            record=$2::TEXT::jsonb, size_bytes=$3, durability=$4,
+            admin_state=$5, delete_id=$6, gc_required=$7, gc_id=$8,
+            gc_roots_digest=$9, gc_started_at=$10, head_generation=$11,
+            head_root_hash=$12, head_root_object_id=$13, lease_owner=$14,
+            lease_epoch=$15, lease_expires_at=$16,
+            last_transition_kind=$17, last_transition_id=$18,
+            transition_placement_epoch=$19,
+            transition_lease_duration_ms=$20
+          WHERE volume_id=$1 AND owner_binding IS NULL AND owner_node_id IS NULL",
+        &[
+            &projection.volume_id,
+            &record_json,
+            &size_bytes,
+            &projection.durability,
+            &projection.admin_state,
+            &projection.delete_id,
+            &projection.gc_required,
+            &projection.gc_id,
+            &projection.gc_roots_digest,
+            &gc_started_at,
+            &head_generation,
+            &projection.head_root_hash,
+            &projection.head_root_object_id,
+            &projection.lease_owner,
+            &lease_epoch,
+            &lease_expires_at,
+            &projection.last_transition_kind,
+            &projection.last_transition_id,
+            &transition_placement_epoch,
+            &transition_lease_duration_ms,
+        ],
+    )?)
 }
 
 fn volume_identity_exact(volume: &VolumeRecord, product: &ProductDisk) -> bool {
@@ -975,9 +1097,7 @@ fn remote_head(
         .map(|value| Sha256Digest::new(value).ok_or_else(corrupt))
         .transpose()?;
     let root_object_id = root_object_id
-        .map(|value| {
-            cats_api::runtime_reconciliation::AsciiText::new(value).ok_or_else(corrupt)
-        })
+        .map(|value| cats_api::runtime_reconciliation::AsciiText::new(value).ok_or_else(corrupt))
         .transpose()?;
     if (generation.get() == 0) != (root_hash.is_none() && root_object_id.is_none())
         || (root_hash.is_some() != root_object_id.is_some())
@@ -996,6 +1116,25 @@ fn head_is_same_or_later(current: &RemoteHead, initialized: &RemoteHead) -> bool
         || (current.generation == initialized.generation && current == initialized)
 }
 
+fn snapshot_matches_product(snapshot: &DiskSnapshotRecord, product: &ProductDisk) -> bool {
+    snapshot.workspace_id == product.workspace_id
+        && snapshot.disk_id == product.disk_id
+        && snapshot.disk_slug == product.disk_slug
+        && snapshot.volume_id == product.volume_id
+        && snapshot.size_bytes == product.size_bytes
+}
+
+fn lock_semantic_disk(transaction: &mut Transaction<'_>, disk_id: &str) -> AuthorityTxResult<()> {
+    transaction.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended(
+            current_schema() || ':semantic-disk:disk:' || $1,
+            0::BIGINT
+         ))",
+        &[&disk_id],
+    )?;
+    Ok(())
+}
+
 fn lock_snapshot_slug(
     transaction: &mut Transaction<'_>,
     workspace_id: &str,
@@ -1011,10 +1150,8 @@ fn lock_snapshot_slug(
     Ok(())
 }
 
-fn json_text<'a>(record: &'a Value, path: &[&str]) -> Option<&'a str> {
-    path.iter()
-        .try_fold(record, |value, key| value.get(*key))
-        .and_then(Value::as_str)
+fn parse_id(value: &str) -> AuthorityTxResult<Id> {
+    Id::new(value).ok_or_else(corrupt)
 }
 
 fn generation_to_i64(generation: Generation) -> AuthorityTxResult<i64> {

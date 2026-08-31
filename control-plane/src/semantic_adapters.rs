@@ -1085,6 +1085,8 @@ fn semantic_error_code(code: SemanticErrorCode) -> &'static str {
         SemanticErrorCode::SnapshotInUse => "snapshot_in_use",
         SemanticErrorCode::DiskOwned => "disk_owned",
         SemanticErrorCode::HeadConflict => "head_conflict",
+        SemanticErrorCode::DiskNotInitialized => "disk_not_initialized",
+        SemanticErrorCode::GenerationExhausted => "generation_exhausted",
         SemanticErrorCode::SnapshotCorrupt => "snapshot_corrupt",
         SemanticErrorCode::StorageUnavailable => "storage_unavailable",
         SemanticErrorCode::MountPathConflict => "mount_path_conflict",

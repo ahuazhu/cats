@@ -18,8 +18,9 @@ use axum::{Json, Router};
 use cats_api::error::ErrorCode;
 use cats_api::semantic_control::{
     AttachDiskRequest, CatAction, CatResponse, CatView, CreateCatRequest, CreateDiskRequest,
-    DetachDiskRequest, DiskResponse, DiskView, ResourceSlug, SemanticErrorBody, SemanticErrorCode,
-    SemanticSuccessCode,
+    CreateDiskSnapshotRequest, DetachDiskRequest, DiskResponse, DiskSnapshotResponse,
+    DiskSnapshotView, DiskView, ResourceSlug, RestoreDiskSnapshotRequest, SemanticErrorBody,
+    SemanticErrorCode, SemanticSuccessCode,
 };
 use serde::de::DeserializeOwned;
 
@@ -38,6 +39,12 @@ pub const DISK_ITEM_PATH: &str = "/v1/workspaces/{workspace}/disks/{disk}";
 pub const DISK_ATTACH_PATH: &str = "/v1/workspaces/{workspace}/disks/{disk}/actions/attach";
 pub const DISK_DETACH_PATH: &str = "/v1/workspaces/{workspace}/disks/{disk}/actions/detach";
 pub const DISK_DESTROY_PATH: &str = "/v1/workspaces/{workspace}/disks/{disk}/actions/destroy";
+pub const SNAPSHOTS_COLLECTION_PATH: &str = "/v1/workspaces/{workspace}/snapshots";
+pub const SNAPSHOT_ITEM_PATH: &str = "/v1/workspaces/{workspace}/snapshots/{snapshot}";
+pub const SNAPSHOT_DESTROY_PATH: &str =
+    "/v1/workspaces/{workspace}/snapshots/{snapshot}/actions/destroy";
+pub const SNAPSHOT_RESTORE_PATH: &str =
+    "/v1/workspaces/{workspace}/snapshots/{snapshot}/actions/restore";
 
 const JSON_BODY_LIMIT: usize = 16 * 1024;
 const IDEMPOTENCY_KEY: &str = "idempotency-key";
@@ -110,6 +117,58 @@ pub trait SemanticResourceApi: Send + Sync {
         workspace_id: &'a str,
         disk_slug: ResourceSlug,
     ) -> SemanticResourceFuture<'a, Result<DiskResponse, SemanticErrorBody>>;
+
+    fn list_snapshots<'a>(
+        &'a self,
+        workspace_id: &'a str,
+    ) -> SemanticResourceFuture<'a, Result<Vec<DiskSnapshotView>, SemanticErrorBody>> {
+        let _ = workspace_id;
+        Box::pin(async { Err(unavailable_snapshot_api()) })
+    }
+
+    fn get_snapshot<'a>(
+        &'a self,
+        workspace_id: &'a str,
+        snapshot_slug: ResourceSlug,
+    ) -> SemanticResourceFuture<'a, Result<DiskSnapshotView, SemanticErrorBody>> {
+        let _ = (workspace_id, snapshot_slug);
+        Box::pin(async { Err(unavailable_snapshot_api()) })
+    }
+
+    fn create_snapshot<'a>(
+        &'a self,
+        workspace_id: &'a str,
+        request: CreateDiskSnapshotRequest,
+    ) -> SemanticResourceFuture<'a, Result<DiskSnapshotResponse, SemanticErrorBody>> {
+        let _ = (workspace_id, request);
+        Box::pin(async { Err(unavailable_snapshot_api()) })
+    }
+
+    fn destroy_snapshot<'a>(
+        &'a self,
+        workspace_id: &'a str,
+        snapshot_slug: ResourceSlug,
+    ) -> SemanticResourceFuture<'a, Result<DiskSnapshotResponse, SemanticErrorBody>> {
+        let _ = (workspace_id, snapshot_slug);
+        Box::pin(async { Err(unavailable_snapshot_api()) })
+    }
+
+    fn restore_snapshot<'a>(
+        &'a self,
+        workspace_id: &'a str,
+        snapshot_slug: ResourceSlug,
+        request: RestoreDiskSnapshotRequest,
+    ) -> SemanticResourceFuture<'a, Result<DiskSnapshotResponse, SemanticErrorBody>> {
+        let _ = (workspace_id, snapshot_slug, request);
+        Box::pin(async { Err(unavailable_snapshot_api()) })
+    }
+}
+
+fn unavailable_snapshot_api() -> SemanticErrorBody {
+    SemanticErrorBody {
+        code: SemanticErrorCode::InternalError,
+        message: "DiskSnapshot service is unavailable".to_owned(),
+    }
 }
 
 /// Builds the clean-slate semantic resource routes. Production composition
@@ -128,6 +187,13 @@ pub fn routes(service: Arc<dyn SemanticResourceApi>) -> Router<AppState> {
         .route(DISK_ATTACH_PATH, post(attach_disk))
         .route(DISK_DETACH_PATH, post(detach_disk))
         .route(DISK_DESTROY_PATH, post(destroy_disk))
+        .route(
+            SNAPSHOTS_COLLECTION_PATH,
+            post(create_snapshot).get(list_snapshots),
+        )
+        .route(SNAPSHOT_ITEM_PATH, axum::routing::get(get_snapshot))
+        .route(SNAPSHOT_DESTROY_PATH, post(destroy_snapshot))
+        .route(SNAPSHOT_RESTORE_PATH, post(restore_snapshot))
         .layer(Extension(service))
 }
 
@@ -211,6 +277,48 @@ async fn get_disk(
         internal_error(format!("service returned invalid PersistentDisk: {error}"))
     })?;
     Ok(success_response(StatusCode::OK, disk))
+}
+
+async fn list_snapshots(
+    State(state): State<AppState>,
+    Extension(service): Extension<Arc<dyn SemanticResourceApi>>,
+    Path(workspace): Path<String>,
+    request: Request<Body>,
+) -> Result<Response, SemanticHttpFailure> {
+    let workspace_id = authenticated_workspace_id(&state, request.headers(), &workspace).await?;
+    reject_retired_headers(request.headers())?;
+    reject_query(request.uri())?;
+    require_empty_body(request).await?;
+    let snapshots = service
+        .list_snapshots(&workspace_id)
+        .await
+        .map_err(SemanticHttpFailure)?;
+    for snapshot in &snapshots {
+        snapshot.validate().map_err(|error| {
+            internal_error(format!("service returned invalid DiskSnapshot: {error}"))
+        })?;
+    }
+    Ok(success_response(StatusCode::OK, snapshots))
+}
+
+async fn get_snapshot(
+    State(state): State<AppState>,
+    Extension(service): Extension<Arc<dyn SemanticResourceApi>>,
+    Path((workspace, snapshot)): Path<(String, String)>,
+    request: Request<Body>,
+) -> Result<Response, SemanticHttpFailure> {
+    let workspace_id = authenticated_workspace_id(&state, request.headers(), &workspace).await?;
+    reject_retired_headers(request.headers())?;
+    reject_query(request.uri())?;
+    require_empty_body(request).await?;
+    let snapshot = service
+        .get_snapshot(&workspace_id, resource_slug(snapshot, "DiskSnapshot")?)
+        .await
+        .map_err(SemanticHttpFailure)?;
+    snapshot.validate().map_err(|error| {
+        internal_error(format!("service returned invalid DiskSnapshot: {error}"))
+    })?;
+    Ok(success_response(StatusCode::OK, snapshot))
 }
 
 async fn create_cat(
@@ -357,6 +465,70 @@ async fn destroy_disk(
     )
 }
 
+async fn create_snapshot(
+    State(state): State<AppState>,
+    Extension(service): Extension<Arc<dyn SemanticResourceApi>>,
+    Path(workspace): Path<String>,
+    request: Request<Body>,
+) -> Result<Response, SemanticHttpFailure> {
+    let workspace_id = authenticated_workspace_id(&state, request.headers(), &workspace).await?;
+    reject_retired_headers(request.headers())?;
+    reject_query(request.uri())?;
+    let request: CreateDiskSnapshotRequest = parse_json(request).await?;
+    let result = service.create_snapshot(&workspace_id, request).await;
+    let created = result
+        .as_ref()
+        .is_ok_and(|response| response.code == SemanticSuccessCode::SnapshotCreated);
+    snapshot_response(
+        result,
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+    )
+}
+
+async fn destroy_snapshot(
+    State(state): State<AppState>,
+    Extension(service): Extension<Arc<dyn SemanticResourceApi>>,
+    Path((workspace, snapshot)): Path<(String, String)>,
+    request: Request<Body>,
+) -> Result<Response, SemanticHttpFailure> {
+    let workspace_id = authenticated_workspace_id(&state, request.headers(), &workspace).await?;
+    reject_retired_headers(request.headers())?;
+    reject_query(request.uri())?;
+    require_empty_body(request).await?;
+    snapshot_response(
+        service
+            .destroy_snapshot(&workspace_id, resource_slug(snapshot, "DiskSnapshot")?)
+            .await,
+        StatusCode::OK,
+    )
+}
+
+async fn restore_snapshot(
+    State(state): State<AppState>,
+    Extension(service): Extension<Arc<dyn SemanticResourceApi>>,
+    Path((workspace, snapshot)): Path<(String, String)>,
+    request: Request<Body>,
+) -> Result<Response, SemanticHttpFailure> {
+    let workspace_id = authenticated_workspace_id(&state, request.headers(), &workspace).await?;
+    reject_retired_headers(request.headers())?;
+    reject_query(request.uri())?;
+    let snapshot_slug = resource_slug(snapshot, "DiskSnapshot")?;
+    let request: RestoreDiskSnapshotRequest = parse_json(request).await?;
+    request
+        .validate()
+        .map_err(|error| invalid_request(error.to_string()))?;
+    snapshot_response(
+        service
+            .restore_snapshot(&workspace_id, snapshot_slug, request)
+            .await,
+        StatusCode::OK,
+    )
+}
+
 async fn create_cat_after_auth(
     service: &dyn SemanticResourceApi,
     workspace_id: &str,
@@ -426,6 +598,17 @@ fn disk_response(
     let response = result.map_err(SemanticHttpFailure)?;
     response.disk.validate().map_err(|error| {
         internal_error(format!("service returned invalid PersistentDisk: {error}"))
+    })?;
+    Ok(success_response(status, response))
+}
+
+fn snapshot_response(
+    result: Result<DiskSnapshotResponse, SemanticErrorBody>,
+    status: StatusCode,
+) -> Result<Response, SemanticHttpFailure> {
+    let response = result.map_err(SemanticHttpFailure)?;
+    response.validate().map_err(|error| {
+        internal_error(format!("service returned invalid DiskSnapshot: {error}"))
     })?;
     Ok(success_response(status, response))
 }

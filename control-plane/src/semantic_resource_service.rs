@@ -78,6 +78,7 @@ pub struct CatProjection {
 pub struct DiskProjection {
     pub disk: db::PersistentDiskRecord,
     pub binding: Option<db::DiskBindingWithCat>,
+    pub head_generation: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +105,14 @@ pub trait SemanticResourceStore: Send + Sync {
         workspace_id: &'a str,
     ) -> SemanticResourceFuture<'a, Result<Vec<String>, ResourceStoreError>>;
 
+    fn current_snapshot_ids<'a>(
+        &'a self,
+        workspace_id: &'a str,
+    ) -> SemanticResourceFuture<'a, Result<Vec<String>, ResourceStoreError>> {
+        let _ = workspace_id;
+        Box::pin(async { Err(ResourceStoreError::new("DiskSnapshot store is unavailable")) })
+    }
+
     fn current_disk<'a>(
         &'a self,
         workspace_id: &'a str,
@@ -125,6 +134,56 @@ pub trait SemanticResourceStore: Send + Sync {
         &'a self,
         disk_id: &'a str,
     ) -> SemanticResourceFuture<'a, Result<Option<DiskProjection>, ResourceStoreError>>;
+
+    fn current_snapshot<'a>(
+        &'a self,
+        workspace_id: &'a str,
+        snapshot_slug: &'a str,
+    ) -> SemanticResourceFuture<'a, Result<Option<db::DiskSnapshotRecord>, ResourceStoreError>>
+    {
+        let _ = (workspace_id, snapshot_slug);
+        Box::pin(async { Err(ResourceStoreError::new("DiskSnapshot store is unavailable")) })
+    }
+
+    fn snapshot_by_id<'a>(
+        &'a self,
+        snapshot_id: &'a str,
+    ) -> SemanticResourceFuture<'a, Result<Option<db::DiskSnapshotRecord>, ResourceStoreError>>
+    {
+        let _ = snapshot_id;
+        Box::pin(async { Err(ResourceStoreError::new("DiskSnapshot store is unavailable")) })
+    }
+
+    fn create_snapshot<'a>(
+        &'a self,
+        snapshot_id: String,
+        workspace_id: String,
+        snapshot_slug: String,
+        disk_id: String,
+    ) -> SemanticResourceFuture<'a, Result<db::CreateDiskSnapshotOutcome, ResourceStoreError>> {
+        let _ = (snapshot_id, workspace_id, snapshot_slug, disk_id);
+        Box::pin(async { Err(ResourceStoreError::new("DiskSnapshot store is unavailable")) })
+    }
+
+    fn delete_snapshot<'a>(
+        &'a self,
+        workspace_id: String,
+        snapshot_id: String,
+    ) -> SemanticResourceFuture<'a, Result<db::DeleteDiskSnapshotOutcome, ResourceStoreError>> {
+        let _ = (workspace_id, snapshot_id);
+        Box::pin(async { Err(ResourceStoreError::new("DiskSnapshot store is unavailable")) })
+    }
+
+    fn restore_snapshot<'a>(
+        &'a self,
+        workspace_id: String,
+        snapshot_id: String,
+        expected_generation: u64,
+    ) -> SemanticResourceFuture<'a, Result<db::RestoreDiskSnapshotOutcome, ResourceStoreError>>
+    {
+        let _ = (workspace_id, snapshot_id, expected_generation);
+        Box::pin(async { Err(ResourceStoreError::new("DiskSnapshot store is unavailable")) })
+    }
 
     fn attach<'a>(
         &'a self,
@@ -194,6 +253,20 @@ impl SemanticResourceStore for PostgresSemanticResourceStore {
         Box::pin(async move {
             store
                 .execute(move |store| store.list_current_semantic_cat_ids(&workspace_id))
+                .await
+                .map_err(resource_store_error)
+        })
+    }
+
+    fn current_snapshot_ids<'a>(
+        &'a self,
+        workspace_id: &'a str,
+    ) -> SemanticResourceFuture<'a, Result<Vec<String>, ResourceStoreError>> {
+        let store = Arc::clone(&self.store);
+        let workspace_id = workspace_id.to_owned();
+        Box::pin(async move {
+            store
+                .execute(move |store| store.list_current_semantic_snapshot_ids(&workspace_id))
                 .await
                 .map_err(resource_store_error)
         })
@@ -292,7 +365,107 @@ impl SemanticResourceStore for PostgresSemanticResourceStore {
                         return Ok(None);
                     };
                     let binding = store.find_semantic_disk_binding(&disk_id)?;
-                    Ok(Some(DiskProjection { disk, binding }))
+                    let head_generation = store.semantic_disk_head_generation(&disk)?;
+                    Ok(Some(DiskProjection {
+                        disk,
+                        binding,
+                        head_generation,
+                    }))
+                })
+                .await
+                .map_err(resource_store_error)
+        })
+    }
+
+    fn current_snapshot<'a>(
+        &'a self,
+        workspace_id: &'a str,
+        snapshot_slug: &'a str,
+    ) -> SemanticResourceFuture<'a, Result<Option<db::DiskSnapshotRecord>, ResourceStoreError>>
+    {
+        let store = Arc::clone(&self.store);
+        let workspace_id = workspace_id.to_owned();
+        let snapshot_slug = snapshot_slug.to_owned();
+        Box::pin(async move {
+            store
+                .execute(move |store| {
+                    store.find_current_semantic_snapshot(&workspace_id, &snapshot_slug)
+                })
+                .await
+                .map_err(resource_store_error)
+        })
+    }
+
+    fn snapshot_by_id<'a>(
+        &'a self,
+        snapshot_id: &'a str,
+    ) -> SemanticResourceFuture<'a, Result<Option<db::DiskSnapshotRecord>, ResourceStoreError>>
+    {
+        let store = Arc::clone(&self.store);
+        let snapshot_id = snapshot_id.to_owned();
+        Box::pin(async move {
+            store
+                .execute(move |store| store.find_semantic_snapshot_by_id(&snapshot_id))
+                .await
+                .map_err(resource_store_error)
+        })
+    }
+
+    fn create_snapshot<'a>(
+        &'a self,
+        snapshot_id: String,
+        workspace_id: String,
+        snapshot_slug: String,
+        disk_id: String,
+    ) -> SemanticResourceFuture<'a, Result<db::CreateDiskSnapshotOutcome, ResourceStoreError>> {
+        let store = Arc::clone(&self.store);
+        Box::pin(async move {
+            store
+                .execute(move |store| {
+                    store.create_semantic_disk_snapshot(db::NewDiskSnapshot {
+                        snapshot_id: &snapshot_id,
+                        workspace_id: &workspace_id,
+                        snapshot_slug: &snapshot_slug,
+                        disk_id: &disk_id,
+                    })
+                })
+                .await
+                .map_err(resource_store_error)
+        })
+    }
+
+    fn delete_snapshot<'a>(
+        &'a self,
+        workspace_id: String,
+        snapshot_id: String,
+    ) -> SemanticResourceFuture<'a, Result<db::DeleteDiskSnapshotOutcome, ResourceStoreError>> {
+        let store = Arc::clone(&self.store);
+        Box::pin(async move {
+            store
+                .execute(move |store| {
+                    store.delete_semantic_disk_snapshot(&workspace_id, &snapshot_id)
+                })
+                .await
+                .map_err(resource_store_error)
+        })
+    }
+
+    fn restore_snapshot<'a>(
+        &'a self,
+        workspace_id: String,
+        snapshot_id: String,
+        expected_generation: u64,
+    ) -> SemanticResourceFuture<'a, Result<db::RestoreDiskSnapshotOutcome, ResourceStoreError>>
+    {
+        let store = Arc::clone(&self.store);
+        Box::pin(async move {
+            store
+                .execute(move |store| {
+                    store.restore_semantic_disk_snapshot(
+                        &workspace_id,
+                        &snapshot_id,
+                        expected_generation,
+                    )
                 })
                 .await
                 .map_err(resource_store_error)
@@ -971,6 +1144,36 @@ where
         })
     }
 
+    fn list_snapshots<'a>(
+        &'a self,
+        workspace_id: &'a str,
+    ) -> SemanticResourceFuture<'a, Result<Vec<wire::DiskSnapshotView>, wire::SemanticErrorBody>>
+    {
+        Box::pin(async move {
+            let ids = self
+                .resources
+                .current_snapshot_ids(workspace_id)
+                .await
+                .map_err(internal_resource_error)?;
+            let mut snapshots = Vec::with_capacity(ids.len());
+            for id in ids {
+                snapshots.push(self.project_snapshot(&id).await?);
+            }
+            Ok(snapshots)
+        })
+    }
+
+    fn get_snapshot<'a>(
+        &'a self,
+        workspace_id: &'a str,
+        snapshot_slug: wire::ResourceSlug,
+    ) -> SemanticResourceFuture<'a, Result<wire::DiskSnapshotView, wire::SemanticErrorBody>> {
+        Box::pin(async move {
+            let snapshot = self.current_snapshot(workspace_id, &snapshot_slug).await?;
+            snapshot_view(snapshot).map_err(internal_resource_error)
+        })
+    }
+
     fn create_cat<'a>(
         &'a self,
         workspace_id: &'a str,
@@ -1177,6 +1380,222 @@ where
         })
     }
 
+    fn create_snapshot<'a>(
+        &'a self,
+        workspace_id: &'a str,
+        request: wire::CreateDiskSnapshotRequest,
+    ) -> SemanticResourceFuture<'a, Result<wire::DiskSnapshotResponse, wire::SemanticErrorBody>>
+    {
+        Box::pin(async move {
+            let disk = self.current_disk(workspace_id, &request.disk_slug).await?;
+            let outcome = self
+                .resources
+                .create_snapshot(
+                    new_id("snapshot_"),
+                    workspace_id.to_owned(),
+                    request.snapshot_slug.to_string(),
+                    disk.disk_id,
+                )
+                .await
+                .map_err(internal_resource_error)?;
+            let (snapshot, status, code) = match outcome {
+                db::CreateDiskSnapshotOutcome::Created(snapshot) => (
+                    snapshot,
+                    wire::SemanticStatus::Ok,
+                    wire::SemanticSuccessCode::SnapshotCreated,
+                ),
+                db::CreateDiskSnapshotOutcome::Existing(snapshot) => (
+                    snapshot,
+                    wire::SemanticStatus::AlreadyExists,
+                    wire::SemanticSuccessCode::AlreadyExists,
+                ),
+                db::CreateDiskSnapshotOutcome::ConfigurationConflict(_) => {
+                    return Err(semantic_error(
+                        wire::SemanticErrorCode::SnapshotConfigurationConflict,
+                        "current DiskSnapshot belongs to a different PersistentDisk",
+                    ));
+                }
+                db::CreateDiskSnapshotOutcome::DiskNotFound => {
+                    return Err(semantic_error(
+                        wire::SemanticErrorCode::DiskNotFound,
+                        "PersistentDisk was not found",
+                    ));
+                }
+                db::CreateDiskSnapshotOutcome::DiskDeleted => {
+                    return Err(semantic_error(
+                        wire::SemanticErrorCode::DiskDeleted,
+                        "PersistentDisk is deleted or in maintenance",
+                    ));
+                }
+                db::CreateDiskSnapshotOutcome::DiskNotInitialized => {
+                    return Err(semantic_error(
+                        wire::SemanticErrorCode::DiskNotInitialized,
+                        "PersistentDisk is not initialized",
+                    ));
+                }
+                db::CreateDiskSnapshotOutcome::CatMustBeCold => {
+                    return Err(semantic_error(
+                        wire::SemanticErrorCode::CatMustBeCold,
+                        "bound Cat must be stably Cold",
+                    ));
+                }
+                db::CreateDiskSnapshotOutcome::DiskWriterActive => {
+                    return Err(semantic_error(
+                        wire::SemanticErrorCode::DiskOwned,
+                        "PersistentDisk still has an active writer",
+                    ));
+                }
+            };
+            let generation = self.disk_generation(&snapshot.disk_id).await?;
+            Ok(wire::DiskSnapshotResponse {
+                status,
+                code,
+                snapshot: snapshot_view(snapshot).map_err(internal_resource_error)?,
+                disk_head_generation: generation,
+            })
+        })
+    }
+
+    fn destroy_snapshot<'a>(
+        &'a self,
+        workspace_id: &'a str,
+        snapshot_slug: wire::ResourceSlug,
+    ) -> SemanticResourceFuture<'a, Result<wire::DiskSnapshotResponse, wire::SemanticErrorBody>>
+    {
+        Box::pin(async move {
+            let current = self.current_snapshot(workspace_id, &snapshot_slug).await?;
+            let outcome = self
+                .resources
+                .delete_snapshot(workspace_id.to_owned(), current.snapshot_id)
+                .await
+                .map_err(internal_resource_error)?;
+            let (snapshot, status, code) = match outcome {
+                db::DeleteDiskSnapshotOutcome::Deleted(snapshot) => (
+                    snapshot,
+                    wire::SemanticStatus::Ok,
+                    wire::SemanticSuccessCode::SnapshotDestroyed,
+                ),
+                db::DeleteDiskSnapshotOutcome::AlreadyDeleted(snapshot) => (
+                    snapshot,
+                    wire::SemanticStatus::AlreadyDone,
+                    wire::SemanticSuccessCode::AlreadyDeleted,
+                ),
+                db::DeleteDiskSnapshotOutcome::NotFound => {
+                    return Err(snapshot_not_found());
+                }
+                db::DeleteDiskSnapshotOutcome::DiskDeleted => {
+                    return Err(semantic_error(
+                        wire::SemanticErrorCode::DiskDeleted,
+                        "PersistentDisk is deleted or in maintenance",
+                    ));
+                }
+                db::DeleteDiskSnapshotOutcome::DiskNotInitialized => {
+                    return Err(semantic_error(
+                        wire::SemanticErrorCode::DiskNotInitialized,
+                        "PersistentDisk is not initialized",
+                    ));
+                }
+                db::DeleteDiskSnapshotOutcome::CatMustBeCold => {
+                    return Err(semantic_error(
+                        wire::SemanticErrorCode::CatMustBeCold,
+                        "bound Cat must be stably Cold",
+                    ));
+                }
+                db::DeleteDiskSnapshotOutcome::DiskWriterActive => {
+                    return Err(semantic_error(
+                        wire::SemanticErrorCode::DiskOwned,
+                        "PersistentDisk still has an active writer",
+                    ));
+                }
+            };
+            let generation = self.disk_generation(&snapshot.disk_id).await?;
+            Ok(wire::DiskSnapshotResponse {
+                status,
+                code,
+                snapshot: snapshot_view(snapshot).map_err(internal_resource_error)?,
+                disk_head_generation: generation,
+            })
+        })
+    }
+
+    fn restore_snapshot<'a>(
+        &'a self,
+        workspace_id: &'a str,
+        snapshot_slug: wire::ResourceSlug,
+        request: wire::RestoreDiskSnapshotRequest,
+    ) -> SemanticResourceFuture<'a, Result<wire::DiskSnapshotResponse, wire::SemanticErrorBody>>
+    {
+        Box::pin(async move {
+            let current = self.current_snapshot(workspace_id, &snapshot_slug).await?;
+            let outcome = self
+                .resources
+                .restore_snapshot(
+                    workspace_id.to_owned(),
+                    current.snapshot_id,
+                    request.expected_generation,
+                )
+                .await
+                .map_err(internal_resource_error)?;
+            let (snapshot, result, status, code) = match outcome {
+                db::RestoreDiskSnapshotOutcome::Restored { snapshot, result } => (
+                    snapshot,
+                    result,
+                    wire::SemanticStatus::Ok,
+                    wire::SemanticSuccessCode::SnapshotRestored,
+                ),
+                db::RestoreDiskSnapshotOutcome::AlreadyRestored { snapshot, result } => (
+                    snapshot,
+                    result,
+                    wire::SemanticStatus::AlreadyDone,
+                    wire::SemanticSuccessCode::AlreadyRestored,
+                ),
+                db::RestoreDiskSnapshotOutcome::NotFound => return Err(snapshot_not_found()),
+                db::RestoreDiskSnapshotOutcome::DiskDeleted => {
+                    return Err(semantic_error(
+                        wire::SemanticErrorCode::DiskDeleted,
+                        "PersistentDisk is deleted or in maintenance",
+                    ));
+                }
+                db::RestoreDiskSnapshotOutcome::DiskNotInitialized => {
+                    return Err(semantic_error(
+                        wire::SemanticErrorCode::DiskNotInitialized,
+                        "PersistentDisk is not initialized",
+                    ));
+                }
+                db::RestoreDiskSnapshotOutcome::CatMustBeCold => {
+                    return Err(semantic_error(
+                        wire::SemanticErrorCode::CatMustBeCold,
+                        "bound Cat must be stably Cold",
+                    ));
+                }
+                db::RestoreDiskSnapshotOutcome::DiskWriterActive => {
+                    return Err(semantic_error(
+                        wire::SemanticErrorCode::DiskOwned,
+                        "PersistentDisk still has an active writer",
+                    ));
+                }
+                db::RestoreDiskSnapshotOutcome::HeadConflict => {
+                    return Err(semantic_error(
+                        wire::SemanticErrorCode::HeadConflict,
+                        "PersistentDisk generation changed",
+                    ));
+                }
+                db::RestoreDiskSnapshotOutcome::AuthorityExhausted => {
+                    return Err(semantic_error(
+                        wire::SemanticErrorCode::GenerationExhausted,
+                        "PersistentDisk generation or writer epoch is exhausted",
+                    ));
+                }
+            };
+            Ok(wire::DiskSnapshotResponse {
+                status,
+                code,
+                snapshot: snapshot_view(snapshot).map_err(internal_resource_error)?,
+                disk_head_generation: result.resulting_head.generation.get(),
+            })
+        })
+    }
+
     fn destroy_disk<'a>(
         &'a self,
         workspace_id: &'a str,
@@ -1213,6 +1632,12 @@ where
                     return Err(semantic_error(
                         wire::SemanticErrorCode::DiskInUse,
                         "PersistentDisk is still bound to a Cat",
+                    ));
+                }
+                db::DeletePersistentDiskOutcome::SnapshotInUse => {
+                    return Err(semantic_error(
+                        wire::SemanticErrorCode::SnapshotInUse,
+                        "PersistentDisk still has a live DiskSnapshot",
                     ));
                 }
                 db::DeletePersistentDiskOutcome::NotFound => {
@@ -1279,6 +1704,43 @@ where
             .map_err(internal_resource_error)?
             .ok_or_else(|| {
                 semantic_error(wire::SemanticErrorCode::CatNotFound, "Cat was not found")
+            })
+    }
+
+    async fn current_snapshot(
+        &self,
+        workspace_id: &str,
+        slug: &wire::ResourceSlug,
+    ) -> Result<db::DiskSnapshotRecord, wire::SemanticErrorBody> {
+        self.resources
+            .current_snapshot(workspace_id, slug.as_str())
+            .await
+            .map_err(internal_resource_error)?
+            .ok_or_else(snapshot_not_found)
+    }
+
+    async fn project_snapshot(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<wire::DiskSnapshotView, wire::SemanticErrorBody> {
+        let snapshot = self
+            .resources
+            .snapshot_by_id(snapshot_id)
+            .await
+            .map_err(internal_resource_error)?
+            .ok_or_else(snapshot_not_found)?;
+        snapshot_view(snapshot).map_err(internal_resource_error)
+    }
+
+    async fn disk_generation(&self, disk_id: &str) -> Result<u64, wire::SemanticErrorBody> {
+        self.project_disk(disk_id)
+            .await?
+            .head_generation
+            .ok_or_else(|| {
+                semantic_error(
+                    wire::SemanticErrorCode::DiskNotInitialized,
+                    "PersistentDisk has no initialized remote head",
+                )
             })
     }
 
@@ -1373,9 +1835,13 @@ fn disk_view(projection: DiskProjection) -> Result<wire::DiskView, ResourceStore
             .ok_or_else(|| ResourceStoreError::new("stored Disk slug is invalid"))?,
         size_bytes: u64::try_from(disk.size_bytes)
             .map_err(|_| ResourceStoreError::new("stored Disk size is invalid"))?,
-        // The snapshot-aware service projection joins the Volume Authority
-        // head. This compatibility path does not have that authority fact.
-        head_generation: None,
+        head_generation: projection
+            .head_generation
+            .map(|value| {
+                u64::try_from(value)
+                    .map_err(|_| ResourceStoreError::new("stored Disk generation is invalid"))
+            })
+            .transpose()?,
         status: match disk.status.as_str() {
             "normal" => wire::DiskStatus::Normal,
             "deleted" => wire::DiskStatus::Deleted,
@@ -1395,6 +1861,31 @@ fn disk_view(projection: DiskProjection) -> Result<wire::DiskView, ResourceStore
             .transpose()?,
         created_at_unix_ms: nonnegative_time(disk.created_at)?,
         deleted_at_unix_ms: disk.deleted_at.map(nonnegative_time).transpose()?,
+    })
+}
+
+fn snapshot_view(
+    snapshot: db::DiskSnapshotRecord,
+) -> Result<wire::DiskSnapshotView, ResourceStoreError> {
+    Ok(wire::DiskSnapshotView {
+        snapshot_id: parse_id(&snapshot.snapshot_id)?,
+        workspace_id: parse_id(&snapshot.workspace_id)?,
+        snapshot_slug: wire::ResourceSlug::new(snapshot.snapshot_slug)
+            .ok_or_else(|| ResourceStoreError::new("stored Snapshot slug is invalid"))?,
+        disk_id: parse_id(&snapshot.disk_id)?,
+        disk_slug: wire::ResourceSlug::new(snapshot.disk_slug)
+            .ok_or_else(|| ResourceStoreError::new("stored Disk slug is invalid"))?,
+        size_bytes: u64::try_from(snapshot.size_bytes)
+            .map_err(|_| ResourceStoreError::new("stored Snapshot size is invalid"))?,
+        status: if snapshot.deleted_at.is_some() {
+            wire::DiskSnapshotStatus::Deleted
+        } else {
+            wire::DiskSnapshotStatus::Normal
+        },
+        captured_generation: u64::try_from(snapshot.captured_generation)
+            .map_err(|_| ResourceStoreError::new("stored Snapshot generation is invalid"))?,
+        created_at_unix_ms: nonnegative_time(snapshot.created_at)?,
+        deleted_at_unix_ms: snapshot.deleted_at.map(nonnegative_time).transpose()?,
     })
 }
 
@@ -1512,6 +2003,13 @@ fn semantic_error_code(code: &str) -> wire::SemanticErrorCode {
         "timeout" => wire::SemanticErrorCode::Timeout,
         _ => wire::SemanticErrorCode::InternalError,
     }
+}
+
+fn snapshot_not_found() -> wire::SemanticErrorBody {
+    semantic_error(
+        wire::SemanticErrorCode::SnapshotNotFound,
+        "DiskSnapshot was not found",
+    )
 }
 
 pub(crate) fn map_lifecycle_error(error: lifecycle::LifecycleError) -> wire::SemanticErrorBody {
@@ -1788,7 +2286,13 @@ mod tests {
                 .clone()
                 .filter(|disk| disk.disk_id == disk_id);
             let binding = self.binding.clone();
-            Box::pin(async move { Ok(disk.map(|disk| DiskProjection { disk, binding })) })
+            Box::pin(async move {
+                Ok(disk.map(|disk| DiskProjection {
+                    disk,
+                    binding,
+                    head_generation: Some(1),
+                }))
+            })
         }
 
         fn attach<'a>(

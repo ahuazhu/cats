@@ -470,6 +470,7 @@ pub enum DeletePersistentDiskOutcome {
     Deleting(PersistentDiskRecord),
     AlreadyDeleted(PersistentDiskRecord),
     Attached,
+    SnapshotInUse,
     NotFound,
 }
 
@@ -2066,6 +2067,13 @@ impl Store {
     ) -> Result<DeletePersistentDiskOutcome> {
         self.with(|client| {
             let mut transaction = client.transaction()?;
+            transaction.query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended(
+                    current_schema() || ':semantic-disk:disk:' || $1,
+                    0::BIGINT
+                 ))",
+                &[&disk_id],
+            )?;
             let Some(row) = transaction.query_opt(
                 &format!("SELECT {DISK_COLUMNS} FROM persistent_disks WHERE disk_id=$1 FOR UPDATE"),
                 &[&disk_id],
@@ -2088,6 +2096,17 @@ impl Store {
             {
                 transaction.rollback()?;
                 return Ok(DeletePersistentDiskOutcome::Attached);
+            }
+            if transaction
+                .query_opt(
+                    "SELECT snapshot_id FROM disk_snapshot_records
+                      WHERE disk_id=$1 LIMIT 1 FOR UPDATE",
+                    &[&disk_id],
+                )?
+                .is_some()
+            {
+                transaction.rollback()?;
+                return Ok(DeletePersistentDiskOutcome::SnapshotInUse);
             }
             let row = transaction.query_one(
                 &format!(

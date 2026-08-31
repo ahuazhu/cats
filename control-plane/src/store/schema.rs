@@ -1628,9 +1628,7 @@ mod semantic_protocol_schema_tests {
             assert!(SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {retained} (")));
         }
         assert!(SCHEMA.contains("REFERENCES cats(workspace_id, cat_id)"));
-        assert!(SCHEMA.contains(
-            "FOREIGN KEY (snapshot_id) REFERENCES disk_snapshots(snapshot_id)"
-        ));
+        assert!(SCHEMA.contains("FOREIGN KEY (snapshot_id) REFERENCES disk_snapshots(snapshot_id)"));
         assert!(SCHEMA.contains("disk_id TEXT NOT NULL REFERENCES disk_records(disk_id)"));
         assert!(SCHEMA.contains("volume_id TEXT NOT NULL REFERENCES volume_records(volume_id)"));
         assert!(!SCHEMA.contains("REFERENCES cat_records"));

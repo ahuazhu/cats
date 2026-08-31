@@ -341,6 +341,8 @@ pub enum SemanticErrorCode {
     SnapshotInUse,
     DiskOwned,
     HeadConflict,
+    DiskNotInitialized,
+    GenerationExhausted,
     SnapshotCorrupt,
     StorageUnavailable,
     MountPathConflict,
@@ -378,6 +380,8 @@ impl SemanticErrorCode {
             | Self::InvalidState
             | Self::NodeResetRequired
             | Self::DiskDeleted
+            | Self::DiskNotInitialized
+            | Self::GenerationExhausted
             | Self::CatMustBeCold => 422,
             Self::NodeUnavailable | Self::StorageUnavailable => 503,
             Self::Timeout => 504,
