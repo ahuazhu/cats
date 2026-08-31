@@ -1,0 +1,23 @@
+[package]
+name = "cats-protocol"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Shared wire contracts and strict codecs for the Cats microVM platform"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["microvm", "virtualization", "protocol"]
+publish = ["crates-io"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+ring = { workspace = true }
+
+[lints]
+workspace = true

@@ -6,16 +6,16 @@
 
 use std::sync::Arc;
 
-use cats_api::metering::{
-    CatUsageCheckpoint, IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse, UsageMetric,
-    USAGE_CHECKPOINTS_PATH,
-};
-use cats_api::runtime_reconciliation::{Epoch, Id, NodeBootId, RandomId128, SessionBinding};
-use cats_api::semantic_control::{NodedServiceToken, NODED_AUTHORIZATION_HEADER};
 use cats_control_plane::server::{Config, Handle};
 use cats_control_plane::store::DsnSource;
 use cats_control_plane::testsupport::spawn_control_plane_for_test as spawn;
 use cats_metering::{deterministic_event_id, SqliteUsageStore};
+use cats_protocol::metering::{
+    CatUsageCheckpoint, IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse, UsageMetric,
+    USAGE_CHECKPOINTS_PATH,
+};
+use cats_protocol::runtime_reconciliation::{Epoch, Id, NodeBootId, RandomId128, SessionBinding};
+use cats_protocol::semantic_control::{NodedServiceToken, NODED_AUTHORIZATION_HEADER};
 use reqwest::StatusCode;
 
 const SERVICE_TOKEN: &str = "semantic-usage-service-token";
@@ -172,7 +172,7 @@ impl Context {
         (status, body)
     }
 
-    async fn usage_report(&self, workspace: &str) -> cats_api::metering::UsageReport {
+    async fn usage_report(&self, workspace: &str) -> cats_protocol::metering::UsageReport {
         self.http
             .get(format!(
                 "{}/v1/workspaces/{workspace}/billing/usage?from_ms=0&to_ms=99999999999999",
@@ -185,7 +185,7 @@ impl Context {
             .send()
             .await
             .expect("usage report request")
-            .json::<cats_api::metering::UsageReport>()
+            .json::<cats_protocol::metering::UsageReport>()
             .await
             .expect("usage report body")
     }
@@ -262,7 +262,7 @@ fn checkpoint_from(
         cat_id: cat_id.to_owned(),
         cat_generation: 1,
         metric,
-        epoch_marker: cats_api::metering::UsageEpochMarker::Open,
+        epoch_marker: cats_protocol::metering::UsageEpochMarker::Open,
         cumulative_quantity,
     };
     checkpoint.event_id = deterministic_event_id(&checkpoint);

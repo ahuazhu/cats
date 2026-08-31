@@ -4,7 +4,7 @@
 //! responsible for locking and validating Control rows before applying the
 //! returned replacement rows in the same transaction.
 
-pub use cats_api::runtime_reconciliation::{
+pub use cats_protocol::runtime_reconciliation::{
     AcquireOrigin, AsciiText, BeginDeleteRequest, BeginDeleteResult, Epoch, FenceEpoch, Generation,
     Id, LastVolumeTransition, NormalAcquireRequest, NormalAcquireResult, RandomId128,
     ReleaseRequest, ReleaseResult, RemoteHead, Revision, Sha256Digest, UnixMillis,
@@ -333,7 +333,7 @@ pub enum CatVolumeRole {
     Persistent {
         cat_id: Id,
         filesystem_uuid: RandomId128,
-        mount_path: cats_api::runtime_reconciliation::HostPath,
+        mount_path: cats_protocol::runtime_reconciliation::HostPath,
         initialization: PersistentInitialization,
     },
 }
@@ -390,7 +390,7 @@ pub trait CatVolumeStore: Send + Sync {
         disk_id: &Id,
         volume_id: &Id,
         filesystem_uuid: &RandomId128,
-        mount_path: &cats_api::runtime_reconciliation::HostPath,
+        mount_path: &cats_protocol::runtime_reconciliation::HostPath,
     ) -> Result<CatVolume>;
 
     fn attach_volume(&self, request: &VolumeAttachRequest) -> Result<AttachedVolume>;

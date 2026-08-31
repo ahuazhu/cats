@@ -149,7 +149,7 @@ impl WorkOsConfig {
     pub(crate) async fn current_fleet_administrator_principal(
         &self,
         candidate: &super::FleetAdministratorIdentityCandidate,
-    ) -> Result<Option<cats_api::runtime_reconciliation::FleetPolicyPrincipal>, ApiError> {
+    ) -> Result<Option<cats_protocol::runtime_reconciliation::FleetPolicyPrincipal>, ApiError> {
         const FLEET_ADMIN_PERMISSION: &str = "cats:fleet:admin";
 
         let page = self
@@ -243,14 +243,14 @@ impl WorkOsConfig {
                 .any(|permission| permission == FLEET_ADMIN_PERMISSION)
             {
                 return Ok(Some(
-                    cats_api::runtime_reconciliation::FleetPolicyPrincipal::WorkosFleetAdministrator {
-                        subject: cats_api::runtime_reconciliation::Id::new(
+                    cats_protocol::runtime_reconciliation::FleetPolicyPrincipal::WorkosFleetAdministrator {
+                        subject: cats_protocol::runtime_reconciliation::Id::new(
                             candidate.subject.clone(),
                         )
                         .ok_or_else(|| {
                             ApiError::unauthenticated("WorkOS administrator subject is invalid")
                         })?,
-                        organization_id: cats_api::runtime_reconciliation::Id::new(
+                        organization_id: cats_protocol::runtime_reconciliation::Id::new(
                             self.admin_organization_id.clone(),
                         )
                         .ok_or_else(|| {

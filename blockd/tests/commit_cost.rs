@@ -26,8 +26,8 @@ use cats_storage::{open_blob_store, AdapterConfig, BlobStoreFactory, MetadataSto
 use cats_test_support::blob_doubles::SizingBlob;
 use cats_test_support::{prepare_sqlite_authorized_serving, SqliteTestVolumeGrant};
 
-const CHUNK: u64 = cats_api::chunk::CHUNK_SIZE as u64;
-const PAGE: u64 = cats_api::chunk::DIRTY_PAGE_SIZE as u64;
+const CHUNK: u64 = cats_protocol::chunk::CHUNK_SIZE as u64;
+const PAGE: u64 = cats_protocol::chunk::DIRTY_PAGE_SIZE as u64;
 const MIB: f64 = 1024.0 * 1024.0;
 
 /// The object store a benchmark run measures against.

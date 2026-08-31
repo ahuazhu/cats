@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use cats_api::guest::{
+use cats_protocol::guest::{
     AcquireGuestWorkLeaseRequest, GuestRuntimeApiErrorResponse, GuestWorkLease, GuestWorkStatus,
     RenewGuestWorkLeaseRequest, DEFAULT_WORK_LEASE_TTL_MS, GUEST_RUNTIME_SOCKET_PATH,
     GUEST_WORK_LEASES_PATH,

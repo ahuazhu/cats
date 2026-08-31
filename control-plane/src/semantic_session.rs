@@ -9,12 +9,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cats_api::runtime_reconciliation::Id;
-use cats_api::semantic_control::{
+use cats_protocol::runtime_reconciliation::Id;
+use cats_protocol::semantic_control::{
     NodedControlEndpoint, NodedServiceToken, ResourceSlug, SemanticErrorBody, SemanticErrorCode,
     NODED_AUTHORIZATION_HEADER,
 };
-use cats_api::sessions::{ExecRequest, ExecResponse, MAX_EXEC_RESPONSE_JSON_BYTES};
+use cats_protocol::sessions::{ExecRequest, ExecResponse, MAX_EXEC_RESPONSE_JSON_BYTES};
 use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -365,8 +365,8 @@ impl SemanticNodedSessionClient {
             })?,
         );
         let config = tungstenite::protocol::WebSocketConfig::default()
-            .max_message_size(Some(cats_api::sessions::MAX_SHELL_MESSAGE_BYTES))
-            .max_frame_size(Some(cats_api::sessions::MAX_SHELL_MESSAGE_BYTES));
+            .max_message_size(Some(cats_protocol::sessions::MAX_SHELL_MESSAGE_BYTES))
+            .max_frame_size(Some(cats_protocol::sessions::MAX_SHELL_MESSAGE_BYTES));
         let connect = tokio_tungstenite::connect_async_with_config(request, Some(config), false);
         let (socket, _) = tokio::time::timeout(SHELL_HANDSHAKE_TIMEOUT, connect)
             .await

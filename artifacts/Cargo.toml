@@ -1,0 +1,25 @@
+[package]
+name = "cats-artifacts"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Fail-closed installed runtime artifact readers for the Cats microVM platform"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["microvm", "virtualization", "artifacts"]
+publish = ["crates-io"]
+
+[dependencies]
+cats-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+libc = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

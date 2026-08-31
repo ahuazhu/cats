@@ -14,13 +14,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use cats_api::runtime_reconciliation::Id;
 use cats_block_client::NbdClient;
 use cats_blockd::engine::{ChunkEngine, EngineConfig, EngineError};
 use cats_blockd::nbd;
 use cats_blockd::vhost_user::{self, VhostUserDeviceId, VhostUserOptions};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_object_store_file::FileBlobStore;
+use cats_protocol::runtime_reconciliation::Id;
 use cats_storage::authority::VolumeDurability;
 use cats_storage::MetadataStore;
 use cats_test_support::{prepare_sqlite_authorized_serving, SqliteTestVolumeGrant};

@@ -27,8 +27,8 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use cats_api::chunk::{self, CHUNK_SIZE};
-use cats_api::runtime_reconciliation::Sha256Digest;
+use cats_protocol::chunk::{self, CHUNK_SIZE};
+use cats_protocol::runtime_reconciliation::Sha256Digest;
 use cats_storage::{
     encode_image_manifest, read_image_manifest, BlobError, BlobStore, ImageManifestReadError,
     LowerHexSha256,

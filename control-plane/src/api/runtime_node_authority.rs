@@ -11,9 +11,9 @@ use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 
-use cats_api::error::{ApiError, ErrorCode};
-use cats_api::node_identity::JSON_CONTENT_TYPE;
-use cats_api::production_mutation_admission::{
+use cats_protocol::error::{ApiError, ErrorCode};
+use cats_protocol::node_identity::JSON_CONTENT_TYPE;
+use cats_protocol::production_mutation_admission::{
     decode_production_mutation_admission_command,
     encode_production_mutation_admission_command_receipt,
     encode_production_mutation_admission_state,
@@ -27,14 +27,14 @@ use cats_api::production_mutation_admission::{
     PRODUCTION_MUTATION_ADMISSION_RESPONSE_MAX_WIRE_BYTES,
     PRODUCTION_MUTATION_ADMISSION_STATE_PATH, PRODUCTION_QUALIFICATION_PRODUCT_INVENTORY_PATH,
 };
-use cats_api::runtime_node_authority::{
+use cats_protocol::runtime_node_authority::{
     verify_runtime_node_authority_request, NODE_AUTHORITY_APPLY_ID_HEADER,
     PROVISIONER_CREDENTIAL_ID_HEADER, PROVISIONER_SIGNATURE_HEADER,
     RUNTIME_NODE_AUTHORITY_ERROR_MAX_WIRE_BYTES, RUNTIME_NODE_AUTHORITY_METHOD,
     RUNTIME_NODE_AUTHORITY_PATH, RUNTIME_NODE_AUTHORITY_REQUEST_MAX_WIRE_BYTES,
     RUNTIME_NODE_AUTHORITY_SUCCESS_MAX_WIRE_BYTES,
 };
-use cats_api::runtime_reconciliation::{
+use cats_protocol::runtime_reconciliation::{
     decode_runtime_node_authority_apply, encode_runtime_node_authority_apply_result,
     FleetPolicyPrincipal, RuntimeNodeAuthorityApply, RuntimeNodeAuthorityStoredOutcome,
     RuntimeProvisionerTrustBundle,
@@ -269,7 +269,7 @@ pub(crate) struct RuntimeNodeAuthorityService {
     store: Arc<crate::store::Store>,
     trust_bundle: RuntimeProvisionerTrustBundle,
     production_cutover_trust:
-        cats_api::production_mutation_admission::ProductionCutoverOperatorTrustBundle,
+        cats_protocol::production_mutation_admission::ProductionCutoverOperatorTrustBundle,
     readiness: Arc<crate::server::ReadinessLatch>,
     admission: RuntimeNodeAuthorityAdmission,
     accepting: tokio::sync::watch::Sender<bool>,
@@ -287,7 +287,7 @@ impl RuntimeNodeAuthorityService {
         store: Arc<crate::store::Store>,
         trust_bundle: RuntimeProvisionerTrustBundle,
         production_cutover_trust:
-            cats_api::production_mutation_admission::ProductionCutoverOperatorTrustBundle,
+            cats_protocol::production_mutation_admission::ProductionCutoverOperatorTrustBundle,
         readiness: Arc<crate::server::ReadinessLatch>,
     ) -> Self {
         let (accepting, _) = tokio::sync::watch::channel(true);
@@ -472,7 +472,7 @@ impl RuntimeNodeAuthorityService {
     async fn apply_production_mutation_admission(
         &self,
         principal: ProductionCutoverOperatorPrincipal,
-        command: cats_api::production_mutation_admission::ProductionMutationAdmissionCommand,
+        command: cats_protocol::production_mutation_admission::ProductionMutationAdmissionCommand,
         deadline: Instant,
         permits: Arc<ApplyPermits>,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -558,7 +558,7 @@ impl RuntimeNodeAuthorityService {
 
 async fn resolve_ambiguous_production_mutation_admission(
     store: Arc<crate::store::Store>,
-    command: cats_api::production_mutation_admission::ProductionMutationAdmissionCommand,
+    command: cats_protocol::production_mutation_admission::ProductionMutationAdmissionCommand,
     original_error: ApiError,
     readiness: Arc<crate::server::ReadinessLatch>,
 ) -> Result<ProductionMutationAdmissionCommandStoreOutcome, ApiError> {
@@ -1676,7 +1676,7 @@ mod tests {
 
     fn signed_request(server: &crate::server::Handle) -> reqwest::RequestBuilder {
         let signer = Ed25519KeyPair::from_seed_unchecked(&TEST_SEED).unwrap();
-        let signed = cats_api::runtime_node_authority::runtime_node_authority_signed_request(
+        let signed = cats_protocol::runtime_node_authority::runtime_node_authority_signed_request(
             "deployment_a",
             "provisioner_a",
             UPDATE,
@@ -1695,7 +1695,7 @@ mod tests {
 
     fn signed_axum_request() -> Request<Body> {
         let signer = Ed25519KeyPair::from_seed_unchecked(&TEST_SEED).unwrap();
-        let signed = cats_api::runtime_node_authority::runtime_node_authority_signed_request(
+        let signed = cats_protocol::runtime_node_authority::runtime_node_authority_signed_request(
             "deployment_a",
             "provisioner_a",
             UPDATE,
@@ -1792,8 +1792,8 @@ mod tests {
         assert!(admission.try_global().is_ok());
 
         let principal = FleetPolicyPrincipal::WorkosFleetAdministrator {
-            subject: cats_api::runtime_reconciliation::Id::new("user_fleet_admin").unwrap(),
-            organization_id: cats_api::runtime_reconciliation::Id::new("org_admin").unwrap(),
+            subject: cats_protocol::runtime_reconciliation::Id::new("user_fleet_admin").unwrap(),
+            organization_id: cats_protocol::runtime_reconciliation::Id::new("org_admin").unwrap(),
         };
         let principals = (0..PRINCIPAL_IN_FLIGHT)
             .map(|_| admission.try_principal(&principal).unwrap())
@@ -2097,7 +2097,7 @@ mod tests {
             .runtime_provisioner_trust_bundle
             .credentials[0];
         let signer = Ed25519KeyPair::from_seed_unchecked(&TEST_SEED).unwrap();
-        let signed = cats_api::runtime_node_authority::runtime_node_authority_signed_request(
+        let signed = cats_protocol::runtime_node_authority::runtime_node_authority_signed_request(
             "deployment_a",
             "provisioner_a",
             UPDATE,

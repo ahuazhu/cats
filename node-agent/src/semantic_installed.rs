@@ -17,19 +17,19 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _, Result};
-use cats_api::blockd::{BlockdControlCommand, BlockdControlResponse, DurabilityStatus};
-use cats_api::guest::{
+use cats_blockd::engine::{ChunkEngine, DurabilityMode, EngineConfig};
+use cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot;
+use cats_protocol::blockd::{BlockdControlCommand, BlockdControlResponse, DurabilityStatus};
+use cats_protocol::guest::{
     FilesystemControlOperationV1, FilesystemControlOutcomeV1, FilesystemControlRequestV1,
     FilesystemIdentityV1, RuntimeReadyRequestV1, GUEST_HOST_CONTROL_PROTOCOL_VERSION_V1,
     GUEST_HOST_CONTROL_VSOCK_PORT_V1,
 };
-use cats_api::runtime_reconciliation::{
+use cats_protocol::runtime_reconciliation::{
     AsciiText, FilesystemInitialization, Generation, GuestDeviceIdentity, HostPath, Id,
     PersistentFilesystemBinding, ProvisionRootImageRequest, RandomId128, RemoteHead, Sha256Digest,
 };
-use cats_api::semantic_control::{CatAction, CatState, NodedCatConfig, NodedDiskMount};
-use cats_blockd::engine::{ChunkEngine, DurabilityMode, EngineConfig};
-use cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot;
+use cats_protocol::semantic_control::{CatAction, CatState, NodedCatConfig, NodedDiskMount};
 use cats_storage::authority::{
     AttachedVolume, CatVolume, CatVolumeRole, CatVolumeStore, PersistentInitialization,
     PersistentInitializationCommit, RootDeleteState, RootVolumeSpec, VolumeAttachRequest,
@@ -325,7 +325,7 @@ impl SemanticCatEffects for InstalledSemanticCatEffects {
             .ok_or_else(|| installed_error("installed Cat is absent"))?;
         if cat.state != CatState::Running {
             return Err(SemanticEffectError::new(
-                cats_api::semantic_control::SemanticErrorCode::InvalidState,
+                cats_protocol::semantic_control::SemanticErrorCode::InvalidState,
                 "installed Cat is not Running",
             ));
         }
@@ -355,7 +355,7 @@ struct ManagedCat {
     snapshot_directory: PathBuf,
     volumes: Vec<LocalVolume>,
     vmm: Option<Child>,
-    boot_descriptors: Option<cats_api::runtime_artifacts::VerifiedGuestRuntimeLaunch>,
+    boot_descriptors: Option<cats_artifacts::VerifiedGuestRuntimeLaunch>,
 }
 
 struct LocalVolume {
@@ -559,7 +559,7 @@ impl InstalledInner {
             disk_id: derived_id("disk_", ROOT_DISK_SCOPE, cat_id.as_str())?,
             volume_id: derived_id("vol_", ROOT_VOLUME_SCOPE, cat_id.as_str())?,
             size_bytes: self.config.root_size_bytes,
-            durability: cats_api::runtime_reconciliation::VolumeDurability::Strict,
+            durability: cats_protocol::runtime_reconciliation::VolumeDurability::Strict,
             head: blank_head(),
             role: CatVolumeRole::Root {
                 cat_id: cat_id.clone(),
@@ -1026,7 +1026,7 @@ impl InstalledInner {
         &self,
         cat: &ManagedCat,
         request: FilesystemControlRequestV1,
-    ) -> Result<cats_api::guest::FilesystemControlResponseV1> {
+    ) -> Result<cats_protocol::guest::FilesystemControlResponseV1> {
         let vmm_pid = cat.vmm.as_ref().context("Cat has no VMM")?.id();
         let mut guest = GuestClient::connect_hybrid_vsock_bounded_exact_peer(
             &cat.vsock_socket,
@@ -1043,7 +1043,7 @@ impl InstalledInner {
     fn guest_timeout_ms(&self) -> Result<u32> {
         let millis = self.config.effect_timeout.as_millis().clamp(
             1,
-            u128::from(cats_api::guest::FILESYSTEM_CONTROL_MAX_TIMEOUT_MS_V1),
+            u128::from(cats_protocol::guest::FILESYSTEM_CONTROL_MAX_TIMEOUT_MS_V1),
         );
         u32::try_from(millis).context("Guest filesystem timeout is outside u32")
     }
@@ -1743,7 +1743,7 @@ fn stop_child(child: &mut Child, grace: Duration) {
 
 fn installed_error(message: impl Into<String>) -> SemanticEffectError {
     SemanticEffectError::new(
-        cats_api::semantic_control::SemanticErrorCode::InternalError,
+        cats_protocol::semantic_control::SemanticErrorCode::InternalError,
         message,
     )
 }
@@ -1763,7 +1763,7 @@ fn check_cancellation(cancellation: &SemanticActionCancellation, action: CatActi
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use cats_api::runtime_reconciliation::{
+    use cats_protocol::runtime_reconciliation::{
         Epoch, FenceEpoch, NormalAcquireRequest, NormalAcquireResult, UnixMillis, VolumeDurability,
         VolumeRecord,
     };

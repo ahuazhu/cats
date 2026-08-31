@@ -7,8 +7,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use cats_api::runtime_reconciliation::Id;
-use cats_api::semantic_control as wire;
+use cats_protocol::runtime_reconciliation::Id;
+use cats_protocol::semantic_control as wire;
 use sha2::{Digest, Sha256};
 
 use crate::api::semantic_resources::{SemanticResourceApi, SemanticResourceFuture};
@@ -265,7 +265,7 @@ impl SemanticResourceStore for PostgresSemanticResourceStore {
                         .map(|node_id| {
                             store.find_semantic_node(node_id).and_then(|node| {
                                 node.map(|node| node.node_name).ok_or_else(|| {
-                                    cats_api::error::ApiError::internal(
+                                    cats_protocol::error::ApiError::internal(
                                         "Cat placement references a missing Node",
                                     )
                                 })
@@ -417,7 +417,7 @@ impl SemanticResourceStore for PostgresSemanticResourceStore {
     }
 }
 
-fn resource_store_error(error: cats_api::error::ApiError) -> ResourceStoreError {
+fn resource_store_error(error: cats_protocol::error::ApiError) -> ResourceStoreError {
     ResourceStoreError::new(error.message)
 }
 
@@ -495,7 +495,7 @@ impl lifecycle::SemanticLifecycleStore for PostgresSemanticLifecycleStore {
                     let cpu_count = i64::from(request.config.cpu_count);
                     let memory_bytes =
                         i64::try_from(request.config.memory_bytes).map_err(|_| {
-                            cats_api::error::ApiError::invalid(
+                            cats_protocol::error::ApiError::invalid(
                                 "Cat memory exceeds PostgreSQL BIGINT",
                             )
                         })?;
@@ -684,7 +684,7 @@ impl PostgresSemanticLifecycleStore {
     }
 }
 
-fn lifecycle_store_error(error: cats_api::error::ApiError) -> lifecycle::StoreError {
+fn lifecycle_store_error(error: cats_protocol::error::ApiError) -> lifecycle::StoreError {
     lifecycle::StoreError::new(error.message)
 }
 

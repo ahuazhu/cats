@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cats_api::runtime_reconciliation::{Id, RandomId128};
+use cats_protocol::runtime_reconciliation::{Id, RandomId128};
 use cats_storage::{delete_volume_objects_page, BlobStore, DeletePrefixPage};
 use sha2::{Digest, Sha256};
 
@@ -187,7 +187,7 @@ fn derive_random_id(namespace: &[u8], value: &str) -> RandomId128 {
         .expect("a 16-byte SHA-256 prefix is a valid RandomId128")
 }
 
-fn resource_error(error: cats_api::error::ApiError) -> ResourceStoreError {
+fn resource_error(error: cats_protocol::error::ApiError) -> ResourceStoreError {
     ResourceStoreError {
         message: error.message,
     }

@@ -264,12 +264,12 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cats_api::runtime_reconciliation::RandomId128;
     use cats_metering::{
         sha256_prefixed as metering_sha256, target_terminal_marker, target_terminal_request_sha256,
         UsageArchiveEvidence, UsageTargetBinding, UsageTerminalBarrierProjection,
         UsageTerminalShardTarget,
     };
+    use cats_protocol::runtime_reconciliation::RandomId128;
 
     const SHA: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 

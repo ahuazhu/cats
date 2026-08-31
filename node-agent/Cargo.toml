@@ -6,7 +6,8 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-cats-api = { workspace = true }
+cats-protocol = { workspace = true }
+cats-artifacts = { workspace = true }
 cats-blockd = { workspace = true }
 cats-metering = { workspace = true }
 cats-storage = { workspace = true }

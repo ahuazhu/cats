@@ -21,13 +21,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use cats_api::guest::{
+use cats_protocol::guest::{
     FilesystemControlOperationV1, FilesystemControlOutcomeV1, FilesystemControlRequestV1,
     FilesystemControlResponseV1, FilesystemIdentityV1, PersistentFilesystemMountV1,
     PersistentFilesystemObservationV1, FILESYSTEM_CONTROL_MAX_MOUNTS_V1,
     GUEST_HOST_CONTROL_PROTOCOL_VERSION_V1,
 };
-use cats_api::runtime_reconciliation::{
+use cats_protocol::runtime_reconciliation::{
     GuestDeviceIdentity, HostPath, Id, MountAccess, RandomId128,
 };
 
@@ -515,12 +515,12 @@ fn classify_probe(
     observation: &PersistentFilesystemObservationV1,
 ) -> FilesystemControlOutcomeV1 {
     let exact = match &request.filesystem.initialization {
-        cats_api::runtime_reconciliation::FilesystemInitialization::Initialize { .. } => {
+        cats_protocol::runtime_reconciliation::FilesystemInitialization::Initialize { .. } => {
             observation.mounts.is_empty()
                 && (matches!(observation.filesystem, FilesystemIdentityV1::Blank)
                     || observation_has_expected_uuid(request, observation))
         }
-        cats_api::runtime_reconciliation::FilesystemInitialization::Existing => {
+        cats_protocol::runtime_reconciliation::FilesystemInitialization::Existing => {
             observation_has_expected_uuid(request, observation)
                 && (observation.mounts.is_empty()
                     || observation_is_expected_mount(request, observation))
@@ -877,7 +877,7 @@ fn ensure_active(guard: EffectGuard) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use cats_api::runtime_reconciliation::{
+    use cats_protocol::runtime_reconciliation::{
         FenceEpoch, FilesystemInitialization, Generation, PersistentFilesystemBinding, RemoteHead,
     };
 

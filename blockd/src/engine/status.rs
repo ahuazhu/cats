@@ -1,5 +1,5 @@
 use super::*;
-use cats_api::blockd::DurabilityStatus;
+use cats_protocol::blockd::DurabilityStatus;
 
 /// When a FLUSH acknowledgment is allowed to reach the Guest (ADR-0022).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -8,9 +8,9 @@
 
 use std::collections::BTreeMap;
 
-use cats_api::chunk::MAX_VOLUME_BYTES;
-use cats_api::runtime_reconciliation::{Id, RandomId128};
-use cats_api::semantic_control::{
+use cats_protocol::chunk::MAX_VOLUME_BYTES;
+use cats_protocol::runtime_reconciliation::{Id, RandomId128};
+use cats_protocol::semantic_control::{
     AttachDiskRequest, CreateDiskRequest, DetachDiskRequest, DiskStatus, NodedDiskMount,
     PersistentDiskFormat, PersistentMountPath, ResourceSlug,
 };

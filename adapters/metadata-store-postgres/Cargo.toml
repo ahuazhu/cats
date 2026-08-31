@@ -6,7 +6,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-cats-api = { workspace = true }
+cats-protocol = { workspace = true }
 cats-storage = { workspace = true }
 native-tls = { workspace = true }
 postgres = { workspace = true }

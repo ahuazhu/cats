@@ -8,11 +8,11 @@ use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use cats_api::error::{ApiError, ErrorBody, ErrorCode};
 use cats_metering::{
     target_terminal_request_sha256, UsageTargetTerminalReceipt, UsageTargetTerminalRequest,
     UsageTerminalPrepareOutcome,
 };
+use cats_protocol::error::{ApiError, ErrorBody, ErrorCode};
 use serde::{Deserialize, Serialize};
 
 use crate::server::AppState;

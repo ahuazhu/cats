@@ -36,7 +36,7 @@ use cats_api::auth::{
     Account, AccountInvitation, AccountMember, CliAuthConfigResponse, MeResponse, UserProfile,
     Workspace,
 };
-use cats_api::error::{ApiError, ErrorCode};
+use cats_protocol::error::{ApiError, ErrorCode};
 
 use crate::api::Failure;
 use crate::server::AppState;

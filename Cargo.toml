@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "api",
+    "protocol",
+    "artifacts",
     "block-client",
     "metering",
     "blockd",
@@ -31,7 +33,9 @@ license = "MIT"
 repository = "https://github.com/ahuazhu/cats"
 
 [workspace.dependencies]
-cats-api = { version = "=0.1.2", path = "api" }
+cats-api = { version = "=0.1.2", path = "api", default-features = false }
+cats-protocol = { version = "=0.1.0", path = "protocol" }
+cats-artifacts = { version = "=0.1.0", path = "artifacts" }
 cats-block-client = { path = "block-client" }
 cats-metering = { path = "metering" }
 cats-blockd = { path = "blockd" }

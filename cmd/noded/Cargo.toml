@@ -18,7 +18,8 @@ name = "cats-usage-terminal-receipt-verifier"
 path = "src/usage_terminal_receipt_verifier.rs"
 
 [dependencies]
-cats-api = { workspace = true }
+cats-protocol = { workspace = true }
+cats-artifacts = { workspace = true }
 cats-metering = { workspace = true }
 cats-node-agent = { workspace = true }
 cats-blockd = { workspace = true }

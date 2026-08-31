@@ -10,8 +10,8 @@ use axum::http::{header, HeaderMap, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use cats_api::semantic_control::{ResourceSlug, SemanticErrorBody, SemanticErrorCode};
-use cats_api::sessions::{
+use cats_protocol::semantic_control::{ResourceSlug, SemanticErrorBody, SemanticErrorCode};
+use cats_protocol::sessions::{
     ExecRequest, ShellClientControl, ShellServerControl, MAX_EXEC_JSON_BODY_BYTES,
     MAX_SHELL_DIMENSION, MAX_SHELL_MESSAGE_BYTES, MIN_SHELL_DIMENSION,
 };
@@ -624,12 +624,12 @@ fn reject_browser_origin(headers: &HeaderMap) -> Result<(), SessionHttpFailure> 
 
 fn auth_failure(Failure(error_value): Failure) -> SessionHttpFailure {
     let code = match error_value.code {
-        cats_api::error::ErrorCode::Unauthenticated
-        | cats_api::error::ErrorCode::PermissionDenied
-        | cats_api::error::ErrorCode::NotFound => SemanticErrorCode::Unauthorized,
-        cats_api::error::ErrorCode::InvalidArgument => SemanticErrorCode::InvalidRequest,
-        cats_api::error::ErrorCode::DeadlineExceeded => SemanticErrorCode::Timeout,
-        cats_api::error::ErrorCode::Unavailable => SemanticErrorCode::NodeUnavailable,
+        cats_protocol::error::ErrorCode::Unauthenticated
+        | cats_protocol::error::ErrorCode::PermissionDenied
+        | cats_protocol::error::ErrorCode::NotFound => SemanticErrorCode::Unauthorized,
+        cats_protocol::error::ErrorCode::InvalidArgument => SemanticErrorCode::InvalidRequest,
+        cats_protocol::error::ErrorCode::DeadlineExceeded => SemanticErrorCode::Timeout,
+        cats_protocol::error::ErrorCode::Unavailable => SemanticErrorCode::NodeUnavailable,
         _ => SemanticErrorCode::InternalError,
     };
     SessionHttpFailure(error(code, error_value.message))
@@ -693,7 +693,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use axum::http::HeaderValue;
-    use cats_api::sessions::ExecResponse;
+    use cats_protocol::sessions::ExecResponse;
     use futures_util::SinkExt as _;
     use tokio::io::AsyncReadExt;
 
@@ -816,7 +816,7 @@ mod tests {
                 dropped: Arc::clone(&prepare_dropped),
             }),
             SemanticNodedSessionClient::new(
-                cats_api::semantic_control::NodedServiceToken::new("x".repeat(32))
+                cats_protocol::semantic_control::NodedServiceToken::new("x".repeat(32))
                     .expect("service token"),
             )
             .expect("noded client"),
@@ -946,8 +946,8 @@ mod tests {
 
         let prepares = Arc::new(AtomicUsize::new(0));
         let target = SessionTarget {
-            cat_id: cats_api::runtime_reconciliation::Id::new("cat_01").expect("Cat ID"),
-            endpoint: cats_api::semantic_control::NodedControlEndpoint::new(format!(
+            cat_id: cats_protocol::runtime_reconciliation::Id::new("cat_01").expect("Cat ID"),
+            endpoint: cats_protocol::semantic_control::NodedControlEndpoint::new(format!(
                 "http://{address}"
             ))
             .expect("noded endpoint"),
@@ -958,7 +958,7 @@ mod tests {
                 prepares: Arc::clone(&prepares),
             }),
             SemanticNodedSessionClient::new(
-                cats_api::semantic_control::NodedServiceToken::new("x".repeat(32))
+                cats_protocol::semantic_control::NodedServiceToken::new("x".repeat(32))
                     .expect("service token"),
             )
             .expect("noded client"),
@@ -1136,15 +1136,16 @@ mod tests {
             Arc::new(RouteAccess {
                 prepares: Arc::clone(&prepares),
                 target: SessionTarget {
-                    cat_id: cats_api::runtime_reconciliation::Id::new("cat_route").expect("Cat ID"),
-                    endpoint: cats_api::semantic_control::NodedControlEndpoint::new(format!(
+                    cat_id: cats_protocol::runtime_reconciliation::Id::new("cat_route")
+                        .expect("Cat ID"),
+                    endpoint: cats_protocol::semantic_control::NodedControlEndpoint::new(format!(
                         "http://{noded_address}"
                     ))
                     .expect("noded endpoint"),
                 },
             }),
             SemanticNodedSessionClient::new(
-                cats_api::semantic_control::NodedServiceToken::new(NODED_TOKEN)
+                cats_protocol::semantic_control::NodedServiceToken::new(NODED_TOKEN)
                     .expect("noded token"),
             )
             .expect("session client"),

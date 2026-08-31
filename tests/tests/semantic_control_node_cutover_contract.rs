@@ -171,7 +171,7 @@ fn noded_exposes_synchronous_semantic_routes_and_one_lane_per_cat() {
 
 #[test]
 fn offline_node_return_requires_reset_before_new_placement() {
-    let api = read_workspace_file("api/src/semantic_control.rs");
+    let api = read_workspace_file("protocol/src/semantic_control.rs");
     let control = read_workspace_file("control-plane/src/semantic_node.rs");
     let routes = read_workspace_file("control-plane/src/api/semantic_nodes.rs");
     let client = read_workspace_file("node-agent/src/semantic_node_client.rs");
