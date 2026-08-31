@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use cats_storage::{BlobError, BlobStore, MetaError, MetadataStore};
+use cats_storage::{BlobError, BlobListPage, BlobStore, MetaError, MetadataStore};
 
 static NEXT_CONTRACT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -62,6 +62,66 @@ pub fn blob_store_contract(make_store: impl FnOnce() -> Arc<dyn BlobStore>) {
         vec![data_key.clone(), map_key.clone()]
     );
 
+    // Calibrate cursor traversal against a late key after multiple full pages
+    // that a selective GC would classify as entirely live. A scan that keeps
+    // restarting at the prefix would never discover the final garbage key.
+    let cursor_prefix = format!("{namespace}/volumes/v1/cursor/");
+    let cursor_keys = [
+        format!("{cursor_prefix}00-live"),
+        format!("{cursor_prefix}01-live"),
+        format!("{cursor_prefix}02-live"),
+        format!("{cursor_prefix}03-live"),
+        format!("{cursor_prefix}99-garbage"),
+    ];
+    for key in &cursor_keys {
+        store.put_immutable(key, b"cursor").unwrap();
+    }
+    let first = store.list_after_bounded(&cursor_prefix, None, 2).unwrap();
+    assert_eq!(
+        first,
+        BlobListPage {
+            keys: cursor_keys[..2].to_vec(),
+            is_truncated: true,
+        }
+    );
+    let second = store
+        .list_after_bounded(&cursor_prefix, first.keys.last().map(String::as_str), 2)
+        .unwrap();
+    assert_eq!(
+        second,
+        BlobListPage {
+            keys: cursor_keys[2..4].to_vec(),
+            is_truncated: true,
+        }
+    );
+    let final_page = store
+        .list_after_bounded(&cursor_prefix, second.keys.last().map(String::as_str), 2)
+        .unwrap();
+    assert_eq!(
+        final_page,
+        BlobListPage {
+            keys: cursor_keys[4..].to_vec(),
+            is_truncated: false,
+        }
+    );
+    assert_eq!(
+        store
+            .list_after_bounded(
+                &cursor_prefix,
+                final_page.keys.last().map(String::as_str),
+                2
+            )
+            .unwrap(),
+        BlobListPage {
+            keys: Vec::new(),
+            is_truncated: false,
+        }
+    );
+    assert!(matches!(
+        store.list_after_bounded(&cursor_prefix, Some(&outside_key), 2),
+        Err(BlobError::InvalidKey { .. })
+    ));
+
     for key in ["", "/absolute", "../escape", "a//b", "a/./b"] {
         assert!(matches!(
             store.put_immutable(key, b"value"),
@@ -73,6 +133,9 @@ pub fn blob_store_contract(make_store: impl FnOnce() -> Arc<dyn BlobStore>) {
     store.delete(&data_key).unwrap();
     assert!(!store.exists(&data_key).unwrap());
     store.delete(&map_key).unwrap();
+    for key in &cursor_keys {
+        store.delete(key).unwrap();
+    }
     store.delete(&outside_key).unwrap();
 }
 

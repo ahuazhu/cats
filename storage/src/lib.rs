@@ -16,8 +16,8 @@ pub use adapter::{
     BlobStoreFactory, MetadataStoreFactory,
 };
 pub use blob::{
-    validate_key, BlobError, BlobListPage, BlobStore, QualifiedDeleteListPage,
-    BLOB_LIST_PAGE_MAX_KEYS,
+    validate_key, validate_list_after, validate_list_page, BlobError, BlobListPage, BlobStore,
+    QualifiedDeleteListPage, BLOB_LIST_PAGE_MAX_KEYS,
 };
 pub use delete::{delete_volume_objects_page, volume_object_prefix, DeletePrefixPage};
 pub use image_manifest::{

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use cats_storage::{BlobError, BlobStore};
+use cats_storage::{BlobError, BlobListPage, BlobStore};
 
 fn is_data_object(key: &str) -> bool {
     key.contains("/data/")
@@ -63,6 +63,15 @@ impl BlobStore for SlowBlob {
     fn list(&self, prefix: &str) -> cats_storage::blob::Result<Vec<String>> {
         self.inner.list(prefix)
     }
+
+    fn list_after_bounded(
+        &self,
+        prefix: &str,
+        after_key: Option<&str>,
+        maximum: usize,
+    ) -> cats_storage::blob::Result<BlobListPage> {
+        self.inner.list_after_bounded(prefix, after_key, maximum)
+    }
 }
 
 /// Counts all reads and volume/image data-object writes.
@@ -113,6 +122,15 @@ impl BlobStore for CountingBlob {
 
     fn list(&self, prefix: &str) -> cats_storage::blob::Result<Vec<String>> {
         self.inner.list(prefix)
+    }
+
+    fn list_after_bounded(
+        &self,
+        prefix: &str,
+        after_key: Option<&str>,
+        maximum: usize,
+    ) -> cats_storage::blob::Result<BlobListPage> {
+        self.inner.list_after_bounded(prefix, after_key, maximum)
     }
 }
 
@@ -181,6 +199,15 @@ impl BlobStore for SizingBlob {
 
     fn list(&self, prefix: &str) -> cats_storage::blob::Result<Vec<String>> {
         self.inner.list(prefix)
+    }
+
+    fn list_after_bounded(
+        &self,
+        prefix: &str,
+        after_key: Option<&str>,
+        maximum: usize,
+    ) -> cats_storage::blob::Result<BlobListPage> {
+        self.inner.list_after_bounded(prefix, after_key, maximum)
     }
 }
 
@@ -257,6 +284,15 @@ impl BlobStore for ConcurrencyProbe {
     fn list(&self, prefix: &str) -> cats_storage::blob::Result<Vec<String>> {
         self.inner.list(prefix)
     }
+
+    fn list_after_bounded(
+        &self,
+        prefix: &str,
+        after_key: Option<&str>,
+        maximum: usize,
+    ) -> cats_storage::blob::Result<BlobListPage> {
+        self.inner.list_after_bounded(prefix, after_key, maximum)
+    }
 }
 
 /// Runtime-switchable read outage used to assert cold-cache boundaries.
@@ -310,5 +346,14 @@ impl BlobStore for SwitchableFailureBlob {
 
     fn list(&self, prefix: &str) -> cats_storage::blob::Result<Vec<String>> {
         self.inner.list(prefix)
+    }
+
+    fn list_after_bounded(
+        &self,
+        prefix: &str,
+        after_key: Option<&str>,
+        maximum: usize,
+    ) -> cats_storage::blob::Result<BlobListPage> {
+        self.inner.list_after_bounded(prefix, after_key, maximum)
     }
 }

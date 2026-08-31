@@ -156,6 +156,35 @@ pub trait BlobStore: Send + Sync {
         })
     }
 
+    /// Return at most `maximum` sorted keys below `prefix` and strictly after
+    /// `after_key`.
+    ///
+    /// The cursor is the last provider-neutral object key returned to the
+    /// caller, not an opaque provider continuation token. This makes a full
+    /// non-destructive scan restartable without leaking an adapter's wire
+    /// protocol. Adapters must override this method before callers rely on
+    /// cursor pagination. The compatibility default supports only the first
+    /// page through an existing `list_bounded` implementation and fails
+    /// closed for a continuation page.
+    fn list_after_bounded(
+        &self,
+        prefix: &str,
+        after_key: Option<&str>,
+        maximum: usize,
+    ) -> Result<BlobListPage> {
+        validate_list_after(prefix, after_key)?;
+        validate_list_maximum(prefix, maximum)?;
+        if after_key.is_some() {
+            return Err(BlobError::Backend {
+                key: prefix.to_string(),
+                message: "blob adapter does not implement resource-bounded cursor LIST".into(),
+            });
+        }
+        let page = self.list_bounded(prefix, maximum)?;
+        validate_list_page(prefix, after_key, maximum, &page)?;
+        Ok(page)
+    }
+
     /// Destructive, strongly-consistent bounded LIST under one absolute
     /// deadline. The default is intentionally unqualified: normal LIST
     /// support is not evidence that an empty result may settle deletion.
@@ -189,6 +218,22 @@ pub fn validate_list_maximum(prefix: &str, maximum: usize) -> Result<()> {
     Ok(())
 }
 
+/// Validate the provider-neutral exclusive LIST cursor.
+pub fn validate_list_after(prefix: &str, after_key: Option<&str>) -> Result<()> {
+    validate_list_result(prefix, &[])?;
+    let Some(after_key) = after_key else {
+        return Ok(());
+    };
+    validate_key(after_key)?;
+    if !after_key.starts_with(prefix) {
+        return Err(BlobError::InvalidKey {
+            key: after_key.to_string(),
+            message: format!("LIST cursor is outside the requested prefix {prefix:?}"),
+        });
+    }
+    Ok(())
+}
+
 pub fn validate_list_result(prefix: &str, keys: &[String]) -> Result<()> {
     if prefix.is_empty() || prefix.starts_with('/') {
         return Err(BlobError::InvalidKey {
@@ -204,6 +249,43 @@ pub fn validate_list_result(prefix: &str, keys: &[String]) -> Result<()> {
                 message: format!("LIST returned key outside the requested prefix: {key}"),
             });
         }
+    }
+    if keys.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(BlobError::Backend {
+            key: prefix.to_string(),
+            message: "LIST keys are not in strictly increasing lexical order".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Validate one bounded, strictly ordered, exclusive LIST page.
+pub fn validate_list_page(
+    prefix: &str,
+    after_key: Option<&str>,
+    maximum: usize,
+    page: &BlobListPage,
+) -> Result<()> {
+    validate_list_after(prefix, after_key)?;
+    validate_list_maximum(prefix, maximum)?;
+    if page.keys.len() > maximum {
+        return Err(BlobError::Backend {
+            key: prefix.to_string(),
+            message: "bounded LIST exceeded its requested key count".into(),
+        });
+    }
+    if page.keys.is_empty() && page.is_truncated {
+        return Err(BlobError::Backend {
+            key: prefix.to_string(),
+            message: "bounded LIST claimed an empty truncated page".into(),
+        });
+    }
+    validate_list_result(prefix, &page.keys)?;
+    if after_key.is_some_and(|after_key| page.keys.iter().any(|key| key.as_str() <= after_key)) {
+        return Err(BlobError::Backend {
+            key: prefix.to_string(),
+            message: "cursor LIST returned a key at or before its exclusive cursor".into(),
+        });
     }
     Ok(())
 }
@@ -275,6 +357,15 @@ impl BlobStore for FaultyBlobStore {
 
     fn list_bounded(&self, prefix: &str, maximum: usize) -> Result<BlobListPage> {
         self.inner.list_bounded(prefix, maximum)
+    }
+
+    fn list_after_bounded(
+        &self,
+        prefix: &str,
+        after_key: Option<&str>,
+        maximum: usize,
+    ) -> Result<BlobListPage> {
+        self.inner.list_after_bounded(prefix, after_key, maximum)
     }
 
     fn list_for_delete_bounded_until(
