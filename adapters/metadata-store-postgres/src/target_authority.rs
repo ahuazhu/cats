@@ -22,8 +22,9 @@ use super::{
 
 const VOLUME_COLUMNS: &str = "
     volume_id, record::text AS record_json, size_bytes, durability,
-    admin_state, delete_id, head_generation, head_root_hash,
-    head_root_object_id, lease_owner, lease_epoch, lease_expires_at,
+    admin_state, delete_id, gc_required, gc_id, gc_roots_digest,
+    gc_started_at, head_generation, head_root_hash, head_root_object_id,
+    lease_owner, lease_epoch, lease_expires_at,
     last_transition_kind, last_transition_id,
     transition_placement_epoch, transition_lease_duration_ms,
     owner_binding::text AS owner_binding_json, owner_node_id";
@@ -433,18 +434,23 @@ fn update_volume_row(
         .transition_lease_duration_ms
         .map(to_pg)
         .transpose()?;
+    let gc_started_at = projection
+        .gc_started_at
+        .map(|value| to_pg(value.get()))
+        .transpose()?;
     let changed = transaction
         .execute(
             "UPDATE volume_records SET
                 record=$2::TEXT::jsonb, size_bytes=$3, durability=$4,
-                admin_state=$5, delete_id=$6, head_generation=$7,
-                head_root_hash=$8, head_root_object_id=$9, lease_owner=$10,
-                lease_epoch=$11, lease_expires_at=$12,
-                last_transition_kind=$13, last_transition_id=$14,
-                transition_placement_epoch=$15,
-                transition_lease_duration_ms=$16,
-                owner_binding=CASE WHEN $17 THEN $18::TEXT::jsonb ELSE owner_binding END,
-                owner_node_id=CASE WHEN $17 THEN $19 ELSE owner_node_id END
+                admin_state=$5, delete_id=$6, gc_required=$7, gc_id=$8,
+                gc_roots_digest=$9, gc_started_at=$10, head_generation=$11,
+                head_root_hash=$12, head_root_object_id=$13, lease_owner=$14,
+                lease_epoch=$15, lease_expires_at=$16,
+                last_transition_kind=$17, last_transition_id=$18,
+                transition_placement_epoch=$19,
+                transition_lease_duration_ms=$20,
+                owner_binding=CASE WHEN $21 THEN $22::TEXT::jsonb ELSE owner_binding END,
+                owner_node_id=CASE WHEN $21 THEN $23 ELSE owner_node_id END
               WHERE volume_id=$1",
             &[
                 &projection.volume_id,
@@ -453,6 +459,10 @@ fn update_volume_row(
                 &projection.durability,
                 &projection.admin_state,
                 &projection.delete_id,
+                &projection.gc_required,
+                &projection.gc_id,
+                &projection.gc_roots_digest,
+                &gc_started_at,
                 &head_generation,
                 &projection.head_root_hash,
                 &projection.head_root_object_id,
@@ -517,12 +527,21 @@ fn decode_stored_volume(
 
 fn projection_from_row(row: &Row) -> Result<VolumeRecordProjection, AuthorityError> {
     let durability = static_value(row, "durability", &["strict", "relaxed"])?;
-    let admin_state = static_value(row, "admin_state", &["active", "deleting"])?;
+    let admin_state = static_value(
+        row,
+        "admin_state",
+        &["active", "deleting", "garbage_collecting"],
+    )?;
     let last_transition_kind = match optional_string(row, "last_transition_kind")? {
         None => None,
         Some(value) => Some(static_str(
             value,
-            &["normal_acquire", "release", "begin_delete"],
+            &[
+                "normal_acquire",
+                "release",
+                "begin_delete",
+                "snapshot_restore",
+            ],
         )?),
     };
     Ok(VolumeRecordProjection {
@@ -531,6 +550,14 @@ fn projection_from_row(row: &Row) -> Result<VolumeRecordProjection, AuthorityErr
         durability,
         admin_state,
         delete_id: optional_string(row, "delete_id")?,
+        gc_id: optional_string(row, "gc_id")?,
+        gc_roots_digest: optional_string(row, "gc_roots_digest")?,
+        gc_started_at: optional_integer(row, "gc_started_at")?
+            .map(unix_millis)
+            .transpose()?,
+        gc_required: row
+            .try_get("gc_required")
+            .map_err(|_| AuthorityError::BackendUnknown)?,
         head_generation: generation(integer(row, "head_generation")?)?,
         head_root_hash: optional_string(row, "head_root_hash")?,
         head_root_object_id: optional_string(row, "head_root_object_id")?,
@@ -706,6 +733,7 @@ mod tests {
             size_bytes: VOLUME_SIZE,
             durability: VolumeDurability::Strict,
             admin_state: VolumeAdminState::Active,
+            gc_required: false,
             head: head(4, 4),
             lease_owner: Some(id(ATTACHMENT_ID)),
             lease_epoch: fence_epoch(7),
@@ -775,15 +803,16 @@ mod tests {
             .execute(
                 "INSERT INTO volume_records (
                     volume_id, record, size_bytes, durability, admin_state, delete_id,
+                    gc_required, gc_id, gc_roots_digest, gc_started_at,
                     head_generation, head_root_hash, head_root_object_id,
                     lease_owner, lease_epoch, lease_expires_at,
                     last_transition_kind, last_transition_id,
                     transition_placement_epoch,
                     transition_lease_duration_ms, owner_binding, owner_node_id
                  ) VALUES (
-                    $1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9,
-                    $10, $11, $12, $13, $14, $15, $16,
-                    $17::TEXT::jsonb, $18
+                    $1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9, $10,
+                    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+                    $21::TEXT::jsonb, $22
                  )",
                 &[
                     &projection.volume_id,
@@ -792,6 +821,12 @@ mod tests {
                     &projection.durability,
                     &projection.admin_state,
                     &projection.delete_id,
+                    &projection.gc_required,
+                    &projection.gc_id,
+                    &projection.gc_roots_digest,
+                    &projection
+                        .gc_started_at
+                        .map(|value| to_pg(value.get()).unwrap()),
                     &head_generation,
                     &projection.head_root_hash,
                     &projection.head_root_object_id,

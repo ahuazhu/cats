@@ -645,6 +645,7 @@ fn blank_volume(volume_id: &Id, size_bytes: u64) -> Result<VolumeRecord, Authori
         size_bytes,
         durability: VolumeDurability::Strict,
         admin_state: VolumeAdminState::Active,
+        gc_required: false,
         head: blank_head(),
         lease_owner: None,
         lease_epoch: FenceEpoch::new(0).ok_or(AuthorityError::BackendUnknown)?,
@@ -671,12 +672,14 @@ fn insert_volume(
         .execute(
             "INSERT INTO volume_records (
                 volume_id,record,size_bytes,durability,admin_state,delete_id,
+                gc_required,gc_id,gc_roots_digest,gc_started_at,
                 head_generation,head_root_hash,head_root_object_id,lease_owner,
                 lease_epoch,lease_expires_at,last_transition_kind,last_transition_id,
                 transition_placement_epoch,
                 transition_lease_duration_ms,owner_binding,owner_node_id
-             ) VALUES ($1,$2::TEXT::jsonb,$3,'strict','active',NULL,0,NULL,NULL,
-                       NULL,0,NULL,NULL,NULL,NULL,NULL,NULL,NULL)",
+             ) VALUES ($1,$2::TEXT::jsonb,$3,'strict','active',NULL,
+                       FALSE,NULL,NULL,NULL,0,NULL,NULL,NULL,0,NULL,NULL,NULL,
+                       NULL,NULL,NULL,NULL)",
             &[
                 &projection.volume_id,
                 &record_json,

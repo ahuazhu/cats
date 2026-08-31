@@ -712,7 +712,14 @@ pub type VolumeDurability = Durability;
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum VolumeAdminState {
     Active,
-    Deleting { delete_id: Id },
+    Deleting {
+        delete_id: Id,
+    },
+    GarbageCollecting {
+        gc_id: Id,
+        roots_digest: Sha256Digest,
+        started_at: UnixMillis,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -722,6 +729,9 @@ pub struct VolumeRecord {
     pub size_bytes: u64,
     pub durability: VolumeDurability,
     pub admin_state: VolumeAdminState,
+    /// True when a committed head change may have left unreachable private
+    /// objects that require a snapshot-aware GC pass.
+    pub gc_required: bool,
     pub head: RemoteHead,
     pub lease_owner: Option<Id>,
     pub lease_epoch: FenceEpoch,

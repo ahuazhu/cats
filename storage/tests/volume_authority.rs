@@ -48,6 +48,7 @@ fn unowned_volume() -> VolumeRecord {
         size_bytes: 4 * 1024 * 1024,
         durability: VolumeDurability::Strict,
         admin_state: VolumeAdminState::Active,
+        gc_required: false,
         head: head(4),
         lease_owner: None,
         lease_epoch: fence_epoch(7),
@@ -403,6 +404,7 @@ fn snapshot_restore_republishes_a_captured_root_at_a_new_generation_and_epoch() 
     assert_eq!(result.resulting_epoch, fence_epoch(8));
     assert_eq!(restored.head, expected_head);
     assert_eq!(restored.lease_epoch, fence_epoch(8));
+    assert!(restored.gc_required);
     assert!(restored.lease_owner.is_none());
     assert_eq!(
         restored.last_transition,
@@ -575,6 +577,7 @@ fn head_cas_binds_owner_epoch_size_and_complete_predecessor() {
     };
     let (published, result) = compare_and_swap_head(&owned, &request).unwrap();
     assert_eq!(published.head, head(5));
+    assert!(published.gc_required);
     assert_eq!(result.resulting_head, head(5));
 
     assert_eq!(
@@ -602,6 +605,92 @@ fn head_cas_binds_owner_epoch_size_and_complete_predecessor() {
         compare_and_swap_head(&owned, &no_advance),
         Err(AuthorityError::HeadConflict)
     );
+}
+
+#[test]
+fn garbage_collecting_is_an_unowned_writer_exclusion_state() {
+    let (owned, _, _) = acquired_volume();
+    let release_request = ReleaseRequest {
+        volume_id: owned.volume_id.clone(),
+        transition_id: random_id(2),
+        attachment_id: owned.lease_owner.clone().unwrap(),
+        expected_epoch: owned.lease_epoch,
+    };
+    let (mut collecting, _) = release(&owned, &release_request).unwrap();
+    collecting.gc_required = true;
+    collecting.admin_state = VolumeAdminState::GarbageCollecting {
+        gc_id: id("gc-1"),
+        roots_digest: Sha256Digest::from_bytes([0xcc; 32]),
+        started_at: time(20_000),
+    };
+    validate_volume_record(&collecting).unwrap();
+    let projection = project_volume_record(&collecting).unwrap();
+    assert_eq!(projection.admin_state, "garbage_collecting");
+    assert_eq!(projection.delete_id, None);
+    assert_eq!(projection.gc_id.as_deref(), Some("gc-1"));
+    assert_eq!(
+        projection.gc_roots_digest.as_deref(),
+        Some("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+    );
+    assert_eq!(projection.gc_started_at, Some(time(20_000)));
+    assert!(projection.gc_required);
+
+    let acquire = NormalAcquireRequest {
+        expected_unowned_epoch: collecting.lease_epoch,
+        ..acquire_request(3)
+    };
+    assert_eq!(
+        normal_acquire(&collecting, &acquire, time(30_000)),
+        Err(AuthorityError::AdminBusy)
+    );
+    let publish = VolumeHeadCasRequest {
+        volume_id: collecting.volume_id.clone(),
+        attachment_id: id("attachment-a"),
+        expected_epoch: collecting.lease_epoch,
+        expected_size_bytes: collecting.size_bytes,
+        expected_head: collecting.head.clone(),
+        new_head: head(5),
+    };
+    assert_eq!(
+        compare_and_swap_head(&collecting, &publish),
+        Err(AuthorityError::AdminBusy)
+    );
+    let delete = BeginDeleteRequest {
+        delete_id: id("delete-1"),
+        disk_id: id("disk-1"),
+        volume_id: collecting.volume_id.clone(),
+        expected_unowned_epoch: collecting.lease_epoch,
+        expected_head: collecting.head.clone(),
+    };
+    assert_eq!(
+        begin_delete(&collecting, &delete),
+        Err(AuthorityError::AdminBusy)
+    );
+
+    collecting.gc_required = false;
+    assert_eq!(
+        validate_volume_record(&collecting),
+        Err(AuthorityError::BackendUnknown)
+    );
+}
+
+#[test]
+fn garbage_collection_preserves_exact_restore_replay_evidence() {
+    let base = unowned_volume();
+    let request = snapshot_restore_request(&base);
+    let (mut collecting, result) = restore_snapshot(&base, &request).unwrap();
+    let restore_marker = collecting.last_transition.clone();
+    collecting.admin_state = VolumeAdminState::GarbageCollecting {
+        gc_id: id("gc-restore"),
+        roots_digest: Sha256Digest::from_bytes([0xdd; 32]),
+        started_at: time(0),
+    };
+
+    validate_volume_record(&collecting).unwrap();
+    assert_eq!(collecting.last_transition, restore_marker);
+    let (replayed, replay) = restore_snapshot(&collecting, &request).unwrap();
+    assert_eq!(replayed, collecting);
+    assert_eq!(replay, result);
 }
 
 #[test]
@@ -646,6 +735,7 @@ fn every_epoch_advancing_direct_transition_fails_at_maximum() {
         size_bytes: 4 * 1024 * 1024,
         durability: VolumeDurability::Strict,
         admin_state: VolumeAdminState::Active,
+        gc_required: false,
         head: result.resulting_head.clone(),
         lease_owner: Some(request.attachment_id.clone()),
         lease_epoch: result.resulting_epoch,
@@ -734,5 +824,9 @@ fn retired_transition_json_shapes_are_rejected() {
         "request_fingerprint":
             "sha256:0000000000000000000000000000000000000000000000000000000000000001"
     });
+    assert!(serde_json::from_value::<VolumeRecord>(value).is_err());
+
+    let mut value = serde_json::to_value(unowned_volume()).unwrap();
+    value.as_object_mut().unwrap().remove("gc_required");
     assert!(serde_json::from_value::<VolumeRecord>(value).is_err());
 }

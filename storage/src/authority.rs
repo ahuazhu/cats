@@ -444,6 +444,10 @@ pub struct VolumeRecordProjection {
     pub durability: &'static str,
     pub admin_state: &'static str,
     pub delete_id: Option<String>,
+    pub gc_id: Option<String>,
+    pub gc_roots_digest: Option<String>,
+    pub gc_started_at: Option<UnixMillis>,
+    pub gc_required: bool,
     pub head_generation: Generation,
     pub head_root_hash: Option<String>,
     pub head_root_object_id: Option<String>,
@@ -458,9 +462,23 @@ pub struct VolumeRecordProjection {
 
 pub fn project_volume_record(record: &VolumeRecord) -> Result<VolumeRecordProjection> {
     validate_volume_record(record)?;
-    let (admin_state, delete_id) = match &record.admin_state {
-        VolumeAdminState::Active => ("active", None),
-        VolumeAdminState::Deleting { delete_id } => ("deleting", Some(delete_id.to_string())),
+    let (admin_state, delete_id, gc_id, gc_roots_digest, gc_started_at) = match &record.admin_state
+    {
+        VolumeAdminState::Active => ("active", None, None, None, None),
+        VolumeAdminState::Deleting { delete_id } => {
+            ("deleting", Some(delete_id.to_string()), None, None, None)
+        }
+        VolumeAdminState::GarbageCollecting {
+            gc_id,
+            roots_digest,
+            started_at,
+        } => (
+            "garbage_collecting",
+            None,
+            Some(gc_id.to_string()),
+            Some(roots_digest.to_string()),
+            Some(*started_at),
+        ),
     };
     let durability = match record.durability {
         VolumeDurability::Strict => "strict",
@@ -499,6 +517,10 @@ pub fn project_volume_record(record: &VolumeRecord) -> Result<VolumeRecordProjec
         durability,
         admin_state,
         delete_id,
+        gc_id,
+        gc_roots_digest,
+        gc_started_at,
+        gc_required: record.gc_required,
         head_generation: record.head.generation,
         head_root_hash: record.head.root_hash.as_ref().map(ToString::to_string),
         head_root_object_id: record.head.root_object_id.as_ref().map(ToString::to_string),
@@ -543,6 +565,8 @@ pub fn validate_volume_record(record: &VolumeRecord) -> Result<()> {
         (VolumeAdminState::Active, Some(_), Some(expires_at))
             if record.lease_epoch.get() > 0 && expires_at.get() > 0 => {}
         (VolumeAdminState::Deleting { .. }, None, None) if record.lease_epoch.get() > 0 => {}
+        (VolumeAdminState::GarbageCollecting { .. }, None, None)
+            if record.gc_required && record.lease_epoch.get() > 0 => {}
         _ => return Err(AuthorityError::BackendUnknown),
     }
 
@@ -572,7 +596,10 @@ pub fn validate_volume_record(record: &VolumeRecord) -> Result<()> {
         } => {
             validate_release_pair(request, result)?;
             if request.volume_id != record.volume_id
-                || !matches!(record.admin_state, VolumeAdminState::Active)
+                || !matches!(
+                    record.admin_state,
+                    VolumeAdminState::Active | VolumeAdminState::GarbageCollecting { .. }
+                )
                 || record.lease_owner.is_some()
                 || record.lease_epoch != result.resulting_epoch
                 || record.head != result.resulting_head
@@ -600,7 +627,10 @@ pub fn validate_volume_record(record: &VolumeRecord) -> Result<()> {
             if request.volume_id != record.volume_id
                 || request.expected_size_bytes != record.size_bytes
                 || record.durability != VolumeDurability::Strict
-                || !matches!(record.admin_state, VolumeAdminState::Active)
+                || !matches!(
+                    record.admin_state,
+                    VolumeAdminState::Active | VolumeAdminState::GarbageCollecting { .. }
+                )
                 || record.lease_owner.is_some()
                 || record.lease_expires_at.is_some()
                 || record.lease_epoch != result.resulting_epoch
@@ -745,6 +775,7 @@ pub fn compare_and_swap_head(
     };
     let mut updated = record.clone();
     updated.head = request.new_head.clone();
+    updated.gc_required = true;
     validate_volume_record(&updated)?;
     Ok((updated, result))
 }
@@ -908,6 +939,7 @@ pub fn restore_snapshot(
     let mut updated = record.clone();
     updated.head = resulting_head;
     updated.lease_epoch = resulting_epoch;
+    updated.gc_required = true;
     updated.last_transition = Some(LastVolumeTransition::SnapshotRestore {
         request: request.clone(),
         result: result.clone(),

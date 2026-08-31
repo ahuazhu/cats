@@ -179,6 +179,7 @@ impl VolumeDataAuthority for TestVolumeDataAuthority {
             size_bytes: head.size_bytes,
             durability: VolumeDurability::Strict,
             admin_state: VolumeAdminState::Active,
+            gc_required: false,
             head: remote_head,
             lease_owner: lease_owner.clone(),
             lease_epoch,
@@ -286,6 +287,7 @@ fn serving_fixture(durability: VolumeDurability) -> ServingFixture {
         size_bytes: SIZE,
         durability,
         admin_state: VolumeAdminState::Active,
+        gc_required: false,
         head: RemoteHead {
             generation: Generation::new(0).unwrap(),
             root_hash: None,
