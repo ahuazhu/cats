@@ -6,11 +6,12 @@
 //! potentially long mark-and-sweep pass.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::store::runtime_authority::snapshot_gc::{
-    SnapshotGcClaim, SnapshotGcRoot, SnapshotGcSettlement,
-};
+use cats_blockd::gc::{collect_garbage, GarbageCollectionClaim, RetainedRoot, RetainedRootSource};
+use cats_storage::{BlobStore, BLOB_LIST_PAGE_MAX_KEYS};
+
+use crate::store::runtime_authority::snapshot_gc::{SnapshotGcClaim, SnapshotGcSettlement};
 use crate::store::Store;
 
 /// Result of the provider-neutral graph validation and selective sweep.
@@ -28,11 +29,61 @@ pub(crate) struct SnapshotGcSweepStats {
 /// DELETE, use bounded cursor LIST for both private volume prefixes, and verify
 /// that every object remaining after the sweep belongs to the marked union.
 pub(crate) trait SnapshotGcSweeper: Send + Sync + 'static {
-    fn sweep(
-        &self,
-        volume_id: &cats_api::runtime_reconciliation::Id,
-        roots: &[SnapshotGcRoot],
-    ) -> std::result::Result<SnapshotGcSweepStats, String>;
+    fn sweep(&self, claim: &SnapshotGcClaim) -> std::result::Result<SnapshotGcSweepStats, String>;
+}
+
+pub(crate) struct ChunkStoreSnapshotGcSweeper {
+    blob: Arc<dyn BlobStore>,
+    deadline: Duration,
+}
+
+impl ChunkStoreSnapshotGcSweeper {
+    pub(crate) fn new(blob: Arc<dyn BlobStore>, deadline: Duration) -> Self {
+        Self { blob, deadline }
+    }
+}
+
+impl SnapshotGcSweeper for ChunkStoreSnapshotGcSweeper {
+    fn sweep(&self, claim: &SnapshotGcClaim) -> std::result::Result<SnapshotGcSweepStats, String> {
+        let size_bytes = claim
+            .roots
+            .first()
+            .map(|root| root.size_bytes)
+            .ok_or_else(|| "snapshot GC claim omitted its current root".to_owned())?;
+        let roots = claim
+            .roots
+            .iter()
+            .map(|root| RetainedRoot {
+                source: match &root.snapshot_id {
+                    Some(snapshot_id) => RetainedRootSource::Snapshot {
+                        snapshot_id: snapshot_id.clone(),
+                    },
+                    None => RetainedRootSource::Current,
+                },
+                head: root.head.clone(),
+            })
+            .collect();
+        let data_claim = GarbageCollectionClaim::new(
+            claim.gc_id.clone(),
+            claim.volume_id.clone(),
+            size_bytes,
+            roots,
+        )
+        .map_err(|error| error.to_string())?;
+        let stats = collect_garbage(
+            self.blob.as_ref(),
+            &data_claim,
+            BLOB_LIST_PAGE_MAX_KEYS,
+            Instant::now() + self.deadline,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(SnapshotGcSweepStats {
+            live_data_objects: stats.data_objects_live,
+            deleted_data_objects: stats.data_objects_deleted,
+            live_map_objects: stats.map_objects_live,
+            deleted_map_objects: stats.map_objects_deleted,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,10 +126,7 @@ impl SnapshotGcService {
 
         let sweep_claim = claim.clone();
         let sweeper = Arc::clone(&self.sweeper);
-        let sweep = tokio::task::spawn_blocking(move || {
-            sweeper.sweep(&sweep_claim.volume_id, &sweep_claim.roots)
-        })
-        .await;
+        let sweep = tokio::task::spawn_blocking(move || sweeper.sweep(&sweep_claim)).await;
 
         match sweep {
             Ok(Ok(stats)) => {

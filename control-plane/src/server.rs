@@ -29,6 +29,8 @@ const DESTROY_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
 const DESTROY_RECOVERY_MINIMUM_AGE: Duration = crate::semantic_lifecycle::DEFAULT_STALE_ACTION_AGE;
 const DESTROY_RECOVERY_BATCH_SIZE: usize = 32;
 const DESTROY_RECOVERY_MAX_IN_FLIGHT: usize = 4;
+const SNAPSHOT_GC_INTERVAL: Duration = Duration::from_secs(30);
+const SNAPSHOT_GC_PASS_DEADLINE: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone)]
 pub struct Config {
@@ -78,6 +80,7 @@ pub struct Handle {
     semantic_node_liveness_shutdown: tokio::sync::watch::Sender<bool>,
     semantic_node_liveness_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     semantic_action_recovery_task: ManagedSingletonTask,
+    snapshot_gc_task: ManagedSingletonTask,
     server_shutdown: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
@@ -115,6 +118,7 @@ impl Handle {
         self.semantic_destroy_recovery_task.begin_shutdown();
         self.semantic_node_liveness_shutdown.send_replace(true);
         self.semantic_action_recovery_task.begin_shutdown();
+        self.snapshot_gc_task.begin_shutdown();
         self.state.runtime_node_authority.begin_shutdown();
     }
 
@@ -133,6 +137,10 @@ impl Handle {
             .shutdown()
             .await
             .context("semantic action recovery task failed")?;
+        self.snapshot_gc_task
+            .shutdown()
+            .await
+            .context("DiskSnapshot garbage collection task failed")?;
         self.state
             .runtime_node_authority
             .shutdown_commit_resolutions()
@@ -332,6 +340,23 @@ async fn spawn_with_session_override(
             cfg.default_boot_image.clone(),
         ),
     );
+    let snapshot_gc = Arc::new(crate::semantic_snapshot_gc::SnapshotGcService::new(
+        Arc::clone(&store),
+        Arc::new(
+            crate::semantic_snapshot_gc::ChunkStoreSnapshotGcSweeper::new(
+                Arc::clone(&cfg.image_blob),
+                SNAPSHOT_GC_PASS_DEADLINE,
+            ),
+        ),
+    ));
+    let snapshot_gc_task = spawn_managed_singleton_task(
+        Arc::clone(&store),
+        SingletonRole::DiskSnapshotGarbageCollection,
+        move || {
+            let snapshot_gc = Arc::clone(&snapshot_gc);
+            async move { snapshot_gc.run(SNAPSHOT_GC_INTERVAL).await }
+        },
+    );
     let semantic_sessions = match session_override {
         Some(sessions) => sessions,
         None => crate::api::sessions::SemanticSessionHttpState::new(
@@ -408,6 +433,7 @@ async fn spawn_with_session_override(
         semantic_node_liveness_shutdown,
         semantic_node_liveness_task: tokio::sync::Mutex::new(Some(semantic_node_liveness_task)),
         semantic_action_recovery_task,
+        snapshot_gc_task,
         server_shutdown: std::sync::Mutex::new(Some(server_shutdown)),
     })
 }

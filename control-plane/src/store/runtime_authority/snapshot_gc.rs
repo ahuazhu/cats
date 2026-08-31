@@ -109,7 +109,8 @@ impl Store {
                         AND p.status='normal' AND p.deleted_at IS NULL
                         AND (
                             b.binding_id IS NULL OR
-                            (c.state='cold' AND c.current_action IS NULL)
+                            (c.state='cold' AND c.current_action IS NULL
+                                AND c.node_id IS NULL)
                         )
                       ORDER BY
                         (v.admin_state='garbage_collecting') DESC,
@@ -384,13 +385,11 @@ fn remote_head_from_row(row: &Row) -> AuthorityTxResult<RemoteHead> {
     let root_hash = row
         .try_get::<_, Option<String>>("head_root_hash")?
         .map(|value| Sha256Digest::new(value).ok_or_else(corrupt_tx))
-        .transpose()
-        ?;
+        .transpose()?;
     let root_object_id = row
         .try_get::<_, Option<String>>("head_root_object_id")?
         .map(|value| AsciiText::new(value).ok_or_else(corrupt_tx))
-        .transpose()
-        ?;
+        .transpose()?;
     let head = RemoteHead {
         generation,
         root_hash,
@@ -477,7 +476,7 @@ fn claim_matches(volume: &VolumeRecord, claim: &SnapshotGcClaim) -> bool {
 }
 
 /// Stable product digest for the exact root set behind one GC permit.
-pub(crate) fn snapshot_gc_roots_digest(
+fn snapshot_gc_roots_digest(
     volume_id: &Id,
     size_bytes: u64,
     current_head: &RemoteHead,
@@ -633,7 +632,10 @@ mod tests {
             &volume_id,
             4 * 1024 * 1024,
             &head(3, '4'),
-            &[first, snapshot("snapshot_22222222222222222222222222222222", 3, '5')],
+            &[
+                first,
+                snapshot("snapshot_22222222222222222222222222222222", 3, '5'),
+            ],
         )
         .unwrap();
         assert_ne!(digest, changed_current);

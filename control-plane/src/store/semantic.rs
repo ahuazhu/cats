@@ -947,6 +947,37 @@ impl Store {
                 return Ok(AdmitCatActionOutcome::InvalidState(aggregate));
             }
 
+            // A Cold -> Running transition must serialize with Control-owned
+            // volume maintenance. Locking every mounted Volume here prevents
+            // a GC claim from being followed by an admitted writer, and makes
+            // a concurrent claim win as Busy instead of failing later inside
+            // noded after the product action was already published.
+            if action == CatAction::Run && aggregate.cat.state == Some(CatState::Cold) {
+                let mut disk_ids = aggregate
+                    .mounts
+                    .iter()
+                    .map(|mount| mount.disk_id.clone())
+                    .collect::<Vec<_>>();
+                disk_ids.sort_unstable();
+                for disk_id in disk_ids {
+                    let available = transaction.query_opt(
+                        "SELECT v.volume_id
+                           FROM persistent_disks p
+                           JOIN volume_records v ON v.volume_id=p.volume_id
+                          WHERE p.disk_id=$1 AND p.status='normal'
+                            AND v.admin_state='active'
+                            AND v.lease_owner IS NULL
+                            AND v.lease_expires_at IS NULL
+                          FOR UPDATE OF v",
+                        &[&disk_id],
+                    )?;
+                    if available.is_none() {
+                        transaction.commit()?;
+                        return Ok(AdmitCatActionOutcome::Busy(aggregate));
+                    }
+                }
+            }
+
             let selected_node_id = match (action, aggregate.cat.state) {
                 (CatAction::Run, Some(CatState::Cold)) => {
                     ACTIVE_PLACEMENT_STRATEGY.select_running_node(&mut transaction, None)?
