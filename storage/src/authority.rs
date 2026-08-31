@@ -7,8 +7,8 @@
 pub use cats_api::runtime_reconciliation::{
     AcquireOrigin, AsciiText, BeginDeleteRequest, BeginDeleteResult, Epoch, FenceEpoch, Generation,
     Id, LastVolumeTransition, NormalAcquireRequest, NormalAcquireResult, RandomId128,
-    ReleaseRequest, ReleaseResult, RemoteHead, Revision, Sha256Digest, UnixMillis,
-    VolumeAdminState, VolumeDurability, VolumeRecord,
+    ReleaseRequest, ReleaseResult, RemoteHead, Revision, Sha256Digest, SnapshotRestoreRequest,
+    SnapshotRestoreResult, UnixMillis, VolumeAdminState, VolumeDurability, VolumeRecord,
 };
 use serde::{Deserialize, Serialize};
 
@@ -205,7 +205,7 @@ pub fn validate_authorized_serving_record(
 /// Sharing this release number lets the adapter reject an unstamped or
 /// incompatible authority shape without importing the product store or
 /// duplicating its schema.
-pub const AUTHORITY_RELEASE_SCHEMA_VERSION: i64 = 19;
+pub const AUTHORITY_RELEASE_SCHEMA_VERSION: i64 = 20;
 
 /// Canonical Node attribution for one currently-owned Volume.
 ///
@@ -275,6 +275,10 @@ pub enum AuthorityError {
     InvalidLeaseDuration,
     #[error("fencing epoch is exhausted")]
     EpochExhausted,
+    #[error("remote generation is exhausted")]
+    GenerationExhausted,
+    #[error("volume durability is not eligible for this transition")]
+    InvalidDurability,
     #[error("volume administration is busy")]
     AdminBusy,
     #[error("remote head does not match")]
@@ -482,6 +486,12 @@ pub fn project_volume_record(record: &VolumeRecord) -> Result<VolumeRecordProjec
             None,
             None,
         ),
+        Some(LastVolumeTransition::SnapshotRestore { request, .. }) => (
+            Some("snapshot_restore"),
+            Some(request.snapshot_id.to_string()),
+            None,
+            None,
+        ),
     };
     Ok(VolumeRecordProjection {
         volume_id: record.volume_id.to_string(),
@@ -581,6 +591,20 @@ pub fn validate_volume_record(record: &VolumeRecord) -> Result<()> {
                     &record.admin_state,
                     VolumeAdminState::Deleting { delete_id } if delete_id == &result.delete_id
                 )
+            {
+                return Err(AuthorityError::BackendUnknown);
+            }
+        }
+        LastVolumeTransition::SnapshotRestore { request, result } => {
+            validate_snapshot_restore_pair(request, result)?;
+            if request.volume_id != record.volume_id
+                || request.expected_size_bytes != record.size_bytes
+                || record.durability != VolumeDurability::Strict
+                || !matches!(record.admin_state, VolumeAdminState::Active)
+                || record.lease_owner.is_some()
+                || record.lease_expires_at.is_some()
+                || record.lease_epoch != result.resulting_epoch
+                || record.head != result.resulting_head
             {
                 return Err(AuthorityError::BackendUnknown);
             }
@@ -825,6 +849,73 @@ pub fn begin_delete(
     Ok((updated, result))
 }
 
+/// Republish one captured snapshot root as a new current generation.
+///
+/// This is a direct storage-authority transition, not a lifecycle Operation.
+/// Its exact predecessor head and unowned epoch identify one occurrence. An
+/// ambiguous caller may replay the complete request while this marker remains
+/// current; after any later transition, the old predecessor fails closed.
+pub fn restore_snapshot(
+    record: &VolumeRecord,
+    request: &SnapshotRestoreRequest,
+) -> Result<(VolumeRecord, SnapshotRestoreResult)> {
+    validate_volume_record(record)?;
+    if let Some(LastVolumeTransition::SnapshotRestore {
+        request: original,
+        result,
+    }) = record.last_transition.as_ref()
+    {
+        if original == request {
+            return Ok((record.clone(), result.clone()));
+        }
+    }
+    if record.volume_id != request.volume_id {
+        return Err(AuthorityError::NotFound);
+    }
+    validate_request_head(&request.expected_head)?;
+    validate_request_head(&request.snapshot_head)?;
+    if !matches!(record.admin_state, VolumeAdminState::Active) {
+        return Err(AuthorityError::AdminBusy);
+    }
+    if record.durability != VolumeDurability::Strict {
+        return Err(AuthorityError::InvalidDurability);
+    }
+    if record.lease_owner.is_some() {
+        return Err(AuthorityError::OtherWriter);
+    }
+    if record.lease_epoch != request.expected_unowned_epoch {
+        return Err(AuthorityError::Fenced);
+    }
+    if record.size_bytes != request.expected_size_bytes || record.head != request.expected_head {
+        return Err(AuthorityError::HeadConflict);
+    }
+
+    let resulting_epoch = next_epoch(record.lease_epoch)?;
+    let resulting_generation = next_generation(record.head.generation)?;
+    let resulting_head = RemoteHead {
+        generation: resulting_generation,
+        root_hash: request.snapshot_head.root_hash.clone(),
+        root_object_id: request.snapshot_head.root_object_id.clone(),
+    };
+    validate_request_head(&resulting_head)?;
+    let result = SnapshotRestoreResult {
+        snapshot_id: request.snapshot_id.clone(),
+        disk_id: request.disk_id.clone(),
+        volume_id: request.volume_id.clone(),
+        resulting_epoch,
+        resulting_head: resulting_head.clone(),
+    };
+    let mut updated = record.clone();
+    updated.head = resulting_head;
+    updated.lease_epoch = resulting_epoch;
+    updated.last_transition = Some(LastVolumeTransition::SnapshotRestore {
+        request: request.clone(),
+        result: result.clone(),
+    });
+    validate_volume_record(&updated)?;
+    Ok((updated, result))
+}
+
 fn validate_normal_acquire_pair(
     request: &NormalAcquireRequest,
     result: &NormalAcquireResult,
@@ -869,6 +960,27 @@ fn validate_begin_delete_pair(
         return Err(AuthorityError::BackendUnknown);
     }
     Ok(())
+}
+
+fn validate_snapshot_restore_pair(
+    request: &SnapshotRestoreRequest,
+    result: &SnapshotRestoreResult,
+) -> Result<()> {
+    validate_stored_head(&request.expected_head)?;
+    validate_stored_head(&request.snapshot_head)?;
+    let resulting_generation = stored_next_generation(request.expected_head.generation)?;
+    if !(1..=MAX_INTEGER).contains(&request.expected_size_bytes)
+        || result.snapshot_id != request.snapshot_id
+        || result.disk_id != request.disk_id
+        || result.volume_id != request.volume_id
+        || result.resulting_epoch != stored_next_epoch(request.expected_unowned_epoch)?
+        || result.resulting_head.generation != resulting_generation
+        || result.resulting_head.root_hash != request.snapshot_head.root_hash
+        || result.resulting_head.root_object_id != request.snapshot_head.root_object_id
+    {
+        return Err(AuthorityError::BackendUnknown);
+    }
+    validate_stored_head(&result.resulting_head)
 }
 
 fn normal_transition_id(last: Option<&LastVolumeTransition>) -> Option<&RandomId128> {
@@ -922,4 +1034,16 @@ fn next_epoch(epoch: FenceEpoch) -> Result<FenceEpoch> {
 
 fn stored_next_epoch(epoch: FenceEpoch) -> Result<FenceEpoch> {
     next_epoch(epoch).map_err(|_| AuthorityError::BackendUnknown)
+}
+
+fn next_generation(generation: Generation) -> Result<Generation> {
+    generation
+        .get()
+        .checked_add(1)
+        .and_then(Generation::new)
+        .ok_or(AuthorityError::GenerationExhausted)
+}
+
+fn stored_next_generation(generation: Generation) -> Result<Generation> {
+    next_generation(generation).map_err(|_| AuthorityError::BackendUnknown)
 }

@@ -744,6 +744,10 @@ pub enum LastVolumeTransition {
         request: BeginDeleteRequest,
         result: BeginDeleteResult,
     },
+    SnapshotRestore {
+        request: SnapshotRestoreRequest,
+        result: SnapshotRestoreResult,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -801,6 +805,34 @@ pub struct BeginDeleteRequest {
 #[serde(deny_unknown_fields)]
 pub struct BeginDeleteResult {
     pub delete_id: Id,
+    pub disk_id: Id,
+    pub volume_id: Id,
+    pub resulting_epoch: FenceEpoch,
+    pub resulting_head: RemoteHead,
+}
+
+/// One exact same-disk snapshot-restore occurrence.
+///
+/// The complete predecessor authority tuple is the occurrence identity. The
+/// Workspace caller supplies only an expected generation; the Control Store
+/// expands it to the locked current head and epoch after joining the exact
+/// snapshot, disk and volume rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotRestoreRequest {
+    pub snapshot_id: Id,
+    pub disk_id: Id,
+    pub volume_id: Id,
+    pub expected_size_bytes: u64,
+    pub expected_unowned_epoch: FenceEpoch,
+    pub expected_head: RemoteHead,
+    pub snapshot_head: RemoteHead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotRestoreResult {
+    pub snapshot_id: Id,
     pub disk_id: Id,
     pub volume_id: Id,
     pub resulting_epoch: FenceEpoch,

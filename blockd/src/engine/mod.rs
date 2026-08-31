@@ -494,7 +494,12 @@ fn map_target_error(error: AuthorityError, volume_id: &str, expected: i64) -> Me
         AuthorityError::BackendUnknown => {
             MetaError::Backend("target volume authority outcome is unknown".into())
         }
-        AuthorityError::StaleTransition | AuthorityError::EpochExhausted => MetaError::Backend(
+        AuthorityError::InvalidDurability => {
+            MetaError::InvalidArgument("volume durability is not eligible".into())
+        }
+        AuthorityError::StaleTransition
+        | AuthorityError::EpochExhausted
+        | AuthorityError::GenerationExhausted => MetaError::Backend(
             "target volume authority rejected an operation outside the data-plane port".into(),
         ),
     }

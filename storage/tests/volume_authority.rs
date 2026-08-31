@@ -73,6 +73,18 @@ fn acquired_volume() -> (VolumeRecord, NormalAcquireRequest, NormalAcquireResult
     (record, request, result)
 }
 
+fn snapshot_restore_request(volume: &VolumeRecord) -> SnapshotRestoreRequest {
+    SnapshotRestoreRequest {
+        snapshot_id: id("snapshot-1"),
+        disk_id: id("disk-1"),
+        volume_id: volume.volume_id.clone(),
+        expected_size_bytes: volume.size_bytes,
+        expected_unowned_epoch: volume.lease_epoch,
+        expected_head: volume.head.clone(),
+        snapshot_head: head(2),
+    }
+}
+
 fn serving_attachment() -> (AuthorizedServingAttachment, VolumeRecord) {
     let (record, request, result) = acquired_volume();
     let attachment = authorized_serving_attachment_from_direct_acquire(DirectAcquireServingInput {
@@ -377,6 +389,180 @@ fn begin_delete_is_exact_and_blocks_all_writer_transitions() {
 }
 
 #[test]
+fn snapshot_restore_republishes_a_captured_root_at_a_new_generation_and_epoch() {
+    let base = unowned_volume();
+    let request = snapshot_restore_request(&base);
+    let (restored, result) = restore_snapshot(&base, &request).unwrap();
+
+    let expected_head = RemoteHead {
+        generation: generation(5),
+        root_hash: request.snapshot_head.root_hash.clone(),
+        root_object_id: request.snapshot_head.root_object_id.clone(),
+    };
+    assert_eq!(result.resulting_head, expected_head);
+    assert_eq!(result.resulting_epoch, fence_epoch(8));
+    assert_eq!(restored.head, expected_head);
+    assert_eq!(restored.lease_epoch, fence_epoch(8));
+    assert!(restored.lease_owner.is_none());
+    assert_eq!(
+        restored.last_transition,
+        Some(LastVolumeTransition::SnapshotRestore {
+            request: request.clone(),
+            result: result.clone(),
+        })
+    );
+
+    let (replayed, replay) = restore_snapshot(&restored, &request).unwrap();
+    assert_eq!(replayed, restored);
+    assert_eq!(replay, result);
+}
+
+#[test]
+fn snapshot_restore_requires_the_exact_unowned_strict_predecessor() {
+    let base = unowned_volume();
+    let request = snapshot_restore_request(&base);
+
+    let mut wrong_size = request.clone();
+    wrong_size.expected_size_bytes += 1;
+    assert_eq!(
+        restore_snapshot(&base, &wrong_size),
+        Err(AuthorityError::HeadConflict)
+    );
+
+    let mut wrong_head = request.clone();
+    wrong_head.expected_head = head(3);
+    assert_eq!(
+        restore_snapshot(&base, &wrong_head),
+        Err(AuthorityError::HeadConflict)
+    );
+
+    let mut wrong_epoch = request.clone();
+    wrong_epoch.expected_unowned_epoch = fence_epoch(6);
+    assert_eq!(
+        restore_snapshot(&base, &wrong_epoch),
+        Err(AuthorityError::Fenced)
+    );
+
+    let (owned, _, _) = acquired_volume();
+    let owned_request = snapshot_restore_request(&owned);
+    assert_eq!(
+        restore_snapshot(&owned, &owned_request),
+        Err(AuthorityError::OtherWriter)
+    );
+
+    let mut relaxed = base.clone();
+    relaxed.durability = VolumeDurability::Relaxed;
+    assert_eq!(
+        restore_snapshot(&relaxed, &request),
+        Err(AuthorityError::InvalidDurability)
+    );
+}
+
+#[test]
+fn snapshot_restore_replay_never_guesses_from_a_matching_root() {
+    let base = unowned_volume();
+    let request = snapshot_restore_request(&base);
+    let (restored, _) = restore_snapshot(&base, &request).unwrap();
+
+    let later_request = SnapshotRestoreRequest {
+        snapshot_id: id("snapshot-2"),
+        expected_unowned_epoch: restored.lease_epoch,
+        expected_head: restored.head.clone(),
+        snapshot_head: head(3),
+        ..request.clone()
+    };
+    let (later, _) = restore_snapshot(&restored, &later_request).unwrap();
+    assert_eq!(
+        restore_snapshot(&later, &request),
+        Err(AuthorityError::Fenced)
+    );
+
+    let mut reused_snapshot = later_request.clone();
+    reused_snapshot.disk_id = id("disk-2");
+    assert_eq!(
+        restore_snapshot(&later, &reused_snapshot),
+        Err(AuthorityError::Fenced)
+    );
+
+    let coincidental_head = VolumeRecord {
+        head: request.snapshot_head.clone(),
+        last_transition: None,
+        ..base
+    };
+    assert_eq!(
+        restore_snapshot(&coincidental_head, &request),
+        Err(AuthorityError::HeadConflict)
+    );
+}
+
+#[test]
+fn the_same_snapshot_can_be_an_explicit_later_occurrence() {
+    let base = unowned_volume();
+    let first_request = snapshot_restore_request(&base);
+    let (first, _) = restore_snapshot(&base, &first_request).unwrap();
+    let second_request = SnapshotRestoreRequest {
+        expected_unowned_epoch: first.lease_epoch,
+        expected_head: first.head.clone(),
+        ..first_request
+    };
+
+    let (second, result) = restore_snapshot(&first, &second_request).unwrap();
+    assert_eq!(second.head.generation, generation(6));
+    assert_eq!(second.lease_epoch, fence_epoch(9));
+    assert_eq!(
+        second.head.root_hash,
+        second_request.snapshot_head.root_hash
+    );
+    assert_eq!(result.resulting_head, second.head);
+}
+
+#[test]
+fn snapshot_restore_fences_the_pre_restore_writer_epoch() {
+    let (owned, _, _) = acquired_volume();
+    let publish = VolumeHeadCasRequest {
+        volume_id: owned.volume_id.clone(),
+        attachment_id: owned.lease_owner.clone().unwrap(),
+        expected_epoch: owned.lease_epoch,
+        expected_size_bytes: owned.size_bytes,
+        expected_head: owned.head.clone(),
+        new_head: head(5),
+    };
+    let release_request = ReleaseRequest {
+        volume_id: owned.volume_id.clone(),
+        transition_id: random_id(2),
+        attachment_id: owned.lease_owner.clone().unwrap(),
+        expected_epoch: owned.lease_epoch,
+    };
+    let (unowned, _) = release(&owned, &release_request).unwrap();
+    let restore_request = snapshot_restore_request(&unowned);
+    let (restored, _) = restore_snapshot(&unowned, &restore_request).unwrap();
+
+    assert_eq!(
+        compare_and_swap_head(&restored, &publish),
+        Err(AuthorityError::Fenced)
+    );
+}
+
+#[test]
+fn snapshot_restore_rejects_generation_and_epoch_overflow() {
+    let mut max_generation = unowned_volume();
+    max_generation.head = head(MAX_INTEGER);
+    let request = snapshot_restore_request(&max_generation);
+    assert_eq!(
+        restore_snapshot(&max_generation, &request),
+        Err(AuthorityError::GenerationExhausted)
+    );
+
+    let mut max_epoch = unowned_volume();
+    max_epoch.lease_epoch = fence_epoch(MAX_INTEGER);
+    let request = snapshot_restore_request(&max_epoch);
+    assert_eq!(
+        restore_snapshot(&max_epoch, &request),
+        Err(AuthorityError::EpochExhausted)
+    );
+}
+
+#[test]
 fn head_cas_binds_owner_epoch_size_and_complete_predecessor() {
     let (owned, _, _) = acquired_volume();
     let request = VolumeHeadCasRequest {
@@ -516,6 +702,18 @@ fn projection_contains_only_direct_transition_coordinates() {
         validate_volume_owner_binding(&wrong, &owned),
         Err(AuthorityError::BackendUnknown)
     );
+
+    let base = unowned_volume();
+    let request = snapshot_restore_request(&base);
+    let (restored, _) = restore_snapshot(&base, &request).unwrap();
+    let projection = project_volume_record(&restored).unwrap();
+    assert_eq!(projection.last_transition_kind, Some("snapshot_restore"));
+    assert_eq!(
+        projection.last_transition_id,
+        Some(request.snapshot_id.to_string())
+    );
+    assert_eq!(projection.transition_placement_epoch, None);
+    assert_eq!(projection.transition_lease_duration_ms, None);
 }
 
 #[test]
