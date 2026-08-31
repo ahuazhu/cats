@@ -91,7 +91,7 @@ blockd adapter只读取当前`volume_id`、不可变`size_bytes`、`admin_state`
 head CAS。它不建权威表，不执行acquire、release、offline recovery、resize、delete或snapshot mutation。
 
 本clean-slate release的Volume Authority持久契约只有一个provider-neutral版本常量
-`AUTHORITY_RELEASE_SCHEMA_VERSION = 19`。Control Store是`control_schema_version`与全部DDL的唯一
+`AUTHORITY_RELEASE_SCHEMA_VERSION = 20`。Control Store是`control_schema_version`与全部DDL的唯一
 owner；release tests要求它与storage adapter使用同一个精确版本。target data-plane
 adapter在任何volume read/renew/CAS前只读校验：`control_schema_version`必须存在singleton
 row且version精确等于该常量，然后再验证本节所需的列projection。未打stamp、row缺失、

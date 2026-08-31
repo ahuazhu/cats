@@ -378,7 +378,7 @@ const CONTROL_TABLES: &[&str] = &[
     "runtime_provisioner_credential_lineage",
 ];
 
-// Version 19 is an empty-database cutover, not an additive migration. A
+// Version 20 is an empty-database cutover, not an additive migration. A
 // manually stamped database that still exposes any former product or Desired
 // authority must fail closed instead of letting old and atomic writers coexist.
 const FORBIDDEN_LEGACY_CONTROL_TABLES: &[&str] = &[
