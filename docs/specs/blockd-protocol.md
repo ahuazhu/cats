@@ -681,17 +681,16 @@ socket，两者服务同一个 engine 与同一个 attachment lease。
 - 永不进入共享 `images/`，也不删除commit record；
 - fenced或任一list/delete错误即停止，后续周期可重试。
 
-该实现只知道当前Root，不读取产品 `disk_snapshot_records`。因此一旦产品snapshot引用已不再是current
-Root的对象，这个sweep会缺少必要live root。当前release没有把product DiskSnapshot root组成到blockd GC
-authority，也没有完成同盘restore；production composition不得把下层current-root sweep描述为完整产品GC，
-更不能在存在未保护snapshot时启用它。
+该实现只知道本进程内存 Map，不读取产品 `disk_snapshot_records`，本地锁也不能排斥另一 Host 或
+attachment。production composition 因此不启动它，也不把它描述为完整产品 GC。
 
-完整产品GC需要新的合同同时冻结：
+产品 GC 由 [ADR-0066](../decisions/0066-product-disk-snapshot-gc-and-same-disk-restore.md) 定义的
+Control-owned maintenance 执行：PostgreSQL `GarbageCollecting` reservation 排斥 writer、Snapshot mutation
+与删除；claim 同时冻结当前 Volume Root 与全部 live DiskSnapshot Root。provider-neutral graph walker
+先完整校验所有 retained Root/Leaf/Base/Delta，再通过 `BlobStore` exclusive cursor 分页构造并执行同卷
+`data/`、`maps/` sweep；任何 live graph 或 LIST 异常都在第一次 DELETE 前 fail closed。
 
-1. 当前Volume Root与全部live DiskSnapshot Root的同一一致性视图；
-2. mark期间阻止新publish/snapshot/delete的串行化authority；
-3. 任一Root/Leaf/object无法读取或校验时零删除；
-4. provider-neutral强一致LIST/delete与response-loss postcondition；
-5. snapshot删除和同盘restore的回归矩阵。
-
-在这些条件组成前，product DiskSnapshot/GC仍是明确开放项。
+`BlobStore::list_after_bounded` 的 `after_key` 是同 prefix 内的 logical key、exclusive continuation；返回
+必须严格排序、数量有界且 key 仍属于 prefix，否则 adapter 返回错误。cursor 只在单次 pass 内使用，
+重启从 prefix 起点重扫。产品 GC 永不进入共享 `images/`，也不删除 commit record；完成前从起点重列并
+确认剩余对象全部 live，再以 exact gc_id/head/roots digest 关闭 reservation。

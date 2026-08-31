@@ -2,8 +2,9 @@
 
 - 状态：当前已实现协议；ADR-0059 已接受，并由
   [ADR-0062](decisions/0062-destroy-preempts-in-progress-cat-actions.md)修正 Destroy 抢占与崩溃恢复；
-  [ADR-0065](decisions/0065-exec-shell-runtime-access-lane.md)增加不进入 CatAction 的 Exec/Shell live access lane
-- 范围：Cat、Node、PersistentDisk 的控制面数据模型、同步接口、状态转换与场景语义幂等
+  [ADR-0065](decisions/0065-exec-shell-runtime-access-lane.md)增加不进入 CatAction 的 Exec/Shell live access lane；
+  [ADR-0066](decisions/0066-product-disk-snapshot-gc-and-same-disk-restore.md)增加产品 DiskSnapshot
+- 范围：Cat、Node、PersistentDisk、DiskSnapshot 的控制面数据模型、同步接口、状态转换与场景语义幂等
 - 切换方式：空数据、单协议直接替换旧 lifecycle 协调；不提供兼容层或数据迁移
 
 ## 1. 设计目标
@@ -20,6 +21,7 @@
 8. Node 正常退出时先迁走 Cat；Node 异常退出后，先撤掉旧实例的流量入口，再从其他 Node 恢复并把唯一入口切到新实例。
 9. Exec/Shell 先认证、按需走普通 run，再由 Node exact-Running-incarnation gate admit；它们不写
    `current_action`，也不复用 lifecycle 的模糊结果重试。
+10. DiskSnapshot 是 Workspace 资源；它只在 Strict、Unowned、Cold 边界捕获或恢复远端磁盘 Root。
 
 本设计优先保证接口简单和常见重试可预测。它不试图处理任意延迟、任意乱序和长期不对称网络下的所有情况。
 
@@ -44,6 +46,7 @@
 
 - 不处理跨越多个后续状态转换后才到达的旧请求。
 - 不支持 PersistentDisk 热挂载、热卸载或扩容。
+- 不支持 hot Snapshot、跨盘 clone、跨 Workspace restore 或 Snapshot schedule。
 - 不支持跨 Node 恢复 Suspended/Warm 的本地内存状态；跨 Node 时先按 Cold 恢复磁盘，再转换到原目标状态。
 - 不在本协议内定义公网 Route、Gateway 或 Endpoint 的详细协议；只要求每个 Cat 最多发布一个当前入口，并且 Control Plane 能撤掉旧目标、发布新目标。
 - 不声明自动云主机隔离、跨 Node live migration 或完整生产 HA 已完成。
@@ -60,16 +63,18 @@
 - `disk_id`
 - `node_id`
 - `workspace_id`
+- `snapshot_id`
 
 Control Plane 调用 `noded` 时只使用内部 ID。slug 不进入 Node 本地目录名、进程名或设备身份。
 
 ### 3.2 用户 slug
 
-Cat 和 PersistentDisk 都有用户指定的 slug：
+Cat、PersistentDisk 和 DiskSnapshot 都有用户指定的 slug：
 
 ```text
 Cat:            (workspace_id, cat_slug)
 PersistentDisk: (workspace_id, disk_slug)
+DiskSnapshot:   (workspace_id, snapshot_slug)
 ```
 
 V1 slug 规则：
@@ -481,6 +486,12 @@ POST /v1/workspaces/{workspace_id}/disks/{disk_slug}/actions/attach
 POST /v1/workspaces/{workspace_id}/disks/{disk_slug}/actions/detach
 POST /v1/workspaces/{workspace_id}/disks/{disk_slug}/actions/destroy
 
+POST /v1/workspaces/{workspace_id}/snapshots
+GET  /v1/workspaces/{workspace_id}/snapshots
+GET  /v1/workspaces/{workspace_id}/snapshots/{snapshot_slug}
+POST /v1/workspaces/{workspace_id}/snapshots/{snapshot_slug}/actions/destroy
+POST /v1/workspaces/{workspace_id}/snapshots/{snapshot_slug}/actions/restore
+
 POST /v1/admin/nodes/{node_id}/actions/drain
 ```
 
@@ -842,7 +853,20 @@ Attach 和 detach 只修改 Cold Cat 的配置与 binding，不启动 Guest。�
 
 ### 12.4 Destroy Disk
 
-Disk 只有未绑定时才能 destroy。删除成功后可以保留 `deleted` 历史行，但该行不再占用 slug；随后可以用相同 slug 创建具有新 `disk_id` 的 Disk。
+Disk 只有未绑定且没有 live Snapshot 时才能 destroy。Snapshot guard 必须与首次产品 delete 事务相同，
+存在 live root 时返回 `snapshot_in_use` 且 Disk 仍保持 normal。删除成功后可以保留 `deleted` 历史行，但
+该行不再占用 slug；随后可以用相同 slug 创建具有新 `disk_id` 的 Disk。
+
+### 12.5 DiskSnapshot
+
+create 接受 `snapshot_slug + disk_slug`。相同 live slug、相同 Disk 返回原 Snapshot；不同 Disk 返回配置
+冲突。Disk 必须已初始化；未绑定时允许，已绑定时 Cat 必须稳定 Cold且无当前动作。Volume 必须
+`Strict + Active + Unowned`，Snapshot identity 与 live root pin 在同一事务写入。
+
+destroy 在同一 admission 下把产品行写成 deleted tombstone、删除 live root并标记 Volume 需要 GC；
+HTTP 请求不递归删除对象。restore 还接受 `expected_generation`，把 captured root发布成当前 generation
+的下一代并推进 lease epoch。所有动作都同步返回，不创建 Operation，也不能与本地
+`WarmRuntimeSnapshot` 混用。
 
 ## 13. Node 注册与心跳
 

@@ -2,10 +2,11 @@
 
 - 状态：Implemented
 - 当前协调协议：[ADR-0059](../decisions/0059-semantic-control-node-synchronous-protocol.md)
-- 存储边界：[ADR-0042](../decisions/0042-volume-authority-and-disk-lifecycle.md)
+- 存储边界：[ADR-0042](../decisions/0042-volume-authority-and-disk-lifecycle.md)、
+  [ADR-0066](../decisions/0066-product-disk-snapshot-gc-and-same-disk-restore.md)
 - 数据面协议：[blockd protocol](blockd-protocol.md)
 
-本文只描述 schema v19 与当前 semantic Control/Node composition。ADR-0056 的 lifecycle
+本文只描述 schema v20 与当前 semantic Control/Node composition。ADR-0056 的 lifecycle
 Operation、command-scoped volume receipt、AgentSession、HostFenceRecovery、takeover authorization
 和 disposable-root authorization 已退出当前协议及代码；Git history 是那些设计的档案。
 
@@ -14,7 +15,7 @@ Operation、command-scoped volume receipt、AgentSession、HostFenceRecovery、t
 `volume_records` 是远端卷 writer 与 root 的唯一 MetadataStore authority。每行至少包含：
 
 - immutable `volume_id`、`size_bytes` 和 durability；
-- `admin_state = active | deleting`；
+- `admin_state = active | garbage_collecting | deleting` 及独立 `gc_required`；
 - 完整 `RemoteHead = (generation, root_hash, root_object_id)`；
 - 可选 `lease_owner`、单调 `lease_epoch` 和 absolute `lease_expires_at`；
 - 最近一次 direct acquire、release 或 begin-delete 的完整 request/result marker；
@@ -27,7 +28,7 @@ Operation、command-scoped volume receipt、AgentSession、HostFenceRecovery、t
    通过远端 root CAS。
 3. expiry lapse 本身不转移 ownership。provider-neutral `normal_acquire` 只接受精确 Unowned epoch，
    不能抢占现有 owner。
-4. schema v19 产品卷只使用 Strict durability；成功 FLUSH 在返回前发布远端 durable root。底层
+4. schema v20 产品卷只使用 Strict durability；成功 FLUSH 在返回前发布远端 durable root。底层
    Relaxed 模式仍可用于独立存储实验，但不是当前 semantic recovery 的产品输入。
 5. head CAS 比较完整 predecessor tuple，不只比较 generation。同 generation 的不同 root 是冲突。
 6. `size_bytes` 在创建后不可变。
@@ -68,10 +69,11 @@ Control Store 是 schema 的唯一 DDL owner。当前相关表为：
 
 - `volume_records`：canonical `VolumeRecord` JSON 与所有可查询 scalar projection；
 - `disk_records`：Root/PersistentDisk 产品身份、角色与初始化状态；
-- `disk_snapshot_records`：已创建的产品 snapshot metadata；
+- `disk_snapshots`：产品 Snapshot identity、当前行与历史 tombstone；
+- `disk_snapshot_records`：仅保存 live Snapshot canonical authority 与 GC root pin；
 - `persistent_disks`、`disk_bindings`：Workspace 产品对象与当前 Cat mount membership。
 
-schema v19 不创建 `host_fence_events`、`volume_authorizations`、`delete_completion_receipts` 或
+schema v20 不创建 `host_fence_events`、`volume_authorizations`、`delete_completion_receipts` 或
 `lifecycle_volume_receipts`；startup catalog gate 把它们当作 retired table 拒绝。
 
 `volume_records` 只接受以下 transition marker：
@@ -81,6 +83,7 @@ schema v19 不创建 `host_fence_events`、`volume_authorizations`、`delete_com
 | none | Active + Unowned 的初始行 |
 | `normal_acquire {request,result}` | Active + exact owner/resulting epoch |
 | `release {request,result}` | Active + Unowned + resulting epoch |
+| `snapshot_restore {request,result}` | Active + Unowned + resulting epoch/head |
 | `begin_delete {request,result}` | Deleting + Unowned + resulting epoch |
 
 每次读取都重新从 canonical JSON 派生 projection 并与 scalar columns 比较。任一漂移返回
@@ -110,7 +113,7 @@ ADR-0059 删除了 caller-supplied `Idempotency-Key` 与独立 Operation row。�
 - 相同当前动作等待或查询同一动作，不同动作返回 busy；
 - Control 在 Node 已完成而数据库尚未更新时退出，恢复者查询 Node 当前事实后闭合产品 row。
 
-因此旧 ADR 中指向本节的 `Idempotency-Key` 说明只具有历史背景；它不是 schema v19 API。
+因此旧 ADR 中指向本节的 `Idempotency-Key` 说明只具有历史背景；它不是 schema v20 API。
 
 ## 4. Lease 接口和状态机
 
@@ -251,14 +254,29 @@ row。
 
 ## 10. DiskSnapshot、GC 与同盘恢复
 
-`disk_snapshot_records` 与 ChunkStore snapshot primitives 已存在，但产品闭环仍不完整：
+DiskSnapshot 是 Workspace 级产品资源；`disk_snapshots` 保存 identity/tombstone，只有
+`disk_snapshot_records` live row 是 retention root。create、destroy、restore 全部要求 PersistentDisk
+正常、storage Disk 已初始化、Volume `Strict + Active + Unowned`；若存在 binding，Cat 必须稳定 Cold、
+无 `current_action` 与 placement。generation-zero 空盘不允许创建 Snapshot。
 
-- product DiskSnapshot root 尚未纳入完整 GC root set；
-- 从 product snapshot 恢复到同一 PersistentDisk 的状态机未完成；
-- 这些能力与本地 WarmRuntimeSnapshot 不同，不能互相替代。
+create 同事务插入产品行和 live root。destroy 同事务写 tombstone、移除 live root并设置
+`gc_required=true`；它不在请求中递归删除对象。live root 存在时 PersistentDisk delete 必须在任何状态
+改变之前返回 `snapshot_in_use`。
 
-在新 ADR、GC protection 与 restore regression 完成前，文档和运维不得宣称 product snapshot 已具备
-生产级恢复语义。
+同盘 restore 比较完整 predecessor head、epoch、Snapshot tuple和 public `expected_generation`。成功把
+captured root 发布为 `current generation + 1`，并把 epoch 推进一代、保持 Unowned；canonical JSON 和
+scalar projection 同事务更新。只有当前 exact `SnapshotRestore` marker 仍匹配时才重放 already-restored；
+marker 已被后续 transition 覆盖时 fail closed。
+
+产品 GC 不是 attached blockd sweep。Control scanner 对 `Active + Unowned + gc_required` 的 Volume 写入
+`GarbageCollecting {gc_id, roots_digest, started_at}` reservation；acquire、publish、Snapshot mutation和
+delete均拒绝该状态。claim 冻结 current head 与按 Snapshot ID 排序的全部 live root。事务外 walker 在
+第一次 DELETE 前完整验证 Root/Leaf/Base/Delta 的 hash、长度、geometry与层数，并通过 exclusive cursor
+有界枚举同卷 `data/`、`maps/`。任一 retained graph 或 LIST 异常保证零删除；永不枚举 `images/` 或删除
+commit records。完成时重新比较 exact gc_id/head/digest/Unowned，再恢复 Active 并清 `gc_required`。
+
+完整算法和不支持项由 [ADR-0066](../decisions/0066-product-disk-snapshot-gc-and-same-disk-restore.md)
+冻结。这些能力与本地 `WarmRuntimeSnapshot` 不同，不能互相替代。
 
 ## 11. Delete
 
