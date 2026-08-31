@@ -1,10 +1,11 @@
 # ADR-0052：默认 Closed build 的有界生产形态 Qualification admission
 
-- 状态：Accepted
+- 状态：部分保留；schema-16 reset/final-open 与 ObjectWrite qualification 已由 ADR-0059/v19 取代
 - 日期：2026-08-14
 - 依赖：[ADR-0038](0038-production-account-qualification-cell-boundary.md)、
   [ADR-0051](0051-production-final-reset-and-open-authority.md)
-- 规格：[Production reset and final-open authority v1](../specs/production-reset-open-authority-v1.md)
+- 历史 reset/final-open runner 已随 ADR-0059 的 v19 单协议切换删除；当前 qualification 分层见
+  [`operations-ha.md`](../operations-ha.md#9-分层-qualification)。
 
 ## 背景
 

@@ -11,11 +11,8 @@ use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 
-use cats_api::agent_registration::{
-    JSON_CONTENT_TYPE, NODE_CREDENTIAL_ID_HEADER, NODE_PUBLIC_KEY_SPKI_HEADER,
-    NODE_SIGNATURE_HEADER,
-};
 use cats_api::error::{ApiError, ErrorCode};
+use cats_api::node_identity::JSON_CONTENT_TYPE;
 use cats_api::production_mutation_admission::{
     decode_production_mutation_admission_command,
     encode_production_mutation_admission_command_receipt,
@@ -53,6 +50,11 @@ use crate::store::AuthorityRequestContext;
 
 const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
 const RESOLUTION_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
+// The retired Node-registration proof envelope must remain fail-closed when it
+// is mixed into either current administrator ingress.
+const RETIRED_NODE_CREDENTIAL_ID_HEADER: &str = "cats-node-credential-id";
+const RETIRED_NODE_PUBLIC_KEY_SPKI_HEADER: &str = "cats-node-public-key-spki";
+const RETIRED_NODE_SIGNATURE_HEADER: &str = "cats-node-signature";
 const GLOBAL_IN_FLIGHT: usize = 32;
 const PRINCIPAL_IN_FLIGHT: usize = 4;
 
@@ -1248,9 +1250,9 @@ enum AuthEnvelope {
 
 fn classify_auth_envelope(headers: &HeaderMap) -> Option<AuthEnvelope> {
     let has_node_header = [
-        NODE_CREDENTIAL_ID_HEADER,
-        NODE_PUBLIC_KEY_SPKI_HEADER,
-        NODE_SIGNATURE_HEADER,
+        RETIRED_NODE_CREDENTIAL_ID_HEADER,
+        RETIRED_NODE_PUBLIC_KEY_SPKI_HEADER,
+        RETIRED_NODE_SIGNATURE_HEADER,
     ]
     .into_iter()
     .any(|name| headers.contains_key(name));
@@ -1313,9 +1315,9 @@ fn classify_auth_envelope(headers: &HeaderMap) -> Option<AuthEnvelope> {
 
 fn classify_production_cutover_signature(headers: &HeaderMap) -> Option<(String, String)> {
     let forbidden = [
-        NODE_CREDENTIAL_ID_HEADER,
-        NODE_PUBLIC_KEY_SPKI_HEADER,
-        NODE_SIGNATURE_HEADER,
+        RETIRED_NODE_CREDENTIAL_ID_HEADER,
+        RETIRED_NODE_PUBLIC_KEY_SPKI_HEADER,
+        RETIRED_NODE_SIGNATURE_HEADER,
         PROVISIONER_CREDENTIAL_ID_HEADER,
         PROVISIONER_SIGNATURE_HEADER,
         header::AUTHORIZATION.as_str(),
@@ -1602,7 +1604,7 @@ mod tests {
     use cats_metering::SqliteUsageStore;
     use ring::signature::Ed25519KeyPair;
 
-    const UPDATE: &[u8] = br#"{"apply_id":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","mutation":{"expected_policy_revision":1,"kind":"update_policy","placement_policy":{"allocatable_memory_bytes":17179869184,"allocatable_vcpus":8,"capabilities":{"block_frontend":"kernel_nbd","guest_agent_protocol_version":1,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","guest_network":"isolated_ipv4","guest_transport":"vsock","vmm":"cloud_hypervisor"},"guest_ipv4_pool":{"kind":"private_ipv4_16","network_address":"10.240.0.0","prefix_length":16},"node_id":"node_a","node_transport_target":"https://node-a.internal:7301","policy_revision":2,"scheduling_state":"schedulable","version":1}},"node_id":"node_a","version":1}"#;
+    const UPDATE: &[u8] = br#"{"apply_id":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","mutation":{"expected_policy_revision":1,"kind":"update_policy","placement_policy":{"allocatable_memory_bytes":17179869184,"allocatable_vcpus":8,"capabilities":{"block_frontend":"kernel_nbd","guest_agent_protocol_version":1,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","guest_network":"isolated_ipv4","guest_transport":"vsock","vmm":"cloud_hypervisor"},"guest_ipv4_pool":{"kind":"private_ipv4_16","network_address":"10.240.0.0","prefix_length":16},"node_id":"node_a","policy_revision":2,"scheduling_state":"schedulable","version":1}},"node_id":"node_a","version":1}"#;
     const TEST_SEED: [u8; 32] = [
         0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
         0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,

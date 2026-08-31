@@ -3,7 +3,7 @@
 - 状态：Implemented operations contract；首次 clean-slate cutover only
 - Authority：[ADR-0043](../decisions/0043-provisioner-owned-runtime-placement-policy.md)
 - A23 wire：[Runtime Placement Policy v1](runtime-placement-policy-v1.md)
-- Host artifact：[Runtime Composition Artifacts v1](runtime-composition-artifacts-v1.md)
+- Host artifact：本规格 §2–§3 的固定 NodeIdentity transaction
 
 本文冻结首次生产 cutover 使用的确定性工具边界。它不增加第三种 A23 principal、第二个签名实现、
 第二份 NodeIdentity wire 或 direct-SQL bootstrap。所有 Control mutation 仍只由官方
@@ -119,8 +119,8 @@ parent fsync；已存在只接受exact bytes+metadata，因此任一 crash重跑
 
 三件套重新走共享 Node runtime validator后，descriptor-relative创建并保护
 `/var/lib/cats/node/<state_path_id>`；Control success、active files与state path全部 exact后才逐file/directory fsync
-删除initial recovery set。Node service启动不属于 activator；后续 worker transaction仍须在 cordoned 状态启动、
-注册并提交 complete empty inventory。
+删除initial recovery set。Node service启动不属于 activator；后续 worker transaction仍须先按当前语义协议注册，
+再由 Control 的 Node 状态决定是否接受 placement。A23 policy 不建立 inventory 或 lifecycle session。
 
 ## 4. Acceptance
 

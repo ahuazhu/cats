@@ -6,41 +6,45 @@ This repository contains a complete Rust V1 development system plus experiments 
 code. Implemented and tested areas include `cats-blockd`, kernel-NBD and native vhost-user-blk,
 delta packs, golden roots, provider-neutral storage ports, S3/PostgreSQL adapters, a
 PostgreSQL-backed Workspace control plane, user/admin consoles, optional WorkOS sessions, CLI,
-Gateway, FakeVmm and Cloud Hypervisor Node paths, vsock Guest Agent, systemd Guest PID 1, usage
-metering, crash injection, fencing, authorization, drain and cross-node Cold restore.
+FakeVmm and Cloud Hypervisor Node paths, vsock Guest Agent, systemd Guest PID 1, usage metering,
+crash injection, drain and cross-node Cold restore.
 
 Do not confuse that with completed production HA. The clean-slate runtime lifecycle authority is
-the atomic command model accepted by ADR-0056:
+the synchronous semantic model accepted by ADR-0059 and amended by ADR-0062:
 
 ```text
-PostgreSQL one-unresolved-per-Cat Lifecycle Operation
-  <-> Node signed command poll and exact terminal result commit
-  -> one bounded, fsync'd per-Cat command journal
-  -> Node-owned physical effects, discovery and strong Stop
+PostgreSQL current Cat row + current_action
+  -> transaction commits before bounded Control -> noded RPC
+  -> noded serializes physical effects per cat_id and returns actual state
+  -> Control settles the exact current action
 
-Runtime inventory -> observation-only telemetry/attestation
-Route Operation   -> independent per-Endpoint lane sharing the local AdmissionCell
+heartbeat / logs / metrics -> liveness and diagnostics only
+current ingress target     -> withdraw before transition, publish after Ready
 ```
 
-The release is one coherent clean-slate vertical cutover across schema, Control, Node effects, disk
-binding, inventory, Operation settlement and Route admission, following
-[`docs/operations-ha.md` §8](docs/operations-ha.md#8-首次终态部署). It has one empty v18 target
-schema and one protocol version; old Desired/reconcile, NodeJob, observation-settlement and
-compatibility paths leave service before it starts. PostgreSQL Operation rows are the sole lifecycle
-intent/result authority, the Node command journal is the sole restart authority for physical effects,
-Volume Authority receipts close disk transitions, and inventory remains observation-only.
+The release is one coherent clean-slate vertical cutover across schema, Control, noded effects, disk
+binding, Node reset and ingress ordering, following
+[`docs/operations-ha.md` §10](docs/operations-ha.md#10-首次单协议部署). It has one empty v19 target
+schema and one protocol version. Desired/reconcile, NodeJob, lifecycle Operation, command
+poll/result, per-Cat command journal, AgentSession and observation-settlement paths leave service
+before it starts. PostgreSQL current resource rows are the sole product intent/result authority;
+noded owns actual per-Cat effects and queryable runtime state. Volume owner/epoch/root CAS remains
+the independent disk writer authority.
 
 The cutover must retain characterization and regression coverage for these failure modes:
 
-- ambiguous AttachDisk completion can leave a physical mount after the control binding rolls back;
-- stale commands or observations can act on or settle a newer runtime unless exact command identity
-  and terminal-result binding are enforced;
-- ordinary acquire must not replace an expired owner that may still hold unique Relaxed `R < L`
-  data; takeover requires its separate exact fenced authority;
-- an Agent crash between a physical effect and ledger write can orphan a runtime or local journal;
-- same-node dual Agents have no Host-global lock or PostgreSQL AgentSession fence;
-- Route Grants require an independent Node installed/closed admission gate bound to the current
-  lifecycle source, runtime incarnation, Endpoint epoch and AgentSession;
+- a noded action may complete after the Control caller times out or exits; recovery must query the
+  action's exact target Node before settling the current row;
+- a superseded action may return after Destroy has claimed the Cat; exact action occurrence and Node
+  matching must reject that late settlement;
+- ambiguous attach or detach effects must be discovered rather than blindly rolled back or repeated;
+- the provider-neutral normal acquire must not replace an expired owner; the current semantic
+  product composes only Strict remote durability and advances an offline owner's epoch under the
+  locked PostgreSQL row without claiming trusted Host fencing;
+- cancellation or caller loss must not cancel a noded-owned action before its terminal physical
+  result is recorded;
+- an offline Node can briefly dual-run with its replacement; ingress withdraw/publish ordering and
+  reset-on-return must converge it without being described as Host fencing or strict physical RWO;
 - PersistentDisk attach must bind filesystem UUID/format authority and an exact Guest
   mount-readiness result;
 - the control Store serializes synchronous PostgreSQL work and can block async request workers;
@@ -58,18 +62,17 @@ Read in this order before a cross-component change:
 1. [`docs/architecture.md`](docs/architecture.md)
 2. [`docs/README.md`](docs/README.md) for current versus target status
 3. Accepted task-relevant ADRs, especially:
-   - lifecycle: ADR-0002 and ADR-0056; ADR-0040 is retained only for the Host/Agent/inventory
-     boundaries that ADR-0056 explicitly preserves
-   - route/admission: ADR-0041 as amended by ADR-0056
-   - storage: ADR-0003, 0005, 0015, 0016, 0017, 0021, 0022, 0025 and 0042
+   - lifecycle: ADR-0002 and ADR-0059, plus the ADR-0062 Destroy preemption amendment
+   - ADR-0040, ADR-0041 and ADR-0056 only when historical context or a retained lower-layer storage
+     boundary is directly relevant; their lifecycle/AgentSession/Route coordination is superseded
+   - storage: ADR-0003, 0005, 0015, 0016, 0017, 0021, 0022 and 0042; ADR-0025 is
+     historical because current Strict direct delete has no disposable local-tail authorization
    - ownership/HA: ADR-0018, 0031, 0032, 0034 and 0038
 4. Task-specific contract:
+   - [`docs/control-node-semantic-protocol.md`](docs/control-node-semantic-protocol.md)
    - [`docs/runtime-lifecycle.md`](docs/runtime-lifecycle.md)
    - [`docs/storage.md`](docs/storage.md)
    - [`docs/operations-ha.md`](docs/operations-ha.md)
-   - [`docs/specs/atomic-runtime-lifecycle-v1.md`](docs/specs/atomic-runtime-lifecycle-v1.md)
-   - [`docs/specs/runtime-inventory-observation-v1.md`](docs/specs/runtime-inventory-observation-v1.md)
-   - [`docs/specs/route-grant-v2.md`](docs/specs/route-grant-v2.md)
    - [`docs/specs/volume-authority.md`](docs/specs/volume-authority.md)
    - [`docs/specs/blockd-protocol.md`](docs/specs/blockd-protocol.md)
 5. Experiment reports and raw evidence only when a measured claim matters.
@@ -97,9 +100,9 @@ measurement boundary and correctness oracle when citing a number.
 - A PersistentDisk is RWO in V1. Exactly one attachment epoch may publish writes; old epochs fail
   closed even when an old Host returns.
 - Strict successful FLUSH is remotely durable and must survive permanent Host loss.
-- Relaxed successful FLUSH may advance local `L` while remote `R < L`. Pending packs in that window
-  are unique data, not deletable cache. Local NVMe is fully disposable only when every retained
-  volume has `R == L`.
+- The storage engine still defines Relaxed `R < L`, and pending packs in that window are unique data,
+  not deletable cache. The ADR-0059 lifecycle may only compose a mode where successful FLUSH is
+  remotely durable; it must not create new Node-local-only success states.
 - Warm, Cold, Snapshot, detach and planned migration require retained volumes at `R == L`.
 - Do not upload an entire sparse virtual disk to commit a small dirty set. Current commits publish
   dirty 64 KiB pages as deltas, bounded to four delta layers before a fresh base.
@@ -107,27 +110,24 @@ measurement boundary and correctness oracle when citing a number.
   Warm retains a local snapshot and exits the VMM. Both are Host-bound and must not be merged.
 - Suspended resume or Warm restore failure protects unique local data first, then converges to a
   provable Cold fallback.
-- A heartbeat timeout is suspicion, not fencing. Planned handoff requires exact release followed by
-  normal acquire; unplanned cross-Node recovery requires a trusted external HostFenceEvent and an
-  exact per-volume takeover authorization.
-- An ordinary lifecycle command never steals or revokes another writer. Only an exact
-  HostFenceRecovery predecessor with trusted fencing and per-volume takeover authorization may
-  replace it.
+- A heartbeat timeout is suspicion, not fencing. The current offline/reset protocol deliberately
+  accepts a bounded dual-run window and must not claim strict physical single-instance or single-writer
+  behavior during it. A trusted external Host fence remains the only proof of Host isolation.
+- The provider-neutral normal acquire never steals or revokes another writer. The semantic offline
+  recovery adapter may advance the locked offline owner's epoch because product FLUSH is Strict;
+  Node reset or ingress withdrawal still is not proof that the old Host stopped.
 - A normal acquire only accepts the exact unowned epoch; retrying the same transition returns its
-  original grant. Volume capacity is immutable in the first terminal release.
-- Leaving Running closes local route admission and drains active guards before touching Guest, VMM,
-  blockd or attachments.
-- Route Grants bind runtime incarnation and one per-Endpoint serving epoch, not a lifecycle
-  revision. An actual or ambiguous gate close burns that Endpoint epoch; reopening requires a new
-  exact Route Enable bound to the current effective RuntimeReady and AgentSession. Unchanged
-  Endpoints do not churn when another Endpoint changes.
-- RootDisk follows the Cat. PersistentDisk is independent. Only explicitly disposable Root destroy
-  may discard a local tail, and only after an exact authorization CAS changes the current Owned
-  volume to Deleting and fences its epoch. Unknown disks and PersistentDisk discard fail closed.
-- Missing/corrupt command journals or incomplete inventory produce a typed failure or quarantine,
-  never guessed Cold and never blind directory deletion.
-- A full inventory establishes a session-bound admission attestation. Partial heartbeats may update
-  Cat observations but cannot replace that attestation or manufacture a complete scan.
+  original grant. PersistentDisk capacity is immutable after create.
+- Leaving Running withdraws the current ingress target before touching Guest, VMM, blockd or
+  attachments. A new target is published only after noded reports the Guest and all declared mounts
+  Ready.
+- RootDisk follows the Cat. PersistentDisk is independent. Current product delete first stops
+  blockd, releases the exact owner/epoch, and changes only an Unowned volume to Deleting. It has no
+  disposable local-tail authorization; unknown or still-Owned disks fail closed.
+- Missing, corrupt or ambiguously owned local state produces a typed failure, never guessed Cold and
+  never blind directory deletion.
+- Heartbeat, logs, metrics and partial runtime observations cannot settle a product action. Recovery
+  reads the exact current action and queries its target noded runtime state.
 - Guest optional runtime capabilities use HTTP/1.1 on `/run/cats/runtime.sock`; they require no Cats
   SDK/CLI or fixed TCP/UDP port. The VMM never opens this Guest-local socket.
 - Do not hard-code cloud account IDs, buckets, instances, credentials or Host paths.

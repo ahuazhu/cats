@@ -42,96 +42,42 @@ sudo CATS_GUEST_RUNTIME_RELEASE_DIR=/path/to/guest-runtime-release.v1 \
 sudoedit /etc/cats/cats.env
 ```
 
-Set `CATS_ROUTE_V2_ROTATION_ORIGIN` to the canonical HTTPS origin of the
-Control rotation listener before starting the Node. The listener hostname
-must match its installed server certificate; the sample uses
-`https://control.internal.example:7444`.
-
 `install.sh` requires the provisioner-owned `/etc/cats/identity` set and
 `CATS_GUEST_RUNTIME_RELEASE_DIR=.../guest-runtime-release.v1`, installs build/runtime dependencies,
 builds release binaries, installs the pinned Cloud Hypervisor and the shared Guest release,
 and installs the systemd units. It configures the kernel NBD pool for the
 default path; vhost-user does not consume `/dev/nbdN`.
 
-The runtime-reconciliation release carries the same exact
-`guest-runtime-profile.v1.json` bytes in the Control and Node artifacts and install them at
-`/opt/cats/release/guest-runtime-profile.v1.json` together with the pinned Guest kernel and optional initramfs.
-Production Control and Node systemd `ExecStart` both pass
-`--guest-runtime-profile-receipt-file /opt/cats/release/guest-runtime-profile.v1.json`; there is no Host rebuild,
-missing-file or fixture fallback. The full fail-closed contract is
-[Agent Registration and Internal Transport v1](../../docs/specs/agent-registration-transport-v1.md), and the
-single-build payload/manifest plus root-provisioned local Node identity are frozen by
-[Runtime Composition Artifacts v1](../../docs/specs/runtime-composition-artifacts-v1.md). `cats-noded` does
-not derive registration identity from the development `CATS_NODE_ID`, hostname, address or Host kernel.
-Control additionally requires the provisioner-owned root:root 0644 regular file
-`/etc/cats/identity/runtime-provisioner-trust.v1.json` through the exact
-`--runtime-provisioner-trust-file` argument. The unit's 35-second stop timeout
-leaves the fixed 30-second A23 commit-resolution join window intact.
+One release build carries the same exact `guest-runtime-profile.v1.json` bytes
+in the Control and Node artifacts and installs them at
+`/opt/cats/release/guest-runtime-profile.v1.json` with the pinned Guest kernel
+and optional initramfs. Production Control and Node both pass that exact file;
+there is no Host rebuild or missing-file fallback. NodeIdentity provisioning is
+defined by the [A23 tooling contract](../../docs/specs/a23-production-provisioner-tooling-v1.md),
+while Cat/Disk/Node registration and heartbeat use the
+[current semantic protocol](../../docs/control-node-semantic-protocol.md).
 
-Each initial cordoned A23 policy also carries the operator-reviewed canonical
-`node_transport_target` (`https://<lowercase-dns-name>:7444` for the production Route v2 machine listener). The deployment provisioner/admin owns
-that value; `cats-noded`, its observation, source address and legacy `nodes.agent_url` cannot publish or override it.
-Rotate the target only through a successor policy while the Node is cordoned and has no assigned Desired runtimes.
-The matching Control rollout requires exact clean-slate Store authority schema version 15; every earlier version is
-rejected rather than altered in place, so create or recreate the empty version-15 schema before any new Control
-replica starts.
+The installer holds `/run/lock/cats/worker-deployment.lock` from Node stop
+through installed mutations, semantic registration readiness and Guest release
+commit. An interrupted transaction restores the previous Guest set, leaves the
+Node stopped and retains its activation journal; rerun the complete installer
+to finish or recover the transaction.
 
-The installer holds one `/run/lock/cats/worker-deployment.lock` descriptor from Node stop through every installed
-mutation, candidate registration-backed readiness and Guest release commit. An interrupted transaction restores
-the exact previous Guest set but deliberately leaves the Node stopped and its journal retained; rerun the full
-installer to replace every outer artifact and commit. The systemd startup gate does not treat a merely busy lock as
-authorization.
-
-The signed cutover contains the A19 registration and A20 signed Desired/observation HTTP routes.
-It renews the exact current `AgentSession` only when a new-sequence observation
-is accepted; exact replay does not renew. Node-loss liveness reads that signed
-state, and `/v1/nodes/heartbeat` is absent from the production route map, so
-service/admin bearer calls get 404 with zero writes.
-
-This is still not a standalone deployable release: the former zero runtime effect
-placeholder is gone, but the combined production-PG-to-physical and Linux/metal
-qualification is still open. The production Node composes the installed
-eleven-source clean-slate scanner, the signed per-Cat reconciler and one shared
-route-admission registry. Local readiness stays closed with HTTP 503 until a
-complete inventory has been accepted for the current AgentSession; incomplete
-or conflicting evidence is never promoted to a complete observation. Do not
-restore either the shared-bearer heartbeat or
-the legacy NodeJob listener as a transition mechanism. Route v2 machine ingress,
-adjacent ring delivery and the Route command runner are mandatory composition:
-the daemon refuses to start before lifecycle/inventory work when the fixed
-signing ring, mTLS artifacts, listener or HTTPS rotation origin is missing.
-The exact current
-evidence endpoint is recorded in
-[`architecture-cross-review.md`](../../docs/architecture-cross-review.md#当前跨组件证据边界).
-
-仅限首次安装、尚未创建任何 Cat 的空节点，配置后可以直接启动或重启服务。
+After editing `/etc/cats/cats.env`, a clean Node can start the semantic service:
 
 ```bash
 sudo systemctl restart cats-noded
 ```
 
-The retired `cats admin node drain` path is not a fallback for an existing
-Node. For any later install, first apply a reviewed A23 cordon and prove that
-the Node has no assigned Desired runtimes or physical residue. The current
-Running-only completion claim does not supply an in-place lifecycle drain; if
-the Node is not already empty, stop and use a separately qualified migration
-or replacement procedure.
+For an existing Node, use the current level-triggered planned drain before an
+agent or Guest release. The drain cordons the source, moves each Cat through a
+Cold-based migration and verifies the Node has no Cat or orphan residue before
+the deployment transaction mutates Host state.
 
-The signed cutover launches VMM and blockd processes as PID-1-owned sibling
-transient services in `system.slice`, not as processes in the `cats-noded`
-service cgroup. The Agent units therefore explicitly retain
-`KillMode=control-group`: a hard Agent stop reaps any Agent-cgroup helpers,
-while the independently owned per-Cat services remain available for Host-lock,
-checkpoint and complete-inventory adoption. Every per-Cat unit independently
-uses `KillMode=control-group`, so an exact lifecycle stop reaps that Cat's
-whole process group rather than leaving a helper behind. This systemd topology
-only preserves the physical candidate; adoption still requires the exact
-checkpoint, grant/epoch/attachment lineage and provider-private process proof.
-
-No current clean SHA has yet passed the combined systemd 255 + KVM/Cloud
-Hypervisor qualification. Until it does, this runbook keeps the conservative
-empty-Node rule; `KillMode` alone is not evidence that a particular release
-safely preserves or adopts a runtime or its pending data.
+Cloud Hypervisor and blockd are direct children of `cats-noded` in its systemd
+cgroup. `KillMode=control-group` makes a Node reset or controlled stop reap the
+complete local process tree; the current protocol deliberately does not adopt
+retired registration, checkpoint or command-journal authority after restart.
 
 ## Cluster configuration
 
@@ -156,29 +102,11 @@ RootDisk expands online at first boot; provision at least 1 GiB for normal use.
 
 ## Verification boundary
 
-`deploy/metal/e2e.sh` is the historical ADR-0002/V1 lifecycle harness. It drove
-legacy create/exec/Suspend/Warm/Cold/destroy APIs and produced the retained
-physical evidence below. The production clean-slate route map deliberately
-does not expose those legacy APIs, so running this script from the current
-branch is not a qualification for schema 15 or the signed Runtime cutover.
-
-The historical harness checked create, Guest/systemd readiness, networking,
-durable writes, Suspend/Resume, Warm snapshot/restore, Cold boot and destroy
-using physical Guest boot identities. Raw environment-specific evidence is
-retained under
-[`metal-e2e-20260721`](../../experiments/metal-e2e-20260721/README.md),
-[`vhost-user-blk-frontend-20260726`](../../experiments/vhost-user-blk-frontend-20260726/README.md),
-and [`metal-cluster-20260726`](../../experiments/metal-cluster-20260726/README.md).
-Those runs are correctness evidence only for their recorded revisions and
-oracles, not for the current clean SHA and not an SLA.
-
-The current release gate still needs a production-public-spawn,
-PostgreSQL-backed test that continues beyond the recording
-`RefreshInventory` seam through the installed scanner and
-`SignedRunningEffect`, followed by Linux/systemd/KVM runs for both applicable
-block paths with immutable exact-SHA receipts. Until those runs are green, the
-full lifecycle, superseded pre-acquire publication and physical release remain
-explicitly unqualified.
+`deploy/metal/e2e.sh` exercises the current synchronous Cat/Disk API: semantic
+replay, PersistentDisk binding and mount readiness, Running/Suspended/Warm/Cold,
+Cold-only binding changes, destroy/delete and slug reuse. Its result qualifies
+only the exact repository revision, Host environment and adapters recorded by
+the run; it is not an SLA or a substitute for `quality.sh full`/Linux gates.
 
 The mount-propagation fixture is isolated acceptance work, not a production
 deployment step:
@@ -193,16 +121,13 @@ sudo deploy/metal/mount-propagation-e2e.sh
   change.
 - Rebuilding a golden image does not rebase existing RootDisks. Migrate or
   rebuild those Cats explicitly.
-- The target contract requires Cloud Hypervisor disk changes to use a
-  stopped/Cold transition rather than online hot-plug; that signed lifecycle
-  path is not part of the current completion claim.
+- Cloud Hypervisor disk changes use a stopped/Cold transition rather than
+  online hot-plug.
 - The Node agent currently runs with Host privileges needed by KVM, networking,
   and kernel NBD; privilege separation remains unimplemented.
-- The ADR-0040/0041 production spine and current-Desired Running path are
-  implemented. Cross-Node overlay, external Host-fence qualification,
-  superseded publication, the remaining lifecycle transitions and the combined
-  physical public-spawn E2E remain open. Current HTTP/WebSocket bridges do not
-  prove their production Cloud Hypervisor boundary.
+- Cross-Node Guest overlay, automatic external Host fencing and privilege
+  separation remain separate work. Current HTTP/WebSocket bridges do not by
+  themselves prove their production Cloud Hypervisor boundary.
 
 Decommission a Terraform-owned Host through its exact state and reviewed plan.
 For a disposable manually created acceptance Host, first preserve required

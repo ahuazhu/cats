@@ -40,7 +40,6 @@ def arguments(root: Path, output: Path) -> argparse.Namespace:
         credential_refresher_image=(
             "123456789012.dkr.ecr.us-east-1.amazonaws.com/cats/refresher:exact"
         ),
-        gateway_image="123456789012.dkr.ecr.us-east-1.amazonaws.com/cats/gateway:exact",
         timeout_seconds=10_800,
         poll_interval_seconds=1,
     )
@@ -75,7 +74,7 @@ def main() -> int:
         package.validate_arguments(valid)
 
         duplicate = arguments(repository, scratch / "duplicate-output")
-        duplicate.gateway_image = duplicate.control_image
+        duplicate.credential_refresher_image = duplicate.control_image
         try:
             package.validate_arguments(duplicate)
         except package.PackagingError as error:
@@ -96,7 +95,6 @@ def main() -> int:
             "cats-publish-content-addressed artifacts",
             valid.control_image,
             valid.credential_refresher_image,
-            valid.gateway_image,
             "jq -cnS",
         ):
             assert required in command, f"remote package command lost {required!r}"

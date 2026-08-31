@@ -1,10 +1,10 @@
 # ADR-0053：Product admission Open 是 public-open 的最后一个外部 effect
 
-- 状态：Accepted
+- 状态：Superseded by ADR-0059；历史背景保留
 - 日期：2026-08-14
 - 修正：[ADR-0051](0051-production-final-reset-and-open-authority.md)
 - 依赖：[ADR-0052](0052-bounded-production-qualification-admission.md)
-- 规格：[Production reset and final-open authority v1](../specs/production-reset-open-authority-v1.md)
+- 历史 final-open runner 已随 ADR-0059 的 v19 单协议切换删除；本 ADR 只保留决策背景。
 
 ## 背景
 

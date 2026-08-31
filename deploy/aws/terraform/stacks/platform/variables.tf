@@ -103,12 +103,6 @@ variable "cluster_admin_principal_arns" {
   default     = []
 }
 
-variable "efs_csi_addon_version" {
-  type        = string
-  description = "Pinned aws-efs-csi-driver EKS add-on version; null selects the cluster default."
-  default     = null
-}
-
 # Database ------------------------------------------------------------------
 
 variable "database_engine_version" {
@@ -305,7 +299,7 @@ variable "chunkstore_bucket_name" {
 }
 
 variable "chunkstore_prefix" {
-  description = "Exact production object-key prefix mediated by the ObjectWrite Gateway."
+  description = "Exact production object-key prefix used by the current workers."
   type        = string
 
   validation {
@@ -331,28 +325,6 @@ variable "metal_worker_ssh_from_instance_connect" {
   description = "Allow sshd on the worker from an EC2 Instance Connect Endpoint in the same security group. The endpoint itself is created outside this stack."
   type        = bool
   default     = true
-}
-
-variable "host_fence_provider_namespace" {
-  description = "Kubernetes namespace containing the AWS HostFence provider."
-  type        = string
-  default     = "cats"
-
-  validation {
-    condition     = can(regex("^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$", var.host_fence_provider_namespace))
-    error_message = "host_fence_provider_namespace must be a DNS-label Kubernetes namespace."
-  }
-}
-
-variable "host_fence_provider_service_account" {
-  description = "Dedicated Kubernetes ServiceAccount allowed to stop only Cats workers and quarantine only their primary ENIs."
-  type        = string
-  default     = "cats-host-fence-provider"
-
-  validation {
-    condition     = can(regex("^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$", var.host_fence_provider_service_account))
-    error_message = "host_fence_provider_service_account must be a DNS-label Kubernetes ServiceAccount name."
-  }
 }
 
 variable "metal_workers" {

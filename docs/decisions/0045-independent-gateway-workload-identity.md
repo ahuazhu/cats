@@ -1,10 +1,11 @@
 # ADR-0045：Route v2 使用独立 Gateway workload identity authority
 
-- 状态：Accepted
+- 状态：Superseded for current production composition by
+  [ADR-0059](0059-semantic-control-node-synchronous-protocol.md)
 - 日期：2026-08-10
 - 关联：[ADR-0041](0041-node-verified-route-admission.md)、
   [ADR-0044](0044-independent-route-v2-signing-authority.md)
-- 规格：[Gateway Workload Identity Authority v1](../specs/gateway-workload-identity-v1.md)
+- 历史协议实现由 Git history 保存
 
 ## 背景
 

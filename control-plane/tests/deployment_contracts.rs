@@ -102,113 +102,6 @@ fn production_metal_fleet_keeps_stable_addresses_and_one_explicit_root_cutover()
 }
 
 #[test]
-fn production_cutover_runbook_orders_gates_and_fences_destructive_commands() {
-    let runbook = read_workspace_file("docs/production-cutover-runbook.md");
-    let ordered_stages = [
-        "<!-- cutover-stage: 00-current-blocker -->",
-        "<!-- cutover-stage: 10-maintenance-ingress-closed -->",
-        "<!-- cutover-stage: 20-fresh-targets -->",
-        "<!-- cutover-stage: 30-exact-release-credentials -->",
-        "<!-- cutover-stage: 40-cordoned-nodes -->",
-        "<!-- cutover-stage: 50-e12-empty-fleet -->",
-        "<!-- cutover-stage: 60-e3-runtime-path -->",
-        "<!-- cutover-stage: 70-final-gates -->",
-        "<!-- cutover-stage: 80-reset-read-only -->",
-        "<!-- cutover-stage: 90-reset-execute-forward-only -->",
-        "<!-- cutover-stage: 100-uncordon-open -->",
-    ];
-    let mut prior = 0;
-    for stage in ordered_stages {
-        assert_eq!(
-            runbook.matches(stage).count(),
-            1,
-            "cutover stage marker must be unique: {stage}"
-        );
-        let position = runbook.find(stage).expect("cutover stage marker");
-        assert!(position >= prior, "cutover stage is out of order: {stage}");
-        prior = position + stage.len();
-    }
-
-    for forbidden in [
-        "rm -rf",
-        "aws s3 rm",
-        "kubectl delete namespace",
-        "DROP DATABASE",
-        "DROP SCHEMA",
-        "terraform destroy",
-    ] {
-        assert!(
-            !runbook.contains(forbidden),
-            "runbook regained a broad destructive command: {forbidden}"
-        );
-    }
-
-    let blocker = runbook
-        .find("Current verdict: HOLD before destructive reset and public opening")
-        .expect("top-level reset blocker");
-    let boundary = runbook
-        .find("<!-- forward-only-boundary: immutable-reset-started -->")
-        .expect("forward-only boundary");
-    let opening = runbook
-        .find("<!-- cutover-stage: 100-uncordon-open -->")
-        .expect("opening stage");
-    assert!(blocker < boundary && boundary < opening);
-    assert!(runbook[..boundary].contains("dry-run only"));
-    assert!(runbook[boundary..opening].contains("there is no rollback/cancel path"));
-    assert!(runbook[opening..].contains("DEFERRED(CROSS_COMPONENT_MUTATION_ADMISSION_OPEN)"));
-}
-
-#[test]
-fn production_cutover_native_full_log_is_frozen_before_exact_job_publication() {
-    let runbook = read_workspace_file("docs/production-cutover-runbook.md");
-    assert!(
-        !runbook.contains("/srv/cats-build/jobs/"),
-        "the qualification runner stores immutable job outputs below /srv/cats-build/target"
-    );
-
-    let phase_zero = runbook
-        .split_once("## 0. Freeze and qualify the exact release before the window")
-        .and_then(|(_, remainder)| {
-            remainder.split_once("<!-- cutover-stage: 10-maintenance-ingress-closed -->")
-        })
-        .map(|(section, _)| section)
-        .expect("Stage A phase 0 release qualification section");
-    let final_gates = runbook
-        .split_once("## 8. Recheck final full and Linux gates")
-        .and_then(|(_, remainder)| remainder.split_once("## Stage B"))
-        .map(|(section, _)| section)
-        .expect("Stage A final gates section");
-
-    for (section, job_id) in [
-        (phase_zero, "<QUALIFICATION_JOB_ID>"),
-        (final_gates, "<FINAL_QUALIFICATION_JOB_ID>"),
-    ] {
-        let run = section.find("cats-run-build").expect("native full runner");
-        let pipefail = section[run..]
-            .find("set -o pipefail")
-            .map(|position| run + position)
-            .expect("native full pipefail gate");
-        let log = section[pipefail..]
-            .find("tee \"$CATS_BUILD_OUTPUT_DIR/quality-full.log\"")
-            .map(|position| pipefail + position)
-            .expect("native full frozen log writer");
-        let publish = section[log..]
-            .find("cats-publish-content-addressed evidence")
-            .map(|position| log + position)
-            .expect("native full evidence publisher");
-        let expected_path = format!(
-            "/srv/cats-build/target/<FINAL_RELEASE_SHA>-<SOURCE_MANIFEST_SHA256>-<SOURCE_BUNDLE_SHA256>/{job_id}/output/quality-full.log"
-        );
-        let exact_output = section[publish..]
-            .find(&expected_path)
-            .map(|position| publish + position)
-            .expect("exact immutable job output path");
-
-        assert!(run < pipefail && pipefail < log && log < publish && publish < exact_output);
-    }
-}
-
-#[test]
 fn production_platform_defaults_to_independent_az_dependencies() {
     let variables = read_workspace_file("deploy/aws/terraform/stacks/platform/variables.tf");
     let example =
@@ -380,32 +273,6 @@ fn production_maintenance_is_one_reviewed_terraform_transition() {
     assert!(example.contains("enable_public_ingress = false"));
 }
 
-#[test]
-fn production_clean_slate_reset_contract_passes_offline_fixture() {
-    let output = Command::new("python3")
-        .arg(workspace_root().join("deploy/aws/production-clean-slate-reset-fixture.py"))
-        .output()
-        .expect("run production clean-slate reset fixture");
-    assert!(
-        output.status.success(),
-        "clean-slate reset fixture failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).expect("fixture output is UTF-8");
-    assert!(stdout.contains("paginated versions+markers"));
-    assert!(stdout.contains("fresh namespace preserved"));
-    assert!(stdout.contains("post-green blocker passed"));
-    assert!(stdout.contains("closed forward-resume"));
-    assert!(stdout.contains("crash replay"));
-    assert!(stdout.contains("mechanical prerequisite blocks"));
-    assert!(stdout.contains("recoverable receipt publication"));
-    assert!(stdout.contains("S3 expected-owner gates passed"));
-    assert!(stdout.contains("fresh DB read-only"));
-    assert!(stdout.contains("ingress Closed"));
-    assert!(stdout.contains("post-open forward/credential-independent cleanup verification"));
-}
-
 /// The cutover tools refuse group- or world-writable ancestors. The Linux
 /// gate's default /tmp is sticky, so scratch space moves under the
 /// workspace target directory there; macOS's per-user /var/folders default
@@ -433,21 +300,6 @@ fn contract_fixture_tmpdir() -> std::path::PathBuf {
     {
         std::env::temp_dir()
     }
-}
-
-#[test]
-fn production_cutover_proof_set_contract_passes_offline_fixture() {
-    let output = Command::new("python3")
-        .arg(workspace_root().join("deploy/aws/production-cutover-proof-set-fixture.py"))
-        .env("TMPDIR", contract_fixture_tmpdir())
-        .output()
-        .expect("run production cutover proof-set fixture");
-    assert!(
-        output.status.success(),
-        "cutover proof-set fixture failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 #[test]
@@ -534,88 +386,6 @@ fn install_operator_tools_contract_passes_offline_fixture() {
 }
 
 #[test]
-fn production_final_open_contract_passes_offline_fixture() {
-    let output = Command::new("python3")
-        .arg(workspace_root().join("deploy/aws/production-final-open-fixture.py"))
-        .output()
-        .expect("run production final-open fixture");
-    assert!(
-        output.status.success(),
-        "production final-open fixture failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        String::from_utf8(output.stdout).expect("fixture output is UTF-8"),
-        "production final-open fixture: PASS\n"
-    );
-}
-
-#[test]
-fn old_host_positive_stop_contract_passes_calibrated_offline_fixture() {
-    let root = workspace_root();
-    let output = Command::new("python3")
-        .arg(root.join("deploy/aws/old-host-positive-stop-fixture.py"))
-        .arg("--tool")
-        .arg(root.join("deploy/aws/old-host-positive-stop.py"))
-        .output()
-        .expect("run old-Host positive-stop fixture");
-    assert!(
-        output.status.success(),
-        "old-Host positive-stop fixture failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).expect("fixture output is UTF-8");
-    for calibrated_boundary in [
-        "calibrated runtime refusal",
-        "descendant/PID-reuse",
-        "absent/failed units",
-        "ambiguous EC2 discovery/replay",
-        "exact AWS identity/rules/ENIs/stable-deadline",
-        "no-replace",
-        "exact coverage",
-    ] {
-        assert!(
-            stdout.contains(calibrated_boundary),
-            "fixture omitted {calibrated_boundary:?}"
-        );
-    }
-
-    let producer = read_workspace_file("deploy/aws/old-host-positive-stop.py");
-    for required in [
-        "cats.old-host-positive-stop-inventory.v1",
-        "cgroup_v2_root",
-        "\"--no-ask-password\", \"stop\"",
-        "modify-network-interface-attribute",
-        "host_fence_event\": \"not_established",
-        "object_write_fence\": \"not_established",
-        "production_reset_prerequisite\": \"proposed_unaccepted",
-    ] {
-        assert!(producer.contains(required), "producer lost {required:?}");
-    }
-    assert!(!producer.contains("shell=True"));
-    assert!(!producer.contains("metering_cgroup_root"));
-
-    let specification = read_workspace_file("docs/specs/old-host-positive-stop-v1.md");
-    assert!(specification.contains("Status: **Proposed**"));
-    assert!(specification.contains("cgroup_v2_root: canonical absolute cgroup2 mount root"));
-    assert!(!specification.contains("metering_cgroup_root"));
-    assert!(specification.contains("不是 ADR-0040 的 `HostFenceEvent`"));
-    assert!(specification.contains("不能解除"));
-
-    // The mechanical block is the fail-closed proof-set default: without the
-    // explicit D7 operator attestation input, the positive-stop proof branch
-    // raises before any destructive step.
-    let reset = read_workspace_file("deploy/aws/production-clean-slate-reset.py");
-    assert!(reset.contains("--accept-manual-fence-evidence"));
-    assert!(reset.contains("local_positive_stop_verifier"));
-    let proof_set = read_workspace_file("deploy/aws/production_cutover_proof_set.py");
-    assert!(proof_set.contains("class _UnavailableLocalPositiveStopVerifier"));
-    assert!(proof_set.contains("local positive-stop evidence remains Proposed with no accepted"));
-}
-
-#[test]
 fn control_plane_image_manifest_access_is_exact_and_read_only() {
     let identity = read_workspace_file("deploy/aws/terraform/modules/usage-infrastructure/main.tf");
     let manifest_policy = identity
@@ -666,12 +436,6 @@ fn control_plane_image_manifest_access_is_exact_and_read_only() {
 
 #[test]
 fn production_fresh_schema_and_chunkstore_prefix_are_single_reviewed_inputs() {
-    let reset_runbook = read_workspace_file("deploy/aws/production-clean-slate-reset.md");
-    assert!(
-        reset_runbook.contains("--fresh-chunkstore-prefix cats-fresh"),
-        "the contract needs a non-default prefix to calibrate the former hardcoded-worker mismatch"
-    );
-
     let infrastructure =
         read_workspace_file("deploy/aws/terraform/stacks/production-infrastructure/main.tf");
     assert_eq!(
@@ -3511,10 +3275,6 @@ fn release_artifacts_share_one_canonical_guest_payload() {
     }
     let worker_image = read_workspace_file("deploy/aws/Dockerfile.worker-artifact");
     assert!(worker_image.contains("COPY guest-runtime-release.v1 /guest-runtime-release.v1"));
-    assert!(worker_image.contains(
-        "COPY --from=builder --chmod=0755 /out/old-host-positive-stop.py /old-host-positive-stop.py"
-    ));
-
     // cats-worker.service requires /opt/cats/bin/setup-guest-network before
     // start; the bundle must carry it and the bundle-driven installer must
     // install it, or a bundle-deployed worker can never start its unit.
@@ -3552,14 +3312,9 @@ fn release_artifacts_share_one_canonical_guest_payload() {
         .expect("control-plane image job");
     let credential_refresher = workflow
         .split_once("  credential-refresher-image:\n")
-        .and_then(|(_, rest)| rest.split_once("  gateway-image:\n"))
-        .map(|(section, _)| section)
-        .expect("credential-refresher image job");
-    let gateway = workflow
-        .split_once("  gateway-image:\n")
         .and_then(|(_, rest)| rest.split_once("  worker-bundle:\n"))
         .map(|(section, _)| section)
-        .expect("gateway image job");
+        .expect("credential-refresher image job");
     let worker = workflow
         .split_once("  worker-bundle:\n")
         .map(|(_, section)| section)
@@ -3572,11 +3327,7 @@ fn release_artifacts_share_one_canonical_guest_payload() {
         assert!(consumer.contains("uses: actions/download-artifact@v4"));
         assert!(consumer.contains("name: guest-runtime-release-v1"));
     }
-    assert!(
-        !gateway.contains("guest-runtime-release-v1"),
-        "the Gateway image must not pretend to consume the shared Guest release artifact"
-    );
-    for release_image in [control, credential_refresher, gateway] {
+    for release_image in [control, credential_refresher] {
         assert!(release_image.contains("platforms: linux/amd64"));
     }
     for release_bound_image in [control, credential_refresher] {
@@ -3598,23 +3349,6 @@ fn release_artifacts_share_one_canonical_guest_payload() {
         workflow.contains("tar --owner=0 --group=0 --numeric-owner -C worker-out"),
         "the worker archive must preserve the root-owned release member contract"
     );
-    for guide in ["deploy/aws/README.md", "deploy/metal/README.md"] {
-        let guide = read_workspace_file(guide);
-        for composition_gate in [
-            "not a standalone deployable release",
-            "A20 signed Desired",
-            "/v1/nodes/heartbeat",
-            "shared-bearer heartbeat",
-            "eleven",
-            "readiness stays closed",
-            "zero runtime effect",
-        ] {
-            assert!(
-                guide.contains(composition_gate),
-                "runtime cutover guide lost composition blocker {composition_gate:?}"
-            );
-        }
-    }
 }
 
 #[test]
@@ -3627,38 +3361,29 @@ fn manual_release_builder_verifies_all_final_artifacts_and_writes_one_receipt() 
         "rustup target add x86_64-unknown-linux-musl",
         "RELEASE_OUT=\"$guest_release\"",
         "--file deploy/aws/Dockerfile.control-plane",
-        "--file deploy/aws/Dockerfile.gateway",
         "--build-arg \"CATS_RELEASE_COMMIT_SHA=$source_sha\"",
         "--file deploy/aws/Dockerfile.worker-artifact",
         "docker create --platform linux/amd64 \"$control_image_id\"",
         "docker create --platform linux/amd64 \"$credential_refresher_image_id\"",
-        "docker create --platform linux/amd64 \"$gateway_image_id\"",
         "verify-manual-release.py",
         "--control-image-registry-verified false",
         "--control-image-registry-verified true",
         "--credential-refresher-image-registry-verified false",
         "--credential-refresher-image-registry-verified true",
-        "--gateway-image-registry-verified false",
-        "--gateway-image-registry-verified true",
         "--input-file \"guest_host_kernel=$guest_kernel\"",
-        "--input-file \"old_host_positive_stop=$source_root/deploy/aws/old-host-positive-stop.py\"",
         "--input-file \"production_mutation_admission_operator=$source_root/deploy/aws/production-mutation-admission.py\"",
-        "--input-file \"production_cutover_proof_set=$source_root/deploy/aws/production_cutover_proof_set.py\"",
         "--export-images",
         "type=oci,dest=$control_archive",
         "type=oci,dest=$credential_refresher_archive",
-        "type=oci,dest=$gateway_archive",
         // Docker loads only its own archive format unless the daemon runs the
         // containerd image store, so the export must also produce the archives
         // the local identity checks and binary extraction load.
         "type=docker,dest=$control_load_archive",
         "type=docker,dest=$credential_refresher_load_archive",
-        "type=docker,dest=$gateway_load_archive",
         "docker image load --input \"$control_load_archive\"",
         "docker image load --input \"$credential_refresher_load_archive\"",
-        "docker image load --input \"$gateway_load_archive\"",
         // Those copies are build scratch and must never reach the handoff.
-        "rm -f -- \"$control_load_archive\" \"$credential_refresher_load_archive\" \"$gateway_load_archive\"",
+        "rm -f -- \"$control_load_archive\" \"$credential_refresher_load_archive\"",
         // Cargo publishes a release binary as a hard link to its deps
         // artifact, so the verifier's single-link rule needs a private copy.
         "cp \"$guest_agent_bin\" \"$guest_agent_fingerprint\"",
@@ -3668,7 +3393,6 @@ fn manual_release_builder_verifies_all_final_artifacts_and_writes_one_receipt() 
         "incomplete release retained for diagnosis",
         "cats-control-plane-image.tar",
         "cats-credential-refresher-image.tar",
-        "cats-gateway-image.tar",
         "> SHA256SUMS",
     ] {
         assert!(

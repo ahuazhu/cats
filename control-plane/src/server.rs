@@ -37,8 +37,7 @@ pub struct Config {
     pub control_store_ca_file: Option<PathBuf>,
     pub usage_store: Arc<dyn UsageStore>,
     pub credit_store: Arc<dyn CreditStore>,
-    /// Retained as a storage-provider boundary for independently composed
-    /// volume/object-write workers. Semantic lifecycle does not read it.
+    /// Storage backend used by the production PersistentDisk authority.
     pub image_blob: Arc<dyn BlobStore>,
     /// Exact deployment-selected Golden Root used for every newly allocated
     /// Cat. The public create API never accepts an image override.

@@ -5,8 +5,6 @@
 //! dialect. The official `cats admin runtime-node provision` state machine is
 //! the only component allowed to perform the signed Control apply.
 
-mod route_v2_r1;
-
 use std::collections::BTreeSet;
 use std::ffi::{CStr, CString, OsString};
 use std::fs::File;
@@ -19,7 +17,7 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Context as _, Result};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
-use cats_api::agent_registration::{
+use cats_api::node_identity::{
     validate_node_identity_material, validate_state_path_component, Ed25519RequestSigner,
 };
 use cats_api::runtime_reconciliation::{
@@ -44,7 +42,7 @@ use crate::stable_unix_fs::{
 };
 use crate::{
     Cli, RuntimeProvisionerCommand, RuntimeProvisionerNodeIdentityCommand,
-    RuntimeProvisionerRouteV2R1Command, RuntimeProvisionerTrustCommand,
+    RuntimeProvisionerTrustCommand,
 };
 
 const PRIVATE_KEY_MAX_BYTES: usize = 16_384;
@@ -116,13 +114,6 @@ pub(crate) fn run(cli: &Cli, command: &RuntimeProvisionerCommand) -> Result<()> 
                 "Host NodeIdentity provisioning must run as root"
             );
             run_node_identity(cli, cmd, Path::new("/"), 0)
-        }
-        RuntimeProvisionerCommand::RouteV2R1 { cmd } => {
-            anyhow::ensure!(
-                effective_uid() == 0,
-                "Route v2 credential provisioning must run as root"
-            );
-            route_v2_r1::run(cli, cmd)
         }
     }
 }
@@ -200,7 +191,7 @@ fn initial_trust_bundle(
 fn signer_from_private_key_and_zero(
     credential_id: &Id,
     private_key: &mut [u8],
-) -> std::result::Result<Ed25519RequestSigner, cats_api::agent_registration::RequestSignerError> {
+) -> std::result::Result<Ed25519RequestSigner, cats_api::node_identity::RequestSignerError> {
     let result = Ed25519RequestSigner::from_pkcs8_v2_pem(credential_id.clone(), private_key);
     private_key.fill(0);
     result
@@ -1521,7 +1512,6 @@ mod tests {
             outcome: RuntimeNodeAuthorityOutcome::Provisioned,
             identity_state: NodeIdentityState::Provisioned,
             policy_revision: Epoch::new(1).unwrap(),
-            writer_authority_id: None,
         };
         let result_path = temp.path().join("apply-result.json");
         std::fs::write(
@@ -1591,7 +1581,6 @@ mod tests {
             outcome: RuntimeNodeAuthorityOutcome::Provisioned,
             identity_state: NodeIdentityState::Provisioned,
             policy_revision: Epoch::new(1).unwrap(),
-            writer_authority_id: None,
         };
         let result_path = temp.path().join("apply-result.json");
         std::fs::write(
@@ -1645,7 +1634,6 @@ mod tests {
             outcome: RuntimeNodeAuthorityOutcome::Provisioned,
             identity_state: NodeIdentityState::Provisioned,
             policy_revision: Epoch::new(1).unwrap(),
-            writer_authority_id: None,
         };
         std::fs::write(
             &result_path,

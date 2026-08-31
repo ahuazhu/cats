@@ -313,7 +313,7 @@ enum AttachmentMode {
 
 enum AuthorityBackend {
     #[cfg(test)]
-    Legacy(Arc<dyn MetadataStore>),
+    Fixture(Arc<dyn MetadataStore>),
     Target(Arc<dyn VolumeDataAuthority>),
 }
 
@@ -321,7 +321,7 @@ impl AuthorityBackend {
     fn load_head(&self, volume_id: &str) -> cats_storage::metadata::Result<VolumeHead> {
         match self {
             #[cfg(test)]
-            Self::Legacy(metadata) => metadata.load_head(volume_id),
+            Self::Fixture(metadata) => metadata.load_head(volume_id),
             Self::Target(authority) => {
                 let volume_id = Id::new(volume_id.to_string()).ok_or_else(|| {
                     MetaError::InvalidArgument("volume_id is not a target authority Id".into())
@@ -364,7 +364,9 @@ impl AuthorityBackend {
     ) -> cats_storage::metadata::Result<()> {
         match self {
             #[cfg(test)]
-            Self::Legacy(metadata) => metadata.renew_lease(volume_id, attachment_id, epoch, ttl_ms),
+            Self::Fixture(metadata) => {
+                metadata.renew_lease(volume_id, attachment_id, epoch, ttl_ms)
+            }
             Self::Target(authority) => {
                 let volume_id = target_id(volume_id, "volume_id")?;
                 let attachment_id = target_id(attachment_id, "attachment_id")?;
@@ -407,7 +409,7 @@ impl AuthorityBackend {
     ) -> cats_storage::metadata::Result<i64> {
         match self {
             #[cfg(test)]
-            Self::Legacy(metadata) => {
+            Self::Fixture(metadata) => {
                 let root_hash = new_head
                     .root_hash
                     .as_ref()
@@ -492,10 +494,7 @@ fn map_target_error(error: AuthorityError, volume_id: &str, expected: i64) -> Me
         AuthorityError::BackendUnknown => {
             MetaError::Backend("target volume authority outcome is unknown".into())
         }
-        AuthorityError::StaleTransition
-        | AuthorityError::EpochExhausted
-        | AuthorityError::SnapshotInUse
-        | AuthorityError::InvalidAuthorization => MetaError::Backend(
+        AuthorityError::StaleTransition | AuthorityError::EpochExhausted => MetaError::Backend(
             "target volume authority rejected an operation outside the data-plane port".into(),
         ),
     }
@@ -667,7 +666,7 @@ fn validate_attachment_identity_file(
     Ok(())
 }
 
-fn remote_head_from_legacy_projection(head: &VolumeHead) -> Result<RemoteHead> {
+fn remote_head_from_fixture_projection(head: &VolumeHead) -> Result<RemoteHead> {
     let generation = u64::try_from(head.generation)
         .ok()
         .and_then(Generation::new)
@@ -707,11 +706,9 @@ impl ChunkEngine {
             Some(_) => Err(EngineError::Corrupt(
                 "pack lineage does not match identity.json and the current grant".into(),
             )),
-            // Preserve the existing legacy restart semantics for the
-            // compatibility-only caller: it historically replays its v1
-            // journal after reacquiring a later epoch. The signed target path
-            // above has no such exception and binds every pack to the exact
-            // immutable grant.
+            // The fixture-only v1 pack format has no attachment lineage. The
+            // production target path above has no such exception and binds
+            // every pack to the exact immutable grant.
             None if header.lease_epoch.is_some()
                 && header.attachment_id.is_none()
                 && header.attachment_epoch.is_none()
@@ -726,8 +723,8 @@ impl ChunkEngine {
     }
 
     /// Adopt the caller's exact externally granted owner/epoch tuple through
-    /// the compatibility metadata data plane. Unlike the retired attach path,
-    /// this performs no acquire, expiry takeover, or epoch mutation.
+    /// the fixture metadata port. This performs no acquire, expiry takeover,
+    /// or epoch mutation.
     #[cfg(test)]
     pub(crate) fn attach_granted_epoch(
         cfg: EngineConfig,
@@ -741,7 +738,7 @@ impl ChunkEngine {
         Self::open(
             cfg,
             blob,
-            AuthorityBackend::Legacy(meta),
+            AuthorityBackend::Fixture(meta),
             AttachmentMode::Granted { expected_epoch },
             None,
         )
@@ -863,7 +860,7 @@ impl ChunkEngine {
                     preflight_authorized_serving(&cfg, attachment, target.as_ref())?
                 }
                 #[cfg(test)]
-                AuthorityBackend::Legacy(_) => {
+                AuthorityBackend::Fixture(_) => {
                     return Err(EngineError::InvalidConfig(
                         "authorized target attach requires target authority".into(),
                     ));
@@ -903,7 +900,7 @@ impl ChunkEngine {
 
         let epoch = match (mode, &authority) {
             #[cfg(test)]
-            (AttachmentMode::Granted { expected_epoch }, AuthorityBackend::Legacy(_)) => {
+            (AttachmentMode::Granted { expected_epoch }, AuthorityBackend::Fixture(_)) => {
                 if head.lease_owner.as_deref() != Some(cfg.attachment_id.as_str())
                     || head.lease_epoch != expected_epoch
                 {
@@ -935,7 +932,7 @@ impl ChunkEngine {
                         "authorized serving attachment disappeared before open".into(),
                     )
                 })?;
-                let current_head = remote_head_from_legacy_projection(&head)?;
+                let current_head = remote_head_from_fixture_projection(&head)?;
                 if head.lease_owner.as_deref() != Some(cfg.attachment_id.as_str())
                     || head.lease_epoch != expected_epoch
                     || head.size_bytes != attachment.size_bytes
@@ -956,7 +953,7 @@ impl ChunkEngine {
                 AttachmentMode::ControlOnly { .. }
                 | AttachmentMode::AuthorizedControlOnly { .. }
                 | AttachmentMode::AuthorizedServing { .. },
-                AuthorityBackend::Legacy(_),
+                AuthorityBackend::Fixture(_),
             ) => {
                 return Err(EngineError::InvalidConfig(
                     "attachment mode and authority backend do not match".into(),
@@ -1290,7 +1287,7 @@ impl ChunkEngine {
 
         let mut st = self.state.lock().unwrap();
         st.generation = head.generation;
-        st.remote_head = remote_head_from_legacy_projection(&head)?;
+        st.remote_head = remote_head_from_fixture_projection(&head)?;
         st.map = refs;
         st.leaf_refs = leaf_refs;
         // Dirty chunks carry uncommitted local data: their cache content is

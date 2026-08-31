@@ -26,8 +26,8 @@ cross-tenant deduplication behavior.
    in their volume namespace; Cats does not provide cross-tenant deduplication.
 3. `BaseRef::image` records the image origin of a chunk. The map encoding moves
    to its image-capable version only when such a reference is present.
-4. Runtime只通过[持久化的`provision_root_image` step](../specs/runtime-reconciliation-v1.md#71-root-image-provision)
-   和blockd的显式typed control request调用`ChunkEngine::provision_from_image`。它发布引用manifest的Map，
+4. Runtime只通过当前 noded 场景语义物理 effect 和 blockd 的显式 typed control request调用
+   `ChunkEngine::provision_from_image`。它发布引用manifest的Map，
    不移动image data，只允许exact owner/epoch下没有dirty/pending/staged write的generation-zero卷；
    Guest device和VMM必须等exact generation-1 target确认后才出现。
 5. Image publication is idempotent. Concurrent publishers put the same bytes
@@ -41,7 +41,7 @@ cross-tenant deduplication behavior.
    only after MetadataStore proves that no live or retained Root references the
    image.
 8. manifest、immutable volume size和既有Map编码纯确定计算generation-1 root hash/object ID。
-   RuntimeCheckpoint先fsync完整request和唯一transition ID；blockd以该ID固定commit object key并做
+   noded在完成effect前保留完整request和唯一transition ID；blockd以该ID固定commit object key并做
    exact blank->target head CAS。响应丢失只比较权威head，不保存第二份provision receipt。
    Cat runtime不得再用`--seed-image-id`在blockd启动时隐式provision，也不保留双路径兼容层。
 9. manifest 的唯一 provider-neutral DTO、canonical artifact bytes、有界 reader、closed error与

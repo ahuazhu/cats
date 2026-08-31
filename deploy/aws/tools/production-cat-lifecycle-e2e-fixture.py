@@ -86,7 +86,6 @@ def main() -> int:
                 "cat_create",
                 "disk_create",
                 "disk_delete",
-                "object_write_ambiguity",
                 "runtime_mutation",
             ],
             "begin_command_id": "command_fixture",

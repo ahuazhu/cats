@@ -17,7 +17,6 @@ from pathlib import Path
 
 DOCKERFILES = (
     "deploy/aws/Dockerfile.control-plane",
-    "deploy/aws/Dockerfile.gateway",
     "deploy/aws/Dockerfile.worker-artifact",
 )
 

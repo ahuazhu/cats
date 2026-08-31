@@ -1,15 +1,14 @@
 # ADR-0041：短期签名 Route Grant + Node 本地 admission gate
 
-- 状态：Accepted；lifecycle interlock 与 drain-timeout 语义已由
-  [ADR-0056](0056-atomic-per-cat-runtime-lifecycle.md) 部分取代
+- 状态：Superseded for current Control/Node composition by
+  [ADR-0059](0059-semantic-control-node-synchronous-protocol.md)
 - 日期：2026-08-08
 - 依赖：[ADR-0040](0040-level-triggered-runtime-reconciliation.md)
-- 规格：[Route Grant v2](../specs/route-grant-v2.md)
+- 历史协议实现由 Git history 保存
 
-> 短期 Grant、per-Endpoint route epoch、Node-local gate/guard、machine transport 与 key rotation
-> 继续有效。ADR-0056 取代 Endpoint/Serving 对 Desired revision/Running observation 的依赖，并取代
-> “CancelAndDrain timeout 必须保留 runtime/writer”：atomic Stop 的 grace deadline 后可以强停；
-> `RequireIdle` Busy 仍只有在 AdmissionCell 从未关闭时保持非破坏性。
+> 本文记录旧 Route v2 设计。当前 ADR-0059 生命周期只要求唯一当前入口目标遵守
+> `withdraw old -> noded Ready -> publish new`；AgentSession、Route Operation、Grant/gate lane 与
+> lifecycle interlock 不再进入当前 Control/Node composition。
 
 ## 背景
 
@@ -145,7 +144,8 @@ partition不触发自动改投；恢复需要Active HostFenceEvent、新完整De
 
 ## Clean-slate cutover
 
-首次部署遵循 [Operations and HA §8](../operations-ha.md#8-首次终态部署)。Route 模块的硬前置是：
+历史首次部署曾遵循现已取代的Route cutover；当前部署见
+[Operations and HA §10](../operations-ha.md#10-首次单协议部署)。历史 Route 模块的硬前置是：
 exact release 已删除旧 parser 和 DynamoDB mirror，旧 route credential 已轮换；Node 以全 gate
 Closed 加载并 ACK 新 public ring 后，Gateway 才能启动。目标 release 只接受本 ADR 的 wire 和
 authority 合同。

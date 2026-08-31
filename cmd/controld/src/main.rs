@@ -125,7 +125,7 @@ struct Args {
     /// alternate.
     #[arg(long, value_name = "PATH")]
     runtime_provisioner_trust_file: std::path::PathBuf,
-    /// Independent release-bound E13 offline operator public trust. The
+    /// Independent release-bound qualification operator public trust. The
     /// loader accepts only the canonical installed path.
     #[arg(
         long,

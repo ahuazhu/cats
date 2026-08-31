@@ -6,11 +6,6 @@ rust-version.workspace = true
 publish = false
 
 [features]
-default = ["proposed-node-residue-reclamation"]
-proposed-node-residue-reclamation = [
-    "cats-api/proposed-node-residue-reclamation",
-    "cats-storage/proposed-node-residue-reclamation",
-]
 # Explicitly opt-in fixture composition for cross-crate E2E tests. Release
 # binaries do not enable this feature.
 test-support = []
@@ -25,11 +20,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
-hyper = { workspace = true }
-hyper-util = { workspace = true }
 http-body-util = { workspace = true }
-rustls = { workspace = true }
-tokio-rustls = { workspace = true }
 reqwest = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }

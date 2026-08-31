@@ -481,9 +481,9 @@ impl IngressPort for UnavailableIngressPort {
     }
 }
 
-/// PostgreSQL-backed current target used by the semantic lifecycle and by a
-/// Gateway path resolving each new request. It is independent from the
-/// retired Route Operation signer.
+/// PostgreSQL-backed current target used by the semantic lifecycle and by
+/// traffic resolvers. It is independent from the retired Route Operation
+/// signer.
 #[derive(Clone)]
 pub struct SemanticIngressAdapter {
     store: Arc<Store>,

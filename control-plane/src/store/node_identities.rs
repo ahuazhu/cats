@@ -2,10 +2,10 @@
 //!
 //! AgentSession registration was retired by the semantic cutover.  The
 //! immutable machine identity and credential lineage remain because the
-//! administrator Node-authority and Host-fence boundaries still depend on
-//! them independently of any Node heartbeat session.
+//! provisioner-owned Node authority still depends on them independently of
+//! the semantic heartbeat transport.
 
-use cats_api::agent_registration::validate_state_path_component;
+use cats_api::node_identity::validate_state_path_component;
 use cats_api::runtime_reconciliation::{
     decode_node_identity, encode_node_identity, CredentialBinding, Id, NodeIdentity,
     NodeIdentityState, Sha256Digest, UnixMillis,

@@ -235,7 +235,6 @@ def load_package(path: Path) -> tuple[dict[str, Any], dict[str, Any], bytes]:
     if not isinstance(artifacts, dict) or set(artifacts) != {
         "control_plane",
         "credential_refresher",
-        "gateway",
         "worker",
     }:
         raise DeploymentError("registry-verified release manifest has the wrong artifact set")
@@ -243,10 +242,9 @@ def load_package(path: Path) -> tuple[dict[str, Any], dict[str, Any], bytes]:
     if not isinstance(receipt_images, dict) or set(receipt_images) != {
         "control_plane",
         "credential_refresher",
-        "gateway",
     }:
         raise DeploymentError("production package receipt has the wrong image set")
-    for name in ("control_plane", "credential_refresher", "gateway"):
+    for name in ("control_plane", "credential_refresher"):
         image = artifacts.get(name)
         if not isinstance(image, dict) or image.get("registry_verified") is not True:
             raise DeploymentError(f"{name} image is not registry-verified")

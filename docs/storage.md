@@ -1,6 +1,7 @@
 # Cats 存储架构
 
-- 状态：目标架构；ChunkStore 数据面已实现，Volume Authority 切换尚未实现
+- 状态：当前存储合同；ChunkStore、Strict 产品路径与 Volume Authority 核心已实现，生命周期只组合
+  成功 FLUSH 已远端持久的模式；Snapshot/GC 与外部 Host-fence 资格仍开放
 - 精确协议：[cats-blockd 协议规格](specs/blockd-protocol.md)、
   [Volume Authority 与磁盘生命周期](specs/volume-authority.md)
 - 关键决定：[ADR-0003](decisions/0003-direct-s3-chunkstore-backend.md)、
@@ -29,7 +30,7 @@ kernel-NBD 或 vhost-user-blk frontend
 cats-blockd
     ├── Host NVMe: cache + pending packs
     ├── BlobStore: immutable data / map / commit objects
-    └── MetadataStore: volume head + writer lease + snapshots
+    └── MetadataStore: volume head + writer lease
 ```
 
 - Guest 不知道 Chunk、对象存储或 PostgreSQL，也不持有这些系统的凭证。
@@ -91,10 +92,11 @@ Relaxed 在 `L` 前进后向 Guest ACK，后台 publisher 再推进 `R`。Guest 
 - 调小后台定时器不能把这种单 Host 数据变成高可用数据。
 
 任何会释放或重建 Host 存储所有权的正常边界——Cold、Warm、DiskSnapshot、计划迁移、Node
-drain 和 `cats sync`——都必须先停止晚到的 Guest 写并 drain 到 `R == L`。Suspended 仍绑定
-原 Host，可以保留本地 pending，但不得删除它。第一版磁盘成员关系和DiskSnapshot只在Cat稳定
-Cold时改变，不实现hot attach/hot detach或Running Snapshot。volume容量创建后不可变，不提供
-resize API。
+drain 和 `cats sync`——都必须先停止晚到的 Guest 写并 drain 到 `R == L`。底层引擎仍保留 Relaxed
+能力，但 ADR-0059 当前产品生命周期不接纳 `R < L` 的成功状态，Suspended 也不能用它制造新的
+Node-local-only 成功数据。第一版磁盘成员关系只在Cat稳定 Cold时改变，不实现hot attach/hot detach；
+未来的DiskSnapshot也必须以Cold/unowned为前置，但当前产品闭环尚未完成。volume容量创建后不可变，
+不提供 resize API。
 
 ## RWO 与 fencing
 
@@ -104,35 +106,32 @@ PersistentDisk 是 RWO。所有 ownership 变化使用带 `transition_id` 和 ex
 - normal acquire只允许精确`Unowned -> this attachment`；相同transition重试返回原grant；
 - release只释放精确owner/epoch，相同transition幂等，其他不匹配显式失败；
 - 其他owner即使TTL已过也保持`OtherWriter`；TTL只表达健康，不授予抢占权；
-- takeover只消费从Active `HostFenceEvent`派生的逐卷授权；计划handoff先release再normal acquire；
 - renew和Root CAS都携带精确owner/epoch，旧epoch永久fail closed。
 
-Node在atomic command内执行lease transition并把精确grant写入RuntimeCommandCheckpoint，再启动blockd。blockd只采用、renew和使用
-该grant，不自行acquire、takeover或增加epoch。本地data-dir和每个pending pack都绑定volume、
-attachment、epoch和acquire transition；新attachment不能发布旧lineage的`R < L`数据。
+当前 noded/Strict backend 在启动 blockd 前取得并验证精确 attachment authority；blockd只采用、renew
+和使用该grant，不自行acquire或增加epoch。下层data-dir和每个pending pack仍绑定volume、attachment、
+epoch和acquire transition；新attachment不能发布旧lineage的`R < L`数据。
 
 Metadata fencing只阻止旧写者发布Root，不能证明旧VMM已停止。跨Node恢复仍必须先完成真实Host
-隔离；heartbeat timeout、Route TTL和lease TTL都不能代替。完整接口与算法见
-[Volume Authority](specs/volume-authority.md)。
+隔离，才能宣称严格物理单实例；heartbeat timeout、入口撤销和lease
+TTL都不能代替。ADR-0059 的 offline/reset 流程选择了较弱合同：从远端持久数据恢复并接受旧 Node
+reset 前的双跑窗口。完整下层接口与算法见 [Volume Authority](specs/volume-authority.md)。
 
 ## RootDisk、PersistentDisk 与 Golden Root
 
-- RootDisk与Cat同生命周期；PersistentDisk独立存在。PersistentDisk创建时预定ext4 UUID和一次性
-  initialization token。Disk与Volume全局一对一，Root与同Workspace Cat一对一，PersistentDisk同时
-  最多被一个current CatRuntimeConfig引用；product path只用immutable disk ID。Guest Agent格式化后必须再次
-  probe exact UUID并让blockd达到`R == L`；Control Store锁current NodeIdentity/AgentSession/Start Operation/
-  Cat head/Volume/Disk/config，再逐字段匹配signed Guest/flush evidence、checkpoint、owner/epoch/head后写
-  Initialized，Observation不参与。正确UUID和mount path是RuntimeReady条件，route仍需separate Enable。
-- Cat create在一个PG commit写Cat/config、Genesis Start Operation、唯一Root Disk、generation-zero/
-  Unowned Volume和exact API result。Root没有Persistent initialization状态或第二个Disk Operation。
-- PersistentDisk只能在Cat稳定Cold时加入或移出完整磁盘集合。DiskSnapshot和restore也只在
-  Cold/unowned时执行。volume容量创建后不可变；需要其他容量时新建Disk并在Guest内复制数据。
-- Warm、Cold和迁移对两类保留盘执行final drain；Stop只保证Killed，不要求R=L/release。
-- Destroy唯一例外：Guest/VMM停止后，控制面明确列出的disposable RootDisk可以丢弃未发布tail；
-  但必须先消费绑定Delete Operation/fingerprint、Node/Cat/placement、delete ID、attachment、owner/epoch/head、
-  disposition与Persistent completion的exact authorization；可达Node与HostFence使用closed不同proof arm。
-  Volume原子置为Deleting并提高epoch后才删除lineage。PersistentDisk仍必须
-  `R == L`。未知、遗漏或冲突分类一律fail closed。
+- RootDisk与Cat同生命周期；PersistentDisk独立存在。PersistentDisk创建时固定ext4 UUID和精确
+  volume identity，产品数据库以`UNIQUE(disk_id)`保证一块盘最多有一个当前binding。Guest Agent格式化、
+  probe exact UUID并确认目标mount；noded只有在blockd达到所需远端持久屏障且Guest mount-ready后才返回
+  Running。heartbeat或日志不参与结算。
+- Cat create在当前 Cat 行上claim `current_action=create`，保存完整创建配置和初始bindings，提交后同步
+  调用目标noded。Control响应丢失时查询该Node的实际`cat_id`状态，不创建Genesis Operation或第二套
+  lifecycle identity。
+- PersistentDisk只能在Cat稳定Cold时加入或移出完整磁盘集合。尚未完成的DiskSnapshot和restore合同也以
+  Cold/unowned为前置。volume容量创建后不可变；需要其他容量时新建Disk并在Guest内复制数据。
+- Warm、Cold和迁移对两类保留盘执行final drain；当前协议没有独立 Stop/Killed 产品动作。
+- Destroy先由noded停止同一Cat的物理资源，再删除随Cat存在的Root；PersistentDisk只解除binding，不随
+  Cat删除。当前产品先精确release，再只允许`Unowned -> Deleting`；没有discard本地tail的授权路径。
+  未知、遗漏、仍Owned或冲突分类一律fail closed。
 - durability是每盘创建时确定的属性，不能在已有ACK语义上原地切换。
 
 Golden Root 位于独立的 `images/<image-id>/` 命名空间。镜像 ID 来自完整镜像内容，非零 Chunk
@@ -155,29 +154,26 @@ miss 时以同一批远端已验证 bytes 原子填充 cache。本地文件不�
 - pack出现缺口、格式损坏、identity缺失或attachment已被fence时，整个目录quarantine；不能跳过
   generation、把旧pack交给新attachment或静默回退。
 - Fresh attachment使用自己的data-dir。旧目录只有在`R == L`且release完成后才是可删除cache；
-  唯一例外是disposable Root的授权Owned->Deleting CAS成功后删除该精确lineage。
+  当前产品没有`R < L`删除例外。
 
 ### GC
 
-每卷GC在持有writer lease且与stage/publish互斥时运行。live roots是当前Root与该卷全部
-`DiskSnapshotRecord`；每个root的Root/Leaf、Base和所有Delta都必须标记。任一record命名的Root无法
-读取或校验时，本轮fail closed，不删除对象。commit records按保留策略处理。
+当前 blockd sweep 只把当前 Volume Root 可达的 Root/Leaf、Base 和 Delta 标成存活，并与同卷的
+stage/publish 互斥。它是下层 current-root 回收机制，不是完整产品 GC：product DiskSnapshot root 尚未
+接入同一 live-root authority，同盘 restore 也未完成。只要产品 snapshot 可能引用不再由当前 Root 引用的
+对象，就不得在 production composition 中启用或宣称该 sweep 能安全覆盖这些对象。完整边界见
+[Volume Authority §10](specs/volume-authority.md#10-disksnapshotgc-与同盘恢复)和
+[blockd protocol §9](specs/blockd-protocol.md#9-gc对象回收)。
 
-DiskSnapshot只在Cold/unowned时创建一条精确包含disk/volume/size/generation/Root的
-`DiskSnapshotRecord`；该row同时是产品资源和GC live-root。第一版只支持恢复到原Disk：restore发布
-一个新的、单调递增generation；不支持clone或跨volume COW。
-
-Volume删除先进入`Deleting(delete_id)`并提高epoch，再清对象。普通卷要求Cold、`R == L`且owner
-为空；Root只由current DeleteCat驱动：R=L时exact release后normal begin，default Root R<L时消费绑定
-Operation/fingerprint/Node/Cat/placement/attachment/epoch/head/disposition的exact authorization后从Owned直接进入
-Deleting。可达Node arm另绑定strong-Stop proof；HostFence arm只绑定event/interrupted Operation/HostLost digest，
-不伪造Stop。全部Persistent必须先R=L/release/detach。release与derive用VolumeRecord锁后重验保证只有一条分支提交。lease TTL、控制面缺行或
+Volume删除先进入`Deleting(delete_id)`并提高epoch，再清对象。所有产品卷要求Cold、`R == L`且owner
+为空；Root由当前语义 Cat Destroy 的已停止物理结果驱动，PersistentDisk由独立Disk destroy驱动。若下层
+仍存在旧disposable Root状态，schema v19 startup直接拒绝而不是迁移。全部Persistent必须先
+R=L/release/detach。lease TTL、控制面缺行或
 本地目录缺失都不是删除证明。
 
-normal begin前必须停止blockd并join upload workers；HostFenceEvent必须由provider cutoff阻止旧Host发起新
-PUT，并等待已接受PUT成功可见或永久失败。sweeper幂等delete后用符合ADR-0005强一致合同的完整prefix LIST确认
-empty，再执行exact PG completion CAS；weak/stale LIST或暂停的late PUT都会保持Deleting。receipt提交后
-再次LIST仍须empty。这不是object store与PG的两阶段事务，也不需要job/claim/proof row。
+normal begin前必须停止blockd、join upload workers并精确release。删除器幂等delete后用符合ADR-0005
+强一致合同的完整prefix LIST确认empty，再在同一锁定产品/volume scope移除row；weak/stale LIST或late PUT
+都会保持Deleting。这不是object store与PG的两阶段事务，也不需要旧job/claim/proof row。
 
 卷GC和volume删除永不进入`images/`。Golden Image第一版不自动或人工回收。
 
@@ -199,8 +195,8 @@ empty，再执行exact PG completion CAS；weak/stale LIST或暂停的late PUT�
 - 没有面向当前 release 的长期、多故障组合和大规模生产资格测试，也没有可引用的可用性或性能 SLA。
 - S3/RDS 的 Multi-AZ failover、备份恢复、区域灾难恢复和 CAS 超时风暴仍需在目标部署形态验证。
 - Relaxed 的未发布数据没有跨 Host 副本；如产品要求 Host 丢失下 `RPO=0`，需要另一种明确的持久性方案，不能重新解释现有模式。
-- attachment lineage绑定、Cold-only磁盘API、ext4初始化、snapshot-aware GC、same-disk restore和
-  delete sweeper未实现。
+- attachment lineage绑定、Cold-only磁盘API和ext4初始化已有组成；snapshot-aware GC、same-disk restore
+  和delete sweeper仍未实现。
 - clone、hot disk mutation与Golden Image GC明确不在第一版目标内。
 - 本地容量限制是每卷机制，不是跨所有 blockd、Warm snapshot、日志和系统预留的 Node 总容量证明。
 

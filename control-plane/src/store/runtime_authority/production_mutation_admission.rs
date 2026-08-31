@@ -1,9 +1,9 @@
-//! ADR-0051 production product-mutation admission authority.
+//! Bounded production qualification mutation authority.
 //!
-//! Product transactions take a shared lock on the singleton only after their
-//! exact API replay lookup.  Open/close commands take the same row for update.
-//! PostgreSQL therefore orders an emergency close after every already-admitted
-//! write, while Closed still permits deterministic replay and all read paths.
+//! Qualification product transactions take a shared lock on the singleton
+//! only after their exact API replay lookup. End/emergency-close commands take
+//! the same row for update, so PostgreSQL drains every admitted write before
+//! the qualification returns to Closed.
 
 use cats_api::production_mutation_admission::{
     encode_production_mutation_admission_command,
@@ -16,11 +16,11 @@ use cats_api::production_mutation_admission::{
     ProductionMutationAdmissionBinding, ProductionMutationAdmissionCommand,
     ProductionMutationAdmissionCommandReceipt, ProductionMutationAdmissionMode,
     ProductionMutationAdmissionMutation, ProductionMutationAdmissionState,
-    ProductionMutationAdmissionStoredOutcome, ProductionMutationOpenBinding,
-    ProductionQualificationAdmissionBinding, ProductionQualificationCloseKind,
-    ProductionQualificationMutationClass, ProductionQualificationProductInventoryCounts,
-    ProductionQualificationProductInventoryReceipt, PRODUCTION_CUTOVER_CLOCK_SKEW_MS,
-    PRODUCTION_MUTATION_ADMISSION_SCHEMA_VERSION, PRODUCTION_QUALIFICATION_MAX_LIFETIME_MS,
+    ProductionMutationAdmissionStoredOutcome, ProductionQualificationAdmissionBinding,
+    ProductionQualificationCloseKind, ProductionQualificationMutationClass,
+    ProductionQualificationProductInventoryCounts, ProductionQualificationProductInventoryReceipt,
+    PRODUCTION_CUTOVER_CLOCK_SKEW_MS, PRODUCTION_MUTATION_ADMISSION_SCHEMA_VERSION,
+    PRODUCTION_QUALIFICATION_MAX_LIFETIME_MS,
     PRODUCTION_QUALIFICATION_PRODUCT_INVENTORY_RECEIPT_KIND,
 };
 use cats_api::runtime_reconciliation::{
@@ -38,19 +38,11 @@ use crate::store::transaction::{
 use crate::store::{ApiError, AuthorityRequestContext, Result, Store};
 
 const STATE_COLUMNS: &str = "
-    revision, mode, binding::text AS binding_json, binding_sha256, binding_kind,
-    qualification_id, reset_id, deployment_id, release_id, source_commit_sha,
+    revision, mode, binding::text AS binding_json, binding_sha256,
+    qualification_id, deployment_id, release_id, source_commit_sha,
     control_schema_version, source_manifest_sha256, source_bundle_sha256,
     build_receipt_sha256, release_manifest_sha256, worker_bundle_sha256,
-    qualification_manifest_sha256,
-    qualification_catalog_sha256, proof_set_sha256, fresh_targets_sha256,
-    reset_complete_receipt_sha256, fleet_closed_receipt_sha256,
-    route_v2_rotation_qualification_receipt_sha256,
-    route_v2_rotation_qualification_node_ack_sets_sha256,
-    route_v2_rotation_qualification_transcript_sha256,
-    usage_terminal_receipt_sha256,
-    old_host_coverage_sha256, kernel_nbd_qualification_bundle_sha256,
-    vhost_user_qualification_bundle_sha256,
+    qualification_catalog_sha256,
     qualification_cell_manifest_sha256, qualification_aws_partition,
     qualification_aws_account_id, qualification_aws_region,
     qualification_cell_id, qualification_cell_namespace,
@@ -65,19 +57,11 @@ const COMMAND_COLUMNS: &str = "
     operator_public_key_spki_sha256, operator_trust_bundle_sha256, operator_aws_partition,
     operator_account_id, operator_role_arn, operator_principal_arn,
     issued_at_unix_ms, expires_at_unix_ms, expected_revision,
-    mutation_kind, target_mode, binding_kind, binding_sha256,
-    qualification_id, reset_id, deployment_id, release_id,
+    mutation_kind, target_mode, binding_sha256,
+    qualification_id, deployment_id, release_id,
     source_commit_sha, control_schema_version, source_manifest_sha256,
     source_bundle_sha256, build_receipt_sha256, release_manifest_sha256,
-    worker_bundle_sha256,
-    qualification_manifest_sha256, qualification_catalog_sha256, proof_set_sha256,
-    fresh_targets_sha256, reset_complete_receipt_sha256,
-    fleet_closed_receipt_sha256, route_v2_rotation_qualification_receipt_sha256,
-    route_v2_rotation_qualification_node_ack_sets_sha256,
-    route_v2_rotation_qualification_transcript_sha256,
-    usage_terminal_receipt_sha256,
-    old_host_coverage_sha256, kernel_nbd_qualification_bundle_sha256,
-    vhost_user_qualification_bundle_sha256,
+    worker_bundle_sha256, qualification_catalog_sha256,
     qualification_cell_manifest_sha256, qualification_aws_partition,
     qualification_aws_account_id, qualification_aws_region,
     qualification_cell_id, qualification_cell_namespace,
@@ -241,7 +225,6 @@ fn qualification_product_inventory_in(
         counts.disk_snapshot_count,
         counts.endpoint_count,
         counts.hostname_endpoint_lookup_count,
-        counts.unresolved_lifecycle_operation_count,
     ]
     .into_iter()
     .try_fold(0_u64, |total, count| total.checked_add(count.get()))
@@ -306,9 +289,7 @@ fn semantic_product_inventory_counts(
         disk_snapshot_count: zero,
         endpoint_count: zero,
         hostname_endpoint_lookup_count: zero,
-        unresolved_lifecycle_operation_count: zero,
         deleted_cat_tombstone_count: count("destroyed_cats")?,
-        terminal_lifecycle_operation_history_count: zero,
         api_idempotency_receipt_count: zero,
     })
 }
@@ -356,7 +337,6 @@ pub(in crate::store) fn require_production_product_mutation_admitted(
                 return Err(closed());
             }
         }
-        (ProductionMutationAdmissionMode::Open, ProductionMutationAdmissionBinding::Open(_)) => {}
         _ => return Err(closed()),
     }
     Ok(binding)
@@ -393,10 +373,6 @@ fn apply_command_in(
                 binding: qualification,
             } => {
                 current.mode == ProductionMutationAdmissionMode::Closed
-                    && !matches!(
-                        current.binding.as_ref(),
-                        Some(ProductionMutationAdmissionBinding::Open(_))
-                    )
                     && qualification.qualification_expires_at_unix_ms > now
                     && qualification
                         .qualification_expires_at_unix_ms
@@ -409,23 +385,9 @@ fn apply_command_in(
                 current.mode == ProductionMutationAdmissionMode::Qualification
                     && current.binding.as_ref() == Some(&binding)
             }
-            ProductionMutationAdmissionMutation::Open { .. } => {
-                current.mode == ProductionMutationAdmissionMode::Closed
-                    && match current.binding.as_ref() {
-                        None | Some(ProductionMutationAdmissionBinding::Qualification(_)) => true,
-                        Some(ProductionMutationAdmissionBinding::Open(installed)) => matches!(
-                            &binding,
-                            ProductionMutationAdmissionBinding::Open(candidate)
-                                if candidate == installed
-                        ),
-                    }
-            }
             ProductionMutationAdmissionMutation::EmergencyClose { .. } => {
-                matches!(
-                    current.mode,
-                    ProductionMutationAdmissionMode::Qualification
-                        | ProductionMutationAdmissionMode::Open
-                ) && current.binding.as_ref() == Some(&binding)
+                current.mode == ProductionMutationAdmissionMode::Qualification
+                    && current.binding.as_ref() == Some(&binding)
             }
         };
     let outcome = if transition_matches {
@@ -442,9 +404,6 @@ fn apply_command_in(
             ProductionMutationAdmissionMutation::EndQualification { .. }
             | ProductionMutationAdmissionMutation::EmergencyClose { .. } => {
                 ProductionMutationAdmissionMode::Closed
-            }
-            ProductionMutationAdmissionMutation::Open { .. } => {
-                ProductionMutationAdmissionMode::Open
             }
         };
         let state = ProductionMutationAdmissionState {
@@ -645,7 +604,6 @@ fn receipt_projection(
         ProductionMutationAdmissionMutation::EndQualification { .. } => {
             ("end_qualification", "closed")
         }
-        ProductionMutationAdmissionMutation::Open { .. } => ("open", "open"),
         ProductionMutationAdmissionMutation::EmergencyClose { .. } => ("emergency_close", "closed"),
     };
     match &receipt.outcome {
@@ -692,28 +650,19 @@ fn insert_command_receipt(
         .map(PgBigInt::to_pg)
         .transpose()
         .map_err(corrupt)?;
-    exactly_one(
-        transaction.execute(
-            "INSERT INTO production_mutation_admission_commands (
+    exactly_one(transaction.execute(
+        "INSERT INTO production_mutation_admission_commands (
             command_id, command, request_sha256, principal, principal_kind,
             operator_credential_id, operator_public_key_spki_sha256,
             operator_trust_bundle_sha256, operator_aws_partition,
             operator_account_id, operator_role_arn,
             operator_principal_arn, issued_at_unix_ms, expires_at_unix_ms,
-            expected_revision, mutation_kind, target_mode, binding_kind,
-            binding_sha256, qualification_id, reset_id,
+            expected_revision, mutation_kind, target_mode, binding_sha256,
+            qualification_id,
             deployment_id, release_id, source_commit_sha, control_schema_version,
             source_manifest_sha256, source_bundle_sha256,
             build_receipt_sha256, release_manifest_sha256, worker_bundle_sha256,
-            qualification_manifest_sha256,
-            qualification_catalog_sha256, proof_set_sha256, fresh_targets_sha256,
-            reset_complete_receipt_sha256, fleet_closed_receipt_sha256,
-            route_v2_rotation_qualification_receipt_sha256,
-            route_v2_rotation_qualification_node_ack_sets_sha256,
-            route_v2_rotation_qualification_transcript_sha256,
-            usage_terminal_receipt_sha256,
-            old_host_coverage_sha256, kernel_nbd_qualification_bundle_sha256,
-            vhost_user_qualification_bundle_sha256,
+            qualification_catalog_sha256,
             qualification_cell_manifest_sha256, qualification_aws_partition,
             qualification_aws_account_id, qualification_aws_region,
             qualification_cell_id, qualification_cell_namespace,
@@ -723,70 +672,55 @@ fn insert_command_receipt(
             resulting_revision, resulting_mode, committed_at_unix_ms
          ) VALUES (
             $1,$2::TEXT::jsonb,$3,$4::TEXT::jsonb,'production_cutover_operator',
-            $5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$18,$19,
-            CASE WHEN $18='qualification' THEN $17::TEXT::jsonb->'binding'->>'qualification_id' END,
-            CASE WHEN $18='open' THEN $17::TEXT::jsonb->'binding'->>'reset_id' END,
+            $5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$18,
+            $17::TEXT::jsonb->'binding'->>'qualification_id',
             $17::TEXT::jsonb->'binding'->>'deployment_id',
             $17::TEXT::jsonb->'binding'->>'release_id',
             $17::TEXT::jsonb->'binding'->>'source_commit_sha',
             ($17::TEXT::jsonb->'binding'->>'control_schema_version')::BIGINT,
             $17::TEXT::jsonb->'binding'->>'source_manifest_sha256',
             $17::TEXT::jsonb->'binding'->>'source_bundle_sha256',
-            CASE WHEN $18='qualification' THEN $17::TEXT::jsonb->'binding'->>'build_receipt_sha256' END,
+            $17::TEXT::jsonb->'binding'->>'build_receipt_sha256',
             $17::TEXT::jsonb->'binding'->>'release_manifest_sha256',
-            CASE WHEN $18='qualification' THEN $17::TEXT::jsonb->'binding'->>'worker_bundle_sha256' END,
-            CASE WHEN $18='open' THEN $17::TEXT::jsonb->'binding'->>'qualification_manifest_sha256' END,
+            $17::TEXT::jsonb->'binding'->>'worker_bundle_sha256',
             $17::TEXT::jsonb->'binding'->>'qualification_catalog_sha256',
-            CASE WHEN $18='open' THEN $17::TEXT::jsonb->'binding'->>'proof_set_sha256' END,
-            CASE WHEN $18='open' THEN $17::TEXT::jsonb->'binding'->>'fresh_targets_sha256' END,
-            CASE WHEN $18='open' THEN $17::TEXT::jsonb->'binding'->>'reset_complete_receipt_sha256' END,
-            CASE WHEN $18='open' THEN $17::TEXT::jsonb->'binding'->>'fleet_closed_receipt_sha256' END,
-            CASE WHEN $18='open' THEN $17::TEXT::jsonb->'binding'->>'route_v2_rotation_qualification_receipt_sha256' END,
-            CASE WHEN $18='open' THEN $17::TEXT::jsonb->'binding'->>'route_v2_rotation_qualification_node_ack_sets_sha256' END,
-            CASE WHEN $18='open' THEN $17::TEXT::jsonb->'binding'->>'route_v2_rotation_qualification_transcript_sha256' END,
-            CASE WHEN $18='open' THEN $17::TEXT::jsonb->'binding'->>'usage_terminal_receipt_sha256' END,
-            CASE WHEN $18='open' THEN $17::TEXT::jsonb->'binding'->>'old_host_coverage_sha256' END,
-            CASE WHEN $18='open' THEN $17::TEXT::jsonb->'binding'->>'kernel_nbd_qualification_bundle_sha256' END,
-            CASE WHEN $18='open' THEN $17::TEXT::jsonb->'binding'->>'vhost_user_qualification_bundle_sha256' END,
-            CASE WHEN $18='qualification' THEN $17::TEXT::jsonb->'binding'->>'qualification_cell_manifest_sha256' END,
-            CASE WHEN $18='qualification' THEN $17::TEXT::jsonb->'binding'->>'aws_partition' END,
-            CASE WHEN $18='qualification' THEN $17::TEXT::jsonb->'binding'->>'aws_account_id' END,
-            CASE WHEN $18='qualification' THEN $17::TEXT::jsonb->'binding'->>'aws_region' END,
-            CASE WHEN $18='qualification' THEN $17::TEXT::jsonb->'binding'->>'cell_id' END,
-            CASE WHEN $18='qualification' THEN $17::TEXT::jsonb->'binding'->>'cell_namespace' END,
-            CASE WHEN $18='qualification' THEN $17::TEXT::jsonb->'binding'->>'cats_account_id' END,
-            CASE WHEN $18='qualification' THEN $17::TEXT::jsonb->'binding'->>'workspace_id' END,
-            CASE WHEN $18='qualification' THEN $17::TEXT::jsonb->'binding'->'allowed_mutation_classes' END,
-            CASE WHEN $18='qualification' THEN ($17::TEXT::jsonb->'binding'->>'qualification_expires_at_unix_ms')::BIGINT END,
-            $20::TEXT::jsonb,$21,$22,$23,$24)",
-            &[
-                &receipt.command.command_id.as_str(),
-                &command_json,
-                &receipt.request_sha256.as_str(),
-                &principal_json,
-                &receipt.principal.credential_id.as_str(),
-                &receipt.principal.public_key_spki_sha256.as_str(),
-                &receipt.principal.trust_bundle_sha256.as_str(),
-                &receipt.principal.sts.aws_partition.as_str(),
-                &receipt.principal.sts.account_id,
-                &receipt.principal.sts.role_arn,
-                &receipt.principal.sts.principal_arn,
-                &issued_at,
-                &expires_at,
-                &expected_revision,
-                &mutation_kind,
-                &target_mode,
-                &binding_json,
-                &binding_kind(&binding),
-                &binding_sha256.as_str(),
-                &outcome_json,
-                &outcome_kind,
-                &resulting_revision,
-                &resulting_mode,
-                &committed_at,
-            ],
-        )?,
-    )
+            $17::TEXT::jsonb->'binding'->>'qualification_cell_manifest_sha256',
+            $17::TEXT::jsonb->'binding'->>'aws_partition',
+            $17::TEXT::jsonb->'binding'->>'aws_account_id',
+            $17::TEXT::jsonb->'binding'->>'aws_region',
+            $17::TEXT::jsonb->'binding'->>'cell_id',
+            $17::TEXT::jsonb->'binding'->>'cell_namespace',
+            $17::TEXT::jsonb->'binding'->>'cats_account_id',
+            $17::TEXT::jsonb->'binding'->>'workspace_id',
+            $17::TEXT::jsonb->'binding'->'allowed_mutation_classes',
+            ($17::TEXT::jsonb->'binding'->>'qualification_expires_at_unix_ms')::BIGINT,
+            $19::TEXT::jsonb,$20,$21,$22,$23)",
+        &[
+            &receipt.command.command_id.as_str(),
+            &command_json,
+            &receipt.request_sha256.as_str(),
+            &principal_json,
+            &receipt.principal.credential_id.as_str(),
+            &receipt.principal.public_key_spki_sha256.as_str(),
+            &receipt.principal.trust_bundle_sha256.as_str(),
+            &receipt.principal.sts.aws_partition.as_str(),
+            &receipt.principal.sts.account_id,
+            &receipt.principal.sts.role_arn,
+            &receipt.principal.sts.principal_arn,
+            &issued_at,
+            &expires_at,
+            &expected_revision,
+            &mutation_kind,
+            &target_mode,
+            &binding_json,
+            &binding_sha256.as_str(),
+            &outcome_json,
+            &outcome_kind,
+            &resulting_revision,
+            &resulting_mode,
+            &committed_at,
+        ],
+    )?)
 }
 
 fn update_state(
@@ -811,42 +745,29 @@ fn update_state(
         transaction.execute(
             "UPDATE production_mutation_admission SET
             revision=$2, mode=$3, binding=$4::TEXT::jsonb,
-            binding_sha256=$5, binding_kind=$6,
-            qualification_id=CASE WHEN $6='qualification' THEN $4::TEXT::jsonb->'binding'->>'qualification_id' END,
-            reset_id=CASE WHEN $6='open' THEN $4::TEXT::jsonb->'binding'->>'reset_id' END,
+            binding_sha256=$5,
+            qualification_id=$4::TEXT::jsonb->'binding'->>'qualification_id',
             deployment_id=$4::TEXT::jsonb->'binding'->>'deployment_id',
             release_id=$4::TEXT::jsonb->'binding'->>'release_id',
             source_commit_sha=$4::TEXT::jsonb->'binding'->>'source_commit_sha',
             control_schema_version=($4::TEXT::jsonb->'binding'->>'control_schema_version')::BIGINT,
             source_manifest_sha256=$4::TEXT::jsonb->'binding'->>'source_manifest_sha256',
             source_bundle_sha256=$4::TEXT::jsonb->'binding'->>'source_bundle_sha256',
-            build_receipt_sha256=CASE WHEN $6='qualification' THEN $4::TEXT::jsonb->'binding'->>'build_receipt_sha256' END,
+            build_receipt_sha256=$4::TEXT::jsonb->'binding'->>'build_receipt_sha256',
             release_manifest_sha256=$4::TEXT::jsonb->'binding'->>'release_manifest_sha256',
-            worker_bundle_sha256=CASE WHEN $6='qualification' THEN $4::TEXT::jsonb->'binding'->>'worker_bundle_sha256' END,
-            qualification_manifest_sha256=CASE WHEN $6='open' THEN $4::TEXT::jsonb->'binding'->>'qualification_manifest_sha256' END,
+            worker_bundle_sha256=$4::TEXT::jsonb->'binding'->>'worker_bundle_sha256',
             qualification_catalog_sha256=$4::TEXT::jsonb->'binding'->>'qualification_catalog_sha256',
-            proof_set_sha256=CASE WHEN $6='open' THEN $4::TEXT::jsonb->'binding'->>'proof_set_sha256' END,
-            fresh_targets_sha256=CASE WHEN $6='open' THEN $4::TEXT::jsonb->'binding'->>'fresh_targets_sha256' END,
-            reset_complete_receipt_sha256=CASE WHEN $6='open' THEN $4::TEXT::jsonb->'binding'->>'reset_complete_receipt_sha256' END,
-            fleet_closed_receipt_sha256=CASE WHEN $6='open' THEN $4::TEXT::jsonb->'binding'->>'fleet_closed_receipt_sha256' END,
-            route_v2_rotation_qualification_receipt_sha256=CASE WHEN $6='open' THEN $4::TEXT::jsonb->'binding'->>'route_v2_rotation_qualification_receipt_sha256' END,
-            route_v2_rotation_qualification_node_ack_sets_sha256=CASE WHEN $6='open' THEN $4::TEXT::jsonb->'binding'->>'route_v2_rotation_qualification_node_ack_sets_sha256' END,
-            route_v2_rotation_qualification_transcript_sha256=CASE WHEN $6='open' THEN $4::TEXT::jsonb->'binding'->>'route_v2_rotation_qualification_transcript_sha256' END,
-            usage_terminal_receipt_sha256=CASE WHEN $6='open' THEN $4::TEXT::jsonb->'binding'->>'usage_terminal_receipt_sha256' END,
-            old_host_coverage_sha256=CASE WHEN $6='open' THEN $4::TEXT::jsonb->'binding'->>'old_host_coverage_sha256' END,
-            kernel_nbd_qualification_bundle_sha256=CASE WHEN $6='open' THEN $4::TEXT::jsonb->'binding'->>'kernel_nbd_qualification_bundle_sha256' END,
-            vhost_user_qualification_bundle_sha256=CASE WHEN $6='open' THEN $4::TEXT::jsonb->'binding'->>'vhost_user_qualification_bundle_sha256' END,
-            qualification_cell_manifest_sha256=CASE WHEN $6='qualification' THEN $4::TEXT::jsonb->'binding'->>'qualification_cell_manifest_sha256' END,
-            qualification_aws_partition=CASE WHEN $6='qualification' THEN $4::TEXT::jsonb->'binding'->>'aws_partition' END,
-            qualification_aws_account_id=CASE WHEN $6='qualification' THEN $4::TEXT::jsonb->'binding'->>'aws_account_id' END,
-            qualification_aws_region=CASE WHEN $6='qualification' THEN $4::TEXT::jsonb->'binding'->>'aws_region' END,
-            qualification_cell_id=CASE WHEN $6='qualification' THEN $4::TEXT::jsonb->'binding'->>'cell_id' END,
-            qualification_cell_namespace=CASE WHEN $6='qualification' THEN $4::TEXT::jsonb->'binding'->>'cell_namespace' END,
-            qualification_cats_account_id=CASE WHEN $6='qualification' THEN $4::TEXT::jsonb->'binding'->>'cats_account_id' END,
-            qualification_workspace_id=CASE WHEN $6='qualification' THEN $4::TEXT::jsonb->'binding'->>'workspace_id' END,
-            qualification_mutation_classes=CASE WHEN $6='qualification' THEN $4::TEXT::jsonb->'binding'->'allowed_mutation_classes' END,
-            qualification_expires_at_unix_ms=CASE WHEN $6='qualification' THEN ($4::TEXT::jsonb->'binding'->>'qualification_expires_at_unix_ms')::BIGINT END,
-            last_command_id=$7, updated_at_unix_ms=$8
+            qualification_cell_manifest_sha256=$4::TEXT::jsonb->'binding'->>'qualification_cell_manifest_sha256',
+            qualification_aws_partition=$4::TEXT::jsonb->'binding'->>'aws_partition',
+            qualification_aws_account_id=$4::TEXT::jsonb->'binding'->>'aws_account_id',
+            qualification_aws_region=$4::TEXT::jsonb->'binding'->>'aws_region',
+            qualification_cell_id=$4::TEXT::jsonb->'binding'->>'cell_id',
+            qualification_cell_namespace=$4::TEXT::jsonb->'binding'->>'cell_namespace',
+            qualification_cats_account_id=$4::TEXT::jsonb->'binding'->>'cats_account_id',
+            qualification_workspace_id=$4::TEXT::jsonb->'binding'->>'workspace_id',
+            qualification_mutation_classes=$4::TEXT::jsonb->'binding'->'allowed_mutation_classes',
+            qualification_expires_at_unix_ms=($4::TEXT::jsonb->'binding'->>'qualification_expires_at_unix_ms')::BIGINT,
+            last_command_id=$6, updated_at_unix_ms=$7
           WHERE singleton AND revision=$1",
             &[
                 &current_revision,
@@ -854,7 +775,6 @@ fn update_state(
                 &mode_text(successor.mode),
                 &binding_json,
                 &binding_sha256.as_str(),
-                &binding_kind(binding),
                 &command_id.as_str(),
                 &updated_at,
             ],
@@ -868,7 +788,7 @@ fn validate_binding_projection(
 ) -> AuthorityTxResult<()> {
     let stored_digest = row.try_get::<_, Option<String>>("binding_sha256")?;
     let Some(binding) = binding else {
-        if stored_digest.is_some() || optional_text(row, "binding_kind")?.is_some() {
+        if stored_digest.is_some() {
             return Err(corrupt(
                 "initial production admission binding projection is partial",
             ));
@@ -879,7 +799,6 @@ fn validate_binding_projection(
     let expected_schema = i64::try_from(binding.control_schema_version().get()).map_err(corrupt)?;
     let digest = production_mutation_admission_binding_sha256(binding).map_err(corrupt)?;
     let projections_match = stored_digest.as_deref() == Some(digest.as_str())
-        && text(row, "binding_kind")? == binding_kind(binding)
         && text(row, "deployment_id")? == binding.deployment_id().as_str()
         && text(row, "release_id")? == binding.release_id().as_str()
         && text(row, "source_commit_sha")? == binding.source_commit_sha()
@@ -887,9 +806,6 @@ fn validate_binding_projection(
         && match binding {
             ProductionMutationAdmissionBinding::Qualification(binding) => {
                 qualification_projection_matches(row, binding)?
-            }
-            ProductionMutationAdmissionBinding::Open(binding) => {
-                open_projection_matches(row, binding)?
             }
         };
     if !projections_match {
@@ -912,13 +828,11 @@ fn qualification_projection_matches(
     )?;
     Ok(
         text(row, "qualification_id")? == binding.qualification_id.as_str()
-            && optional_text(row, "reset_id")?.is_none()
             && text(row, "source_manifest_sha256")? == binding.source_manifest_sha256.as_str()
             && text(row, "source_bundle_sha256")? == binding.source_bundle_sha256.as_str()
             && text(row, "build_receipt_sha256")? == binding.build_receipt_sha256.as_str()
             && text(row, "release_manifest_sha256")? == binding.release_manifest_sha256.as_str()
             && text(row, "worker_bundle_sha256")? == binding.worker_bundle_sha256.as_str()
-            && optional_text(row, "qualification_manifest_sha256")?.is_none()
             && text(row, "qualification_catalog_sha256")?
                 == binding.qualification_catalog_sha256.as_str()
             && text(row, "qualification_cell_manifest_sha256")?
@@ -935,70 +849,15 @@ fn qualification_projection_matches(
     )
 }
 
-fn open_projection_matches(
-    row: &Row,
-    binding: &ProductionMutationOpenBinding,
-) -> AuthorityTxResult<bool> {
-    Ok(text(row, "reset_id")? == binding.reset_id.as_str()
-        && optional_text(row, "qualification_id")?.is_none()
-        && text(row, "source_manifest_sha256")? == binding.source_manifest_sha256.as_str()
-        && text(row, "source_bundle_sha256")? == binding.source_bundle_sha256.as_str()
-        && optional_text(row, "build_receipt_sha256")?.is_none()
-        && text(row, "release_manifest_sha256")? == binding.release_manifest_sha256.as_str()
-        && optional_text(row, "worker_bundle_sha256")?.is_none()
-        && text(row, "qualification_manifest_sha256")?
-            == binding.qualification_manifest_sha256.as_str()
-        && text(row, "qualification_catalog_sha256")?
-            == binding.qualification_catalog_sha256.as_str()
-        && text(row, "proof_set_sha256")? == binding.proof_set_sha256.as_str()
-        && text(row, "fresh_targets_sha256")? == binding.fresh_targets_sha256.as_str()
-        && text(row, "reset_complete_receipt_sha256")?
-            == binding.reset_complete_receipt_sha256.as_str()
-        && text(row, "fleet_closed_receipt_sha256")?
-            == binding.fleet_closed_receipt_sha256.as_str()
-        && text(row, "route_v2_rotation_qualification_receipt_sha256")?
-            == binding
-                .route_v2_rotation_qualification_receipt_sha256
-                .as_str()
-        && text(row, "route_v2_rotation_qualification_node_ack_sets_sha256")?
-            == binding
-                .route_v2_rotation_qualification_node_ack_sets_sha256
-                .as_str()
-        && text(row, "route_v2_rotation_qualification_transcript_sha256")?
-            == binding
-                .route_v2_rotation_qualification_transcript_sha256
-                .as_str()
-        && text(row, "usage_terminal_receipt_sha256")?
-            == binding.usage_terminal_receipt_sha256.as_str()
-        && text(row, "old_host_coverage_sha256")? == binding.old_host_coverage_sha256.as_str()
-        && text(row, "kernel_nbd_qualification_bundle_sha256")?
-            == binding.kernel_nbd_qualification_bundle_sha256.as_str()
-        && text(row, "vhost_user_qualification_bundle_sha256")?
-            == binding.vhost_user_qualification_bundle_sha256.as_str()
-        && optional_text(row, "qualification_cell_manifest_sha256")?.is_none())
-}
-
 fn text(row: &Row, column: &str) -> AuthorityTxResult<String> {
     row.try_get::<_, Option<String>>(column)?
         .ok_or_else(|| corrupt("production mutation admission binding projection is partial"))
-}
-
-fn optional_text(row: &Row, column: &str) -> AuthorityTxResult<Option<String>> {
-    row.try_get(column).map_err(AuthorityTransactionError::from)
-}
-
-const fn binding_kind(binding: &ProductionMutationAdmissionBinding) -> &'static str {
-    match binding {
-        ProductionMutationAdmissionBinding::Qualification(_) => "qualification",
-        ProductionMutationAdmissionBinding::Open(_) => "open",
-    }
 }
 
 fn parse_mode(value: String) -> AuthorityTxResult<ProductionMutationAdmissionMode> {
     match value.as_str() {
         "closed" => Ok(ProductionMutationAdmissionMode::Closed),
         "qualification" => Ok(ProductionMutationAdmissionMode::Qualification),
-        "open" => Ok(ProductionMutationAdmissionMode::Open),
         _ => Err(corrupt(
             "stored production mutation admission mode is unknown",
         )),
@@ -1009,7 +868,6 @@ const fn mode_text(mode: ProductionMutationAdmissionMode) -> &'static str {
     match mode {
         ProductionMutationAdmissionMode::Closed => "closed",
         ProductionMutationAdmissionMode::Qualification => "qualification",
-        ProductionMutationAdmissionMode::Open => "open",
     }
 }
 
@@ -1076,33 +934,6 @@ mod tests {
         Sha256Digest::new(format!("sha256:{}", byte.to_string().repeat(64))).unwrap()
     }
 
-    fn binding() -> ProductionMutationOpenBinding {
-        ProductionMutationOpenBinding {
-            reset_id: Id::new("reset_a").unwrap(),
-            deployment_id: Id::new("deployment_a").unwrap(),
-            release_id: Id::new("release_a").unwrap(),
-            source_commit_sha: "a".repeat(40),
-            control_schema_version: WireU64::new(PRODUCTION_MUTATION_ADMISSION_SCHEMA_VERSION)
-                .unwrap(),
-            source_manifest_sha256: digest('0'),
-            source_bundle_sha256: digest('1'),
-            release_manifest_sha256: digest('2'),
-            qualification_manifest_sha256: digest('3'),
-            qualification_catalog_sha256: digest('4'),
-            proof_set_sha256: digest('5'),
-            fresh_targets_sha256: digest('6'),
-            reset_complete_receipt_sha256: digest('7'),
-            fleet_closed_receipt_sha256: digest('8'),
-            route_v2_rotation_qualification_receipt_sha256: digest('9'),
-            route_v2_rotation_qualification_node_ack_sets_sha256: digest('a'),
-            route_v2_rotation_qualification_transcript_sha256: digest('b'),
-            usage_terminal_receipt_sha256: digest('c'),
-            old_host_coverage_sha256: digest('d'),
-            kernel_nbd_qualification_bundle_sha256: digest('e'),
-            vhost_user_qualification_bundle_sha256: digest('f'),
-        }
-    }
-
     fn qualification_binding(
         cats_account_id: Id,
         workspace_id: Id,
@@ -1133,7 +964,6 @@ mod tests {
                 ProductionQualificationMutationClass::CatCreate,
                 ProductionQualificationMutationClass::DiskCreate,
                 ProductionQualificationMutationClass::DiskDelete,
-                ProductionQualificationMutationClass::ObjectWriteAmbiguity,
                 ProductionQualificationMutationClass::RuntimeMutation,
             ],
             qualification_expires_at_unix_ms: expires_at_unix_ms,
@@ -1198,98 +1028,6 @@ mod tests {
     }
 
     #[test]
-    fn emergency_close_waits_for_admitted_product_transaction_and_cancelled_reopen_is_empty() {
-        let dsn = crate::testsupport::isolated_control_store_url();
-        let store = Store::connect(&dsn, None).unwrap();
-        let binding = binding();
-        let open = command(
-            '1',
-            1,
-            ProductionMutationAdmissionMutation::Open {
-                binding: binding.clone(),
-            },
-        );
-        let opened = apply(&store, &open);
-        assert!(matches!(
-            opened.outcome,
-            ProductionMutationAdmissionStoredOutcome::Applied { ref state }
-                if state.mode == ProductionMutationAdmissionMode::Open
-                    && state.revision.get() == 2
-        ));
-
-        let mut product_client = postgres::Client::connect(&dsn, NoTls).unwrap();
-        let mut product_transaction = product_client.transaction().unwrap();
-        let workspace = Id::new("workspace_a").unwrap();
-        assert_eq!(
-            require_production_product_mutation_admitted(
-                &mut product_transaction,
-                &workspace,
-                ProductionQualificationMutationClass::CatCreate,
-            )
-            .unwrap(),
-            ProductionMutationAdmissionBinding::Open(binding.clone())
-        );
-
-        let close = command(
-            '2',
-            2,
-            ProductionMutationAdmissionMutation::EmergencyClose {
-                binding: ProductionMutationAdmissionBinding::Open(binding.clone()),
-            },
-        );
-        let (close_started_tx, close_started_rx) = mpsc::channel();
-        let (close_done_tx, close_done_rx) = mpsc::channel();
-        let close_dsn = dsn.clone();
-        let close_thread = std::thread::spawn(move || {
-            let close_store = Store::connect(&close_dsn, None).unwrap();
-            close_started_tx.send(()).unwrap();
-            close_done_tx.send(apply(&close_store, &close)).unwrap();
-        });
-        close_started_rx
-            .recv_timeout(cats_test_support::poll_bound())
-            .unwrap();
-        assert!(close_done_rx
-            .recv_timeout(Duration::from_millis(100))
-            .is_err());
-        product_transaction.commit().unwrap();
-        let closed = close_done_rx
-            .recv_timeout(cats_test_support::poll_bound())
-            .unwrap();
-        close_thread.join().unwrap();
-        assert!(matches!(
-            closed.outcome,
-            ProductionMutationAdmissionStoredOutcome::Applied { ref state }
-                if state.mode == ProductionMutationAdmissionMode::Closed
-                    && state.revision.get() == 3
-                    && state.binding.as_ref()
-                        == Some(&ProductionMutationAdmissionBinding::Open(binding.clone()))
-        ));
-
-        let reopen = command(
-            '3',
-            3,
-            ProductionMutationAdmissionMutation::Open { binding },
-        );
-        let cancelled = AuthorityRequestContext::new(Instant::now() + Duration::from_secs(5));
-        cancelled.cancel();
-        assert!(store
-            .apply_production_mutation_admission_command_request(&principal(), &reopen, &cancelled,)
-            .is_err());
-        assert_eq!(
-            store
-                .production_mutation_admission_state()
-                .unwrap()
-                .revision
-                .get(),
-            3
-        );
-        assert!(store
-            .resolve_production_mutation_admission_command(&reopen)
-            .unwrap()
-            .is_none());
-    }
-
-    #[test]
     fn qualification_is_exact_workspace_scoped_replayable_and_end_drains_writers() {
         let dsn = crate::testsupport::isolated_control_store_url();
         let store = Store::connect(&dsn, None).unwrap();
@@ -1346,15 +1084,6 @@ mod tests {
                 &mut product_transaction,
                 &binding.workspace_id,
                 ProductionQualificationMutationClass::DiskCreate,
-            )
-            .unwrap(),
-            ProductionMutationAdmissionBinding::Qualification(binding.clone())
-        );
-        assert_eq!(
-            require_production_product_mutation_admitted(
-                &mut product_transaction,
-                &binding.workspace_id,
-                ProductionQualificationMutationClass::ObjectWriteAmbiguity,
             )
             .unwrap(),
             ProductionMutationAdmissionBinding::Qualification(binding.clone())

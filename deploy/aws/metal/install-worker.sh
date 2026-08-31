@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install only the Cats worker data plane on Linux x86_64 bare metal.
-# The web UI, control plane and gateway stay in EKS.
+# The web UI and control plane stay in EKS.
 set -euo pipefail
 
 CATS_REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -204,17 +204,6 @@ cats_worker_deployment_crash_probe after-daemon-reload
 # leaves the mid-run rotation window unbounded until the next boot fires
 # OnBootSec. It can only start once worker.env exists, since the unit reads it.
 if [[ -f /etc/cats/worker.env ]]; then
-  # Remove only the retired Route listener override. The direct Control/Node
-  # protocol uses CATS_AUTH_TOKEN from this root-only environment file.
-  worker_env_temp=$(mktemp /etc/cats/.worker.env.XXXXXX)
-  awk -F= '$1 != "CATS_ROUTE_V2_MACHINE_LISTEN"' \
-    /etc/cats/worker.env > "$worker_env_temp"
-  chown root:root "$worker_env_temp"
-  chmod 0600 "$worker_env_temp"
-  mv -f -- "$worker_env_temp" /etc/cats/worker.env
-  sync -f /etc/cats/worker.env
-  sync -f /etc/cats
-  cats_worker_deployment_crash_probe after-remove-retired-route-listener
   systemctl enable --now cats-postgres-url.timer
   cats_worker_deployment_crash_probe after-enable-postgres-timer
   cats_begin_candidate_lifetime cats-worker "$release_installer"

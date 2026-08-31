@@ -20,7 +20,7 @@ usage_archive_object_lock_days = 2555
 # usage_archive_bucket_name; every other fresh name derives from
 # fresh_usage_name_suffix. Read the fresh_usage_kinesis_stream,
 # fresh_usage_checkpoint_table and fresh_usage_archive_bucket outputs into
-# production-clean-slate-reset.py's --fresh-usage-* arguments.
+# the reviewed v19 clean-slate release inputs.
 # fresh_usage_enabled             = true
 # fresh_usage_name_suffix         = "fresh"
 # fresh_usage_archive_bucket_name = "REPLACE_WITH_GLOBALLY_UNIQUE_FRESH_USAGE_BUCKET"

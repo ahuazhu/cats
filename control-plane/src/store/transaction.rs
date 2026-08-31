@@ -768,13 +768,12 @@ pub(super) fn authority_rejection(error: AuthorityError) -> ApiError {
         AuthorityError::NotFound => ApiError::not_found("volume"),
         AuthorityError::OtherWriter
         | AuthorityError::StaleTransition
-        | AuthorityError::HeadConflict
-        | AuthorityError::SnapshotInUse => ApiError::conflict(message),
+        | AuthorityError::HeadConflict => ApiError::conflict(message),
         AuthorityError::Fenced => ApiError::new(ErrorCode::StaleEpoch, message),
         AuthorityError::InvalidLeaseDuration => ApiError::invalid(message),
-        AuthorityError::EpochExhausted
-        | AuthorityError::AdminBusy
-        | AuthorityError::InvalidAuthorization => ApiError::failed_precondition(message),
+        AuthorityError::EpochExhausted | AuthorityError::AdminBusy => {
+            ApiError::failed_precondition(message)
+        }
         AuthorityError::BackendUnknown => ApiError::internal(message),
     }
 }

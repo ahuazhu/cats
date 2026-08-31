@@ -1,11 +1,12 @@
 # ADR-0050：Route v2 使用独立 rotation operator、live ring delivery 与前向恢复
 
-- 状态：Accepted
+- 状态：Superseded for current production composition by
+  [ADR-0059](0059-semantic-control-node-synchronous-protocol.md)
 - 日期：2026-08-14
 - 依赖：[ADR-0041](0041-node-verified-route-admission.md)、
   [ADR-0044](0044-independent-route-v2-signing-authority.md)、
   [ADR-0046](0046-gateway-node-route-v2-machine-tunnel.md)
-- 规格：[Route v2 Signing Authority v1](../specs/route-signing-authority-v1.md)
+- 历史协议实现由 Git history 保存
 
 ## 背景
 

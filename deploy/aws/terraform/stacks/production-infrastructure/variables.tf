@@ -114,7 +114,7 @@ variable "usage_consumer_lag_alarm_threshold_ms" {
 }
 
 # Clean-slate cutover lane. The reset executor
-# (deploy/aws/production-clean-slate-reset.py) requires the fresh usage
+# The v19 clean-slate release requires the fresh usage
 # transport -- Kinesis stream, DynamoDB checkpoint table and Object-Locked
 # archive bucket -- to exist in parallel with the old set under strictly
 # different names. Enabling this creates a second, fully disjoint

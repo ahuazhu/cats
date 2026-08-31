@@ -1,10 +1,11 @@
 # ADR-0046：Gateway 到 Node 使用 mTLS HTTP Upgrade Route v2 tunnel
 
-- 状态：Accepted
+- 状态：Superseded for current production composition by
+  [ADR-0059](0059-semantic-control-node-synchronous-protocol.md)
 - 日期：2026-08-11
 - 依赖：[ADR-0041](0041-node-verified-route-admission.md)、
   [ADR-0045](0045-independent-gateway-workload-identity.md)
-- 规格：[Route Grant v2](../specs/route-grant-v2.md)
+- 历史协议实现由 Git history 保存
 
 ## 背景
 

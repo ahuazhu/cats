@@ -66,7 +66,7 @@ impl ChunkEngine {
     /// them would turn a transient remote outage into acknowledged data loss.
     #[cfg(test)]
     pub(crate) fn detach(&self) -> Result<()> {
-        let AuthorityBackend::Legacy(metadata) = &self.authority else {
+        let AuthorityBackend::Fixture(metadata) = &self.authority else {
             return Err(EngineError::GuestIoDisabled);
         };
         if self.is_fenced() {

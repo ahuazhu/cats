@@ -4,19 +4,16 @@
 //! `cats_storage_volumes` schema. The Control Store owns schema creation; this
 //! module only verifies and operates the exact projection it needs.
 
-use std::collections::BTreeSet;
 use std::sync::{mpsc, Arc};
 
 use cats_storage::authority::{
     compare_and_swap_head, project_volume_record, renew_lease, validate_volume_owner_binding,
-    AuthorityError, Epoch, FenceEpoch, Generation, Id, NodeVolumeInventoryRecord,
-    NodeVolumeInventorySnapshot, RenewLeaseRequest, RenewLeaseResult,
-    RuntimeVolumeInventoryAuthority, UnixMillis, VolumeDataAuthority, VolumeHeadCasRequest,
-    VolumeHeadCasResult, VolumeOwnerBinding, VolumeRecord, VolumeRecordProjection,
-    AUTHORITY_RELEASE_SCHEMA_VERSION, MAX_NODE_OWNED_VOLUMES,
+    AuthorityError, Epoch, FenceEpoch, Generation, Id, RenewLeaseRequest, RenewLeaseResult,
+    UnixMillis, VolumeDataAuthority, VolumeHeadCasRequest, VolumeHeadCasResult, VolumeOwnerBinding,
+    VolumeRecord, VolumeRecordProjection, AUTHORITY_RELEASE_SCHEMA_VERSION,
 };
 use cats_storage::{AdapterConfig, AdapterError, MetaError};
-use postgres::{Client, IsolationLevel, Row, Transaction};
+use postgres::{Client, Row, Transaction};
 
 use super::{
     dispatch_on, dsn_source, session_setup, spawn_worker, DsnSource, Job, SchemaAccess,
@@ -27,8 +24,7 @@ const VOLUME_COLUMNS: &str = "
     volume_id, record::text AS record_json, size_bytes, durability,
     admin_state, delete_id, head_generation, head_root_hash,
     head_root_object_id, lease_owner, lease_epoch, lease_expires_at,
-    last_transition_kind, last_transition_id, transition_source_kind,
-    transition_operation_id, transition_request_fingerprint,
+    last_transition_kind, last_transition_id,
     transition_placement_epoch, transition_lease_duration_ms,
     owner_binding::text AS owner_binding_json, owner_node_id";
 
@@ -91,10 +87,8 @@ impl PostgresVolumeDataAuthority {
             })
     }
 
-    /// Open the Runtime's two deliberately separate capabilities over one
-    /// concrete adapter. Sharing the adapter preserves the data-plane versus
-    /// inventory trait boundary without doubling each Node's PostgreSQL
-    /// worker/session budget.
+    /// Open the one concrete Node adapter that implements both Cat membership
+    /// transitions and the narrower block-data-plane authority port.
     pub fn open_runtime(config: &AdapterConfig) -> std::result::Result<Arc<Self>, AdapterError> {
         config.ensure_only(
             ADAPTER_NAME,
@@ -183,20 +177,6 @@ impl VolumeDataAuthority for PostgresVolumeDataAuthority {
                 .commit()
                 .map_err(|_| AuthorityError::BackendUnknown)?;
             Ok(result)
-        })
-    }
-}
-
-impl RuntimeVolumeInventoryAuthority for PostgresVolumeDataAuthority {
-    fn load_node_volume_inventory(
-        &self,
-        node_id: &Id,
-        candidate_volume_ids: &BTreeSet<Id>,
-    ) -> Result<NodeVolumeInventorySnapshot, AuthorityError> {
-        let node_id = node_id.clone();
-        let candidate_volume_ids = candidate_volume_ids.clone();
-        self.dispatch(move |client| {
-            load_node_volume_inventory(client, &node_id, &candidate_volume_ids)
         })
     }
 }
@@ -401,87 +381,6 @@ pub(super) fn load_volume_for_update(
         .ok_or(AuthorityError::NotFound)
 }
 
-fn load_node_volume_inventory(
-    client: &mut Client,
-    node_id: &Id,
-    candidate_volume_ids: &BTreeSet<Id>,
-) -> Result<NodeVolumeInventorySnapshot, AuthorityError> {
-    if candidate_volume_ids.len() > MAX_NODE_OWNED_VOLUMES {
-        return Err(AuthorityError::BackendUnknown);
-    }
-    let mut transaction = client
-        .build_transaction()
-        .isolation_level(IsolationLevel::RepeatableRead)
-        .read_only(true)
-        .start()
-        .map_err(|_| AuthorityError::BackendUnknown)?;
-    let read_at_unix_ms = database_now(&mut transaction)?;
-    let limit =
-        i64::try_from(MAX_NODE_OWNED_VOLUMES + 1).map_err(|_| AuthorityError::BackendUnknown)?;
-    let candidate_volume_ids = candidate_volume_ids
-        .iter()
-        .map(|volume_id| volume_id.as_str().to_owned())
-        .collect::<Vec<_>>();
-    let sql = node_volume_inventory_sql();
-    let rows = transaction
-        .query(&sql, &[&node_id.as_str(), &candidate_volume_ids, &limit])
-        .map_err(|_| AuthorityError::BackendUnknown)?;
-    if rows.len() > MAX_NODE_OWNED_VOLUMES {
-        return Err(AuthorityError::BackendUnknown);
-    }
-    let mut records: Vec<NodeVolumeInventoryRecord> = Vec::with_capacity(rows.len());
-    for row in rows {
-        let (volume, binding) = decode_stored_volume(&row)?;
-        if records
-            .last()
-            .is_some_and(|previous| previous.volume.volume_id.as_str() >= volume.volume_id.as_str())
-        {
-            return Err(AuthorityError::BackendUnknown);
-        }
-        records.push(NodeVolumeInventoryRecord { binding, volume });
-    }
-    transaction
-        .commit()
-        .map_err(|_| AuthorityError::BackendUnknown)?;
-    Ok(NodeVolumeInventorySnapshot {
-        node_id: node_id.clone(),
-        read_at_unix_ms,
-        records,
-    })
-}
-
-fn node_volume_inventory_sql() -> String {
-    format!(
-        "WITH candidate_ids AS MATERIALIZED (
-            (
-                SELECT volume_id
-                  FROM volume_records
-                 WHERE owner_node_id=$1
-                 ORDER BY volume_id COLLATE \"C\"
-                 LIMIT $3
-            )
-            UNION
-            (
-                SELECT volume_id
-                  FROM volume_records
-                 WHERE owner_binding->>'owner_node_id'=$1
-                 ORDER BY volume_id COLLATE \"C\"
-                 LIMIT $3
-            )
-            UNION
-            (
-                SELECT requested.volume_id
-                  FROM unnest($2::text[]) AS requested(volume_id)
-            )
-        )
-        SELECT {VOLUME_COLUMNS}
-         FROM volume_records
-         WHERE volume_id IN (SELECT volume_id FROM candidate_ids)
-         ORDER BY volume_id COLLATE \"C\"
-         LIMIT $3"
-    )
-}
-
 pub(super) fn database_now(
     transaction: &mut Transaction<'_>,
 ) -> Result<UnixMillis, AuthorityError> {
@@ -542,12 +441,10 @@ fn update_volume_row(
                 head_root_hash=$8, head_root_object_id=$9, lease_owner=$10,
                 lease_epoch=$11, lease_expires_at=$12,
                 last_transition_kind=$13, last_transition_id=$14,
-                transition_source_kind=$15, transition_operation_id=$16,
-                transition_request_fingerprint=$17,
-                transition_placement_epoch=$18,
-                transition_lease_duration_ms=$19,
-                owner_binding=CASE WHEN $20 THEN $21::TEXT::jsonb ELSE owner_binding END,
-                owner_node_id=CASE WHEN $20 THEN $22 ELSE owner_node_id END
+                transition_placement_epoch=$15,
+                transition_lease_duration_ms=$16,
+                owner_binding=CASE WHEN $17 THEN $18::TEXT::jsonb ELSE owner_binding END,
+                owner_node_id=CASE WHEN $17 THEN $19 ELSE owner_node_id END
               WHERE volume_id=$1",
             &[
                 &projection.volume_id,
@@ -564,9 +461,6 @@ fn update_volume_row(
                 &lease_expires_at,
                 &projection.last_transition_kind,
                 &projection.last_transition_id,
-                &projection.transition_source_kind,
-                &projection.transition_operation_id,
-                &projection.transition_request_fingerprint,
                 &transition_placement,
                 &transition_duration,
                 &replace_owner,
@@ -628,13 +522,7 @@ fn projection_from_row(row: &Row) -> Result<VolumeRecordProjection, AuthorityErr
         None => None,
         Some(value) => Some(static_str(
             value,
-            &[
-                "normal_acquire",
-                "release",
-                "takeover",
-                "begin_delete",
-                "begin_disposable_delete",
-            ],
+            &["normal_acquire", "release", "begin_delete"],
         )?),
     };
     Ok(VolumeRecordProjection {
@@ -653,11 +541,6 @@ fn projection_from_row(row: &Row) -> Result<VolumeRecordProjection, AuthorityErr
             .transpose()?,
         last_transition_kind,
         last_transition_id: optional_string(row, "last_transition_id")?,
-        transition_source_kind: optional_string(row, "transition_source_kind")?
-            .map(|value| static_str(value, &["independent", "lifecycle"]))
-            .transpose()?,
-        transition_operation_id: optional_string(row, "transition_operation_id")?,
-        transition_request_fingerprint: optional_string(row, "transition_request_fingerprint")?,
         transition_placement_epoch: optional_integer(row, "transition_placement_epoch")?
             .map(epoch)
             .transpose()?,
@@ -745,8 +628,8 @@ mod tests {
 
     use cats_control_plane::store::Store;
     use cats_storage::authority::{
-        AsciiText, LastVolumeTransition, Sha256Digest, VolumeAdminState, VolumeDurability,
-        VolumeTransitionSource,
+        AsciiText, LastVolumeTransition, NormalAcquireRequest, NormalAcquireResult, RandomId128,
+        Sha256Digest, VolumeAdminState, VolumeDurability,
     };
     use postgres::NoTls;
 
@@ -828,24 +711,26 @@ mod tests {
             lease_epoch: fence_epoch(7),
             // Deliberately expired: expiry lapse alone is not fencing.
             lease_expires_at: Some(unix_millis(1)),
-            last_transition: Some(LastVolumeTransition::Takeover {
-                source: VolumeTransitionSource::Independent,
-                authorization_id: id("takeover-target-authority"),
+            last_transition: Some(LastVolumeTransition::NormalAcquire {
+                request: NormalAcquireRequest {
+                    volume_id: id(VOLUME_ID),
+                    transition_id: RandomId128::new("00000000000000000000000000000001")
+                        .expect("test transition id is valid"),
+                    attachment_id: id(ATTACHMENT_ID),
+                    expected_unowned_epoch: fence_epoch(6),
+                    placement_epoch: Epoch::new(1).expect("test placement epoch is valid"),
+                    lease_duration_ms: 1,
+                },
+                result: NormalAcquireResult {
+                    volume_id: id(VOLUME_ID),
+                    transition_id: RandomId128::new("00000000000000000000000000000001")
+                        .expect("test transition id is valid"),
+                    attachment_id: id(ATTACHMENT_ID),
+                    resulting_epoch: fence_epoch(7),
+                    resulting_head: head(4, 4),
+                    lease_expires_at: unix_millis(1),
+                },
             }),
-        }
-    }
-
-    fn unowned_volume(volume_id: &str) -> VolumeRecord {
-        VolumeRecord {
-            volume_id: id(volume_id),
-            size_bytes: VOLUME_SIZE,
-            durability: VolumeDurability::Strict,
-            admin_state: VolumeAdminState::Active,
-            head: head(0, 0),
-            lease_owner: None,
-            lease_epoch: fence_epoch(0),
-            lease_expires_at: None,
-            last_transition: None,
         }
     }
 
@@ -893,13 +778,12 @@ mod tests {
                     head_generation, head_root_hash, head_root_object_id,
                     lease_owner, lease_epoch, lease_expires_at,
                     last_transition_kind, last_transition_id,
-                    transition_source_kind, transition_operation_id,
-                    transition_request_fingerprint, transition_placement_epoch,
+                    transition_placement_epoch,
                     transition_lease_duration_ms, owner_binding, owner_node_id
                  ) VALUES (
                     $1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9,
-                    $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
-                    $20::TEXT::jsonb, $21
+                    $10, $11, $12, $13, $14, $15, $16,
+                    $17::TEXT::jsonb, $18
                  )",
                 &[
                     &projection.volume_id,
@@ -916,9 +800,6 @@ mod tests {
                     &lease_expires_at,
                     &projection.last_transition_kind,
                     &projection.last_transition_id,
-                    &projection.transition_source_kind,
-                    &projection.transition_operation_id,
-                    &projection.transition_request_fingerprint,
                     &transition_placement,
                     &transition_duration,
                     &owner_binding_json,
@@ -926,57 +807,6 @@ mod tests {
                 ],
             )
             .expect("insert target authority test row");
-    }
-
-    fn insert_generated_owned_volumes(
-        client: &mut Client,
-        owner_node_id: &str,
-        first: i64,
-        last: i64,
-    ) {
-        client
-            .execute(
-                "INSERT INTO volume_records (
-                    volume_id, record, size_bytes, durability, admin_state,
-                    head_generation, lease_owner, lease_epoch, lease_expires_at,
-                    last_transition_kind, last_transition_id,
-                    transition_source_kind, owner_binding, owner_node_id
-                 )
-                 SELECT
-                    'generated-volume-' || value,
-                    jsonb_build_object(
-                        'volume_id', 'generated-volume-' || value,
-                        'size_bytes', 4096,
-                        'durability', 'strict',
-                        'admin_state', jsonb_build_object('kind', 'active'),
-                        'head', jsonb_build_object(
-                            'generation', 0,
-                            'root_hash', NULL,
-                            'root_object_id', NULL
-                        ),
-                        'lease_owner', 'generated-attachment-' || value,
-                        'lease_epoch', 1,
-                        'lease_expires_at', 9999999999999,
-                        'last_transition', jsonb_build_object(
-                            'kind', 'takeover',
-                            'source', jsonb_build_object('kind', 'independent'),
-                            'authorization_id', 'generated-auth-' || value
-                        )
-                    ),
-                    4096, 'strict', 'active', 0,
-                    'generated-attachment-' || value, 1, 9999999999999,
-                    'takeover', 'generated-auth-' || value, 'independent',
-                    jsonb_build_object(
-                        'volume_id', 'generated-volume-' || value,
-                        'owner_node_id', $1::text,
-                        'attachment_id', 'generated-attachment-' || value,
-                        'attachment_epoch', 1
-                    ),
-                    $1::text
-                   FROM generate_series($2::bigint, $3::bigint) value",
-                &[&owner_node_id, &first, &last],
-            )
-            .expect("insert generated owned Volume rows");
     }
 
     fn renew_request(owner: &str, epoch_value: u64, duration_ms: u64) -> RenewLeaseRequest {
@@ -1270,184 +1100,6 @@ mod tests {
             .collect();
         assert_eq!(markers, ["do-not-touch"]);
         assert_eq!(fixture.stored().head, head(5, 5));
-    }
-
-    #[test]
-    fn runtime_inventory_returns_the_complete_node_index_and_rejects_binding_drift() {
-        let mut fixture = Fixture::new();
-        let no_candidates = BTreeSet::new();
-        let snapshot = fixture
-            .authority
-            .load_node_volume_inventory(&id(NODE_ID), &no_candidates)
-            .unwrap();
-        assert_eq!(snapshot.node_id, id(NODE_ID));
-        assert_eq!(snapshot.records.len(), 1);
-        assert_eq!(snapshot.records[0].volume, fixture.record);
-        assert_eq!(
-            snapshot.records[0].binding.as_ref().unwrap().owner_node_id,
-            id(NODE_ID)
-        );
-        assert!(fixture
-            .authority
-            .load_node_volume_inventory(&id("node-with-no-volumes"), &no_candidates)
-            .unwrap()
-            .records
-            .is_empty());
-
-        // Model a storage-corruption shape that bypassed the database guard.
-        // The bidirectional selector and strict decoder must still expose the
-        // row to both projected owners and fail closed.
-        fixture
-            .client
-            .batch_execute(
-                "ALTER TABLE volume_records
-                    DROP CONSTRAINT volume_records_owner_binding_check",
-            )
-            .unwrap();
-        fixture
-            .client
-            .execute(
-                "UPDATE volume_records SET owner_node_id='drifted-node' WHERE volume_id=$1",
-                &[&VOLUME_ID],
-            )
-            .unwrap();
-        assert_eq!(
-            fixture
-                .authority
-                .load_node_volume_inventory(&id(NODE_ID), &no_candidates),
-            Err(AuthorityError::BackendUnknown)
-        );
-        assert_eq!(
-            fixture
-                .authority
-                .load_node_volume_inventory(&id("drifted-node"), &no_candidates),
-            Err(AuthorityError::BackendUnknown)
-        );
-    }
-
-    #[test]
-    fn runtime_inventory_reads_candidates_and_node_owners_in_one_snapshot() {
-        let mut fixture = Fixture::new();
-        let unowned = unowned_volume("candidate-unowned");
-        insert_volume_with_owner(&mut fixture.client, &unowned, None);
-        let mut foreign = owned_volume();
-        foreign.volume_id = id("candidate-foreign");
-        insert_volume_with_owner(&mut fixture.client, &foreign, Some("node-foreign"));
-
-        let candidates = BTreeSet::from([
-            unowned.volume_id.clone(),
-            foreign.volume_id.clone(),
-            id("candidate-missing"),
-        ]);
-        let snapshot = fixture
-            .authority
-            .load_node_volume_inventory(&id(NODE_ID), &candidates)
-            .unwrap();
-        assert_eq!(snapshot.node_id, id(NODE_ID));
-        assert_eq!(snapshot.records.len(), 3);
-        assert!(snapshot
-            .records
-            .iter()
-            .all(|record| record.volume.volume_id != id("candidate-missing")));
-
-        let unowned = snapshot
-            .records
-            .iter()
-            .find(|record| record.volume.volume_id == id("candidate-unowned"))
-            .unwrap();
-        assert_eq!(unowned.binding, None);
-        let foreign = snapshot
-            .records
-            .iter()
-            .find(|record| record.volume.volume_id == id("candidate-foreign"))
-            .unwrap();
-        assert_eq!(
-            foreign.binding.as_ref().unwrap().owner_node_id,
-            id("node-foreign")
-        );
-        let owned = snapshot
-            .records
-            .iter()
-            .find(|record| record.volume.volume_id == id(VOLUME_ID))
-            .unwrap();
-        assert_eq!(owned.binding.as_ref().unwrap().owner_node_id, id(NODE_ID));
-    }
-
-    #[test]
-    fn runtime_inventory_rejects_duplicate_volume_ids_without_the_catalog_guard() {
-        let mut fixture = Fixture::new();
-        fixture
-            .client
-            .batch_execute("ALTER TABLE volume_records DROP CONSTRAINT volume_records_pkey CASCADE")
-            .unwrap();
-        assert_eq!(
-            fixture
-                .client
-                .execute(
-                    "INSERT INTO volume_records
-                     SELECT * FROM volume_records WHERE volume_id=$1",
-                    &[&VOLUME_ID],
-                )
-                .unwrap(),
-            1
-        );
-
-        assert_eq!(
-            load_node_volume_inventory(&mut fixture.client, &id(NODE_ID), &BTreeSet::new()),
-            Err(AuthorityError::BackendUnknown)
-        );
-    }
-
-    #[test]
-    fn runtime_inventory_query_uses_both_owner_indexes_with_large_foreign_history() {
-        let mut fixture = Fixture::new();
-        insert_generated_owned_volumes(&mut fixture.client, "foreign-node", 1, 50_000);
-        fixture
-            .client
-            .batch_execute("ANALYZE volume_records")
-            .unwrap();
-        let explain = format!("EXPLAIN (COSTS OFF) {}", node_volume_inventory_sql());
-        let candidates = vec![VOLUME_ID.to_owned()];
-        let plan = fixture
-            .client
-            .query(
-                &explain,
-                &[&"node-absent-from-large-history", &candidates, &257_i64],
-            )
-            .unwrap()
-            .into_iter()
-            .map(|row| row.get::<_, String>(0))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(plan.contains("volume_records_owner_node"), "{plan}");
-        assert!(plan.contains("volume_records_owner_binding_node"), "{plan}");
-        assert!(plan.contains("volume_records_pkey"), "{plan}");
-        assert!(!plan.contains("Seq Scan on volume_records"), "{plan}");
-    }
-
-    #[test]
-    fn runtime_inventory_accepts_the_exact_bound_and_rejects_one_more_row() {
-        let mut fixture = Fixture::new();
-        insert_generated_owned_volumes(
-            &mut fixture.client,
-            NODE_ID,
-            2,
-            i64::try_from(MAX_NODE_OWNED_VOLUMES).unwrap(),
-        );
-        let snapshot = fixture
-            .authority
-            .load_node_volume_inventory(&id(NODE_ID), &BTreeSet::new())
-            .unwrap();
-        assert_eq!(snapshot.records.len(), MAX_NODE_OWNED_VOLUMES);
-
-        let overflow = i64::try_from(MAX_NODE_OWNED_VOLUMES + 1).unwrap();
-        insert_generated_owned_volumes(&mut fixture.client, NODE_ID, overflow, overflow);
-        assert_eq!(
-            fixture
-                .authority
-                .load_node_volume_inventory(&id(NODE_ID), &BTreeSet::new()),
-            Err(AuthorityError::BackendUnknown)
-        );
     }
 
     #[test]

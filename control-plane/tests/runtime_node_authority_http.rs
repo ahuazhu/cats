@@ -5,20 +5,16 @@ use std::sync::Arc;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use cats_api::agent_registration::{
-    JSON_CONTENT_TYPE, NODE_CREDENTIAL_ID_HEADER, NODE_PUBLIC_KEY_SPKI_HEADER,
-    NODE_SIGNATURE_HEADER,
-};
+use cats_api::node_identity::JSON_CONTENT_TYPE;
 use cats_api::runtime_node_authority::{
     runtime_node_authority_signed_request, NODE_AUTHORITY_APPLY_ID_HEADER,
     PROVISIONER_CREDENTIAL_ID_HEADER, PROVISIONER_SIGNATURE_HEADER, RUNTIME_NODE_AUTHORITY_PATH,
 };
 use cats_api::runtime_reconciliation::{
     decode_runtime_node_authority_apply_result, encode_runtime_node_authority_apply,
-    object_write_writer_authority_id, runtime_provisioner_active_set_digest,
-    AllocatableMemoryBytes, AllocatableVcpus, AsciiText, Base64UrlNoPad, ContractVersion,
-    CredentialBinding, Epoch, GuestIpv4Pool, GuestIpv4PoolKind, Id, Ipv4Address, NodeIdentity,
-    NodeIdentityState, NodePlacementPolicy, NodeTransportTarget, RandomId128,
+    runtime_provisioner_active_set_digest, AllocatableMemoryBytes, AllocatableVcpus,
+    Base64UrlNoPad, ContractVersion, CredentialBinding, Epoch, GuestIpv4Pool, GuestIpv4PoolKind,
+    Id, Ipv4Address, NodeIdentity, NodeIdentityState, NodePlacementPolicy, RandomId128,
     RuntimeNodeAuthorityApply, RuntimeNodeAuthorityMutation, RuntimeNodeAuthorityOutcome,
     RuntimePlacementBlockFrontend, RuntimePlacementCapabilities, RuntimePlacementGuestNetwork,
     RuntimePlacementGuestTransport, RuntimePlacementVmm, RuntimeProvisionerActiveSet,
@@ -38,6 +34,9 @@ const DEPLOYMENT_ID: &str = "deployment_a";
 const PROVISIONER_ID: &str = "provisioner_a";
 const SERVICE_TOKEN: &str = "runtime-node-authority-service-token";
 const ADMIN_TOKEN: &str = "runtime-node-authority-admin-token";
+const RETIRED_NODE_CREDENTIAL_ID_HEADER: &str = "cats-node-credential-id";
+const RETIRED_NODE_PUBLIC_KEY_SPKI_HEADER: &str = "cats-node-public-key-spki";
+const RETIRED_NODE_SIGNATURE_HEADER: &str = "cats-node-signature";
 const RFC8032_TEST_SEED: [u8; 32] = [
     0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4,
     0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae, 0x7f, 0x60,
@@ -273,7 +272,6 @@ fn policy(revision: u64, state: RuntimeSchedulingState, memory: u64) -> NodePlac
             network_address: Ipv4Address::new("10.240.0.0").unwrap(),
             prefix_length: 16,
         },
-        node_transport_target: NodeTransportTarget::new("https://node-http.internal:7301").unwrap(),
     }
 }
 
@@ -303,46 +301,6 @@ fn update(
             placement_policy: Box::new(policy(expected + 1, state, 16 << 30)),
         },
     }
-}
-
-fn writer_authority(apply_id: u128, object_store_scope_id: &str) -> RuntimeNodeAuthorityApply {
-    RuntimeNodeAuthorityApply {
-        version: ContractVersion::V1,
-        apply_id: random(apply_id),
-        node_id: id("node_http_a"),
-        mutation: RuntimeNodeAuthorityMutation::ProvisionObjectWriteAuthority {
-            expected_policy_revision: Epoch::new(1).unwrap(),
-            object_provider_scope: cats_api::runtime_reconciliation::ProviderScope {
-                provider: id("test_object_provider"),
-                partition: id("test_object_partition"),
-                account_id: id("test_object_account"),
-                region: id("test_object_region"),
-            },
-            workload_principal_id: AsciiText::new(
-                "arn:test:iam::test_object_account:role/cats-object-write-gateway",
-            )
-            .unwrap(),
-            object_store_scope_id: AsciiText::new(object_store_scope_id).unwrap(),
-        },
-    }
-}
-
-fn assigned_writer_authority_id(apply: &RuntimeNodeAuthorityApply) -> Id {
-    let RuntimeNodeAuthorityMutation::ProvisionObjectWriteAuthority {
-        object_provider_scope,
-        workload_principal_id,
-        object_store_scope_id,
-        ..
-    } = &apply.mutation
-    else {
-        panic!("fixture is a writer authority apply")
-    };
-    object_write_writer_authority_id(
-        &apply.node_id,
-        object_provider_scope,
-        workload_principal_id,
-        object_store_scope_id,
-    )
 }
 
 async fn exact_body(response: reqwest::Response) -> Vec<u8> {
@@ -416,69 +374,6 @@ async fn machine_apply_replay_conflict_and_persisted_precondition_are_exact() {
 }
 
 #[tokio::test]
-async fn signed_writer_authority_apply_returns_one_assigned_authority_id() {
-    let context = Context::new().await;
-    let provisioned = context
-        .signed(encode_runtime_node_authority_apply(&provision(1)).unwrap())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(provisioned.status(), StatusCode::OK);
-
-    let request = writer_authority(2, "arn:test:s3:::cats-http/chunks");
-    let request_body = encode_runtime_node_authority_apply(&request).unwrap();
-    let applied = context.signed(request_body.clone()).send().await.unwrap();
-    assert_eq!(applied.status(), StatusCode::OK);
-    let applied_body = exact_body(applied).await;
-    let result = decode_runtime_node_authority_apply_result(&applied_body).unwrap();
-    assert_eq!(
-        result.outcome,
-        RuntimeNodeAuthorityOutcome::ObjectWriteAuthorityProvisioned
-    );
-    assert_eq!(
-        result.writer_authority_id,
-        Some(assigned_writer_authority_id(&request))
-    );
-
-    // Exact replay returns the same assigned authority; a second apply ID with
-    // a changed binding is refused rather than silently rebinding the Host.
-    let replay = context.signed(request_body).send().await.unwrap();
-    assert_eq!(replay.status(), StatusCode::OK);
-    assert_eq!(exact_body(replay).await, applied_body);
-
-    let changed = writer_authority(3, "arn:test:s3:::cats-http-other/chunks");
-    let refused = context
-        .signed(encode_runtime_node_authority_apply(&changed).unwrap())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(refused.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        exact_body(refused).await,
-        br#"{"code":"authority_precondition_failed","message":"runtime node authority precondition failed"}"#
-    );
-
-    // An unsigned bearer envelope is still the only authentication the ingress
-    // knows; the writer authority adds no second mechanism.
-    let unsigned = context
-        .http
-        .post(context.url(RUNTIME_NODE_AUTHORITY_PATH))
-        .header(reqwest::header::CONTENT_TYPE, JSON_CONTENT_TYPE)
-        .bearer_auth(ADMIN_TOKEN)
-        .body(
-            encode_runtime_node_authority_apply(&writer_authority(
-                4,
-                "arn:test:s3:::cats-http/chunks",
-            ))
-            .unwrap(),
-        )
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
 async fn machine_envelope_rejects_legacy_and_node_credentials_before_decode() {
     let context = Context::new().await;
     for token in [
@@ -506,9 +401,9 @@ async fn machine_envelope_rejects_legacy_and_node_credentials_before_decode() {
         .http
         .post(context.url(RUNTIME_NODE_AUTHORITY_PATH))
         .header(reqwest::header::CONTENT_TYPE, JSON_CONTENT_TYPE)
-        .header(NODE_CREDENTIAL_ID_HEADER, "node_credential")
-        .header(NODE_PUBLIC_KEY_SPKI_HEADER, "node_spki")
-        .header(NODE_SIGNATURE_HEADER, "node_signature")
+        .header(RETIRED_NODE_CREDENTIAL_ID_HEADER, "node_credential")
+        .header(RETIRED_NODE_PUBLIC_KEY_SPKI_HEADER, "node_spki")
+        .header(RETIRED_NODE_SIGNATURE_HEADER, "node_signature")
         .body("not-json")
         .send()
         .await

@@ -96,7 +96,8 @@ fn release_help_exposes_only_artifact_authorized_volume_modes() {
             "frozen protocol advertises removed release flag {retired_gc_flag}"
         );
     }
-    assert!(protocol.contains("typed lifecycle/sweeper effect"));
+    assert!(protocol.contains("blockd不执行volume delete"));
+    assert!(protocol.contains("product DiskSnapshot/GC仍是明确开放项"));
 }
 
 #[test]

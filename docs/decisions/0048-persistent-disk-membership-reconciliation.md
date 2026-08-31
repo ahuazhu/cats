@@ -1,10 +1,11 @@
 # ADR-0048：PersistentDisk 绑定是 Cold Desired 成员变更
 
-- 状态：Accepted
+- 状态：Superseded for lifecycle coordination by
+  [ADR-0059](0059-semantic-control-node-synchronous-protocol.md)；Volume RWO 与 Cold-only 成员变更保留
 - 日期：2026-08-14
 - 上位决定：[ADR-0040](0040-level-triggered-runtime-reconciliation.md)、
   [ADR-0042](0042-volume-authority-and-disk-lifecycle.md)
-- 冻结协议：[Runtime Reconciliation v1](../specs/runtime-reconciliation-v1.md)、
+- 当前协议：[Control/Node semantic protocol](../control-node-semantic-protocol.md)、
   [Volume Authority](../specs/volume-authority.md)
 
 ## 背景

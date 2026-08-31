@@ -10,7 +10,7 @@ Guest Runtime API使用它。S3、PostgreSQL、NVMe cache、VMM和fencing都属�
 
 - Direct-OS ChunkStore、delta packs、golden roots、Strict/Relaxed durability；
 - kernel-NBD 与 native vhost-user-blk 两个前端；
-- Workspace控制面、用户/管理员 Console、WorkOS sessions、CLI和Gateway；
+- Workspace控制面、用户/管理员 Console、WorkOS sessions和CLI；
 - FakeVmm 与 Cloud Hypervisor/KVM Node路径、vsock Guest Agent、systemd Guest PID 1；
 - S3/PostgreSQL provider adapters、usage/billing pipeline、Terraform/AWS部署；
 - adapter contracts、crash injection、fencing、鉴权、drain、Cold restore和bare-metal实验。
@@ -25,7 +25,7 @@ production composition。Cloud Hypervisor 的完整实际 effects 仍在缺少�
 
 尚未实现/验收的主要边界：
 
-- 清理旧 Route v2 部署合同，并补齐真实双 Node/Cloud Hypervisor 纵向联调；
+- 补齐真实双 Node/Cloud Hypervisor 纵向联调；
 - Strict PersistentDisk backend 和精确卷/文件系统身份已接入；仍需 Guest/Cloud Hypervisor 物理
   mount readiness E2E；
 - Cloud Hypervisor 的完整 semantic effects 和真实 Linux/KVM 资格；
@@ -50,7 +50,8 @@ production composition。Cloud Hypervisor 的完整实际 effects 仍在缺少�
 - MetadataStore owner/epoch和可信Host fence仍是独立的数据/物理隔离边界；Cat行、binding和入口切换
   不能冒充它们。
 - 离开Running先撤掉新流量入口，再暂停或停止Guest/VMM/blockd。
-- RootDisk跟随Cat；PersistentDisk独立。只有显式disposable Root destroy可放弃本地tail。
+- RootDisk跟随Cat；PersistentDisk独立。当前产品只允许已停止且精确 release 的 Unowned 卷进入
+  Deleting，不提供放弃 `R < L` 本地tail的例外。
 - Workspace是资源唯一owner；Guest runtime capability通过 `/run/cats/runtime.sock` HTTP提供。
 
 ## 开始阅读
@@ -65,24 +66,16 @@ production composition。Cloud Hypervisor 的完整实际 effects 仍在缺少�
 
 ## 本地开发
 
-需要 Rust toolchain、Docker、OpenSSL和PostgreSQL client依赖。快速启动一个控制面、一个
-FakeVmm Node和Gateway：
+需要 Rust toolchain、Docker、OpenSSL和PostgreSQL client依赖。当前同步协议通过进程内
+FakeVmm、真实Control→noded HTTP和PostgreSQL测试启动隔离的开发拓扑：
 
 ```bash
-./scripts/dev.sh up
-
-export CATS_API_URL=http://127.0.0.1:7300
-export CATS_TOKEN=dev-admin-token
-target/debug/cats create dev --cpu 2 --memory 2GiB
-target/debug/cats exec dev -- echo hello
-
-./scripts/dev.sh status
-./scripts/dev.sh down
+cargo test -p cats-control-plane --test semantic_runtime_lifecycle
+cargo test -p cats-control-plane --test semantic_noded_http_lifecycle
 ```
 
-`scripts/dev.sh` 使用 `/tmp/cats-dev` 保存本地状态和日志。真实Cloud Hypervisor/KVM需要
-Linux bare metal，见 [deploy/metal/README.md](deploy/metal/README.md)。AWS部署见
-[deploy/aws/README.md](deploy/aws/README.md)。
+测试需要一次性PostgreSQL，仓库质量脚本会自动准备。真实Cloud Hypervisor/KVM需要Linux bare metal，
+见 [deploy/metal/README.md](deploy/metal/README.md)。AWS部署见 [deploy/aws/README.md](deploy/aws/README.md)。
 
 ## 质量门
 
@@ -106,7 +99,6 @@ blockd/          ChunkStore engine、NBD和vhost-user-blk frontend
 control-plane/   API、PostgreSQL store、scheduler/controller、Web Console
 node-agent/      Node runtime、Cloud Hypervisor、blockd/Guest supervision
 guest/           vsock Guest Agent与Guest-local Runtime API
-network/         Endpoint Gateway
 metering/        累计usage ledger和rating
 cmd/             daemon composition roots与CLI
 tests/           跨组件E2E

@@ -1,10 +1,10 @@
 # Control Plane 与 noded 同步协议设计
 
-- 状态：ADR-0059 已接受，并由 [ADR-0062](decisions/0062-destroy-preempts-in-progress-cat-actions.md)
-  修正 Destroy 抢占与崩溃恢复；[ADR-0065](decisions/0065-exec-shell-runtime-access-lane.md)增加不进入
-  CatAction 的 Exec/Shell live access lane；正在实施
+- 状态：当前已实现协议；ADR-0059 已接受，并由
+  [ADR-0062](decisions/0062-destroy-preempts-in-progress-cat-actions.md)修正 Destroy 抢占与崩溃恢复；
+  [ADR-0065](decisions/0065-exec-shell-runtime-access-lane.md)增加不进入 CatAction 的 Exec/Shell live access lane
 - 范围：Cat、Node、PersistentDisk 的控制面数据模型、同步接口、状态转换与场景语义幂等
-- 切换方式：空数据、单协议直接替换旧 lifecycle 协调；不提供兼容层或数据迁移，实施进度见[执行计划](semantic-control-node-implementation-plan.md)
+- 切换方式：空数据、单协议直接替换旧 lifecycle 协调；不提供兼容层或数据迁移
 
 ## 1. 设计目标
 

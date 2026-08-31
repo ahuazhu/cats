@@ -7,7 +7,7 @@
 use cats_api::runtime_reconciliation::{
     Epoch, FenceEpoch, Generation, HostPath, Id, LastVolumeTransition, NormalAcquireRequest,
     RandomId128, ReleaseRequest, RemoteHead, Sha256Digest, VolumeAdminState, VolumeDurability,
-    VolumeRecord, VolumeTransitionSource,
+    VolumeRecord,
 };
 use cats_storage::authority::{
     authorized_serving_attachment_from_direct_acquire, begin_delete, normal_acquire,
@@ -279,7 +279,6 @@ impl CatVolumeStore for PostgresVolumeDataAuthority {
                     result: acquire_result,
                     current_head: volume.head.clone(),
                     current_lease_expires_at: renewed.lease_expires_at,
-                    object_write_credential: None,
                 })?;
             let mut descriptor = request.volume;
             descriptor.head = volume.head.clone();
@@ -674,11 +673,10 @@ fn insert_volume(
                 volume_id,record,size_bytes,durability,admin_state,delete_id,
                 head_generation,head_root_hash,head_root_object_id,lease_owner,
                 lease_epoch,lease_expires_at,last_transition_kind,last_transition_id,
-                transition_source_kind,transition_operation_id,
-                transition_request_fingerprint,transition_placement_epoch,
+                transition_placement_epoch,
                 transition_lease_duration_ms,owner_binding,owner_node_id
              ) VALUES ($1,$2::TEXT::jsonb,$3,'strict','active',NULL,0,NULL,NULL,
-                       NULL,0,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)",
+                       NULL,0,NULL,NULL,NULL,NULL,NULL,NULL,NULL)",
             &[
                 &projection.volume_id,
                 &record_json,
@@ -1125,7 +1123,6 @@ fn attach_replay(
     AuthorityError,
 > {
     let LastVolumeTransition::NormalAcquire {
-        source: VolumeTransitionSource::Independent,
         request: acquire,
         result,
     } = volume

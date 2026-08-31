@@ -67,8 +67,7 @@ manifest="$release_root/release-manifest.v1.json"
 checksums="$release_root/SHA256SUMS"
 control_archive="$release_root/cats-control-plane-image.tar"
 credential_refresher_archive="$release_root/cats-credential-refresher-image.tar"
-gateway_archive="$release_root/cats-gateway-image.tar"
-for input in "$manifest" "$checksums" "$control_archive" "$credential_refresher_archive" "$gateway_archive"; do
+for input in "$manifest" "$checksums" "$control_archive" "$credential_refresher_archive"; do
   [[ -f $input && ! -L $input ]] || {
     echo "missing regular release input: $input" >&2
     exit 1
@@ -83,10 +82,10 @@ done
   awk '
     NR == 1 { expected = "cats-control-plane-image.tar" }
     NR == 2 { expected = "cats-credential-refresher-image.tar" }
-    NR == 3 { expected = "cats-gateway-image.tar" }
     $1 !~ /^[0-9a-f]{64}$/ || $2 != expected { exit 1 }
+    END { if (NR != 2) exit 1 }
   ' SHA256SUMS || {
-    echo "SHA256SUMS must contain only the three canonical transport names" >&2
+    echo "SHA256SUMS must contain only the two canonical transport names" >&2
     exit 1
   }
   sha256sum --check --strict SHA256SUMS
@@ -101,9 +100,6 @@ control_config=$(jq -er '.control_plane.config_digest' <<<"$candidate")
 credential_refresher_reference=$(jq -er '.credential_refresher.reference' <<<"$candidate")
 credential_refresher_digest=$(jq -er '.credential_refresher.image_digest' <<<"$candidate")
 credential_refresher_config=$(jq -er '.credential_refresher.config_digest' <<<"$candidate")
-gateway_reference=$(jq -er '.gateway.reference' <<<"$candidate")
-gateway_digest=$(jq -er '.gateway.image_digest' <<<"$candidate")
-gateway_config=$(jq -er '.gateway.config_digest' <<<"$candidate")
 
 verify_archive() {
   archive=$1
@@ -137,8 +133,6 @@ verify_archive \
   "$credential_refresher_digest" \
   "$credential_refresher_config" \
   credential-refresher
-verify_archive "$gateway_archive" "$gateway_reference" "$gateway_digest" "$gateway_config" Gateway
-
 docker push "$control_reference"
 [[ $(docker buildx imagetools inspect --raw "$control_reference" | sha256sum | awk '{print "sha256:" $1}') == "$control_digest" ]] || {
   echo "registry Control digest differs from the release manifest" >&2
@@ -149,18 +143,11 @@ docker push "$credential_refresher_reference"
   echo "registry credential-refresher digest differs from the release manifest" >&2
   exit 1
 }
-docker push "$gateway_reference"
-[[ $(docker buildx imagetools inspect --raw "$gateway_reference" | sha256sum | awk '{print "sha256:" $1}') == "$gateway_digest" ]] || {
-  echo "registry Gateway digest differs from the release manifest" >&2
-  exit 1
-}
-
 python3 -B "$release_verifier" registry-candidate \
   --manifest "$manifest" \
   --manifest-sha256 "$manifest_sha256" \
   --control-registry-digest "$control_digest" \
   --credential-refresher-registry-digest "$credential_refresher_digest" \
-  --gateway-registry-digest "$gateway_digest" \
   --output "$output_manifest"
 
 echo "registry-verified manual release manifest: $output_manifest"

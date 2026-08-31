@@ -106,7 +106,9 @@ def check_workflow_contracts() -> None:
         "guest-runtime-release:",
         "Build the one Guest payload",
     )
-    control_job = release[release.index("  control-plane-image:") : release.index("  gateway-image:")]
+    control_job = release[
+        release.index("  control-plane-image:") : release.index("  credential-refresher-image:")
+    ]
     assert_order(
         control_job,
         "Assume AWS role",
@@ -114,13 +116,15 @@ def check_workflow_contracts() -> None:
         "Log in to ECR",
         "Build and push",
     )
-    gateway_job = release[release.index("  gateway-image:") : release.index("  worker-bundle:")]
+    refresher_job = release[
+        release.index("  credential-refresher-image:") : release.index("  worker-bundle:")
+    ]
     assert_order(
-        gateway_job,
+        refresher_job,
         "Assume AWS role",
         "Reverify release AWS target before registry access",
         "Log in to ECR",
-        "Build and push Gateway",
+        "Build and push credential refresher",
     )
     assert_order(
         deploy,
