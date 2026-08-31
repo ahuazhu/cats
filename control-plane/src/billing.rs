@@ -7,8 +7,8 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cats_api::error::ApiError;
 use cats_metering::CheckoutIntent;
+use cats_protocol::error::ApiError;
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};

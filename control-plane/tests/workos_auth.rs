@@ -13,13 +13,13 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use cats_api::runtime_node_authority::{
-    NODE_AUTHORITY_APPLY_ID_HEADER, RUNTIME_NODE_AUTHORITY_PATH,
-};
 use cats_control_plane::auth::{WorkOsConfig, WorkOsConfigParams};
 use cats_control_plane::server::{Config, Handle};
 use cats_control_plane::testsupport::spawn_control_plane_for_test as spawn;
 use cats_metering::SqliteUsageStore;
+use cats_protocol::runtime_node_authority::{
+    NODE_AUTHORITY_APPLY_ID_HEADER, RUNTIME_NODE_AUTHORITY_PATH,
+};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use reqwest::header::{LOCATION, SET_COOKIE};
 use reqwest::{StatusCode, Url};

@@ -4,8 +4,8 @@ use std::cell::Cell;
 use std::fmt;
 use std::time::Instant;
 
-use cats_api::chunk::{CHUNK_SIZE, MAX_VOLUME_BYTES};
-use cats_api::runtime_reconciliation::Sha256Digest;
+use cats_protocol::chunk::{CHUNK_SIZE, MAX_VOLUME_BYTES};
+use cats_protocol::runtime_reconciliation::Sha256Digest;
 use serde::de::{DeserializeSeed, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 

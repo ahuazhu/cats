@@ -863,7 +863,7 @@ impl ChunkEngine {
         packs: &[(&PackHeader, &[u8])],
         base_map: &[ChunkRef],
     ) -> Result<Vec<(PackHeader, Vec<u8>)>> {
-        let page_bytes = cats_api::chunk::DIRTY_PAGE_SIZE as usize;
+        let page_bytes = cats_protocol::chunk::DIRTY_PAGE_SIZE as usize;
         let mut outputs: Vec<Vec<u8>> = packs
             .iter()
             .map(|(header, _)| {
@@ -922,7 +922,7 @@ impl ChunkEngine {
                     if entry.is_base() {
                         output.extend_from_slice(image);
                     } else {
-                        for page in 0..cats_api::chunk::PAGES_PER_CHUNK {
+                        for page in 0..cats_protocol::chunk::PAGES_PER_CHUNK {
                             if entry.page_mask & (1u64 << page) == 0 {
                                 continue;
                             }

@@ -197,7 +197,7 @@ impl ChunkEngine {
     /// Materialize one committed chunk in memory. The publisher also uses this
     /// to merge a local byte overlay without touching the Guest cache.
     pub(super) fn fetch_chunk_image(&self, chunk_ref: &ChunkRef) -> Result<Vec<u8>> {
-        let page = cats_api::chunk::DIRTY_PAGE_SIZE as usize;
+        let page = cats_protocol::chunk::DIRTY_PAGE_SIZE as usize;
         let image = match chunk_ref {
             ChunkRef::Hole => vec![0u8; CHUNK_SIZE as usize],
             ChunkRef::Base(base) => self.fetch_verified(
@@ -222,7 +222,7 @@ impl ChunkEngine {
                 }
                 for (delta, bytes) in deltas.iter().zip(delta_bytes) {
                     let mut consumed = 0usize;
-                    for page_idx in 0..cats_api::chunk::PAGES_PER_CHUNK {
+                    for page_idx in 0..cats_protocol::chunk::PAGES_PER_CHUNK {
                         if delta.page_mask & (1u64 << page_idx) == 0 {
                             continue;
                         }

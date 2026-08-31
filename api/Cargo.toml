@@ -3,7 +3,7 @@ name = "cats-api"
 version = "0.1.2"
 edition.workspace = true
 rust-version.workspace = true
-description = "Shared API and protocol types for the Cats microVM platform"
+description = "Public HTTP API types for the Cats microVM platform"
 license.workspace = true
 repository.workspace = true
 readme = "README.md"
@@ -11,17 +11,14 @@ keywords = ["microvm", "virtualization", "api"]
 publish = ["crates-io"]
 
 [dependencies]
+cats-protocol = { workspace = true, optional = true }
+cats-artifacts = { workspace = true, optional = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
-sha2 = { workspace = true }
-hex = { workspace = true }
-base64 = { workspace = true }
-ring = { workspace = true }
-libc = { workspace = true }
 
-[dev-dependencies]
-tempfile = { workspace = true }
+[features]
+default = ["protocol-compat", "artifacts-compat"]
+protocol-compat = ["dep:cats-protocol"]
+artifacts-compat = ["protocol-compat", "dep:cats-artifacts"]
 
 [lints]
 workspace = true

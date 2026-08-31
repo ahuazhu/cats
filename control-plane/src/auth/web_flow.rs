@@ -208,13 +208,13 @@ pub async fn callback(
         })
         .ok_or_else(|| {
             ApiError::new(
-                cats_api::error::ErrorCode::Unauthenticated,
+                cats_protocol::error::ErrorCode::Unauthenticated,
                 "invalid or expired WorkOS login state",
             )
         })?;
     if crate::store::now_unix() - flow.created_at_unix > FLOW_MAX_AGE_UNIX_SECONDS {
         return Err(ApiError::new(
-            cats_api::error::ErrorCode::Unauthenticated,
+            cats_protocol::error::ErrorCode::Unauthenticated,
             "WorkOS login state expired",
         )
         .into());
@@ -238,7 +238,7 @@ pub async fn callback(
         .map_err(|error| {
             tracing::warn!(error = %error, "WorkOS authorization-code exchange failed");
             ApiError::new(
-                cats_api::error::ErrorCode::Unauthenticated,
+                cats_protocol::error::ErrorCode::Unauthenticated,
                 "WorkOS authentication failed",
             )
         })?;
@@ -413,7 +413,7 @@ pub(super) async fn scope_session_to_organization(
         })?;
     if !refreshed.authenticated {
         return Err(ApiError::new(
-            cats_api::error::ErrorCode::PermissionDenied,
+            cats_protocol::error::ErrorCode::PermissionDenied,
             format!("WorkOS did not authorize {label}"),
         )
         .into());
@@ -425,7 +425,7 @@ pub(super) async fn scope_session_to_organization(
         || candidate.user.as_ref().map(|user| user.id.as_str()) != Some(user_id.as_str())
     {
         return Err(ApiError::new(
-            cats_api::error::ErrorCode::PermissionDenied,
+            cats_protocol::error::ErrorCode::PermissionDenied,
             format!("WorkOS returned an invalid {label} session"),
         )
         .into());

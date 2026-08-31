@@ -976,10 +976,17 @@ dependencies = [
 name = "cats-api"
 version = "0.1.2"
 dependencies = [
- "base64",
- "hex",
+ "cats-artifacts",
+ "cats-protocol",
+ "serde",
+]
+
+[[package]]
+name = "cats-artifacts"
+version = "0.1.0"
+dependencies = [
+ "cats-protocol",
  "libc",
- "ring",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -998,11 +1005,11 @@ dependencies = [
 name = "cats-blockd"
 version = "0.1.0"
 dependencies = [
- "cats-api",
  "cats-block-client",
  "cats-metadata-store-sqlite",
  "cats-object-store-aws-s3",
  "cats-object-store-file",
+ "cats-protocol",
  "cats-storage",
  "cats-test-support",
  "hex",
@@ -1027,12 +1034,12 @@ name = "cats-blockd-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "cats-api",
  "cats-blockd",
  "cats-metadata-store-postgres",
  "cats-metadata-store-sqlite",
  "cats-object-store-aws-s3",
  "cats-object-store-file",
+ "cats-protocol",
  "cats-storage",
  "cats-test-support",
  "clap",
@@ -1051,6 +1058,7 @@ dependencies = [
  "anyhow",
  "base64",
  "cats-api",
+ "cats-protocol",
  "cats-test-support",
  "clap",
  "crossterm",
@@ -1080,6 +1088,7 @@ dependencies = [
  "base64",
  "cats-api",
  "cats-metering",
+ "cats-protocol",
  "cats-storage",
  "cats-test-support",
  "futures-util",
@@ -1111,7 +1120,7 @@ name = "cats-control-plane-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "cats-api",
+ "cats-artifacts",
  "cats-control-plane",
  "cats-metering",
  "cats-object-store-aws-s3",
@@ -1142,8 +1151,8 @@ name = "cats-guest-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "cats-api",
  "cats-block-client",
+ "cats-protocol",
  "clap",
  "flate2",
  "hex",
@@ -1167,8 +1176,8 @@ dependencies = [
 name = "cats-metadata-store-postgres"
 version = "0.1.0"
 dependencies = [
- "cats-api",
  "cats-control-plane",
+ "cats-protocol",
  "cats-storage",
  "cats-test-support",
  "native-tls",
@@ -1193,7 +1202,7 @@ dependencies = [
 name = "cats-metering"
 version = "0.1.0"
 dependencies = [
- "cats-api",
+ "cats-protocol",
  "hex",
  "rusqlite",
  "serde",
@@ -1209,10 +1218,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "cats-api",
+ "cats-artifacts",
  "cats-blockd",
  "cats-control-plane",
  "cats-metering",
+ "cats-protocol",
  "cats-storage",
  "cats-test-support",
  "futures-util",
@@ -1236,13 +1246,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "cats-api",
+ "cats-artifacts",
  "cats-blockd",
  "cats-metadata-store-postgres",
  "cats-metering",
  "cats-node-agent",
  "cats-object-store-aws-s3",
  "cats-object-store-file",
+ "cats-protocol",
  "cats-storage",
  "cats-test-support",
  "cats-usage-store-postgres",
@@ -1284,10 +1295,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "cats-protocol"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "hex",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "cats-storage"
 version = "0.1.0"
 dependencies = [
- "cats-api",
+ "cats-protocol",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1298,7 +1322,7 @@ dependencies = [
 name = "cats-test-support"
 version = "0.1.0"
 dependencies = [
- "cats-api",
+ "cats-protocol",
  "cats-storage",
  "rusqlite",
  "serde_json",
@@ -1328,8 +1352,8 @@ dependencies = [
 name = "cats-usage-store-postgres"
 version = "0.1.0"
 dependencies = [
- "cats-api",
  "cats-metering",
+ "cats-protocol",
  "cats-test-support",
  "native-tls",
  "postgres",

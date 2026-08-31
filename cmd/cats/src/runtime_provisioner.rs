@@ -17,10 +17,10 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Context as _, Result};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
-use cats_api::node_identity::{
+use cats_protocol::node_identity::{
     validate_node_identity_material, validate_state_path_component, Ed25519RequestSigner,
 };
-use cats_api::runtime_reconciliation::{
+use cats_protocol::runtime_reconciliation::{
     decode_runtime_node_authority_apply_result, decode_runtime_provisioner_trust_bundle,
     encode_node_identity, encode_runtime_node_authority_apply_result,
     encode_runtime_provisioner_active_set, encode_runtime_provisioner_trust_bundle,
@@ -191,7 +191,7 @@ fn initial_trust_bundle(
 fn signer_from_private_key_and_zero(
     credential_id: &Id,
     private_key: &mut [u8],
-) -> std::result::Result<Ed25519RequestSigner, cats_api::node_identity::RequestSignerError> {
+) -> std::result::Result<Ed25519RequestSigner, cats_protocol::node_identity::RequestSignerError> {
     let result = Ed25519RequestSigner::from_pkcs8_v2_pem(credential_id.clone(), private_key);
     private_key.fill(0);
     result
@@ -1502,9 +1502,9 @@ mod tests {
         )
         .unwrap();
 
-        let result = cats_api::runtime_reconciliation::RuntimeNodeAuthorityApplyResult {
+        let result = cats_protocol::runtime_reconciliation::RuntimeNodeAuthorityApplyResult {
             version: ContractVersion::V1,
-            apply_id: cats_api::runtime_reconciliation::RandomId128::new(
+            apply_id: cats_protocol::runtime_reconciliation::RandomId128::new(
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             )
             .unwrap(),
@@ -1571,9 +1571,9 @@ mod tests {
         // the first recovery entry had already been removed.
         std::fs::remove_file(recovery.join(PRIVATE_KEY_FILE)).unwrap();
 
-        let result = cats_api::runtime_reconciliation::RuntimeNodeAuthorityApplyResult {
+        let result = cats_protocol::runtime_reconciliation::RuntimeNodeAuthorityApplyResult {
             version: ContractVersion::V1,
-            apply_id: cats_api::runtime_reconciliation::RandomId128::new(
+            apply_id: cats_protocol::runtime_reconciliation::RandomId128::new(
                 "cccccccccccccccccccccccccccccccc",
             )
             .unwrap(),
@@ -1624,9 +1624,9 @@ mod tests {
         )
         .unwrap();
         let result_path = temp.path().join("bad-result.json");
-        let wrong_node = cats_api::runtime_reconciliation::RuntimeNodeAuthorityApplyResult {
+        let wrong_node = cats_protocol::runtime_reconciliation::RuntimeNodeAuthorityApplyResult {
             version: ContractVersion::V1,
-            apply_id: cats_api::runtime_reconciliation::RandomId128::new(
+            apply_id: cats_protocol::runtime_reconciliation::RandomId128::new(
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             )
             .unwrap(),

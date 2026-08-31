@@ -14,7 +14,6 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc as tokio_mpsc;
 
-use cats_api::metering::UsageMetric;
 use cats_metering::{
     build_source_terminal_receipt, decode_terminal_receipt, metric_from_slug, sha256_prefixed,
     target_terminal_marker, target_terminal_request_sha256, usage_view_from_intervals,
@@ -29,6 +28,7 @@ use cats_metering::{
     UsageTargetTerminalState, UsageTerminalBarrierProjection, UsageTerminalPrepareOutcome,
     UsageTotals, UsageView,
 };
+use cats_protocol::metering::UsageMetric;
 use native_tls::{Certificate, TlsConnector};
 use postgres::{Client, Row, Transaction};
 use postgres_native_tls::MakeTlsConnector;
@@ -1270,7 +1270,7 @@ fn pg_maybe_insert_source_terminal_receipt(
         .query(&sql, &[&source_id, &source_epoch])
         .map_err(|error| pg_error("read projected source epoch", error))?;
     let mut projected = Vec::<(
-        cats_api::metering::CatUsageCheckpoint,
+        cats_protocol::metering::CatUsageCheckpoint,
         RuntimeUsageSourceBinding,
         UsageArchiveEvidence,
     )>::with_capacity(rows.len());
@@ -3521,7 +3521,7 @@ mod tests {
         let store = PostgresUsageStore::connect(&url, None, &schema, 2).unwrap();
 
         let make = |metric, sequence, observed_at_unix_ms, cumulative_quantity| {
-            let mut checkpoint = cats_api::metering::CatUsageCheckpoint {
+            let mut checkpoint = cats_protocol::metering::CatUsageCheckpoint {
                 event_id: String::new(),
                 source_id: "node/node-a/cat/cat-a".to_string(),
                 source_epoch: "runtime-7".to_string(),
@@ -3530,28 +3530,29 @@ mod tests {
                 cat_id: "cat-a".to_string(),
                 cat_generation: 7,
                 metric,
-                epoch_marker: cats_api::metering::UsageEpochMarker::Open,
+                epoch_marker: cats_protocol::metering::UsageEpochMarker::Open,
                 cumulative_quantity,
             };
             checkpoint.event_id = deterministic_event_id(&checkpoint);
             AttributedCheckpoint {
                 checkpoint,
                 source_binding: cats_metering::RuntimeUsageSourceBinding {
-                    session: cats_api::runtime_reconciliation::SessionBinding {
-                        node_id: cats_api::runtime_reconciliation::Id::new("node-a").unwrap(),
-                        node_boot_id: cats_api::runtime_reconciliation::NodeBootId::new(
+                    session: cats_protocol::runtime_reconciliation::SessionBinding {
+                        node_id: cats_protocol::runtime_reconciliation::Id::new("node-a").unwrap(),
+                        node_boot_id: cats_protocol::runtime_reconciliation::NodeBootId::new(
                             "11111111111111111111111111111111",
                         )
                         .unwrap(),
-                        agent_instance_id: cats_api::runtime_reconciliation::RandomId128::new(
+                        agent_instance_id: cats_protocol::runtime_reconciliation::RandomId128::new(
                             "22222222222222222222222222222222",
                         )
                         .unwrap(),
-                        agent_session_epoch: cats_api::runtime_reconciliation::Epoch::new(1)
+                        agent_session_epoch: cats_protocol::runtime_reconciliation::Epoch::new(1)
                             .unwrap(),
                     },
-                    desired_revision: cats_api::runtime_reconciliation::Revision::new(7).unwrap(),
-                    runtime_incarnation: cats_api::runtime_reconciliation::RandomId128::new(
+                    desired_revision: cats_protocol::runtime_reconciliation::Revision::new(7)
+                        .unwrap(),
+                    runtime_incarnation: cats_protocol::runtime_reconciliation::RandomId128::new(
                         "33333333333333333333333333333333",
                     )
                     .unwrap(),

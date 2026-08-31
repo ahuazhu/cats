@@ -39,8 +39,8 @@ use postgres::Client;
 use uuid::Uuid;
 
 use cats_api::auth::{Account, AccountInvitation, AccountKind, Workspace, WorkspaceToken};
-use cats_api::error::{ApiError, ErrorCode};
 use cats_api::ids;
+use cats_protocol::error::{ApiError, ErrorCode};
 
 pub type Result<T> = std::result::Result<T, ApiError>;
 

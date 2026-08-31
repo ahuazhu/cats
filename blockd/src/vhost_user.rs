@@ -44,7 +44,7 @@ use vmm_sys_util::event::{
     new_event_consumer_and_notifier, EventConsumer, EventFlag, EventNotifier,
 };
 
-use cats_api::runtime_reconciliation::{Id, GUEST_DEVICE_SERIAL_MAX_BYTES_V1};
+use cats_protocol::runtime_reconciliation::{Id, GUEST_DEVICE_SERIAL_MAX_BYTES_V1};
 
 use crate::engine::{ChunkEngine, EngineError};
 

@@ -15,24 +15,24 @@ impl ChunkPlan {
 
     /// Payload bytes this plan contributes to the pack.
     pub(super) fn len(&self) -> usize {
-        self.page_mask.count_ones() as usize * cats_api::chunk::DIRTY_PAGE_SIZE as usize
+        self.page_mask.count_ones() as usize * cats_protocol::chunk::DIRTY_PAGE_SIZE as usize
     }
 
     /// Byte runs to copy out of the cache, coalescing adjacent dirty pages so a
     /// scattered mask still costs few reads.
     fn runs(&self, payload_offset: usize) -> Vec<CopyRun> {
-        let page = cats_api::chunk::DIRTY_PAGE_SIZE as u64;
+        let page = cats_protocol::chunk::DIRTY_PAGE_SIZE as u64;
         let chunk_start = self.chunk_idx * CHUNK_SIZE as u64;
         let mut runs = Vec::new();
         let mut dst = payload_offset;
         let mut page_idx = 0u32;
-        while page_idx < cats_api::chunk::PAGES_PER_CHUNK {
+        while page_idx < cats_protocol::chunk::PAGES_PER_CHUNK {
             if self.page_mask & (1u64 << page_idx) == 0 {
                 page_idx += 1;
                 continue;
             }
             let first = page_idx;
-            while page_idx < cats_api::chunk::PAGES_PER_CHUNK
+            while page_idx < cats_protocol::chunk::PAGES_PER_CHUNK
                 && self.page_mask & (1u64 << page_idx) != 0
             {
                 page_idx += 1;
@@ -68,7 +68,7 @@ pub(super) fn plan_commit(
     base_map: &[ChunkRef],
     discarded: &[u64],
 ) -> Vec<ChunkPlan> {
-    let pages_per_chunk = cats_api::chunk::PAGES_PER_CHUNK;
+    let pages_per_chunk = cats_protocol::chunk::PAGES_PER_CHUNK;
     // A discarded chunk carries no pages: `ChunkPlan::len()` is zero, so it
     // occupies no payload and its pack entry publishes no object. It still has to
     // be in the plan, because the commit is what turns its map entry into a Hole

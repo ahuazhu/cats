@@ -9,9 +9,9 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-use cats_api::error::{ApiError, ErrorBody};
-use cats_api::runtime_reconciliation::Id;
-use cats_api::semantic_control::{
+use cats_protocol::error::{ApiError, ErrorBody};
+use cats_protocol::runtime_reconciliation::Id;
+use cats_protocol::semantic_control::{
     CatState, NodeDrainCatResult, NodeDrainResponse, NodeDrainStatus, NodeHeartbeatRequest,
     NodeHeartbeatResponse, NodeRegistrationRequest, NodeRegistrationResponse, NodedServiceToken,
     CONTROL_NODE_DRAIN_PATH, NODED_AUTHORIZATION_HEADER,

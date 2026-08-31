@@ -4,7 +4,7 @@
 //! job, cursor, claim, or completion flag: every bounded pass starts at the
 //! exact volume prefix and authoritative completion is an empty re-list.
 
-use cats_api::runtime_reconciliation::Id;
+use cats_protocol::runtime_reconciliation::Id;
 use std::time::Instant;
 
 use crate::blob::{validate_list_result, BlobError, BlobStore, Result};

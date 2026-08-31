@@ -19,14 +19,14 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use cats_api::runtime_reconciliation::Id;
-use cats_api::runtime_reconciliation::RandomId128;
-use cats_api::semantic_control::{
+use cats_protocol::runtime_reconciliation::Id;
+use cats_protocol::runtime_reconciliation::RandomId128;
+use cats_protocol::semantic_control::{
     noded_cat_path, NodedCatActionRequest, NodedCatConfig, NodedCatListResponse, NodedCatResponse,
     NodedCatView, NodedCreateCatRequest, NodedResultStatus, NodedServiceToken,
     SemanticErrorBody as WireErrorBody, SemanticErrorCode,
 };
-use cats_api::sessions::{
+use cats_protocol::sessions::{
     ExecRequest, ExecResponse, ShellClientControl, ShellServerControl, MAX_EXEC_JSON_BODY_BYTES,
     MAX_SHELL_MESSAGE_BYTES,
 };
@@ -35,9 +35,9 @@ use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 
 use crate::guest_client::{GuestClient, GuestExecError, GuestShell, GuestShellStartError};
 use crate::semantic_node_client::{NodeClientFuture, NodePlacementGate, NodeResetExecutor};
-use cats_api::guest::GuestShellFrame;
+use cats_protocol::guest::GuestShellFrame;
 
-pub use cats_api::semantic_control::{
+pub use cats_protocol::semantic_control::{
     CatAction as SemanticCatAction, CatState as SemanticCatState,
     NodedCatConfig as SemanticCatConfig, NodedDiskMount as SemanticMount,
 };
@@ -2704,10 +2704,12 @@ mod tests {
             mounts: vec![SemanticMount {
                 disk_id: Id::new("disk_01").expect("valid disk ID"),
                 volume_id: Id::new("vol_01").expect("valid volume ID"),
-                filesystem_uuid: cats_api::runtime_reconciliation::RandomId128::new("1".repeat(32))
-                    .expect("valid filesystem UUID"),
-                format: cats_api::semantic_control::PersistentDiskFormat::Ext4,
-                mount_path: cats_api::semantic_control::PersistentMountPath::new("/data")
+                filesystem_uuid: cats_protocol::runtime_reconciliation::RandomId128::new(
+                    "1".repeat(32),
+                )
+                .expect("valid filesystem UUID"),
+                format: cats_protocol::semantic_control::PersistentDiskFormat::Ext4,
+                mount_path: cats_protocol::semantic_control::PersistentMountPath::new("/data")
                     .expect("valid mount path"),
             }],
         }
@@ -2924,10 +2926,12 @@ mod tests {
         latest.mounts.push(SemanticMount {
             disk_id: Id::new("disk_02").expect("valid disk ID"),
             volume_id: Id::new("vol_02").expect("valid volume ID"),
-            filesystem_uuid: cats_api::runtime_reconciliation::RandomId128::new("2".repeat(32))
-                .expect("valid filesystem UUID"),
-            format: cats_api::semantic_control::PersistentDiskFormat::Ext4,
-            mount_path: cats_api::semantic_control::PersistentMountPath::new("/cache")
+            filesystem_uuid: cats_protocol::runtime_reconciliation::RandomId128::new(
+                "2".repeat(32),
+            )
+            .expect("valid filesystem UUID"),
+            format: cats_protocol::semantic_control::PersistentDiskFormat::Ext4,
+            mount_path: cats_protocol::semantic_control::PersistentMountPath::new("/cache")
                 .expect("valid mount path"),
         });
         let running = service
@@ -3183,17 +3187,23 @@ mod tests {
             read_guest_shell(shell, sender, reader_session, remote_terminal)
         });
 
-        cats_api::guest::write_frame(&mut fake_guest, &GuestShellFrame::Output { data: vec![1] })
-            .expect("write first Output that fills guest_sender");
-        cats_api::guest::write_frame(&mut fake_guest, &GuestShellFrame::Output { data: vec![2] })
-            .expect("write second Output for blocked forwarding");
+        cats_protocol::guest::write_frame(
+            &mut fake_guest,
+            &GuestShellFrame::Output { data: vec![1] },
+        )
+        .expect("write first Output that fills guest_sender");
+        cats_protocol::guest::write_frame(
+            &mut fake_guest,
+            &GuestShellFrame::Output { data: vec![2] },
+        )
+        .expect("write second Output for blocked forwarding");
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), cancellation.cancelled())
                 .await
                 .expect("full guest_sender cancels forwarding"),
             RuntimeAccessCloseMode::Graceful
         );
-        cats_api::guest::write_frame(&mut fake_guest, &GuestShellFrame::Exit { exit_code: 0 })
+        cats_protocol::guest::write_frame(&mut fake_guest, &GuestShellFrame::Exit { exit_code: 0 })
             .expect("write cleanup proof after forwarding stopped");
         tokio::time::timeout(Duration::from_secs(1), async {
             while !*remote_terminal_receiver.borrow_and_update() {
@@ -3511,11 +3521,11 @@ mod tests {
             server
                 .write_all(b"OK 1073741824\n")
                 .expect("write hybrid ACK");
-            let request: cats_api::guest::GuestRequest =
-                cats_api::guest::read_frame(&mut server).expect("read dispatched Exec");
+            let request: cats_protocol::guest::GuestRequest =
+                cats_protocol::guest::read_frame(&mut server).expect("read dispatched Exec");
             assert!(matches!(
                 request.body,
-                cats_api::guest::GuestRequestBody::Exec { .. }
+                cats_protocol::guest::GuestRequestBody::Exec { .. }
             ));
             let mut byte = [0_u8; 1];
             assert_eq!(
@@ -3585,14 +3595,14 @@ mod tests {
             guest
                 .write_all(b"OK 1073741824\n")
                 .expect("write delayed hybrid ACK");
-            let request: cats_api::guest::GuestRequest =
-                cats_api::guest::read_frame(&mut guest).expect("read dispatched Exec");
+            let request: cats_protocol::guest::GuestRequest =
+                cats_protocol::guest::read_frame(&mut guest).expect("read dispatched Exec");
             std::thread::sleep(Duration::from_millis(120));
-            cats_api::guest::write_frame(
+            cats_protocol::guest::write_frame(
                 &mut guest,
-                &cats_api::guest::GuestResponse {
+                &cats_protocol::guest::GuestResponse {
                     id: request.id,
-                    body: cats_api::guest::GuestResponseBody::Error {
+                    body: cats_protocol::guest::GuestResponseBody::Error {
                         message: "exec timed out after 20 ms".to_owned(),
                     },
                 },
@@ -3655,21 +3665,21 @@ mod tests {
             guest
                 .write_all(b"OK 1073741824\n")
                 .expect("write hybrid ACK");
-            let request: cats_api::guest::GuestRequest =
-                cats_api::guest::read_frame(&mut guest).expect("read Shell request");
+            let request: cats_protocol::guest::GuestRequest =
+                cats_protocol::guest::read_frame(&mut guest).expect("read Shell request");
             assert!(matches!(
                 request.body,
-                cats_api::guest::GuestRequestBody::Shell { .. }
+                cats_protocol::guest::GuestRequestBody::Shell { .. }
             ));
-            cats_api::guest::write_frame(
+            cats_protocol::guest::write_frame(
                 &mut guest,
-                &cats_api::guest::GuestResponse {
+                &cats_protocol::guest::GuestResponse {
                     id: request.id,
-                    body: cats_api::guest::GuestResponseBody::ShellReady,
+                    body: cats_protocol::guest::GuestResponseBody::ShellReady,
                 },
             )
             .expect("write ShellReady");
-            cats_api::guest::write_frame(
+            cats_protocol::guest::write_frame(
                 &mut guest,
                 &GuestShellFrame::Output {
                     data: vec![0x5a; output_len],
@@ -3677,9 +3687,9 @@ mod tests {
             )
             .expect("write fake Guest output");
             let close: GuestShellFrame =
-                cats_api::guest::read_frame(&mut guest).expect("read Node Close");
+                cats_protocol::guest::read_frame(&mut guest).expect("read Node Close");
             assert_eq!(close, GuestShellFrame::Close);
-            cats_api::guest::write_frame(&mut guest, &GuestShellFrame::Exit { exit_code: 0 })
+            cats_protocol::guest::write_frame(&mut guest, &GuestShellFrame::Exit { exit_code: 0 })
                 .expect("write terminal Guest Exit");
         });
         let effects = Arc::new(GuestTargetEffects(RuntimeAccessTarget {
@@ -3786,13 +3796,13 @@ mod tests {
             guest
                 .write_all(b"OK 1073741824\n")
                 .expect("write hybrid ACK");
-            let request: cats_api::guest::GuestRequest =
-                cats_api::guest::read_frame(&mut guest).expect("read Shell request");
-            cats_api::guest::write_frame(
+            let request: cats_protocol::guest::GuestRequest =
+                cats_protocol::guest::read_frame(&mut guest).expect("read Shell request");
+            cats_protocol::guest::write_frame(
                 &mut guest,
-                &cats_api::guest::GuestResponse {
+                &cats_protocol::guest::GuestResponse {
                     id: request.id,
-                    body: cats_api::guest::GuestResponseBody::Error {
+                    body: cats_protocol::guest::GuestResponseBody::Error {
                         message: "shell unavailable".to_owned(),
                     },
                 },

@@ -5,8 +5,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use cats_api::guest::{GUEST_HOST_CONTROL_VSOCK_PORT_V1, GUEST_RUNTIME_SOCKET_PATH};
 use cats_guest_agent::{bind_vsock, GuestAgent, GuestMode};
+use cats_protocol::guest::{GUEST_HOST_CONTROL_VSOCK_PORT_V1, GUEST_RUNTIME_SOCKET_PATH};
 
 #[derive(Parser, Debug)]
 #[command(name = "cats-guest-agent", about = "Cats in-guest control agent")]

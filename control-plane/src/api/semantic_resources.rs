@@ -15,8 +15,8 @@ use axum::http::{header, HeaderMap, Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-use cats_api::error::ErrorCode;
-use cats_api::semantic_control::{
+use cats_protocol::error::ErrorCode;
+use cats_protocol::semantic_control::{
     AttachDiskRequest, CatAction, CatResponse, CatView, CreateCatRequest, CreateDiskRequest,
     DetachDiskRequest, DiskResponse, DiskView, ResourceSlug, SemanticErrorBody, SemanticErrorCode,
     SemanticSuccessCode,
@@ -557,8 +557,8 @@ mod tests {
     use std::sync::Mutex;
 
     use axum::http::HeaderValue;
-    use cats_api::runtime_reconciliation::Id;
-    use cats_api::semantic_control::{
+    use cats_protocol::runtime_reconciliation::Id;
+    use cats_protocol::semantic_control::{
         CatView, DiskStatus, DiskView, NodeName, PersistentMountPath, SemanticStatus,
     };
 
@@ -785,7 +785,7 @@ mod tests {
                 cat_id: id("cat_01"),
                 workspace_id: id("ws_01"),
                 cat_slug,
-                state: Some(cats_api::semantic_control::CatState::Running),
+                state: Some(cats_protocol::semantic_control::CatState::Running),
                 current_action: None,
                 node_id: Some(id("node_01")),
                 node_name: Some(NodeName::new("node-one").expect("node name")),

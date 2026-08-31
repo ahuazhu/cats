@@ -2,12 +2,6 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use cats_api::runtime_reconciliation::Id;
-use cats_api::semantic_control::{
-    CatAction as NodeAction, CatState as NodeState, NodedCatConfig, NodedControlEndpoint,
-    NodedDiskMount, NodedServiceToken, PersistentDiskFormat, PersistentMountPath,
-    SemanticErrorCode,
-};
 use cats_control_plane::semantic_adapters::SemanticNodedLifecycleAdapter;
 use cats_control_plane::semantic_lifecycle::{
     classify_action, classify_create, ActionClaim, ActionDecision, Admission,
@@ -24,6 +18,12 @@ use cats_control_plane::semantic_noded_client::{SemanticNodedClient, SemanticNod
 use cats_node_agent::semantic_lifecycle::{
     semantic_node_router, SemanticActionCancellation, SemanticCatEffects, SemanticEffectError,
     SemanticEffectFuture, SemanticEffectRequest, SemanticNodeService,
+};
+use cats_protocol::runtime_reconciliation::Id;
+use cats_protocol::semantic_control::{
+    CatAction as NodeAction, CatState as NodeState, NodedCatConfig, NodedControlEndpoint,
+    NodedDiskMount, NodedServiceToken, PersistentDiskFormat, PersistentMountPath,
+    SemanticErrorCode,
 };
 use tokio::sync::{oneshot, Notify};
 use tokio::time::Instant;
@@ -703,8 +703,10 @@ fn noded_config() -> NodedCatConfig {
         mounts: vec![NodedDiskMount {
             disk_id: Id::new("disk_01").expect("Disk ID"),
             volume_id: Id::new("vol_01").expect("Volume ID"),
-            filesystem_uuid: cats_api::runtime_reconciliation::RandomId128::new("1".repeat(32))
-                .expect("filesystem UUID"),
+            filesystem_uuid: cats_protocol::runtime_reconciliation::RandomId128::new(
+                "1".repeat(32),
+            )
+            .expect("filesystem UUID"),
             format: PersistentDiskFormat::Ext4,
             mount_path: PersistentMountPath::new("/data").expect("mount path"),
         }],

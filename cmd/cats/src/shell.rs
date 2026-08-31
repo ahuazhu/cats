@@ -12,7 +12,7 @@ use tokio_tungstenite::tungstenite::http::{header, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 
-use cats_api::sessions::{ShellClientControl, ShellServerControl, MAX_SHELL_MESSAGE_BYTES};
+use cats_protocol::sessions::{ShellClientControl, ShellServerControl, MAX_SHELL_MESSAGE_BYTES};
 
 /// Restores the caller's terminal on every normal and error return after raw
 /// mode has been enabled. The interactive loop catches the Unix terminating
@@ -534,7 +534,7 @@ mod tests {
         run_async, send_websocket_with_signal, spawn_stdin_reader, websocket_config, StdinEvent,
         TerminationSignal,
     };
-    use cats_api::sessions::MAX_SHELL_MESSAGE_BYTES;
+    use cats_protocol::sessions::MAX_SHELL_MESSAGE_BYTES;
 
     #[tokio::test]
     async fn detached_stdin_reader_reports_data_then_eof() {

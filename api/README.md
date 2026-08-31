@@ -1,11 +1,16 @@
 # cats-api
 
-`cats-api` contains the shared Rust request, response, and protocol types used
-by the [Cats](https://github.com/ahuazhu/cats) microVM platform.
+`cats-api` contains the public HTTP request and response types used by clients
+of the [Cats](https://github.com/ahuazhu/cats) microVM platform.
 
-It is published primarily as the protocol dependency of `cats-cli`. Platform
-architecture, protocol status, and compatibility boundaries are documented in
-the repository.
+Cross-component wire contracts and strict codecs live in `cats-protocol`.
+Fail-closed readers for installed Host artifacts live in `cats-artifacts`.
+Compatibility features preserve the former `cats_api` module paths for
+existing library consumers; workspace components use the owning crates
+directly.
+
+Platform architecture, protocol status, and compatibility boundaries are
+documented in the repository.
 
 ## License
 

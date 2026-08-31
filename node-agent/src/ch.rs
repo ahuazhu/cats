@@ -37,7 +37,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use cats_api::runtime_reconciliation::{
+use cats_protocol::runtime_reconciliation::{
     Id, IsolatedIpv4Kind, NetworkConfig, RandomId128, RuntimeNetworkIdentity,
     GUEST_DEVICE_SERIAL_MAX_BYTES_V1,
 };
@@ -97,7 +97,7 @@ pub struct ChConfig {
     /// the exact boot bytes for every fresh launch. `None` exists only for
     /// test and historical experiment constructors that do not use the
     /// production installed release paths.
-    pub boot_contract: Option<cats_api::runtime_artifacts::GuestRuntimeBootContract>,
+    pub boot_contract: Option<cats_artifacts::GuestRuntimeBootContract>,
     /// Kernel command line; `root=/dev/vda` etc.
     pub cmdline: String,
     /// Golden root: the raw image a generation-0 root volume is provisioned from.
@@ -1175,8 +1175,16 @@ struct IpJsonAddress {
 impl HostNetworkSnapshot {
     fn managed_networks(
         &self,
-    ) -> Result<BTreeMap<String, (cats_api::runtime_reconciliation::Id, RandomId128, Ipv4Cidr)>>
-    {
+    ) -> Result<
+        BTreeMap<
+            String,
+            (
+                cats_protocol::runtime_reconciliation::Id,
+                RandomId128,
+                Ipv4Cidr,
+            ),
+        >,
+    > {
         let mut managed = BTreeMap::new();
         let mut network_ids = BTreeSet::new();
         let mut ownership_tokens = BTreeSet::new();
@@ -1383,7 +1391,9 @@ fn is_managed_tap_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
 }
 
-fn parse_network_alias(alias: &str) -> Result<(cats_api::runtime_reconciliation::Id, RandomId128)> {
+fn parse_network_alias(
+    alias: &str,
+) -> Result<(cats_protocol::runtime_reconciliation::Id, RandomId128)> {
     let fields = alias
         .strip_prefix("cats-network:")
         .context("Host network alias is outside the Cats namespace")?;
@@ -1395,7 +1405,7 @@ fn parse_network_alias(alias: &str) -> Result<(cats_api::runtime_reconciliation:
         "Cats Host network alias lacks network ID"
     );
     Ok((
-        cats_api::runtime_reconciliation::Id::new(network_id.to_owned())
+        cats_protocol::runtime_reconciliation::Id::new(network_id.to_owned())
             .context("Cats Host network alias has invalid network ID")?,
         RandomId128::new(ownership_token.to_owned())
             .context("Cats Host network alias has invalid ownership token")?,
@@ -2673,7 +2683,7 @@ pub(crate) struct SpawnedVmm {
     /// `/proc/self/fd/<n>` paths. Cloud Hypervisor persists those paths in a
     /// Warm snapshot, so the Node must retain the exact descriptors until the
     /// Warm runtime is either restored or discarded.
-    pub(crate) boot_descriptors: Option<cats_api::runtime_artifacts::VerifiedGuestRuntimeLaunch>,
+    pub(crate) boot_descriptors: Option<cats_artifacts::VerifiedGuestRuntimeLaunch>,
 }
 
 pub(crate) fn spawn_vmm_retaining_boot(s: &ChSpawn<'_>) -> Result<SpawnedVmm> {
@@ -2686,7 +2696,7 @@ pub(crate) fn spawn_vmm_retaining_boot(s: &ChSpawn<'_>) -> Result<SpawnedVmm> {
             .boot_contract
             .as_ref()
             .map(|contract| {
-                cats_api::runtime_artifacts::open_verified_guest_runtime_launch(
+                cats_artifacts::open_verified_guest_runtime_launch(
                     contract,
                     &s.cfg.kernel,
                     s.cfg.initramfs.as_deref(),
@@ -3576,7 +3586,7 @@ mod tests {
     }
 
     fn desired_network() -> NetworkConfig {
-        use cats_api::runtime_reconciliation::{Id, Ipv4Address, MacAddress};
+        use cats_protocol::runtime_reconciliation::{Id, Ipv4Address, MacAddress};
 
         NetworkConfig {
             kind: IsolatedIpv4Kind::IsolatedIpv4,
@@ -3598,7 +3608,7 @@ mod tests {
     }
 
     fn incumbent_network() -> RuntimeNetworkIdentity {
-        use cats_api::runtime_reconciliation::{Id, Ipv4Address, MacAddress};
+        use cats_protocol::runtime_reconciliation::{Id, Ipv4Address, MacAddress};
 
         RuntimeNetworkIdentity {
             network_config: NetworkConfig {
@@ -3719,12 +3729,14 @@ mod tests {
 
         let overlap = bind_desired_network(
             &NetworkConfig {
-                network_id: cats_api::runtime_reconciliation::Id::new("net_overlap").unwrap(),
-                guest_mac: cats_api::runtime_reconciliation::MacAddress::new("02:ca:0a:f0:00:02")
+                network_id: cats_protocol::runtime_reconciliation::Id::new("net_overlap").unwrap(),
+                guest_mac: cats_protocol::runtime_reconciliation::MacAddress::new(
+                    "02:ca:0a:f0:00:02",
+                )
+                .unwrap(),
+                guest_ipv4: cats_protocol::runtime_reconciliation::Ipv4Address::new("10.240.0.2")
                     .unwrap(),
-                guest_ipv4: cats_api::runtime_reconciliation::Ipv4Address::new("10.240.0.2")
-                    .unwrap(),
-                gateway_ipv4: cats_api::runtime_reconciliation::Ipv4Address::new("10.240.0.1")
+                gateway_ipv4: cats_protocol::runtime_reconciliation::Ipv4Address::new("10.240.0.1")
                     .unwrap(),
                 ..desired_network()
             },
@@ -3840,7 +3852,7 @@ mod tests {
 
     #[test]
     fn exact_desired_network_is_retained_without_cat_or_cidr_derivation() {
-        use cats_api::runtime_reconciliation::{Ipv4Address, MacAddress};
+        use cats_protocol::runtime_reconciliation::{Ipv4Address, MacAddress};
 
         let desired = desired_network();
         let ownership = RandomId128::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
@@ -3905,7 +3917,8 @@ mod tests {
     #[test]
     fn network_alias_round_trips_colon_bearing_network_id() {
         let config = NetworkConfig {
-            network_id: cats_api::runtime_reconciliation::Id::new("tenant:segment:42").unwrap(),
+            network_id: cats_protocol::runtime_reconciliation::Id::new("tenant:segment:42")
+                .unwrap(),
             ..desired_network()
         };
         let network = bind_desired_network(
@@ -4161,7 +4174,7 @@ exit 0\n",
         );
         let identity = RuntimeNetworkIdentity {
             network_config: network.config.clone(),
-            tap_name: cats_api::runtime_reconciliation::Id::new(network.tap.clone()).unwrap(),
+            tap_name: cats_protocol::runtime_reconciliation::Id::new(network.tap.clone()).unwrap(),
             ownership_token: network.ownership_token.clone(),
         };
         assert_eq!(
@@ -4255,7 +4268,8 @@ exit 0\n",
             assert!(replacement_link.ipv4.is_empty());
             let identity = RuntimeNetworkIdentity {
                 network_config: network.config.clone(),
-                tap_name: cats_api::runtime_reconciliation::Id::new(network.tap.clone()).unwrap(),
+                tap_name: cats_protocol::runtime_reconciliation::Id::new(network.tap.clone())
+                    .unwrap(),
                 ownership_token: network.ownership_token.clone(),
             };
             assert!(

@@ -2,7 +2,7 @@
 
 - 状态：Frozen v1（V1 dev shape 已实现）
 - 决策依据：[ADR-0007](../decisions/0007-guest-runtime-http-over-unix-socket.md)
-- 实现：`api/src/guest.rs`、`guest/src/lib.rs`
+- 实现：`protocol/src/guest.rs`、`guest/src/lib.rs`
 
 ## 1. 传输与发现
 

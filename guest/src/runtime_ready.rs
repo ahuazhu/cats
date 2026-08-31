@@ -12,12 +12,12 @@ use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use cats_api::guest::{
+use cats_protocol::guest::{
     RuntimeReadyDeviceV1, RuntimeReadyMountV1, RuntimeReadyRequestV1, RuntimeReadyResponseV1,
     GUEST_HOST_CONTROL_PROTOCOL_VERSION_V1, RUNTIME_READY_MAX_DEVICES_V1,
     RUNTIME_READY_MAX_MOUNTS_V1,
 };
-use cats_api::runtime_reconciliation::{
+use cats_protocol::runtime_reconciliation::{
     GuestBootId, GuestDeviceIdentity, HostPath, Id, MountAccess, RandomId128,
 };
 

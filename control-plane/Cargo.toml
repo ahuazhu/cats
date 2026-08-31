@@ -12,6 +12,7 @@ test-support = []
 
 [dependencies]
 cats-api = { workspace = true }
+cats-protocol = { workspace = true }
 cats-metering = { workspace = true }
 cats-storage = { workspace = true }
 anyhow = { workspace = true }

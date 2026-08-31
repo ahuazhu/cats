@@ -33,7 +33,7 @@ use cats_storage::blob::{BlobStore, Result as BlobResult};
 use cats_storage::{open_blob_store, AdapterConfig, BlobStoreFactory, MetadataStore, VolumeHead};
 use cats_test_support::{prepare_sqlite_authorized_serving, SqliteTestVolumeGrant};
 
-const CHUNK: u64 = cats_api::chunk::CHUNK_SIZE as u64;
+const CHUNK: u64 = cats_protocol::chunk::CHUNK_SIZE as u64;
 const MIB: f64 = 1024.0 * 1024.0;
 
 /// Splits what a volume uploaded for itself from what the shared image cost, and
@@ -232,7 +232,7 @@ fn provisioning_one_root_disk() {
         "image MiB", "path", "uploaded MiB", "objects", "provision ms", "speedup", "gen"
     );
     for image_mib in [64u64, 256, 512] {
-        let size = cats_api::chunk::round_up_to_chunk(image_mib * MIB as u64) + 4 * CHUNK;
+        let size = cats_protocol::chunk::round_up_to_chunk(image_mib * MIB as u64) + 4 * CHUNK;
         let mut copy_samples = Vec::new();
         let mut copy_report = (0u64, 0u64, 0i64);
         for repeat in 0..repeats {
@@ -311,7 +311,7 @@ fn provisioning_one_root_disk() {
 #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
 fn provisioning_many_root_disks_from_one_image() {
     let image_mib = 256u64;
-    let size = cats_api::chunk::round_up_to_chunk(image_mib * MIB as u64) + 4 * CHUNK;
+    let size = cats_protocol::chunk::round_up_to_chunk(image_mib * MIB as u64) + 4 * CHUNK;
     println!(
         "\nimage {image_mib} MiB, {} logical cpus\n{:>8} {:>10} {:>12} {:>10} {:>14} {:>10}",
         std::thread::available_parallelism()
@@ -377,7 +377,7 @@ fn provisioning_many_root_disks_from_one_image() {
 #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
 fn first_read_of_a_referenced_chunk_versus_a_private_one() {
     let image_mib = 64u64;
-    let size = cats_api::chunk::round_up_to_chunk(image_mib * MIB as u64);
+    let size = cats_protocol::chunk::round_up_to_chunk(image_mib * MIB as u64);
     let chunks = size / CHUNK;
     println!("\n{:>12} {:>18} {:>18}", "path", "cold read ms", "MiB/s");
     for by_reference in [false, true] {

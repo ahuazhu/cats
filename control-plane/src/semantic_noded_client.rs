@@ -7,8 +7,8 @@
 use std::future::Future;
 use std::time::Duration;
 
-use cats_api::runtime_reconciliation::Id;
-use cats_api::semantic_control::{
+use cats_protocol::runtime_reconciliation::Id;
+use cats_protocol::semantic_control::{
     noded_cat_action_path, noded_cat_path, CatAction, NodedCatActionRequest, NodedCatListResponse,
     NodedCatResponse, NodedCatView, NodedControlEndpoint, NodedCreateCatRequest, NodedResultStatus,
     NodedServiceToken, SemanticErrorBody, SemanticValidationError, NODED_AUTHORIZATION_HEADER,
@@ -441,8 +441,8 @@ mod tests {
     use axum::http::{header, Response};
     use axum::routing::any;
     use axum::Router;
-    use cats_api::runtime_reconciliation::RandomId128;
-    use cats_api::semantic_control::{
+    use cats_protocol::runtime_reconciliation::RandomId128;
+    use cats_protocol::semantic_control::{
         CatState, NodedCatConfig, NodedDiskMount, PersistentDiskFormat, PersistentMountPath,
         SemanticErrorCode, NODED_BEARER_SCHEME,
     };

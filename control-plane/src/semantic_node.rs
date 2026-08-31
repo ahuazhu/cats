@@ -9,8 +9,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cats_api::error::ApiError;
-use cats_api::semantic_control::{
+use cats_protocol::error::ApiError;
+use cats_protocol::semantic_control::{
     NodeHeartbeatRequest, NodeHeartbeatResponse, NodeRegistrationRequest, NodeRegistrationResponse,
     NodeStatus, NodedServiceToken, NODED_HEALTH_PATH,
 };
@@ -111,7 +111,7 @@ impl NodeHealthProbe for HttpNodeHealthProbe {
             Ok(client
                 .get(url)
                 .header(
-                    cats_api::semantic_control::NODED_AUTHORIZATION_HEADER,
+                    cats_protocol::semantic_control::NODED_AUTHORIZATION_HEADER,
                     service_token.authorization_value(),
                 )
                 .send()
@@ -393,8 +393,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    use cats_api::runtime_reconciliation::Id;
-    use cats_api::semantic_control::{
+    use cats_protocol::runtime_reconciliation::Id;
+    use cats_protocol::semantic_control::{
         NodeHeartbeatStatus, NodeName, NodeRegistrationStatus, NodedControlEndpoint,
     };
 
@@ -448,7 +448,7 @@ mod tests {
             Box::pin(async move {
                 Ok(NodeRegistrationResponse {
                     status: NodeRegistrationStatus::Registered,
-                    node: cats_api::semantic_control::NodeView {
+                    node: cats_protocol::semantic_control::NodeView {
                         node_id: request.node_id,
                         node_name: request.node_name,
                         control_endpoint: request.control_endpoint,

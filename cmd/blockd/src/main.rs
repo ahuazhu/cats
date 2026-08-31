@@ -13,16 +13,16 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use cats_api::blockd::{BlockdControlCommand, BlockdControlResponse};
-use cats_api::runtime_reconciliation::{
-    HostPath, Id, ProvisionRootImageRequest, ProvisionRootImageResult, RandomId128,
-    GUEST_DEVICE_SERIAL_MAX_BYTES_V1,
-};
 use cats_blockd::engine::{ChunkEngine, EngineConfig, ProvisionRootImageEffectError};
 use cats_blockd::nbd;
 use cats_metadata_store_postgres::PostgresVolumeDataAuthority;
 use cats_object_store_aws_s3::AwsS3BlobStoreFactory;
 use cats_object_store_file::FileBlobStoreFactory;
+use cats_protocol::blockd::{BlockdControlCommand, BlockdControlResponse};
+use cats_protocol::runtime_reconciliation::{
+    HostPath, Id, ProvisionRootImageRequest, ProvisionRootImageResult, RandomId128,
+    GUEST_DEVICE_SERIAL_MAX_BYTES_V1,
+};
 use cats_storage::authority::AuthorizedServingAttachment;
 use cats_storage::{open_blob_store, AdapterConfig, BlobStoreFactory};
 use clap::Parser;
@@ -672,7 +672,7 @@ fn serve_root_provision_control(
         }
         let Some(frame) = read_first_lf_frame(
             &mut connection,
-            cats_api::runtime_reconciliation::PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES,
+            cats_protocol::runtime_reconciliation::PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES,
             PROVISION_CONTROL_IO_TIMEOUT,
         ) else {
             continue;
@@ -692,7 +692,7 @@ fn serve_root_provision_control(
             continue;
         };
         let Ok(request) =
-            cats_api::runtime_reconciliation::decode_provision_root_image_request(payload)
+            cats_protocol::runtime_reconciliation::decode_provision_root_image_request(payload)
         else {
             continue;
         };
@@ -717,11 +717,13 @@ fn encode_root_provision_response(
         -> std::result::Result<ProvisionRootImageResult, ProvisionRootImageEffectError>,
 ) -> Option<(&'static [u8], Vec<u8>)> {
     match effect(request) {
-        Ok(result) => cats_api::runtime_reconciliation::encode_provision_root_image_result(&result)
-            .ok()
-            .map(|json| (b"OK ".as_slice(), json)),
+        Ok(result) => {
+            cats_protocol::runtime_reconciliation::encode_provision_root_image_result(&result)
+                .ok()
+                .map(|json| (b"OK ".as_slice(), json))
+        }
         Err(ProvisionRootImageEffectError::Closed(error)) => {
-            cats_api::runtime_reconciliation::encode_provision_root_image_error(&error)
+            cats_protocol::runtime_reconciliation::encode_provision_root_image_error(&error)
                 .ok()
                 .map(|json| (b"ERR ".as_slice(), json))
         }

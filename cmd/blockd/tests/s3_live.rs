@@ -59,7 +59,7 @@ fn engine_flush_and_empty_cache_restore_through_live_s3() {
     let blob: Arc<dyn BlobStore> = Arc::new(store);
     let dir = tempfile::tempdir().unwrap();
     let meta = Arc::new(SqliteMetadataStore::open(&dir.path().join("meta.db")).unwrap());
-    let size = 2 * cats_api::chunk::CHUNK_SIZE as u64;
+    let size = 2 * cats_protocol::chunk::CHUNK_SIZE as u64;
     meta.create_volume("vol_live", size).unwrap();
     let payload: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
     {

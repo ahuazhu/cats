@@ -92,7 +92,9 @@ cargo test -p cats-control-plane --test semantic_noded_http_lifecycle
 ## Workspace
 
 ```text
-api/             跨组件资源、请求、协议类型
+api/             面向客户端的公共HTTP请求/响应类型
+protocol/        跨组件wire合同、严格codec、签名与协议常量
+artifacts/       已安装runtime制品的fail-closed读取与启动验证
 storage/         provider-neutral BlobStore/MetadataStore contracts
 adapters/        File/S3、SQLite/PostgreSQL等具体adapter
 blockd/          ChunkStore engine、NBD和vhost-user-blk frontend

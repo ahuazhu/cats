@@ -12,11 +12,11 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::production_mutation_admission::{
+use cats_protocol::production_mutation_admission::{
     decode_production_cutover_operator_trust_bundle, ProductionCutoverOperatorTrustBundle,
     PRODUCTION_MUTATION_ADMISSION_REQUEST_MAX_WIRE_BYTES,
 };
-use crate::runtime_reconciliation::{
+use cats_protocol::runtime_reconciliation::{
     decode_guest_runtime_profile_receipt, decode_runtime_provisioner_trust_bundle, ContractVersion,
     GuestRuntimeProfileReceipt, RuntimeProvisionerTrustBundle, Sha256Digest, WireU64,
     GUEST_RUNTIME_PROFILE_RECEIPT_MAX_WIRE_BYTES, RUNTIME_PROVISIONER_TRUST_BUNDLE_MAX_WIRE_BYTES,
@@ -438,7 +438,7 @@ fn decode_release_manifest(
     }
     let manifest: GuestRuntimeReleaseManifest =
         serde_json::from_slice(bytes).map_err(|_| RuntimeArtifactError::InvalidReceipt)?;
-    let canonical = crate::runtime_reconciliation::canonical_json_value_bytes(
+    let canonical = cats_protocol::runtime_reconciliation::canonical_json_value_bytes(
         &serde_json::to_value(&manifest).map_err(|_| RuntimeArtifactError::InvalidReceipt)?,
     );
     if canonical != bytes

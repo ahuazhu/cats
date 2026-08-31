@@ -1,11 +1,11 @@
 //! Mint the production cutover operator trust bundle with the crate's own
 //! canonical encoder, so the wire shape cannot drift from the validator.
-use cats_api::production_mutation_admission::{
+use cats_protocol::production_mutation_admission::{
     encode_production_cutover_operator_trust_bundle, ProductionCutoverAwsPartition,
     ProductionCutoverAwsRoleScope, ProductionCutoverOperatorCredential,
     ProductionCutoverOperatorTrustBundle,
 };
-use cats_api::runtime_reconciliation::{Base64UrlNoPad, ContractVersion, Id, WireU64};
+use cats_protocol::runtime_reconciliation::{Base64UrlNoPad, ContractVersion, Id, WireU64};
 
 fn main() {
     let mut args = std::env::args().skip(1);

@@ -11,8 +11,8 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Mutex;
 
-use cats_api::metering::{CatUsageCheckpoint, UsageEpochMarker, UsageMetric};
-use cats_api::runtime_reconciliation::{
+use cats_protocol::metering::{CatUsageCheckpoint, UsageEpochMarker, UsageMetric};
+use cats_protocol::runtime_reconciliation::{
     Epoch, Id, NodeBootId, RandomId128, Revision, SessionBinding,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -2770,14 +2770,15 @@ mod tests {
             checkpoint,
             source_binding: RuntimeUsageSourceBinding {
                 session: SessionBinding {
-                    node_id: cats_api::runtime_reconciliation::Id::new("node-a").unwrap(),
-                    node_boot_id: cats_api::runtime_reconciliation::NodeBootId::new(
+                    node_id: cats_protocol::runtime_reconciliation::Id::new("node-a").unwrap(),
+                    node_boot_id: cats_protocol::runtime_reconciliation::NodeBootId::new(
                         "11111111111111111111111111111111",
                     )
                     .unwrap(),
                     agent_instance_id: RandomId128::new("22222222222222222222222222222222")
                         .unwrap(),
-                    agent_session_epoch: cats_api::runtime_reconciliation::Epoch::new(1).unwrap(),
+                    agent_session_epoch: cats_protocol::runtime_reconciliation::Epoch::new(1)
+                        .unwrap(),
                 },
                 desired_revision: Revision::new(7).unwrap(),
                 runtime_incarnation: RandomId128::new("33333333333333333333333333333333").unwrap(),

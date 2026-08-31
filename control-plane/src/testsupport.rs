@@ -51,8 +51,8 @@ pub fn test_boot_image() -> String {
 /// Explicit typed receipt injection for tests that never exercise the
 /// production fixed-path filesystem reader.
 pub fn test_guest_runtime_profile_receipt(
-) -> cats_api::runtime_reconciliation::GuestRuntimeProfileReceipt {
-    use cats_api::runtime_reconciliation::{
+) -> cats_protocol::runtime_reconciliation::GuestRuntimeProfileReceipt {
+    use cats_protocol::runtime_reconciliation::{
         AsciiText, ContractVersion, GuestRuntimeProfileReceipt, Sha256Digest,
     };
 
@@ -74,8 +74,8 @@ pub fn test_guest_runtime_profile_receipt(
 /// inject the typed value and therefore do not weaken the production fixed-
 /// path filesystem reader.
 pub fn test_runtime_provisioner_trust_bundle(
-) -> cats_api::runtime_reconciliation::RuntimeProvisionerTrustBundle {
-    use cats_api::runtime_reconciliation::{
+) -> cats_protocol::runtime_reconciliation::RuntimeProvisionerTrustBundle {
+    use cats_protocol::runtime_reconciliation::{
         Base64UrlNoPad, ContractVersion, Epoch, Id, RuntimeProvisionerCredential,
         RuntimeProvisionerTrustBundle,
     };
@@ -97,12 +97,12 @@ pub fn test_runtime_provisioner_trust_bundle(
 
 /// Independent qualification-operator public trust for server tests.
 pub fn test_production_cutover_operator_trust_bundle(
-) -> cats_api::production_mutation_admission::ProductionCutoverOperatorTrustBundle {
-    use cats_api::production_mutation_admission::{
+) -> cats_protocol::production_mutation_admission::ProductionCutoverOperatorTrustBundle {
+    use cats_protocol::production_mutation_admission::{
         ProductionCutoverAwsPartition, ProductionCutoverAwsRoleScope,
         ProductionCutoverOperatorCredential, ProductionCutoverOperatorTrustBundle,
     };
-    use cats_api::runtime_reconciliation::{Base64UrlNoPad, ContractVersion, Id, WireU64};
+    use cats_protocol::runtime_reconciliation::{Base64UrlNoPad, ContractVersion, Id, WireU64};
 
     ProductionCutoverOperatorTrustBundle {
         version: ContractVersion::V1,
@@ -134,15 +134,15 @@ pub fn test_production_cutover_operator_trust_bundle(
 #[cfg(any(test, debug_assertions, feature = "test-support"))]
 pub fn begin_production_qualification_for_product_test(
     store: &crate::store::Store,
-    workspace_id: &cats_api::runtime_reconciliation::Id,
-) -> cats_api::production_mutation_admission::ProductionQualificationAdmissionBinding {
-    use cats_api::production_mutation_admission::{
+    workspace_id: &cats_protocol::runtime_reconciliation::Id,
+) -> cats_protocol::production_mutation_admission::ProductionQualificationAdmissionBinding {
+    use cats_protocol::production_mutation_admission::{
         ProductionCutoverAwsPartition, ProductionMutationAdmissionBinding,
         ProductionMutationAdmissionCommand, ProductionMutationAdmissionMode,
         ProductionMutationAdmissionMutation, ProductionMutationAdmissionStoredOutcome,
         ProductionQualificationAdmissionBinding, PRODUCTION_QUALIFICATION_MUTATION_CLASSES,
     };
-    use cats_api::runtime_reconciliation::{
+    use cats_protocol::runtime_reconciliation::{
         ContractVersion, Epoch, Id, RandomId128, Sha256Digest, UnixMillis, WireU64,
     };
     use sha2::{Digest as _, Sha256};
@@ -193,7 +193,7 @@ pub fn begin_production_qualification_for_product_test(
         release_id: Id::new("release_a").expect("valid test release ID"),
         source_commit_sha: "a".repeat(40),
         control_schema_version: WireU64::new(
-            cats_api::production_mutation_admission::PRODUCTION_MUTATION_ADMISSION_SCHEMA_VERSION,
+            cats_protocol::production_mutation_admission::PRODUCTION_MUTATION_ADMISSION_SCHEMA_VERSION,
         )
         .expect("valid schema version"),
         source_manifest_sha256: digest('0'),
@@ -235,7 +235,7 @@ pub fn begin_production_qualification_for_product_test(
         ProductionMutationAdmissionStoredOutcome::Applied { ref state }
             if state.mode == ProductionMutationAdmissionMode::Qualification
                 && state.binding.as_ref()
-                    == Some(&cats_api::production_mutation_admission::ProductionMutationAdmissionBinding::Qualification(binding.clone()))
+                    == Some(&cats_protocol::production_mutation_admission::ProductionMutationAdmissionBinding::Qualification(binding.clone()))
     ));
     binding
 }
@@ -245,12 +245,12 @@ pub fn begin_production_qualification_for_product_test(
 /// singleton to another exact Workspace scope.
 #[cfg(any(test, debug_assertions, feature = "test-support"))]
 pub fn end_production_qualification_for_product_test(store: &crate::store::Store) {
-    use cats_api::production_mutation_admission::{
+    use cats_protocol::production_mutation_admission::{
         ProductionMutationAdmissionBinding, ProductionMutationAdmissionCommand,
         ProductionMutationAdmissionMode, ProductionMutationAdmissionMutation,
         ProductionMutationAdmissionStoredOutcome,
     };
-    use cats_api::runtime_reconciliation::{ContractVersion, Epoch, RandomId128, UnixMillis};
+    use cats_protocol::runtime_reconciliation::{ContractVersion, Epoch, RandomId128, UnixMillis};
     use sha2::{Digest as _, Sha256};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -294,8 +294,8 @@ pub fn end_production_qualification_for_product_test(store: &crate::store::Store
 
 #[cfg(any(test, debug_assertions, feature = "test-support"))]
 fn test_production_cutover_sts_principal(
-) -> cats_api::production_mutation_admission::ProductionCutoverStsPrincipal {
-    use cats_api::production_mutation_admission::{
+) -> cats_protocol::production_mutation_admission::ProductionCutoverStsPrincipal {
+    use cats_protocol::production_mutation_admission::{
         ProductionCutoverAwsPartition, ProductionCutoverStsPrincipal,
     };
 
@@ -311,15 +311,15 @@ fn test_production_cutover_sts_principal(
 #[cfg(any(test, debug_assertions, feature = "test-support"))]
 fn apply_production_admission_for_product_test(
     store: &crate::store::Store,
-    command: &cats_api::production_mutation_admission::ProductionMutationAdmissionCommand,
+    command: &cats_protocol::production_mutation_admission::ProductionMutationAdmissionCommand,
     now_unix_ms: u64,
-) -> cats_api::production_mutation_admission::ProductionMutationAdmissionCommandReceipt {
-    use cats_api::node_identity::Ed25519RequestSigner;
-    use cats_api::production_mutation_admission::{
+) -> cats_protocol::production_mutation_admission::ProductionMutationAdmissionCommandReceipt {
+    use cats_protocol::node_identity::Ed25519RequestSigner;
+    use cats_protocol::production_mutation_admission::{
         encode_production_mutation_admission_command, sign_production_mutation_admission_command,
         verify_production_mutation_admission_command,
     };
-    use cats_api::runtime_reconciliation::Id;
+    use cats_protocol::runtime_reconciliation::Id;
 
     let body = encode_production_mutation_admission_command(command)
         .expect("canonical test production admission command");
@@ -361,7 +361,7 @@ fn apply_production_admission_for_product_test(
 /// server using the next revision is started.
 pub fn seed_runtime_provisioner_trust_bundle(
     dsn: &str,
-    bundle: &cats_api::runtime_reconciliation::RuntimeProvisionerTrustBundle,
+    bundle: &cats_protocol::runtime_reconciliation::RuntimeProvisionerTrustBundle,
 ) {
     let dsn = dsn.to_owned();
     let bundle = bundle.clone();
@@ -377,7 +377,7 @@ pub fn seed_runtime_provisioner_trust_bundle(
 /// isolated HTTP server remains live.
 pub async fn install_runtime_provisioner_trust_bundle(
     store: &Arc<crate::store::Store>,
-    bundle: cats_api::runtime_reconciliation::RuntimeProvisionerTrustBundle,
+    bundle: cats_protocol::runtime_reconciliation::RuntimeProvisionerTrustBundle,
 ) {
     store
         .execute(move |store| store.install_runtime_provisioner_trust_bundle(&bundle))
@@ -439,7 +439,7 @@ fn isolated_schema_url(base: &str, schema: &str) -> String {
 /// transport tests need a real PostgreSQL identity authority now.
 pub async fn provision_node_identity(
     store: &Arc<crate::store::Store>,
-    identity: cats_api::runtime_reconciliation::NodeIdentity,
+    identity: cats_protocol::runtime_reconciliation::NodeIdentity,
 ) {
     store
         .execute(move |store| store.provision_node_identity(&identity))

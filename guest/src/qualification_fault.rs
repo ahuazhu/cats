@@ -14,10 +14,10 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context as _, Result};
-use cats_api::guest::{
+use cats_protocol::guest::{
     FilesystemControlOperationV1, FilesystemControlOutcomeV1, FilesystemControlResponseV1,
 };
-use cats_api::runtime_reconciliation::{FilesystemInitialization, Id, RandomId128};
+use cats_protocol::runtime_reconciliation::{FilesystemInitialization, Id, RandomId128};
 use serde::{Deserialize, Serialize};
 
 const DIRECTORY: &str = "/run/cats/qualification";
@@ -58,7 +58,7 @@ fn invocation_name(filesystem_uuid: &RandomId128) -> String {
 }
 
 fn increment_invocations(
-    request: &cats_api::guest::FilesystemControlRequestV1,
+    request: &cats_protocol::guest::FilesystemControlRequestV1,
     initialization_token: &RandomId128,
 ) -> Result<FormatInvocationV1> {
     let mut counts = FORMAT_INVOCATIONS
@@ -226,7 +226,7 @@ where
 /// Record the one actual mkfs invocation. Failure to record never blocks a
 /// production format; it merely makes a qualification fault ineligible.
 pub(super) fn record_format_invocation(
-    response_request: &cats_api::guest::FilesystemControlRequestV1,
+    response_request: &cats_protocol::guest::FilesystemControlRequestV1,
 ) -> Result<()> {
     let FilesystemInitialization::Initialize {
         initialization_token,
@@ -306,11 +306,11 @@ pub(super) fn consume_validated_format_response_once(
 
 #[cfg(test)]
 mod tests {
-    use cats_api::guest::{
+    use cats_protocol::guest::{
         FilesystemControlRequestV1, FilesystemIdentityV1, PersistentFilesystemObservationV1,
         GUEST_HOST_CONTROL_PROTOCOL_VERSION_V1,
     };
-    use cats_api::runtime_reconciliation::{
+    use cats_protocol::runtime_reconciliation::{
         FenceEpoch, Generation, GuestDeviceIdentity, HostPath, PersistentFilesystemBinding,
         RemoteHead,
     };

@@ -10,8 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use cats_api::guest::GuestResponseBody;
-use cats_api::sessions::{ExecRequest, MAX_EXEC_OUTPUT_BYTES};
+use cats_protocol::guest::GuestResponseBody;
+use cats_protocol::sessions::{ExecRequest, MAX_EXEC_OUTPUT_BYTES};
 
 const IO_CHUNK_BYTES: usize = 16 * 1024;
 const IO_CHANNEL_DEPTH: usize = 8;
@@ -325,7 +325,7 @@ pub(super) fn execute(request: ExecRequest, peer_fd: Option<RawFd>) -> Result<Gu
     }
 
     let status = status.context("exec exited without a wait status")?;
-    let response = cats_api::sessions::ExecResponse {
+    let response = cats_protocol::sessions::ExecResponse {
         exit_code: exit_code(status),
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),

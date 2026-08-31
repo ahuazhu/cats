@@ -4,7 +4,7 @@
 //! Store receives one typed principal and revalidates persisted machine-key
 //! lineage inside the same transaction that commits an apply result.
 
-use cats_api::runtime_reconciliation::{
+use cats_protocol::runtime_reconciliation::{
     canonical_ed25519_spki_sha256, encode_node_placement_policy,
     encode_runtime_node_authority_apply, encode_runtime_node_authority_apply_result,
     encode_runtime_provisioner_active_set, encode_runtime_provisioner_trust_bundle,
@@ -71,10 +71,10 @@ impl PolicyProjection {
                 .map_err(corrupt)?,
             guest_config_digest: policy.capabilities.guest_config_digest.to_string(),
             block_frontend: match policy.capabilities.block_frontend {
-                cats_api::runtime_reconciliation::RuntimePlacementBlockFrontend::KernelNbd => {
+                cats_protocol::runtime_reconciliation::RuntimePlacementBlockFrontend::KernelNbd => {
                     "kernel_nbd"
                 }
-                cats_api::runtime_reconciliation::RuntimePlacementBlockFrontend::VhostUserBlk => {
+                cats_protocol::runtime_reconciliation::RuntimePlacementBlockFrontend::VhostUserBlk => {
                     "vhost_user_blk"
                 }
             }

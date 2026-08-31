@@ -20,13 +20,13 @@
 //! Set `CATS_TEST_POSTGRES_URL` to run it. Without one it skips rather than
 //! passes vacuously, so a green run without that variable is not evidence.
 
-use cats_api::metering::{CatUsageCheckpoint, UsageMetric};
-use cats_api::runtime_reconciliation::{
-    Epoch, Id, NodeBootId, RandomId128, Revision, SessionBinding,
-};
 use cats_metering::{
     deterministic_event_id, AttributedCheckpoint, RuntimeUsageSourceBinding, UsageAttribution,
     UsageQuery, UsageStore,
+};
+use cats_protocol::metering::{CatUsageCheckpoint, UsageMetric};
+use cats_protocol::runtime_reconciliation::{
+    Epoch, Id, NodeBootId, RandomId128, Revision, SessionBinding,
 };
 use cats_usage_store_postgres::PostgresUsageStore;
 
@@ -56,7 +56,7 @@ fn checkpoint(
         cat_id: "cat-a".to_string(),
         cat_generation: 1,
         metric,
-        epoch_marker: cats_api::metering::UsageEpochMarker::Open,
+        epoch_marker: cats_protocol::metering::UsageEpochMarker::Open,
         cumulative_quantity,
     };
     checkpoint.event_id = deterministic_event_id(&checkpoint);

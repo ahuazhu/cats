@@ -342,7 +342,7 @@ mod tests {
     fn engine(dir: &Path) -> Arc<ChunkEngine> {
         let blob = Arc::new(FileBlobStore::open(dir.join("blob")).unwrap());
         let meta = Arc::new(SqliteMetadataStore::open(&dir.join("meta.db")).unwrap());
-        meta.create_volume("vol_nbd", 4 * cats_api::chunk::CHUNK_SIZE as u64)
+        meta.create_volume("vol_nbd", 4 * cats_protocol::chunk::CHUNK_SIZE as u64)
             .unwrap();
         let epoch = 1;
         cats_test_support::install_sqlite_grant(&dir.join("meta.db"), "vol_nbd", "att1", epoch)
@@ -365,7 +365,7 @@ mod tests {
         let server = std::thread::spawn(move || handle_connection(a, server_engine));
 
         let mut client = NbdClient::handshake(Box::new(b)).unwrap();
-        assert_eq!(client.size(), 4 * cats_api::chunk::CHUNK_SIZE as u64);
+        assert_eq!(client.size(), 4 * cats_protocol::chunk::CHUNK_SIZE as u64);
 
         let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
         client.write(4096, &data).unwrap();

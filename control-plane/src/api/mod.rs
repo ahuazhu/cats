@@ -19,16 +19,16 @@ use cats_api::auth::{
     UpdateWorkspaceRequest, Workspace, WorkspaceToken,
 };
 use cats_api::billing::{BillingBalance, CreateCheckoutRequest, CreateCheckoutResponse};
-use cats_api::error::{ApiError, ErrorBody, ErrorCode};
 use cats_api::list::ListResponse;
-use cats_api::metering::{
-    CatUsageSummary, UsageDetailLine, UsageMetric, UsageReport, UsageSummaryLine, UsageTimeBucket,
-};
 use cats_metering::{
     CheckoutIntent, CheckoutPayment, CheckoutRefund, CreditApplyOutcome, RateCard,
     UsageQuery as MeterUsageQuery,
 };
 use cats_metering::{UsageInterval, UsageView};
+use cats_protocol::error::{ApiError, ErrorBody, ErrorCode};
+use cats_protocol::metering::{
+    CatUsageSummary, UsageDetailLine, UsageMetric, UsageReport, UsageSummaryLine, UsageTimeBucket,
+};
 
 use crate::server::AppState;
 
