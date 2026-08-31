@@ -112,6 +112,15 @@ pub struct NewDiskSnapshot<'a> {
     pub workspace_id: &'a str,
     pub snapshot_slug: &'a str,
     pub disk_id: &'a str,
+    pub expected_head: &'a RemoteHead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskSnapshotGraphCandidate {
+    pub disk_id: String,
+    pub volume_id: Id,
+    pub size_bytes: u64,
+    pub head: RemoteHead,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +133,7 @@ pub enum CreateDiskSnapshotOutcome {
     DiskNotInitialized,
     CatMustBeCold,
     DiskWriterActive,
+    HeadConflict,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,6 +239,57 @@ impl Store {
         })
     }
 
+    pub fn semantic_disk_snapshot_graph_candidate(
+        &self,
+        workspace_id: &str,
+        disk_id: &str,
+    ) -> Result<Option<DiskSnapshotGraphCandidate>> {
+        self.authority_read_snapshot(|transaction| {
+            let Some(product) = load_product_disk(transaction, workspace_id, disk_id, false)?
+            else {
+                return Ok(None);
+            };
+            if product.status != "normal" {
+                return Ok(None);
+            }
+            let disk = load_disk_authority(transaction, disk_id, false)?;
+            if !disk_identity_exact(&disk, &product) || !disk_is_initialized(&disk) {
+                return Err(corrupt());
+            }
+            let volume = load_volume(transaction, &product.volume_id, false)?;
+            if !volume_identity_exact(&volume, &product) || volume.head.generation.get() == 0 {
+                return Ok(None);
+            }
+            Ok(Some(DiskSnapshotGraphCandidate {
+                disk_id: product.disk_id,
+                volume_id: volume.volume_id,
+                size_bytes: volume.size_bytes,
+                head: volume.head,
+            }))
+        })
+    }
+
+    pub fn semantic_snapshot_graph_candidate(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Option<DiskSnapshotGraphCandidate>> {
+        self.authority_read_snapshot(|transaction| {
+            let Some((snapshot, head)) = load_snapshot_by_id(transaction, snapshot_id, false)?
+            else {
+                return Ok(None);
+            };
+            let Some(head) = head else {
+                return Ok(None);
+            };
+            Ok(Some(DiskSnapshotGraphCandidate {
+                disk_id: snapshot.disk_id,
+                volume_id: parse_id(&snapshot.volume_id)?,
+                size_bytes: u64::try_from(snapshot.size_bytes).map_err(|_| corrupt())?,
+                head,
+            }))
+        })
+    }
+
     /// Read the current remotely durable generation without exposing the
     /// internal Root tuple. An initialized normal Disk must join an exact
     /// canonical Disk/Volume authority row; an uninitialized Disk has no
@@ -321,6 +382,9 @@ impl Store {
             }
             if volume.lease_owner.is_some() {
                 return Ok(CreateDiskSnapshotOutcome::DiskWriterActive);
+            }
+            if &volume.head != request.expected_head {
+                return Ok(CreateDiskSnapshotOutcome::HeadConflict);
             }
 
             let created_at: i64 = transaction

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use cats_api::runtime_reconciliation::Id;
+use cats_api::runtime_reconciliation::{Id, RemoteHead};
 use cats_api::semantic_control as wire;
 use sha2::{Digest, Sha256};
 
@@ -94,6 +94,12 @@ impl ResourceStoreError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotGraphValidationError {
+    Corrupt(String),
+    StorageUnavailable(String),
+}
+
 pub trait SemanticResourceStore: Send + Sync {
     fn current_cat_ids<'a>(
         &'a self,
@@ -154,14 +160,44 @@ pub trait SemanticResourceStore: Send + Sync {
         Box::pin(async { Err(ResourceStoreError::new("DiskSnapshot store is unavailable")) })
     }
 
+    fn disk_snapshot_graph_candidate<'a>(
+        &'a self,
+        workspace_id: &'a str,
+        disk_id: &'a str,
+    ) -> SemanticResourceFuture<
+        'a,
+        Result<Option<db::DiskSnapshotGraphCandidate>, ResourceStoreError>,
+    > {
+        let _ = (workspace_id, disk_id);
+        Box::pin(async { Err(ResourceStoreError::new("DiskSnapshot store is unavailable")) })
+    }
+
+    fn snapshot_graph_candidate<'a>(
+        &'a self,
+        snapshot_id: &'a str,
+    ) -> SemanticResourceFuture<
+        'a,
+        Result<Option<db::DiskSnapshotGraphCandidate>, ResourceStoreError>,
+    > {
+        let _ = snapshot_id;
+        Box::pin(async { Err(ResourceStoreError::new("DiskSnapshot store is unavailable")) })
+    }
+
     fn create_snapshot<'a>(
         &'a self,
         snapshot_id: String,
         workspace_id: String,
         snapshot_slug: String,
         disk_id: String,
+        expected_head: RemoteHead,
     ) -> SemanticResourceFuture<'a, Result<db::CreateDiskSnapshotOutcome, ResourceStoreError>> {
-        let _ = (snapshot_id, workspace_id, snapshot_slug, disk_id);
+        let _ = (
+            snapshot_id,
+            workspace_id,
+            snapshot_slug,
+            disk_id,
+            expected_head,
+        );
         Box::pin(async { Err(ResourceStoreError::new("DiskSnapshot store is unavailable")) })
     }
 
@@ -253,6 +289,44 @@ impl SemanticResourceStore for PostgresSemanticResourceStore {
         Box::pin(async move {
             store
                 .execute(move |store| store.list_current_semantic_cat_ids(&workspace_id))
+                .await
+                .map_err(resource_store_error)
+        })
+    }
+
+    fn disk_snapshot_graph_candidate<'a>(
+        &'a self,
+        workspace_id: &'a str,
+        disk_id: &'a str,
+    ) -> SemanticResourceFuture<
+        'a,
+        Result<Option<db::DiskSnapshotGraphCandidate>, ResourceStoreError>,
+    > {
+        let store = Arc::clone(&self.store);
+        let workspace_id = workspace_id.to_owned();
+        let disk_id = disk_id.to_owned();
+        Box::pin(async move {
+            store
+                .execute(move |store| {
+                    store.semantic_disk_snapshot_graph_candidate(&workspace_id, &disk_id)
+                })
+                .await
+                .map_err(resource_store_error)
+        })
+    }
+
+    fn snapshot_graph_candidate<'a>(
+        &'a self,
+        snapshot_id: &'a str,
+    ) -> SemanticResourceFuture<
+        'a,
+        Result<Option<db::DiskSnapshotGraphCandidate>, ResourceStoreError>,
+    > {
+        let store = Arc::clone(&self.store);
+        let snapshot_id = snapshot_id.to_owned();
+        Box::pin(async move {
+            store
+                .execute(move |store| store.semantic_snapshot_graph_candidate(&snapshot_id))
                 .await
                 .map_err(resource_store_error)
         })
@@ -417,6 +491,7 @@ impl SemanticResourceStore for PostgresSemanticResourceStore {
         workspace_id: String,
         snapshot_slug: String,
         disk_id: String,
+        expected_head: RemoteHead,
     ) -> SemanticResourceFuture<'a, Result<db::CreateDiskSnapshotOutcome, ResourceStoreError>> {
         let store = Arc::clone(&self.store);
         Box::pin(async move {
@@ -427,6 +502,7 @@ impl SemanticResourceStore for PostgresSemanticResourceStore {
                         workspace_id: &workspace_id,
                         snapshot_slug: &snapshot_slug,
                         disk_id: &disk_id,
+                        expected_head: &expected_head,
                     })
                 })
                 .await
@@ -607,6 +683,11 @@ pub trait SemanticPersistentDiskBackend: Send + Sync {
         &'a self,
         disk: &'a db::PersistentDiskRecord,
     ) -> SemanticResourceFuture<'a, Result<(), ResourceStoreError>>;
+
+    fn validate_snapshot_graph<'a>(
+        &'a self,
+        candidate: db::DiskSnapshotGraphCandidate,
+    ) -> SemanticResourceFuture<'a, Result<(), SnapshotGraphValidationError>>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -625,6 +706,17 @@ impl SemanticPersistentDiskBackend for UnavailablePersistentDiskBackend {
         _disk: &'a db::PersistentDiskRecord,
     ) -> SemanticResourceFuture<'a, Result<(), ResourceStoreError>> {
         Box::pin(async { Err(ResourceStoreError::new(STRICT_DISK_BACKEND_GAP)) })
+    }
+
+    fn validate_snapshot_graph<'a>(
+        &'a self,
+        _candidate: db::DiskSnapshotGraphCandidate,
+    ) -> SemanticResourceFuture<'a, Result<(), SnapshotGraphValidationError>> {
+        Box::pin(async {
+            Err(SnapshotGraphValidationError::StorageUnavailable(
+                STRICT_DISK_BACKEND_GAP.to_owned(),
+            ))
+        })
     }
 }
 
@@ -1388,6 +1480,41 @@ where
     {
         Box::pin(async move {
             let disk = self.current_disk(workspace_id, &request.disk_slug).await?;
+            if let Some(existing) = self
+                .resources
+                .current_snapshot(workspace_id, request.snapshot_slug.as_str())
+                .await
+                .map_err(internal_resource_error)?
+            {
+                if existing.disk_id != disk.disk_id {
+                    return Err(semantic_error(
+                        wire::SemanticErrorCode::SnapshotConfigurationConflict,
+                        "current DiskSnapshot belongs to a different PersistentDisk",
+                    ));
+                }
+                let generation = self.disk_generation(&existing.disk_id).await?;
+                return Ok(wire::DiskSnapshotResponse {
+                    status: wire::SemanticStatus::AlreadyExists,
+                    code: wire::SemanticSuccessCode::AlreadyExists,
+                    snapshot: snapshot_view(existing).map_err(internal_resource_error)?,
+                    disk_head_generation: generation,
+                });
+            }
+            let candidate = self
+                .resources
+                .disk_snapshot_graph_candidate(workspace_id, &disk.disk_id)
+                .await
+                .map_err(internal_resource_error)?
+                .ok_or_else(|| {
+                    semantic_error(
+                        wire::SemanticErrorCode::DiskNotInitialized,
+                        "PersistentDisk has no remotely durable initialized Root",
+                    )
+                })?;
+            self.disk_backend
+                .validate_snapshot_graph(candidate.clone())
+                .await
+                .map_err(snapshot_graph_validation_error)?;
             let outcome = self
                 .resources
                 .create_snapshot(
@@ -1395,6 +1522,7 @@ where
                     workspace_id.to_owned(),
                     request.snapshot_slug.to_string(),
                     disk.disk_id,
+                    candidate.head,
                 )
                 .await
                 .map_err(internal_resource_error)?;
@@ -1443,6 +1571,12 @@ where
                     return Err(semantic_error(
                         wire::SemanticErrorCode::DiskOwned,
                         "PersistentDisk still has an active writer",
+                    ));
+                }
+                db::CreateDiskSnapshotOutcome::HeadConflict => {
+                    return Err(semantic_error(
+                        wire::SemanticErrorCode::HeadConflict,
+                        "PersistentDisk generation changed during snapshot validation",
                     ));
                 }
             };
@@ -1527,6 +1661,21 @@ where
     {
         Box::pin(async move {
             let current = self.current_snapshot(workspace_id, &snapshot_slug).await?;
+            let candidate = self
+                .resources
+                .snapshot_graph_candidate(&current.snapshot_id)
+                .await
+                .map_err(internal_resource_error)?
+                .ok_or_else(|| {
+                    semantic_error(
+                        wire::SemanticErrorCode::SnapshotCorrupt,
+                        "DiskSnapshot has no retained Root",
+                    )
+                })?;
+            self.disk_backend
+                .validate_snapshot_graph(candidate)
+                .await
+                .map_err(snapshot_graph_validation_error)?;
             let outcome = self
                 .resources
                 .restore_snapshot(
@@ -2109,6 +2258,17 @@ fn internal_resource_error(error: ResourceStoreError) -> wire::SemanticErrorBody
     semantic_error(wire::SemanticErrorCode::InternalError, error.message)
 }
 
+fn snapshot_graph_validation_error(error: SnapshotGraphValidationError) -> wire::SemanticErrorBody {
+    match error {
+        SnapshotGraphValidationError::Corrupt(message) => {
+            semantic_error(wire::SemanticErrorCode::SnapshotCorrupt, message)
+        }
+        SnapshotGraphValidationError::StorageUnavailable(message) => {
+            semantic_error(wire::SemanticErrorCode::StorageUnavailable, message)
+        }
+    }
+}
+
 fn semantic_error(
     code: wire::SemanticErrorCode,
     message: impl Into<String>,
@@ -2397,6 +2557,13 @@ mod tests {
             &'a self,
             _disk: &'a db::PersistentDiskRecord,
         ) -> SemanticResourceFuture<'a, Result<(), ResourceStoreError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn validate_snapshot_graph<'a>(
+            &'a self,
+            _candidate: db::DiskSnapshotGraphCandidate,
+        ) -> SemanticResourceFuture<'a, Result<(), SnapshotGraphValidationError>> {
             Box::pin(async { Ok(()) })
         }
     }
