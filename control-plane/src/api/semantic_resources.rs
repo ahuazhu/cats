@@ -816,6 +816,7 @@ mod tests {
                 workspace_id: id("ws_01"),
                 disk_slug,
                 size_bytes: 1024,
+                head_generation: None,
                 status: DiskStatus::Normal,
                 binding: None,
                 created_at_unix_ms: 1,

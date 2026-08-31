@@ -46,8 +46,9 @@ use cats_api::oci::{
 };
 use cats_api::semantic_control::{
     AttachDiskRequest, CatMountRequest, CatResponse, CatView, CreateCatRequest, CreateDiskRequest,
-    DetachDiskRequest, DiskResponse, DiskView, PersistentMountPath, ResourceSlug,
-    SemanticErrorBody,
+    CreateDiskSnapshotRequest, DetachDiskRequest, DiskResponse, DiskSnapshotResponse,
+    DiskSnapshotStatus, DiskSnapshotView, DiskView, PersistentMountPath, ResourceSlug,
+    RestoreDiskSnapshotRequest, SemanticErrorBody, SemanticSuccessCode,
 };
 use cats_api::sessions::{
     ExecRequest, ExecResponse, DEFAULT_EXEC_TIMEOUT_MS, MAX_EXEC_ENV_BYTES,
@@ -353,6 +354,45 @@ pub enum DiskCommand {
     Destroy {
         #[arg(value_name = "DISK_SLUG")]
         disk: String,
+    },
+    /// Create and manage remote restore points for PersistentDisks.
+    Snapshot {
+        #[command(subcommand)]
+        cmd: DiskSnapshotCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DiskSnapshotCommand {
+    /// Capture a remote restore point for a Cold PersistentDisk.
+    Create {
+        #[arg(value_name = "DISK_SLUG")]
+        disk: String,
+        #[arg(value_name = "SNAPSHOT_SLUG")]
+        snapshot: String,
+    },
+    /// List current DiskSnapshots in the Workspace.
+    List {
+        /// Restrict the local projection to one PersistentDisk.
+        #[arg(long, value_name = "DISK_SLUG")]
+        disk: Option<String>,
+    },
+    /// Inspect one DiskSnapshot.
+    #[command(alias = "get")]
+    Show {
+        #[arg(value_name = "SNAPSHOT_SLUG")]
+        snapshot: String,
+    },
+    /// Delete a restore point without deleting its PersistentDisk.
+    #[command(alias = "delete")]
+    Destroy {
+        #[arg(value_name = "SNAPSHOT_SLUG")]
+        snapshot: String,
+    },
+    /// Restore the captured contents to the original PersistentDisk.
+    Restore {
+        #[arg(value_name = "SNAPSHOT_SLUG")]
+        snapshot: String,
     },
 }
 
@@ -909,6 +949,17 @@ fn list_disks(client: &Client) -> Result<Vec<DiskView>> {
     Ok(disks)
 }
 
+fn list_disk_snapshots(client: &Client) -> Result<Vec<DiskSnapshotView>> {
+    let snapshots: Vec<DiskSnapshotView> = serde_json::from_value(client.get("/snapshots")?)
+        .context("invalid semantic DiskSnapshot list response")?;
+    for snapshot in &snapshots {
+        snapshot
+            .validate()
+            .context("invalid DiskSnapshot list item")?;
+    }
+    Ok(snapshots)
+}
+
 /// One Cat, or `None` once it no longer exists.
 fn fetch_cat(client: &Client, slug: &ResourceSlug) -> Result<Option<CatView>> {
     let Some(value) = client.get_optional(&format!("/cats/{slug}"))? else {
@@ -998,6 +1049,41 @@ fn disks_table(term: Term, disks: &[DiskView]) -> String {
             Cell::styled(term, status, style),
             Cell::plain(attached),
             Cell::styled(term, disk.disk_id.as_str(), Style::Dim),
+        ]);
+    }
+    table.render()
+}
+
+fn disk_snapshots_table(term: Term, snapshots: &[DiskSnapshotView]) -> String {
+    let mut table = Table::new(
+        term,
+        vec![
+            ("NAME", Align::Left),
+            ("DISK", Align::Left),
+            ("SIZE", Align::Right),
+            ("GENERATION", Align::Right),
+            ("STATUS", Align::Left),
+            ("ID", Align::Left),
+        ],
+    );
+    let mut ordered: Vec<&DiskSnapshotView> = snapshots.iter().collect();
+    ordered.sort_by(|left, right| {
+        left.snapshot_slug
+            .as_str()
+            .cmp(right.snapshot_slug.as_str())
+    });
+    for snapshot in ordered {
+        let (status, style) = match snapshot.status {
+            DiskSnapshotStatus::Normal => ("available", Style::Plain),
+            DiskSnapshotStatus::Deleted => ("deleted", Style::Dim),
+        };
+        table.push(vec![
+            Cell::plain(snapshot.snapshot_slug.as_str()),
+            Cell::plain(snapshot.disk_slug.as_str()),
+            Cell::plain(format_bytes(snapshot.size_bytes)),
+            Cell::plain(snapshot.captured_generation.to_string()),
+            Cell::styled(term, status, style),
+            Cell::styled(term, snapshot.snapshot_id.as_str(), Style::Dim),
         ]);
     }
     table.render()
@@ -1828,6 +1914,175 @@ fn print_disk_response(response: &DiskResponse, json_mode: bool) -> Result<()> {
     Ok(())
 }
 
+fn print_disk_snapshot_response(response: &DiskSnapshotResponse, json_mode: bool) -> Result<()> {
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(response)?);
+    } else {
+        let code = serde_json::to_value(response.code)?;
+        let code = code
+            .as_str()
+            .context("semantic success code was not a string")?;
+        println!(
+            "{code}: snapshot={} id={} disk={} captured_generation={} disk_head_generation={}",
+            response.snapshot.snapshot_slug,
+            response.snapshot.snapshot_id,
+            response.snapshot.disk_slug,
+            response.snapshot.captured_generation,
+            response.disk_head_generation,
+        );
+    }
+    Ok(())
+}
+
+fn fetch_disk_snapshot(client: &Client, slug: &ResourceSlug) -> Result<DiskSnapshotView> {
+    let snapshot: DiskSnapshotView =
+        serde_json::from_value(client.get(&format!("/snapshots/{slug}"))?)
+            .context("invalid semantic DiskSnapshot response")?;
+    snapshot
+        .validate()
+        .context("invalid DiskSnapshot response")?;
+    Ok(snapshot)
+}
+
+fn fetch_disk(client: &Client, slug: &ResourceSlug) -> Result<DiskView> {
+    let disk: DiskView = serde_json::from_value(client.get(&format!("/disks/{slug}"))?)
+        .context("invalid semantic PersistentDisk response")?;
+    disk.validate().context("invalid PersistentDisk response")?;
+    Ok(disk)
+}
+
+fn run_disk_snapshot(client: &Client, cli: &Cli, cmd: &DiskSnapshotCommand) -> Result<()> {
+    match cmd {
+        DiskSnapshotCommand::Create { disk, snapshot } => {
+            let request = CreateDiskSnapshotRequest {
+                snapshot_slug: resource_slug("snapshot", snapshot)?,
+                disk_slug: resource_slug("disk", disk)?,
+            };
+            let response = client.post("/snapshots", Some(serde_json::to_value(&request)?))?;
+            let response: DiskSnapshotResponse = serde_json::from_value(response)
+                .context("invalid semantic DiskSnapshot create response")?;
+            response
+                .validate()
+                .context("invalid DiskSnapshot create response")?;
+            anyhow::ensure!(
+                matches!(
+                    response.code,
+                    SemanticSuccessCode::SnapshotCreated | SemanticSuccessCode::AlreadyExists
+                ) && response.snapshot.snapshot_slug == request.snapshot_slug
+                    && response.snapshot.disk_slug == request.disk_slug
+                    && response.snapshot.status == DiskSnapshotStatus::Normal
+                    && response.disk_head_generation == response.snapshot.captured_generation,
+                "DiskSnapshot create response changed its semantic identity"
+            );
+            print_disk_snapshot_response(&response, cli.json)
+        }
+        DiskSnapshotCommand::List { disk } => {
+            let disk = disk
+                .as_deref()
+                .map(|slug| resource_slug("disk", slug))
+                .transpose()?;
+            let mut snapshots = list_disk_snapshots(client)?;
+            if let Some(disk) = &disk {
+                snapshots.retain(|snapshot| &snapshot.disk_slug == disk);
+            }
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&snapshots)?);
+                return Ok(());
+            }
+            if snapshots.is_empty() {
+                println!(
+                    "No disk snapshots yet. Create one with:\n  \
+                     cats disk snapshot create DISK_SLUG SNAPSHOT_SLUG"
+                );
+                return Ok(());
+            }
+            println!(
+                "{}",
+                disk_snapshots_table(Term::stdout(cli.color), &snapshots)
+            );
+            Ok(())
+        }
+        DiskSnapshotCommand::Show { snapshot } => {
+            let snapshot = fetch_disk_snapshot(client, &resource_slug("snapshot", snapshot)?)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            } else {
+                println!(
+                    "{}",
+                    disk_snapshots_table(Term::stdout(cli.color), std::slice::from_ref(&snapshot))
+                );
+            }
+            Ok(())
+        }
+        DiskSnapshotCommand::Destroy { snapshot } => {
+            let slug = resource_slug("snapshot", snapshot)?;
+            let response = client.post(&format!("/snapshots/{slug}/actions/destroy"), None)?;
+            let response: DiskSnapshotResponse = serde_json::from_value(response)
+                .context("invalid semantic DiskSnapshot destroy response")?;
+            response
+                .validate()
+                .context("invalid DiskSnapshot destroy response")?;
+            anyhow::ensure!(
+                matches!(
+                    response.code,
+                    SemanticSuccessCode::SnapshotDestroyed | SemanticSuccessCode::AlreadyDestroyed
+                ) && response.snapshot.snapshot_slug == slug
+                    && response.snapshot.status == DiskSnapshotStatus::Deleted,
+                "DiskSnapshot destroy response changed its semantic identity"
+            );
+            print_disk_snapshot_response(&response, cli.json)
+        }
+        DiskSnapshotCommand::Restore { snapshot } => {
+            let slug = resource_slug("snapshot", snapshot)?;
+            let snapshot = fetch_disk_snapshot(client, &slug)?;
+            anyhow::ensure!(
+                snapshot.status == DiskSnapshotStatus::Normal,
+                "DiskSnapshot is deleted"
+            );
+            // The generation read names this restore occurrence. Control
+            // atomically rejects a concurrent head change; the CLI never
+            // guesses success from a matching captured Root.
+            let disk = fetch_disk(client, &snapshot.disk_slug)?;
+            anyhow::ensure!(
+                disk.disk_id == snapshot.disk_id,
+                "PersistentDisk read changed the Snapshot target identity"
+            );
+            let expected_generation = disk
+                .head_generation
+                .context("PersistentDisk has no initialized current head")?;
+            let request = RestoreDiskSnapshotRequest {
+                expected_generation,
+            };
+            request
+                .validate()
+                .context("invalid DiskSnapshot restore request")?;
+            let resulting_generation = request
+                .expected_generation
+                .checked_add(1)
+                .context("PersistentDisk generation is exhausted")?;
+            let response = client.post(
+                &format!("/snapshots/{slug}/actions/restore"),
+                Some(serde_json::to_value(request)?),
+            )?;
+            let response: DiskSnapshotResponse = serde_json::from_value(response)
+                .context("invalid semantic DiskSnapshot restore response")?;
+            response
+                .validate()
+                .context("invalid DiskSnapshot restore response")?;
+            anyhow::ensure!(
+                matches!(
+                    response.code,
+                    SemanticSuccessCode::SnapshotRestored | SemanticSuccessCode::AlreadyRestored
+                ) && response.snapshot.snapshot_id == snapshot.snapshot_id
+                    && response.snapshot.disk_id == disk.disk_id
+                    && response.disk_head_generation == resulting_generation,
+                "DiskSnapshot restore response changed its semantic occurrence"
+            );
+            print_disk_snapshot_response(&response, cli.json)
+        }
+    }
+}
+
 fn run_disk(client: &Client, cli: &Cli, cmd: &DiskCommand) -> Result<()> {
     match cmd {
         DiskCommand::Create { name, size } => {
@@ -1925,6 +2180,7 @@ fn run_disk(client: &Client, cli: &Cli, cmd: &DiskCommand) -> Result<()> {
                 .context("invalid PersistentDisk response")?;
             print_disk_response(&response, cli.json)
         }
+        DiskCommand::Snapshot { cmd } => run_disk_snapshot(client, cli, cmd),
     }
 }
 
@@ -1994,6 +2250,7 @@ mod tests {
             workspace_id: cats_api::runtime_reconciliation::Id::new("ws_01").unwrap(),
             disk_slug: ResourceSlug::new(slug).unwrap(),
             size_bytes,
+            head_generation: Some(1),
             status: cats_api::semantic_control::DiskStatus::Normal,
             binding: None,
             created_at_unix_ms: 1,
@@ -2674,6 +2931,16 @@ mod tests {
                 "GET /v1/workspaces/ws_01/disks HTTP/1.1",
                 br#"[{"disk_id":"disk_01","workspace_id":"ws_01","disk_slug":"data","size_bytes":1073741824,"status":"normal","binding":null,"created_at_unix_ms":1,"deleted_at_unix_ms":null}]"#.as_slice(),
             ),
+            (
+                vec!["disk", "snapshot", "list"],
+                "GET /v1/workspaces/ws_01/snapshots HTTP/1.1",
+                br#"[{"snapshot_id":"snapshot_01","workspace_id":"ws_01","snapshot_slug":"before-upgrade","disk_id":"disk_01","disk_slug":"data","size_bytes":1073741824,"status":"normal","captured_generation":42,"created_at_unix_ms":1,"deleted_at_unix_ms":null}]"#.as_slice(),
+            ),
+            (
+                vec!["disk", "snapshot", "show", "before-upgrade"],
+                "GET /v1/workspaces/ws_01/snapshots/before-upgrade HTTP/1.1",
+                br#"{"snapshot_id":"snapshot_01","workspace_id":"ws_01","snapshot_slug":"before-upgrade","disk_id":"disk_01","disk_slug":"data","size_bytes":1073741824,"status":"normal","captured_generation":42,"created_at_unix_ms":1,"deleted_at_unix_ms":null}"#.as_slice(),
+            ),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
@@ -3132,6 +3399,183 @@ mod tests {
     }
 
     #[test]
+    fn disk_snapshot_create_sends_both_slugs_without_request_tokens() {
+        use clap::Parser as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let captured = read_request(&mut stream);
+            write_json_response(
+                &mut stream,
+                br#"{"status":"ok","code":"snapshot_created","snapshot":{"snapshot_id":"snapshot_01","workspace_id":"ws_01","snapshot_slug":"before-upgrade","disk_id":"disk_01","disk_slug":"data","size_bytes":1073741824,"status":"normal","captured_generation":42,"created_at_unix_ms":1,"deleted_at_unix_ms":null},"disk_head_generation":42}"#,
+            );
+            captured
+        });
+        run(Cli::parse_from([
+            "cats",
+            "--api-url",
+            &base,
+            "--token",
+            "test-token",
+            "--workspace",
+            "ws_01",
+            "disk",
+            "snapshot",
+            "create",
+            "data",
+            "before-upgrade",
+        ]))
+        .unwrap();
+        let (headers, body) = server.join().unwrap();
+        assert_eq!(
+            headers.lines().next().unwrap(),
+            "POST /v1/workspaces/ws_01/snapshots HTTP/1.1"
+        );
+        assert_eq!(
+            body,
+            br#"{"disk_slug":"data","snapshot_slug":"before-upgrade"}"#
+        );
+        assert!(!headers
+            .lines()
+            .any(|line| line.to_ascii_lowercase().starts_with("idempotency-key:")));
+    }
+
+    #[test]
+    fn disk_snapshot_restore_reads_the_latest_disk_generation_before_posting() {
+        use clap::Parser as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let responses: [&[u8]; 3] = [
+                br#"{"snapshot_id":"snapshot_01","workspace_id":"ws_01","snapshot_slug":"before-upgrade","disk_id":"disk_01","disk_slug":"data","size_bytes":1073741824,"status":"normal","captured_generation":42,"created_at_unix_ms":1,"deleted_at_unix_ms":null}"#,
+                br#"{"disk_id":"disk_01","workspace_id":"ws_01","disk_slug":"data","size_bytes":1073741824,"head_generation":77,"status":"normal","binding":null,"created_at_unix_ms":1,"deleted_at_unix_ms":null}"#,
+                br#"{"status":"ok","code":"snapshot_restored","snapshot":{"snapshot_id":"snapshot_01","workspace_id":"ws_01","snapshot_slug":"before-upgrade","disk_id":"disk_01","disk_slug":"data","size_bytes":1073741824,"status":"normal","captured_generation":42,"created_at_unix_ms":1,"deleted_at_unix_ms":null},"disk_head_generation":78}"#,
+            ];
+            let mut captured = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                captured.push(read_request(&mut stream));
+                write_json_response(&mut stream, response);
+            }
+            captured
+        });
+        run(Cli::parse_from([
+            "cats",
+            "--api-url",
+            &base,
+            "--token",
+            "test-token",
+            "--workspace",
+            "ws_01",
+            "disk",
+            "snapshot",
+            "restore",
+            "before-upgrade",
+        ]))
+        .unwrap();
+        let captured = server.join().unwrap();
+        assert_eq!(
+            captured[0].0.lines().next().unwrap(),
+            "GET /v1/workspaces/ws_01/snapshots/before-upgrade HTTP/1.1"
+        );
+        assert_eq!(
+            captured[1].0.lines().next().unwrap(),
+            "GET /v1/workspaces/ws_01/disks/data HTTP/1.1"
+        );
+        assert_eq!(
+            captured[2].0.lines().next().unwrap(),
+            "POST /v1/workspaces/ws_01/snapshots/before-upgrade/actions/restore HTTP/1.1"
+        );
+        assert_eq!(captured[2].1, br#"{"expected_generation":77}"#);
+        assert!(!captured[2]
+            .0
+            .lines()
+            .any(|line| line.to_ascii_lowercase().starts_with("idempotency-key:")));
+    }
+
+    #[test]
+    fn disk_snapshot_restore_fails_closed_without_an_initialized_disk_head() {
+        use clap::Parser as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let responses: [&[u8]; 2] = [
+                br#"{"snapshot_id":"snapshot_01","workspace_id":"ws_01","snapshot_slug":"before-upgrade","disk_id":"disk_01","disk_slug":"data","size_bytes":1073741824,"status":"normal","captured_generation":42,"created_at_unix_ms":1,"deleted_at_unix_ms":null}"#,
+                br#"{"disk_id":"disk_01","workspace_id":"ws_01","disk_slug":"data","size_bytes":1073741824,"head_generation":null,"status":"normal","binding":null,"created_at_unix_ms":1,"deleted_at_unix_ms":null}"#,
+            ];
+            let mut captured = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                captured.push(read_request(&mut stream));
+                write_json_response(&mut stream, response);
+            }
+            captured
+        });
+        let error = run(Cli::parse_from([
+            "cats",
+            "--api-url",
+            &base,
+            "--token",
+            "test-token",
+            "--workspace",
+            "ws_01",
+            "disk",
+            "snapshot",
+            "restore",
+            "before-upgrade",
+        ]))
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("PersistentDisk has no initialized current head"));
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn disk_snapshot_destroy_posts_one_bodyless_scenario_action() {
+        use clap::Parser as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let captured = read_request(&mut stream);
+            write_json_response(
+                &mut stream,
+                br#"{"status":"ok","code":"snapshot_destroyed","snapshot":{"snapshot_id":"snapshot_01","workspace_id":"ws_01","snapshot_slug":"before-upgrade","disk_id":"disk_01","disk_slug":"data","size_bytes":1073741824,"status":"deleted","captured_generation":42,"created_at_unix_ms":1,"deleted_at_unix_ms":2},"disk_head_generation":77}"#,
+            );
+            captured
+        });
+        run(Cli::parse_from([
+            "cats",
+            "--api-url",
+            &base,
+            "--token",
+            "test-token",
+            "--workspace",
+            "ws_01",
+            "disk",
+            "snapshot",
+            "destroy",
+            "before-upgrade",
+        ]))
+        .unwrap();
+        let (headers, body) = server.join().unwrap();
+        assert_eq!(
+            headers.lines().next().unwrap(),
+            "POST /v1/workspaces/ws_01/snapshots/before-upgrade/actions/destroy HTTP/1.1"
+        );
+        assert!(body.is_empty());
+        assert!(!headers
+            .lines()
+            .any(|line| line.to_ascii_lowercase().starts_with("idempotency-key:")));
+    }
+
+    #[test]
     fn semantic_disk_binding_sends_slug_requests() {
         use clap::Parser as _;
         use std::io::Write as _;
@@ -3239,6 +3683,43 @@ mod tests {
     }
 
     #[test]
+    fn disk_snapshot_cli_grammar_uses_explicit_stable_slugs() {
+        use clap::Parser as _;
+
+        assert!(matches!(
+            Cli::parse_from([
+                "cats",
+                "disk",
+                "snapshot",
+                "create",
+                "data",
+                "before-upgrade"
+            ])
+            .command,
+            Command::Disk {
+                cmd: DiskCommand::Snapshot {
+                    cmd: DiskSnapshotCommand::Create { disk, snapshot }
+                }
+            } if disk == "data" && snapshot == "before-upgrade"
+        ));
+        assert!(matches!(
+            Cli::parse_from(["cats", "disk", "snapshot", "list", "--disk", "data"])
+                .command,
+            Command::Disk {
+                cmd: DiskCommand::Snapshot {
+                    cmd: DiskSnapshotCommand::List { disk: Some(disk) }
+                }
+            } if disk == "data"
+        ));
+        for action in ["show", "destroy", "restore", "get", "delete"] {
+            assert!(
+                Cli::try_parse_from(["cats", "disk", "snapshot", action, "before-upgrade"]).is_ok()
+            );
+        }
+        assert!(Cli::try_parse_from(["cats", "disk", "snapshot", "create", "data"]).is_err());
+    }
+
+    #[test]
     fn retired_product_commands_are_not_parseable() {
         use clap::Parser;
 
@@ -3249,7 +3730,6 @@ mod tests {
             &["sleep", "status", "app"],
             &["expiry", "app"],
             &["disk", "delete", "data"],
-            &["disk", "snapshot", "data"],
             &["mount", "data", "--cat", "app"],
             &["unmount", "data"],
             &["expose", "app", "8080"],
@@ -3357,11 +3837,22 @@ mod tests {
             .expect("Disk command")
             .clone();
         let disk_help = disk.render_long_help().to_string();
-        for supported in ["create", "ls", "get", "attach", "detach", "destroy"] {
+        for supported in [
+            "create", "ls", "get", "attach", "detach", "destroy", "snapshot",
+        ] {
             assert!(disk_help.contains(&format!("\n  {supported} ")));
         }
-        for retired in ["resize", "delete", "snapshot"] {
+        for retired in ["resize", "delete"] {
             assert!(!disk_help.contains(&format!("\n  {retired} ")));
+        }
+
+        let mut snapshot = disk
+            .find_subcommand("snapshot")
+            .expect("DiskSnapshot command")
+            .clone();
+        let snapshot_help = snapshot.render_long_help().to_string();
+        for supported in ["create", "list", "show", "destroy", "restore"] {
+            assert!(snapshot_help.contains(&format!("\n  {supported} ")));
         }
 
         let mut create = Cli::command()

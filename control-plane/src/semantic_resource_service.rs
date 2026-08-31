@@ -1373,6 +1373,9 @@ fn disk_view(projection: DiskProjection) -> Result<wire::DiskView, ResourceStore
             .ok_or_else(|| ResourceStoreError::new("stored Disk slug is invalid"))?,
         size_bytes: u64::try_from(disk.size_bytes)
             .map_err(|_| ResourceStoreError::new("stored Disk size is invalid"))?,
+        // The snapshot-aware service projection joins the Volume Authority
+        // head. This compatibility path does not have that authority fact.
+        head_generation: None,
         status: match disk.status.as_str() {
             "normal" => wire::DiskStatus::Normal,
             "deleted" => wire::DiskStatus::Deleted,

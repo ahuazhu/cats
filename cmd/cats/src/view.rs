@@ -749,6 +749,7 @@ mod tests {
             workspace_id: Id::new("ws_0000000001").unwrap(),
             disk_slug: ResourceSlug::new("data").unwrap(),
             size_bytes: 20 * 1024 * 1024 * 1024,
+            head_generation: Some(7),
             status: DiskStatus::Normal,
             binding: None,
             created_at_unix_ms: 0,
