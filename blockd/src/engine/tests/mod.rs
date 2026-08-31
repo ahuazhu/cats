@@ -1,20 +1,11 @@
 use super::*;
-use cats_api::runtime_lifecycle_volume::{
-    DiskRole, PlacementIdentity, RuntimeVolumeConfig, RuntimeVolumeGuestBinding,
-};
-use cats_api::runtime_lifecycle_volume::{
-    LifecycleCommandStartVolumeGrantReceipt, LifecycleStartVolumeGrantAuthority,
-    LifecycleVolumeCommandScope,
-};
-use cats_api::runtime_reconciliation::WireU64;
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_object_store_file::FileBlobStore;
 use cats_storage::authority::{
-    authorized_serving_attachment_from_start_volume_grant, AuthorizedServingAttachment,
-    LastVolumeTransition, NormalAcquireRequest, RenewLeaseResult, UnixMillis, VolumeAdminState,
-    VolumeDurability, VolumeHeadCasResult, VolumeRecord, VolumeTransitionSource,
+    authorized_serving_attachment_from_direct_acquire, AuthorizedServingAttachment,
+    DirectAcquireServingInput, LastVolumeTransition, NormalAcquireRequest, RenewLeaseResult,
+    UnixMillis, VolumeAdminState, VolumeDurability, VolumeHeadCasResult, VolumeRecord,
 };
-use cats_storage::lifecycle_volume::command_start_volume_grant_receipt_digest_from_closed_receipt;
 use cats_test_support::blob_doubles::{
     ConcurrencyProbe, CountingBlob, SizingBlob, SlowBlob, SwitchableFailureBlob,
 };
@@ -143,30 +134,56 @@ impl VolumeDataAuthority for TestVolumeDataAuthority {
         });
         let lease_epoch = FenceEpoch::new(u64::try_from(head.lease_epoch).unwrap_or(0))
             .expect("zero is a valid fence epoch");
+        let volume_id =
+            Id::new(head.volume_id).expect("legacy test volume ids are valid target authority ids");
+        let remote_head = RemoteHead {
+            generation: Generation::new(u64::try_from(head.generation).unwrap_or(u64::MAX))
+                .expect("legacy test generations fit the target wire range"),
+            root_hash: head.root_hash.map(Sha256Digest::from_bytes),
+            root_object_id: head.root_object_id.map(|object_id| {
+                AsciiText::new(object_id)
+                    .expect("legacy test object ids are valid target ASCII text")
+            }),
+        };
+        let last_transition = lease_owner.as_ref().and_then(|attachment_id| {
+            (lease_epoch.get() > 0).then(|| {
+                let transition_id = cats_api::runtime_reconciliation::RandomId128::new(format!(
+                    "{:032x}",
+                    lease_epoch.get()
+                ))
+                .expect("positive lease epoch is a nonzero transition id");
+                LastVolumeTransition::NormalAcquire {
+                    request: NormalAcquireRequest {
+                        volume_id: volume_id.clone(),
+                        transition_id: transition_id.clone(),
+                        attachment_id: attachment_id.clone(),
+                        expected_unowned_epoch: FenceEpoch::new(lease_epoch.get() - 1).unwrap(),
+                        placement_epoch: cats_api::runtime_reconciliation::Epoch::new(1).unwrap(),
+                        lease_duration_ms: 1,
+                    },
+                    result: cats_api::runtime_reconciliation::NormalAcquireResult {
+                        volume_id: volume_id.clone(),
+                        transition_id,
+                        attachment_id: attachment_id.clone(),
+                        resulting_epoch: lease_epoch,
+                        resulting_head: remote_head.clone(),
+                        lease_expires_at: UnixMillis::new(1).unwrap(),
+                    },
+                }
+            })
+        });
         Ok(VolumeRecord {
-            volume_id: Id::new(head.volume_id)
-                .expect("legacy test volume ids are valid target authority ids"),
+            volume_id,
             size_bytes: head.size_bytes,
             durability: VolumeDurability::Strict,
             admin_state: VolumeAdminState::Active,
-            head: RemoteHead {
-                generation: Generation::new(u64::try_from(head.generation).unwrap_or(u64::MAX))
-                    .expect("legacy test generations fit the target wire range"),
-                root_hash: head.root_hash.map(Sha256Digest::from_bytes),
-                root_object_id: head.root_object_id.map(|object_id| {
-                    AsciiText::new(object_id)
-                        .expect("legacy test object ids are valid target ASCII text")
-                }),
-            },
+            head: remote_head,
             lease_owner: lease_owner.clone(),
             lease_epoch,
             lease_expires_at: lease_owner
                 .as_ref()
                 .map(|_| UnixMillis::new(1).expect("one is a valid timestamp")),
-            last_transition: lease_owner.map(|_| LastVolumeTransition::Takeover {
-                source: VolumeTransitionSource::Independent,
-                authorization_id: Id::new("test-authority").expect("constant is a valid id"),
-            }),
+            last_transition,
         })
     }
 
@@ -277,45 +294,22 @@ fn serving_fixture(durability: VolumeDurability) -> ServingFixture {
         lease_expires_at: None,
         last_transition: None,
     };
-    let transition_source = VolumeTransitionSource::Lifecycle {
-        operation_id: Id::new("operation_start").unwrap(),
-        request_fingerprint: Sha256Digest::from_bytes([7; 32]),
-    };
-    let (record, result) = cats_storage::authority::normal_acquire_with_source(
+    let (record, result) = cats_storage::authority::normal_acquire(
         &unowned,
-        &transition_source,
         &request,
         UnixMillis::new(10_000).unwrap(),
     )
     .unwrap();
-    let grant = LifecycleCommandStartVolumeGrantReceipt {
-        scope: LifecycleVolumeCommandScope {
-            operation_id: Id::new("operation_start").unwrap(),
-            request_fingerprint: Sha256Digest::from_bytes([7; 32]),
-            cat_id: Id::new("cat_test").unwrap(),
-            node_id: Id::new("node_a").unwrap(),
-            placement_identity: PlacementIdentity {
-                node_id: Id::new("node_a").unwrap(),
-                placement_epoch: request.placement_epoch,
-            },
-        },
-        grant_sequence: WireU64::new(0).unwrap(),
-        volume: RuntimeVolumeConfig {
-            volume_id: request.volume_id.clone(),
-            disk_id: Id::new("disk_root").unwrap(),
-            disk_role: DiskRole::Root,
-            size_bytes: record.size_bytes,
-            durability: record.durability,
-            guest_device_serial: Id::new("root-boot").unwrap(),
-            guest_device_slot: 0,
-            guest_binding: RuntimeVolumeGuestBinding::RootBoot,
-        },
-        authority: LifecycleStartVolumeGrantAuthority::NormalAcquire { request, result },
-    };
-    let grant_digest =
-        command_start_volume_grant_receipt_digest_from_closed_receipt(&grant).unwrap();
-    let attachment =
-        authorized_serving_attachment_from_start_volume_grant(&grant, &grant_digest, None).unwrap();
+    let attachment = authorized_serving_attachment_from_direct_acquire(DirectAcquireServingInput {
+        node_id: Id::new("node_a").unwrap(),
+        size_bytes: record.size_bytes,
+        durability: record.durability,
+        request,
+        result,
+        current_head: record.head.clone(),
+        current_lease_expires_at: record.lease_expires_at.unwrap(),
+    })
+    .unwrap();
     let data_dir = dir.path().join("serving-data");
     let mut config = EngineConfig::new(VOL, &data_dir, "attA");
     config.lease_ttl_ms = 60_000;

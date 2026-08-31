@@ -3,7 +3,6 @@
 pub mod api;
 pub mod auth;
 pub mod billing;
-pub mod object_write_gateway;
 pub mod semantic_adapters;
 pub mod semantic_disk;
 pub mod semantic_lifecycle;

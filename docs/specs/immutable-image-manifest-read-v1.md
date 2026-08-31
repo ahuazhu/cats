@@ -184,7 +184,7 @@ Kubernetes/runtime Secret只保存非公开的配置引用；AWS workload identi
 `version,image_id,size_bytes,chunks`，旧 reader也接受 whitespace/member-order变化；这些旧 bytes不是本合同
 的 canonical artifact，不能被新 reader接受，也不能在同一个 immutable key下覆盖。
 
-本节不定义第二条cutover runbook；唯一顺序是[Operations HA §8](../operations-ha.md#8-首次终态部署)的首次终态
+本节不定义第二条cutover runbook；当前顺序是[Operations HA §10](../operations-ha.md#10-首次单协议部署)的首次单协议
 destructive reset。旧schema没有足以证明target image引用集合的authority，因此不得把缺表、空表或对旧Control
 PostgreSQL的扫描解释成零引用proof，也不得在Operations步骤3之后用新建的空schema补做这种证明。
 

@@ -1,11 +1,10 @@
 # ADR-0058：Route ring ACK 绑定不可变 AgentSession 历史
 
-- 状态：Accepted
+- 状态：Superseded by [ADR-0059](0059-semantic-control-node-synchronous-protocol.md)
 - 日期：2026-08-21
 - 修正：[ADR-0056](0056-atomic-per-cat-runtime-lifecycle.md) 的 schema 17 组成；新终态为
   clean-slate schema 18
-- 相关规格：[Agent Registration and Internal Transport v1](../specs/agent-registration-transport-v1.md)、
-  [Route v2 Signing Authority v1](../specs/route-signing-authority-v1.md)
+- 历史协议实现由 Git history 保存
 
 ## 背景
 

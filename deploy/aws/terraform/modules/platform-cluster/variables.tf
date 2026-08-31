@@ -47,12 +47,6 @@ variable "pod_identity_addon_version" {
   default     = null
 }
 
-variable "efs_csi_addon_version" {
-  type        = string
-  description = "aws-efs-csi-driver add-on version. Null selects the EKS default for the cluster version."
-  default     = null
-}
-
 variable "tags" {
   type        = map(string)
   description = "Additional tags."

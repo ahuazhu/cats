@@ -1941,7 +1941,6 @@ mod tests {
                 result,
                 current_head: head,
                 current_lease_expires_at: UnixMillis::new(6_000).expect("lease expiry"),
-                object_write_credential: None,
             })
             .expect("direct attachment");
         Arc::new(RecordingRootStore {

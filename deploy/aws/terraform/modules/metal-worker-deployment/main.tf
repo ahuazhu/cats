@@ -482,13 +482,7 @@ CATS_BASE_ENVIRONMENT
       {
         key = $0
         sub(/=.*/, "", key)
-        if (key == "CATS_ROUTE_V2_MACHINE_LISTEN" ||
-            key == "CATS_ROUTE_V2_ROTATION_ORIGIN" ||
-            key == "CATS_OBJECT_WRITE_GATEWAY_URL" ||
-            key == "CATS_OBJECT_WRITE_GATEWAY_CA_FILE") {
-          # Remove configuration retained by the retired Route/ObjectWrite path.
-          next
-        } else if (key in replacement) {
+        if (key in replacement) {
           print replacement[key]
           replaced[key] = 1
         } else {

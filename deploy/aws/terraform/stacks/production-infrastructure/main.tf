@@ -65,7 +65,7 @@ module "usage_infrastructure" {
 
 # Clean-slate cutover lane: the reset executor requires the fresh Kinesis
 # stream, checkpoint table and usage archive to exist in parallel with the old
-# set under strictly different names (deploy/aws/production-clean-slate-reset.py
+# set under strictly different names (the v19 clean-slate release
 # rejects any collision). Guard the half-configured case before the module can
 # fail deep inside S3 bucket creation or, worse, alias the old archive.
 resource "terraform_data" "fresh_usage_inputs" {

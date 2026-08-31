@@ -129,14 +129,6 @@ pub(crate) fn valid_ascii_text(value: &str) -> bool {
     (1..=512).contains(&value.len()) && printable_ascii(value)
 }
 
-/// The closed shape of an assigned object-write writer-authority ID: the one
-/// version prefix followed by the SHA-256 of its exact binding preimage.
-pub(crate) fn valid_object_write_writer_authority_id(value: &str) -> bool {
-    value
-        .strip_prefix("owa1_")
-        .is_some_and(|digest| digest.len() == 64 && lowercase_hex(digest))
-}
-
 pub(crate) fn valid_json_pointer(value: &str) -> bool {
     if value.len() > 512 || !printable_ascii(value) {
         return false;
@@ -211,41 +203,6 @@ pub(crate) fn valid_hostname(value: &str) -> bool {
         })
 }
 
-fn ipv4_number_like_hostname(value: &str) -> bool {
-    value.split('.').all(|component| {
-        component.bytes().all(|byte| byte.is_ascii_digit())
-            || component
-                .strip_prefix("0x")
-                .is_some_and(|digits| digits.bytes().all(|byte| byte.is_ascii_hexdigit()))
-    })
-}
-
-pub(crate) fn valid_node_transport_target(value: &str) -> bool {
-    if !(1..=512).contains(&value.len()) {
-        return false;
-    }
-    let Some(authority) = value.strip_prefix("https://") else {
-        return false;
-    };
-    if authority
-        .bytes()
-        .any(|byte| matches!(byte, b'/' | b'?' | b'#' | b'@'))
-    {
-        return false;
-    }
-    let Some((hostname, port)) = authority.rsplit_once(':') else {
-        return false;
-    };
-    valid_hostname(hostname)
-        && hostname.parse::<Ipv4Addr>().is_err()
-        && !ipv4_number_like_hostname(hostname)
-        && port
-            .parse::<u16>()
-            .ok()
-            .filter(|port| *port != 0)
-            .is_some_and(|parsed| parsed.to_string() == port)
-}
-
 pub(crate) fn valid_ipv4(value: &str) -> bool {
     value
         .parse::<Ipv4Addr>()
@@ -289,7 +246,6 @@ string_newtype!(GuestBootId, valid_random_id);
 string_newtype!(KeyId, valid_key_id);
 string_newtype!(HostPath, valid_host_path);
 string_newtype!(Hostname, valid_hostname);
-string_newtype!(NodeTransportTarget, valid_node_transport_target);
 string_newtype!(Ipv4Address, valid_ipv4);
 string_newtype!(MacAddress, valid_mac);
 string_newtype!(Base64UrlNoPad, valid_base64url_no_pad);
@@ -492,7 +448,6 @@ pub struct NodePlacementPolicy {
     pub allocatable_memory_bytes: AllocatableMemoryBytes,
     pub capabilities: RuntimePlacementCapabilities,
     pub guest_ipv4_pool: GuestIpv4Pool,
-    pub node_transport_target: NodeTransportTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -535,17 +490,6 @@ pub enum RuntimeNodeAuthorityMutation {
         expected_credential_id: Id,
         expected_credential_binding: PublicKeyCredentialBinding,
     },
-    /// Opens the one Host-scoped object-write writer authority this Node's
-    /// attachment credentials register against. The operator states only the
-    /// object-store side of the binding; Control derives the Host identity,
-    /// the assigned authority ID and the empty accepted-sequence state from
-    /// the Node's own provisioned identity.
-    ProvisionObjectWriteAuthority {
-        expected_policy_revision: Epoch,
-        object_provider_scope: ProviderScope,
-        workload_principal_id: AsciiText,
-        object_store_scope_id: AsciiText,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -555,7 +499,6 @@ pub enum RuntimeNodeAuthorityOutcome {
     PolicyUpdated,
     CredentialRotated,
     Retired,
-    ObjectWriteAuthorityProvisioned,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -567,12 +510,6 @@ pub struct RuntimeNodeAuthorityApplyResult {
     pub outcome: RuntimeNodeAuthorityOutcome,
     pub identity_state: NodeIdentityState,
     pub policy_revision: Epoch,
-    /// Present exactly for [`RuntimeNodeAuthorityOutcome::ObjectWriteAuthorityProvisioned`].
-    /// Control assigns this ID and no caller may choose it. The Node cannot
-    /// derive it either, so it reads its own assigned authority back from
-    /// Control rather than carrying it as configuration.
-    #[serde(default)]
-    pub writer_authority_id: Option<Id>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -640,20 +577,6 @@ pub struct RuntimeNodeAuthorityApplyRecord {
     pub principal: FleetPolicyPrincipal,
     pub outcome: RuntimeNodeAuthorityStoredOutcome,
     pub committed_at_unix_ms: UnixMillis,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AgentSession {
-    pub version: ContractVersion,
-    pub node_id: Id,
-    pub immutable_host_id: Id,
-    pub node_boot_id: NodeBootId,
-    pub agent_instance_id: RandomId128,
-    pub agent_session_epoch: Epoch,
-    pub registration_attempt_id: RandomId128,
-    pub guest_config_digest: Sha256Digest,
-    pub lease_deadline_unix_ms: UnixMillis,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -806,45 +729,20 @@ pub struct VolumeRecord {
     pub last_transition: Option<LastVolumeTransition>,
 }
 
-/// Closed authority namespace for the transition marker currently carried by
-/// a Volume row. Independent product/storage mutations deliberately have no
-/// lifecycle coordinate; lifecycle mutations bind the exact immutable
-/// Operation request rather than a mutable Desired revision.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum VolumeTransitionSource {
-    Independent,
-    Lifecycle {
-        operation_id: Id,
-        request_fingerprint: Sha256Digest,
-    },
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LastVolumeTransition {
     NormalAcquire {
-        source: VolumeTransitionSource,
         request: NormalAcquireRequest,
         result: NormalAcquireResult,
     },
     Release {
-        source: VolumeTransitionSource,
         request: ReleaseRequest,
         result: ReleaseResult,
     },
-    Takeover {
-        source: VolumeTransitionSource,
-        authorization_id: Id,
-    },
     BeginDelete {
-        source: VolumeTransitionSource,
         request: BeginDeleteRequest,
         result: BeginDeleteResult,
-    },
-    BeginDisposableDelete {
-        source: VolumeTransitionSource,
-        authorization_id: Id,
     },
 }
 
@@ -891,40 +789,6 @@ pub struct ReleaseResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct VolumeTakeoverAuthorization {
-    pub authorization_id: Id,
-    pub operation_id: Id,
-    pub request_fingerprint: Sha256Digest,
-    pub authorized_node_id: Id,
-    pub host_fence_event_id: Id,
-    pub interrupted_operation_id: Id,
-    pub host_lost_result_digest: Sha256Digest,
-    pub disk_id: Id,
-    pub volume_id: Id,
-    pub cat_id: Id,
-    pub expected_attachment_id: Id,
-    pub expected_epoch: FenceEpoch,
-    pub expected_head: RemoteHead,
-    pub new_attachment_id: Id,
-    pub new_placement_epoch: Epoch,
-    pub lease_duration_ms: u64,
-    pub not_after: UnixMillis,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TakeoverConsumedReceipt {
-    pub authorization_id: Id,
-    pub host_fence_event_id: Id,
-    pub volume_id: Id,
-    pub new_attachment_id: Id,
-    pub resulting_epoch: FenceEpoch,
-    pub resulting_head: RemoteHead,
-    pub consumed_at: UnixMillis,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BeginDeleteRequest {
     pub delete_id: Id,
     pub disk_id: Id,
@@ -941,223 +805,6 @@ pub struct BeginDeleteResult {
     pub volume_id: Id,
     pub resulting_epoch: FenceEpoch,
     pub resulting_head: RemoteHead,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DisposableRootDeleteAuthorization {
-    pub authorization_id: Id,
-    pub operation_id: Id,
-    pub request_fingerprint: Sha256Digest,
-    pub authorized_node_id: Id,
-    pub delete_id: Id,
-    pub disk_id: Id,
-    pub volume_id: Id,
-    pub cat_id: Id,
-    pub placement_epoch: Epoch,
-    pub expected_attachment_id: Id,
-    pub expected_epoch: FenceEpoch,
-    pub expected_head: RemoteHead,
-    pub disposition: DisposableRootDisposition,
-    pub persistent_dispositions_digest: Sha256Digest,
-    pub isolation_basis: DisposableDeleteIsolationBasis,
-    pub not_after: UnixMillis,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DisposableRootDisposition {
-    DiscardWithCat,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum DisposableDeleteIsolationBasis {
-    LifecycleStrongStop {
-        node_id: Id,
-        agent_session_epoch: Epoch,
-        strong_stop_operation_id: Id,
-        strong_stop_receipt_digest: Sha256Digest,
-        execution_absence_proof_digest: Sha256Digest,
-        inventory_attestation_digest: Sha256Digest,
-    },
-    HostFenceEvent {
-        event_id: Id,
-        interrupted_operation_id: Id,
-        host_lost_result_digest: Sha256Digest,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BeginDisposableDeleteConsumedReceipt {
-    pub authorization_id: Id,
-    pub volume_id: Id,
-    pub disk_id: Id,
-    pub cat_id: Id,
-    pub delete_id: Id,
-    pub prior_attachment_id: Id,
-    pub resulting_epoch: FenceEpoch,
-    pub resulting_head: RemoteHead,
-    pub consumed_at: UnixMillis,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum VolumeAuthorization {
-    Takeover(VolumeTakeoverAuthorization),
-    DisposableRootDelete(DisposableRootDeleteAuthorization),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum AuthorizationConsumedReceipt {
-    Takeover(TakeoverConsumedReceipt),
-    BeginDisposableDelete(BeginDisposableDeleteConsumedReceipt),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    content = "receipt",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-pub enum AuthorizationState {
-    Unconsumed,
-    Consumed(Box<AuthorizationConsumedReceipt>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuthorizationRecord {
-    pub authorization: VolumeAuthorization,
-    pub state: AuthorizationState,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum DeleteCompletionReceipt {
-    Normal {
-        request: BeginDeleteRequest,
-        deleting_epoch: FenceEpoch,
-        deleting_head: RemoteHead,
-        completed_at: UnixMillis,
-    },
-    DisposableRoot {
-        disk_id: Id,
-        volume_id: Id,
-        delete_id: Id,
-        authorization_id: Id,
-        prior_attachment_id: Id,
-        deleting_epoch: FenceEpoch,
-        deleting_head: RemoteHead,
-        completed_at: UnixMillis,
-    },
-}
-
-/// Immutable, complete Control receipt which created one serving attachment.
-///
-/// The residue contract carries this exact value (plus its domain-separated
-/// digest) instead of reconstructing authority from path or identifier hints.
-#[cfg(feature = "proposed-node-residue-reclamation")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum AuthorizedServingAcquire {
-    Normal {
-        request: NormalAcquireRequest,
-        result: NormalAcquireResult,
-    },
-    Takeover {
-        authorization: Box<VolumeTakeoverAuthorization>,
-        receipt: TakeoverConsumedReceipt,
-    },
-}
-
-/// One exact local block-data lineage presented for read-only reclaim
-/// qualification.  This is physical evidence, not ownership authority.  The
-/// Control Plane must bind it to the current PostgreSQL authority snapshot and
-/// return one of the closed proofs below before the Node may delete any byte.
-#[cfg(feature = "proposed-node-residue-reclamation")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ResidueDataDirectoryLineage {
-    pub workspace_id: Id,
-    pub cat_id: Id,
-    pub disk_id: Id,
-    pub disk_kind: DiskKind,
-    pub volume_id: Id,
-    pub attachment_id: Id,
-    pub attachment_epoch: FenceEpoch,
-    pub acquire_origin: AcquireOrigin,
-    pub node_id: Id,
-    /// Current Desired coordinate under which Control is asked to qualify
-    /// reclamation. The immutable acquire receipt below carries its own
-    /// historical revision and placement.
-    pub desired_revision: Revision,
-    pub spec_digest: Sha256Digest,
-    pub placement: AssignedPlacement,
-    pub placement_epoch: Epoch,
-    pub acquisition: AuthorizedServingAcquire,
-    pub acquisition_digest: Sha256Digest,
-    pub local_durable_generation: Generation,
-    pub remote_durable_generation: Generation,
-    pub remote_head: RemoteHead,
-    pub pending_pack_count: WireU64,
-    pub fenced: bool,
-}
-
-#[cfg(feature = "proposed-node-residue-reclamation")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeResidueAuthorityRequest {
-    pub version: ContractVersion,
-    pub session: SessionBinding,
-    pub lineage: ResidueDataDirectoryLineage,
-}
-
-/// A read-only Control decision from one repeatable-read authority snapshot.
-/// `Retained` is diagnostic only.  `Reclaimable` contains the complete proof
-/// that a Node must independently validate against its retained descriptor.
-#[cfg(feature = "proposed-node-residue-reclamation")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum RuntimeResidueAuthorityOutcome {
-    Retained {
-        reason: ResidueAuthorityRetentionReason,
-    },
-    Reclaimable {
-        proof: Box<ResidueReclaimProof>,
-    },
-}
-
-#[cfg(feature = "proposed-node-residue-reclamation")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ResidueAuthorityRetentionReason {
-    NoAuthorityRecord,
-    CurrentOrNewerOwner,
-    ReleaseNotRecorded,
-    DeleteIncomplete,
-    LineageMismatch,
-    UniqueLocalTail,
-    UnsupportedDiskKind,
-}
-
-#[cfg(feature = "proposed-node-residue-reclamation")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ResidueReclaimProof {
-    OrdinaryRelease {
-        current_volume: Box<VolumeRecord>,
-    },
-    NormalDeleteCompletion {
-        completion: Box<DeleteCompletionReceipt>,
-    },
-    DisposableRootDeleteCompletion {
-        completion: Box<DeleteCompletionReceipt>,
-        consumed_authorization: Box<AuthorizationRecord>,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1234,7 +881,6 @@ pub struct SessionBinding {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AcquireOrigin {
     Normal { transition_id: RandomId128 },
-    Takeover { authorization_id: Id },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1263,57 +909,6 @@ impl std::error::Error for ContractError {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "code", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContractErrorDetail {
-    MissingAgentSession {
-        node_id: Id,
-    },
-    StaleSession {
-        node_id: Id,
-        presented_agent_session_epoch: Epoch,
-        current_agent_session_epoch: Epoch,
-    },
-    WrongSession {
-        expected: SessionBinding,
-        presented: SessionBinding,
-    },
-    RegistrationAttemptConflict {
-        node_id: Id,
-        registration_attempt_id: RandomId128,
-        expected: RegistrationAttemptBinding,
-        presented: RegistrationAttemptBinding,
-    },
-    GuestConfigMismatch {
-        node_id: Id,
-        expected_guest_config_digest: Sha256Digest,
-        presented_guest_config_digest: Sha256Digest,
-    },
-    SessionExpired {
-        node_id: Id,
-        agent_session_epoch: Epoch,
-        lease_deadline_unix_ms: UnixMillis,
-        server_time_unix_ms: UnixMillis,
-    },
-    MissingInventoryAttestation {
-        node_id: Id,
-        agent_session_epoch: Epoch,
-    },
-    StaleInventoryEpoch {
-        node_id: Id,
-        agent_session_epoch: Epoch,
-        presented_inventory_epoch: Epoch,
-        current_inventory_epoch: Epoch,
-    },
-    WrongInventoryEpoch {
-        node_id: Id,
-        agent_session_epoch: Epoch,
-        expected_inventory_epoch: Epoch,
-        presented_inventory_epoch: Epoch,
-    },
-    PartialCatNotInFullInventory {
-        node_id: Id,
-        agent_session_epoch: Epoch,
-        inventory_epoch: Epoch,
-        cat_id: Id,
-    },
     UnsupportedVersion {
         contract: ContractName,
         supported_version: ContractVersion,
@@ -1331,23 +926,6 @@ pub enum ContractErrorDetail {
         maximum: WireU64,
         observed_at_least: WireU64,
     },
-    IdempotencyConflict {
-        authenticated_workspace_id: Id,
-        canonical_route: AsciiText,
-        idempotency_key: AsciiText,
-        expected_request_fingerprint: Sha256Digest,
-        presented_request_fingerprint: Sha256Digest,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RegistrationAttemptBinding {
-    pub immutable_host_id: Id,
-    pub node_boot_id: NodeBootId,
-    pub agent_instance_id: RandomId128,
-    pub guest_config_digest: Sha256Digest,
-    pub expected_agent_session_epoch: Option<Epoch>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1359,16 +937,7 @@ pub enum ContractName {
     RuntimeNodeAuthorityApplyResult,
     RuntimeProvisionerTrustBundle,
     RuntimeProvisionerActiveSet,
-    RuntimeNodeAuthorityApplyRecord,
-    AgentRegistrationAttempt,
-    AgentSession,
     GuestRuntimeProfileReceipt,
-    AdmissionInventoryAttestation,
-    RuntimeSpineError,
-    #[cfg(feature = "proposed-node-residue-reclamation")]
-    RuntimeResidueAuthorityRequest,
-    #[cfg(feature = "proposed-node-residue-reclamation")]
-    RuntimeResidueAuthoritySuccess,
     ContractError,
 }
 

@@ -1,8 +1,8 @@
 //! Shared scalar, Node identity, placement and Volume Authority contracts.
 //!
-//! ADR-0056 removed revision-driven lifecycle intent and aggregate observation
-//! settlement. The remaining contracts are provider-neutral inputs
-//! shared by atomic lifecycle, inventory, storage and provisioning modules.
+//! ADR-0059 removed revision-driven lifecycle intent, AgentSession and
+//! observation settlement. The remaining contracts are provider-neutral
+//! storage and provisioning inputs still consumed by current modules.
 //!
 //! Decoder working memory is linear in each contract's documented wire-byte
 //! limit. Ingresses must enforce that limit while reading the body, before
@@ -17,8 +17,6 @@ mod canonical;
 mod types;
 mod wire;
 
-#[cfg(feature = "proposed-node-residue-reclamation")]
-pub const RUNTIME_RESIDUE_AUTHORITY_PATH: &str = "/v1/internal/runtime/residue-authority";
 /// Exact product-router fallback body for an unmatched `/v1/...` route.
 /// Runtime clients use the whole shape (status, headers and these bytes) to
 /// distinguish a deployment mismatch from an HTML/plain proxy response.
@@ -29,11 +27,9 @@ pub const RUNTIME_INTERNAL_ROUTE_NOT_FOUND_ROBOTS: &str = "noindex, nofollow, no
 pub use canonical::value_bytes as canonical_json_value_bytes;
 pub(crate) use canonical::{append_frame, decode_base64url_exact};
 
-#[cfg(feature = "proposed-node-residue-reclamation")]
-pub use canonical::residue_acquisition_digest;
 pub use canonical::{
     canonical_ed25519_spki_sha256, guest_config_digest, key_ring_digest,
-    object_write_writer_authority_id, runtime_provisioner_active_set_digest,
+    runtime_provisioner_active_set_digest,
 };
 pub use types::*;
 pub use wire::{
@@ -46,19 +42,11 @@ pub use wire::{
     encode_node_placement_policy, encode_provision_root_image_error,
     encode_provision_root_image_result, encode_runtime_node_authority_apply,
     encode_runtime_node_authority_apply_result, encode_runtime_provisioner_active_set,
-    encode_runtime_provisioner_trust_bundle, volume_transition_evidence_bundle_is_closed,
-    ADMISSION_INVENTORY_ATTESTATION_MAX_WIRE_BYTES, AGENT_REGISTRATION_ATTEMPT_MAX_WIRE_BYTES,
-    AGENT_SESSION_MAX_WIRE_BYTES, CONTRACT_ERROR_MAX_WIRE_BYTES,
+    encode_runtime_provisioner_trust_bundle, CONTRACT_ERROR_MAX_WIRE_BYTES,
     GUEST_RUNTIME_PROFILE_RECEIPT_MAX_WIRE_BYTES, NODE_IDENTITY_MAX_WIRE_BYTES,
     NODE_PLACEMENT_POLICY_MAX_WIRE_BYTES, PROVISION_ROOT_IMAGE_ERROR_MAX_WIRE_BYTES,
     PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES, PROVISION_ROOT_IMAGE_RESULT_MAX_WIRE_BYTES,
     RUNTIME_NODE_AUTHORITY_APPLY_MAX_WIRE_BYTES,
     RUNTIME_NODE_AUTHORITY_APPLY_RESULT_MAX_WIRE_BYTES,
     RUNTIME_PROVISIONER_ACTIVE_SET_MAX_WIRE_BYTES, RUNTIME_PROVISIONER_TRUST_BUNDLE_MAX_WIRE_BYTES,
-    RUNTIME_SPINE_ERROR_MAX_WIRE_BYTES,
-};
-#[cfg(feature = "proposed-node-residue-reclamation")]
-pub use wire::{
-    residue_reclaim_proof_is_closed, RUNTIME_RESIDUE_AUTHORITY_REQUEST_MAX_WIRE_BYTES,
-    RUNTIME_RESIDUE_AUTHORITY_SUCCESS_MAX_WIRE_BYTES,
 };

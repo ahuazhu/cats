@@ -95,7 +95,7 @@ pub fn test_runtime_provisioner_trust_bundle(
     }
 }
 
-/// Independent E13 offline-operator public trust for server tests.
+/// Independent qualification-operator public trust for server tests.
 pub fn test_production_cutover_operator_trust_bundle(
 ) -> cats_api::production_mutation_admission::ProductionCutoverOperatorTrustBundle {
     use cats_api::production_mutation_admission::{
@@ -165,10 +165,7 @@ pub fn begin_production_qualification_for_product_test(
         let ProductionMutationAdmissionBinding::Qualification(installed) = state
             .binding
             .as_ref()
-            .expect("Qualification mode has a binding")
-        else {
-            panic!("Qualification mode did not carry a Qualification binding")
-        };
+            .expect("Qualification mode has a binding");
         if &installed.workspace_id == workspace_id {
             return installed.clone();
         }
@@ -263,10 +260,7 @@ pub fn end_production_qualification_for_product_test(store: &crate::store::Store
     let ProductionMutationAdmissionBinding::Qualification(binding) = state
         .binding
         .clone()
-        .expect("test Qualification has a binding")
-    else {
-        panic!("test Qualification did not carry a Qualification binding")
-    };
+        .expect("test Qualification has a binding");
     assert_eq!(state.mode, ProductionMutationAdmissionMode::Qualification);
     let now = u64::try_from(
         SystemTime::now()
@@ -320,7 +314,7 @@ fn apply_production_admission_for_product_test(
     command: &cats_api::production_mutation_admission::ProductionMutationAdmissionCommand,
     now_unix_ms: u64,
 ) -> cats_api::production_mutation_admission::ProductionMutationAdmissionCommandReceipt {
-    use cats_api::agent_registration::Ed25519RequestSigner;
+    use cats_api::node_identity::Ed25519RequestSigner;
     use cats_api::production_mutation_admission::{
         encode_production_mutation_admission_command, sign_production_mutation_admission_command,
         verify_production_mutation_admission_command,

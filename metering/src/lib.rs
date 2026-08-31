@@ -59,8 +59,8 @@ pub struct UsageAttribution {
 pub struct AttributedCheckpoint {
     pub checkpoint: CatUsageCheckpoint,
     pub attribution: UsageAttribution,
-    /// Immutable runtime authority captured by the signed Control ingestion
-    /// boundary. Producers cannot choose billing attribution or this binding.
+    /// Immutable producer/runtime coordinates captured by Control ingestion.
+    /// Producers cannot choose billing attribution.
     pub source_binding: RuntimeUsageSourceBinding,
 }
 
@@ -74,7 +74,9 @@ pub struct RuntimeUsageSourceBinding {
 /// The receipt/archive wire shape intentionally avoids any field named
 /// `session`: release evidence scanners reserve that word for possible session
 /// credentials. These six fields are the complete, lossless expansion of the
-/// non-secret AgentSession identity plus the runtime authority binding.
+/// non-secret producer-process coordinates plus the runtime binding. The
+/// field names are retained by the usage-store v16 persisted shape; ADR-0063
+/// no longer treats them as AgentSession or Desired authority.
 #[derive(serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct RuntimeUsageSourceBindingRef<'a> {

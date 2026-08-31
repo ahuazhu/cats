@@ -60,7 +60,7 @@ pub struct PostgresMetadataStore {
     ///
     /// Every operation on a shared worker is serial, so a renewal queued behind
     /// a commit's metadata work waits for it. Renewals use a separate connection
-    /// to keep the lease fresh and make takeover latency predictable. A bare
+    /// to keep the lease fresh and make recovery latency predictable. A bare
     /// expiry lapse is not itself a fence: only an external Volume Authority
     /// transition changes the owner/epoch token.
     lease_jobs: mpsc::SyncSender<Job>,

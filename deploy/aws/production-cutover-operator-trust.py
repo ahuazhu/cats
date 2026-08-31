@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create, verify, package, and install the E13 public operator trust artifact.
+"""Create, verify, package, and install qualification operator public trust.
 
 The offline Ed25519 private key is accepted only by ``generate``, ``verify``,
 and the explicit operator-execution-host installer.
@@ -41,9 +41,6 @@ INSTALLED_TRUST_PATH = Path("/etc/cats") / TRUST_FILE
 OPERATOR_HOST_ROOT = Path("/etc/cats/production-cutover-operator")
 OPERATOR_HOST_PRIVATE_KEY_PATH = OPERATOR_HOST_ROOT / "operator-private-key.pem"
 OPERATOR_HOST_TRUST_PATH = OPERATOR_HOST_ROOT / TRUST_FILE
-FINAL_OPEN_STATE_ROOT = Path("/var/lib/cats/production-final-open")
-FINAL_OPEN_ADMISSION_STATE = FINAL_OPEN_STATE_ROOT / "admission-state"
-FINAL_OPEN_RECEIPTS = FINAL_OPEN_STATE_ROOT / "receipts"
 MAX_TRUST_BYTES = 65_536
 MAX_RECEIPT_BYTES = 65_536
 MAX_PRIVATE_KEY_BYTES = 16_384
@@ -495,136 +492,6 @@ def pin_output_parent(path: Path, *, private_parent: bool) -> PinnedOutputParent
         actor=actor,
         private_parent=private_parent,
     )
-
-
-def directory_receipt(path: Path, metadata: os.stat_result) -> dict[str, Any]:
-    return {
-        "gid": metadata.st_gid,
-        "mode": "0700",
-        "path": str(path),
-        "type": "directory",
-        "uid": metadata.st_uid,
-    }
-
-
-def ensure_private_directory_at(
-    parent: PinnedOutputParent,
-    name: str,
-    path: Path,
-    *,
-    require_root: bool,
-) -> os.stat_result:
-    if not name or name in {".", ".."} or "/" in name or path.name != name:
-        raise TrustError("fixed private directory name is invalid")
-    created = False
-    parent.verify()
-    try:
-        os.mkdir(name, 0o700, dir_fd=parent.descriptor)
-        created = True
-    except FileExistsError:
-        pass
-    parent.verify()
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    try:
-        descriptor = os.open(name, flags, dir_fd=parent.descriptor)
-    except OSError as error:
-        raise TrustError(f"fixed private directory is not real: {path}") from error
-    try:
-        if created:
-            parent.verify()
-            os.fchmod(descriptor, 0o700)
-            if require_root:
-                parent.verify()
-                os.fchown(descriptor, 0, 0)
-        parent.verify()
-        metadata = os.fstat(descriptor)
-        expected_owner = (0, 0) if require_root else parent.actor
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or (metadata.st_uid, metadata.st_gid) != expected_owner
-            or stat.S_IMODE(metadata.st_mode) != 0o700
-        ):
-            raise TrustError(f"fixed private directory metadata is invalid: {path}")
-        parent.verify()
-        named = os.stat(name, dir_fd=parent.descriptor, follow_symlinks=False)
-        if (metadata.st_dev, metadata.st_ino) != (named.st_dev, named.st_ino):
-            raise TrustError(f"fixed private directory binding changed: {path}")
-        parent.verify()
-        os.fsync(descriptor)
-        parent.fsync()
-        parent.verify()
-        return os.fstat(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def provision_final_open_state_layout(
-    state_root: Path = FINAL_OPEN_STATE_ROOT,
-    *,
-    require_root: bool = True,
-) -> dict[str, Any]:
-    """Create the one fixed final-open state layout without storing secrets."""
-
-    if require_root and state_root != FINAL_OPEN_STATE_ROOT:
-        raise TrustError("production final-open state root is not the fixed path")
-    if require_root and (os.geteuid(), os.getegid()) != (0, 0):
-        raise TrustError("production final-open state installation requires root:root")
-    root_parent = pin_output_parent(state_root, private_parent=False)
-    try:
-        root_metadata = ensure_private_directory_at(
-            root_parent,
-            state_root.name,
-            state_root,
-            require_root=require_root,
-        )
-    finally:
-        root_parent.close()
-
-    layout_parent = pin_output_parent(
-        state_root / ".cats-final-open-layout", private_parent=True
-    )
-    try:
-        if stat.S_IMODE(os.fstat(layout_parent.descriptor).st_mode) != 0o700:
-            raise TrustError("production final-open state root mode is not 0700")
-        admission_path = state_root / "admission-state"
-        receipt_path = state_root / "receipts"
-        admission_metadata = ensure_private_directory_at(
-            layout_parent,
-            admission_path.name,
-            admission_path,
-            require_root=require_root,
-        )
-        receipt_metadata = ensure_private_directory_at(
-            layout_parent,
-            receipt_path.name,
-            receipt_path,
-            require_root=require_root,
-        )
-        layout_parent.verify()
-        # Linux fdopendir inherits the descriptor offset (macOS rewinds); an
-        # already-consumed offset would list nothing and let foreign entries
-        # hide, so rewind before enumerating.
-        os.lseek(layout_parent.descriptor, 0, os.SEEK_SET)
-        direct_children = sorted(os.listdir(layout_parent.descriptor))
-        layout_parent.verify()
-        if direct_children != ["admission-state", "receipts"]:
-            raise TrustError("production final-open state root has foreign direct children")
-        layout_parent.fsync()
-        return {
-            "admission_state": directory_receipt(
-                admission_path, admission_metadata
-            ),
-            "direct_children": direct_children,
-            "receipts": directory_receipt(receipt_path, receipt_metadata),
-            "root": directory_receipt(state_root, root_metadata),
-        }
-    finally:
-        layout_parent.close()
 
 
 @dataclass
@@ -1350,7 +1217,7 @@ def validate_release_manifest_binding(
     trust: dict[str, Any],
 ) -> str:
     # The current manual-release manifest closes exactly {control_plane,
-    # credential_refresher, gateway, worker}; it carries no operator trust member. Release binding
+    # credential_refresher, worker}; it carries no operator trust member. Release binding
     # is therefore the independently approved manifest digest plus the exact
     # source-commit equality between that manifest and the public trust.
     manifest_raw = stable_read(
@@ -1372,7 +1239,7 @@ def validate_release_manifest_binding(
         raise TrustError("manual release manifest version is not 1")
     artifacts = require_exact_fields(
         manifest["artifacts"],
-        {"control_plane", "credential_refresher", "gateway", "worker"},
+        {"control_plane", "credential_refresher", "worker"},
         "manual release artifacts",
     )
     control_image = require_exact_fields(
@@ -1386,18 +1253,6 @@ def validate_release_manifest_binding(
             "registry_verified",
         },
         "manual release Control image",
-    )
-    gateway_image = require_exact_fields(
-        artifacts["gateway"],
-        {
-            "binary_sha256",
-            "binary_size_bytes",
-            "image_config_digest",
-            "image_digest",
-            "image_reference",
-            "registry_verified",
-        },
-        "manual release Gateway image",
     )
     credential_refresher_image = require_exact_fields(
         artifacts["credential_refresher"],
@@ -1414,7 +1269,6 @@ def validate_release_manifest_binding(
     for image_name, image in (
         ("control_plane", control_image),
         ("credential_refresher", credential_refresher_image),
-        ("gateway", gateway_image),
     ):
         if image["registry_verified"] is not True:
             raise TrustError(
@@ -1441,13 +1295,6 @@ def validate_release_manifest_binding(
             credential_refresher_image[field],
             f"manual release credential-refresher {field}",
         )
-    require_sha256(gateway_image["binary_sha256"], "manual release Gateway binary")
-    if (
-        type(gateway_image["binary_size_bytes"]) is not int
-        or gateway_image["binary_size_bytes"] <= 0
-    ):
-        raise TrustError("manual release Gateway binary size is invalid")
-
     worker = require_exact_fields(
         artifacts["worker"],
         {
@@ -1844,7 +1691,6 @@ def install_operator_host(args: argparse.Namespace) -> dict[str, Any]:
         or stat.S_IMODE(root.st_mode) != 0o700
     ):
         raise TrustError("canonical operator Host directory must be root:root 0700")
-    final_open_state = provision_final_open_state_layout()
     write_exact_or_replay(
         OPERATOR_HOST_TRUST_PATH,
         trust_raw,
@@ -1895,7 +1741,6 @@ def install_operator_host(args: argparse.Namespace) -> dict[str, Any]:
         "credential_id": credential["credential_id"],
         "deployment_id": trust["deployment_id"],
         "generation_receipt_sha256": sha256(generation_raw),
-        "final_open_state": final_open_state,
         "kind": "cats.production-cutover-operator-execution-host-installation.v1",
         "public_key_spki_sha256": sha256(spki),
         "public_trust": {

@@ -1,10 +1,10 @@
 # ADR-0044：Route v2 使用独立的签名与公钥环 authority
 
-- 状态：Accepted
+- 状态：Superseded for current production composition by
+  [ADR-0059](0059-semantic-control-node-synchronous-protocol.md)
 - 日期：2026-08-10
-- 关联：[ADR-0041](0041-node-verified-route-admission.md)、
-  [Route Grant v2](../specs/route-grant-v2.md)
-- 规格：[Route v2 Signing Authority v1](../specs/route-signing-authority-v1.md)
+- 关联：[ADR-0041](0041-node-verified-route-admission.md)
+- 历史协议实现由 Git history 保存
 
 ## 背景
 

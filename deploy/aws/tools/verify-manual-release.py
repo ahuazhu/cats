@@ -31,7 +31,6 @@ MAX_BOOT_MEMBER_BYTES = 512 * 1024 * 1024
 MAX_WORKER_BUNDLE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_WORKER_ENTRIES = 48
 MAX_WORKER_MEMBER_BYTES = 512 * 1024 * 1024
-MAX_GATEWAY_BINARY_BYTES = 256 * 1024 * 1024
 MAX_RELEASE_MANIFEST_BYTES = 1024 * 1024
 WORKER_STATIC_FILES = {
     "cats",
@@ -44,7 +43,6 @@ WORKER_STATIC_FILES = {
     "update-guest-seed.sh",
     "require-idle-worker.sh",
     "setup-guest-network.sh",
-    "old-host-positive-stop.py",
     "render-postgres-url.sh",
     "install-guest-runtime-release.sh",
     "validate-node-identity-installation.sh",
@@ -79,7 +77,6 @@ WORKER_EXECUTABLE_FILES = {
     "update-guest-seed.sh",
     "require-idle-worker.sh",
     "setup-guest-network.sh",
-    "old-host-positive-stop.py",
     "render-postgres-url.sh",
     "install-guest-runtime-release.sh",
     "validate-node-identity-installation.sh",
@@ -545,16 +542,6 @@ def verify_exact_copy(path: Path, expected: bytes, *, label: str) -> str:
     return sha256_bytes(actual)
 
 
-def verify_reviewed_worker_program(path: Path, expected: bytes) -> str:
-    actual = read_regular(path, cap=MAX_WORKER_MEMBER_BYTES, mode=0o755)
-    if actual != expected:
-        raise VerificationError(
-            "worker old-host-positive-stop.py is not byte-identical to reviewed input "
-            "old_host_positive_stop"
-        )
-    return sha256_bytes(actual)
-
-
 def parse_input_file(raw: str) -> tuple[str, Path]:
     label, separator, path = raw.partition("=")
     if separator != "=" or INPUT_LABEL_PATTERN.fullmatch(label) is None or not path:
@@ -569,7 +556,6 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shared-guest-runtime", required=True, type=Path)
     parser.add_argument("--control-root", required=True, type=Path)
-    parser.add_argument("--gateway-image-root", required=True, type=Path)
     parser.add_argument("--worker-bundle", required=True, type=Path)
     parser.add_argument("--control-image-reference", required=True)
     parser.add_argument("--control-image-digest", required=True)
@@ -584,10 +570,6 @@ def parse_arguments() -> argparse.Namespace:
         choices=("true", "false"),
         required=True,
     )
-    parser.add_argument("--gateway-image-reference", required=True)
-    parser.add_argument("--gateway-image-digest", required=True)
-    parser.add_argument("--gateway-image-config-digest", required=True)
-    parser.add_argument("--gateway-image-registry-verified", choices=("true", "false"), required=True)
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--source-tree", required=True)
     parser.add_argument("--source-fingerprint", required=True)
@@ -606,13 +588,11 @@ def parse_registry_candidate_arguments(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--manifest-sha256", required=True)
     parser.add_argument("--control-registry-digest")
     parser.add_argument("--credential-refresher-registry-digest")
-    parser.add_argument("--gateway-registry-digest")
     parser.add_argument("--output", type=Path)
     arguments = parser.parse_args(argv)
     promotion = (
         arguments.control_registry_digest,
         arguments.credential_refresher_registry_digest,
-        arguments.gateway_registry_digest,
         arguments.output,
     )
     if any(value is not None for value in promotion) and not all(
@@ -631,7 +611,6 @@ def validate_existing_release_manifest(value: dict[str, Any]) -> dict[str, dict[
     if not isinstance(artifacts, dict) or set(artifacts) != {
         "control_plane",
         "credential_refresher",
-        "gateway",
         "worker",
     }:
         raise VerificationError("existing release manifest has the wrong artifact set")
@@ -651,14 +630,6 @@ def validate_existing_release_manifest(value: dict[str, Any]) -> dict[str, dict[
             "refresh_program_sha256",
             "registry_verified",
             "swap_dsn_program_sha256",
-        },
-        "gateway": {
-            "binary_sha256",
-            "binary_size_bytes",
-            "image_config_digest",
-            "image_digest",
-            "image_reference",
-            "registry_verified",
         },
     }
     identity: dict[str, dict[str, str]] = {}
@@ -692,7 +663,6 @@ def validate_existing_release_manifest(value: dict[str, Any]) -> dict[str, dict[
         require_distinct_image_tags(
             identity["control_plane"]["reference"],
             identity["credential_refresher"]["reference"],
-            identity["gateway"]["reference"],
         )
     except ImageReferenceError as error:
         raise VerificationError(str(error)) from error
@@ -802,9 +772,6 @@ def registry_candidate(arguments: argparse.Namespace) -> int:
             arguments.credential_refresher_registry_digest,
             name="observed credential-refresher registry digest",
         ),
-        "gateway": require_sha256(
-            arguments.gateway_registry_digest, name="observed Gateway registry digest"
-        ),
     }
     for name, digest in observed.items():
         if digest != identity[name]["image_digest"]:
@@ -836,12 +803,9 @@ def validate_identifier_arguments(arguments: argparse.Namespace) -> None:
         arguments.credential_refresher_image_config_digest,
         name="credential-refresher image config digest",
     )
-    require_sha256(arguments.gateway_image_digest, name="Gateway OCI digest")
-    require_sha256(arguments.gateway_image_config_digest, name="Gateway image config digest")
     for label, reference in (
         ("Control", arguments.control_image_reference),
         ("credential-refresher", arguments.credential_refresher_image_reference),
-        ("Gateway", arguments.gateway_image_reference),
     ):
         if (
             not reference
@@ -856,7 +820,6 @@ def validate_identifier_arguments(arguments: argparse.Namespace) -> None:
         require_distinct_image_tags(
             arguments.control_image_reference,
             arguments.credential_refresher_image_reference,
-            arguments.gateway_image_reference,
         )
     except ImageReferenceError as error:
         raise VerificationError(str(error)) from error
@@ -904,46 +867,6 @@ def atomic_write_new(path: Path, raw: bytes) -> None:
             temporary.unlink()
         except FileNotFoundError:
             pass
-
-
-def verify_gateway_image_root(root: Path) -> tuple[str, int]:
-    expected_directories = {".", "usr", "usr/local", "usr/local/bin"}
-    expected_files = {"usr/local/bin/cats-gatewayd"}
-    actual_directories: set[str] = {"."}
-    actual_files: set[str] = set()
-    root_metadata = root.lstat()
-    if not stat.S_ISDIR(root_metadata.st_mode) or stat.S_ISLNK(root_metadata.st_mode):
-        raise VerificationError("Gateway image root is not a real directory")
-    for directory, names, filenames in os.walk(root, followlinks=False):
-        directory_path = Path(directory)
-        for name in names:
-            path = directory_path / name
-            metadata = path.lstat()
-            relative = path.relative_to(root).as_posix()
-            if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-                raise VerificationError(f"Gateway image root contains a non-directory: {relative}")
-            actual_directories.add(relative)
-        for name in filenames:
-            path = directory_path / name
-            metadata = path.lstat()
-            relative = path.relative_to(root).as_posix()
-            if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-                raise VerificationError(f"Gateway image root contains a non-file: {relative}")
-            actual_files.add(relative)
-    if actual_directories != expected_directories:
-        raise VerificationError(
-            f"Gateway image directory set differs: {sorted(actual_directories ^ expected_directories)}"
-        )
-    if actual_files != expected_files:
-        raise VerificationError(
-            f"Gateway image file set differs: {sorted(actual_files ^ expected_files)}"
-        )
-    binary = read_regular(
-        root / "usr/local/bin/cats-gatewayd",
-        cap=MAX_GATEWAY_BINARY_BYTES,
-        mode=0o755,
-    )
-    return sha256_bytes(binary), len(binary)
 
 
 def verify_credential_refresher_root(
@@ -1013,7 +936,6 @@ def verify_credential_refresher_root(
 def verify(arguments: argparse.Namespace) -> tuple[dict[str, Any], bytes]:
     validate_identifier_arguments(arguments)
     input_files: dict[str, dict[str, Any]] = {}
-    reviewed_old_host_positive_stop: bytes | None = None
     reviewed_refresh_program: bytes | None = None
     reviewed_swap_dsn_program: bytes | None = None
     for label, path in arguments.input_file:
@@ -1021,16 +943,12 @@ def verify(arguments: argparse.Namespace) -> tuple[dict[str, Any], bytes]:
             raise VerificationError(f"duplicate fingerprinted input label: {label}")
         digest, size = hash_regular(path)
         input_files[label] = {"sha256": digest, "size_bytes": size}
-        if label == "old_host_positive_stop":
-            reviewed_old_host_positive_stop = read_regular(path, cap=MAX_WORKER_MEMBER_BYTES)
-        elif label == "credential_refresher_program":
+        if label == "credential_refresher_program":
             reviewed_refresh_program = read_regular(path, cap=MAX_WORKER_MEMBER_BYTES)
         elif label == "swap_dsn_program":
             reviewed_swap_dsn_program = read_regular(path, cap=MAX_WORKER_MEMBER_BYTES)
     if not input_files:
         raise VerificationError("at least one exact build input file must be fingerprinted")
-    if reviewed_old_host_positive_stop is None:
-        raise VerificationError("reviewed input old_host_positive_stop is required")
     if reviewed_refresh_program is None or reviewed_swap_dsn_program is None:
         raise VerificationError(
             "reviewed credential_refresher_program and swap_dsn_program inputs are required"
@@ -1050,15 +968,6 @@ def verify(arguments: argparse.Namespace) -> tuple[dict[str, Any], bytes]:
                 raise VerificationError(
                     f"worker {field.removesuffix('_raw')} is not byte-identical to the shared Guest release"
                 )
-        worker_old_host_positive_stop_sha = verify_reviewed_worker_program(
-            worker_root / "old-host-positive-stop.py",
-            reviewed_old_host_positive_stop,
-        )
-        if worker_old_host_positive_stop_sha != input_files["old_host_positive_stop"]["sha256"]:
-            raise VerificationError(
-                "worker old-host-positive-stop.py digest does not match reviewed input "
-                "old_host_positive_stop"
-            )
         installer = worker_root / "install-guest-runtime-release.sh"
         installer_metadata = installer.lstat()
         if (
@@ -1088,9 +997,6 @@ def verify(arguments: argparse.Namespace) -> tuple[dict[str, Any], bytes]:
         control_release_root / "guest-runtime-profile.v1.json",
         shared["profile_raw"],
         label="Control Guest runtime profile",
-    )
-    gateway_binary_sha, gateway_binary_size = verify_gateway_image_root(
-        arguments.gateway_image_root
     )
     refresh_program_sha, swap_dsn_program_sha = verify_credential_refresher_root(
         arguments.credential_refresher_root,
@@ -1138,14 +1044,6 @@ def verify(arguments: argparse.Namespace) -> tuple[dict[str, Any], bytes]:
                     arguments.credential_refresher_image_registry_verified == "true"
                 ),
                 "swap_dsn_program_sha256": swap_dsn_program_sha,
-            },
-            "gateway": {
-                "binary_sha256": gateway_binary_sha,
-                "binary_size_bytes": gateway_binary_size,
-                "image_config_digest": arguments.gateway_image_config_digest,
-                "image_digest": arguments.gateway_image_digest,
-                "image_reference": arguments.gateway_image_reference,
-                "registry_verified": arguments.gateway_image_registry_verified == "true",
             },
             "worker": {
                 "bundle_name": arguments.worker_bundle.name,
@@ -1200,11 +1098,6 @@ def main() -> int:
         "credential_refresher_image="
         f"{release_manifest['artifacts']['credential_refresher']['image_reference']}@"
         f"{release_manifest['artifacts']['credential_refresher']['image_digest']}"
-    )
-    print(
-        "gateway_image="
-        f"{release_manifest['artifacts']['gateway']['image_reference']}@"
-        f"{release_manifest['artifacts']['gateway']['image_digest']}"
     )
     print(f"worker_bundle_sha256={release_manifest['artifacts']['worker']['bundle_sha256']}")
     return 0

@@ -90,7 +90,7 @@ variable "runtime_secret_data" {
 }
 
 variable "production_cutover_operator_trust_bundle_json" {
-  description = "Release-bound public E13 operator trust bundle. cats-controld loads it at startup and refuses to start without it; it carries no private material."
+  description = "Release-bound public qualification-operator trust bundle. cats-controld loads it at startup and refuses to start without it; it carries no private material."
   type        = string
 
   validation {

@@ -221,7 +221,6 @@ def make_fixture(root: Path) -> None:
                 "prefix_length": 16,
             },
             "node_id": node_id,
-            "node_transport_target": f"https://{node_id}.fixture.invalid:7301",
             "policy_revision": 1,
             "scheduling_state": "cordoned",
             "version": 1,

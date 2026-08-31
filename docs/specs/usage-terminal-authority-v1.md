@@ -1,38 +1,41 @@
 # Usage Terminal Authority v1
 
-- 状态：Frozen；schema/protocol v16 clean-slate contract
-- Authority：[ADR-0047](../decisions/0047-terminal-usage-archive-and-projection-authority.md)
+- 状态：Frozen archive/terminal schema v16；producer/auth 由 ADR-0063 修正
+- Terminal authority：[ADR-0047](../decisions/0047-terminal-usage-archive-and-projection-authority.md)
+- 当前 producer/auth：[ADR-0063](../decisions/0063-semantic-node-usage-metering.md)
 
 ## 1. Source terminal
 
-compute source固定为`node/<node_id>/cat/<cat_id>`，固定meter集合按slug排序为
-`cats.compute.cpu.v1,cats.compute.memory.v1`。每个stream envelope包含server-frozen：
+compute source 固定为 `node/<node_id>/cat/<cat_id>`，meter 集合按 slug 排序为
+`cats.compute.cpu.v1,cats.compute.memory.v1`。usage-store v16 保留以下 persisted binding 字段：
 
 ```text
 RuntimeUsageSourceBinding {
-  node_id: Id,
-  node_boot_id: NodeBootId,
-  agent_instance_id: RandomId128,
-  agent_epoch: Epoch,
-  desired_revision: Revision,
-  runtime_incarnation: RandomId128
+  node_id,
+  node_boot_id,
+  agent_instance_id,
+  agent_epoch,
+  desired_revision,
+  runtime_incarnation
 }
 ```
 
-`source_epoch`的canonical signed Runtime shape必须逐字段编码同一个agent instance/session epoch、Desired
-revision、runtime incarnation和非空process identity。Control先用A19验证current provisioned Node/current
-AgentSession，再从source epoch解码并与request逐字段比较；不接受caller另传binding。
+这些字段现在是 producer process/runtime 的兼容坐标，不是 AgentSession、Desired 或 lifecycle authority。
+`agent_epoch` 由 noded 进程启动时的 ordinal 填充，`desired_revision` 使用 semantic compatibility
+generation；Control 不再查询 current AgentSession 或解码签名 source epoch。
 
-Node普通sample使用`epoch_marker=open`。准备改变runtime时，Node先采样counter并在一个SQLite transaction中写入
-`usage_pending_final`：exact `SignedMeterTarget`、`RuntimeMeterAccumulatorSnapshot`、以及由该snapshot非破坏计算的
-CPU/memory候选final。pending不是outbox，不可发送。effect失败或accepted same-target observation删除pending，
-从snapshot恢复同一accumulator并继续open采样；`RetryExact|RefreshInventory`以及process crash保留pending。只有
-accepted full observation证明原target absent或different时，才在一个transaction中把exact候选插入outbox、删除
-pending并写`usage_promoted_source_epoch` tombstone。tombstone拒绝该source epoch任何brand-new open，但允许exact
-outbox replay。因此尝试过effect不等于terminal，且receipt成立前不会再有同epoch的新event。
+noded 为每个 live Cat runtime 建立 cgroup lane，以 `runtime_incarnation` 作为 `source_epoch`，周期发布
+`epoch_marker=open` 的 CPU/memory 累计 pair。Cold、Destroy 或 runtime replacement 关闭 lane 时，Node
+读取最后可得 counter，并发布同 sequence、time、Cat、binding 的 `epoch_marker=final` pair。marker 进入
+deterministic event ID；同 metric/sequence 的 open 与 final 不是同一 event。
 
-promoted最后sample使用`final`。CPU、memory两个final event共享source、epoch、sequence、time、Cat、revision和
-binding。marker进入event ID hash frame；同一metric/sequence的open与final不是同一event。
+投递通过 semantic Node service token；Control 以当前 `cats.node_id` 或
+`cats.current_action_node_id` 限定 claimed Node 可为哪些 Cat 开启 epoch，并从当前产品 row 冻结 Workspace
+与 Billing Account。producer 不能选择计费归属。
+
+当前 Node queue 是有界内存队列，final delivery 也是 best effort；它没有旧
+`usage_pending_final`、inventory observation promotion 或 durable tombstone。丢失 final 会使 terminal
+receipt 保持 absent，只能解释为“尚未证明 terminal”，不能解释为零 usage 或清理许可。
 
 projector为每个event保存：
 
@@ -66,7 +69,7 @@ results: [{event_id, outcome: accepted|exact_replay|rejected, reason?}]
 ```
 
 `reason`只在rejected存在。`accepted/duplicates/rejected[]`是由results导出的诊断镜像，逐项不一致即整批ACK
-无效。Node只在全部result为accepted/exact_replay时删除完整exact outbox prefix；不做部分删除。HTTP timeout、
+无效。Node只在全部result为accepted/exact_replay时删除完整exact in-memory pending prefix；不做部分删除。HTTP timeout、
 5xx、body读取/解码失败、缺项、错序、重复/foreign ID和rejected都保留prefix。413只缩小尚未获得任何成功
 response的有序batch，不改变event bytes。
 
@@ -171,7 +174,7 @@ global成功目录只有七个evidence文件加`SHA256SUMS`：`case-evidence.jso
 - archive success后project crash、project success response loss、DynamoDB save前crash：exact replay收敛为一份
   event evidence和一份source receipt；无false ACK。
 - final缺项/错序/extra/later-open/binding或attribution漂移都卡住shard checkpoint且零receipt。
-- exact per-event ACK的缺项、错序、foreign/rejected/count漂移都保留Node outbox。
+- exact per-event ACK的缺项、错序、foreign/rejected/count漂移都保留Node内存pending queue。
 - marker PutRecord response loss产生相同marker；reshard、任一source未terminal、DDB checkpoint落后、old/fresh
   overlap、target ARN变化或S3 receipt冲突均零target receipt。
 - 两个block-path分别只能生成source case闭集；第一条path不得调用target begin。只有两个passed manifest/evidence的

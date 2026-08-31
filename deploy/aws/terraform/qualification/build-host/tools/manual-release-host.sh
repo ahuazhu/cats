@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: manual-release-host.sh <prepare|verify|build|golden-root> <40hex-commit> <64hex-manifest-sha256> <64hex-bundle-sha256> <control-repository:tag> <credential-refresher-repository:tag> <gateway-repository:tag>
+usage: manual-release-host.sh <prepare|verify|build|golden-root> <40hex-commit> <64hex-manifest-sha256> <64hex-bundle-sha256> <control-repository:tag> <credential-refresher-repository:tag>
 
 The exact source must already have been delivered by cats-checkout-exact-sha.
 prepare installs only the version-locked Guest/buildx/Rust prerequisites.
@@ -15,7 +15,7 @@ contains that exact Agent, and emits a separately publishable frozen artifact.
 EOF
 }
 
-if [[ $# -ne 7 || ! $2 =~ ^[0-9a-f]{40}$ || ! $3 =~ ^[0-9a-f]{64}$ || ! $4 =~ ^[0-9a-f]{64}$ ]]; then
+if [[ $# -ne 6 || ! $2 =~ ^[0-9a-f]{40}$ || ! $3 =~ ^[0-9a-f]{64}$ || ! $4 =~ ^[0-9a-f]{64}$ ]]; then
   usage
   exit 64
 fi
@@ -33,11 +33,9 @@ readonly manifest_sha256="$3"
 readonly bundle_sha256="$4"
 readonly control_image_reference="$5"
 readonly credential_refresher_image_reference="$6"
-readonly gateway_image_reference="$7"
 for image_reference in \
   "${control_image_reference}" \
-  "${credential_refresher_image_reference}" \
-  "${gateway_image_reference}"; do
+  "${credential_refresher_image_reference}"; do
   [[ ${image_reference} == */*:* && ${image_reference} != *@* && ${image_reference} != *[[:space:]]* ]] || {
     echo "manual release image references must be explicit repository:tag values" >&2
     exit 64
@@ -450,10 +448,9 @@ EOF
       GIT_CONFIG_NOSYSTEM=1 \
       GIT_CONFIG_GLOBAL=/dev/null \
       GIT_TERMINAL_PROMPT=0 \
-      bash -c 'cd /srv/cats-build/source && exec deploy/aws/tools/build-manual-release.sh --source-sha "$1" --output "$2" --image "$3" --credential-refresher-image "$4" --gateway-image "$5" --export-images' \
+      bash -c 'cd /srv/cats-build/source && exec deploy/aws/tools/build-manual-release.sh --source-sha "$1" --output "$2" --image "$3" --credential-refresher-image "$4" --export-images' \
       cats-manual-release "${source_sha}" "${release_dir}" \
       "${control_image_reference}" "${credential_refresher_image_reference}" \
-      "${gateway_image_reference}" \
     2>&1 | tee "${build_log}"
   local -a pipeline_status=("${PIPESTATUS[@]}")
   status=${pipeline_status[0]}
@@ -471,14 +468,11 @@ EOF
         --arg source_sha "${source_sha}" \
         --arg control_image_reference "${control_image_reference}" \
         --arg credential_refresher_image_reference "${credential_refresher_image_reference}" \
-        --arg gateway_image_reference "${gateway_image_reference}" \
         '.source.commit == $source_sha and
          .artifacts.control_plane.image_reference == $control_image_reference and
          .artifacts.credential_refresher.image_reference == $credential_refresher_image_reference and
-         .artifacts.gateway.image_reference == $gateway_image_reference and
          .artifacts.control_plane.registry_verified == false and
-         .artifacts.credential_refresher.registry_verified == false and
-         .artifacts.gateway.registry_verified == false' \
+         .artifacts.credential_refresher.registry_verified == false' \
         release-manifest.v1.json >/dev/null
       find . -type f ! -name release-files.sha256 -print0 \
         | LC_ALL=C sort -z \
@@ -507,7 +501,7 @@ EOF
     --source-sha "${source_sha}" --output "${release_dir}" \
     --image "${control_image_reference}" \
     --credential-refresher-image "${credential_refresher_image_reference}" \
-    --gateway-image "${gateway_image_reference}" --export-images \
+    --export-images \
     | jq -Rs 'split("\u0000")[:-1]')"
   archive_sha256=""
   [[ ! -f ${transport_archive} ]] || archive_sha256="$(hash_file "${transport_archive}")"
@@ -518,7 +512,6 @@ EOF
     --arg bundle_sha256 "${bundle_sha256}" \
     --arg control_image_reference "${control_image_reference}" \
     --arg credential_refresher_image_reference "${credential_refresher_image_reference}" \
-    --arg gateway_image_reference "${gateway_image_reference}" \
     --arg job_id "${job_id}" \
     --arg job_dir "${job_dir}" \
     --arg output_dir "${output_dir}" \
@@ -536,7 +529,6 @@ EOF
       manifest_sha256:$manifest_sha256,bundle_sha256:$bundle_sha256,
       control_image_reference:$control_image_reference,
       credential_refresher_image_reference:$credential_refresher_image_reference,
-      gateway_image_reference:$gateway_image_reference,
       job_id:$job_id,job_dir:$job_dir,output_dir:$output_dir,
       source_receipt:$source_receipt,command:$command,with_postgres:false,
       exit_status:$exit_status,bootstrap_payload_sha256:$bootstrap_payload_sha256,

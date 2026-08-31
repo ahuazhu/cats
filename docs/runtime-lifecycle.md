@@ -112,10 +112,9 @@ run 从 Suspended、Warm 或 Cold 进入 Running；Cold run 可以重新选择 N
 - 当前 Node 仍允许 placement；
 - 新流量入口只在上述条件完成后发布。
 
-真实 Control→noded HTTP 的 Cat 全状态机和重复语义已经通过。Strict PersistentDisk provision/delete
-backend 已接入 production composition，精确卷/文件系统身份已贯穿 Control/noded wire；Cloud Hypervisor
-的完整实际 effects 和 Guest 物理挂载 E2E 尚未闭合。这些仍是上线前置，不能把 HTTP/FakeVmm 或 backend 单层通过
-写成完整物理路径完成。
+真实 Control→noded HTTP 的 Cat 全状态机、Strict PersistentDisk provision/delete、精确卷/文件系统身份、
+Cloud Hypervisor实际effects、Guest物理mount-ready、Cold重挂和双Node恢复均已有production证据。后续改动
+仍须在自身exact release重跑分层资格，不能用旧commit或单层FakeVmm结果替代。
 
 create 最终失败或超时时，Control 可以对同一 `cat_id` 调用一次 noded DELETE 清理尝试残留；产品 Cat
 仍写为 `failure`，不会自动变成 destroyed。用户随后显式 destroy。
@@ -172,8 +171,8 @@ RootDisk 按产品删除规则处理。成功后 Control 删除 bindings、写 `
 
 PersistentDisk 有未远端持久数据、未知写入权限或无法安全 detach 时，destroy 必须失败并保留数据。
 Root 与 PersistentDisk 的具体 owner/epoch、remote root 和删除屏障由
-[Volume Authority](specs/volume-authority.md)负责；其中依赖旧 lifecycle Operation/AgentSession 的组合部分
-已被 ADR-0059 supersede，不能作为当前 Control/Node wire。
+[Volume Authority](specs/volume-authority.md)负责；当前 Control/Node 只使用其中的 direct semantic
+composition。
 
 ## 5. 配置、磁盘与 placement
 
@@ -268,5 +267,5 @@ Control 崩溃恢复动作只查询保存的目标 Node 和 Cat 实际状态。
   且它们不进入 `CatAction/current_action`。
 - offline 恢复先撤旧入口，新 Node Ready 后发布；旧 Node 返回时 reset 并最终收敛到单实例。
 - `disk_bindings` 的 RWO、MetadataStore writer epoch 和 Host fence 三个边界不互相冒充。
-- 已通过的真实 Control→noded HTTP Cat 状态机、PersistentDisk backend、PostgreSQL composition 和 Cloud
-  Hypervisor 必须分层验证；文档不得把前两层通过写成真实物理路径完成。
+- 真实Control→noded HTTP、PersistentDisk backend、PostgreSQL composition、Cloud Hypervisor/Guest与
+  双Node恢复必须继续分层验证；文档不得把旧commit证据投射到新release。

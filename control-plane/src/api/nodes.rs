@@ -2,8 +2,8 @@ use super::*;
 
 /// Resolve immutable Workspace identities for an administrator.
 ///
-/// Runtime Node provisioning and Agent registration use their separate v18
-/// machine-authority APIs; this management surface only lists Workspaces.
+/// Runtime Node provisioning and semantic registration use separate fleet
+/// surfaces; this management surface only lists Workspaces.
 pub(super) async fn admin_list_workspaces(
     State(state): State<AppState>,
     headers: HeaderMap,

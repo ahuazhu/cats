@@ -9,8 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::runtime_reconciliation::SessionBinding;
 
-/// The one production ingestion route shared by legacy development producers
-/// and the signed runtime spine.
+/// The semantic Node usage-ingestion route.
 pub const USAGE_CHECKPOINTS_METHOD: &str = "POST";
 pub const USAGE_CHECKPOINTS_PATH: &str = "/v1/internal/usage/checkpoints";
 
@@ -105,9 +104,9 @@ pub struct CatUsageCheckpoint {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestUsageCheckpointsRequest {
-    /// The exact AgentSession which sampled these checkpoints. Ingestion
-    /// rejects a stale session even when the Node credential itself remains
-    /// valid.
+    /// Producer-process coordinates used to keep one checkpoint batch
+    /// internally coherent. ADR-0063 authenticates the request with the fleet
+    /// service token; these fields are not an AgentSession fence.
     pub session: SessionBinding,
     pub node_id: String,
     pub checkpoints: Vec<CatUsageCheckpoint>,

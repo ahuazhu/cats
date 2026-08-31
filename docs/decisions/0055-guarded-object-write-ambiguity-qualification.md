@@ -1,6 +1,6 @@
 # ADR-0055：对象写模糊响应资格注入使用持锁事务 guard
 
-- 状态：Accepted
+- 状态：Superseded；ObjectWrite Gateway/qualification composition 已从 v19 release 删除
 - 日期：2026-08-14
 - 依赖：[ADR-0042](0042-volume-authority-and-disk-lifecycle.md)、
   [ADR-0052](0052-bounded-production-qualification-admission.md)

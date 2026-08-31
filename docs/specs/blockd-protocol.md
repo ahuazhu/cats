@@ -1,6 +1,7 @@
 # cats-blockd 目标协议
 
-- 状态：目标合同；Chunk/Map/FLUSH 数据面已实现，Volume Authority 切换尚未实现
+- 状态：Implemented data-plane contract；Chunk/Map/FLUSH 与 Volume owner/epoch 核心已实现；
+  ADR-0059 产品生命周期只组合成功 FLUSH 已远端持久的模式
 - 依据：[ADR-0003](../decisions/0003-direct-s3-chunkstore-backend.md)、
   [ADR-0042](../decisions/0042-volume-authority-and-disk-lifecycle.md)、
   [Cats 存储架构](../storage.md)、[Volume Authority](volume-authority.md)
@@ -80,18 +81,18 @@ tag==1 时: [leaf_hash 32B] [object_id_len u16] [object_id bytes]
 
 ## 4. 权威元数据（MetadataStore）
 
-权威`VolumeRecord`、closed transition与receipt schema唯一见
+权威`VolumeRecord`与direct transition schema唯一见
 [Volume Authority §3](volume-authority.md#3-postgresql-authority-模型)。Control Store是唯一PostgreSQL DDL和
 cross-row事务owner；本协议不复制第二份Volume SQL schema。SQLite只可作为blockd数据面projection/CAS及
 pure-domain fixture，不实现Control事务或形成第二个authority。
 
 blockd adapter只读取当前`volume_id`、不可变`size_bytes`、`admin_state`、exact `RemoteHead`、
 `lease_owner`、`lease_epoch`和absolute `lease_expires_at` projection，以精确owner/epoch renew，并执行下面的
-head CAS。它不建权威表，不执行acquire、release、takeover、revoke、resize、delete或snapshot mutation。
+head CAS。它不建权威表，不执行acquire、release、offline recovery、resize、delete或snapshot mutation。
 
 本clean-slate release的Volume Authority持久契约只有一个provider-neutral版本常量
-`AUTHORITY_RELEASE_SCHEMA_VERSION = 15`。Control Store是`control_schema_version`与全部DDL的唯一
-owner；它的私有`SCHEMA_VERSION`直接引用该常量，不保留第二个literal。target data-plane
+`AUTHORITY_RELEASE_SCHEMA_VERSION = 19`。Control Store是`control_schema_version`与全部DDL的唯一
+owner；release tests要求它与storage adapter使用同一个精确版本。target data-plane
 adapter在任何volume read/renew/CAS前只读校验：`control_schema_version`必须存在singleton
 row且version精确等于该常量，然后再验证本节所需的列projection。未打stamp、row缺失、
 旧版、future version或列不匹配都拒绝启动；adapter不建表、不迁移、不修复stamp，也不回退读写
@@ -153,7 +154,7 @@ resize入口。CAS响应不明时，只有在同owner/epoch/size下读到request
   在飞提交一律作废。
 - 旧 epoch 的任何 Root CAS 必然 0 行受影响 —— 这是双写防护的最后一道闸，与租约到期判断相互独立。
 - expiry只用于健康判断，不打开竞争acquire。短暂renewal lapse不得自我fence；只有精确release或
-  授权takeover原子增加epoch后，旧Writer的renew/CAS才fail closed。
+  semantic offline recovery在锁定row上增加epoch后，旧Writer的renew/CAS才fail closed。
 - 完整ownership/admin状态机、typed replay和错误闭集唯一见
   [Volume Authority](volume-authority.md#4-lease-接口和状态机)。blockd绝不自行增加epoch。
 
@@ -168,8 +169,8 @@ resize入口。CAS响应不明时，只有在同owner/epoch/size下读到request
 
 `identity.json`包含`volume_id + attachment_id + attachment_epoch + acquire_origin + node_id +
 placement_epoch`。`acquire_origin`严格使用[Volume Authority §6](volume-authority.md#6-本地-attachment-lineage)
-的closed object：`normal {transition_id: RandomId128}`或`takeover {authorization_id: Id}`。data-dir属于
-这一次attachment，不能仅按volume id被下一个attachment复用，也不能从裸ID猜测acquire namespace。
+的closed object：`normal {transition_id: RandomId128}`。data-dir属于这一次attachment，不能仅按
+volume id被下一个attachment复用，也不能从裸ID猜测acquire identity。
 
 - **Strict 写路径**：WRITE → 若目标 chunk 已有已提交 Base 且 cache 未水化，先整
   chunk 水化；写 cache；记录 dirty page/range。
@@ -298,8 +299,8 @@ admission 必须把“当前 dirty set 的未来 pack”作为 accounted reserva
 恢复阶段执行远端写；后台 publisher 随后对每个 pack：
 
 - 先验证pack、data-dir identity和Node随当前精确LeaseGrant传入的完整`acquire_origin`逐字段相同，
-  并验证三者的volume、attachment、epoch一致且MetadataStore仍认可该owner/epoch。normal/takeover即使
-  ID文本相同也不相等；缺失、unknown variant、损坏、已fence或不匹配时整个目录
+  并验证三者的volume、attachment、epoch一致且MetadataStore仍认可该owner/epoch。缺失、unknown
+  variant、损坏、已fence或不匹配时整个目录
   quarantine；不能删除pack，也不能交给新attachment发布。
 - 再读MetadataStore的exact current head。target-v2中Strict与Relaxed共用同一条持久队列和恢复规则，
   durability mode只决定Guest ACK的时点，不改变batch已提交事实的判定：
@@ -361,8 +362,8 @@ Cat runtime不得在blockd进程启动参数中携带`--seed-image-id`，也不�
 完成。clean-slate vertical cutover删除这个隐式路径，不提供兼容解析。`--publish-image`只可保留为
 operator发布immutable系统镜像的离线入口；per-Cat reconciler只读取已经发布且manifest-last的镜像。
 
-Node先按[Runtime Reconciliation §7.1](runtime-reconciliation-v1.md#71-root-image-provision)持久化step，
-再通过现有Host control socket发送唯一新增的typed命令；语义payload固定为：
+Node通过当前场景语义effect保留同一次调用的完整参数，再通过现有Host control socket发送唯一的
+typed命令；语义payload固定为：
 
 ```text
 ProvisionRootImageRequest {
@@ -499,8 +500,8 @@ pending pack或staged commit，然后按leaf -> root -> commit record顺序PUT�
 同一result。任何其他generation/root、owner/epoch或immutable request冲突都fail closed，绝不覆盖已有head。
 blockd本地cache在target确认后按该Map重新加载，`L=R=1`且没有pending pack；这个本地状态不是成功authority。
 无法证明当前进程已经加载该target时必须保持Guest I/O gate关闭并以同grant重启/重载，不能把stale
-generation-zero cache交给frontend。Volume head是唯一数据authority，RuntimeCheckpoint是唯一current
-effect journal，不增加provision receipt。
+generation-zero cache交给frontend。Volume head是唯一数据authority；Node查询到的实际blockd状态只用于
+semantic动作恢复，不增加provision receipt或第二份storage authority。
 
 #### 6.3.2 Root provision fixed vector
 
@@ -602,11 +603,10 @@ socket，两者服务同一个 engine 与同一个 attachment lease。
    Relaxed：同 Host blockd 重启从 pack 恢复全部 ACK 数据，Host 永久丢失只承诺
    `R`；`L-R`、bytes和oldest age只能报告最后一次Node observation，不得声称是故障瞬间的
    精确损失量。
-2. 仅在 `R == L` 且release完成后删除普通本地状态，空缓存懒读全卷digest与删除前一致。唯一例外
-   是disposable Root：精确Owned->Deleting删除授权CAS已成功、旧epoch已fence后，才删除该
-   attachment lineage的`R < L`tail。
-3. normal acquire不能越过任何owner；逐卷授权takeover增加epoch后，旧blockd无法完成任何Root
-   CAS或继续ACK写；单纯expiry lapse不自我fence。
+2. 仅在 `R == L` 且release完成后删除本地状态，空缓存懒读全卷digest与删除前一致；当前产品没有
+   disposable `R < L` local-tail删除例外。
+3. provider-neutral normal acquire不能越过任何owner；semantic offline recovery在锁定的Strict卷row上
+   增加epoch后，旧blockd无法完成任何Root CAS；单纯expiry lapse不自我fence。
 4. 同一 txn 重放不产生第二个 generation。
 5. Hole 读取恒为零且不产生远端 GET。
 6. Relaxed 冷 cache 局部 WRITE/FLUSH 不产生远端 GET；publisher 合并后 fresh-host
@@ -614,10 +614,9 @@ socket，两者服务同一个 engine 与同一个 attachment lease。
 7. Stop/Cold、Warm、`cats sync`和计划迁移必须drain到`R == L`；失败保留pending、lease与源
    runtime，重试成功前不得越过生命周期边界。磁盘成员关系与DiskSnapshot只允许Cold/unowned；
    volume容量创建后不可变。
-8. blockd restart只有在data-dir identity、全部pending pack、Runtime inventory evidence和Node从服务器端
-   acquisition marker投影并随精确grant传入的完整`AcquireOrigin`逐字段相同时才adopt；同文本不同variant、
-   missing/unknown origin或旧裸字段都quarantine且不发布Root。
-9. Root provision逐个覆盖manifest/leaf/root/commit PUT前后、CAS前后、CAS成功响应丢失和blockd/Agent
+8. blockd restart只有在data-dir identity、全部pending pack、服务器端当前Volume row和Node随精确grant
+   传入的完整`AcquireOrigin`逐字段相同时才adopt；missing/unknown origin或旧裸字段都quarantine且不发布Root。
+9. Root provision逐个覆盖manifest/leaf/root/commit PUT前后、CAS前后、CAS成功响应丢失和blockd/noded
    restart；同一持久step只产生同一generation-1 target与commit key。wrong image/size/grant/head、
    非blank predecessor、pending/dirty/staged write均在CAS前拒绝；exact target可重放，exact blank
    可重试，任何其他generation绝不覆盖。测试还必须断言provision确认前Guest frontend没有listen且VMM未启动。
@@ -666,31 +665,33 @@ socket，两者服务同一个 engine 与同一个 attachment lease。
   Node仍须把它与unit的exact PID/start ticks/cgroup membership和同一PID持有的control socket逐项交叉验证。
 - `drain`只在`R == L`后成功；它不释放lease。Node停止blockd后通过Volume Authority提交精确、幂等的
   release transition。
-  任一步失败必须可重试，不能清理journal。
-- blockd不执行volume delete。disposable Root必须先停止blockd，再由Node消费
-  [Volume Authority §11](volume-authority.md#11-delete)的精确删除授权；只有MetadataStore已返回
-  Deleting/新epoch，Node才可删除授权中的本地lineage。
+  任一步失败必须可重试，不能清理lineage或pending pack。
+- blockd不执行volume delete。Root/PersistentDisk必须先停止blockd并精确release，再由Node按
+  [Volume Authority §11](volume-authority.md#11-delete)把Unowned卷转为Deleting；仍Owned或状态未知时
+  不得删除本地lineage。
 - 上述 quota 当前是每卷隔离；不是跨 blockd 进程的 Host 总容量证明。
 
 ## 9. GC（对象回收）
 
-存活判据是**从卷当前 Root和全部DiskSnapshotRecord Root可达**:root节点、它命名的leaf节点,以及每个
-`ChunkRef`命名的每个对象——delta pack之后这意味着**base加上它的全部delta**,而不是"每个
-chunk最新的那个对象"。删掉一个chunk的base只留最新delta,会直接损坏该chunk。任一record命名的Root无法
-读取或校验时，本轮GC fail closed，不删除任何对象。
+`ChunkEngine::collect_garbage` 是当前 attachment 内的下层 current-root sweep：
 
-- **绝不碰 `images/`。**镜像对象属于镜像、被所有从它 provision 的卷共享,删一个卷不能删掉全队列
-  的 rootfs(§6.3)。GC只列举和删除本卷前缀下的对象;`ChunkRef`里带image origin的base根本
-  不算本卷的对象。第一版不提供Golden Image删除或GC。
-- **必须由typed volume lifecycle/sweeper授权并与卷写入串行化**。执行者要么证明精确active
-  attachment仍是当前writer，要么证明卷已进入禁止新写者的删除阶段；不能从裸owner/epoch参数推断权限。
-  当前writer自己的pending pack仍属于live恢复输入：恢复会从pack文件重放并重新上传尚未被Root命名的对象。
-- **commit record 不删**:它是审计线索、体积极小,清理它属于保留策略而不是垃圾回收。
-- 完全被后来的 delta 覆盖的旧 delta**根本不会进入 Map**:`with_delta` 在追加时就把
-  `page_mask` 被新 delta 完全覆盖的旧 delta 丢掉了(它在 hydration 里会被逐字节覆盖,留着只是
-  让链更长、冷读更贵、GC 还得当它活着)。
+- 同时持有 flush/publish lock，避免与本 writer 的stage或CAS竞争；
+- 只在本卷 `volumes/<volume-id>/data/` 和 `maps/` prefix下工作；
+- 从内存中的当前Map标记Root、Leaf、Base和全部Delta；
+- 永不进入共享 `images/`，也不删除commit record；
+- fenced或任一list/delete错误即停止，后续周期可重试。
 
-release `cats-blockd`不提供GC CLI、裸attachment epoch入口或进程内定时GC。对象扫描/删除由
-[Volume Authority](volume-authority.md)的typed lifecycle/sweeper effect驱动：输入绑定精确卷状态、完整
-`DiskSnapshotRecord`保留集与幂等完成回执；任一Root或snapshot解码失败即fail closed、零删除。底层
-ChunkStore walker仍是provider-neutral数据面实现，不取得或推导卷所有权。
+该实现只知道当前Root，不读取产品 `disk_snapshot_records`。因此一旦产品snapshot引用已不再是current
+Root的对象，这个sweep会缺少必要live root。当前release没有把product DiskSnapshot root组成到blockd GC
+authority，也没有完成同盘restore；production composition不得把下层current-root sweep描述为完整产品GC，
+更不能在存在未保护snapshot时启用它。
+
+完整产品GC需要新的合同同时冻结：
+
+1. 当前Volume Root与全部live DiskSnapshot Root的同一一致性视图；
+2. mark期间阻止新publish/snapshot/delete的串行化authority；
+3. 任一Root/Leaf/object无法读取或校验时零删除；
+4. provider-neutral强一致LIST/delete与response-loss postcondition；
+5. snapshot删除和同盘restore的回归矩阵。
+
+在这些条件组成前，product DiskSnapshot/GC仍是明确开放项。

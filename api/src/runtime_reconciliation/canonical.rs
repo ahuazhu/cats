@@ -1,34 +1,15 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-#[cfg(feature = "proposed-node-residue-reclamation")]
-use super::types::AuthorizedServingAcquire;
 use super::types::{
-    AsciiText, Base64UrlNoPad, ContractError, ContractErrorDetail, ContractName, ContractVersion,
-    Epoch, GuestRuntimeProfileReceipt, Id, JsonPointer, KeyId, MalformedProblem, ProviderScope,
+    Base64UrlNoPad, ContractError, ContractVersion, Epoch, GuestRuntimeProfileReceipt, KeyId,
     RuntimeProvisionerActiveSet, Sha256Digest,
 };
 
 const KEY_RING_DOMAIN: &[u8] = b"cats.runtime.key-ring.v1";
-const OBJECT_WRITE_WRITER_AUTHORITY_ID_DOMAIN: &[u8] = b"cats.object-write.writer-authority-id.v1";
 const GUEST_RUNTIME_PROFILE_DOMAIN: &[u8] = b"cats.runtime.guest-runtime-profile.v1";
-#[cfg(feature = "proposed-node-residue-reclamation")]
-const RESIDUE_ACQUISITION_DOMAIN: &[u8] = b"cats.runtime.residue-acquisition.v1";
-
-/// Computes the digest of the complete immutable acquire receipt carried by a
-/// residue authority request. The digest is diagnostic binding, never an
-/// authority substitute for the receipt itself.
-#[cfg(feature = "proposed-node-residue-reclamation")]
-pub fn residue_acquisition_digest(
-    acquisition: &AuthorizedServingAcquire,
-) -> Result<Sha256Digest, ContractError> {
-    let value = as_value(acquisition, ContractName::RuntimeResidueAuthorityRequest)?;
-    Ok(digest_value(RESIDUE_ACQUISITION_DOMAIN, &value))
-}
-
 /// Computes the digest of one validated canonical GuestRuntimeProfileReceipt artifact.
 pub fn guest_config_digest(
     receipt: &GuestRuntimeProfileReceipt,
@@ -62,60 +43,12 @@ pub fn runtime_provisioner_active_set_digest(
     Ok(Sha256Digest::from_bytes(Sha256::digest(canonical).into()))
 }
 
-/// Derives the one object-write writer-authority ID assigned to an exact
-/// writer binding.
-///
-/// Control assigns the ID from this closed preimage rather than accepting a
-/// caller-chosen value, so the same binding can never open two authorities and
-/// a stored authority ID is independently verifiable from the apply that
-/// created it. The immutable Host identity is deliberately absent: the Node ID
-/// already resolves to exactly one provisioned Host in the catalog, and the
-/// Host facts are derived from that row instead of restated here.
-pub fn object_write_writer_authority_id(
-    node_id: &Id,
-    object_provider_scope: &ProviderScope,
-    workload_principal_id: &AsciiText,
-    object_store_scope_id: &AsciiText,
-) -> Id {
-    let projection = serde_json::json!({
-        "version": ContractVersion::V1,
-        "node_id": node_id,
-        "object_provider_scope": object_provider_scope,
-        "workload_principal_id": workload_principal_id,
-        "object_store_scope_id": object_store_scope_id,
-    });
-    let digest = digest_value(OBJECT_WRITE_WRITER_AUTHORITY_ID_DOMAIN, &projection);
-    let hex = digest
-        .as_str()
-        .strip_prefix("sha256:")
-        .expect("Sha256Digest always carries its sha256: prefix");
-    // 5 prefix bytes plus 64 lowercase hex digits satisfy the `Id` charset and
-    // its 128-byte bound.
-    Id::new(format!("owa1_{hex}")).expect("owa1_ plus 64 lowercase hex is a valid Id")
-}
-
 /// Computes the ordinary SHA-256 of one exact canonical Ed25519 SPKI DER
 /// value. The narrow `Option` keeps provider code from accepting a merely
 /// base64url-shaped string as an Ed25519 key.
 pub fn canonical_ed25519_spki_sha256(public_key_spki: &Base64UrlNoPad) -> Option<Sha256Digest> {
     let der = super::wire::canonical_ed25519_spki_bytes(public_key_spki)?;
     Some(Sha256Digest::from_bytes(Sha256::digest(der).into()))
-}
-
-fn as_value<T: Serialize>(value: &T, contract: ContractName) -> Result<Value, ContractError> {
-    serde_json::to_value(value).map_err(|_| invalid(contract, ""))
-}
-
-fn invalid(contract: ContractName, pointer: &str) -> ContractError {
-    ContractError {
-        version: ContractVersion::V1,
-        error: Box::new(ContractErrorDetail::MalformedPayload {
-            contract,
-            json_pointer: JsonPointer::new(pointer).expect("static pointer is valid"),
-            problem: MalformedProblem::InvalidValue,
-        }),
-        message: "contract cannot be canonically encoded".to_owned(),
-    }
 }
 
 fn digest_value(domain: &[u8], value: &Value) -> Sha256Digest {

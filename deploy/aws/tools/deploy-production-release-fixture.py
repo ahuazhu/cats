@@ -64,7 +64,6 @@ def fixture_package(root: Path, deployer) -> tuple[Path, dict]:
     references = {
         "control_plane": "123456789012.dkr.ecr.us-east-1.amazonaws.com/cats/control:exact",
         "credential_refresher": "123456789012.dkr.ecr.us-east-1.amazonaws.com/cats/refresher:exact",
-        "gateway": "123456789012.dkr.ecr.us-east-1.amazonaws.com/cats/gateway:exact",
     }
     manifest = {
         "artifacts": {
@@ -75,7 +74,7 @@ def fixture_package(root: Path, deployer) -> tuple[Path, dict]:
                     "registry_verified": True,
                 }
                 for (name, reference), character in zip(
-                    references.items(), ("1", "2", "3"), strict=True
+                    references.items(), ("1", "2"), strict=True
                 )
             },
             "worker": {

@@ -10,7 +10,7 @@ use base64::Engine as _;
 use ring::signature::{UnparsedPublicKey, ED25519};
 use sha2::{Digest as _, Sha256};
 
-use crate::agent_registration::Ed25519RequestSigner;
+use crate::node_identity::Ed25519RequestSigner;
 use crate::runtime_reconciliation::{
     canonical_ed25519_spki_sha256, FleetPolicyPrincipal, RuntimeProvisionerCredential,
 };
@@ -107,7 +107,7 @@ pub fn runtime_node_authority_signed_request(
             + 8 * 5
             + RUNTIME_NODE_AUTHORITY_METHOD.len()
             + RUNTIME_NODE_AUTHORITY_PATH.len()
-            + crate::agent_registration::JSON_CONTENT_TYPE.len()
+            + crate::node_identity::JSON_CONTENT_TYPE.len()
             + deployment_id.len()
             + credential_id.len()
             + 32,
@@ -118,7 +118,7 @@ pub fn runtime_node_authority_signed_request(
     append_frame(&mut signed, RUNTIME_NODE_AUTHORITY_PATH.as_bytes());
     append_frame(
         &mut signed,
-        crate::agent_registration::JSON_CONTENT_TYPE.as_bytes(),
+        crate::node_identity::JSON_CONTENT_TYPE.as_bytes(),
     );
     append_frame(&mut signed, deployment_id.as_bytes());
     append_frame(&mut signed, credential_id.as_bytes());
@@ -132,7 +132,7 @@ mod tests {
     use super::*;
     use crate::runtime_reconciliation::{Base64UrlNoPad, Id};
 
-    const APPLY: &[u8] = br#"{"apply_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","mutation":{"expected_policy_revision":1,"kind":"update_policy","placement_policy":{"allocatable_memory_bytes":17179869184,"allocatable_vcpus":8,"capabilities":{"block_frontend":"kernel_nbd","guest_agent_protocol_version":1,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","guest_network":"isolated_ipv4","guest_transport":"vsock","vmm":"cloud_hypervisor"},"guest_ipv4_pool":{"kind":"private_ipv4_16","network_address":"10.240.0.0","prefix_length":16},"node_id":"node_a","node_transport_target":"https://node-a.internal:7301","policy_revision":2,"scheduling_state":"schedulable","version":1}},"node_id":"node_a","version":1}"#;
+    const APPLY: &[u8] = br#"{"apply_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","mutation":{"expected_policy_revision":1,"kind":"update_policy","placement_policy":{"allocatable_memory_bytes":17179869184,"allocatable_vcpus":8,"capabilities":{"block_frontend":"kernel_nbd","guest_agent_protocol_version":1,"guest_config_digest":"sha256:78215611e8c3bd683eb542b5696a6316156365a94624c7521446ab5660d067e2","guest_network":"isolated_ipv4","guest_transport":"vsock","vmm":"cloud_hypervisor"},"guest_ipv4_pool":{"kind":"private_ipv4_16","network_address":"10.240.0.0","prefix_length":16},"node_id":"node_a","policy_revision":2,"scheduling_state":"schedulable","version":1}},"node_id":"node_a","version":1}"#;
 
     #[test]
     fn frozen_signature_vector_verifies() {
@@ -148,7 +148,7 @@ mod tests {
             &deployment_id,
             &credential,
             APPLY,
-            "2e7RW-nONH8NAPi7tPQeVdiOCRG0fUKI9OMO6MxjwvmPLPdefC2DWPwvDC-lE6BQ2XzFdZEoKcgb4LCo_MBXAA",
+            "ZqMEaH3fIxcNWG5CExvV4nHOSk7OEQORKctt-z9R_naZm2s0OM64IGOAHr_5hhNdl2SZ1CeUBCKNX1t-O-wyAg",
         )
         .unwrap();
         assert!(matches!(
@@ -161,7 +161,7 @@ mod tests {
                 "provisioner_a",
                 APPLY,
             ))),
-            "4c67c5a92e987723f0e64e1468ca77a7ddcac6ea4f06d12c85444e9050fb939e"
+            "3441dcc9b166491330f9b2579919c04779c2842180929cbc3cbef5db23bd05f0"
         );
     }
 
@@ -182,7 +182,7 @@ mod tests {
         assert_eq!(proof.credential_id, "provisioner_a");
         assert_eq!(
             proof.signature,
-            "2e7RW-nONH8NAPi7tPQeVdiOCRG0fUKI9OMO6MxjwvmPLPdefC2DWPwvDC-lE6BQ2XzFdZEoKcgb4LCo_MBXAA"
+            "ZqMEaH3fIxcNWG5CExvV4nHOSk7OEQORKctt-z9R_naZm2s0OM64IGOAHr_5hhNdl2SZ1CeUBCKNX1t-O-wyAg"
         );
     }
 

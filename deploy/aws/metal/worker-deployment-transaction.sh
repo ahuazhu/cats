@@ -137,35 +137,6 @@ cats_stop_node_service() {
   cats_require_node_service_stopped "$service"
 }
 
-cats_retire_legacy_gateway() {
-  local unit_file wants_link binary_file service load_state
-  unit_file=$1
-  wants_link=$2
-  binary_file=$3
-  service=cats-gatewayd.service
-
-  case "$unit_file:$wants_link:$binary_file" in
-    */cats-gatewayd.service:*/multi-user.target.wants/cats-gatewayd.service:*/bin/cats-gatewayd) ;;
-    *)
-      echo "refusing to remove unexpected legacy Gateway paths" >&2
-      return 1
-      ;;
-  esac
-
-  if ! systemctl disable "$service"; then
-    load_state=$(cats_systemd_property "$service" LoadState) || return 1
-    [ "$load_state" = not-found ] || {
-      echo "failed to disable loaded service $service" >&2
-      return 1
-    }
-  fi
-  cats_stop_node_service "$service" || return 1
-  # Keep the proof adjacent to deletion: a successful `systemctl stop` alone
-  # does not guarantee that the unit reached an inactive state.
-  cats_require_node_service_stopped "$service" || return 1
-  rm -f -- "$unit_file" "$wants_link" "$binary_file"
-}
-
 cats_worker_cgroup_v2_root() {
   local cgroup_mount
   cgroup_mount=$(findmnt --noheadings --first-only --types cgroup2 --output TARGET) || return 1

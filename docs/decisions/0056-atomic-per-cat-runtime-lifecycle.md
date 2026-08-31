@@ -1,7 +1,9 @@
 # ADR-0056：每 Cat 原子 Runtime 生命周期命令
 
-- 状态：Accepted
+- 状态：Superseded by [ADR-0059](0059-semantic-control-node-synchronous-protocol.md)
 - 日期：2026-08-20
+- 历史范围：本文的 Operation、poll/result、journal、typed predecessor、AgentSession 与 Route lane
+  只记录已退役设计；不得作为当前实现合同
 - schema组成修正：[ADR-0058](0058-route-ring-acknowledges-immutable-agent-session.md) 将终态推进到
   schema 18，并让Route ring ACK绑定immutable AgentSession history
 - 部分取代：[ADR-0057](0057-product-lifecycle-actions-and-internal-execution-evidence.md)取代本文的
@@ -19,12 +21,12 @@
   rotation 边界
 - Volume authority：[ADR-0042](0042-volume-authority-and-disk-lifecycle.md) 与
   [Volume Authority](../specs/volume-authority.md)
-- 冻结规格：[Atomic Runtime Lifecycle v1](../specs/atomic-runtime-lifecycle-v1.md)
+- 历史规格：已随 ADR-0059 切换从当前文档集删除；Git history 保留原文
 - 实现边界：schema 18 atomic lifecycle/Volume/Route内部软件组成与ADR-0057六动作product adapter已落地；
   private Start/Stop/Delete/Killed execution wire/head不进入product projection；Route resolve只接受
   `run_required`并拒绝旧`wake_required`。其他current release gate
-  与production qualification由[规格 §11](../specs/atomic-runtime-lifecycle-v1.md#11-acceptance-matrix)
-  与[Architecture §3.1](../architecture.md#31-当前实现事实)维护
+  与production qualification曾由已删除的历史规格维护；当前边界见
+  [Architecture §3.1](../architecture.md#31-当前实现事实)
 
 ## 背景
 
@@ -68,8 +70,8 @@ PostgreSQL commit的目标Node unresolved command，再签名POST exact terminal
 Control→Node lifecycle client。poll只是delivery，不能创建/claim命令，PostgreSQL仍是intent authority；重复
 poll join/resume同一journal command，result或ACK丢失则repost同一result，从而实现exact query/retry。
 
-精确 wire、结果闭集、predecessor、journal、state transition、route interlock 与验收 oracle 由
-[Atomic Runtime Lifecycle v1](../specs/atomic-runtime-lifecycle-v1.md) 唯一冻结。
+精确 wire、结果闭集、predecessor、journal、state transition、route interlock 与验收 oracle 曾由其
+配套规格冻结；该规格已由 ADR-0059 取代并由 Git history 保存。
 
 ## Authority 与单 lane
 
@@ -193,8 +195,8 @@ claim；新的 route epoch 与 runtime incarnation 足以使旧 Grant 失效。
 `effective_runtime_ready` 与 Serving receipt 的 source，而不是简单要求 Serving source 等于 head
 Operation。任何实际或模糊 close 都使旧 Serving 失效并 burn route epoch。
 
-Route 的 exact wire、epoch 和 signer 快照继续由 [Route Grant v2](../specs/route-grant-v2.md) 定义；本 ADR
-只替换它与 lifecycle authority 的连接方式。
+历史 Route v2 wire、epoch 和 signer 快照由 Git history 保存；本 ADR 与该 Route composition 均已由
+ADR-0059 取代。
 
 ## 保留的边界
 

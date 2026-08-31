@@ -1,21 +1,15 @@
 # ADR-0040：电平触发的 Runtime Reconciliation
 
-- 状态：Accepted；lifecycle coordination、Desired-driven reconcile 与 observation-based Operation
-  settlement 已由 [ADR-0056](0056-atomic-per-cat-runtime-lifecycle.md) 取代
+- 状态：Superseded for current lifecycle by
+  [ADR-0059](0059-semantic-control-node-synchronous-protocol.md)
 - 日期：2026-08-08
 - 取代：ADR-0002 中的旧协调合同
-- 规格：[Runtime Reconciliation v1](../specs/runtime-reconciliation-v1.md)
-- 保留的inventory foundation：[Runtime Inventory and Telemetry v1](../specs/runtime-inventory-observation-v1.md)
-- Current Volume transition transport：
-  [Atomic Runtime Lifecycle v1](../specs/atomic-runtime-lifecycle-v1.md)的command-scoped signed route；
-  本ADR使用的pre-cutover Runtime Volume Transitions spec已删除
-- composition：[Runtime Composition Artifacts v1](../specs/runtime-composition-artifacts-v1.md)
+- 历史规格：已由 ADR-0059 取代并从当前文档集删除；Git history 保留原文
 - placement policy：[ADR-0043](0043-provisioner-owned-runtime-placement-policy.md)
 
-> ADR-0056 只取代本文的 lifecycle intent/execution/settlement authority。本文的 provisioned
-> NodeIdentity、AgentSession、Host-global lock、complete inventory/attestation、HostFence ordering 与 Volume
-> Authority composition 继续有效；旧 Desired/reconcile/observation-settlement 不能作为 atomic release 的
-> fallback 或兼容路径。
+> ADR-0059 取代本文的 Desired/reconcile/observation settlement、AgentSession、完整 inventory 和
+> HostFence lifecycle 前置条件。独立 provisioned NodeIdentity、底层 Volume Authority 与可信 Host fence
+> 仍可在其当前合同中使用，但不得把本文的协调模型重新接回当前生命周期。
 
 ## 背景
 
@@ -60,9 +54,9 @@ DesiredRuntimeSpec(revision, placement)
 Volume 的精确状态机由 [Volume Authority](../specs/volume-authority.md) 定义；Runtime 只编排
 它的窄acquire/publish/release/takeover/delete接口。Node到Control的acquire/release/disposable consume
 在本文被取代前使用pre-cutover Runtime Volume Transitions签名mutation/evidence read；该spec、DTO、codec、
-constant与route parser现已删除。current atomic release只使用
-[Atomic Runtime Lifecycle v1](../specs/atomic-runtime-lifecycle-v1.md)冻结的command-scoped signed mutation与
-immutable receipt replay；Node没有Control表的raw SQL权限，blockd不获得ownership mutation或authorization read能力。
+constant与route parser现已删除。其后的 ADR-0056 曾改用 command-scoped signed mutation 与 immutable
+receipt replay；该协调同样已被 ADR-0059 取代。Node没有Control表的raw SQL权限，blockd不获得ownership
+mutation或authorization read能力。
 
 只有能把业务rows与结果在唯一Control PostgreSQL事务中原子提交的Workspace product mutation使用
 `ApiIdempotencyResult`；精确scope、request envelope、fingerprint和重放合同以
@@ -90,8 +84,8 @@ Agent 必须先取得固定 Host state path 的 kernel 排他锁。它在注册 
 复用，provisioned credential 排除另一台机器自称同一 Node。
 
 Node本地identity artifact、identity-selected固定state path与Host lock，以及Control/Node共同消费的单一
-Guest release payload属于composition，不增加数据库authority；exact path、provision/rotation和部署规则由
-Runtime Composition Artifacts v1冻结。
+Guest release payload属于composition，不增加数据库authority；当前路径与部署规则由 A23 provisioner
+合同和部署脚本校验。
 
 ## Desired、placement 与 Operation
 
@@ -398,7 +392,7 @@ Root都可授权，包括最后`R == L`或L未知，不能等待已不可达Node
 5. crash/ABA/double-Agent/Host-loss/Deleted 验收矩阵全部通过后，才允许部署。
 
 当前开发数据可删除，因此不做 V1 row 或 runtime 迁移。首次部署按
-[Operations and HA §8](../operations-ha.md#8-首次终态部署)执行一次 clean-slate vertical cutover；
+[Operations and HA §10](../operations-ha.md#10-首次单协议部署)执行一次 clean-slate vertical cutover；
 切换后只有空的新 schema 和一套协议版本，组件版本不匹配直接启动失败。ChunkStore 格式与 Guest
 ABI 可以继续使用，但切换不依赖任何旧数据。
 

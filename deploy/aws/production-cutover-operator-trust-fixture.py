@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Black-box fixture for the E13 public-trust supply chain."""
+"""Black-box fixture for the qualification public-trust supply chain."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import argparse
 import base64
 import errno
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -15,7 +14,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any
 
 
 SOURCE = "3" * 40
@@ -260,173 +258,6 @@ def exercise_ancestry_rejections(tool: Path, openssl: Path, root: Path) -> None:
     assert not (protected_parent / "offline-operator-key.pem").exists()
 
 
-def load_authority_module(tool: Path) -> Any:
-    module_name = "cats_production_cutover_operator_trust_fixture"
-    specification = importlib.util.spec_from_file_location(module_name, tool)
-    assert specification is not None and specification.loader is not None
-    module = importlib.util.module_from_spec(specification)
-    sys.modules[module_name] = module
-    specification.loader.exec_module(module)
-    return module
-
-
-def expect_trust_error(module: Any, operation: Any) -> None:
-    try:
-        operation()
-    except module.TrustError:
-        return
-    raise AssertionError("final-open layout operation did not fail closed")
-
-
-def exercise_final_open_layout(tool: Path, root: Path) -> None:
-    """The operator installer owns one exact, secret-free final-open layout."""
-
-    module = load_authority_module(tool)
-    assert str(module.FINAL_OPEN_STATE_ROOT) == "/var/lib/cats/production-final-open"
-    assert str(module.FINAL_OPEN_ADMISSION_STATE) == (
-        "/var/lib/cats/production-final-open/admission-state"
-    )
-    assert str(module.FINAL_OPEN_RECEIPTS) == (
-        "/var/lib/cats/production-final-open/receipts"
-    )
-
-    state_root = root / "final-open-layout"
-    layout = module.provision_final_open_state_layout(
-        state_root, require_root=False
-    )
-    replay = module.provision_final_open_state_layout(
-        state_root, require_root=False
-    )
-    assert replay == layout
-    assert set(layout) == {
-        "admission_state",
-        "direct_children",
-        "receipts",
-        "root",
-    }
-    assert layout["direct_children"] == ["admission-state", "receipts"]
-    expected_paths = {
-        "root": state_root,
-        "admission_state": state_root / "admission-state",
-        "receipts": state_root / "receipts",
-    }
-    for label, expected_path in expected_paths.items():
-        entry = layout[label]
-        assert set(entry) == {"gid", "mode", "path", "type", "uid"}
-        assert entry == {
-            "gid": os.getegid(),
-            "mode": "0700",
-            "path": str(expected_path),
-            "type": "directory",
-            "uid": os.geteuid(),
-        }
-        metadata = expected_path.stat(follow_symlinks=False)
-        assert metadata.st_mode & 0o777 == 0o700
-    encoded = canonical(layout)
-    assert b"inode" not in encoded and b"device" not in encoded
-    assert all(path.is_dir() for path in state_root.iterdir())
-    assert not any(path.is_file() for path in state_root.rglob("*"))
-
-    foreign_root = root / "final-open-foreign"
-    foreign_root.mkdir(mode=0o700)
-    foreign = foreign_root / "foreign"
-    foreign.write_bytes(b"foreign-state\n")
-    foreign.chmod(0o600)
-    expect_trust_error(
-        module,
-        lambda: module.provision_final_open_state_layout(
-            foreign_root, require_root=False
-        ),
-    )
-    assert foreign.read_bytes() == b"foreign-state\n"
-
-    symlink_target = root / "final-open-symlink-target"
-    symlink_target.mkdir(mode=0o700)
-    symlink_root = root / "final-open-symlink"
-    symlink_root.symlink_to(symlink_target, target_is_directory=True)
-    expect_trust_error(
-        module,
-        lambda: module.provision_final_open_state_layout(
-            symlink_root, require_root=False
-        ),
-    )
-    assert not list(symlink_target.iterdir())
-
-    child_symlink_root = root / "final-open-child-symlink"
-    child_symlink_root.mkdir(mode=0o700)
-    child_target = root / "final-open-child-target"
-    child_target.mkdir(mode=0o700)
-    (child_symlink_root / "admission-state").symlink_to(
-        child_target, target_is_directory=True
-    )
-    expect_trust_error(
-        module,
-        lambda: module.provision_final_open_state_layout(
-            child_symlink_root, require_root=False
-        ),
-    )
-    assert not list(child_target.iterdir())
-
-    wrong_mode_root = root / "final-open-wrong-mode"
-    wrong_mode_root.mkdir(mode=0o700)
-    wrong_mode_root.chmod(0o755)
-    expect_trust_error(
-        module,
-        lambda: module.provision_final_open_state_layout(
-            wrong_mode_root, require_root=False
-        ),
-    )
-    assert not list(wrong_mode_root.iterdir())
-
-    writable_ancestor = root / "final-open-writable-ancestor"
-    writable_ancestor.mkdir(mode=0o700)
-    writable_ancestor.chmod(0o777)
-    rejected_root = writable_ancestor / "production-final-open"
-    expect_trust_error(
-        module,
-        lambda: module.provision_final_open_state_layout(
-            rejected_root, require_root=False
-        ),
-    )
-    assert not rejected_root.exists()
-
-    swap_parent = root / "final-open-swap-parent"
-    swap_parent.mkdir(mode=0o700)
-    swap_root = swap_parent / "production-final-open"
-    detached_parent = root / "final-open-swap-parent-detached"
-    original_mkdir = module.os.mkdir
-    swapped = False
-
-    def swap_before_mkdir(
-        path: Any,
-        mode: int = 0o777,
-        *,
-        dir_fd: int | None = None,
-    ) -> None:
-        nonlocal swapped
-        if path == swap_root.name and dir_fd is not None and not swapped:
-            swapped = True
-            swap_parent.rename(detached_parent)
-            original_mkdir(swap_parent, 0o700)
-        original_mkdir(path, mode, dir_fd=dir_fd)
-
-    module.os.mkdir = swap_before_mkdir
-    try:
-        expect_trust_error(
-            module,
-            lambda: module.provision_final_open_state_layout(
-                swap_root, require_root=False
-            ),
-        )
-    finally:
-        module.os.mkdir = original_mkdir
-    assert swapped
-    assert not swap_root.exists()
-    detached_root = detached_parent / swap_root.name
-    assert detached_root.is_dir()
-    assert not list(detached_root.iterdir())
-
-
 def generation_command(
     tool: Path,
     openssl: Path,
@@ -508,7 +339,7 @@ def main() -> int:
     tool = args.tool.resolve(strict=True)
     openssl = args.openssl.resolve(strict=True)
 
-    with tempfile.TemporaryDirectory(prefix="cats-e13-trust-fixture-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="cats-qualification-trust-fixture-") as temporary:
         # macOS exposes its real temporary root through a /var symlink. Resolve
         # once in the harness; the authority tool itself must reject symlinked
         # output ancestry instead of silently canonicalizing caller input.
@@ -519,7 +350,6 @@ def main() -> int:
             print("production cutover operator parent-swap regression passed")
             return 0
         exercise_ancestry_rejections(tool, openssl, root)
-        exercise_final_open_layout(tool, root)
         private_key = root / "offline-operator-key.pem"
         trust = root / "production-cutover-operator-trust.v1.json"
         generation = root / "production-cutover-operator-trust-generation.receipt.json"
@@ -631,7 +461,7 @@ def main() -> int:
                     process.communicate()
         exercise_lock_aba(tool, openssl, root)
         # The current manual-release manifest closes exactly {control_plane,
-        # credential_refresher, gateway, worker}; public trust is not a member.
+        # credential_refresher, worker}; public trust is not a member.
         release_manifest = root / "release-manifest.v1.json"
         fixture_digest = "sha256:" + "5" * 64
         release_manifest_value = {
@@ -651,14 +481,6 @@ def main() -> int:
                     "refresh_program_sha256": fixture_digest,
                     "registry_verified": True,
                     "swap_dsn_program_sha256": fixture_digest,
-                },
-                "gateway": {
-                    "binary_sha256": fixture_digest,
-                    "binary_size_bytes": 1,
-                    "image_config_digest": fixture_digest,
-                    "image_digest": fixture_digest,
-                    "image_reference": "registry.example/cats/gateway:fixture",
-                    "registry_verified": True,
                 },
                 "worker": {
                     "bundle_name": "cats-worker.tar.zst",

@@ -5,15 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
-[features]
-default = ["proposed-node-residue-reclamation"]
-# Kept as a compatibility feature name while N2 is the default production
-# scanner, A20 wire and residue-authority client shape.
-proposed-node-residue-reclamation = [
-    "cats-api/proposed-node-residue-reclamation",
-    "cats-storage/proposed-node-residue-reclamation",
-]
-
 [dependencies]
 cats-api = { workspace = true }
 cats-blockd = { workspace = true }

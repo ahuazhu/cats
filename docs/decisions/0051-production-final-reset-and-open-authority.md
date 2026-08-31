@@ -1,6 +1,6 @@
 # ADR-0051：首次生产切换的终态 reset 与 public-open authority
 
-- 状态：Accepted
+- 状态：Superseded by ADR-0059；历史背景保留
 - 日期：2026-08-14
 - 依赖：[ADR-0038](0038-production-account-qualification-cell-boundary.md)、
   [ADR-0040](0040-level-triggered-runtime-reconciliation.md)、
@@ -10,7 +10,7 @@
   [ADR-0044](0044-independent-route-v2-signing-authority.md)
 - 后续闭合：[ADR-0052](0052-bounded-production-qualification-admission.md)
 - final-open 顺序修正：[ADR-0053](0053-final-open-last-product-admission.md)
-- 规格：[Production reset and final-open authority v1](../specs/production-reset-open-authority-v1.md)
+- 历史规格已随 ADR-0059 的 v19 单协议切换删除；本 ADR 只保留决策背景。
 
 ## 背景
 

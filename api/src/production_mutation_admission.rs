@@ -1,10 +1,9 @@
-//! E13 production product-mutation admission authority.
+//! Bounded production qualification mutation authority.
 //!
-//! This contract intentionally carries no convenient `enabled` boolean.  The
-//! one database singleton starts Closed, and Open is meaningful only together
-//! with the exact clean-slate reset, release and terminal-proof binding that
-//! authorized it.  Emergency close retains that binding so reopening cannot
-//! substitute a different proof set.
+//! The database singleton starts Closed and can enter only one exact,
+//! release-bound qualification cell. End or emergency close retains that
+//! binding as immutable evidence; this contract cannot open general product
+//! mutation traffic.
 
 use crate::runtime_reconciliation::decode_base64url_exact;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -50,11 +49,10 @@ pub const PRODUCTION_QUALIFICATION_PRODUCT_INVENTORY_RECEIPT_FILE: &str =
 pub const PRODUCTION_QUALIFICATION_PRODUCT_INVENTORY_RECEIPT_KIND: &str =
     "cats.production-mutation-qualification-product-inventory.v1";
 
-pub const PRODUCTION_QUALIFICATION_MUTATION_CLASSES: [ProductionQualificationMutationClass; 5] = [
+pub const PRODUCTION_QUALIFICATION_MUTATION_CLASSES: [ProductionQualificationMutationClass; 4] = [
     ProductionQualificationMutationClass::CatCreate,
     ProductionQualificationMutationClass::DiskCreate,
     ProductionQualificationMutationClass::DiskDelete,
-    ProductionQualificationMutationClass::ObjectWriteAmbiguity,
     ProductionQualificationMutationClass::RuntimeMutation,
 ];
 
@@ -133,43 +131,9 @@ pub struct ProductionCutoverOperatorPrincipal {
     pub sts: ProductionCutoverStsPrincipal,
 }
 
-/// Exact evidence set installed by the first successful Open command.
-///
-/// Each digest names canonical producer bytes or, for the two qualification
-/// fields, the immutable checksum-closed runner bundle.  The E13 verifier
-/// validates producer-specific terminal semantics before submitting this
-/// binding; the Control transaction makes the resulting identity inseparable
-/// from every admitted product write.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProductionMutationOpenBinding {
-    pub reset_id: Id,
-    pub deployment_id: Id,
-    pub release_id: Id,
-    pub source_commit_sha: String,
-    pub control_schema_version: WireU64,
-    pub source_manifest_sha256: Sha256Digest,
-    pub source_bundle_sha256: Sha256Digest,
-    pub release_manifest_sha256: Sha256Digest,
-    pub qualification_manifest_sha256: Sha256Digest,
-    pub qualification_catalog_sha256: Sha256Digest,
-    pub proof_set_sha256: Sha256Digest,
-    pub fresh_targets_sha256: Sha256Digest,
-    pub reset_complete_receipt_sha256: Sha256Digest,
-    pub fleet_closed_receipt_sha256: Sha256Digest,
-    pub route_v2_rotation_qualification_receipt_sha256: Sha256Digest,
-    pub route_v2_rotation_qualification_node_ack_sets_sha256: Sha256Digest,
-    pub route_v2_rotation_qualification_transcript_sha256: Sha256Digest,
-    pub usage_terminal_receipt_sha256: Sha256Digest,
-    pub old_host_coverage_sha256: Sha256Digest,
-    pub kernel_nbd_qualification_bundle_sha256: Sha256Digest,
-    pub vhost_user_qualification_bundle_sha256: Sha256Digest,
-}
-
 /// Exact ADR-0038 cell scope admitted only long enough to produce release
-/// qualification evidence.  It intentionally cannot carry any final-reset
-/// proof: a qualification cell must be able to qualify the same default-
-/// Closed build whose terminal receipts are later consumed by `Open`.
+/// qualification evidence. It cannot open general product mutation traffic;
+/// normal production admission is owned by the current deployment surface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProductionQualificationAdmissionBinding {
@@ -202,14 +166,9 @@ pub enum ProductionQualificationMutationClass {
     CatCreate,
     DiskCreate,
     DiskDelete,
-    ObjectWriteAmbiguity,
     RuntimeMutation,
 }
 
-// Cold-path operator admission receipt. Its size is dominated by the fixed
-// digest set each binding must carry verbatim; it is constructed a handful of
-// times per cutover window, so indirection would only churn authority code.
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -219,35 +178,30 @@ pub enum ProductionQualificationMutationClass {
 )]
 pub enum ProductionMutationAdmissionBinding {
     Qualification(ProductionQualificationAdmissionBinding),
-    Open(ProductionMutationOpenBinding),
 }
 
 impl ProductionMutationAdmissionBinding {
     pub fn deployment_id(&self) -> &Id {
         match self {
             Self::Qualification(binding) => &binding.deployment_id,
-            Self::Open(binding) => &binding.deployment_id,
         }
     }
 
     pub fn release_id(&self) -> &Id {
         match self {
             Self::Qualification(binding) => &binding.release_id,
-            Self::Open(binding) => &binding.release_id,
         }
     }
 
     pub fn source_commit_sha(&self) -> &str {
         match self {
             Self::Qualification(binding) => &binding.source_commit_sha,
-            Self::Open(binding) => &binding.source_commit_sha,
         }
     }
 
     pub fn control_schema_version(&self) -> WireU64 {
         match self {
             Self::Qualification(binding) => binding.control_schema_version,
-            Self::Open(binding) => binding.control_schema_version,
         }
     }
 }
@@ -261,9 +215,6 @@ pub enum ProductionMutationAdmissionMutation {
     EndQualification {
         binding: ProductionQualificationAdmissionBinding,
     },
-    Open {
-        binding: ProductionMutationOpenBinding,
-    },
     EmergencyClose {
         binding: ProductionMutationAdmissionBinding,
     },
@@ -275,7 +226,6 @@ impl ProductionMutationAdmissionMutation {
             Self::BeginQualification { binding } | Self::EndQualification { binding } => {
                 ProductionMutationAdmissionBinding::Qualification(binding.clone())
             }
-            Self::Open { binding } => ProductionMutationAdmissionBinding::Open(binding.clone()),
             Self::EmergencyClose { binding } => binding.clone(),
         }
     }
@@ -285,7 +235,6 @@ impl ProductionMutationAdmissionMutation {
             Self::BeginQualification { binding } | Self::EndQualification { binding } => {
                 &binding.deployment_id
             }
-            Self::Open { binding } => &binding.deployment_id,
             Self::EmergencyClose { binding } => binding.deployment_id(),
         }
     }
@@ -295,7 +244,6 @@ impl ProductionMutationAdmissionMutation {
             Self::BeginQualification { binding } | Self::EndQualification { binding } => {
                 &binding.release_id
             }
-            Self::Open { binding } => &binding.release_id,
             Self::EmergencyClose { binding } => binding.release_id(),
         }
     }
@@ -305,7 +253,6 @@ impl ProductionMutationAdmissionMutation {
             Self::BeginQualification { binding } | Self::EndQualification { binding } => {
                 &binding.source_commit_sha
             }
-            Self::Open { binding } => &binding.source_commit_sha,
             Self::EmergencyClose { binding } => binding.source_commit_sha(),
         }
     }
@@ -328,7 +275,6 @@ pub struct ProductionMutationAdmissionCommand {
 pub enum ProductionMutationAdmissionMode {
     Closed,
     Qualification,
-    Open,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,9 +340,7 @@ pub struct ProductionQualificationBeginReceipt {
 ///
 /// EndQualification takes the singleton `FOR UPDATE`, so the final Closed
 /// revision is ordered after every admitted cleanup mutation.  The producer
-/// must then obtain the two canonical read-only receipts named here.  E9
-/// terminalization deliberately follows this boundary and is consumed later
-/// by the final Open proof rather than by this receipt.
+/// must then obtain the two canonical read-only receipts named here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProductionQualificationTerminalReceipt {
@@ -432,10 +376,9 @@ pub struct ProductionQualificationTerminalReceipt {
 
 /// Complete current-product projection for one qualification Workspace.
 ///
-/// The first seven fields contribute to `product_resource_count`.  Deleted
-/// Cat tombstones, terminal Operation rows and exact API idempotency results
-/// are retained history and are reported separately rather than becoming a
-/// false nonzero product inventory.
+/// The first six fields contribute to `product_resource_count`.  Deleted Cat
+/// tombstones and exact API idempotency results are retained history and are
+/// reported separately rather than becoming a false nonzero product inventory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProductionQualificationProductInventoryCounts {
@@ -445,9 +388,7 @@ pub struct ProductionQualificationProductInventoryCounts {
     pub disk_snapshot_count: WireU64,
     pub endpoint_count: WireU64,
     pub hostname_endpoint_lookup_count: WireU64,
-    pub unresolved_lifecycle_operation_count: WireU64,
     pub deleted_cat_tombstone_count: WireU64,
-    pub terminal_lifecycle_operation_history_count: WireU64,
     pub api_idempotency_receipt_count: WireU64,
 }
 
@@ -523,7 +464,7 @@ pub fn encode_production_cutover_operator_trust_bundle(
 
 pub fn sign_production_mutation_admission_command(
     trust: &ProductionCutoverOperatorTrustBundle,
-    signer: &crate::agent_registration::Ed25519RequestSigner,
+    signer: &crate::node_identity::Ed25519RequestSigner,
     exact_body: &[u8],
 ) -> Result<ProductionCutoverSignatureProof, ProductionMutationAdmissionContractError> {
     validate_trust_bundle(trust)?;
@@ -650,7 +591,7 @@ pub fn production_mutation_admission_signed_request(
     for value in [
         PRODUCTION_MUTATION_ADMISSION_METHOD.as_bytes(),
         PRODUCTION_MUTATION_ADMISSION_COMMANDS_PATH.as_bytes(),
-        crate::agent_registration::JSON_CONTENT_TYPE.as_bytes(),
+        crate::node_identity::JSON_CONTENT_TYPE.as_bytes(),
         trust.deployment_id.as_str().as_bytes(),
         trust.release_id.as_str().as_bytes(),
         trust.source_commit_sha.as_bytes(),
@@ -847,7 +788,6 @@ fn validate_command(
         ProductionMutationAdmissionMutation::EndQualification { binding } => {
             validate_qualification_binding(binding)
         }
-        ProductionMutationAdmissionMutation::Open { binding } => validate_open_binding(binding),
         ProductionMutationAdmissionMutation::EmergencyClose { binding } => {
             validate_state_binding(binding)
         }
@@ -929,21 +869,6 @@ fn valid_arn(value: &str) -> bool {
     (1..=2_048).contains(&value.len()) && value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
 }
 
-fn validate_open_binding(
-    binding: &ProductionMutationOpenBinding,
-) -> Result<(), ProductionMutationAdmissionContractError> {
-    if binding.control_schema_version.get() != PRODUCTION_MUTATION_ADMISSION_SCHEMA_VERSION
-        || binding.source_commit_sha.len() != 40
-        || !binding
-            .source_commit_sha
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(ProductionMutationAdmissionContractError::Invalid);
-    }
-    Ok(())
-}
-
 fn validate_qualification_binding(
     binding: &ProductionQualificationAdmissionBinding,
 ) -> Result<(), ProductionMutationAdmissionContractError> {
@@ -1015,7 +940,6 @@ fn validate_qualification_product_inventory_receipt(
         receipt.counts.disk_snapshot_count,
         receipt.counts.endpoint_count,
         receipt.counts.hostname_endpoint_lookup_count,
-        receipt.counts.unresolved_lifecycle_operation_count,
     ];
     let expected_total = current_counts
         .into_iter()
@@ -1039,7 +963,6 @@ fn validate_state_binding(
         ProductionMutationAdmissionBinding::Qualification(binding) => {
             validate_qualification_binding(binding)
         }
-        ProductionMutationAdmissionBinding::Open(binding) => validate_open_binding(binding),
     }
 }
 
@@ -1088,11 +1011,6 @@ fn validate_state(
                 state.binding.as_ref(),
                 Some(ProductionMutationAdmissionBinding::Qualification(_))
             )
-        || matches!(state.mode, ProductionMutationAdmissionMode::Open)
-            && !matches!(
-                state.binding.as_ref(),
-                Some(ProductionMutationAdmissionBinding::Open(_))
-            )
         || state.binding.is_none() != state.last_command_id.is_none()
         || state.binding.is_none() && state.revision.get() != 1
     {
@@ -1124,9 +1042,6 @@ fn validate_receipt(
                 | ProductionMutationAdmissionMutation::EmergencyClose { .. } => {
                     state.mode != ProductionMutationAdmissionMode::Closed
                 }
-                ProductionMutationAdmissionMutation::Open { .. } => {
-                    state.mode != ProductionMutationAdmissionMode::Open
-                }
             }
         {
             return Err(ProductionMutationAdmissionContractError::Invalid);
@@ -1141,33 +1056,6 @@ mod tests {
 
     fn digest(byte: char) -> Sha256Digest {
         Sha256Digest::new(format!("sha256:{}", byte.to_string().repeat(64))).unwrap()
-    }
-
-    fn binding() -> ProductionMutationOpenBinding {
-        ProductionMutationOpenBinding {
-            reset_id: Id::new("reset_a").unwrap(),
-            deployment_id: Id::new("deployment_a").unwrap(),
-            release_id: Id::new("release_a").unwrap(),
-            source_commit_sha: "a".repeat(40),
-            control_schema_version: WireU64::new(PRODUCTION_MUTATION_ADMISSION_SCHEMA_VERSION)
-                .unwrap(),
-            source_manifest_sha256: digest('0'),
-            source_bundle_sha256: digest('1'),
-            release_manifest_sha256: digest('2'),
-            qualification_manifest_sha256: digest('3'),
-            qualification_catalog_sha256: digest('4'),
-            proof_set_sha256: digest('5'),
-            fresh_targets_sha256: digest('6'),
-            reset_complete_receipt_sha256: digest('7'),
-            fleet_closed_receipt_sha256: digest('8'),
-            route_v2_rotation_qualification_receipt_sha256: digest('9'),
-            route_v2_rotation_qualification_node_ack_sets_sha256: digest('a'),
-            route_v2_rotation_qualification_transcript_sha256: digest('b'),
-            usage_terminal_receipt_sha256: digest('c'),
-            old_host_coverage_sha256: digest('d'),
-            kernel_nbd_qualification_bundle_sha256: digest('e'),
-            vhost_user_qualification_bundle_sha256: digest('f'),
-        }
     }
 
     fn qualification_binding() -> ProductionQualificationAdmissionBinding {
@@ -1196,7 +1084,6 @@ mod tests {
                 ProductionQualificationMutationClass::CatCreate,
                 ProductionQualificationMutationClass::DiskCreate,
                 ProductionQualificationMutationClass::DiskDelete,
-                ProductionQualificationMutationClass::ObjectWriteAmbiguity,
                 ProductionQualificationMutationClass::RuntimeMutation,
             ],
             qualification_expires_at_unix_ms: UnixMillis::new(3_600_000).unwrap(),
@@ -1245,7 +1132,9 @@ mod tests {
             expires_at_unix_ms: UnixMillis::new(301_000).unwrap(),
             operator: operator(),
             expected_revision: Epoch::new(1).unwrap(),
-            mutation: ProductionMutationAdmissionMutation::Open { binding: binding() },
+            mutation: ProductionMutationAdmissionMutation::BeginQualification {
+                binding: qualification_binding(),
+            },
         };
         let encoded = encode_production_mutation_admission_command(&command).unwrap();
         assert_eq!(
@@ -1261,7 +1150,7 @@ mod tests {
     }
 
     #[test]
-    fn qualification_is_a_distinct_bounded_binding_not_a_partial_open() {
+    fn qualification_is_an_exact_bounded_binding() {
         let command = ProductionMutationAdmissionCommand {
             version: ContractVersion::V1,
             command_id: RandomId128::new("2".repeat(32)).unwrap(),
@@ -1371,7 +1260,7 @@ mod tests {
     }
 
     #[test]
-    fn qualification_product_inventory_separates_current_rows_from_history() {
+    fn qualification_product_inventory_separates_resources_from_history() {
         let counts = ProductionQualificationProductInventoryCounts {
             current_cat_count: WireU64::new(1).unwrap(),
             root_disk_count: WireU64::new(1).unwrap(),
@@ -1379,9 +1268,7 @@ mod tests {
             disk_snapshot_count: WireU64::new(1).unwrap(),
             endpoint_count: WireU64::new(1).unwrap(),
             hostname_endpoint_lookup_count: WireU64::new(1).unwrap(),
-            unresolved_lifecycle_operation_count: WireU64::new(1).unwrap(),
             deleted_cat_tombstone_count: WireU64::new(3).unwrap(),
-            terminal_lifecycle_operation_history_count: WireU64::new(4).unwrap(),
             api_idempotency_receipt_count: WireU64::new(5).unwrap(),
         };
         let receipt = ProductionQualificationProductInventoryReceipt {
@@ -1401,7 +1288,7 @@ mod tests {
             evaluated_at_unix_ms: UnixMillis::new(4_000).unwrap(),
             complete: true,
             counts,
-            product_resource_count: WireU64::new(8).unwrap(),
+            product_resource_count: WireU64::new(7).unwrap(),
         };
         let encoded = encode_production_qualification_product_inventory_receipt(&receipt).unwrap();
         assert_eq!(
@@ -1426,7 +1313,9 @@ mod tests {
             expires_at_unix_ms: UnixMillis::new(61_000).unwrap(),
             operator: operator(),
             expected_revision: Epoch::new(1).unwrap(),
-            mutation: ProductionMutationAdmissionMutation::Open { binding: binding() },
+            mutation: ProductionMutationAdmissionMutation::BeginQualification {
+                binding: qualification_binding(),
+            },
         };
         let body = encode_production_mutation_admission_command(&command).unwrap();
         let mut pkcs8 = hex::decode("302e020100300506032b657004220420").unwrap();
@@ -1434,7 +1323,7 @@ mod tests {
             &hex::decode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
                 .unwrap(),
         );
-        let signer = crate::agent_registration::Ed25519RequestSigner::from_pkcs8_der(
+        let signer = crate::node_identity::Ed25519RequestSigner::from_pkcs8_der(
             Id::new("cutover_a").unwrap(),
             &pkcs8,
         )

@@ -160,7 +160,7 @@ resource "kubernetes_config_map_v1" "runtime_provisioner_trust" {
   }
 }
 
-# Release-bound public E13 operator trust. cats-controld loads this at startup
+# Release-bound public qualification-operator trust. cats-controld loads this at startup
 # through the same reader as the provisioner trust and refuses to start without
 # it, so it is a deployment input rather than an optional extra.
 resource "kubernetes_config_map_v1" "production_cutover_operator_trust" {

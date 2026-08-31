@@ -244,15 +244,6 @@ if [[ ! -f /etc/cats/cats.env ]]; then
 fi
 
 echo "==> systemd units"
-# A host upgraded from the V1 development shape may still have the old
-# Gateway enabled. Stop it before daemon-reload and remove its exact unit and
-# binary; leaving either behind would let a reboot revive legacy route
-# resolve/wake and Node proxy traffic.
-cats_retire_legacy_gateway \
-  /etc/systemd/system/cats-gatewayd.service \
-  /etc/systemd/system/multi-user.target.wants/cats-gatewayd.service \
-  "$PREFIX/bin/cats-gatewayd"
-cats_worker_deployment_crash_probe after-remove-legacy-gateway
 for unit in "$REPO"/deploy/metal/systemd/*.service; do
   [[ ${unit##*/} == cats-noded.service ]] && continue
   install -m 0644 "$unit" /etc/systemd/system/

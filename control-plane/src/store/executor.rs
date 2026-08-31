@@ -226,13 +226,6 @@ impl BlockingExecutor {
             peak_active: self.inner.peak_active.load(Ordering::Acquire),
         }
     }
-
-    /// Close admission and discard every queued job without waiting for an
-    /// already-running job. The owner must still drop this executor to join
-    /// its workers before releasing the resource protected by those jobs.
-    pub(super) fn begin_shutdown(&self) {
-        shutdown(&self.inner);
-    }
 }
 
 impl Drop for BlockingExecutor {

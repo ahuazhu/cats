@@ -38,25 +38,20 @@
 
 仍开放：
 
-- 旧 Route v2 部署合同随新入口传输实现一起清理；
-- PersistentDisk/Cloud Hypervisor 的 Guest 物理挂载链 E2E；
-- Cloud Hypervisor 的完整 `SemanticCatEffects`；当前 bridge 缺少输入时在物理副作用前失败；
-- 两 Node 双跑窗口/reset 收敛、Linux/Cloud Hypervisor 和最终全仓门禁。
+- product DiskSnapshot/GC、自动cloud/BMC Host fencing与长期不对称网络合同；
+- 每个后续交付在自身exact commit重跑full、Linux和适用production qualification，不能复用旧发布候选绿灯。
 
-详细滚动进度只维护在
-[场景语义 Control/Node 协议实施计划](semantic-control-node-implementation-plan.md)，不要从本文推断
-某项正在开发的物理路径已经完成。
+各模块的当前实现边界由代码、校准测试和对应的现行合同共同决定；Git history 保存切换实施记录。
 
 ## Active architecture
 
 | 文档 | 状态 | 用途 |
 |---|---|---|
 | [architecture.md](architecture.md) | Target + current boundary | 系统总图、当前 authority、实现差距和上线门 |
-| [Control/Node semantic protocol](control-node-semantic-protocol.md) | Accepted target, implementation in progress | 当前同步 wire、状态机、场景语义、Node reset |
+| [Control/Node semantic protocol](control-node-semantic-protocol.md) | Current implemented protocol | 当前同步 wire、状态机、场景语义、Node reset |
 | [runtime-lifecycle.md](runtime-lifecycle.md) | Current product contract | 四态、failure/destroy、动作和入口/数据屏障 |
 | [storage.md](storage.md) | Implemented core + explicit gaps | ChunkStore 格式、FLUSH、R/L、owner/epoch、GC |
 | [operations-ha.md](operations-ha.md) | Current operations contract | heartbeat/offline/reset、故障域、qualification、clean-slate deploy |
-| [architecture-cross-review.md](architecture-cross-review.md) | Historical cross-review | ADR-0056 时期的证据复核；协议结论已被 ADR-0059 supersede |
 | [实验总报告](experiments-2026-07-21-storage-lifecycle.md) | Evidence | 记录环境、样本、结果和失败尝试 |
 
 ## Protocol/spec status
@@ -66,22 +61,14 @@
 | [Control/Node semantic protocol](control-node-semantic-protocol.md) | Current accepted target | Cat/Disk/Node 同步协议和验收 |
 | [blockd protocol](specs/blockd-protocol.md) | Implemented data plane | Chunk/Map/FLUSH；生命周期只使用远端持久模式 |
 | [Guest Runtime API](specs/guest-runtime-api.md) | Frozen v1 | Guest-local `/run/cats/runtime.sock` 能力 |
-| [Exec / Interactive Shell](specs/interactive-shell-protocol.md) | Accepted target, implementation in progress | 认证 wake、exact-incarnation access gate、bounded Exec 与 WebSocket PTY；不属于 CatAction |
-| [Volume Authority](specs/volume-authority.md) | Storage authority retained; lifecycle composition sections superseded | owner/epoch/remote root 和数据安全；旧 Operation/AgentSession 接线不再是当前 wire |
-| [Atomic Runtime Lifecycle v1](specs/atomic-runtime-lifecycle-v1.md) | Superseded by ADR-0059 | 历史 Operation/poll/journal 协议资料，不是当前目标 |
-| [Runtime Reconciliation v1](specs/runtime-reconciliation-v1.md) | Superseded by ADR-0059 for lifecycle | 历史 Desired/AgentSession/inventory 协议；不进入当前 lifecycle |
-| [Agent Registration and Internal Transport v1](specs/agent-registration-transport-v1.md) | Superseded for current Node registration | 历史 signed session/lease wire；当前使用 semantic register/heartbeat/reset |
-| [Runtime Inventory and Telemetry v1](specs/runtime-inventory-observation-v1.md) | Superseded by ADR-0059 for Node lifecycle | 历史 session-bound inventory；当前 heartbeat/Node 查询不使用其 settlement |
-| [Route Grant v2](specs/route-grant-v2.md) | Superseded for current Control/Node lifecycle composition | 历史 Route Operation/AgentSession lane；当前只要求唯一入口目标 |
-| [Route v2 Signing Authority v1](specs/route-signing-authority-v1.md) | Historical, not in current semantic composition | 旧 signing/ring/ACK 路径 |
+| [Interactive Shell](specs/interactive-shell-protocol.md) | Implemented v1 | WorkOS 鉴权 WebSocket PTY |
+| [Volume Authority](specs/volume-authority.md) | Current v19 storage contract | direct acquire/renew/release/delete、owner/epoch、remote root 和 blockd serving admission |
 | [Runtime Placement Policy v1](specs/runtime-placement-policy-v1.md) | Fleet policy foundation retained | 独立 provisioner-owned capacity/policy；不充当 Cat action authority |
 | [A23 Provisioner Tooling v1](specs/a23-production-provisioner-tooling-v1.md) | Operations foundation retained | 独立 `runtime_node_authority` 配置入口 |
-| [Runtime Composition Artifacts v1](specs/runtime-composition-artifacts-v1.md) | Historical implementation reference | Node/Guest artifact 背景；不定义当前同步 lifecycle |
 | [Immutable Image Manifest Read v1](specs/immutable-image-manifest-read-v1.md) | Storage/boot reference retained | 不表示当前 CH semantic effects 已接入 |
-| [Old Host Positive Stop Evidence v1](specs/old-host-positive-stop-v1.md) | Historical proposed evidence | 不是 heartbeat/reset 或 Host fence authority |
 
-旧 spec 保留用于说明历史实现和仍适用的底层安全事实。凡涉及 lifecycle Operation、poll/result、journal、
-AgentSession 或 HostFenceRecovery 协调的段落，都由 ADR-0059 supersede；不得作为当前目标合同引用。
+已取代的协议规格由 Git history 保存；当前文档不得把 lifecycle Operation、poll/result、journal、AgentSession、
+Route v2 或 HostFenceRecovery 协调作为目标合同引用。
 
 ## Active decisions
 
@@ -112,6 +99,8 @@ AgentSession 或 HostFenceRecovery 协调的段落，都由 ADR-0059 supersede�
   六动作名称保留，Operation 投影已取代。
 - [0058 Route ring ACK / AgentSession](decisions/0058-route-ring-acknowledges-immutable-agent-session.md)：
   AgentSession/Route ACK 协调已取代。
+- [0025 disposable Root destroy](decisions/0025-destroy-disposable-root-without-remote-drain.md)：
+  local-tail discard authorization 已由 ADR-0059 的 Strict direct delete 取代。
 
 ### 存储、身份和产品边界
 
@@ -122,7 +111,6 @@ AgentSession 或 HostFenceRecovery 协调的段落，都由 ADR-0059 supersede�
 - [0017 golden roots](decisions/0017-golden-root-shared-base-images.md)
 - [0021 Relaxed durability](decisions/0021-relaxed-durability-tier.md)
 - [0022 dual watermark](decisions/0022-relaxed-local-first-dual-watermark.md)
-- [0025 disposable Root destroy](decisions/0025-destroy-disposable-root-without-remote-drain.md)
 - [0042 Volume Authority 与磁盘生命周期](decisions/0042-volume-authority-and-disk-lifecycle.md)
 - [0018 Workspace 唯一 owner](decisions/0018-remove-the-v1-project-compatibility-layer.md)
 - [0006 WorkOS AuthKit](decisions/0006-workos-authkit-for-browser-identity.md)

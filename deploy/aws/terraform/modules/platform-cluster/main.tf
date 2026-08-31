@@ -1,9 +1,8 @@
 # Cats EKS cluster.
 #
-# Dedicated to Cats. The account this replaces ran cats-controld and
-# cats-gatewayd as a namespace on another product's cluster, which coupled the
-# two lifecycles: the cluster could not be upgraded, drained or deleted for one
-# product without affecting the other.
+# Dedicated to Cats. Sharing this cluster with another product would couple
+# their lifecycles: the cluster could not be upgraded, drained or deleted for
+# one product without affecting the other.
 #
 # Auto Mode is retained from the previous deployment because the application
 # stack's ingress depends on its IngressClassParams and managed ALB.
@@ -155,20 +154,6 @@ resource "aws_eks_addon" "pod_identity" {
   cluster_name  = aws_eks_cluster.this.name
   addon_name    = "eks-pod-identity-agent"
   addon_version = var.pod_identity_addon_version
-
-  resolve_conflicts_on_create = "OVERWRITE"
-  resolve_conflicts_on_update = "OVERWRITE"
-
-  tags = var.tags
-}
-
-# EFS is the crash-safe, cross-replica receiving spool for the ObjectWrite
-# Gateway. The application uses one Terraform-created static access point; the
-# driver never dynamically creates or deletes access points.
-resource "aws_eks_addon" "efs_csi" {
-  cluster_name  = aws_eks_cluster.this.name
-  addon_name    = "aws-efs-csi-driver"
-  addon_version = var.efs_csi_addon_version
 
   resolve_conflicts_on_create = "OVERWRITE"
   resolve_conflicts_on_update = "OVERWRITE"

@@ -48,7 +48,7 @@ def main() -> int:
                 str(root / "release"),
                 "--image",
                 "cats:fixture",
-                "--gateway-image",
+                "--credential-refresher-image",
                 "INDEX.DOCKER.IO:443/library/cats:fixture",
             ],
             env=environment,

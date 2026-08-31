@@ -9,15 +9,7 @@ use super::canonical::value_bytes;
 use super::types::*;
 
 pub const NODE_IDENTITY_MAX_WIRE_BYTES: usize = 16_384;
-pub const AGENT_REGISTRATION_ATTEMPT_MAX_WIRE_BYTES: usize = 16_384;
-pub const AGENT_SESSION_MAX_WIRE_BYTES: usize = 16_384;
 pub const GUEST_RUNTIME_PROFILE_RECEIPT_MAX_WIRE_BYTES: usize = 4_096;
-pub const ADMISSION_INVENTORY_ATTESTATION_MAX_WIRE_BYTES: usize = 16_384;
-pub const RUNTIME_SPINE_ERROR_MAX_WIRE_BYTES: usize = 20_480;
-#[cfg(feature = "proposed-node-residue-reclamation")]
-pub const RUNTIME_RESIDUE_AUTHORITY_REQUEST_MAX_WIRE_BYTES: usize = 16_384;
-#[cfg(feature = "proposed-node-residue-reclamation")]
-pub const RUNTIME_RESIDUE_AUTHORITY_SUCCESS_MAX_WIRE_BYTES: usize = 65_536;
 pub const CONTRACT_ERROR_MAX_WIRE_BYTES: usize = 16_384;
 pub const PROVISION_ROOT_IMAGE_REQUEST_MAX_WIRE_BYTES: usize = 4_096;
 pub const PROVISION_ROOT_IMAGE_RESULT_MAX_WIRE_BYTES: usize = 4_096;
@@ -697,7 +689,6 @@ enum StringRule {
     JsonPointer,
     RandomId,
     Digest,
-    NodeTransportTarget,
     Ipv4,
     Base64UrlNoPad,
     Message,
@@ -1334,7 +1325,6 @@ fn valid_string(rule: StringRule, value: &str) -> bool {
         StringRule::JsonPointer => valid_json_pointer(value),
         StringRule::RandomId => valid_random_id(value),
         StringRule::Digest => valid_digest(value),
-        StringRule::NodeTransportTarget => valid_node_transport_target(value),
         StringRule::Ipv4 => valid_ipv4(value),
         StringRule::Base64UrlNoPad => valid_base64url_no_pad(value),
         StringRule::Message => {
@@ -1681,15 +1671,6 @@ fn credential_binding_schema() -> Schema {
     )
 }
 
-fn session_binding_schema() -> Schema {
-    object(vec![
-        field("node_id", id()),
-        field("node_boot_id", random_id()),
-        field("agent_instance_id", random_id()),
-        field("agent_session_epoch", epoch()),
-    ])
-}
-
 fn remote_head_schema() -> Schema {
     object(vec![
         field("generation", wire_u64()),
@@ -1774,27 +1755,8 @@ fn contract_name_schema() -> Schema {
         "runtime_node_authority_apply_result",
         "runtime_provisioner_trust_bundle",
         "runtime_provisioner_active_set",
-        "runtime_node_authority_apply_record",
-        "agent_registration_attempt",
-        "agent_session",
         "guest_runtime_profile_receipt",
-        "admission_inventory_attestation",
-        "runtime_spine_error",
-        #[cfg(feature = "proposed-node-residue-reclamation")]
-        "runtime_residue_authority_request",
-        #[cfg(feature = "proposed-node-residue-reclamation")]
-        "runtime_residue_authority_success",
         "contract_error",
-    ])
-}
-
-fn registration_binding_schema() -> Schema {
-    object(vec![
-        field("immutable_host_id", id()),
-        field("node_boot_id", random_id()),
-        field("agent_instance_id", random_id()),
-        field("guest_config_digest", digest()),
-        field("expected_agent_session_epoch", nullable(epoch())),
     ])
 }
 
@@ -1802,82 +1764,6 @@ fn contract_error_detail_schema() -> Schema {
     union(
         "code",
         vec![
-            variant("missing_agent_session", vec![field("node_id", id())]),
-            variant(
-                "stale_session",
-                vec![
-                    field("node_id", id()),
-                    field("presented_agent_session_epoch", epoch()),
-                    field("current_agent_session_epoch", epoch()),
-                ],
-            ),
-            variant(
-                "wrong_session",
-                vec![
-                    field("expected", session_binding_schema()),
-                    field("presented", session_binding_schema()),
-                ],
-            ),
-            variant(
-                "registration_attempt_conflict",
-                vec![
-                    field("node_id", id()),
-                    field("registration_attempt_id", random_id()),
-                    field("expected", registration_binding_schema()),
-                    field("presented", registration_binding_schema()),
-                ],
-            ),
-            variant(
-                "guest_config_mismatch",
-                vec![
-                    field("node_id", id()),
-                    field("expected_guest_config_digest", digest()),
-                    field("presented_guest_config_digest", digest()),
-                ],
-            ),
-            variant(
-                "session_expired",
-                vec![
-                    field("node_id", id()),
-                    field("agent_session_epoch", epoch()),
-                    field("lease_deadline_unix_ms", wire_u64()),
-                    field("server_time_unix_ms", wire_u64()),
-                ],
-            ),
-            variant(
-                "missing_inventory_attestation",
-                vec![
-                    field("node_id", id()),
-                    field("agent_session_epoch", epoch()),
-                ],
-            ),
-            variant(
-                "stale_inventory_epoch",
-                vec![
-                    field("node_id", id()),
-                    field("agent_session_epoch", epoch()),
-                    field("presented_inventory_epoch", epoch()),
-                    field("current_inventory_epoch", epoch()),
-                ],
-            ),
-            variant(
-                "wrong_inventory_epoch",
-                vec![
-                    field("node_id", id()),
-                    field("agent_session_epoch", epoch()),
-                    field("expected_inventory_epoch", epoch()),
-                    field("presented_inventory_epoch", epoch()),
-                ],
-            ),
-            variant(
-                "partial_cat_not_in_full_inventory",
-                vec![
-                    field("node_id", id()),
-                    field("agent_session_epoch", epoch()),
-                    field("inventory_epoch", epoch()),
-                    field("cat_id", id()),
-                ],
-            ),
             variant(
                 "unsupported_version",
                 vec![
@@ -1915,16 +1801,6 @@ fn contract_error_detail_schema() -> Schema {
                     field("limit", closed(&["wire_bytes", "array_items"])),
                     field("maximum", wire_u64()),
                     field("observed_at_least", wire_u64()),
-                ],
-            ),
-            variant(
-                "idempotency_conflict",
-                vec![
-                    field("authenticated_workspace_id", id()),
-                    field("canonical_route", string(StringRule::AsciiText)),
-                    field("idempotency_key", string(StringRule::AsciiText)),
-                    field("expected_request_fingerprint", digest()),
-                    field("presented_request_fingerprint", digest()),
                 ],
             ),
         ],
@@ -1989,10 +1865,6 @@ fn node_placement_policy_schema() -> Schema {
         field("allocatable_memory_bytes", number(1, MAX_WIRE_INTEGER)),
         field("capabilities", runtime_placement_capabilities_schema()),
         field("guest_ipv4_pool", guest_ipv4_pool_schema()),
-        field(
-            "node_transport_target",
-            string(StringRule::NodeTransportTarget),
-        ),
     ])
 }
 
@@ -2051,23 +1923,6 @@ fn runtime_node_authority_mutation_schema() -> Schema {
                     ),
                 ],
             ),
-            variant(
-                "provision_object_write_authority",
-                vec![
-                    field("expected_policy_revision", epoch()),
-                    field(
-                        "object_provider_scope",
-                        object(vec![
-                            field("provider", id()),
-                            field("partition", id()),
-                            field("account_id", id()),
-                            field("region", id()),
-                        ]),
-                    ),
-                    field("workload_principal_id", string(StringRule::AsciiText)),
-                    field("object_store_scope_id", string(StringRule::AsciiText)),
-                ],
-            ),
         ],
     )
 }
@@ -2093,12 +1948,10 @@ fn runtime_node_authority_apply_result_schema() -> Schema {
                 "policy_updated",
                 "credential_rotated",
                 "retired",
-                "object_write_authority_provisioned",
             ]),
         ),
         field("identity_state", closed(&["provisioned", "retired"])),
         field("policy_revision", epoch()),
-        field("writer_authority_id", nullable(id())),
     ])
 }
 
@@ -2585,9 +2438,6 @@ fn validate_runtime_node_authority_apply(
             }
         }
         RuntimeNodeAuthorityMutation::Retire { .. } => {}
-        // Every field is context-free scalar-validated by the schema, and the
-        // Host side of the binding is deliberately absent from the request.
-        RuntimeNodeAuthorityMutation::ProvisionObjectWriteAuthority { .. } => {}
     }
     if let Some(candidate) = choose(candidates) {
         return Err(malformed(contract, candidate));
@@ -2618,23 +2468,7 @@ fn validate_runtime_node_authority_apply_result(
             result.identity_state == NodeIdentityState::Provisioned
         }
         RuntimeNodeAuthorityOutcome::Retired => result.identity_state == NodeIdentityState::Retired,
-        RuntimeNodeAuthorityOutcome::ObjectWriteAuthorityProvisioned => {
-            result.identity_state == NodeIdentityState::Provisioned
-        }
     };
-    // The assigned writer authority ID belongs to exactly one outcome, and it
-    // is always the closed shape Control derives. A result claiming any other
-    // outcome may not smuggle one in.
-    let valid = valid
-        && match (result.outcome, result.writer_authority_id.as_ref()) {
-            (
-                RuntimeNodeAuthorityOutcome::ObjectWriteAuthorityProvisioned,
-                Some(writer_authority_id),
-            ) => valid_object_write_writer_authority_id(writer_authority_id.as_str()),
-            (RuntimeNodeAuthorityOutcome::ObjectWriteAuthorityProvisioned, None) => false,
-            (_, Some(_)) => false,
-            (_, None) => true,
-        };
     if !valid {
         return Err(malformed(
             ContractName::RuntimeNodeAuthorityApplyResult,
@@ -2763,671 +2597,6 @@ pub(crate) fn validate_key_ring(loaded_kids: &[KeyId]) -> Result<(), ContractErr
     )
 }
 
-fn authorization_id(record: &AuthorizationRecord) -> &Id {
-    match &record.authorization {
-        VolumeAuthorization::Takeover(authorization) => &authorization.authorization_id,
-        VolumeAuthorization::DisposableRootDelete(authorization) => &authorization.authorization_id,
-    }
-}
-
-fn authorization_volume_id(record: &AuthorizationRecord) -> &Id {
-    match &record.authorization {
-        VolumeAuthorization::Takeover(authorization) => &authorization.volume_id,
-        VolumeAuthorization::DisposableRootDelete(authorization) => &authorization.volume_id,
-    }
-}
-
-fn valid_next_epoch(previous: FenceEpoch, next: FenceEpoch) -> bool {
-    previous
-        .get()
-        .checked_add(1)
-        .is_some_and(|value| value <= MAX_WIRE_INTEGER && value == next.get())
-}
-
-fn remote_head_valid(head: &RemoteHead) -> bool {
-    if head.generation.get() == 0 {
-        head.root_hash.is_none() && head.root_object_id.is_none()
-    } else {
-        head.root_hash.is_some() && head.root_object_id.is_some()
-    }
-}
-
-fn remote_head_same_or_later(current: &RemoteHead, previous: &RemoteHead) -> bool {
-    remote_head_valid(current)
-        && remote_head_valid(previous)
-        && (current.generation > previous.generation
-            || (current.generation == previous.generation && current == previous))
-}
-
-fn authorization_record_valid(record: &AuthorizationRecord) -> bool {
-    match (&record.authorization, &record.state) {
-        (VolumeAuthorization::Takeover(authorization), AuthorizationState::Unconsumed) => {
-            authorization.new_attachment_id != authorization.expected_attachment_id
-                && remote_head_valid(&authorization.expected_head)
-        }
-        (VolumeAuthorization::Takeover(authorization), AuthorizationState::Consumed(receipt)) => {
-            match receipt.as_ref() {
-                AuthorizationConsumedReceipt::Takeover(receipt) => {
-                    authorization.new_attachment_id != authorization.expected_attachment_id
-                        && remote_head_valid(&authorization.expected_head)
-                        && receipt.authorization_id == authorization.authorization_id
-                        && receipt.host_fence_event_id == authorization.host_fence_event_id
-                        && receipt.volume_id == authorization.volume_id
-                        && receipt.new_attachment_id == authorization.new_attachment_id
-                        && valid_next_epoch(authorization.expected_epoch, receipt.resulting_epoch)
-                        && receipt.resulting_head == authorization.expected_head
-                        && receipt.consumed_at <= authorization.not_after
-                        && receipt
-                            .consumed_at
-                            .get()
-                            .checked_add(authorization.lease_duration_ms)
-                            .is_some_and(|value| value <= MAX_WIRE_INTEGER)
-                }
-                AuthorizationConsumedReceipt::BeginDisposableDelete(_) => false,
-            }
-        }
-        (
-            VolumeAuthorization::DisposableRootDelete(authorization),
-            AuthorizationState::Unconsumed,
-        ) => {
-            remote_head_valid(&authorization.expected_head)
-                && match &authorization.isolation_basis {
-                    DisposableDeleteIsolationBasis::LifecycleStrongStop { node_id, .. } => {
-                        node_id == &authorization.authorized_node_id
-                    }
-                    DisposableDeleteIsolationBasis::HostFenceEvent { .. } => true,
-                }
-        }
-        (
-            VolumeAuthorization::DisposableRootDelete(authorization),
-            AuthorizationState::Consumed(receipt),
-        ) => match receipt.as_ref() {
-            AuthorizationConsumedReceipt::BeginDisposableDelete(receipt) => {
-                remote_head_valid(&authorization.expected_head)
-                    && match &authorization.isolation_basis {
-                        DisposableDeleteIsolationBasis::LifecycleStrongStop { node_id, .. } => {
-                            node_id == &authorization.authorized_node_id
-                        }
-                        DisposableDeleteIsolationBasis::HostFenceEvent { .. } => true,
-                    }
-                    && receipt.authorization_id == authorization.authorization_id
-                    && receipt.volume_id == authorization.volume_id
-                    && receipt.disk_id == authorization.disk_id
-                    && receipt.cat_id == authorization.cat_id
-                    && receipt.delete_id == authorization.delete_id
-                    && receipt.prior_attachment_id == authorization.expected_attachment_id
-                    && valid_next_epoch(authorization.expected_epoch, receipt.resulting_epoch)
-                    && receipt.resulting_head == authorization.expected_head
-                    && receipt.consumed_at <= authorization.not_after
-            }
-            AuthorizationConsumedReceipt::Takeover(_) => false,
-        },
-    }
-}
-
-fn volume_record_valid(record: &VolumeRecord) -> bool {
-    if record.size_bytes == 0
-        || record.size_bytes > MAX_WIRE_INTEGER
-        || !remote_head_valid(&record.head)
-    {
-        return false;
-    }
-    match (
-        &record.admin_state,
-        &record.lease_owner,
-        &record.lease_expires_at,
-    ) {
-        (VolumeAdminState::Active, None, None) => {}
-        (VolumeAdminState::Active, Some(_), Some(expires_at))
-            if record.lease_epoch.get() > 0 && expires_at.get() > 0 => {}
-        (VolumeAdminState::Deleting { .. }, None, None) if record.lease_epoch.get() > 0 => {}
-        _ => return false,
-    }
-    let Some(last) = &record.last_transition else {
-        return matches!(record.admin_state, VolumeAdminState::Active)
-            && record.lease_owner.is_none();
-    };
-    match last {
-        LastVolumeTransition::NormalAcquire {
-            request, result, ..
-        } => {
-            request.volume_id == record.volume_id
-                && result.volume_id == request.volume_id
-                && result.transition_id == request.transition_id
-                && result.attachment_id == request.attachment_id
-                && valid_next_epoch(request.expected_unowned_epoch, result.resulting_epoch)
-                && result.lease_expires_at.get() >= request.lease_duration_ms
-                && matches!(record.admin_state, VolumeAdminState::Active)
-                && record.lease_owner.as_ref() == Some(&result.attachment_id)
-                && record.lease_epoch == result.resulting_epoch
-                && remote_head_same_or_later(&record.head, &result.resulting_head)
-        }
-        LastVolumeTransition::Release {
-            request, result, ..
-        } => {
-            request.volume_id == record.volume_id
-                && result.volume_id == request.volume_id
-                && result.transition_id == request.transition_id
-                && result.released_attachment_id == request.attachment_id
-                && valid_next_epoch(request.expected_epoch, result.resulting_epoch)
-                && matches!(record.admin_state, VolumeAdminState::Active)
-                && record.lease_owner.is_none()
-                && record.lease_epoch == result.resulting_epoch
-                && record.head == result.resulting_head
-                && remote_head_valid(&result.resulting_head)
-        }
-        LastVolumeTransition::Takeover { .. } => {
-            matches!(record.admin_state, VolumeAdminState::Active) && record.lease_owner.is_some()
-        }
-        LastVolumeTransition::BeginDelete {
-            request, result, ..
-        } => {
-            request.volume_id == record.volume_id
-                && result.delete_id == request.delete_id
-                && result.disk_id == request.disk_id
-                && result.volume_id == request.volume_id
-                && valid_next_epoch(request.expected_unowned_epoch, result.resulting_epoch)
-                && result.resulting_head == request.expected_head
-                && record.lease_epoch == result.resulting_epoch
-                && record.head == result.resulting_head
-                && matches!(
-                    &record.admin_state,
-                    VolumeAdminState::Deleting { delete_id } if delete_id == &result.delete_id
-                )
-        }
-        LastVolumeTransition::BeginDisposableDelete { .. } => {
-            matches!(record.admin_state, VolumeAdminState::Deleting { .. })
-        }
-    }
-}
-
-fn delete_completion_valid(receipt: &DeleteCompletionReceipt) -> bool {
-    match receipt {
-        DeleteCompletionReceipt::Normal {
-            request,
-            deleting_epoch,
-            deleting_head,
-            ..
-        } => {
-            remote_head_valid(&request.expected_head)
-                && request.expected_head == *deleting_head
-                && valid_next_epoch(request.expected_unowned_epoch, *deleting_epoch)
-        }
-        DeleteCompletionReceipt::DisposableRoot { deleting_head, .. } => {
-            remote_head_valid(deleting_head)
-        }
-    }
-}
-
-/// Returns whether the four stored rows form the one closed authorization
-/// evidence bundle allowed by the runtime-volume-transition contract.
-///
-/// This is the shared, context-free closure used by both the public success
-/// codec and the Volume Authority adapter. The caller still owns transport
-/// context such as binding the primary authorization to the authenticated
-/// session's Node.
-pub fn volume_transition_evidence_bundle_is_closed(
-    primary: &AuthorizationRecord,
-    current_volume: Option<&VolumeRecord>,
-    delete_completion: Option<&DeleteCompletionReceipt>,
-    direct_successor: Option<&AuthorizationRecord>,
-) -> bool {
-    if !authorization_record_valid(primary)
-        || current_volume.is_some_and(|record| !volume_record_valid(record))
-        || delete_completion.is_some_and(|receipt| !delete_completion_valid(receipt))
-        || direct_successor.is_some_and(|record| !authorization_record_valid(record))
-        || (current_volume.is_some() && delete_completion.is_some())
-    {
-        return false;
-    }
-
-    let primary_id = authorization_id(primary);
-    let volume_id = authorization_volume_id(primary);
-    if current_volume.is_some_and(|record| &record.volume_id != volume_id)
-        || delete_completion.is_some_and(|receipt| completion_volume_id(receipt) != volume_id)
-    {
-        return false;
-    }
-    if let VolumeAuthorization::DisposableRootDelete(authorization) = &primary.authorization {
-        if delete_completion
-            .is_some_and(|completion| completion_delete_id(completion) != &authorization.delete_id)
-        {
-            return false;
-        }
-    }
-
-    let marker = current_volume
-        .and_then(volume_authorization_marker)
-        .or_else(|| delete_completion.and_then(completion_authorization_marker));
-    match marker.filter(|marker| *marker != primary_id) {
-        None if direct_successor.is_none() => {}
-        Some(marker)
-            if direct_successor.is_some_and(|record| authorization_id(record) == marker) => {}
-        _ => return false,
-    }
-
-    if let Some(record) = direct_successor {
-        if authorization_id(record) == primary_id
-            || authorization_volume_id(record) != volume_id
-            || !direct_successor_postcondition_is_closed(record, current_volume, delete_completion)
-            || !direct_successor_is_monotonic(primary, record)
-        {
-            return false;
-        }
-    } else if marker == Some(primary_id)
-        && !direct_successor_postcondition_is_closed(primary, current_volume, delete_completion)
-    {
-        return false;
-    }
-
-    primary_postcondition_is_monotonic(primary, current_volume, delete_completion)
-}
-
-fn completion_volume_id(receipt: &DeleteCompletionReceipt) -> &Id {
-    match receipt {
-        DeleteCompletionReceipt::Normal { request, .. } => &request.volume_id,
-        DeleteCompletionReceipt::DisposableRoot { volume_id, .. } => volume_id,
-    }
-}
-
-fn completion_delete_id(receipt: &DeleteCompletionReceipt) -> &Id {
-    match receipt {
-        DeleteCompletionReceipt::Normal { request, .. } => &request.delete_id,
-        DeleteCompletionReceipt::DisposableRoot { delete_id, .. } => delete_id,
-    }
-}
-
-fn volume_authorization_marker(record: &VolumeRecord) -> Option<&Id> {
-    match &record.last_transition {
-        Some(LastVolumeTransition::Takeover {
-            authorization_id, ..
-        })
-        | Some(LastVolumeTransition::BeginDisposableDelete {
-            authorization_id, ..
-        }) => Some(authorization_id),
-        _ => None,
-    }
-}
-
-fn completion_authorization_marker(receipt: &DeleteCompletionReceipt) -> Option<&Id> {
-    match receipt {
-        DeleteCompletionReceipt::Normal { .. } => None,
-        DeleteCompletionReceipt::DisposableRoot {
-            authorization_id, ..
-        } => Some(authorization_id),
-    }
-}
-
-fn direct_successor_postcondition_is_closed(
-    record: &AuthorizationRecord,
-    current_volume: Option<&VolumeRecord>,
-    delete_completion: Option<&DeleteCompletionReceipt>,
-) -> bool {
-    let AuthorizationState::Consumed(receipt) = &record.state else {
-        return false;
-    };
-    match (&record.authorization, receipt.as_ref()) {
-        (
-            VolumeAuthorization::Takeover(authorization),
-            AuthorizationConsumedReceipt::Takeover(receipt),
-        ) => {
-            let Some(current) = current_volume else {
-                return false;
-            };
-            matches!(
-                &current.last_transition,
-                Some(LastVolumeTransition::Takeover { authorization_id, .. })
-                    if authorization_id == &authorization.authorization_id
-            ) && matches!(current.admin_state, VolumeAdminState::Active)
-                && current.lease_owner.as_ref() == Some(&receipt.new_attachment_id)
-                && current.lease_epoch == receipt.resulting_epoch
-                && remote_head_same_or_later(&current.head, &receipt.resulting_head)
-        }
-        (
-            VolumeAuthorization::DisposableRootDelete(authorization),
-            AuthorizationConsumedReceipt::BeginDisposableDelete(receipt),
-        ) => match (current_volume, delete_completion) {
-            (Some(current), None) => {
-                disposable_direct_postcondition_is_closed(current, authorization, receipt)
-            }
-            (None, Some(completion)) => {
-                disposable_completion_is_closed(completion, authorization, receipt)
-            }
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
-fn disposable_direct_postcondition_is_closed(
-    record: &VolumeRecord,
-    authorization: &DisposableRootDeleteAuthorization,
-    receipt: &BeginDisposableDeleteConsumedReceipt,
-) -> bool {
-    matches!(
-        &record.admin_state,
-        VolumeAdminState::Deleting { delete_id } if delete_id == &authorization.delete_id
-    ) && record.lease_owner.is_none()
-        && record.lease_expires_at.is_none()
-        && record.lease_epoch == receipt.resulting_epoch
-        && record.head == receipt.resulting_head
-        && matches!(
-            &record.last_transition,
-            Some(LastVolumeTransition::BeginDisposableDelete { authorization_id, .. })
-                if authorization_id == &authorization.authorization_id
-        )
-}
-
-fn disposable_completion_is_closed(
-    completion: &DeleteCompletionReceipt,
-    authorization: &DisposableRootDeleteAuthorization,
-    receipt: &BeginDisposableDeleteConsumedReceipt,
-) -> bool {
-    matches!(
-        completion,
-        DeleteCompletionReceipt::DisposableRoot {
-            disk_id,
-            volume_id,
-            delete_id,
-            authorization_id,
-            prior_attachment_id,
-            deleting_epoch,
-            deleting_head,
-            completed_at,
-            ..
-        } if disk_id == &authorization.disk_id
-            && volume_id == &authorization.volume_id
-            && delete_id == &authorization.delete_id
-            && authorization_id == &authorization.authorization_id
-            && prior_attachment_id == &authorization.expected_attachment_id
-            && deleting_epoch == &receipt.resulting_epoch
-            && deleting_head == &receipt.resulting_head
-            && completed_at >= &receipt.consumed_at
-    )
-}
-
-fn direct_successor_is_monotonic(
-    primary: &AuthorizationRecord,
-    direct: &AuthorizationRecord,
-) -> bool {
-    let (VolumeAuthorization::Takeover(_), AuthorizationState::Consumed(primary_receipt)) =
-        (&primary.authorization, &primary.state)
-    else {
-        return true;
-    };
-    let AuthorizationConsumedReceipt::Takeover(primary_receipt) = primary_receipt.as_ref() else {
-        return false;
-    };
-    match (&direct.authorization, &direct.state) {
-        (VolumeAuthorization::Takeover(authorization), AuthorizationState::Consumed(receipt)) => {
-            let AuthorizationConsumedReceipt::Takeover(receipt) = receipt.as_ref() else {
-                return false;
-            };
-            ((authorization.expected_attachment_id == primary_receipt.new_attachment_id
-                && authorization.expected_epoch == primary_receipt.resulting_epoch)
-                // A signed direct authorization may describe the current tip
-                // after one or more intervening ownership cycles. A strictly
-                // higher predecessor epoch is itself a closed fence over the
-                // primary receipt; equal epoch with another owner remains a
-                // competing branch.
-                || authorization.expected_epoch > primary_receipt.resulting_epoch)
-                && remote_head_same_or_later(
-                    &receipt.resulting_head,
-                    &primary_receipt.resulting_head,
-                )
-        }
-        (
-            VolumeAuthorization::DisposableRootDelete(authorization),
-            AuthorizationState::Consumed(_),
-        ) => {
-            ((authorization.expected_attachment_id == primary_receipt.new_attachment_id
-                && authorization.expected_epoch == primary_receipt.resulting_epoch)
-                || authorization.expected_epoch > primary_receipt.resulting_epoch)
-                && remote_head_same_or_later(
-                    &authorization.expected_head,
-                    &primary_receipt.resulting_head,
-                )
-        }
-        _ => false,
-    }
-}
-
-fn primary_postcondition_is_monotonic(
-    primary: &AuthorizationRecord,
-    current_volume: Option<&VolumeRecord>,
-    delete_completion: Option<&DeleteCompletionReceipt>,
-) -> bool {
-    let AuthorizationState::Consumed(receipt) = &primary.state else {
-        return true;
-    };
-    match (&primary.authorization, receipt.as_ref()) {
-        (VolumeAuthorization::Takeover(_), AuthorizationConsumedReceipt::Takeover(receipt)) => {
-            let (epoch, head) = match (current_volume, delete_completion) {
-                (Some(current), None) => (current.lease_epoch, &current.head),
-                (
-                    None,
-                    Some(DeleteCompletionReceipt::Normal {
-                        deleting_epoch,
-                        deleting_head,
-                        ..
-                    }),
-                )
-                | (
-                    None,
-                    Some(DeleteCompletionReceipt::DisposableRoot {
-                        deleting_epoch,
-                        deleting_head,
-                        ..
-                    }),
-                ) => (*deleting_epoch, deleting_head),
-                (None, None) => return true,
-                _ => return false,
-            };
-            epoch >= receipt.resulting_epoch
-                && remote_head_same_or_later(head, &receipt.resulting_head)
-        }
-        (
-            VolumeAuthorization::DisposableRootDelete(authorization),
-            AuthorizationConsumedReceipt::BeginDisposableDelete(receipt),
-        ) => match (current_volume, delete_completion) {
-            (Some(current), None) => {
-                disposable_direct_postcondition_is_closed(current, authorization, receipt)
-            }
-            (None, Some(completion)) => {
-                disposable_completion_is_closed(completion, authorization, receipt)
-            }
-            // A sweeper crash between row deletion and completion insertion is
-            // incomplete recovery evidence, not permission to infer success.
-            (None, None) => true,
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
-#[cfg(feature = "proposed-node-residue-reclamation")]
-fn residue_acquisition_is_exact(lineage: &ResidueDataDirectoryLineage) -> bool {
-    let receipt_is_exact = match (&lineage.acquire_origin, &lineage.acquisition) {
-        (
-            AcquireOrigin::Normal { transition_id },
-            AuthorizedServingAcquire::Normal { request, result },
-        ) => {
-            request.volume_id == lineage.volume_id
-                && request.transition_id == *transition_id
-                && request.attachment_id == lineage.attachment_id
-                && request.placement_epoch == lineage.placement_epoch
-                && result.volume_id == lineage.volume_id
-                && result.transition_id == *transition_id
-                && result.attachment_id == lineage.attachment_id
-                && valid_next_epoch(request.expected_unowned_epoch, result.resulting_epoch)
-                && result.resulting_epoch == lineage.attachment_epoch
-                && result.lease_expires_at.get() >= request.lease_duration_ms
-                && remote_head_same_or_later(&lineage.remote_head, &result.resulting_head)
-        }
-        (
-            AcquireOrigin::Takeover { authorization_id },
-            AuthorizedServingAcquire::Takeover {
-                authorization,
-                receipt,
-            },
-        ) => {
-            authorization.authorization_id == *authorization_id
-                && authorization.authorized_node_id == lineage.node_id
-                && authorization.volume_id == lineage.volume_id
-                && authorization.new_attachment_id != authorization.expected_attachment_id
-                && remote_head_valid(&authorization.expected_head)
-                && authorization.new_attachment_id == lineage.attachment_id
-                && authorization.new_placement_epoch == lineage.placement_epoch
-                && receipt.authorization_id == authorization.authorization_id
-                && receipt.host_fence_event_id == authorization.host_fence_event_id
-                && receipt.volume_id == authorization.volume_id
-                && receipt.new_attachment_id == authorization.new_attachment_id
-                && valid_next_epoch(authorization.expected_epoch, receipt.resulting_epoch)
-                && receipt.resulting_epoch == lineage.attachment_epoch
-                && receipt.resulting_head == authorization.expected_head
-                && receipt.consumed_at <= authorization.not_after
-                && receipt
-                    .consumed_at
-                    .get()
-                    .checked_add(authorization.lease_duration_ms)
-                    .is_some_and(|value| value <= MAX_WIRE_INTEGER)
-                && remote_head_same_or_later(&lineage.remote_head, &receipt.resulting_head)
-        }
-        _ => false,
-    };
-    receipt_is_exact
-        && super::canonical::residue_acquisition_digest(&lineage.acquisition)
-            .is_ok_and(|digest| digest == lineage.acquisition_digest)
-}
-
-#[cfg(feature = "proposed-node-residue-reclamation")]
-fn residue_lineage_valid(lineage: &ResidueDataDirectoryLineage) -> bool {
-    lineage.attachment_epoch.get() > 0
-        && !lineage.node_id.as_str().is_empty()
-        && lineage.placement.node_id == lineage.node_id
-        && residue_acquisition_is_exact(lineage)
-        && lineage.remote_head.generation == lineage.remote_durable_generation
-        && remote_head_valid(&lineage.remote_head)
-        && lineage.local_durable_generation >= lineage.remote_durable_generation
-        && ((lineage.local_durable_generation == lineage.remote_durable_generation
-            && lineage.pending_pack_count.get() == 0)
-            || (lineage.local_durable_generation > lineage.remote_durable_generation
-                && lineage.pending_pack_count.get() > 0))
-}
-
-/// Context-free closure for the only three authority proofs which may qualify
-/// an exact retained data-directory lineage for deletion.  Filesystem
-/// descriptor identity and live-owner absence remain Node-local preconditions.
-#[cfg(feature = "proposed-node-residue-reclamation")]
-pub fn residue_reclaim_proof_is_closed(
-    lineage: &ResidueDataDirectoryLineage,
-    proof: &ResidueReclaimProof,
-) -> bool {
-    if !residue_lineage_valid(lineage) {
-        return false;
-    }
-    match proof {
-        ResidueReclaimProof::OrdinaryRelease { current_volume } => {
-            if lineage.local_durable_generation != lineage.remote_durable_generation
-                || !volume_record_valid(current_volume)
-                || current_volume.volume_id != lineage.volume_id
-            {
-                return false;
-            }
-            matches!(
-                &current_volume.last_transition,
-                Some(LastVolumeTransition::Release {
-                    request, result, ..
-                })
-                    if request.volume_id == lineage.volume_id
-                        && request.attachment_id == lineage.attachment_id
-                        && request.expected_epoch == lineage.attachment_epoch
-                        && result.released_attachment_id == lineage.attachment_id
-                        && remote_head_same_or_later(
-                            &result.resulting_head,
-                            &lineage.remote_head,
-                        )
-            )
-        }
-        ResidueReclaimProof::NormalDeleteCompletion { completion } => {
-            if lineage.local_durable_generation != lineage.remote_durable_generation
-                || !delete_completion_valid(completion)
-            {
-                return false;
-            }
-            matches!(
-                completion.as_ref(),
-                DeleteCompletionReceipt::Normal {
-                    request,
-                    deleting_head,
-                    ..
-                } if request.disk_id == lineage.disk_id
-                    && request.volume_id == lineage.volume_id
-                    && valid_next_epoch(
-                        lineage.attachment_epoch,
-                        request.expected_unowned_epoch,
-                    )
-                    && remote_head_same_or_later(deleting_head, &lineage.remote_head)
-            )
-        }
-        ResidueReclaimProof::DisposableRootDeleteCompletion {
-            completion,
-            consumed_authorization,
-        } => {
-            if lineage.disk_kind != DiskKind::Root
-                || !delete_completion_valid(completion)
-                || !authorization_record_valid(consumed_authorization)
-            {
-                return false;
-            }
-            let (
-                DeleteCompletionReceipt::DisposableRoot {
-                    disk_id,
-                    volume_id,
-                    delete_id,
-                    authorization_id,
-                    prior_attachment_id,
-                    deleting_epoch,
-                    deleting_head,
-                    completed_at,
-                    ..
-                },
-                VolumeAuthorization::DisposableRootDelete(authorization),
-                AuthorizationState::Consumed(consumed),
-            ) = (
-                completion.as_ref(),
-                &consumed_authorization.authorization,
-                &consumed_authorization.state,
-            )
-            else {
-                return false;
-            };
-            let AuthorizationConsumedReceipt::BeginDisposableDelete(consumed) = consumed.as_ref()
-            else {
-                return false;
-            };
-            disk_id == &lineage.disk_id
-                && volume_id == &lineage.volume_id
-                && prior_attachment_id == &lineage.attachment_id
-                && delete_id == &authorization.delete_id
-                && delete_id == &consumed.delete_id
-                && authorization_id == &authorization.authorization_id
-                && authorization.authorized_node_id == lineage.node_id
-                && authorization.disk_id == lineage.disk_id
-                && authorization.volume_id == lineage.volume_id
-                && authorization.cat_id == lineage.cat_id
-                && authorization.expected_attachment_id == lineage.attachment_id
-                && authorization.expected_epoch == lineage.attachment_epoch
-                && authorization.placement_epoch == lineage.placement.placement_epoch
-                && authorization.expected_head == lineage.remote_head
-                && consumed.resulting_epoch == *deleting_epoch
-                && consumed.resulting_head == *deleting_head
-                && completed_at >= &consumed.consumed_at
-                && valid_next_epoch(lineage.attachment_epoch, *deleting_epoch)
-        }
-    }
-}
-
 fn rebase_contract_candidate(prefix: &[PathSegment], error: &ContractError) -> Candidate {
     let (pointer, problem) = match error.error.as_ref() {
         ContractErrorDetail::MalformedPayload {
@@ -3479,43 +2648,6 @@ fn parse_rendered_pointer(pointer: &str) -> Option<Vec<PathSegment>> {
 
 fn validate_contract_error(error: &ContractError) -> Result<(), ContractError> {
     let valid = match error.error.as_ref() {
-        ContractErrorDetail::StaleSession {
-            presented_agent_session_epoch,
-            current_agent_session_epoch,
-            ..
-        } => presented_agent_session_epoch < current_agent_session_epoch,
-        ContractErrorDetail::WrongSession {
-            expected,
-            presented,
-        } => {
-            expected != presented
-                && presented.agent_session_epoch.get() >= expected.agent_session_epoch.get()
-        }
-        ContractErrorDetail::RegistrationAttemptConflict {
-            expected,
-            presented,
-            ..
-        } => expected != presented,
-        ContractErrorDetail::GuestConfigMismatch {
-            expected_guest_config_digest,
-            presented_guest_config_digest,
-            ..
-        } => expected_guest_config_digest != presented_guest_config_digest,
-        ContractErrorDetail::SessionExpired {
-            lease_deadline_unix_ms,
-            server_time_unix_ms,
-            ..
-        } => server_time_unix_ms >= lease_deadline_unix_ms,
-        ContractErrorDetail::StaleInventoryEpoch {
-            presented_inventory_epoch,
-            current_inventory_epoch,
-            ..
-        } => presented_inventory_epoch <= current_inventory_epoch,
-        ContractErrorDetail::WrongInventoryEpoch {
-            expected_inventory_epoch,
-            presented_inventory_epoch,
-            ..
-        } => presented_inventory_epoch > expected_inventory_epoch,
         ContractErrorDetail::UnsupportedVersion {
             supported_version,
             presented_version,
@@ -3539,11 +2671,6 @@ fn validate_contract_error(error: &ContractError) -> Result<(), ContractError> {
             problem: MalformedProblem::InvalidUtf8 | MalformedProblem::InvalidJson,
             ..
         } => json_pointer.as_str().is_empty(),
-        ContractErrorDetail::IdempotencyConflict {
-            expected_request_fingerprint,
-            presented_request_fingerprint,
-            ..
-        } => expected_request_fingerprint != presented_request_fingerprint,
         _ => true,
     };
     if !valid {

@@ -1,12 +1,13 @@
 # ADR-0057：产品生命周期动作与内部执行证据分层
 
-- 状态：Accepted
+- 状态：Superseded for Operation projection by
+  [ADR-0059](0059-semantic-control-node-synchronous-protocol.md)；六个产品动作名称保留
 - 日期：2026-08-21
 - 取代：[ADR-0056](0056-atomic-per-cat-runtime-lifecycle.md) 的公开动作命名与产品
   Operation 投影；保留其 one-unresolved lane、exact result settlement、typed causal evidence、
   Node-private journal/replay、Volume/Route interlock 与 HostFence 边界
 - 产品合同：[Runtime 生命周期](../runtime-lifecycle.md)
-- 内部执行规格：[Atomic Runtime Lifecycle v1](../specs/atomic-runtime-lifecycle-v1.md)
+- 历史内部执行规格已从当前文档集删除；Git history 保留原文
 
 ## 背景
 

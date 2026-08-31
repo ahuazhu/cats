@@ -28,8 +28,7 @@ const VOLUME_COLUMNS: &str = "
     volume_id, record::text AS record_json, size_bytes, durability,
     admin_state, delete_id, head_generation, head_root_hash,
     head_root_object_id, lease_owner, lease_epoch, lease_expires_at,
-    last_transition_kind, last_transition_id, transition_source_kind,
-    transition_operation_id, transition_request_fingerprint,
+    last_transition_kind, last_transition_id,
     transition_placement_epoch, transition_lease_duration_ms";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -386,22 +385,6 @@ fn volume_projection_matches(row: &Row, record: &VolumeRecord) -> bool {
             .flatten()
             == projection.last_transition_id
         && row
-            .try_get::<_, Option<String>>("transition_source_kind")
-            .ok()
-            .flatten()
-            .as_deref()
-            == projection.transition_source_kind
-        && row
-            .try_get::<_, Option<String>>("transition_operation_id")
-            .ok()
-            .flatten()
-            == projection.transition_operation_id
-        && row
-            .try_get::<_, Option<String>>("transition_request_fingerprint")
-            .ok()
-            .flatten()
-            == projection.transition_request_fingerprint
-        && row
             .try_get::<_, Option<i64>>("transition_placement_epoch")
             .ok()
             .flatten()
@@ -428,12 +411,11 @@ fn insert_volume(
             volume_id, record, size_bytes, durability, admin_state, delete_id,
             head_generation, head_root_hash, head_root_object_id, lease_owner,
             lease_epoch, lease_expires_at, last_transition_kind,
-            last_transition_id, transition_source_kind, transition_operation_id,
-            transition_request_fingerprint, transition_placement_epoch,
+            last_transition_id, transition_placement_epoch,
             transition_lease_duration_ms, owner_binding, owner_node_id
          ) VALUES (
             $1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9, NULL,
-            $10, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+            $10, NULL, NULL, NULL, NULL, NULL, NULL, NULL
          )",
         &[
             &projection.volume_id,
@@ -534,10 +516,8 @@ fn update_volume(
             head_root_hash=$8, head_root_object_id=$9, lease_owner=$10,
             lease_epoch=$11, lease_expires_at=$12,
             last_transition_kind=$13, last_transition_id=$14,
-            transition_source_kind=$15, transition_operation_id=$16,
-            transition_request_fingerprint=$17,
-            transition_placement_epoch=$18,
-            transition_lease_duration_ms=$19
+            transition_placement_epoch=$15,
+            transition_lease_duration_ms=$16
           WHERE volume_id=$1 AND owner_binding IS NULL AND owner_node_id IS NULL",
         &[
             &projection.volume_id,
@@ -554,9 +534,6 @@ fn update_volume(
             &lease_expires_at,
             &projection.last_transition_kind,
             &projection.last_transition_id,
-            &projection.transition_source_kind,
-            &projection.transition_operation_id,
-            &projection.transition_request_fingerprint,
             &transition_placement,
             &transition_duration,
         ],

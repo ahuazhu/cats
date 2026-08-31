@@ -1,16 +1,15 @@
 # ADR-0042：用一个条件状态机管理 Volume Authority 与磁盘生命周期
 
-- 状态：Accepted；Desired/Observation lifecycle integration与RuntimeStopped authorization basis已由
-  [ADR-0056](0056-atomic-per-cat-runtime-lifecycle.md)取代，storage CAS/receipt state machine保留
+- 状态：Accepted（storage CAS/receipt state machine保留；全部 lifecycle composition 已由
+  [ADR-0059](0059-semantic-control-node-synchronous-protocol.md)取代）
 - 日期：2026-08-08
 - 规格：[Volume Authority 与磁盘生命周期](../specs/volume-authority.md)
-- Current runtime transition transport：
-  [Atomic Runtime Lifecycle v1](../specs/atomic-runtime-lifecycle-v1.md)的command-scoped signed route；
-  pre-cutover Runtime Volume Transitions spec已删除
+- 当前产品组合：[Runtime 生命周期](../runtime-lifecycle.md)与同步 noded 协议；旧 command-scoped
+  lifecycle transport 仅为历史实现
 
-> Atomic release以exact lifecycle Operation/request/result替代Desired/Observation输入；disposable Root的可达
-> Node arm绑定strong-Stop proof，HostFence arm只绑定event/interrupted Operation/HostLost digest。精确schema以
-> [Volume Authority §11.2](../specs/volume-authority.md#112-放弃本地-tail-的-disposable-root)为准。
+> 本 ADR 继续决定 owner/epoch/root CAS、RWO、L/R、条件transition和危险删除的存储边界。正文中
+> RuntimeCheckpoint、Desired、Operation、AgentSession、signed transition与HostFenceRecovery接线均是
+> 历史composition，不得接回当前ADR-0059生命周期。
 
 ## 背景
 
@@ -186,7 +185,7 @@ epoch。目标使用normal acquire，不使用takeover。Host丢失另走HostFen
 
 本 ADR 只声明存储前置条件：切换前删除当前开发数据、Cat、Disk、Snapshot、volume objects和
 Node本地状态，目标release只读取本ADR定义的attachment identity和pack格式。完整、有序的操作
-以[Operations and HA §8](../operations-ha.md#8-首次终态部署)为唯一runbook。
+以[Operations and HA §10](../operations-ha.md#10-首次单协议部署)为当前runbook。
 
 持久格式仍保留显式version、hash校验和未知版本fail closed。这些机制防止损坏或错误解释当前
 数据，并不要求兼容切换前数据。

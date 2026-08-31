@@ -157,7 +157,7 @@ class BuildHostBoundaryTests(unittest.TestCase):
         self.assertIn("/opt/cats-manual-release/${manual_lock_sha256}", helper)
         self.assertIn("--export-images", helper)
         self.assertIn(
-            "--image \"$3\" --credential-refresher-image \"$4\" --gateway-image \"$5\" --export-images",
+            "--image \"$3\" --credential-refresher-image \"$4\" --export-images",
             helper,
         )
         self.assertIn("control_image_reference:$control_image_reference", helper)
@@ -165,7 +165,6 @@ class BuildHostBoundaryTests(unittest.TestCase):
             "credential_refresher_image_reference:$credential_refresher_image_reference",
             helper,
         )
-        self.assertIn("gateway_image_reference:$gateway_image_reference", helper)
         self.assertNotIn("--push", helper)
         self.assertNotIn("docker push", helper)
         self.assertIn("/boot/vmlinuz-", helper)

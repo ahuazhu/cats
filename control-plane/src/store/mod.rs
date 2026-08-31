@@ -16,7 +16,6 @@ mod executor;
 mod leadership;
 mod metrics;
 mod node_identities;
-mod object_write_gateway_client;
 mod rows;
 pub(crate) mod runtime_authority;
 mod schema;
@@ -27,19 +26,7 @@ pub(crate) use transaction::AuthorityRequestContext;
 
 pub use leadership::SingletonRole;
 pub(crate) use leadership::SingletonSession;
-pub use object_write_gateway_client::{
-    ObjectWriteGatewayClient, OBJECT_WRITE_GATEWAY_POSTGRES_ROLE,
-    OBJECT_WRITE_GATEWAY_PROTOCOL_VERSION_V1,
-};
 use rows::{row_to_account, row_to_workspace};
-pub use runtime_authority::host_fence_provider_queue::{
-    HostFenceProviderClaimV1, HostFenceProviderObjectCutoffV1, HostFenceProviderQueueClient,
-    HostFenceProviderQueueRecordV1, HostFenceProviderQueueStateV1, PgObjectWriteCutoffPort,
-    HOST_FENCE_PROVIDER_EVIDENCE_MAX_BYTES, HOST_FENCE_PROVIDER_LEASE_MAX_MS,
-    HOST_FENCE_PROVIDER_POSTGRES_ROLE, HOST_FENCE_PROVIDER_QUEUE_VERSION_V1,
-    HOST_FENCE_PROVIDER_REQUEST_MAX_BYTES,
-};
-
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;

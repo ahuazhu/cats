@@ -153,7 +153,6 @@ def validate_arguments(arguments: argparse.Namespace) -> None:
             str(image_validator),
             arguments.control_image,
             arguments.credential_refresher_image,
-            arguments.gateway_image,
         ]
     )
 
@@ -317,7 +316,6 @@ def remote_build_command(arguments: argparse.Namespace, source: dict[str, Any]) 
         source["bundle_sha256"],
         arguments.control_image,
         arguments.credential_refresher_image,
-        arguments.gateway_image,
     ]
     quoted = " ".join(shlex.quote(value) for value in values)
     helper = (
@@ -501,10 +499,7 @@ def publish_images(arguments: argparse.Namespace, release: Path, output: Path) -
     registry = arguments.control_image.split("/", 1)[0]
     if any(
         reference.split("/", 1)[0] != registry
-        for reference in (
-            arguments.credential_refresher_image,
-            arguments.gateway_image,
-        )
+        for reference in (arguments.credential_refresher_image,)
     ):
         raise PackagingError("all production images must use the same registry login boundary")
     password = run(
@@ -562,7 +557,6 @@ def package(arguments: argparse.Namespace) -> None:
         "images": {
             "control_plane": arguments.control_image,
             "credential_refresher": arguments.credential_refresher_image,
-            "gateway": arguments.gateway_image,
         },
         "promoted_release_manifest_sha256": "sha256:" + sha256_file(promoted),
         "readiness_ssm_command_id": readiness_command_id,
@@ -605,7 +599,6 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--artifact-bucket", required=True)
     parser.add_argument("--control-image", required=True)
     parser.add_argument("--credential-refresher-image", required=True)
-    parser.add_argument("--gateway-image", required=True)
     parser.add_argument("--timeout-seconds", type=int, default=10_800)
     parser.add_argument("--poll-interval-seconds", type=int, default=10)
     return parser.parse_args()

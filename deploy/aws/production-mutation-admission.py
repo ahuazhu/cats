@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dedicated E13 ProductionCutoverOperator command client.
+"""Dedicated production qualification admission command client.
 
 This client has no WorkOS, A23, G3, administrator-token or Workspace-token
 fallback.  ``prepare`` performs a real AWS STS caller-identity lookup, binds
@@ -115,29 +115,6 @@ ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 ACCOUNT_ID = re.compile(r"^[0-9]{12}$")
 BASE64URL = re.compile(r"^[A-Za-z0-9_-]+$")
 
-OPEN_BINDING_FIELDS = {
-    "reset_id",
-    "deployment_id",
-    "release_id",
-    "source_commit_sha",
-    "control_schema_version",
-    "source_manifest_sha256",
-    "source_bundle_sha256",
-    "release_manifest_sha256",
-    "qualification_manifest_sha256",
-    "qualification_catalog_sha256",
-    "proof_set_sha256",
-    "fresh_targets_sha256",
-    "reset_complete_receipt_sha256",
-    "fleet_closed_receipt_sha256",
-    "route_v2_rotation_qualification_receipt_sha256",
-    "route_v2_rotation_qualification_node_ack_sets_sha256",
-    "route_v2_rotation_qualification_transcript_sha256",
-    "usage_terminal_receipt_sha256",
-    "old_host_coverage_sha256",
-    "kernel_nbd_qualification_bundle_sha256",
-    "vhost_user_qualification_bundle_sha256",
-}
 QUALIFICATION_BINDING_FIELDS = {
     "qualification_id",
     "deployment_id",
@@ -165,7 +142,6 @@ QUALIFICATION_MUTATION_CLASSES = [
     "cat_create",
     "disk_create",
     "disk_delete",
-    "object_write_ambiguity",
     "runtime_mutation",
 ]
 
@@ -404,26 +380,6 @@ def validate_origin(value: str) -> str:
     return canonical
 
 
-def validate_open_binding(value: Any) -> dict[str, Any]:
-    binding = require_fields(value, OPEN_BINDING_FIELDS, "Open admission binding")
-    for field in ("reset_id", "deployment_id", "release_id"):
-        require_string(binding[field], ID, f"binding.{field}")
-    require_string(binding["source_commit_sha"], COMMIT, "binding.source_commit_sha")
-    if binding["control_schema_version"] != CONTROL_SCHEMA_VERSION:
-        raise AdmissionError(
-            f"binding.control_schema_version must be {CONTROL_SCHEMA_VERSION}"
-        )
-    for field in OPEN_BINDING_FIELDS - {
-        "reset_id",
-        "deployment_id",
-        "release_id",
-        "source_commit_sha",
-        "control_schema_version",
-    }:
-        require_string(binding[field], SHA256, f"binding.{field}")
-    return binding
-
-
 def validate_qualification_binding(value: Any) -> dict[str, Any]:
     binding = require_fields(
         value, QUALIFICATION_BINDING_FIELDS, "Qualification admission binding"
@@ -487,12 +443,9 @@ def validate_qualification_binding(value: Any) -> dict[str, Any]:
 
 def validate_state_binding(value: Any) -> dict[str, Any]:
     state_binding = require_fields(value, {"kind", "binding"}, "state binding")
-    if state_binding["kind"] == "qualification":
-        validate_qualification_binding(state_binding["binding"])
-    elif state_binding["kind"] == "open":
-        validate_open_binding(state_binding["binding"])
-    else:
+    if state_binding["kind"] != "qualification":
         raise AdmissionError("state binding kind is invalid")
+    validate_qualification_binding(state_binding["binding"])
     return state_binding
 
 
@@ -741,8 +694,6 @@ def validate_command(value: Any) -> dict[str, Any]:
             raise AdmissionError("Qualification lifetime is outside its closed DB window")
     elif mutation["kind"] == "end_qualification":
         validate_qualification_binding(mutation["binding"])
-    elif mutation["kind"] == "open":
-        validate_open_binding(mutation["binding"])
     elif mutation["kind"] == "emergency_close":
         validate_state_binding(mutation["binding"])
     else:
@@ -761,17 +712,11 @@ def command_state_binding(command: dict[str, Any]) -> dict[str, Any]:
     mutation = command["mutation"]
     if mutation["kind"] == "emergency_close":
         return mutation["binding"]
-    kind = "qualification" if mutation["kind"] in {
-        "begin_qualification",
-        "end_qualification",
-    } else "open"
-    return {"kind": kind, "binding": mutation["binding"]}
+    return {"kind": "qualification", "binding": mutation["binding"]}
 
 
 def prepare(args: argparse.Namespace) -> tuple[Path, str]:
     validate_private_directory(args.state_directory)
-    if args.mutation != "emergency_close" and args.binding_kind is not None:
-        raise AdmissionError("--binding-kind is valid only for emergency_close")
     origin = validate_origin(args.origin)
     trust_bytes = read_stable_file(args.trust_file, "cutover trust", MAX_TRUST_BYTES, private=False)
     trust_value = decode_json(trust_bytes, "cutover trust")
@@ -782,17 +727,7 @@ def prepare(args: argparse.Namespace) -> tuple[Path, str]:
         args.binding_file, "admission binding", MAX_BINDING_BYTES, private=False
     )
     decoded_binding = decode_json(binding_bytes, "admission binding")
-    if args.mutation in {"begin_qualification", "end_qualification"}:
-        binding = validate_qualification_binding(decoded_binding)
-    elif args.mutation == "open":
-        binding = validate_open_binding(decoded_binding)
-    else:
-        if args.binding_kind == "qualification":
-            binding = validate_qualification_binding(decoded_binding)
-        elif args.binding_kind == "open":
-            binding = validate_open_binding(decoded_binding)
-        else:
-            raise AdmissionError("emergency-close requires an exact --binding-kind")
+    binding = validate_qualification_binding(decoded_binding)
     if canonical_json(binding, newline=True) != binding_bytes:
         raise AdmissionError("admission binding must be canonical JSON with one terminal LF")
     if (
@@ -809,7 +744,7 @@ def prepare(args: argparse.Namespace) -> tuple[Path, str]:
     if lifetime <= 0 or lifetime > MAX_COMMAND_LIFETIME_MS:
         raise AdmissionError("command lifetime exceeds the closed five-minute limit")
     wire_binding = (
-        {"kind": args.binding_kind, "binding": binding}
+        {"kind": "qualification", "binding": binding}
         if args.mutation == "emergency_close"
         else binding
     )
@@ -1004,7 +939,6 @@ def validate_receipt(
         expected_mode = {
             "begin_qualification": "qualification",
             "end_qualification": "closed",
-            "open": "open",
             "emergency_close": "closed",
         }[command["mutation"]["kind"]]
         if (
@@ -1035,7 +969,7 @@ def validate_state(value: Any) -> dict[str, Any]:
         or not isinstance(state["revision"], int)
         or isinstance(state["revision"], bool)
         or state["revision"] <= 0
-        or state["mode"] not in {"closed", "qualification", "open"}
+        or state["mode"] not in {"closed", "qualification"}
     ):
         raise AdmissionError("admission state scalar fields are invalid")
     if state["binding"] is None:
@@ -1045,8 +979,6 @@ def validate_state(value: Any) -> dict[str, Any]:
         state_binding = validate_state_binding(state["binding"])
         if state["mode"] == "qualification" and state_binding["kind"] != "qualification":
             raise AdmissionError("Qualification state does not carry a Qualification binding")
-        if state["mode"] == "open" and state_binding["kind"] != "open":
-            raise AdmissionError("Open state does not carry an Open binding")
         require_string(state["last_command_id"], RANDOM_ID, "state.last_command_id")
     return state
 
@@ -1217,7 +1149,6 @@ def ensure_qualification_pending(
         state_directory=args.state_directory,
         expected_revision=expected_revision,
         mutation=mutation,
-        binding_kind="qualification" if mutation == "emergency_close" else None,
         command_id=command_id,
         command_lifetime_seconds=args.command_lifetime_seconds,
         aws=args.aws,
@@ -2134,15 +2065,9 @@ def parser() -> argparse.ArgumentParser:
         choices=(
             "begin_qualification",
             "end_qualification",
-            "open",
             "emergency_close",
         ),
         required=True,
-    )
-    prepare_parser.add_argument(
-        "--binding-kind",
-        choices=("qualification", "open"),
-        help="required only for emergency_close because its binding is the installed sum variant",
     )
     prepare_parser.add_argument("--command-id")
     prepare_parser.add_argument(

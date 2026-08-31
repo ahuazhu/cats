@@ -75,12 +75,12 @@ heartbeat 利用率不成为 placement authority。
 
 | 范围 | 当前事实 | 仍未完成或未验证 |
 |---|---|---|
-| 公共协议 | Cat/Disk/Node 同步 DTO、稳定错误码、内部 Bearer 认证已组成；严格拒绝旧幂等和 Operation 字段 | 最终全仓协议残留检查待门禁 |
-| PostgreSQL | v19 当前资源表、可复用 slug 的部分唯一索引、Disk binding RWO、Cat 动作 CAS、数据库接收时间心跳和当前入口目标已组成；旧 lifecycle/Route settlement schema 已删除 | 最终 PostgreSQL 全仓门待跑 |
-| Control | 同步 lifecycle、超时后 Node 查询、资源 API、入口先撤后发、Node 注册/心跳/reset、管理面 planned drain 和失联恢复已接入生产进程；真实 Control→noded HTTP 的 Cat 全状态机与重复语义已通过 | PersistentDisk/CH 完整纵向联调和最终门禁待完成 |
-| noded | 同步 HTTP server、按 Cat 串行、destroy 清理、reset gate、注册和 heartbeat supervisor已组成 | Cloud Hypervisor 的完整实际 effects 尚未接入；当前 CH bridge 在缺少精确输入时会在物理副作用前失败 |
-| PersistentDisk | slug、目录、binding 语义、精确卷/文件系统身份、Guest mount-ready 校验器和 Strict provision/delete backend 已组成；backend 已接入 production composition | Guest/CH 物理挂载链和产品 E2E 尚未完成 |
-| Node 失联恢复 | offline 后按数据库当前事实反复发现未迁走 Cat，先撤入口、在其他 running Node 恢复、Ready 后发布；旧 Node 回来要求 reset | 双跑窗口的真实两 Node 验证待完成；协议本身不承诺严格物理单实例 |
+| 公共协议 | Cat/Disk/Node 同步 DTO、稳定错误码、内部 Bearer 认证已组成；严格拒绝旧幂等和 Operation 字段；最终发布候选门已通过 | 后续改动必须在自身 exact commit 重跑门禁 |
+| PostgreSQL | v19 当前资源表、可复用 slug 的部分唯一索引、Disk binding RWO、Cat 动作 CAS、数据库接收时间心跳和当前入口目标已组成；旧 lifecycle/Route settlement schema 已删除并通过 PostgreSQL/full 门 | 不因此承诺跨长期分区的物理单写 |
+| Control | 同步 lifecycle、超时后 Node 查询、资源 API、入口先撤后发、Node 注册/心跳/reset、planned drain 和失联恢复已接入生产进程；真实 Control→noded HTTP 与 production physical E2E 已通过 | 新版本仍须重跑 exact release qualification |
+| noded | 同步 HTTP server、按 Cat 串行、destroy 清理、reset gate、注册/heartbeat supervisor和Cloud Hypervisor实际effects已组成 | vhost-user-blk 等替代frontend仍按各自release资格验证 |
+| PersistentDisk | slug、binding、精确卷/文件系统身份、Strict backend、Guest mount-ready与CH物理挂载链已组成；Cold detach/attach和同盘重挂production E2E已通过 | DiskSnapshot/GC仍是独立开放项 |
+| Node 失联恢复 | offline后按数据库当前事实反复发现未迁走Cat，先撤入口、在其他running Node恢复、Ready后发布；真实两Node reset/re-register已验证 | 协议不承诺双跑窗口内严格物理单实例或长期不对称网络安全 |
 | 入口 | 当前 `cat_id -> node_id` 目标和 withdraw/publish 顺序已组成 | 公网 Gateway/Endpoint 传输协议不在本次 Control/Node 合同范围 |
 | 底层存储 | ChunkStore、delta、golden root、NBD/vhost-user-blk、MetadataStore owner/epoch 和相关测试已存在 | 本次同步 lifecycle 只允许远端持久模式；磁盘产品 E2E、Snapshot/GC 和真实 Host-loss 资格仍开放 |
 | 独立 Node authority | `runtime_node_authority` 管理入口仍独立组成 | 它不成为 Cat 生命周期、心跳或失联恢复的第二套协议 |
@@ -299,12 +299,10 @@ binding 和 signed poll/result lane 不是当前 Control/Node 生命周期协议
 
 1. 当前资源 schema、共享 DTO 和场景语义规则；
 2. Control 同步 lifecycle、noded 每 Cat 串行与 Node 注册/heartbeat/reset；
-3. 闭合 PersistentDisk 的 Guest 物理挂载链和 Cloud Hypervisor effects；
-4. 在已通过的 HTTP/PostgreSQL 场景基础上跑真实双 Node 纵向联调；
-5. 旧 Route v2 部署合同清理和最终全仓、Linux 门禁。
+3. PersistentDisk Guest物理挂载链、Cloud Hypervisor effects与真实双Node恢复已经组成并验证；
+4. 后续release继续在exact commit跑全仓、Linux与适用production资格门。
 
-并行进度、提交和验证只在
-[实施计划](semantic-control-node-implementation-plan.md)维护，本文不复制滚动提交表。
+切换期间的提交和验证记录由 Git history 保存，本文只维护当前架构边界。
 
 ### 12.2 Clean-slate 部署
 
@@ -312,7 +310,7 @@ binding 和 signed poll/result lane 不是当前 Control/Node 生命周期协议
 
 1. 构建并验证同一版本的 Control、noded 和 CLI；
 2. 进入维护窗口，关闭公网入口和 mutation；
-3. 停止全部旧 Control/Node/Gateway write path；
+3. 停止全部旧 Control、Node 和入口 write path；
 4. 轮换或撤销旧内部凭据；
 5. 删除旧产品数据并创建空 v19 schema；启动必须拒绝旧 schema version；
 6. 先启动 Control，再让空净 Node 用 `node_id/node_name/control_endpoint` 注册；
@@ -331,11 +329,12 @@ binding 和 signed poll/result lane 不是当前 Control/Node 生命周期协议
 - offline 前必须经过连续 heartbeat 超时和主动探测失败；旧 Node 下一次通信收到
   `reset_required`，reset 完成前不能接受 placement。
 - 跨 Node 恢复先撤旧入口，Running Ready 后才发布新入口；允许窗口内的双跑被真实测试并最终收敛。
-- PersistentDisk Strict backend 和精确身份已进入 production composition，但仍须通过 Guest
-  mount-ready 和 Cloud Hypervisor 纵向测试；真实 Control→noded HTTP/FakeVmm 结果不能替代物理上线证据。
+- PersistentDisk Strict backend、精确身份、Guest mount-ready、Cloud Hypervisor纵向链、Cold重挂和
+  双Node恢复均已有production证据；后续改动不能拿旧commit的证据替代当前exact release门。
 - production route map 不包含 lifecycle Operation GET、Node command poll/result、AgentSession 或
   observation settlement。
-- `./scripts/quality.sh full` 和适用的 Linux/Cloud Hypervisor 门禁在 exact commit 上通过或明确记录环境阻塞。
+- `./scripts/quality.sh full` 和适用的 Linux/Cloud Hypervisor 门禁必须在每个交付exact commit上重新通过
+  或明确记录环境阻塞。
 
 ## 14. 文档边界
 
@@ -344,12 +343,8 @@ binding 和 signed poll/result lane 不是当前 Control/Node 生命周期协议
   场景语义和验收。
 - [runtime-lifecycle.md](runtime-lifecycle.md)：四态、动作和数据/入口屏障。
 - [storage.md](storage.md)：当前 ChunkStore 与 FLUSH 数据正确性。
-- [Volume Authority](specs/volume-authority.md)：底层卷 owner/epoch、remote root 与磁盘数据安全；其中旧
-  lifecycle Operation/AgentSession 组合段落已被 ADR-0059 supersede。
+- [Volume Authority](specs/volume-authority.md)：当前 direct acquire/renew/release/delete、底层卷
+  owner/epoch、remote root 与磁盘数据安全。
 - [operations-ha.md](operations-ha.md)：运行拓扑、心跳/reset、故障恢复和资格验证。
-- [Atomic Runtime Lifecycle v1](specs/atomic-runtime-lifecycle-v1.md)、
-  [Runtime Inventory v1](specs/runtime-inventory-observation-v1.md) 和
-  [Route Grant v2](specs/route-grant-v2.md)：历史已实现协议资料；其 Operation/poll/journal/AgentSession
-  协调已经由 ADR-0059 supersede，不是当前目标协议。
 - `docs/decisions/`：决策及 superseded 链。
 - `experiments/`：保留环境、样本和 oracle 的证据，不是生产 SLA。
