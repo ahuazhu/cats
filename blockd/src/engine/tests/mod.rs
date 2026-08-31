@@ -13,6 +13,8 @@ use cats_test_support::poll_bound;
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
 
+mod snapshot_gc;
+
 struct Env {
     _dir: tempfile::TempDir,
     blob: Arc<dyn BlobStore>,
