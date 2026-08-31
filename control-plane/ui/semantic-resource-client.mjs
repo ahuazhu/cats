@@ -11,6 +11,14 @@ function positiveSafeInteger(value, field) {
   return parsed;
 }
 
+function nonnegativeSafeInteger(value, field) {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error(`${field} must be a non-negative safe integer`);
+  }
+  return parsed;
+}
+
 function resourceSlug(value, label) {
   const slug = String(value ?? "").trim();
   if (!SLUG.test(slug)) {
@@ -34,6 +42,22 @@ export function diskCollectionPath(value) {
   return `/v1/workspaces/${workspaceId(value)}/disks`;
 }
 
+export function diskSnapshotCollectionPath(immutableWorkspaceId) {
+  return `/v1/workspaces/${workspaceId(immutableWorkspaceId)}/snapshots`;
+}
+
+export function diskSnapshotItemPath(immutableWorkspaceId, snapshot) {
+  return `${diskSnapshotCollectionPath(immutableWorkspaceId)}/${resourceSlug(snapshot, "DiskSnapshot name")}`;
+}
+
+export function diskSnapshotActionPath(immutableWorkspaceId, snapshot, action) {
+  const supportedAction = String(action);
+  if (!new Set(["destroy", "restore"]).has(supportedAction)) {
+    throw new Error("unsupported DiskSnapshot action");
+  }
+  return `${diskSnapshotItemPath(immutableWorkspaceId, snapshot)}/actions/${supportedAction}`;
+}
+
 export function buildSemanticCatCreateRequest({ name, vcpus, memoryMib }) {
   return {
     cat_slug: resourceSlug(name, "Cat name"),
@@ -50,6 +74,17 @@ export function buildSemanticDiskCreateRequest({ name, sizeGib }) {
     disk_slug: resourceSlug(name, "PersistentDisk name"),
     size_bytes: sizeBytes,
   };
+}
+
+export function buildSemanticDiskSnapshotCreateRequest({ disk, name }) {
+  return {
+    snapshot_slug: resourceSlug(name, "DiskSnapshot name"),
+    disk_slug: resourceSlug(disk, "PersistentDisk name"),
+  };
+}
+
+export function buildSemanticDiskSnapshotRestoreRequest({ expectedGeneration }) {
+  return { expected_generation: nonnegativeSafeInteger(expectedGeneration, "expected_generation") };
 }
 
 function validateTransport(response, kind) {
@@ -118,9 +153,115 @@ export async function createSemanticDisk({ immutableWorkspaceId, request, send }
   return response;
 }
 
+function validateDiskSnapshot(snapshot, { immutableWorkspaceId, snapshotSlug, diskSlug } = {}) {
+  if (
+    !snapshot
+    || typeof snapshot !== "object"
+    || Array.isArray(snapshot)
+    || !ID.test(snapshot.snapshot_id || "")
+    || !ID.test(snapshot.disk_id || "")
+    || snapshot.workspace_id !== immutableWorkspaceId
+    || snapshot.snapshot_slug !== snapshotSlug
+    || (diskSlug !== undefined && snapshot.disk_slug !== diskSlug)
+    || !SLUG.test(snapshot.disk_slug || "")
+    || !["normal", "deleted"].includes(snapshot.status)
+    || !Number.isSafeInteger(snapshot.captured_generation)
+    || snapshot.captured_generation < 0
+  ) {
+    throw new Error("DiskSnapshot response changed its semantic identity binding");
+  }
+  return snapshot;
+}
+
+function validateDiskSnapshotResponse(transport, expected, codes, operation) {
+  const response = validateTransport(transport, `DiskSnapshot ${operation}`);
+  if (!codes.includes(response.code)) {
+    throw new Error(`DiskSnapshot ${operation} returned an invalid semantic result`);
+  }
+  validateDiskSnapshot(response.snapshot, expected);
+  return response;
+}
+
+export async function createSemanticDiskSnapshot({ immutableWorkspaceId, request, send }) {
+  if (typeof send !== "function") throw new Error("DiskSnapshot create transport is unavailable");
+  const expected = buildSemanticDiskSnapshotCreateRequest({
+    disk: request?.disk_slug,
+    name: request?.snapshot_slug,
+  });
+  const response = await send(diskSnapshotCollectionPath(immutableWorkspaceId), {
+    method: "POST",
+    redirect: "error",
+    headers: { "Content-Type": JSON_CONTENT_TYPE },
+    body: JSON.stringify(expected),
+  });
+  const validated = validateDiskSnapshotResponse(response, {
+    immutableWorkspaceId,
+    snapshotSlug: expected.snapshot_slug,
+    diskSlug: expected.disk_slug,
+  }, ["snapshot_created", "already_exists"], "create");
+  if (
+    validated.snapshot.status !== "normal"
+    || !Number.isSafeInteger(validated.disk_head_generation)
+    || validated.disk_head_generation !== validated.snapshot.captured_generation
+  ) {
+    throw new Error("DiskSnapshot create returned an invalid captured generation");
+  }
+  return validated;
+}
+
+export async function destroySemanticDiskSnapshot({ immutableWorkspaceId, snapshot, send }) {
+  if (typeof send !== "function") throw new Error("DiskSnapshot destroy transport is unavailable");
+  const snapshotSlug = resourceSlug(snapshot, "DiskSnapshot name");
+  const response = await send(diskSnapshotActionPath(immutableWorkspaceId, snapshotSlug, "destroy"), {
+    method: "POST",
+    redirect: "error",
+  });
+  const validated = validateDiskSnapshotResponse(response, {
+    immutableWorkspaceId,
+    snapshotSlug,
+  }, ["snapshot_destroyed", "already_destroyed"], "destroy");
+  if (validated.snapshot.status !== "deleted") {
+    throw new Error("DiskSnapshot destroy did not return a tombstone");
+  }
+  return validated;
+}
+
+export async function restoreSemanticDiskSnapshot({
+  immutableWorkspaceId,
+  snapshot,
+  disk,
+  expectedGeneration,
+  send,
+}) {
+  if (typeof send !== "function") throw new Error("DiskSnapshot restore transport is unavailable");
+  const snapshotSlug = resourceSlug(snapshot, "DiskSnapshot name");
+  const diskSlug = resourceSlug(disk, "PersistentDisk name");
+  const expected = buildSemanticDiskSnapshotRestoreRequest({ expectedGeneration });
+  const response = await send(diskSnapshotActionPath(immutableWorkspaceId, snapshotSlug, "restore"), {
+    method: "POST",
+    redirect: "error",
+    headers: { "Content-Type": JSON_CONTENT_TYPE },
+    body: JSON.stringify(expected),
+  });
+  const validated = validateDiskSnapshotResponse(response, {
+    immutableWorkspaceId,
+    snapshotSlug,
+    diskSlug,
+  }, ["snapshot_restored", "already_restored"], "restore");
+  if (
+    validated.snapshot.status !== "normal"
+    || !Number.isSafeInteger(validated.disk_head_generation)
+    || validated.disk_head_generation !== expected.expected_generation + 1
+  ) {
+    throw new Error("DiskSnapshot restore returned an invalid resulting generation");
+  }
+  return validated;
+}
+
 // Fail locally for product surfaces that are intentionally not exposed by the
-// current console. The exact semantic Cat/Disk collection reads and creates
-// are the only user resource requests made by this release UI.
+// current console. Every admitted route is an exact synchronous resource
+// endpoint; query pagination and legacy asynchronous Operation routes stay
+// closed.
 export function assertSemanticConsoleRequestSupported(path, method = "GET") {
   const normalizedMethod = String(method).toUpperCase();
   const catCollection = /^\/v1\/workspaces\/[^/?]+\/cats$/;
@@ -130,7 +271,14 @@ export function assertSemanticConsoleRequestSupported(path, method = "GET") {
   const exactCatRead = /^\/v1\/workspaces\/[^/?]+\/cats\/[^/?]+$/;
   const exactDiskRead = /^\/v1\/workspaces\/[^/?]+\/disks\/[^/?]+$/;
   if (normalizedMethod === "GET" && (exactCatRead.test(path) || exactDiskRead.test(path))) return;
-  const closedSurface = /^\/v1\/(?:workspaces\/[^/]*\/(?:cats|disks|operations)|operations|admin\/(?:nodes|monitoring))(?:[/?]|$)/;
+  const diskSnapshotCollection = /^\/v1\/workspaces\/[^/?]+\/snapshots$/;
+  if ((normalizedMethod === "GET" || normalizedMethod === "POST")
+    && diskSnapshotCollection.test(path)) return;
+  const diskSnapshotItem = /^\/v1\/workspaces\/[^/?]+\/snapshots\/[^/?]+$/;
+  if (normalizedMethod === "GET" && diskSnapshotItem.test(path)) return;
+  const diskSnapshotAction = /^\/v1\/workspaces\/[^/?]+\/snapshots\/[^/?]+\/actions\/(?:destroy|restore)$/;
+  if (normalizedMethod === "POST" && diskSnapshotAction.test(path)) return;
+  const closedSurface = /^\/v1\/(?:workspaces\/[^/]*\/(?:cats|disks|snapshots|operations)|operations|admin\/(?:nodes|monitoring))(?:[/?]|$)/;
   if (closedSurface.test(path)) {
     throw new Error("This feature is unavailable in the current console; no request was sent.");
   }

@@ -9,10 +9,11 @@ The signed runtime cutover deliberately exposes a narrow product surface:
   idempotent lifecycle action.
 - Create, list, and inspect PersistentDisks.
 - Attach or detach one PersistentDisk while its exact Cat is terminal Cold.
+- Create, inspect, restore, and delete a Cold PersistentDisk Snapshot.
 - Inspect one exact accepted Operation by ID.
 - Use the Guest-local Runtime API and the independent identity/billing surfaces.
 
-Guest command, Endpoint mutation, PersistentDisk snapshot, capacity change, and
+Endpoint mutation, capacity change, and
 PersistentDisk deletion remain unavailable. The console and CLI fail closed
 instead of probing legacy routes.
 

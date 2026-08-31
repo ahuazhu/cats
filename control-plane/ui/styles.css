@@ -153,6 +153,7 @@ input:focus, select:focus { border-color: #67a785; box-shadow: 0 0 0 4px rgb(56 
 .metric-card span { color: #8b958f; font-size: 10px; }
 .dashboard-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
 .panel { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: var(--radius); background: white; box-shadow: 0 6px 22px rgb(35 55 42 / 4%); }
+.storage-snapshots-panel { margin-top: 18px; }
 .panel-span-2 { grid-column: span 2; }
 .panel-span-3 { grid-column: span 3; }
 .panel-header { min-height: 78px; display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 19px 21px; border-bottom: 1px solid var(--line-soft); }
@@ -284,6 +285,7 @@ tbody tr:hover { background: #fbfcfb; }
 .modal header code { display: block; max-width: 520px; margin-top: 4px; overflow: hidden; color: var(--muted); font: 9px ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
 .icon-button { width: 34px; height: 34px; border: 1px solid var(--line); border-radius: 9px; background: white; color: var(--muted); cursor: pointer; font-size: 20px; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 17px; padding: 22px; }
+.form-hint { margin: -8px 22px 16px; color: var(--muted); font-size: 10px; line-height: 1.5; }
 .modal form > label { margin: 22px; }
 .form-grid .span-2 { grid-column: span 2; }
 .modal .form-error { margin: -9px 22px 12px; }

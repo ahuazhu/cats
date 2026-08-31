@@ -27,9 +27,9 @@ Operation 从 `pending` 进入且只进入 `succeeded`、`failed` 或 `supersede
 3.  管理员检查 Node Heartbeat、blockd/Guest readiness、Console Output 与 Attachment Epoch。
 4.  如果 Suspended/Warm 恢复失败，确认 Controller 已收敛到 Cold fallback，而不是停在中间态。
 
-## Disk Mutation 不可用
+## Snapshot Create 或 Restore 被拒绝
 
-执行 `cats disk get DISK_ID` 查看当前 Projection。Attachment、Snapshot、容量变更与删除不属于 release product surface。不要探测 Legacy Route，也不要绕过 Authority/Fencing Conflict。
+执行 `cats disk get DISK_SLUG --json` 与 `cats disk snapshot show SNAPSHOT_SLUG --json`。Create 与 Restore 要求磁盘已远端持久且 Unowned；磁盘已绑定时，其 Cat 必须稳定处于 Cold。`head_conflict` 表示磁盘在客户端预检读取后发生变化；先刷新事实，再决定是否重试。`snapshot_corrupt` 会 fail closed，需要管理员排查；不要绕过 GC 或 Volume Authority 检查。
 
 ## Lifecycle 命令不可用
 

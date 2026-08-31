@@ -17,13 +17,18 @@ import {
   assertSemanticConsoleRequestSupported,
   buildSemanticCatCreateRequest,
   buildSemanticDiskCreateRequest,
+  buildSemanticDiskSnapshotCreateRequest,
   createSemanticCat,
   createSemanticDisk,
+  createSemanticDiskSnapshot,
+  destroySemanticDiskSnapshot,
+  restoreSemanticDiskSnapshot,
 } from "/ui/semantic-resource-client.mjs";
 import {
   loadAll as loadRuntimeProductReads,
   runtimeCatView,
   runtimeDiskView,
+  runtimeDiskSnapshotView,
   setRuntimeProductLoadingShell,
 } from "/ui/runtime-product-load.mjs";
 
@@ -37,6 +42,7 @@ const state = {
   authConfig: null,
   cats: [],
   disks: [],
+  snapshots: [],
   operations: [],
   billing: null,
   billingBalance: null,
@@ -58,6 +64,7 @@ const appShell = document.querySelector("#app-shell");
 const loginError = document.querySelector("#login-error");
 const createCatDialog = document.querySelector("#create-cat-dialog");
 const createDiskDialog = document.querySelector("#create-disk-dialog");
+const createSnapshotDialog = document.querySelector("#create-snapshot-dialog");
 const billingCatDialog = document.querySelector("#billing-cat-dialog");
 
 const switchView = initNavigation(
@@ -126,6 +133,7 @@ async function switchWorkspace(workspaceId, { updateUrl = true } = {}) {
     applySession(session);
     state.cats = [];
     state.disks = [];
+    state.snapshots = [];
     state.operations = [];
     state.billing = null;
     state.billingBalance = null;
@@ -230,6 +238,7 @@ async function loadAll({ quiet = false } = {}) {
       || result.workspaceId !== workspaceId) return;
     state.cats = result.cats.map(runtimeCatView);
     state.disks = result.disks.map(runtimeDiskView);
+    state.snapshots = result.snapshots.map(runtimeDiskSnapshotView);
     // The frozen runtime contract intentionally has no Operation collection.
     state.operations = [];
     render();
@@ -265,6 +274,7 @@ function render() {
   renderOverview();
   renderCats();
   renderDisks();
+  renderSnapshots();
   renderBillingBalance();
   renderBilling();
   renderOperations();
@@ -322,6 +332,26 @@ function renderDisks() {
     <td><div class="resource-name"><span class="resource-avatar">D</span><span><strong>${escapeHtml(disk.name)}</strong><small>${escapeHtml(disk.id)}</small></span></div></td>
     <td>${escapeHtml(resourceKind(disk.kind))}</td><td>${formatBytes(disk.size_bytes)}</td><td>${statusBadge(disk.state)}</td>
     <td>${escapeHtml(catNames.get(disk.bound_cat_id) || disk.bound_cat_id || "—")}</td>
+  </tr>`).join("");
+}
+
+function renderSnapshots() {
+  const body = document.querySelector("#snapshots-table");
+  const empty = document.querySelector("#snapshots-empty");
+  const snapshots = [...state.snapshots].sort((left, right) => (
+    right.created_at_unix - left.created_at_unix || left.name.localeCompare(right.name)
+  ));
+  empty.classList.toggle("is-hidden", snapshots.length !== 0);
+  body.closest(".table-wrap").classList.toggle("is-hidden", snapshots.length === 0);
+  body.innerHTML = snapshots.map((snapshot) => `<tr>
+    <td><div class="resource-name"><span class="resource-avatar">S</span><span><strong>${escapeHtml(snapshot.name)}</strong><small>${escapeHtml(snapshot.id)}</small></span></div></td>
+    <td>${escapeHtml(snapshot.disk_slug)}</td>
+    <td>${escapeHtml(snapshot.captured_generation)}</td>
+    <td>${formatTime(snapshot.created_at_unix)}</td>
+    <td><div class="row-actions">
+      <button class="mini-button" type="button" data-snapshot-action="restore" data-snapshot-id="${escapeHtml(snapshot.id)}">${escapeHtml(t("user.snapshots.restore"))}</button>
+      <button class="mini-button danger" type="button" data-snapshot-action="destroy" data-snapshot-id="${escapeHtml(snapshot.id)}">${escapeHtml(t("user.snapshots.delete"))}</button>
+    </div></td>
   </tr>`).join("");
 }
 
@@ -885,6 +915,15 @@ document.querySelector("#workspace-switcher").addEventListener("change", (event)
 });
 document.querySelectorAll("#create-cat-button, [data-create-cat]").forEach((button) => button.addEventListener("click", () => createCatDialog.showModal()));
 document.querySelector("#create-disk-button").addEventListener("click", () => createDiskDialog.showModal());
+document.querySelector("#create-snapshot-button").addEventListener("click", () => {
+  const select = document.querySelector('#create-snapshot-form select[name="disk"]');
+  select.innerHTML = state.disks
+    .filter((disk) => disk.status === "normal")
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .map((disk) => `<option value="${escapeHtml(disk.name)}">${escapeHtml(disk.name)} · ${formatBytes(disk.size_bytes)}</option>`)
+    .join("");
+  createSnapshotDialog.showModal();
+});
 document.querySelector("#billing-range-form").addEventListener("submit", (event) => {
   event.preventDefault();
   if (billingCatDialog.open) billingCatDialog.close();
@@ -960,6 +999,93 @@ document.querySelector("#create-disk-form").addEventListener("submit", async (ev
     toast(t("user.disk.created"), `${response.disk.disk_slug} · ${formatBytes(response.disk.size_bytes)}`);
   } catch (caught) {
     error.textContent = caught.message;
+  } finally {
+    setBusy(button, false);
+  }
+});
+
+document.querySelector("#create-snapshot-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (event.submitter?.value === "cancel") {
+    createSnapshotDialog.close();
+    return;
+  }
+  const form = event.currentTarget;
+  const values = new FormData(form);
+  const button = form.querySelector('button[value="default"]');
+  const error = form.querySelector("[data-form-error]");
+  error.textContent = "";
+  setBusy(button, true);
+  try {
+    const workspaceId = state.activeWorkspaceId;
+    const body = buildSemanticDiskSnapshotCreateRequest({
+      disk: values.get("disk"),
+      name: values.get("name"),
+    });
+    const response = await createSemanticDiskSnapshot({
+      immutableWorkspaceId: workspaceId,
+      request: body,
+      send: authenticatedRequestWithStatus,
+    });
+    createSnapshotDialog.close();
+    form.reset();
+    if (workspaceId === state.activeWorkspaceId) await loadAll({ quiet: true });
+    toast(t("user.snapshots.created"), `${response.snapshot.snapshot_slug} · ${response.snapshot.disk_slug}`);
+  } catch (caught) {
+    error.textContent = caught.message;
+  } finally {
+    setBusy(button, false);
+  }
+});
+
+document.querySelector("#snapshots-table").addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-snapshot-action]");
+  if (!button) return;
+  const snapshot = state.snapshots.find((candidate) => candidate.id === button.dataset.snapshotId);
+  if (!snapshot || snapshot.status === "deleted") return;
+  const action = button.dataset.snapshotAction;
+  const confirmation = action === "restore"
+    ? t("user.snapshots.restoreConfirm", { snapshot: snapshot.name, disk: snapshot.disk_slug })
+    : t("user.snapshots.deleteConfirm", { snapshot: snapshot.name });
+  if (!window.confirm(confirmation)) return;
+  const workspaceId = state.activeWorkspaceId;
+  setBusy(button, true);
+  try {
+    if (action === "restore") {
+      // A restore occurrence is named by the target disk's latest generation.
+      // Fetch immediately before POST; the server still rechecks it atomically.
+      const disk = await authenticatedRequest(workspacePath(`/disks/${encodeURIComponent(snapshot.disk_slug)}`));
+      if (disk?.head_generation == null) {
+        throw new Error("PersistentDisk has no initialized current head");
+      }
+      const expectedGeneration = Number(disk?.head_generation);
+      if (
+        disk?.workspace_id !== workspaceId
+        || disk?.disk_id !== snapshot.disk_id
+        || !Number.isSafeInteger(expectedGeneration)
+        || expectedGeneration < 0
+      ) {
+        throw new Error("PersistentDisk read changed the Snapshot target identity");
+      }
+      await restoreSemanticDiskSnapshot({
+        immutableWorkspaceId: workspaceId,
+        snapshot: snapshot.name,
+        disk: snapshot.disk_slug,
+        expectedGeneration,
+        send: authenticatedRequestWithStatus,
+      });
+      toast(t("user.snapshots.restored"), `${snapshot.name} → ${snapshot.disk_slug}`);
+    } else if (action === "destroy") {
+      await destroySemanticDiskSnapshot({
+        immutableWorkspaceId: workspaceId,
+        snapshot: snapshot.name,
+        send: authenticatedRequestWithStatus,
+      });
+      toast(t("user.snapshots.deleted"), snapshot.name);
+    }
+    if (workspaceId === state.activeWorkspaceId) await loadAll({ quiet: true });
+  } catch (caught) {
+    toast(action === "restore" ? t("user.snapshots.restored") : t("user.snapshots.deleted"), caught.message, "error");
   } finally {
     setBusy(button, false);
   }

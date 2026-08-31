@@ -43,7 +43,19 @@ Create 精确返回 `202 application/json` 和 `{"cat_id":"…","operation_id":"
       "size_bytes": 21474836480
     }
 
-Create 以精确的 `201 application/json` 返回已创建 Disk Projection。这个 release 中容量和 Durability 不可变；Item Read 要求不可变 `disk_…` ID。Attach/Detach 是只用于终态 Cold Cat 的同步、幂等产品事务，两者都使用 closed body `{"cat_id":"cat_…","mount_path":"/absolute/guest/path"}`。Snapshot、容量变更与 Disk Delete Mutation 均不可用。
+Create 以精确的 `201 application/json` 返回已创建 Disk Projection。这个 release 中容量和 Durability 不可变；Item Read 要求不可变 `disk_…` ID。Attach/Detach 是只用于终态 Cold Cat 的同步、幂等产品事务，两者都使用 closed body `{"cat_id":"cat_…","mount_path":"/absolute/guest/path"}`。容量变更 Mutation 不可用。
+
+## DiskSnapshot Surface
+
+    POST /v1/workspaces/{workspace_id}/snapshots
+    GET  /v1/workspaces/{workspace_id}/snapshots
+    GET  /v1/workspaces/{workspace_id}/snapshots/{snapshot_slug}
+    POST /v1/workspaces/{workspace_id}/snapshots/{snapshot_slug}/actions/restore
+    POST /v1/workspaces/{workspace_id}/snapshots/{snapshot_slug}/actions/destroy
+
+Create 使用 closed body `{"snapshot_slug":"before-upgrade","disk_slug":"project-data"}`。Restore 使用 closed body `{"expected_generation":42}`；它是目标磁盘的最新 Generation，不是 Snapshot 捕获时的 Generation。Restore 成功会把捕获的 Root 发布为 Generation 43，并返回 `disk_head_generation: 43`。Destroy 使用空 Body。这些同步 Route 不接收 Idempotency-Key，也不创建 Operation。
+
+Snapshot Projection 暴露不可变 Snapshot/Disk ID、当前 Slug、容量、状态、捕获 Generation 与创建/删除时间，绝不暴露内部 Root Hash 或 Object Key。第一版只支持恢复到原盘；Clone、Hot Snapshot 与跨 Workspace Copy 都不是可用 Route。
 
 ## Operation
 

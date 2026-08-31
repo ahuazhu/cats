@@ -24,8 +24,8 @@ cats operation wait OPERATION_ID</code></pre>
   <li>If Suspended/Warm restore failed, verify the controller converged to Cold fallback instead of remaining in an intermediate state.</li>
 </ol>
 
-<h2 id="disk-busy">A Disk mutation is unavailable</h2>
-<p>Run <code>cats disk get DISK_ID</code> to inspect the current projection. Attachment, snapshot, capacity change, and deletion are outside the release product surface. Do not probe a legacy route or bypass an authority/fencing conflict.</p>
+<h2 id="snapshot-rejected">A Snapshot create or restore is rejected</h2>
+<p>Run <code>cats disk get DISK_SLUG --json</code> and <code>cats disk snapshot show SNAPSHOT_SLUG --json</code>. Create and restore require a remotely durable, unowned disk and a stable Cold Cat when attached. A <code>head_conflict</code> means the disk changed after the client's preflight read; refresh before deciding whether to retry. <code>snapshot_corrupt</code> fails closed and needs operator investigation—do not bypass GC or Volume Authority checks.</p>
 
 <h2 id="lifecycle-unavailable">A lifecycle command is unavailable</h2>
 <p>Lifecycle and Guest-command clients are intentionally absent during the signed runtime cutover. Preserve the accepted create Operation ID and current Cat projection; do not substitute an old command or route.</p>

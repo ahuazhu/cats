@@ -27,9 +27,14 @@ An Operation moves from `pending` to exactly one of `succeeded`, `failed`, or `s
 3.  Operators check node heartbeat, blockd/Guest readiness, console output, and attachment epoch.
 4.  If Suspended/Warm restore failed, verify the controller converged to Cold fallback instead of remaining in an intermediate state.
 
-## A Disk mutation is unavailable
+## A Snapshot create or restore is rejected
 
-Run `cats disk get DISK_ID` to inspect the current projection. Attachment, snapshot, capacity change, and deletion are outside the release product surface. Do not probe a legacy route or bypass an authority/fencing conflict.
+Run `cats disk get DISK_SLUG --json` and `cats disk snapshot show SNAPSHOT_SLUG --json`.
+Create and restore require a remotely durable, unowned disk and a stable Cold
+Cat when attached. A `head_conflict` means the disk changed after the client's
+preflight read; refresh before deciding whether to retry. `snapshot_corrupt`
+fails closed and needs operator investigation—do not bypass GC or Volume
+Authority checks.
 
 ## A lifecycle command is unavailable
 
