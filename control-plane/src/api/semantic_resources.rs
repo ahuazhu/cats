@@ -18,9 +18,9 @@ use axum::{Json, Router};
 use cats_api::error::ErrorCode;
 use cats_api::semantic_control::{
     AttachDiskRequest, CatAction, CatResponse, CatView, CreateCatRequest, CreateDiskRequest,
-    CreateDiskSnapshotRequest, DetachDiskRequest, DiskResponse, DiskSnapshotResponse,
-    DiskSnapshotView, DiskView, ResourceSlug, RestoreDiskSnapshotRequest, SemanticErrorBody,
-    SemanticErrorCode, SemanticSuccessCode,
+    CreateDiskSnapshotRequest, DestroyDiskSnapshotRequest, DetachDiskRequest, DiskResponse,
+    DiskSnapshotResponse, DiskSnapshotView, DiskView, ResourceSlug, RestoreDiskSnapshotRequest,
+    SemanticErrorBody, SemanticErrorCode, SemanticSuccessCode,
 };
 use serde::de::DeserializeOwned;
 
@@ -148,8 +148,9 @@ pub trait SemanticResourceApi: Send + Sync {
         &'a self,
         workspace_id: &'a str,
         snapshot_slug: ResourceSlug,
+        request: DestroyDiskSnapshotRequest,
     ) -> SemanticResourceFuture<'a, Result<DiskSnapshotResponse, SemanticErrorBody>> {
-        let _ = (workspace_id, snapshot_slug);
+        let _ = (workspace_id, snapshot_slug, request);
         Box::pin(async { Err(unavailable_snapshot_api()) })
     }
 
@@ -498,10 +499,17 @@ async fn destroy_snapshot(
     let workspace_id = authenticated_workspace_id(&state, request.headers(), &workspace).await?;
     reject_retired_headers(request.headers())?;
     reject_query(request.uri())?;
-    require_empty_body(request).await?;
+    let request: DestroyDiskSnapshotRequest = parse_json(request).await?;
+    request
+        .validate()
+        .map_err(|error| invalid_request(error.to_string()))?;
     snapshot_response(
         service
-            .destroy_snapshot(&workspace_id, resource_slug(snapshot, "DiskSnapshot")?)
+            .destroy_snapshot(
+                &workspace_id,
+                resource_slug(snapshot, "DiskSnapshot")?,
+                request,
+            )
             .await,
         StatusCode::OK,
     )

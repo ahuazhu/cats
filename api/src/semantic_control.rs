@@ -453,14 +453,28 @@ pub struct CreateDiskSnapshotRequest {
     pub disk_slug: ResourceSlug,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DestroyDiskSnapshotRequest {
+    pub expected_snapshot_id: Id,
+}
+
+impl DestroyDiskSnapshotRequest {
+    pub fn validate(&self) -> Result<(), SemanticValidationError> {
+        validate_prefixed_id(&self.expected_snapshot_id, "snapshot_")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RestoreDiskSnapshotRequest {
+    pub expected_snapshot_id: Id,
     pub expected_generation: u64,
 }
 
 impl RestoreDiskSnapshotRequest {
     pub fn validate(&self) -> Result<(), SemanticValidationError> {
+        validate_prefixed_id(&self.expected_snapshot_id, "snapshot_")?;
         if self.expected_generation > i64::MAX as u64 {
             return Err(SemanticValidationError::Generation);
         }
@@ -1348,11 +1362,18 @@ mod tests {
         )
         .is_err());
 
-        let restore: RestoreDiskSnapshotRequest =
-            serde_json::from_slice(br#"{"expected_generation":0}"#).unwrap();
+        let destroy: DestroyDiskSnapshotRequest =
+            serde_json::from_slice(br#"{"expected_snapshot_id":"snapshot_01"}"#).unwrap();
+        destroy.validate().unwrap();
+
+        let restore: RestoreDiskSnapshotRequest = serde_json::from_slice(
+            br#"{"expected_snapshot_id":"snapshot_01","expected_generation":0}"#,
+        )
+        .unwrap();
         restore.validate().unwrap();
         assert_eq!(
             RestoreDiskSnapshotRequest {
+                expected_snapshot_id: id("snapshot_01"),
                 expected_generation: i64::MAX as u64 + 1,
             }
             .validate(),

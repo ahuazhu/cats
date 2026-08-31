@@ -46,9 +46,9 @@ use cats_api::oci::{
 };
 use cats_api::semantic_control::{
     AttachDiskRequest, CatMountRequest, CatResponse, CatView, CreateCatRequest, CreateDiskRequest,
-    CreateDiskSnapshotRequest, DetachDiskRequest, DiskResponse, DiskSnapshotResponse,
-    DiskSnapshotStatus, DiskSnapshotView, DiskView, PersistentMountPath, ResourceSlug,
-    RestoreDiskSnapshotRequest, SemanticErrorBody, SemanticSuccessCode,
+    CreateDiskSnapshotRequest, DestroyDiskSnapshotRequest, DetachDiskRequest, DiskResponse,
+    DiskSnapshotResponse, DiskSnapshotStatus, DiskSnapshotView, DiskView, PersistentMountPath,
+    ResourceSlug, RestoreDiskSnapshotRequest, SemanticErrorBody, SemanticSuccessCode,
 };
 use cats_api::sessions::{
     ExecRequest, ExecResponse, DEFAULT_EXEC_TIMEOUT_MS, MAX_EXEC_ENV_BYTES,
@@ -2016,7 +2016,17 @@ fn run_disk_snapshot(client: &Client, cli: &Cli, cmd: &DiskSnapshotCommand) -> R
         }
         DiskSnapshotCommand::Destroy { snapshot } => {
             let slug = resource_slug("snapshot", snapshot)?;
-            let response = client.post(&format!("/snapshots/{slug}/actions/destroy"), None)?;
+            let snapshot = fetch_disk_snapshot(client, &slug)?;
+            let request = DestroyDiskSnapshotRequest {
+                expected_snapshot_id: snapshot.snapshot_id.clone(),
+            };
+            request
+                .validate()
+                .context("invalid DiskSnapshot destroy request")?;
+            let response = client.post(
+                &format!("/snapshots/{slug}/actions/destroy"),
+                Some(serde_json::to_value(request)?),
+            )?;
             let response: DiskSnapshotResponse = serde_json::from_value(response)
                 .context("invalid semantic DiskSnapshot destroy response")?;
             response
@@ -2051,6 +2061,7 @@ fn run_disk_snapshot(client: &Client, cli: &Cli, cmd: &DiskSnapshotCommand) -> R
                 .head_generation
                 .context("PersistentDisk has no initialized current head")?;
             let request = RestoreDiskSnapshotRequest {
+                expected_snapshot_id: snapshot.snapshot_id.clone(),
                 expected_generation,
             };
             request
@@ -3489,7 +3500,10 @@ mod tests {
             captured[2].0.lines().next().unwrap(),
             "POST /v1/workspaces/ws_01/snapshots/before-upgrade/actions/restore HTTP/1.1"
         );
-        assert_eq!(captured[2].1, br#"{"expected_generation":77}"#);
+        assert_eq!(
+            captured[2].1,
+            br#"{"expected_generation":77,"expected_snapshot_id":"snapshot_01"}"#
+        );
         assert!(!captured[2]
             .0
             .lines()
@@ -3536,18 +3550,22 @@ mod tests {
     }
 
     #[test]
-    fn disk_snapshot_destroy_posts_one_bodyless_scenario_action() {
+    fn disk_snapshot_destroy_binds_the_exact_snapshot_occurrence() {
         use clap::Parser as _;
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let captured = read_request(&mut stream);
-            write_json_response(
-                &mut stream,
+            let responses: [&[u8]; 2] = [
+                br#"{"snapshot_id":"snapshot_01","workspace_id":"ws_01","snapshot_slug":"before-upgrade","disk_id":"disk_01","disk_slug":"data","size_bytes":1073741824,"status":"normal","captured_generation":42,"created_at_unix_ms":1,"deleted_at_unix_ms":null}"#,
                 br#"{"status":"ok","code":"snapshot_destroyed","snapshot":{"snapshot_id":"snapshot_01","workspace_id":"ws_01","snapshot_slug":"before-upgrade","disk_id":"disk_01","disk_slug":"data","size_bytes":1073741824,"status":"deleted","captured_generation":42,"created_at_unix_ms":1,"deleted_at_unix_ms":2},"disk_head_generation":77}"#,
-            );
+            ];
+            let mut captured = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                captured.push(read_request(&mut stream));
+                write_json_response(&mut stream, response);
+            }
             captured
         });
         run(Cli::parse_from([
@@ -3564,13 +3582,18 @@ mod tests {
             "before-upgrade",
         ]))
         .unwrap();
-        let (headers, body) = server.join().unwrap();
+        let captured = server.join().unwrap();
         assert_eq!(
-            headers.lines().next().unwrap(),
+            captured[0].0.lines().next().unwrap(),
+            "GET /v1/workspaces/ws_01/snapshots/before-upgrade HTTP/1.1"
+        );
+        assert_eq!(
+            captured[1].0.lines().next().unwrap(),
             "POST /v1/workspaces/ws_01/snapshots/before-upgrade/actions/destroy HTTP/1.1"
         );
-        assert!(body.is_empty());
-        assert!(!headers
+        assert_eq!(captured[1].1, br#"{"expected_snapshot_id":"snapshot_01"}"#);
+        assert!(!captured[1]
+            .0
             .lines()
             .any(|line| line.to_ascii_lowercase().starts_with("idempotency-key:")));
     }

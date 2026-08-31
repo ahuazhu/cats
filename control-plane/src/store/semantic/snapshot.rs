@@ -163,6 +163,7 @@ pub enum RestoreDiskSnapshotOutcome {
     CatMustBeCold,
     DiskWriterActive,
     HeadConflict,
+    SnapshotConflict,
     AuthorityExhausted,
 }
 
@@ -541,6 +542,7 @@ impl Store {
         workspace_id: &str,
         snapshot_id: &str,
         expected_generation: u64,
+        expected_snapshot: &DiskSnapshotGraphCandidate,
     ) -> Result<RestoreDiskSnapshotOutcome> {
         self.authority_transaction(|transaction| {
             let Some(lock_row) = transaction.query_opt(
@@ -562,6 +564,14 @@ impl Store {
                 return Ok(RestoreDiskSnapshotOutcome::NotFound);
             }
             let snapshot_head = snapshot_head.ok_or_else(corrupt)?;
+            if snapshot.disk_id != expected_snapshot.disk_id
+                || parse_id(&snapshot.volume_id)? != expected_snapshot.volume_id
+                || u64::try_from(snapshot.size_bytes).map_err(|_| corrupt())?
+                    != expected_snapshot.size_bytes
+                || snapshot_head != expected_snapshot.head
+            {
+                return Ok(RestoreDiskSnapshotOutcome::SnapshotConflict);
+            }
             let Some(product) = load_product_disk(transaction, workspace_id, &disk_id, true)?
             else {
                 return Err(corrupt());

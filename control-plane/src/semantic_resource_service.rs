@@ -215,9 +215,15 @@ pub trait SemanticResourceStore: Send + Sync {
         workspace_id: String,
         snapshot_id: String,
         expected_generation: u64,
+        expected_snapshot: db::DiskSnapshotGraphCandidate,
     ) -> SemanticResourceFuture<'a, Result<db::RestoreDiskSnapshotOutcome, ResourceStoreError>>
     {
-        let _ = (workspace_id, snapshot_id, expected_generation);
+        let _ = (
+            workspace_id,
+            snapshot_id,
+            expected_generation,
+            expected_snapshot,
+        );
         Box::pin(async { Err(ResourceStoreError::new("DiskSnapshot store is unavailable")) })
     }
 
@@ -531,6 +537,7 @@ impl SemanticResourceStore for PostgresSemanticResourceStore {
         workspace_id: String,
         snapshot_id: String,
         expected_generation: u64,
+        expected_snapshot: db::DiskSnapshotGraphCandidate,
     ) -> SemanticResourceFuture<'a, Result<db::RestoreDiskSnapshotOutcome, ResourceStoreError>>
     {
         let store = Arc::clone(&self.store);
@@ -541,6 +548,7 @@ impl SemanticResourceStore for PostgresSemanticResourceStore {
                         &workspace_id,
                         &snapshot_id,
                         expected_generation,
+                        &expected_snapshot,
                     )
                 })
                 .await
@@ -1594,13 +1602,20 @@ where
         &'a self,
         workspace_id: &'a str,
         snapshot_slug: wire::ResourceSlug,
+        request: wire::DestroyDiskSnapshotRequest,
     ) -> SemanticResourceFuture<'a, Result<wire::DiskSnapshotResponse, wire::SemanticErrorBody>>
     {
         Box::pin(async move {
             let current = self.current_snapshot(workspace_id, &snapshot_slug).await?;
+            if current.snapshot_id != request.expected_snapshot_id.as_str() {
+                return Err(snapshot_occurrence_conflict());
+            }
             let outcome = self
                 .resources
-                .delete_snapshot(workspace_id.to_owned(), current.snapshot_id)
+                .delete_snapshot(
+                    workspace_id.to_owned(),
+                    request.expected_snapshot_id.to_string(),
+                )
                 .await
                 .map_err(internal_resource_error)?;
             let (snapshot, status, code) = match outcome {
@@ -1661,6 +1676,9 @@ where
     {
         Box::pin(async move {
             let current = self.current_snapshot(workspace_id, &snapshot_slug).await?;
+            if current.snapshot_id != request.expected_snapshot_id.as_str() {
+                return Err(snapshot_occurrence_conflict());
+            }
             let candidate = self
                 .resources
                 .snapshot_graph_candidate(&current.snapshot_id)
@@ -1673,15 +1691,16 @@ where
                     )
                 })?;
             self.disk_backend
-                .validate_snapshot_graph(candidate)
+                .validate_snapshot_graph(candidate.clone())
                 .await
                 .map_err(snapshot_graph_validation_error)?;
             let outcome = self
                 .resources
                 .restore_snapshot(
                     workspace_id.to_owned(),
-                    current.snapshot_id,
+                    request.expected_snapshot_id.to_string(),
                     request.expected_generation,
+                    candidate,
                 )
                 .await
                 .map_err(internal_resource_error)?;
@@ -1728,6 +1747,9 @@ where
                         wire::SemanticErrorCode::HeadConflict,
                         "PersistentDisk generation changed",
                     ));
+                }
+                db::RestoreDiskSnapshotOutcome::SnapshotConflict => {
+                    return Err(snapshot_occurrence_conflict());
                 }
                 db::RestoreDiskSnapshotOutcome::AuthorityExhausted => {
                     return Err(semantic_error(
@@ -2158,6 +2180,13 @@ fn snapshot_not_found() -> wire::SemanticErrorBody {
     semantic_error(
         wire::SemanticErrorCode::SnapshotNotFound,
         "DiskSnapshot was not found",
+    )
+}
+
+fn snapshot_occurrence_conflict() -> wire::SemanticErrorBody {
+    semantic_error(
+        wire::SemanticErrorCode::SnapshotConfigurationConflict,
+        "current DiskSnapshot occurrence does not match expected_snapshot_id",
     )
 }
 
