@@ -1001,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "cats-api"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64",
  "hex",
@@ -1076,7 +1076,7 @@ dependencies = [
 
 [[package]]
 name = "cats-cli"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "base64",
