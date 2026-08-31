@@ -271,7 +271,9 @@ fn semantic_product_inventory_counts(
             (SELECT count(*) FROM cats
               WHERE workspace_id=$1 AND destroyed_at IS NOT NULL) AS destroyed_cats,
             (SELECT count(*) FROM persistent_disks
-              WHERE workspace_id=$1 AND deleted_at IS NULL) AS current_disks",
+              WHERE workspace_id=$1 AND deleted_at IS NULL) AS current_disks,
+            (SELECT count(*) FROM disk_snapshots
+              WHERE workspace_id=$1 AND deleted_at IS NULL) AS current_snapshots",
         &[&workspace_id.as_str()],
     )?;
     let count = |name| -> AuthorityTxResult<WireU64> {
@@ -286,7 +288,7 @@ fn semantic_product_inventory_counts(
         current_cat_count: count("current_cats")?,
         root_disk_count: zero,
         persistent_disk_count: count("current_disks")?,
-        disk_snapshot_count: zero,
+        disk_snapshot_count: count("current_snapshots")?,
         endpoint_count: zero,
         hostname_endpoint_lookup_count: zero,
         deleted_cat_tombstone_count: count("destroyed_cats")?,
