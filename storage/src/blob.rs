@@ -162,10 +162,14 @@ pub trait BlobStore: Send + Sync {
     /// The cursor is the last provider-neutral object key returned to the
     /// caller, not an opaque provider continuation token. This makes a full
     /// non-destructive scan restartable without leaking an adapter's wire
-    /// protocol. Adapters must override this method before callers rely on
-    /// cursor pagination. The compatibility default supports only the first
-    /// page through an existing `list_bounded` implementation and fails
-    /// closed for a continuation page.
+    /// protocol. Across a complete cursor walk, adapters must preserve the
+    /// immutable-object LIST contract: every PUT completed before the first
+    /// page is present exactly once unless a DELETE completed during the walk.
+    /// Callers that exclude concurrent PUT/DELETE may therefore use the walk as
+    /// a complete GC inventory. Adapters must override this method before
+    /// callers rely on cursor pagination. The compatibility default supports
+    /// only the first page through an existing `list_bounded` implementation
+    /// and fails closed for a continuation page.
     fn list_after_bounded(
         &self,
         prefix: &str,
