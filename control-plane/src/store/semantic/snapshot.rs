@@ -515,6 +515,11 @@ impl Store {
             {
                 return Ok(DeleteDiskSnapshotOutcome::DiskDeleted);
             }
+            if !head_is_same_or_later(&volume.head, &initialized_head(&disk)?)
+                || !head_is_same_or_later(&volume.head, &live_head)
+            {
+                return Err(corrupt());
+            }
             if volume.lease_owner.is_some() {
                 return Ok(DeleteDiskSnapshotOutcome::DiskWriterActive);
             }
@@ -756,6 +761,7 @@ fn snapshot_from_joined_row(
     if size_bytes <= 0
         || captured_generation <= 0
         || deleted_head_generation.is_some_and(|generation| generation <= 0)
+        || deleted_head_generation.is_some_and(|generation| generation < captured_generation)
         || created_at < 0
         || deleted_at.is_some() != deleted_head_generation.is_some()
     {

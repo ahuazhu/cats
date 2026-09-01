@@ -918,6 +918,9 @@ CREATE TABLE IF NOT EXISTS disk_snapshots (
     deleted_at BIGINT CHECK (deleted_at >= created_at),
     CONSTRAINT disk_snapshots_deleted_result_exact
         CHECK ((deleted_at IS NULL) = (deleted_head_generation IS NULL)),
+    CONSTRAINT disk_snapshots_deleted_generation_monotonic
+        CHECK (deleted_head_generation IS NULL OR
+               deleted_head_generation >= captured_generation),
     CONSTRAINT disk_snapshots_workspace_identity_unique
         UNIQUE (workspace_id, snapshot_id)
 );

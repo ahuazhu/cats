@@ -340,6 +340,52 @@ fn deleted_snapshot_replays_its_destroy_generation_after_storage_disk_removal() 
 }
 
 #[test]
+fn snapshot_destroy_rejects_a_volume_head_older_than_the_captured_root() {
+    let store = store();
+    let candidate = candidate();
+    store
+        .ensure_semantic_strict_disk_created(&candidate)
+        .unwrap();
+    initialize_disk(&store, &candidate);
+    insert_snapshot(&store, &candidate);
+    store
+        .with(|client| {
+            client.execute(
+                "UPDATE disk_snapshots SET captured_generation=2
+                  WHERE snapshot_id='snapshot_delete_guard'",
+                &[],
+            )?;
+            client.execute(
+                "UPDATE disk_snapshot_records
+                    SET record=jsonb_set(record,'{head,generation}','2'::jsonb),
+                        head_generation=2
+                  WHERE snapshot_id='snapshot_delete_guard'",
+                &[],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(store
+        .delete_semantic_disk_snapshot("ws_snapshot_delete", "snapshot_delete_guard")
+        .is_err());
+    let still_live = store
+        .with(|client| {
+            client
+                .query_one(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM disk_snapshot_records
+                         WHERE snapshot_id='snapshot_delete_guard'
+                    )",
+                    &[],
+                )
+                .map(|row| row.get::<_, bool>(0))
+        })
+        .unwrap();
+    assert!(still_live, "corrupt head ordering released the live root");
+}
+
+#[test]
 fn garbage_collecting_keeps_disk_projection_readable_and_rejects_binding_mutations() {
     let store = store();
     let candidate = candidate();
