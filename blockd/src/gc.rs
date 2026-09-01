@@ -199,6 +199,8 @@ pub enum GcError {
     ClaimMismatch,
     #[error("garbage-collection deadline elapsed")]
     Deadline,
+    #[error("garbage collection was cancelled")]
+    Cancelled,
     #[error(transparent)]
     Blob(#[from] BlobError),
 }
@@ -216,13 +218,32 @@ pub fn trace_live_objects(
     retained_roots: &[RetainedRoot],
     deadline: Instant,
 ) -> Result<LiveObjectGraph, GcError> {
+    trace_live_objects_with_cancellation(
+        blob,
+        volume_id,
+        size_bytes,
+        retained_roots,
+        deadline,
+        &|| false,
+    )
+}
+
+fn trace_live_objects_with_cancellation(
+    blob: &dyn BlobStore,
+    volume_id: &Id,
+    size_bytes: u64,
+    retained_roots: &[RetainedRoot],
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<LiveObjectGraph, GcError> {
     validate_trace_input(size_bytes, retained_roots)?;
-    ensure_deadline(deadline)?;
+    ensure_active(deadline, cancelled)?;
     let mut tracer = Tracer {
         blob,
         volume_id,
         size_bytes,
         deadline,
+        cancelled,
         live_data: HashSet::new(),
         live_maps: HashSet::new(),
         verified_data: HashMap::new(),
@@ -248,13 +269,24 @@ pub fn plan_garbage(
     page_size: usize,
     deadline: Instant,
 ) -> Result<GarbageCollectionPlan, GcError> {
+    plan_garbage_with_cancellation(blob, claim, page_size, deadline, &|| false)
+}
+
+fn plan_garbage_with_cancellation(
+    blob: &dyn BlobStore,
+    claim: &GarbageCollectionClaim,
+    page_size: usize,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<GarbageCollectionPlan, GcError> {
     validate_page_size(page_size)?;
-    let graph = trace_live_objects(
+    let graph = trace_live_objects_with_cancellation(
         blob,
         claim.volume_id(),
         claim.size_bytes(),
         claim.retained_roots(),
         deadline,
+        cancelled,
     )?;
     let data_objects_candidates = count_candidates(
         blob,
@@ -262,6 +294,7 @@ pub fn plan_garbage(
         graph.data_objects(),
         page_size,
         deadline,
+        cancelled,
     )?;
     let map_objects_candidates = count_candidates(
         blob,
@@ -269,6 +302,7 @@ pub fn plan_garbage(
         graph.map_nodes(),
         page_size,
         deadline,
+        cancelled,
     )?;
     Ok(GarbageCollectionPlan {
         claim: claim.clone(),
@@ -289,6 +323,16 @@ pub fn execute_garbage_plan(
     plan: GarbageCollectionPlan,
     deadline: Instant,
 ) -> Result<GcStats, GcError> {
+    execute_garbage_plan_with_cancellation(blob, claim, plan, deadline, &|| false)
+}
+
+fn execute_garbage_plan_with_cancellation(
+    blob: &dyn BlobStore,
+    claim: &GarbageCollectionClaim,
+    plan: GarbageCollectionPlan,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<GcStats, GcError> {
     if &plan.claim != claim {
         return Err(GcError::ClaimMismatch);
     }
@@ -303,6 +347,7 @@ pub fn execute_garbage_plan(
         plan.live.data_objects(),
         plan.data_objects_candidates,
         deadline,
+        cancelled,
     )?;
     stats.map_objects_deleted = sweep_prefix(
         blob,
@@ -310,6 +355,7 @@ pub fn execute_garbage_plan(
         plan.live.map_nodes(),
         plan.map_objects_candidates,
         deadline,
+        cancelled,
     )?;
     Ok(stats)
 }
@@ -322,8 +368,28 @@ pub fn collect_garbage(
     page_size: usize,
     deadline: Instant,
 ) -> Result<GcStats, GcError> {
-    let plan = plan_garbage(blob, claim, page_size, deadline)?;
-    execute_garbage_plan(blob, claim, plan, deadline)
+    collect_garbage_with_cancellation(blob, claim, page_size, deadline, || false)
+}
+
+/// Plan and execute one claim while cooperatively observing authority loss.
+///
+/// Cancellation is checked around every provider call and immediately before
+/// every DELETE. An adapter call already in flight remains bounded by its
+/// ordinary deadline, but a cancelled pass cannot start another destructive
+/// operation.
+pub fn collect_garbage_with_cancellation<F>(
+    blob: &dyn BlobStore,
+    claim: &GarbageCollectionClaim,
+    page_size: usize,
+    deadline: Instant,
+    cancelled: F,
+) -> Result<GcStats, GcError>
+where
+    F: Fn() -> bool,
+{
+    let plan =
+        plan_garbage_with_cancellation(blob, claim, page_size, deadline, &cancelled)?;
+    execute_garbage_plan_with_cancellation(blob, claim, plan, deadline, &cancelled)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,6 +403,7 @@ struct Tracer<'a> {
     volume_id: &'a Id,
     size_bytes: u64,
     deadline: Instant,
+    cancelled: &'a dyn Fn() -> bool,
     live_data: HashSet<String>,
     live_maps: HashSet<String>,
     verified_data: HashMap<String, DataObjectIdentity>,
@@ -496,10 +563,11 @@ impl Tracer<'_> {
         expected_hash: &[u8; 32],
         kind: &str,
     ) -> Result<Vec<u8>, GcError> {
-        ensure_deadline(self.deadline)?;
+        ensure_active(self.deadline, self.cancelled)?;
         let bytes = self
             .blob
             .get_bounded_until(key, MAX_MAP_NODE_BYTES, self.deadline)?;
+        ensure_active(self.deadline, self.cancelled)?;
         if &format::sha256(&bytes) != expected_hash {
             return corrupt(format!("{kind} {key} content hash mismatch"));
         }
@@ -516,10 +584,11 @@ impl Tracer<'_> {
             }
             return Ok(());
         }
-        ensure_deadline(self.deadline)?;
+        ensure_active(self.deadline, self.cancelled)?;
         let bytes = self
             .blob
             .get_bounded_until(key, len as usize, self.deadline)?;
+        ensure_active(self.deadline, self.cancelled)?;
         if bytes.len() != len as usize || format::sha256(&bytes) != sha256 {
             return corrupt(format!("data object {key} length/hash mismatch"));
         }
@@ -534,14 +603,15 @@ fn count_candidates(
     live: &HashSet<String>,
     page_size: usize,
     deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<usize, GcError> {
     let mut candidates = 0usize;
     let mut cursor: Option<String> = None;
     loop {
-        ensure_deadline(deadline)?;
+        ensure_active(deadline, cancelled)?;
         let page = blob.list_after_bounded(prefix, cursor.as_deref(), page_size)?;
         validate_list_page(prefix, cursor.as_deref(), page_size, &page)?;
-        ensure_deadline(deadline)?;
+        ensure_active(deadline, cancelled)?;
         let next = page.keys.last().cloned();
         candidates = candidates
             .checked_add(page.keys.iter().filter(|key| !live.contains(*key)).count())
@@ -559,22 +629,26 @@ fn sweep_prefix(
     live: &HashSet<String>,
     expected_candidates: usize,
     deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<usize, GcError> {
     let mut deleted = 0usize;
     let mut cursor: Option<String> = None;
     loop {
-        ensure_deadline(deadline)?;
+        ensure_active(deadline, cancelled)?;
         // The port bounds the returned page. It cannot cancel an adapter call
         // in flight yet, so the deadline is checked on both sides and a late
         // response fails closed before any key from that page is deleted.
         let page = blob.list_after_bounded(prefix, cursor.as_deref(), BLOB_LIST_PAGE_MAX_KEYS)?;
         validate_list_page(prefix, cursor.as_deref(), BLOB_LIST_PAGE_MAX_KEYS, &page)?;
-        ensure_deadline(deadline)?;
+        ensure_active(deadline, cancelled)?;
         let next = page.keys.last().cloned();
         for key in page.keys {
             if live.contains(&key) {
                 continue;
             }
+            // Authority cancellation must be observed immediately before each
+            // destructive operation, not merely once per LIST page.
+            ensure_active(deadline, cancelled)?;
             blob.delete_until(&key, deadline)?;
             deleted = deleted
                 .checked_add(1)
@@ -699,6 +773,14 @@ fn ensure_deadline(deadline: Instant) -> Result<(), GcError> {
         Err(GcError::Deadline)
     } else {
         Ok(())
+    }
+}
+
+fn ensure_active(deadline: Instant, cancelled: &dyn Fn() -> bool) -> Result<(), GcError> {
+    if cancelled() {
+        Err(GcError::Cancelled)
+    } else {
+        ensure_deadline(deadline)
     }
 }
 

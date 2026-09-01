@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,6 +16,61 @@ use crate::engine::{ChunkEngine, DurabilityMode, EngineConfig};
 const VOL: &str = "vol_gc_test";
 const SIZE: u64 = 8 * CHUNK_SIZE as u64;
 const ATTACHMENT: &str = "att_gc_test";
+
+struct CancelAfterFirstDelete {
+    inner: Arc<FileBlobStore>,
+    cancelled: Arc<AtomicBool>,
+    deletes: AtomicUsize,
+}
+
+impl BlobStore for CancelAfterFirstDelete {
+    fn put_immutable(&self, key: &str, data: &[u8]) -> cats_storage::Result<()> {
+        self.inner.put_immutable(key, data)
+    }
+
+    fn get(&self, key: &str) -> cats_storage::Result<Vec<u8>> {
+        self.inner.get(key)
+    }
+
+    fn get_bounded_until(
+        &self,
+        key: &str,
+        maximum: usize,
+        deadline: Instant,
+    ) -> cats_storage::Result<Vec<u8>> {
+        self.inner.get_bounded_until(key, maximum, deadline)
+    }
+
+    fn exists(&self, key: &str) -> cats_storage::Result<bool> {
+        self.inner.exists(key)
+    }
+
+    fn delete(&self, key: &str) -> cats_storage::Result<()> {
+        self.inner.delete(key)
+    }
+
+    fn delete_until(&self, key: &str, deadline: Instant) -> cats_storage::Result<()> {
+        self.inner.delete_until(key, deadline)?;
+        if self.deletes.fetch_add(1, Ordering::AcqRel) == 0 {
+            self.cancelled.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    fn list(&self, prefix: &str) -> cats_storage::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_after_bounded(
+        &self,
+        prefix: &str,
+        after_key: Option<&str>,
+        maximum: usize,
+    ) -> cats_storage::Result<cats_storage::BlobListPage> {
+        self.inner
+            .list_after_bounded(prefix, after_key, maximum)
+    }
+}
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -303,4 +359,54 @@ fn executor_requires_the_exact_claim_and_never_touches_images_or_commits() {
     // This test directly removed blob objects only after the engine detached;
     // leave no local state that another fixture could accidentally adopt.
     fs::remove_dir_all(&fixture.data_dir).unwrap();
+}
+
+#[test]
+fn cancellation_is_checked_again_before_every_delete() {
+    let fixture = Fixture::new();
+    let first = format!("volumes/{VOL}/data/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-c6");
+    let second = format!("volumes/{VOL}/data/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-c7");
+    fixture.blob.put_immutable(&first, b"garbage").unwrap();
+    fixture.blob.put_immutable(&second, b"garbage").unwrap();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let blob = CancelAfterFirstDelete {
+        inner: Arc::clone(&fixture.blob),
+        cancelled: Arc::clone(&cancelled),
+        deletes: AtomicUsize::new(0),
+    };
+    let claim = fixture.claim(vec![fixture.current_root()], 6);
+
+    let result = collect_garbage_with_cancellation(&blob, &claim, 2, deadline(), || {
+        cancelled.load(Ordering::Acquire)
+    });
+
+    assert!(matches!(result, Err(GcError::Cancelled)));
+    assert_eq!(blob.deletes.load(Ordering::Acquire), 1);
+    assert_ne!(
+        fixture.blob.exists(&first).unwrap(),
+        fixture.blob.exists(&second).unwrap(),
+        "the worker started a second DELETE after cancellation"
+    );
+}
+
+#[test]
+fn an_expired_execution_deadline_never_starts_a_delete() {
+    let fixture = Fixture::new();
+    let orphan = format!("volumes/{VOL}/data/cccccccccccccccccccccccccccccccc-c7");
+    fixture.blob.put_immutable(&orphan, b"garbage").unwrap();
+    let claim = fixture.claim(vec![fixture.current_root()], 7);
+
+    let result = collect_garbage_with_cancellation(
+        fixture.blob.as_ref(),
+        &claim,
+        1,
+        Instant::now(),
+        || false,
+    );
+
+    assert!(matches!(result, Err(GcError::Deadline)));
+    assert!(
+        fixture.blob.exists(&orphan).unwrap(),
+        "an expired worker performed a DELETE"
+    );
 }

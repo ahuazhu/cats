@@ -1,5 +1,5 @@
-use cats_api::error::ErrorCode;
-use cats_api::runtime_reconciliation::{Id, RandomId128};
+use cats_protocol::error::ErrorCode;
+use cats_protocol::runtime_reconciliation::{Id, RandomId128};
 
 use super::semantic_persistent_disk::{SemanticStrictDeleteState, SemanticStrictPersistentDisk};
 use crate::store::semantic::{
@@ -325,7 +325,7 @@ fn garbage_collecting_keeps_disk_projection_readable_and_rejects_binding_mutatio
     ));
     mark_gc_required(&store, &candidate);
     let claim = store
-        .claim_next_snapshot_gc()
+        .claim_next_snapshot_gc(std::time::Duration::from_secs(1))
         .unwrap()
         .expect("stable Cold binding is GC eligible");
 
@@ -396,7 +396,9 @@ fn gc_claim_and_initial_mount_create_serialize_on_the_disk_identity() {
     let gc_start = start.clone();
     let gc = std::thread::spawn(move || {
         gc_start.wait();
-        gc_store.claim_next_snapshot_gc().unwrap()
+        gc_store
+            .claim_next_snapshot_gc(std::time::Duration::from_secs(1))
+            .unwrap()
     });
     let create_start = start.clone();
     let disk_id = candidate.disk_id.to_string();

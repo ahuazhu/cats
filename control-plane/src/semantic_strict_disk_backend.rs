@@ -179,6 +179,9 @@ fn snapshot_graph_error(error: GcError) -> SnapshotGraphValidationError {
         GcError::Deadline => SnapshotGraphValidationError::StorageUnavailable(
             "snapshot graph validation deadline elapsed".to_owned(),
         ),
+        GcError::Cancelled => SnapshotGraphValidationError::StorageUnavailable(
+            "snapshot graph validation was cancelled".to_owned(),
+        ),
         GcError::ClaimMismatch => SnapshotGraphValidationError::Corrupt(
             "snapshot graph validation authority did not match its Root".to_owned(),
         ),

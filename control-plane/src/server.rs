@@ -31,6 +31,11 @@ const DESTROY_RECOVERY_BATCH_SIZE: usize = 32;
 const DESTROY_RECOVERY_MAX_IN_FLIGHT: usize = 4;
 const SNAPSHOT_GC_INTERVAL: Duration = Duration::from_secs(30);
 const SNAPSHOT_GC_PASS_DEADLINE: Duration = Duration::from_secs(10 * 60);
+// The durable occurrence outlives the monotonic object-I/O budget. Another
+// Control may acquire the PostgreSQL singleton lock immediately after this
+// process loses its session, but it cannot resume or settle this GC until the
+// old worker's bounded provider calls have drained.
+const SNAPSHOT_GC_EXECUTION_LEASE: Duration = Duration::from_secs(10 * 60 + 30);
 
 #[derive(Clone)]
 pub struct Config {
@@ -342,19 +347,18 @@ async fn spawn_with_session_override(
     );
     let snapshot_gc = Arc::new(crate::semantic_snapshot_gc::SnapshotGcService::new(
         Arc::clone(&store),
-        Arc::new(
-            crate::semantic_snapshot_gc::ChunkStoreSnapshotGcSweeper::new(
-                Arc::clone(&cfg.image_blob),
-                SNAPSHOT_GC_PASS_DEADLINE,
-            ),
-        ),
+        Arc::new(crate::semantic_snapshot_gc::ChunkStoreSnapshotGcSweeper::new(
+            Arc::clone(&cfg.image_blob),
+        )),
+        SNAPSHOT_GC_PASS_DEADLINE,
+        SNAPSHOT_GC_EXECUTION_LEASE,
     ));
-    let snapshot_gc_task = spawn_managed_singleton_task(
+    let snapshot_gc_task = spawn_managed_cooperative_singleton_task(
         Arc::clone(&store),
         SingletonRole::DiskSnapshotGarbageCollection,
-        move || {
+        move |shutdown| {
             let snapshot_gc = Arc::clone(&snapshot_gc);
-            async move { snapshot_gc.run(SNAPSHOT_GC_INTERVAL).await }
+            async move { snapshot_gc.run(SNAPSHOT_GC_INTERVAL, shutdown).await }
         },
     );
     let semantic_sessions = match session_override {
@@ -470,7 +474,15 @@ where
     F: Fn() -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    tokio::spawn(run_singleton_election(store, role, make_task, None))
+    tokio::spawn(run_singleton_election(
+        store,
+        role,
+        move || ElectedSingletonTask {
+            future: make_task(),
+            cooperative_shutdown: None,
+        },
+        None,
+    ))
 }
 
 pub fn spawn_managed_singleton_task<F, Fut>(
@@ -486,7 +498,10 @@ where
     let task = tokio::spawn(run_singleton_election(
         store,
         role,
-        make_task,
+        move || ElectedSingletonTask {
+            future: make_task(),
+            cooperative_shutdown: None,
+        },
         Some(shutdown_rx),
     ));
     ManagedSingletonTask {
@@ -495,13 +510,46 @@ where
     }
 }
 
+fn spawn_managed_cooperative_singleton_task<F, Fut>(
+    store: Arc<Store>,
+    role: SingletonRole,
+    make_task: F,
+) -> ManagedSingletonTask
+where
+    F: Fn(tokio::sync::watch::Receiver<bool>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(run_singleton_election(
+        store,
+        role,
+        move || {
+            let (cooperative_shutdown, task_shutdown) = tokio::sync::watch::channel(false);
+            ElectedSingletonTask {
+                future: make_task(task_shutdown),
+                cooperative_shutdown: Some(cooperative_shutdown),
+            }
+        },
+        Some(shutdown_rx),
+    ));
+    ManagedSingletonTask {
+        shutdown,
+        task: tokio::sync::Mutex::new(Some(task)),
+    }
+}
+
+struct ElectedSingletonTask<Fut> {
+    future: Fut,
+    cooperative_shutdown: Option<tokio::sync::watch::Sender<bool>>,
+}
+
 async fn run_singleton_election<F, Fut>(
     store: Arc<Store>,
     role: SingletonRole,
     make_task: F,
     mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) where
-    F: Fn() -> Fut + Send + Sync + 'static,
+    F: Fn() -> ElectedSingletonTask<Fut> + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
     'election: loop {
@@ -543,13 +591,14 @@ async fn run_singleton_election<F, Fut>(
                 }
             }
         }
-        let mut task = tokio::spawn(make_task());
+        let elected = make_task();
+        let mut cooperative_shutdown = elected.cooperative_shutdown;
+        let mut task = tokio::spawn(elected.future);
         loop {
             tokio::select! {
                 _ = &mut task => break,
                 () = wait_for_shutdown_optional(&mut shutdown) => {
-                    task.abort();
-                    let _ = task.await;
+                    stop_elected_task(&mut task, cooperative_shutdown.take()).await;
                     close_singleton(session).await;
                     return;
                 }
@@ -558,8 +607,7 @@ async fn run_singleton_election<F, Fut>(
                         Ok(returned) => session = returned,
                         Err(error) => {
                             tracing::warn!(role = role.name(), %error, "singleton session lost");
-                            task.abort();
-                            let _ = task.await;
+                            stop_elected_task(&mut task, cooperative_shutdown.take()).await;
                             if retry_or_shutdown(&mut shutdown).await {
                                 return;
                             }
@@ -574,6 +622,19 @@ async fn run_singleton_election<F, Fut>(
             return;
         }
     }
+}
+
+async fn stop_elected_task(
+    task: &mut tokio::task::JoinHandle<()>,
+    cooperative_shutdown: Option<tokio::sync::watch::Sender<bool>>,
+) {
+    match cooperative_shutdown {
+        Some(shutdown) => {
+            let _ = shutdown.send(true);
+        }
+        None => task.abort(),
+    }
+    let _ = task.await;
 }
 
 fn shutdown_requested(shutdown: &Option<tokio::sync::watch::Receiver<bool>>) -> bool {
@@ -639,7 +700,7 @@ async fn close_singleton(session: crate::store::SingletonSession) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
 
@@ -695,5 +756,86 @@ mod tests {
         })
         .await;
         task.shutdown().await.expect("singleton shutdown");
+    }
+
+    #[tokio::test]
+    async fn cooperative_singleton_joins_cancelled_worker_before_reelection() {
+        let store = Arc::new(
+            Store::connect(&crate::testsupport::isolated_control_store_url(), None)
+                .expect("test Store"),
+        );
+        let starts = Arc::new(AtomicUsize::new(0));
+        let cancellation_seen = Arc::new(AtomicBool::new(false));
+        let (release_first, release_first_rx) = tokio::sync::watch::channel(false);
+        let role = SingletonRole::DiskSnapshotGarbageCollection;
+        let task = spawn_managed_cooperative_singleton_task(
+            Arc::clone(&store),
+            role,
+            {
+                let starts = Arc::clone(&starts);
+                let cancellation_seen = Arc::clone(&cancellation_seen);
+                move |mut shutdown| {
+                    let starts = Arc::clone(&starts);
+                    let cancellation_seen = Arc::clone(&cancellation_seen);
+                    let mut release_first = release_first_rx.clone();
+                    async move {
+                        let ordinal = starts.fetch_add(1, Ordering::AcqRel) + 1;
+                        wait_for_shutdown(&mut shutdown).await;
+                        if ordinal == 1 {
+                            cancellation_seen.store(true, Ordering::Release);
+                            wait_for_shutdown(&mut release_first).await;
+                        }
+                    }
+                }
+            },
+        );
+
+        cats_test_support::wait_until_async("first cooperative singleton leadership", || async {
+            starts.load(Ordering::Acquire) == 1
+        })
+        .await;
+
+        let role_key = role.lock_key();
+        let terminated: bool = store
+            .execute(move |store| {
+                store.with(|client| {
+                    let rows = client.query(
+                        "SELECT pid FROM pg_catalog.pg_locks
+                          WHERE locktype='advisory'
+                            AND classid=hashtext(current_schema())::oid
+                            AND objid=$1::int4::oid
+                            AND objsubid=2
+                            AND granted
+                            AND pid<>pg_backend_pid()",
+                        &[&role_key],
+                    )?;
+                    assert_eq!(rows.len(), 1, "calibrate exact singleton lock lookup");
+                    let pid: i32 = rows[0].get(0);
+                    client
+                        .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+                        .map(|row| row.get(0))
+                })
+            })
+            .await
+            .expect("terminate elected singleton session");
+        assert!(terminated);
+
+        cats_test_support::wait_until_async("cooperative cancellation delivery", || async {
+            cancellation_seen.load(Ordering::Acquire)
+        })
+        .await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            starts.load(Ordering::Acquire),
+            1,
+            "a replacement became leader before the cancelled worker exited"
+        );
+
+        release_first.send_replace(true);
+        cats_test_support::wait_until_async("leadership only after old worker exit", || async {
+            starts.load(Ordering::Acquire) >= 2
+        })
+        .await;
+        task.shutdown().await.expect("cooperative singleton shutdown");
     }
 }

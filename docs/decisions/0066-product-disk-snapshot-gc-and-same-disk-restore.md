@@ -112,6 +112,13 @@ claim 冻结 current head 与全部 live Snapshot head，并用稳定、带长�
 编码计算 `roots_digest`。进入 maintenance 不推进 epoch，也不覆盖最后一次 writer transition；acquire、
 publish、Snapshot mutation 和 Volume delete 都拒绝 `GarbageCollecting`。
 
+每次实际 sweep 还以 `gc_started_at` 标识一个有界 execution occurrence。它的数据库 lease 严格长于
+对象 I/O 的 monotonic deadline；worker 在发起 claim 之前就锚定该 deadline，并在每次 DELETE 前重验。
+另一 Control 即使已经取得 singleton lock，也只能在旧 lease 到期后用同一 `gc_id`、新的
+`gc_started_at` 恢复 sweep；complete/abort 必须同时匹配该 occurrence。领导权丢失时旧进程发出协作取消
+并等待 blocking worker 退出，而 durable lease 保证跨进程的新 leader 不会在旧 provider 调用尚未排空时
+解除 maintenance 或开始另一轮 sweep。
+
 事务外 GC 先完整读取并验证所有 retained Root、Leaf、Base、Delta，包括 object ID、hash、长度、volume
 geometry、leaf index/count 和 delta 层界限。任何 live graph 缺失、损坏、超界或 GET/LIST 不确定结果
 都必须发生在第一次 DELETE 前，并保证本轮零删除。

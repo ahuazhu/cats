@@ -6,6 +6,8 @@
 //! and sweep outside the PostgreSQL transaction without relying on a blockd
 //! process lock that cannot fence another Host.
 
+use std::time::Duration;
+
 use cats_api::error::ApiError;
 use cats_api::runtime_reconciliation::{
     AsciiText, Generation, Id, RemoteHead, Sha256Digest, UnixMillis, VolumeAdminState,
@@ -82,8 +84,19 @@ impl Store {
     /// Eligibility is rechecked after taking the shared per-Disk exclusion and
     /// under the Volume row lock. Bound disks require a stable Cold Cat; an
     /// unbound initialized disk is also eligible. A prior `garbage_collecting`
-    /// row is resumed with its original `gc_id`.
-    pub(crate) fn claim_next_snapshot_gc(&self) -> Result<Option<SnapshotGcClaim>> {
+    /// row is resumed with its original `gc_id` only after its execution lease
+    /// expires. Refreshed `started_at` makes the resumed pass a new exact
+    /// occurrence that rejects late settlement by the old one.
+    pub(crate) fn claim_next_snapshot_gc(
+        &self,
+        execution_lease: Duration,
+    ) -> Result<Option<SnapshotGcClaim>> {
+        let lease_millis = u64::try_from(execution_lease.as_millis())
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| ApiError::internal("invalid snapshot GC lease"))?;
+        let lease_millis_i64 = i64::try_from(lease_millis)
+            .map_err(|_| ApiError::internal("invalid snapshot GC lease"))?;
         self.authority_transaction(|transaction| {
             // Candidate discovery takes no destructive row lock. The common
             // per-Disk lock is the first exclusion lock, and the full
@@ -104,7 +117,9 @@ impl Store {
                     AND v.owner_node_id IS NULL
                     AND (
                         (v.admin_state='active' AND v.gc_required) OR
-                        v.admin_state='garbage_collecting'
+                        (v.admin_state='garbage_collecting' AND
+                         v.gc_started_at <=
+                           (floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint - $1))
                     )
                     AND d.admin_state='active'
                     AND d.role_kind='persistent'
@@ -119,7 +134,7 @@ impl Store {
                     (v.admin_state='garbage_collecting') DESC,
                     v.volume_id COLLATE \"C\"
                   LIMIT 1",
-                &[],
+                &[&lease_millis_i64],
             )?
             else {
                 return Ok(None);
@@ -144,7 +159,9 @@ impl Store {
                         AND v.owner_node_id IS NULL
                         AND (
                             (v.admin_state='active' AND v.gc_required) OR
-                            v.admin_state='garbage_collecting'
+                            (v.admin_state='garbage_collecting' AND
+                             v.gc_started_at <=
+                               (floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint - $2))
                         )
                         AND d.admin_state='active'
                         AND d.role_kind='persistent'
@@ -158,7 +175,7 @@ impl Store {
                         )
                       FOR UPDATE OF v SKIP LOCKED"
                 ),
-                &[&candidate_disk_id],
+                &[&candidate_disk_id, &lease_millis_i64],
             )?
             else {
                 return Ok(None);
@@ -186,11 +203,12 @@ impl Store {
                 &roots[1..],
             )?;
 
+            let now = database_now(transaction)?;
             let (gc_id, started_at) = match &volume.admin_state {
                 VolumeAdminState::Active if volume.gc_required => {
                     let gc_id = Id::new(format!("gc_{}", uuid::Uuid::new_v4().simple()))
                         .ok_or_else(corrupt_tx)?;
-                    let started_at = database_now(transaction)?;
+                    let started_at = now;
                     volume.admin_state = VolumeAdminState::GarbageCollecting {
                         gc_id: gc_id.clone(),
                         roots_digest: roots_digest.clone(),
@@ -203,7 +221,19 @@ impl Store {
                     gc_id,
                     roots_digest: stored_digest,
                     started_at,
-                } if stored_digest == &roots_digest => (gc_id.clone(), *started_at),
+                } if stored_digest == &roots_digest
+                    && gc_execution_lease_expired(*started_at, now, lease_millis) =>
+                {
+                    let gc_id = gc_id.clone();
+                    volume.admin_state = VolumeAdminState::GarbageCollecting {
+                        gc_id: gc_id.clone(),
+                        roots_digest: roots_digest.clone(),
+                        started_at: now,
+                    };
+                    write_volume(transaction, &volume)?;
+                    (gc_id, now)
+                }
+                VolumeAdminState::GarbageCollecting { .. } => return Ok(None),
                 _ => return Err(corrupt_tx()),
             };
 
@@ -523,6 +553,14 @@ fn claim_matches(volume: &VolumeRecord, claim: &SnapshotGcClaim) -> bool {
         )
 }
 
+fn gc_execution_lease_expired(
+    started_at: UnixMillis,
+    now: UnixMillis,
+    lease_millis: u64,
+) -> bool {
+    started_at.get() <= now.get().saturating_sub(lease_millis)
+}
+
 /// Stable product digest for the exact root set behind one GC permit.
 fn snapshot_gc_roots_digest(
     volume_id: &Id,
@@ -632,6 +670,7 @@ fn corrupt_tx() -> AuthorityTransactionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cats_api::runtime_reconciliation::FenceEpoch;
 
     fn id(value: &str) -> Id {
         Id::new(value).unwrap()
@@ -713,5 +752,76 @@ mod tests {
             &[],
         )
         .is_err());
+    }
+
+    #[test]
+    fn execution_lease_blocks_another_pass_until_its_exact_expiry() {
+        let started_at = UnixMillis::new(10_000).unwrap();
+        assert!(!gc_execution_lease_expired(
+            started_at,
+            UnixMillis::new(10_999).unwrap(),
+            1_000,
+        ));
+        assert!(gc_execution_lease_expired(
+            started_at,
+            UnixMillis::new(11_000).unwrap(),
+            1_000,
+        ));
+    }
+
+    #[test]
+    fn renewing_the_execution_occurrence_makes_the_old_claim_stale() {
+        let volume_id = id("vol_22222222222222222222222222222222");
+        let disk_id = id("disk_11111111111111111111111111111111");
+        let roots_digest = snapshot_gc_roots_digest(
+            &volume_id,
+            4 * 1024 * 1024,
+            &head(3, '4'),
+            &[],
+        )
+        .unwrap();
+        let first_started_at = UnixMillis::new(10_000).unwrap();
+        let gc_id = id("gc_33333333333333333333333333333333");
+        let claim = SnapshotGcClaim {
+            gc_id: gc_id.clone(),
+            roots_digest: roots_digest.clone(),
+            started_at: first_started_at,
+            volume_id: volume_id.clone(),
+            claimed_head: head(3, '4'),
+            roots: vec![SnapshotGcRoot {
+                snapshot_id: None,
+                disk_id,
+                volume_id: volume_id.clone(),
+                size_bytes: 4 * 1024 * 1024,
+                head: head(3, '4'),
+            }],
+        };
+        let mut volume = VolumeRecord {
+            volume_id,
+            size_bytes: 4 * 1024 * 1024,
+            durability: VolumeDurability::Strict,
+            admin_state: VolumeAdminState::GarbageCollecting {
+                gc_id,
+                roots_digest,
+                started_at: first_started_at,
+            },
+            gc_required: true,
+            head: head(3, '4'),
+            lease_owner: None,
+            lease_epoch: FenceEpoch::new(7).unwrap(),
+            lease_expires_at: None,
+            last_transition: None,
+        };
+        assert!(claim_matches(&volume, &claim));
+
+        if let VolumeAdminState::GarbageCollecting { started_at, .. } =
+            &mut volume.admin_state
+        {
+            *started_at = UnixMillis::new(11_000).unwrap();
+        }
+        assert!(
+            !claim_matches(&volume, &claim),
+            "the prior execution occurrence could settle a renewed lease"
+        );
     }
 }
