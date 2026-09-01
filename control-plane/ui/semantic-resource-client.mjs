@@ -34,6 +34,18 @@ function workspaceId(value) {
   return value;
 }
 
+function snapshotId(value) {
+  if (
+    typeof value !== "string"
+    || !ID.test(value)
+    || !value.startsWith("snapshot_")
+    || value === "snapshot_"
+  ) {
+    throw new Error("invalid immutable DiskSnapshot ID");
+  }
+  return value;
+}
+
 export function catCollectionPath(value) {
   return `/v1/workspaces/${workspaceId(value)}/cats`;
 }
@@ -83,8 +95,18 @@ export function buildSemanticDiskSnapshotCreateRequest({ disk, name }) {
   };
 }
 
-export function buildSemanticDiskSnapshotRestoreRequest({ expectedGeneration }) {
-  return { expected_generation: nonnegativeSafeInteger(expectedGeneration, "expected_generation") };
+export function buildSemanticDiskSnapshotDestroyRequest({ expectedSnapshotId }) {
+  return { expected_snapshot_id: snapshotId(expectedSnapshotId) };
+}
+
+export function buildSemanticDiskSnapshotRestoreRequest({
+  expectedSnapshotId,
+  expectedGeneration,
+}) {
+  return {
+    expected_snapshot_id: snapshotId(expectedSnapshotId),
+    expected_generation: nonnegativeSafeInteger(expectedGeneration, "expected_generation"),
+  };
 }
 
 function validateTransport(response, kind) {
@@ -153,7 +175,12 @@ export async function createSemanticDisk({ immutableWorkspaceId, request, send }
   return response;
 }
 
-function validateDiskSnapshot(snapshot, { immutableWorkspaceId, snapshotSlug, diskSlug } = {}) {
+function validateDiskSnapshot(snapshot, {
+  immutableWorkspaceId,
+  snapshotSlug,
+  snapshotId: expectedSnapshotId,
+  diskSlug,
+} = {}) {
   if (
     !snapshot
     || typeof snapshot !== "object"
@@ -162,6 +189,7 @@ function validateDiskSnapshot(snapshot, { immutableWorkspaceId, snapshotSlug, di
     || !ID.test(snapshot.disk_id || "")
     || snapshot.workspace_id !== immutableWorkspaceId
     || snapshot.snapshot_slug !== snapshotSlug
+    || (expectedSnapshotId !== undefined && snapshot.snapshot_id !== expectedSnapshotId)
     || (diskSlug !== undefined && snapshot.disk_slug !== diskSlug)
     || !SLUG.test(snapshot.disk_slug || "")
     || !["normal", "deleted"].includes(snapshot.status)
@@ -209,17 +237,28 @@ export async function createSemanticDiskSnapshot({ immutableWorkspaceId, request
   return validated;
 }
 
-export async function destroySemanticDiskSnapshot({ immutableWorkspaceId, snapshot, send }) {
+export async function destroySemanticDiskSnapshot({
+  immutableWorkspaceId,
+  snapshot,
+  snapshotId: immutableSnapshotId,
+  send,
+}) {
   if (typeof send !== "function") throw new Error("DiskSnapshot destroy transport is unavailable");
   const snapshotSlug = resourceSlug(snapshot, "DiskSnapshot name");
+  const expected = buildSemanticDiskSnapshotDestroyRequest({
+    expectedSnapshotId: immutableSnapshotId,
+  });
   const response = await send(diskSnapshotActionPath(immutableWorkspaceId, snapshotSlug, "destroy"), {
     method: "POST",
     redirect: "error",
+    headers: { "Content-Type": JSON_CONTENT_TYPE },
+    body: JSON.stringify(expected),
   });
   const validated = validateDiskSnapshotResponse(response, {
     immutableWorkspaceId,
     snapshotSlug,
-  }, ["snapshot_destroyed", "already_destroyed"], "destroy");
+    snapshotId: expected.expected_snapshot_id,
+  }, ["snapshot_destroyed", "already_deleted"], "destroy");
   if (validated.snapshot.status !== "deleted") {
     throw new Error("DiskSnapshot destroy did not return a tombstone");
   }
@@ -229,6 +268,7 @@ export async function destroySemanticDiskSnapshot({ immutableWorkspaceId, snapsh
 export async function restoreSemanticDiskSnapshot({
   immutableWorkspaceId,
   snapshot,
+  snapshotId: immutableSnapshotId,
   disk,
   expectedGeneration,
   send,
@@ -236,7 +276,10 @@ export async function restoreSemanticDiskSnapshot({
   if (typeof send !== "function") throw new Error("DiskSnapshot restore transport is unavailable");
   const snapshotSlug = resourceSlug(snapshot, "DiskSnapshot name");
   const diskSlug = resourceSlug(disk, "PersistentDisk name");
-  const expected = buildSemanticDiskSnapshotRestoreRequest({ expectedGeneration });
+  const expected = buildSemanticDiskSnapshotRestoreRequest({
+    expectedSnapshotId: immutableSnapshotId,
+    expectedGeneration,
+  });
   const response = await send(diskSnapshotActionPath(immutableWorkspaceId, snapshotSlug, "restore"), {
     method: "POST",
     redirect: "error",
@@ -246,6 +289,7 @@ export async function restoreSemanticDiskSnapshot({
   const validated = validateDiskSnapshotResponse(response, {
     immutableWorkspaceId,
     snapshotSlug,
+    snapshotId: expected.expected_snapshot_id,
     diskSlug,
   }, ["snapshot_restored", "already_restored"], "restore");
   if (

@@ -1135,6 +1135,22 @@ mod tests {
             .expect("request");
         assert!(parse_json::<CreateDiskRequest>(request).await.is_err());
 
+        let request = Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{}"#))
+            .expect("request");
+        assert!(parse_json::<DestroyDiskSnapshotRequest>(request)
+            .await
+            .is_err());
+
+        let request = Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"expected_generation":42}"#))
+            .expect("request");
+        assert!(parse_json::<RestoreDiskSnapshotRequest>(request)
+            .await
+            .is_err());
+
         let mut headers = HeaderMap::new();
         headers.insert(IDEMPOTENCY_KEY, HeaderValue::from_static("old-key"));
         assert!(reject_retired_headers(&headers).is_err());
@@ -1175,10 +1191,18 @@ mod tests {
             ("DISK_ATTACH_PATH", DISK_ATTACH_PATH),
             ("DISK_DETACH_PATH", DISK_DETACH_PATH),
             ("DISK_DESTROY_PATH", DISK_DESTROY_PATH),
+            ("SNAPSHOTS_COLLECTION_PATH", SNAPSHOTS_COLLECTION_PATH),
+            ("SNAPSHOT_ITEM_PATH", SNAPSHOT_ITEM_PATH),
+            ("SNAPSHOT_DESTROY_PATH", SNAPSHOT_DESTROY_PATH),
+            ("SNAPSHOT_RESTORE_PATH", SNAPSHOT_RESTORE_PATH),
         ] {
             assert!(source.contains(path), "path constant is missing: {path}");
+            let route_count = source.matches(&format!(".route({name},")).count()
+                + source
+                    .matches(&format!(".route(\n            {name},"))
+                    .count();
             assert_eq!(
-                source.matches(&format!(".route({name},")).count(),
+                route_count,
                 1,
                 "route mismatch: {path}"
             );

@@ -864,9 +864,12 @@ create 接受 `snapshot_slug + disk_slug`。相同 live slug、相同 Disk 返�
 `Strict + Active + Unowned`，Snapshot identity 与 live root pin 在同一事务写入。
 
 destroy 在同一 admission 下把产品行写成 deleted tombstone、删除 live root并标记 Volume 需要 GC；
-HTTP 请求不递归删除对象。restore 还接受 `expected_generation`，把 captured root发布成当前 generation
-的下一代并推进 lease epoch。所有动作都同步返回，不创建 Operation，也不能与本地
-`WarmRuntimeSnapshot` 混用。
+HTTP 请求不递归删除对象。destroy body 是
+`{"expected_snapshot_id":"snapshot_…"}`。restore 接受
+`{"expected_snapshot_id":"snapshot_…","expected_generation":42}`，把 captured root发布成当前
+generation 的下一代并推进 lease epoch。不可变 Snapshot ID 把两种动作都绑定到路径当前表示的精确
+occurrence，slug 删除后复用不能接收旧请求。所有动作都同步返回，不创建 Operation，也不能与本地
+`WarmRuntimeSnapshot` 混用。同一 occurrence 的 destroy 重试返回 `already_deleted`。
 
 ## 13. Node 注册与心跳
 

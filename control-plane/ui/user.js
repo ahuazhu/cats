@@ -1070,6 +1070,7 @@ document.querySelector("#snapshots-table").addEventListener("click", async (even
       await restoreSemanticDiskSnapshot({
         immutableWorkspaceId: workspaceId,
         snapshot: snapshot.name,
+        snapshotId: snapshot.id,
         disk: snapshot.disk_slug,
         expectedGeneration,
         send: authenticatedRequestWithStatus,
@@ -1079,6 +1080,7 @@ document.querySelector("#snapshots-table").addEventListener("click", async (even
       await destroySemanticDiskSnapshot({
         immutableWorkspaceId: workspaceId,
         snapshot: snapshot.name,
+        snapshotId: snapshot.id,
         send: authenticatedRequestWithStatus,
       });
       toast(t("user.snapshots.deleted"), snapshot.name);

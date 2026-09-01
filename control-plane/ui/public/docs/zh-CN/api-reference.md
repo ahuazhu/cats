@@ -53,7 +53,7 @@ Create 以精确的 `201 application/json` 返回已创建 Disk Projection。这
     POST /v1/workspaces/{workspace_id}/snapshots/{snapshot_slug}/actions/restore
     POST /v1/workspaces/{workspace_id}/snapshots/{snapshot_slug}/actions/destroy
 
-Create 使用 closed body `{"snapshot_slug":"before-upgrade","disk_slug":"project-data"}`。Restore 使用 closed body `{"expected_generation":42}`；它是目标磁盘的最新 Generation，不是 Snapshot 捕获时的 Generation。Restore 成功会把捕获的 Root 发布为 Generation 43，并返回 `disk_head_generation: 43`。Destroy 使用空 Body。这些同步 Route 不接收 Idempotency-Key，也不创建 Operation。
+Create 使用 closed body `{"snapshot_slug":"before-upgrade","disk_slug":"project-data"}`。Restore 使用 closed body `{"expected_snapshot_id":"snapshot_…","expected_generation":42}`；不可变 ID 把动作绑定到精确 Snapshot occurrence，Generation 是目标磁盘的最新 Generation，不是 Snapshot 捕获时的 Generation。Restore 成功会把捕获的 Root 发布为 Generation 43，并返回 `disk_head_generation: 43`。Destroy 使用 closed body `{"expected_snapshot_id":"snapshot_…"}`。这些同步 Route 不接收 Idempotency-Key，也不创建 Operation；同一不可变 occurrence 的 destroy 重试返回 `already_deleted`，绝不会作用于后来复用该 slug 的资源。
 
 Snapshot Projection 暴露不可变 Snapshot/Disk ID、当前 Slug、容量、状态、捕获 Generation 与创建/删除时间，绝不暴露内部 Root Hash 或 Object Key。第一版只支持恢复到原盘；Clone、Hot Snapshot 与跨 Workspace Copy 都不是可用 Route。
 

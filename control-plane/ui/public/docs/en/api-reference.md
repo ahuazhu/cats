@@ -54,11 +54,16 @@ Create returns the exact created Disk projection with `201 application/json`. Ca
     POST /v1/workspaces/{workspace_id}/snapshots/{snapshot_slug}/actions/destroy
 
 Create has the closed body `{"snapshot_slug":"before-upgrade","disk_slug":"project-data"}`.
-Restore has the closed body `{"expected_generation":42}`; this is the target
+Restore has the closed body
+`{"expected_snapshot_id":"snapshot_…","expected_generation":42}`; the ID binds
+the action to the exact Snapshot occurrence and the generation is the target
 disk's latest generation, not the Snapshot's captured generation. A successful
 restore publishes the captured Root at generation 43 and returns
-`disk_head_generation: 43`. Destroy has an empty body. These synchronous routes
-do not accept an Idempotency-Key and do not create an Operation.
+`disk_head_generation: 43`. Destroy has the closed body
+`{"expected_snapshot_id":"snapshot_…"}`. These synchronous routes do not accept
+an Idempotency-Key and do not create an Operation. Retrying destroy for the same
+immutable occurrence returns `already_deleted`; it never targets a later reuse
+of the slug.
 
 The Snapshot projection exposes immutable Snapshot/Disk IDs, their current
 slugs, capacity, status, captured generation, and create/delete times. It never

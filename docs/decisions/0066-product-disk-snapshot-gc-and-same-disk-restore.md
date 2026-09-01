@@ -33,10 +33,11 @@ POST /v1/workspaces/{workspace}/snapshots/{snapshot}/actions/destroy
 POST /v1/workspaces/{workspace}/snapshots/{snapshot}/actions/restore
 ```
 
-create 显式接受 `snapshot_slug` 与 `disk_slug`；restore 接受调用方刚读取的
-`expected_generation`。Snapshot ID 由服务端分配且永不复用。相同 live slug、相同 Disk 的 create
-返回原资源而不重新捕获较新 head；相同 slug 指向不同 Disk 是配置冲突。destroy 后 slug 可以复用，
-但新资源取得新的 Snapshot ID。
+create 显式接受 `snapshot_slug` 与 `disk_slug`；restore 接受调用方刚读取的不可变
+`expected_snapshot_id` 和 `expected_generation`，destroy 也接受 `expected_snapshot_id`，把动作绑定到
+路径当前表示的精确 Snapshot occurrence。Snapshot ID 由服务端分配且永不复用。相同 live slug、相同
+Disk 的 create 返回原资源而不重新捕获较新 head；相同 slug 指向不同 Disk 是配置冲突。destroy 后
+slug 可以复用，但新资源取得新的 Snapshot ID，旧 occurrence 的重试不能作用于新资源。
 
 公开视图暴露 captured generation，不暴露内部 Root hash/object ID。Disk 视图暴露可选
 `head_generation`：正常且已初始化的 Disk 必须有值；deleted Disk 没有当前 head。

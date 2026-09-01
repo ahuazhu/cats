@@ -2035,8 +2035,9 @@ fn run_disk_snapshot(client: &Client, cli: &Cli, cmd: &DiskSnapshotCommand) -> R
             anyhow::ensure!(
                 matches!(
                     response.code,
-                    SemanticSuccessCode::SnapshotDestroyed | SemanticSuccessCode::AlreadyDestroyed
-                ) && response.snapshot.snapshot_slug == slug
+                    SemanticSuccessCode::SnapshotDestroyed | SemanticSuccessCode::AlreadyDeleted
+                ) && response.snapshot.snapshot_id == snapshot.snapshot_id
+                    && response.snapshot.snapshot_slug == slug
                     && response.snapshot.status == DiskSnapshotStatus::Deleted,
                 "DiskSnapshot destroy response changed its semantic identity"
             );
@@ -3551,7 +3552,7 @@ mod tests {
     }
 
     #[test]
-    fn disk_snapshot_destroy_binds_the_exact_snapshot_occurrence() {
+    fn disk_snapshot_destroy_retry_binds_the_exact_snapshot_occurrence() {
         use clap::Parser as _;
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3559,7 +3560,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let responses: [&[u8]; 2] = [
                 br#"{"snapshot_id":"snapshot_01","workspace_id":"ws_01","snapshot_slug":"before-upgrade","disk_id":"disk_01","disk_slug":"data","size_bytes":1073741824,"status":"normal","captured_generation":42,"created_at_unix_ms":1,"deleted_at_unix_ms":null}"#,
-                br#"{"status":"ok","code":"snapshot_destroyed","snapshot":{"snapshot_id":"snapshot_01","workspace_id":"ws_01","snapshot_slug":"before-upgrade","disk_id":"disk_01","disk_slug":"data","size_bytes":1073741824,"status":"deleted","captured_generation":42,"created_at_unix_ms":1,"deleted_at_unix_ms":2},"disk_head_generation":77}"#,
+                br#"{"status":"already_done","code":"already_deleted","snapshot":{"snapshot_id":"snapshot_01","workspace_id":"ws_01","snapshot_slug":"before-upgrade","disk_id":"disk_01","disk_slug":"data","size_bytes":1073741824,"status":"deleted","captured_generation":42,"created_at_unix_ms":1,"deleted_at_unix_ms":2},"disk_head_generation":77}"#,
             ];
             let mut captured = Vec::new();
             for response in responses {

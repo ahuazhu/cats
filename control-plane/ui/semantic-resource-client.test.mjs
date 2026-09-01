@@ -6,6 +6,7 @@ import {
   buildSemanticCatCreateRequest,
   buildSemanticDiskCreateRequest,
   buildSemanticDiskSnapshotCreateRequest,
+  buildSemanticDiskSnapshotDestroyRequest,
   buildSemanticDiskSnapshotRestoreRequest,
   catCollectionPath,
   createSemanticCat,
@@ -38,7 +39,14 @@ test("semantic builders emit only the current scenario-identity DTOs", () => {
     snapshot_slug: "before-upgrade",
     disk_slug: "data-disk",
   });
-  assert.deepEqual(buildSemanticDiskSnapshotRestoreRequest({ expectedGeneration: 42 }), {
+  assert.deepEqual(buildSemanticDiskSnapshotDestroyRequest({ expectedSnapshotId: "snapshot_01" }), {
+    expected_snapshot_id: "snapshot_01",
+  });
+  assert.deepEqual(buildSemanticDiskSnapshotRestoreRequest({
+    expectedSnapshotId: "snapshot_01",
+    expectedGeneration: 42,
+  }), {
+    expected_snapshot_id: "snapshot_01",
     expected_generation: 42,
   });
   assert.equal(catCollectionPath("ws_01"), "/v1/workspaces/ws_01/cats");
@@ -64,7 +72,11 @@ test("DiskSnapshot paths reject mutable-looking or non-canonical resource keys",
     () => diskSnapshotActionPath("ws_01", "snapshot", "clone"),
     () => buildSemanticDiskSnapshotCreateRequest({ disk: "Data", name: "before-upgrade" }),
     () => buildSemanticDiskSnapshotCreateRequest({ disk: "data", name: "before upgrade" }),
-    () => buildSemanticDiskSnapshotRestoreRequest({ expectedGeneration: -1 }),
+    () => buildSemanticDiskSnapshotDestroyRequest({ expectedSnapshotId: "other_01" }),
+    () => buildSemanticDiskSnapshotRestoreRequest({
+      expectedSnapshotId: "snapshot_01",
+      expectedGeneration: -1,
+    }),
   ]) {
     assert.throws(callback);
   }
@@ -124,6 +136,7 @@ test("DiskSnapshot restore carries the latest target-disk generation", async () 
   const response = await restoreSemanticDiskSnapshot({
     immutableWorkspaceId: "ws_01",
     snapshot: "before-upgrade",
+    snapshotId: "snapshot_01",
     disk: "data",
     expectedGeneration: 77,
     send: async (path, options) => {
@@ -143,15 +156,19 @@ test("DiskSnapshot restore carries the latest target-disk generation", async () 
   });
   assert.equal(response.code, "snapshot_restored");
   assert.equal(sent.path, "/v1/workspaces/ws_01/snapshots/before-upgrade/actions/restore");
-  assert.deepEqual(JSON.parse(sent.options.body), { expected_generation: 77 });
+  assert.deepEqual(JSON.parse(sent.options.body), {
+    expected_snapshot_id: "snapshot_01",
+    expected_generation: 77,
+  });
   assert.equal("Idempotency-Key" in sent.options.headers, false);
 });
 
-test("DiskSnapshot destroy is a bodyless scenario action and validates the tombstone identity", async () => {
+test("DiskSnapshot destroy carries the exact occurrence and accepts its already-deleted tombstone", async () => {
   let sent;
   await destroySemanticDiskSnapshot({
     immutableWorkspaceId: "ws_01",
     snapshot: "before-upgrade",
+    snapshotId: "snapshot_01",
     send: async (path, options) => {
       sent = { path, options };
       return {
@@ -159,17 +176,20 @@ test("DiskSnapshot destroy is a bodyless scenario action and validates the tombs
         contentType: "application/json",
         contentEncoding: "",
         value: {
-          status: "ok",
-          code: "snapshot_destroyed",
+          status: "already_done",
+          code: "already_deleted",
           snapshot: snapshotView({ status: "deleted", deleted_at_unix_ms: 2 }),
           disk_head_generation: 42,
         },
       };
     },
   });
-  assert.deepEqual(sent, {
-    path: "/v1/workspaces/ws_01/snapshots/before-upgrade/actions/destroy",
-    options: { method: "POST", redirect: "error" },
+  assert.equal(sent.path, "/v1/workspaces/ws_01/snapshots/before-upgrade/actions/destroy");
+  assert.deepEqual(sent.options, {
+    method: "POST",
+    redirect: "error",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ expected_snapshot_id: "snapshot_01" }),
   });
 });
 
@@ -177,6 +197,7 @@ test("DiskSnapshot actions reject responses rebound to another resource", async 
   await assert.rejects(restoreSemanticDiskSnapshot({
     immutableWorkspaceId: "ws_01",
     snapshot: "before-upgrade",
+    snapshotId: "snapshot_01",
     disk: "data",
     expectedGeneration: 77,
     send: async () => ({
@@ -188,6 +209,27 @@ test("DiskSnapshot actions reject responses rebound to another resource", async 
         code: "snapshot_restored",
         snapshot: snapshotView({ disk_slug: "other" }),
         disk_head_generation: 78,
+      },
+    }),
+  }), /semantic identity binding/);
+
+  await assert.rejects(destroySemanticDiskSnapshot({
+    immutableWorkspaceId: "ws_01",
+    snapshot: "before-upgrade",
+    snapshotId: "snapshot_01",
+    send: async () => ({
+      status: 200,
+      contentType: "application/json",
+      contentEncoding: "",
+      value: {
+        status: "ok",
+        code: "snapshot_destroyed",
+        snapshot: snapshotView({
+          snapshot_id: "snapshot_02",
+          status: "deleted",
+          deleted_at_unix_ms: 2,
+        }),
+        disk_head_generation: 42,
       },
     }),
   }), /semantic identity binding/);
