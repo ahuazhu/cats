@@ -11,8 +11,10 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use cats_api::chunk::{self, keys, CHUNKS_PER_LEAF, CHUNK_SIZE, DIRTY_PAGE_SIZE, MAX_VOLUME_BYTES};
-use cats_api::runtime_reconciliation::{Id, RemoteHead};
+use cats_protocol::chunk::{
+    self, keys, CHUNKS_PER_LEAF, CHUNK_SIZE, DIRTY_PAGE_SIZE, MAX_VOLUME_BYTES,
+};
+use cats_protocol::runtime_reconciliation::{Id, RemoteHead};
 use cats_storage::{validate_list_page, BlobError, BlobStore, BLOB_LIST_PAGE_MAX_KEYS};
 
 use crate::engine::MAX_DELTA_LAYERS;

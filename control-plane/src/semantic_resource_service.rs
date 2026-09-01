@@ -1682,7 +1682,15 @@ where
                     ));
                 }
             };
-            let generation = self.disk_generation(&snapshot.disk_id).await?;
+            let generation = snapshot
+                .deleted_head_generation
+                .and_then(|generation| u64::try_from(generation).ok())
+                .ok_or_else(|| {
+                    semantic_error(
+                        wire::SemanticErrorCode::InternalError,
+                        "DiskSnapshot tombstone omitted its destroy generation",
+                    )
+                })?;
             Ok(wire::DiskSnapshotResponse {
                 status,
                 code,
@@ -2577,6 +2585,7 @@ mod tests {
                         db::DeleteDiskSnapshotOutcome::AlreadyDeleted(snapshot.clone())
                     } else {
                         snapshot.deleted_at = Some(2);
+                        snapshot.deleted_head_generation = Some(1);
                         db::DeleteDiskSnapshotOutcome::Deleted(snapshot.clone())
                     }
                 })
@@ -2773,6 +2782,7 @@ mod tests {
             volume_id: "vol_current".to_owned(),
             size_bytes: 100,
             captured_generation: 1,
+            deleted_head_generation: None,
             created_at: 1,
             deleted_at: None,
         }
@@ -2944,6 +2954,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(destroyed.code, wire::SemanticSuccessCode::SnapshotDestroyed);
+        *api.resources.disk.lock().unwrap() = None;
 
         let replayed = api
             .destroy_snapshot(

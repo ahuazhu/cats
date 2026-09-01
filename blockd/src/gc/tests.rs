@@ -4,8 +4,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cats_api::chunk::{self, CHUNK_SIZE};
-use cats_api::runtime_reconciliation::{AsciiText, Generation, Id, RemoteHead, Sha256Digest};
+use cats_protocol::chunk::{self, CHUNK_SIZE};
+use cats_protocol::runtime_reconciliation::{
+    AsciiText, Generation, Id, RemoteHead, Sha256Digest,
+};
 use cats_metadata_store_sqlite::SqliteMetadataStore;
 use cats_object_store_file::FileBlobStore;
 use cats_storage::{BlobStore, MetadataStore, SnapshotRow, VolumeHead};
@@ -103,9 +105,9 @@ impl Fixture {
                 attachment_id: ATTACHMENT.into(),
                 lease_ttl_ms: 15_000,
                 durability: DurabilityMode::Strict,
-                max_staged_bytes: cats_api::blockd::DEFAULT_MAX_STAGED_BYTES,
-                max_staged_packs: cats_api::blockd::DEFAULT_MAX_STAGED_PACKS,
-                max_local_bytes: cats_api::blockd::DEFAULT_MAX_LOCAL_BYTES,
+                max_staged_bytes: cats_protocol::blockd::DEFAULT_MAX_STAGED_BYTES,
+                max_staged_packs: cats_protocol::blockd::DEFAULT_MAX_STAGED_PACKS,
+                max_local_bytes: cats_protocol::blockd::DEFAULT_MAX_LOCAL_BYTES,
             },
             1,
             self.blob.clone(),

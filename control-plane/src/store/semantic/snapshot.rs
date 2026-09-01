@@ -4,8 +4,8 @@
 //! `disk_snapshot_records` row exists only while the snapshot is a live GC
 //! root, and keeps PostgreSQL foreign keys to the exact Disk/Volume authority.
 
-use cats_api::error::ApiError;
-use cats_api::runtime_reconciliation::{
+use cats_protocol::error::ApiError;
+use cats_protocol::runtime_reconciliation::{
     Generation, Id, RandomId128, RemoteHead, Sha256Digest, SnapshotRestoreRequest,
     SnapshotRestoreResult,
 };
@@ -22,6 +22,7 @@ use crate::store::{lock_semantic_disk, Result, Store};
 const SNAPSHOT_COLUMNS: &str = "
     s.snapshot_id, s.workspace_id, s.snapshot_slug, s.disk_id,
     s.disk_slug, s.volume_id, s.size_bytes, s.captured_generation,
+    s.deleted_head_generation,
     r.record::text AS snapshot_record_json, r.head_generation,
     r.head_root_hash, r.head_root_object_id, s.created_at, s.deleted_at";
 
@@ -102,6 +103,7 @@ pub struct DiskSnapshotRecord {
     pub volume_id: String,
     pub size_bytes: i64,
     pub captured_generation: i64,
+    pub deleted_head_generation: Option<i64>,
     pub created_at: i64,
     pub deleted_at: Option<i64>,
 }
@@ -404,8 +406,9 @@ impl Store {
             transaction.execute(
                 "INSERT INTO disk_snapshots (
                     snapshot_id,workspace_id,snapshot_slug,disk_id,disk_slug,
-                    volume_id,size_bytes,captured_generation,created_at,deleted_at
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULL)",
+                    volume_id,size_bytes,captured_generation,
+                    deleted_head_generation,created_at,deleted_at
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NULL,$9,NULL)",
                 &[
                     &request.snapshot_id,
                     &request.workspace_id,
@@ -521,10 +524,17 @@ impl Store {
                     &[],
                 )?
                 .get(0);
+            let deleted_head_generation = generation_to_i64(volume.head.generation)?;
             exactly_one(transaction.execute(
-                "UPDATE disk_snapshots SET deleted_at=$3
+                "UPDATE disk_snapshots
+                    SET deleted_at=$3,deleted_head_generation=$4
                   WHERE snapshot_id=$1 AND workspace_id=$2 AND deleted_at IS NULL",
-                &[&snapshot_id, &workspace_id, &deleted_at],
+                &[
+                    &snapshot_id,
+                    &workspace_id,
+                    &deleted_at,
+                    &deleted_head_generation,
+                ],
             )?)?;
             exactly_one(transaction.execute(
                 "DELETE FROM disk_snapshot_records WHERE snapshot_id=$1",
@@ -736,13 +746,19 @@ fn snapshot_from_joined_row(
     let volume_id: String = row.try_get("volume_id")?;
     let size_bytes: i64 = row.try_get("size_bytes")?;
     let captured_generation: i64 = row.try_get("captured_generation")?;
+    let deleted_head_generation: Option<i64> = row.try_get("deleted_head_generation")?;
     let record_json: Option<String> = row.try_get("snapshot_record_json")?;
     let generation: Option<i64> = row.try_get("head_generation")?;
     let root_hash: Option<String> = row.try_get("head_root_hash")?;
     let root_object_id: Option<String> = row.try_get("head_root_object_id")?;
     let created_at: i64 = row.try_get("created_at")?;
     let deleted_at: Option<i64> = row.try_get("deleted_at")?;
-    if size_bytes <= 0 || captured_generation <= 0 || created_at < 0 {
+    if size_bytes <= 0
+        || captured_generation <= 0
+        || deleted_head_generation.is_some_and(|generation| generation <= 0)
+        || created_at < 0
+        || deleted_at.is_some() != deleted_head_generation.is_some()
+    {
         return Err(corrupt());
     }
     let product = DiskSnapshotRecord {
@@ -754,6 +770,7 @@ fn snapshot_from_joined_row(
         volume_id,
         size_bytes,
         captured_generation,
+        deleted_head_generation,
         created_at,
         deleted_at,
     };
@@ -1177,7 +1194,9 @@ fn remote_head(
         .map(|value| Sha256Digest::new(value).ok_or_else(corrupt))
         .transpose()?;
     let root_object_id = root_object_id
-        .map(|value| cats_api::runtime_reconciliation::AsciiText::new(value).ok_or_else(corrupt))
+        .map(|value| {
+            cats_protocol::runtime_reconciliation::AsciiText::new(value).ok_or_else(corrupt)
+        })
         .transpose()?;
     if (generation.get() == 0) != (root_hash.is_none() && root_object_id.is_none())
         || (root_hash.is_some() != root_object_id.is_some())

@@ -8,8 +8,8 @@
 
 use std::time::Duration;
 
-use cats_api::error::ApiError;
-use cats_api::runtime_reconciliation::{
+use cats_protocol::error::ApiError;
+use cats_protocol::runtime_reconciliation::{
     AsciiText, Generation, Id, RemoteHead, Sha256Digest, UnixMillis, VolumeAdminState,
     VolumeDurability, VolumeRecord,
 };
@@ -670,7 +670,7 @@ fn corrupt_tx() -> AuthorityTransactionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cats_api::runtime_reconciliation::FenceEpoch;
+    use cats_protocol::runtime_reconciliation::FenceEpoch;
 
     fn id(value: &str) -> Id {
         Id::new(value).unwrap()

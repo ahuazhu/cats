@@ -304,6 +304,42 @@ fn a_live_product_snapshot_blocks_both_disk_delete_phases() {
 }
 
 #[test]
+fn deleted_snapshot_replays_its_destroy_generation_after_storage_disk_removal() {
+    let store = store();
+    let candidate = candidate();
+    store
+        .ensure_semantic_strict_disk_created(&candidate)
+        .unwrap();
+    initialize_disk(&store, &candidate);
+    insert_snapshot(&store, &candidate);
+
+    let deleted = match store
+        .delete_semantic_disk_snapshot("ws_snapshot_delete", "snapshot_delete_guard")
+        .unwrap()
+    {
+        crate::store::semantic::DeleteDiskSnapshotOutcome::Deleted(snapshot) => snapshot,
+        other => panic!("snapshot was not deleted: {other:?}"),
+    };
+    assert_eq!(deleted.deleted_head_generation, Some(1));
+
+    assert_eq!(
+        store.begin_semantic_strict_disk_delete(&candidate).unwrap(),
+        SemanticStrictDeleteState::Deleting
+    );
+    store
+        .complete_semantic_strict_disk_delete(&candidate)
+        .unwrap();
+    assert!(store.semantic_strict_disk_is_absent(&candidate).unwrap());
+
+    let tombstone = store
+        .find_semantic_snapshot_by_id("snapshot_delete_guard")
+        .unwrap()
+        .expect("snapshot tombstone survives its storage Disk");
+    assert!(tombstone.deleted_at.is_some());
+    assert_eq!(tombstone.deleted_head_generation, Some(1));
+}
+
+#[test]
 fn garbage_collecting_keeps_disk_projection_readable_and_rejects_binding_mutations() {
     let store = store();
     let candidate = candidate();

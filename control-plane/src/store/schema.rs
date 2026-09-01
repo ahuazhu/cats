@@ -474,7 +474,8 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             initialization_commit_receipt_digest
        FROM disk_records WHERE FALSE",
     "SELECT snapshot_id, workspace_id, snapshot_slug, disk_id, disk_slug,
-            volume_id, size_bytes, captured_generation, created_at, deleted_at
+            volume_id, size_bytes, captured_generation,
+            deleted_head_generation, created_at, deleted_at
        FROM disk_snapshots WHERE FALSE",
     "SELECT snapshot_id, record, disk_id, volume_id, size_bytes,
             head_generation, head_root_hash, head_root_object_id, created_at
@@ -912,8 +913,11 @@ CREATE TABLE IF NOT EXISTS disk_snapshots (
     volume_id TEXT NOT NULL,
     size_bytes BIGINT NOT NULL CHECK (size_bytes > 0),
     captured_generation BIGINT NOT NULL CHECK (captured_generation > 0),
+    deleted_head_generation BIGINT CHECK (deleted_head_generation > 0),
     created_at BIGINT NOT NULL CHECK (created_at >= 0),
     deleted_at BIGINT CHECK (deleted_at >= created_at),
+    CONSTRAINT disk_snapshots_deleted_result_exact
+        CHECK ((deleted_at IS NULL) = (deleted_head_generation IS NULL)),
     CONSTRAINT disk_snapshots_workspace_identity_unique
         UNIQUE (workspace_id, snapshot_id)
 );

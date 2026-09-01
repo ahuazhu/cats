@@ -52,7 +52,9 @@ create、destroy 和 restore 都是 ADR-0059 的有界同步 mutation，不恢�
 schema v20 使用两层记录：
 
 - `disk_snapshots` 保存产品身份、Workspace/slug、创建时的 Disk 展示身份、volume/size、captured
-  generation 及 Normal/Deleted tombstone；它不依赖最终会物理删除的 storage Disk/Volume 行；
+  generation 及 Normal/Deleted tombstone；destroy 时还固化返回的 Disk head generation，使同一
+  occurrence 在父 Disk/Volume 删除后仍能回答 `already_deleted`。它不依赖最终会物理删除的 storage
+  Disk/Volume 行；
 - `disk_snapshot_records` 只保存仍参与 retention 的 canonical Snapshot record 和精确 captured
   `RemoteHead`，并通过外键绑定当前 `disk_records`、`volume_records` 与产品 Snapshot。
 
