@@ -126,6 +126,11 @@
             <div class="table-wrap"><table><thead><tr><th data-i18n="common.name">Name</th><th data-i18n="common.type">Type</th><th data-i18n="common.capacity">Capacity</th><th data-i18n="common.status">Status</th><th data-i18n="user.disks.boundCat">Attached Cat</th></tr></thead><tbody id="disks-table"></tbody></table></div>
             <div class="empty-state is-hidden" id="disks-empty"><span>▱</span><h3 data-i18n="user.disks.emptyTitle">No independent disks</h3><p data-i18n="user.disks.emptyDescription">RootDisk is created with each Cat; extra PersistentDisks appear here.</p></div>
           </section>
+          <section class="panel storage-snapshots-panel">
+            <header class="panel-header"><div><small data-i18n="section.storage">STORAGE</small><h2 data-i18n="user.snapshots.title">Disk Snapshots</h2><p data-i18n="user.snapshots.description">Remote restore points for Cold PersistentDisks. Restore replaces the disk's current contents.</p></div><button class="button button-primary" id="create-snapshot-button">＋ <span data-i18n="user.snapshots.create">Create snapshot</span></button></header>
+            <div class="table-wrap"><table><thead><tr><th data-i18n="common.name">Name</th><th data-i18n="user.snapshots.disk">Disk</th><th data-i18n="user.snapshots.generation">Captured generation</th><th data-i18n="common.created">Created</th><th class="align-right" data-i18n="common.actions">Actions</th></tr></thead><tbody id="snapshots-table"></tbody></table></div>
+            <div class="empty-state is-hidden" id="snapshots-empty"><span>◫</span><h3 data-i18n="user.snapshots.emptyTitle">No disk snapshots</h3><p data-i18n="user.snapshots.emptyDescription">Create a restore point before a risky upgrade or data migration.</p></div>
+          </section>
         </section>
 
         <section class="view" id="view-billing">
@@ -202,6 +207,19 @@
       <div class="form-grid"><label class="span-2"><span data-i18n="common.name">Name</span><input name="name" placeholder="workspace-data" required></label><label class="span-2"><span data-i18n="user.diskDialog.size">Capacity (GiB)</span><input name="size_gib" type="number" min="0.0625" step="0.0625" value="1" required></label></div>
       <p class="form-error" data-form-error></p>
       <footer><button class="button button-quiet" value="cancel" data-i18n="common.cancel">Cancel</button><button class="button button-primary" value="default" data-i18n="user.diskDialog.submit">Create disk</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="create-snapshot-dialog" class="modal">
+    <form method="dialog" id="create-snapshot-form">
+      <header><div><small data-i18n="user.snapshotDialog.eyebrow">NEW RESTORE POINT</small><h2 data-i18n="user.snapshotDialog.title">Create DiskSnapshot</h2></div><button class="icon-button" value="cancel" data-i18n-aria-label="common.close" aria-label="Close">×</button></header>
+      <div class="form-grid">
+        <label class="span-2"><span data-i18n="user.snapshots.disk">Disk</span><select name="disk" required></select></label>
+        <label class="span-2"><span data-i18n="common.name">Name</span><input name="name" placeholder="before-upgrade" pattern="[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?" maxlength="63" required></label>
+      </div>
+      <p class="form-hint" data-i18n="user.snapshotDialog.coldHint">The disk must be remotely durable and its Cat, if attached, must be Cold.</p>
+      <p class="form-error" data-form-error></p>
+      <footer><button class="button button-quiet" value="cancel" data-i18n="common.cancel">Cancel</button><button class="button button-primary" value="default" data-i18n="user.snapshotDialog.submit">Create snapshot</button></footer>
     </form>
   </dialog>
 

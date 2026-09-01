@@ -76,13 +76,13 @@ heartbeat 利用率不成为 placement authority。
 | 范围 | 当前事实 | 仍未完成或未验证 |
 |---|---|---|
 | 公共协议 | Cat/Disk/Node 同步 DTO、稳定错误码、内部 Bearer 认证已组成；严格拒绝旧幂等和 Operation 字段；最终发布候选门已通过 | 后续改动必须在自身 exact commit 重跑门禁 |
-| PostgreSQL | v19 当前资源表、可复用 slug 的部分唯一索引、Disk binding RWO、Cat 动作 CAS、数据库接收时间心跳和当前入口目标已组成；旧 lifecycle/Route settlement schema 已删除并通过 PostgreSQL/full 门 | 不因此承诺跨长期分区的物理单写 |
+| PostgreSQL | v20 当前资源表、可复用 slug 的部分唯一索引、Disk/Snapshot authority、Cat 动作 CAS、数据库接收时间心跳和当前入口目标已组成；旧 lifecycle/Route settlement schema 已删除 | 不因此承诺跨长期分区的物理单写 |
 | Control | 同步 lifecycle、超时后 Node 查询、资源 API、入口先撤后发、Node 注册/心跳/reset、planned drain 和失联恢复已接入生产进程；真实 Control→noded HTTP 与 production physical E2E 已通过 | 新版本仍须重跑 exact release qualification |
 | noded | 同步 HTTP server、按 Cat 串行、destroy 清理、reset gate、注册/heartbeat supervisor和Cloud Hypervisor实际effects已组成 | vhost-user-blk 等替代frontend仍按各自release资格验证 |
-| PersistentDisk | slug、binding、精确卷/文件系统身份、Strict backend、Guest mount-ready与CH物理挂载链已组成；Cold detach/attach和同盘重挂production E2E已通过 | DiskSnapshot/GC仍是独立开放项 |
+| PersistentDisk | slug、binding、精确卷/文件系统身份、Strict backend、Guest mount-ready、Cold DiskSnapshot、完整 root GC 保护与同盘 restore 已组成；Cold detach/attach和同盘重挂production E2E已通过 | hot Snapshot、跨盘 clone和真实 Host-loss qualification 仍开放 |
 | Node 失联恢复 | offline后按数据库当前事实反复发现未迁走Cat，先撤入口、在其他running Node恢复、Ready后发布；真实两Node reset/re-register已验证 | 协议不承诺双跑窗口内严格物理单实例或长期不对称网络安全 |
 | 入口 | 当前 `cat_id -> node_id` 目标和 withdraw/publish 顺序已组成 | 公网 Gateway/Endpoint 传输协议不在本次 Control/Node 合同范围 |
-| 底层存储 | ChunkStore、delta、golden root、NBD/vhost-user-blk、MetadataStore owner/epoch 和相关测试已存在 | 本次同步 lifecycle 只允许远端持久模式；磁盘产品 E2E、Snapshot/GC 和真实 Host-loss 资格仍开放 |
+| 底层存储 | ChunkStore、delta、golden root、NBD/vhost-user-blk、MetadataStore owner/epoch、Snapshot restore transition 与 Control-owned GC 已存在 | 产品只允许远端持久模式；真实 Host-loss 资格仍开放 |
 | 独立 Node authority | `runtime_node_authority` 管理入口仍独立组成 | 它不成为 Cat 生命周期、心跳或失联恢复的第二套协议 |
 
 ## 4. 组件职责
@@ -125,7 +125,18 @@ PersistentDisk 有不可变 `disk_id` 和 Workspace 内用户指定的 `disk_slu
 `UNIQUE(cat_id, mount_path)` 防止挂载点冲突。binding 当前是否存在就是产品关联事实；这条数据库
 约束不是失联双跑窗口内的物理单写证明。
 
-### 5.3 Node
+### 5.3 DiskSnapshot
+
+DiskSnapshot 是 Workspace 下的一等资源，不是 Cat 或 Warm 的内部状态。产品 identity/tombstone 与只在
+live 时存在的 GC root pin 分离；create、destroy、restore 都只在 Disk 已初始化、Volume Strict/Unowned，
+且绑定 Cat 稳定 Cold 时发生。
+
+同盘 restore 不把 generation 倒回历史值，而是把 captured root 作为当前 generation 的下一代发布并推进
+lease epoch；旧 attachment 因此不能继续发布。Control-owned GC 在 PostgreSQL maintenance reservation
+下同时保护 current root 与全部 live Snapshot root。完整合同见
+[ADR-0066](decisions/0066-product-disk-snapshot-gc-and-same-disk-restore.md)。
+
+### 5.4 Node
 
 Node 有内部 `node_id`、不可变展示名 `node_name` 和 Control 可达的 `control_endpoint`。Node 注册时
 显式上报地址；普通 heartbeat 不能修改展示名或回连地址。
@@ -133,7 +144,7 @@ Node 有内部 `node_id`、不可变展示名 `node_name` 和 Control 可达的 
 `node_heartbeats.last_heartbeat_at` 由 PostgreSQL 接收时间写入并用于失联判断；Node 自报时间只作诊断。
 `running` Node 才能接受 placement；`draining/offline/reset_required/deleted` 都不能。
 
-### 5.4 每类事实的唯一写入方
+### 5.5 每类事实的唯一写入方
 
 | 事实 | 写入 authority | 非 authority |
 |---|---|---|
@@ -141,6 +152,7 @@ Node 有内部 `node_id`、不可变展示名 `node_name` 和 Control 可达的 
 | VMM/blockd/Guest/mount 是否实际存在 | noded 的实际执行与查询 | Control 的旧稳定 state |
 | 当前新流量目标 | PostgreSQL 当前入口目标 | Node heartbeat、历史 placement |
 | volume writer、attachment epoch、remote root | MetadataStore CAS | `disk_bindings`、Cat state、入口目标 |
+| Snapshot identity、live root 与 GC reservation | PostgreSQL Snapshot/Volume rows | blockd 内存 Map、对象 LIST、Warm snapshot |
 | 本地尚未远端发布的数据 | 原 Node 的持久数据路径 | Control 当前行、可删除 cache 的猜测 |
 | Host 是否已经隔离 | 可信外部 Host fence 证据 | heartbeat timeout、入口撤销、Node offline |
 | fleet provisioning/credential policy | 独立 `runtime_node_authority` | Cat lifecycle 和 Node heartbeat |
@@ -306,13 +318,13 @@ binding 和 signed poll/result lane 不是当前 Control/Node 生命周期协议
 
 ### 12.2 Clean-slate 部署
 
-首次部署使用一个空 v19 schema，不迁移旧 Cat/Disk/Node/runtime 数据，不双读、双写或运行混合版本：
+首次部署使用一个空 v20 schema，不迁移旧 Cat/Disk/Node/Snapshot/runtime 数据，不双读、双写或运行混合版本：
 
 1. 构建并验证同一版本的 Control、noded 和 CLI；
 2. 进入维护窗口，关闭公网入口和 mutation；
 3. 停止全部旧 Control、Node 和入口 write path；
 4. 轮换或撤销旧内部凭据；
-5. 删除旧产品数据并创建空 v19 schema；启动必须拒绝旧 schema version；
+5. 删除旧产品数据并创建空 v20 schema；启动必须拒绝旧 schema version；
 6. 先启动 Control，再让空净 Node 用 `node_id/node_name/control_endpoint` 注册；
 7. 完成定向 smoke、纵向测试和最终门禁后再开放 mutation 和入口。
 

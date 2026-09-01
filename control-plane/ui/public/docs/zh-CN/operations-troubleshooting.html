@@ -24,8 +24,8 @@ cats operation wait OPERATION_ID</code></pre>
   <li>如果 Suspended/Warm 恢复失败，确认 Controller 已收敛到 Cold fallback，而不是停在中间态。</li>
 </ol>
 
-<h2 id="disk-busy">Disk Mutation 不可用</h2>
-<p>执行 <code>cats disk get DISK_ID</code> 查看当前 Projection。Attachment、Snapshot、容量变更与删除不属于 release product surface。不要探测 Legacy Route，也不要绕过 Authority/Fencing Conflict。</p>
+<h2 id="snapshot-rejected">Snapshot Create 或 Restore 被拒绝</h2>
+<p>执行 <code>cats disk get DISK_SLUG --json</code> 与 <code>cats disk snapshot show SNAPSHOT_SLUG --json</code>。Create 与 Restore 要求磁盘已远端持久且 Unowned；磁盘已绑定时，其 Cat 必须稳定处于 Cold。<code>head_conflict</code> 表示磁盘在客户端预检读取后发生变化；先刷新事实，再决定是否重试。<code>snapshot_corrupt</code> 会 fail closed，需要管理员排查；不要绕过 GC 或 Volume Authority 检查。</p>
 
 <h2 id="lifecycle-unavailable">Lifecycle 命令不可用</h2>
 <p>Signed Runtime Cutover 期间有意不提供 Lifecycle 与 Guest-command Client。请保留已接受的 Create Operation ID 与当前 Cat Projection；不要替换为旧命令或旧 Route。</p>

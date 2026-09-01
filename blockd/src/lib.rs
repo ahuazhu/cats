@@ -24,6 +24,7 @@ pub mod crashpoint;
 pub mod engine;
 pub mod format;
 pub mod frontend_contract;
+pub mod gc;
 pub mod image;
 pub mod nbd;
 pub mod runtime_socket_namespace;

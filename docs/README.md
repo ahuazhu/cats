@@ -24,7 +24,7 @@
 
 当前分支已经组成：
 
-- v19 Cat/Disk/Node 当前资源 schema、可复用 slug、Disk binding RWO、数据库时间 heartbeat 和当前入口目标；
+- v20 Cat/Disk/Node/Snapshot 当前资源 schema、可复用 slug、Disk binding RWO、数据库时间 heartbeat 和当前入口目标；
 - 同步 Cat/Disk API、CLI、Control lifecycle 和 noded HTTP client/server；
 - noded 按 Cat 串行、destroy 清理、Node registration/heartbeat/reset；Control 的管理接口先 cordon Node，
   再以可重试的 Cold-based drain 迁移其 Running/Suspended/Warm Cat；
@@ -32,13 +32,14 @@
 - `controld` 对普通 `current_action` 的单例超时恢复扫描，按 noded 实际状态收敛而不使用 heartbeat 结算；
 - 真实 Control→noded HTTP 的 Cat 全状态机和重复调用语义；
 - 已接入 production composition 的 Strict PersistentDisk provision/delete backend，包括 volume/disk authority 和 BlobStore delete postcondition；
+- Workspace 级 DiskSnapshot create/list/get/destroy、完整 live-root GC 保护和 Cold/Unowned 同盘 restore；
 - production Control 只挂载 semantic resource/Node 主监听，旧 lifecycle Operation、AgentSession、
   observation settlement 和 Route Operation 不再进入生产 composition；
 - 独立 `runtime_node_authority` 管理入口继续组成，但不承担 Cat lifecycle authority。
 
 仍开放：
 
-- product DiskSnapshot/GC、自动cloud/BMC Host fencing与长期不对称网络合同；
+- hot Snapshot、跨盘 clone、Snapshot schedule、自动cloud/BMC Host fencing与长期不对称网络合同；
 - 每个后续交付在自身exact commit重跑full、Linux和适用production qualification，不能复用旧发布候选绿灯。
 
 各模块的当前实现边界由代码、校准测试和对应的现行合同共同决定；Git history 保存切换实施记录。
@@ -62,7 +63,7 @@
 | [blockd protocol](specs/blockd-protocol.md) | Implemented data plane | Chunk/Map/FLUSH；生命周期只使用远端持久模式 |
 | [Guest Runtime API](specs/guest-runtime-api.md) | Frozen v1 | Guest-local `/run/cats/runtime.sock` 能力 |
 | [Interactive Shell](specs/interactive-shell-protocol.md) | Implemented v1 | WorkOS 鉴权 WebSocket PTY |
-| [Volume Authority](specs/volume-authority.md) | Current v19 storage contract | direct acquire/renew/release/delete、owner/epoch、remote root 和 blockd serving admission |
+| [Volume Authority](specs/volume-authority.md) | Current v20 storage contract | direct acquire/renew/release/delete、Snapshot restore/GC、owner/epoch、remote root 和 blockd serving admission |
 | [Runtime Placement Policy v1](specs/runtime-placement-policy-v1.md) | Fleet policy foundation retained | 独立 provisioner-owned capacity/policy；不充当 Cat action authority |
 | [A23 Provisioner Tooling v1](specs/a23-production-provisioner-tooling-v1.md) | Operations foundation retained | 独立 `runtime_node_authority` 配置入口 |
 | [Immutable Image Manifest Read v1](specs/immutable-image-manifest-read-v1.md) | Storage/boot reference retained | 不表示当前 CH semantic effects 已接入 |
@@ -74,6 +75,7 @@ Route v2 或 HostFenceRecovery 协调作为目标合同引用。
 
 ### 当前协调决策
 
+- [0066 产品 DiskSnapshot、完整 GC 保护与同盘恢复](decisions/0066-product-disk-snapshot-gc-and-same-disk-restore.md)
 - [0059 Control/Node 场景语义同步协议](decisions/0059-semantic-control-node-synchronous-protocol.md)
 - [0065 Exec/Shell Runtime Access Lane](decisions/0065-exec-shell-runtime-access-lane.md)
 - [0064 Cat 动作时钟与运行时钟](decisions/0064-cat-run-and-action-clocks.md)

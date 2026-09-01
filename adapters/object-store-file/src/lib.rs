@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use cats_storage::blob::{
-    validate_key, validate_list_maximum, validate_list_result, BlobError, BlobListPage, BlobStore,
-    QualifiedDeleteListPage, Result,
+    validate_key, validate_list_after, validate_list_maximum, validate_list_page, BlobError,
+    BlobListPage, BlobStore, QualifiedDeleteListPage, Result,
 };
 use cats_storage::{AdapterConfig, AdapterError, BlobStoreFactory};
 
@@ -81,7 +81,13 @@ impl FileBlobStore {
         }
     }
 
-    fn list_page(&self, prefix: &str, maximum: usize) -> Result<BlobListPage> {
+    fn list_page(
+        &self,
+        prefix: &str,
+        after_key: Option<&str>,
+        maximum: usize,
+    ) -> Result<BlobListPage> {
+        validate_list_after(prefix, after_key)?;
         validate_list_maximum(prefix, maximum)?;
         let directory_prefix = prefix.strip_suffix('/').unwrap_or(prefix);
         if directory_prefix
@@ -107,19 +113,28 @@ impl FileBlobStore {
         // objects).
         let mut output = BinaryHeap::with_capacity(maximum);
         let mut is_truncated = false;
-        self.collect_page_entries(&anchor, prefix, maximum, &mut output, &mut is_truncated)?;
+        self.collect_page_entries(
+            &anchor,
+            prefix,
+            after_key,
+            maximum,
+            &mut output,
+            &mut is_truncated,
+        )?;
         let output = output.into_sorted_vec();
-        validate_list_result(prefix, &output)?;
-        Ok(BlobListPage {
+        let page = BlobListPage {
             keys: output,
             is_truncated,
-        })
+        };
+        validate_list_page(prefix, after_key, maximum, &page)?;
+        Ok(page)
     }
 
     fn collect_page_entries(
         &self,
         path: &Path,
         prefix: &str,
+        after_key: Option<&str>,
         maximum: usize,
         output: &mut BinaryHeap<String>,
         is_truncated: &mut bool,
@@ -137,7 +152,14 @@ impl FileBlobStore {
             };
             for entry in entries {
                 let entry = entry.map_err(|source| Self::io_err(prefix, source))?;
-                self.collect_page_entries(&entry.path(), prefix, maximum, output, is_truncated)?;
+                self.collect_page_entries(
+                    &entry.path(),
+                    prefix,
+                    after_key,
+                    maximum,
+                    output,
+                    is_truncated,
+                )?;
             }
             return Ok(());
         }
@@ -159,7 +181,7 @@ impl FileBlobStore {
             .map(|component| component.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
             .join("/");
-        if key.starts_with(prefix) {
+        if key.starts_with(prefix) && after_key.is_none_or(|after_key| key.as_str() > after_key) {
             if output.len() < maximum {
                 output.push(key);
             } else {
@@ -321,7 +343,16 @@ impl BlobStore for FileBlobStore {
     }
 
     fn list_bounded(&self, prefix: &str, maximum: usize) -> Result<BlobListPage> {
-        self.list_page(prefix, maximum)
+        self.list_page(prefix, None, maximum)
+    }
+
+    fn list_after_bounded(
+        &self,
+        prefix: &str,
+        after_key: Option<&str>,
+        maximum: usize,
+    ) -> Result<BlobListPage> {
+        self.list_page(prefix, after_key, maximum)
     }
 
     fn list_for_delete_bounded_until(
@@ -336,7 +367,7 @@ impl BlobStore for FileBlobStore {
                 message: "destructive LIST deadline elapsed".into(),
             });
         }
-        let page = self.list_page(prefix, maximum)?;
+        let page = self.list_page(prefix, None, maximum)?;
         if Instant::now() > deadline {
             return Err(BlobError::Backend {
                 key: prefix.to_string(),

@@ -180,7 +180,7 @@ import re
 import stat
 import sys
 
-CONTROL_SCHEMA_VERSION = 19
+CONTROL_SCHEMA_VERSION = 20
 
 (
     exact_commit,

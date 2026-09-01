@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cats_storage::blob::{
-    validate_key, validate_list_maximum, validate_list_result, BlobError, BlobListPage, BlobStore,
-    QualifiedDeleteListPage, Result,
+    validate_key, validate_list_after, validate_list_maximum, validate_list_page, BlobError,
+    BlobListPage, BlobStore, QualifiedDeleteListPage, Result,
 };
 use cats_storage::{AdapterConfig, AdapterError, BlobStoreFactory};
 
@@ -1004,7 +1004,26 @@ impl BlobStore for AwsS3BlobStore {
     }
 
     fn list_bounded(&self, prefix: &str, maximum: usize) -> Result<BlobListPage> {
-        self.list_bounded_until(prefix, maximum, Instant::now() + Duration::from_secs(60))
+        self.list_bounded_until(
+            prefix,
+            None,
+            maximum,
+            Instant::now() + Duration::from_secs(60),
+        )
+    }
+
+    fn list_after_bounded(
+        &self,
+        prefix: &str,
+        after_key: Option<&str>,
+        maximum: usize,
+    ) -> Result<BlobListPage> {
+        self.list_bounded_until(
+            prefix,
+            after_key,
+            maximum,
+            Instant::now() + Duration::from_secs(60),
+        )
     }
 
     fn list_for_delete_bounded_until(
@@ -1016,7 +1035,7 @@ impl BlobStore for AwsS3BlobStore {
         // Amazon S3 provides strong read-after-write consistency for DELETE
         // and LIST. Compatible endpoints must meet the same adapter contract
         // before this implementation is selected for production deletion.
-        self.list_bounded_until(prefix, maximum, deadline)
+        self.list_bounded_until(prefix, None, maximum, deadline)
             .map(QualifiedDeleteListPage::from_strongly_consistent_adapter)
     }
 }
@@ -1025,21 +1044,27 @@ impl AwsS3BlobStore {
     fn list_bounded_until(
         &self,
         prefix: &str,
+        after_key: Option<&str>,
         maximum: usize,
         deadline: Instant,
     ) -> Result<BlobListPage> {
+        validate_list_after(prefix, after_key)?;
         validate_list_maximum(prefix, maximum)?;
         let full_prefix = self.full_key(prefix);
+        let full_after = after_key.map(|key| self.full_key(key));
         let strip = if self.cfg.prefix.is_empty() {
             String::new()
         } else {
             format!("{}/", self.cfg.prefix.trim_end_matches('/'))
         };
-        let query = vec![
+        let mut query = vec![
             ("list-type".to_string(), "2".to_string()),
             ("prefix".to_string(), full_prefix.clone()),
             ("max-keys".to_string(), maximum.to_string()),
         ];
+        if let Some(full_after) = &full_after {
+            query.push(("start-after".to_string(), full_after.clone()));
+        }
         let path = format!("/{}", uri_encode(&self.cfg.bucket, false));
         let maximum_bytes = maximum
             .checked_mul(LIST_RESPONSE_BYTES_PER_KEY)
@@ -1086,11 +1111,23 @@ impl AwsS3BlobStore {
         let is_truncated = parsed
             .is_truncated
             .ok_or_else(|| list_shape_error(prefix))?;
-        let mut keys = parsed
+        let keys = parsed
             .keys
             .into_iter()
-            .map(|key| key.strip_prefix(&strip).unwrap_or(&key).to_string())
-            .collect::<Vec<_>>();
+            .map(|key| {
+                if strip.is_empty() {
+                    Ok(key)
+                } else {
+                    key.strip_prefix(&strip)
+                        .map(str::to_string)
+                        .ok_or_else(|| BlobError::Backend {
+                            key: prefix.to_string(),
+                            message: "LIST returned key outside the configured adapter prefix"
+                                .into(),
+                        })
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
         let key_count = parsed.key_count.ok_or_else(|| list_shape_error(prefix))?;
         if key_count != keys.len() {
             return Err(BlobError::Backend {
@@ -1104,13 +1141,6 @@ impl AwsS3BlobStore {
                 message: "LIST response exceeded max-keys".into(),
             });
         }
-        keys.sort();
-        if keys.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(BlobError::Backend {
-                key: prefix.to_string(),
-                message: "LIST response repeated an object key".into(),
-            });
-        }
         if (is_truncated
             && !matches!(parsed.next_continuation_token.as_deref(), Some(token) if !token.is_empty()))
             || (!is_truncated && parsed.next_continuation_token.is_some())
@@ -1120,8 +1150,9 @@ impl AwsS3BlobStore {
                 message: "LIST response continuation-token shape is invalid".into(),
             });
         }
-        validate_list_result(prefix, &keys)?;
-        Ok(BlobListPage { keys, is_truncated })
+        let page = BlobListPage { keys, is_truncated };
+        validate_list_page(prefix, after_key, maximum, &page)?;
+        Ok(page)
     }
 }
 
@@ -1847,6 +1878,78 @@ mod tests {
             "GET /test?list-type=2&max-keys=2&prefix=env%2Fvolumes%2Fvol_a%2F HTTP/1.1"
         ));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn cursor_list_uses_exclusive_logical_start_after() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (request_tx, request_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            request_tx.send(read_request(&mut stream)).unwrap();
+            let body = b"<ListBucketResult><Prefix>env/volumes/vol_a/</Prefix><StartAfter>env/volumes/vol_a/data/a</StartAfter><KeyCount>2</KeyCount><MaxKeys>2</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>env/volumes/vol_a/data/b</Key></Contents><Contents><Key>env/volumes/vol_a/maps/c</Key></Contents></ListBucketResult>";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+        let store = AwsS3BlobStore::new(AwsS3Config {
+            endpoint,
+            bucket: "test".into(),
+            region: "us-east-1".into(),
+            access_key: "test-access".into(),
+            secret_key: "test-secret".into(),
+            session_token: None,
+            prefix: "env".into(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            store
+                .list_after_bounded("volumes/vol_a/", Some("volumes/vol_a/data/a"), 2,)
+                .unwrap(),
+            BlobListPage {
+                keys: vec!["volumes/vol_a/data/b".into(), "volumes/vol_a/maps/c".into()],
+                is_truncated: false,
+            }
+        );
+        let request = String::from_utf8(request_rx.recv().unwrap()).unwrap();
+        assert!(request.starts_with(
+            "GET /test?list-type=2&max-keys=2&prefix=env%2Fvolumes%2Fvol_a%2F&start-after=env%2Fvolumes%2Fvol_a%2Fdata%2Fa HTTP/1.1"
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn cursor_list_fails_closed_on_nonexclusive_or_unsorted_keys() {
+        for body in [
+            b"<ListBucketResult><Prefix>volumes/vol_a/</Prefix><KeyCount>1</KeyCount><MaxKeys>10</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>volumes/vol_a/data/a</Key></Contents></ListBucketResult>".as_slice(),
+            b"<ListBucketResult><Prefix>volumes/vol_a/</Prefix><KeyCount>2</KeyCount><MaxKeys>10</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>volumes/vol_a/data/c</Key></Contents><Contents><Key>volumes/vol_a/data/b</Key></Contents></ListBucketResult>".as_slice(),
+        ] {
+            let body = body.to_vec();
+            let (store, server) = local_store(move |mut stream| {
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(&body).unwrap();
+            });
+            assert!(matches!(
+                store.list_after_bounded(
+                    "volumes/vol_a/",
+                    Some("volumes/vol_a/data/a"),
+                    10,
+                ),
+                Err(BlobError::Backend { .. })
+            ));
+            server.join().unwrap();
+        }
     }
 
     #[test]

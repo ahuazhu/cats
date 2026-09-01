@@ -286,7 +286,7 @@ control as production credentials.
 The production-application stack exposes `maintenance_mode`. A reviewed plan
 with it set to `true` removes public ingress/DNS and scales `cats-controld` to
 zero without creating kubectl drift. Stop every old Control/Node write path,
-recreate the product/runtime database as the one empty v19 schema, then deploy
+recreate the product/runtime database as the one empty v20 schema, then deploy
 the single current protocol while `enable_public_ingress` remains false. Run
 the release-bound qualification cell, directed smoke tests and current gates
 before a separately reviewed plan re-enables public ingress. The exact sequence
@@ -357,7 +357,7 @@ HA drill uses the same runner when it maps the PostgreSQL advisory-lock owner to
 a control-plane Pod. This avoids `kubectl` attach fallback replaying a fast
 command's output in either safety gate. A missing version table is the reviewed
 fresh-schema case; cluster, scheduling, authentication and query failures all
-fail closed. `cats-controld` opens only exact clean-slate authority schema 19;
+fail closed. `cats-controld` opens only exact clean-slate authority schema 20;
 it does not migrate an earlier stamp or partial catalog in place.
 The disruptive drill separately uploads fixed-rate public-probe results and
 Pod/EndpointSlice transition evidence; those artifacts contain no Secret

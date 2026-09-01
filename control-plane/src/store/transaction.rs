@@ -770,10 +770,12 @@ pub(super) fn authority_rejection(error: AuthorityError) -> ApiError {
         | AuthorityError::StaleTransition
         | AuthorityError::HeadConflict => ApiError::conflict(message),
         AuthorityError::Fenced => ApiError::new(ErrorCode::StaleEpoch, message),
-        AuthorityError::InvalidLeaseDuration => ApiError::invalid(message),
-        AuthorityError::EpochExhausted | AuthorityError::AdminBusy => {
-            ApiError::failed_precondition(message)
+        AuthorityError::InvalidLeaseDuration | AuthorityError::InvalidDurability => {
+            ApiError::invalid(message)
         }
+        AuthorityError::EpochExhausted
+        | AuthorityError::GenerationExhausted
+        | AuthorityError::AdminBusy => ApiError::failed_precondition(message),
         AuthorityError::BackendUnknown => ApiError::internal(message),
     }
 }

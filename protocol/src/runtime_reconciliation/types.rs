@@ -712,7 +712,14 @@ pub type VolumeDurability = Durability;
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum VolumeAdminState {
     Active,
-    Deleting { delete_id: Id },
+    Deleting {
+        delete_id: Id,
+    },
+    GarbageCollecting {
+        gc_id: Id,
+        roots_digest: Sha256Digest,
+        started_at: UnixMillis,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -722,6 +729,9 @@ pub struct VolumeRecord {
     pub size_bytes: u64,
     pub durability: VolumeDurability,
     pub admin_state: VolumeAdminState,
+    /// True when a committed head change may have left unreachable private
+    /// objects that require a snapshot-aware GC pass.
+    pub gc_required: bool,
     pub head: RemoteHead,
     pub lease_owner: Option<Id>,
     pub lease_epoch: FenceEpoch,
@@ -743,6 +753,10 @@ pub enum LastVolumeTransition {
     BeginDelete {
         request: BeginDeleteRequest,
         result: BeginDeleteResult,
+    },
+    SnapshotRestore {
+        request: SnapshotRestoreRequest,
+        result: SnapshotRestoreResult,
     },
 }
 
@@ -801,6 +815,34 @@ pub struct BeginDeleteRequest {
 #[serde(deny_unknown_fields)]
 pub struct BeginDeleteResult {
     pub delete_id: Id,
+    pub disk_id: Id,
+    pub volume_id: Id,
+    pub resulting_epoch: FenceEpoch,
+    pub resulting_head: RemoteHead,
+}
+
+/// One exact same-disk snapshot-restore occurrence.
+///
+/// The complete predecessor authority tuple is the occurrence identity. The
+/// Workspace caller supplies only an expected generation; the Control Store
+/// expands it to the locked current head and epoch after joining the exact
+/// snapshot, disk and volume rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotRestoreRequest {
+    pub snapshot_id: Id,
+    pub disk_id: Id,
+    pub volume_id: Id,
+    pub expected_size_bytes: u64,
+    pub expected_unowned_epoch: FenceEpoch,
+    pub expected_head: RemoteHead,
+    pub snapshot_head: RemoteHead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotRestoreResult {
+    pub snapshot_id: Id,
     pub disk_id: Id,
     pub volume_id: Id,
     pub resulting_epoch: FenceEpoch,

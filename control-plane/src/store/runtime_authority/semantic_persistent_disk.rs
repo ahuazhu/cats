@@ -26,8 +26,9 @@ const DISK_COLUMNS: &str = "
 
 const VOLUME_COLUMNS: &str = "
     volume_id, record::text AS record_json, size_bytes, durability,
-    admin_state, delete_id, head_generation, head_root_hash,
-    head_root_object_id, lease_owner, lease_epoch, lease_expires_at,
+    admin_state, delete_id, gc_required, gc_id, gc_roots_digest,
+    gc_started_at, head_generation, head_root_hash, head_root_object_id,
+    lease_owner, lease_epoch, lease_expires_at,
     last_transition_kind, last_transition_id,
     transition_placement_epoch, transition_lease_duration_ms";
 
@@ -347,6 +348,20 @@ fn volume_projection_matches(row: &Row, record: &VolumeRecord) -> bool {
         && row.try_get::<_, String>("durability").ok().as_deref() == Some(projection.durability)
         && row.try_get::<_, String>("admin_state").ok().as_deref() == Some(projection.admin_state)
         && row.try_get::<_, Option<String>>("delete_id").ok().flatten() == projection.delete_id
+        && row.try_get::<_, bool>("gc_required").ok() == Some(projection.gc_required)
+        && row.try_get::<_, Option<String>>("gc_id").ok().flatten() == projection.gc_id
+        && row
+            .try_get::<_, Option<String>>("gc_roots_digest")
+            .ok()
+            .flatten()
+            == projection.gc_roots_digest
+        && row
+            .try_get::<_, Option<i64>>("gc_started_at")
+            .ok()
+            .flatten()
+            == projection
+                .gc_started_at
+                .and_then(|value| i64::try_from(value.get()).ok())
         && row.try_get::<_, i64>("head_generation").ok()
             == i64::try_from(projection.head_generation.get()).ok()
         && row
@@ -406,30 +421,40 @@ fn insert_volume(
 ) -> AuthorityTxResult<()> {
     let projection = project_volume_record(record).map_err(|_| corrupt_tx())?;
     let record_json = serde_json::to_string(record).map_err(|_| corrupt_tx())?;
-    exactly_one(transaction.execute(
-        "INSERT INTO volume_records (
+    exactly_one(
+        transaction.execute(
+            "INSERT INTO volume_records (
             volume_id, record, size_bytes, durability, admin_state, delete_id,
+            gc_required, gc_id, gc_roots_digest, gc_started_at,
             head_generation, head_root_hash, head_root_object_id, lease_owner,
             lease_epoch, lease_expires_at, last_transition_kind,
             last_transition_id, transition_placement_epoch,
             transition_lease_duration_ms, owner_binding, owner_node_id
          ) VALUES (
-            $1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9, NULL,
-            $10, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+            $1, $2::TEXT::jsonb, $3, $4, $5, $6, $7, $8, $9, $10,
+            $11, $12, $13, NULL, $14, NULL, NULL, NULL, NULL, NULL, NULL, NULL
          )",
-        &[
-            &projection.volume_id,
-            &record_json,
-            &to_i64(projection.size_bytes)?,
-            &projection.durability,
-            &projection.admin_state,
-            &projection.delete_id,
-            &to_i64(projection.head_generation.get())?,
-            &projection.head_root_hash,
-            &projection.head_root_object_id,
-            &to_i64(projection.lease_epoch.get())?,
-        ],
-    )?)
+            &[
+                &projection.volume_id,
+                &record_json,
+                &to_i64(projection.size_bytes)?,
+                &projection.durability,
+                &projection.admin_state,
+                &projection.delete_id,
+                &projection.gc_required,
+                &projection.gc_id,
+                &projection.gc_roots_digest,
+                &projection
+                    .gc_started_at
+                    .map(|value| to_i64(value.get()))
+                    .transpose()?,
+                &to_i64(projection.head_generation.get())?,
+                &projection.head_root_hash,
+                &projection.head_root_object_id,
+                &to_i64(projection.lease_epoch.get())?,
+            ],
+        )?,
+    )
 }
 
 fn insert_disk(
@@ -509,15 +534,20 @@ fn update_volume(
         .transition_lease_duration_ms
         .map(to_i64)
         .transpose()?;
+    let gc_started_at = projection
+        .gc_started_at
+        .map(|value| to_i64(value.get()))
+        .transpose()?;
     exactly_one(transaction.execute(
         "UPDATE volume_records SET
             record=$2::TEXT::jsonb, size_bytes=$3, durability=$4,
-            admin_state=$5, delete_id=$6, head_generation=$7,
-            head_root_hash=$8, head_root_object_id=$9, lease_owner=$10,
-            lease_epoch=$11, lease_expires_at=$12,
-            last_transition_kind=$13, last_transition_id=$14,
-            transition_placement_epoch=$15,
-            transition_lease_duration_ms=$16
+            admin_state=$5, delete_id=$6, gc_required=$7, gc_id=$8,
+            gc_roots_digest=$9, gc_started_at=$10, head_generation=$11,
+            head_root_hash=$12, head_root_object_id=$13, lease_owner=$14,
+            lease_epoch=$15, lease_expires_at=$16,
+            last_transition_kind=$17, last_transition_id=$18,
+            transition_placement_epoch=$19,
+            transition_lease_duration_ms=$20
           WHERE volume_id=$1 AND owner_binding IS NULL AND owner_node_id IS NULL",
         &[
             &projection.volume_id,
@@ -526,6 +556,10 @@ fn update_volume(
             &projection.durability,
             &projection.admin_state,
             &projection.delete_id,
+            &projection.gc_required,
+            &projection.gc_id,
+            &projection.gc_roots_digest,
+            &gc_started_at,
             &to_i64(projection.head_generation.get())?,
             &projection.head_root_hash,
             &projection.head_root_object_id,
@@ -635,6 +669,7 @@ fn blank_volume(candidate: &SemanticStrictPersistentDisk) -> VolumeRecord {
         size_bytes: candidate.size_bytes,
         durability: VolumeDurability::Strict,
         admin_state: VolumeAdminState::Active,
+        gc_required: false,
         head: blank_head(),
         lease_owner: None,
         lease_epoch: FenceEpoch::new(0).expect("zero is a valid initial Volume epoch"),

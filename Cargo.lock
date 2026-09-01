@@ -1087,6 +1087,7 @@ dependencies = [
  "axum",
  "base64",
  "cats-api",
+ "cats-blockd",
  "cats-metering",
  "cats-protocol",
  "cats-storage",
