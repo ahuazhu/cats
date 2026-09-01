@@ -1606,9 +1606,34 @@ where
     ) -> SemanticResourceFuture<'a, Result<wire::DiskSnapshotResponse, wire::SemanticErrorBody>>
     {
         Box::pin(async move {
-            let current = self.current_snapshot(workspace_id, &snapshot_slug).await?;
-            if current.snapshot_id != request.expected_snapshot_id.as_str() {
-                return Err(snapshot_occurrence_conflict());
+            match self
+                .resources
+                .current_snapshot(workspace_id, snapshot_slug.as_str())
+                .await
+                .map_err(internal_resource_error)?
+            {
+                Some(current)
+                    if current.snapshot_id != request.expected_snapshot_id.as_str() =>
+                {
+                    return Err(snapshot_occurrence_conflict());
+                }
+                Some(_) => {}
+                None => {
+                    let Some(previous) = self
+                        .resources
+                        .snapshot_by_id(request.expected_snapshot_id.as_str())
+                        .await
+                        .map_err(internal_resource_error)?
+                    else {
+                        return Err(snapshot_not_found());
+                    };
+                    if previous.workspace_id != workspace_id
+                        || previous.snapshot_slug != snapshot_slug.as_str()
+                        || previous.deleted_at.is_none()
+                    {
+                        return Err(snapshot_not_found());
+                    }
+                }
             }
             let outcome = self
                 .resources
@@ -2368,6 +2393,7 @@ mod tests {
         disk: Mutex<Option<db::PersistentDiskRecord>>,
         cat: Option<db::CatRecord>,
         binding: Option<db::DiskBindingWithCat>,
+        snapshots: Mutex<Vec<db::DiskSnapshotRecord>>,
         attaches: Mutex<Vec<(String, String, String)>>,
     }
 
@@ -2377,6 +2403,7 @@ mod tests {
                 disk: Mutex::new(Some(disk_record("disk_current", "data", 100))),
                 cat: Some(cat_record("cat_current", "worker")),
                 binding: None,
+                snapshots: Mutex::new(Vec::new()),
                 attaches: Mutex::new(Vec::new()),
             }
         }
@@ -2482,6 +2509,65 @@ mod tests {
                     head_generation: Some(1),
                 }))
             })
+        }
+
+        fn current_snapshot<'a>(
+            &'a self,
+            workspace_id: &'a str,
+            snapshot_slug: &'a str,
+        ) -> SemanticResourceFuture<'a, Result<Option<db::DiskSnapshotRecord>, ResourceStoreError>>
+        {
+            let snapshot = self
+                .snapshots
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|snapshot| {
+                    snapshot.workspace_id == workspace_id
+                        && snapshot.snapshot_slug == snapshot_slug
+                        && snapshot.deleted_at.is_none()
+                })
+                .cloned();
+            Box::pin(async move { Ok(snapshot) })
+        }
+
+        fn snapshot_by_id<'a>(
+            &'a self,
+            snapshot_id: &'a str,
+        ) -> SemanticResourceFuture<'a, Result<Option<db::DiskSnapshotRecord>, ResourceStoreError>>
+        {
+            let snapshot = self
+                .snapshots
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|snapshot| snapshot.snapshot_id == snapshot_id)
+                .cloned();
+            Box::pin(async move { Ok(snapshot) })
+        }
+
+        fn delete_snapshot<'a>(
+            &'a self,
+            workspace_id: String,
+            snapshot_id: String,
+        ) -> SemanticResourceFuture<'a, Result<db::DeleteDiskSnapshotOutcome, ResourceStoreError>>
+        {
+            let mut snapshots = self.snapshots.lock().unwrap();
+            let outcome = snapshots
+                .iter_mut()
+                .find(|snapshot| {
+                    snapshot.workspace_id == workspace_id && snapshot.snapshot_id == snapshot_id
+                })
+                .map(|snapshot| {
+                    if snapshot.deleted_at.is_some() {
+                        db::DeleteDiskSnapshotOutcome::AlreadyDeleted(snapshot.clone())
+                    } else {
+                        snapshot.deleted_at = Some(2);
+                        db::DeleteDiskSnapshotOutcome::Deleted(snapshot.clone())
+                    }
+                })
+                .unwrap_or(db::DeleteDiskSnapshotOutcome::NotFound);
+            Box::pin(async move { Ok(outcome) })
         }
 
         fn attach<'a>(
@@ -2663,6 +2749,21 @@ mod tests {
         }
     }
 
+    fn snapshot_record(snapshot_id: &str, snapshot_slug: &str) -> db::DiskSnapshotRecord {
+        db::DiskSnapshotRecord {
+            snapshot_id: snapshot_id.to_owned(),
+            workspace_id: "ws_test".to_owned(),
+            snapshot_slug: snapshot_slug.to_owned(),
+            disk_id: "disk_current".to_owned(),
+            disk_slug: "data".to_owned(),
+            volume_id: "vol_current".to_owned(),
+            size_bytes: 100,
+            captured_generation: 1,
+            created_at: 1,
+            deleted_at: None,
+        }
+    }
+
     #[tokio::test]
     async fn create_cat_resolves_mount_slug_to_immutable_disk_id() {
         let api = ProductionSemanticResourceApi::new(
@@ -2804,6 +2905,97 @@ mod tests {
                 "/data".to_owned()
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn destroy_snapshot_replays_the_exact_deleted_occurrence() {
+        let resources = MockResources::populated();
+        resources
+            .snapshots
+            .lock()
+            .unwrap()
+            .push(snapshot_record("snapshot_original", "checkpoint"));
+        let api =
+            ProductionSemanticResourceApi::new(MockLifecycle::new(), resources, DEFAULT_BOOT_IMAGE);
+        let request = || wire::DestroyDiskSnapshotRequest {
+            expected_snapshot_id: Id::new("snapshot_original").unwrap(),
+        };
+
+        let destroyed = api
+            .destroy_snapshot(
+                "ws_test",
+                wire::ResourceSlug::new("checkpoint").unwrap(),
+                request(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(destroyed.code, wire::SemanticSuccessCode::SnapshotDestroyed);
+
+        let replayed = api
+            .destroy_snapshot(
+                "ws_test",
+                wire::ResourceSlug::new("checkpoint").unwrap(),
+                request(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replayed.status, wire::SemanticStatus::AlreadyDone);
+        assert_eq!(replayed.code, wire::SemanticSuccessCode::AlreadyDeleted);
+        assert_eq!(replayed.snapshot.snapshot_id.as_str(), "snapshot_original");
+    }
+
+    #[tokio::test]
+    async fn destroy_snapshot_replay_rejects_a_reused_slug() {
+        let resources = MockResources::populated();
+        let mut original = snapshot_record("snapshot_original", "checkpoint");
+        original.deleted_at = Some(2);
+        resources.snapshots.lock().unwrap().extend([
+            original,
+            snapshot_record("snapshot_replacement", "checkpoint"),
+        ]);
+        let api =
+            ProductionSemanticResourceApi::new(MockLifecycle::new(), resources, DEFAULT_BOOT_IMAGE);
+
+        let error = api
+            .destroy_snapshot(
+                "ws_test",
+                wire::ResourceSlug::new("checkpoint").unwrap(),
+                wire::DestroyDiskSnapshotRequest {
+                    expected_snapshot_id: Id::new("snapshot_original").unwrap(),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, wire::SemanticErrorCode::SnapshotConflict);
+        let snapshots = api.resources.snapshots.lock().unwrap();
+        assert!(snapshots
+            .iter()
+            .any(|snapshot| snapshot.snapshot_id == "snapshot_replacement"
+                && snapshot.deleted_at.is_none()));
+    }
+
+    #[tokio::test]
+    async fn destroy_snapshot_does_not_replay_a_tombstone_from_another_path() {
+        let resources = MockResources::populated();
+        let mut snapshot = snapshot_record("snapshot_original", "other-checkpoint");
+        snapshot.deleted_at = Some(2);
+        resources.snapshots.lock().unwrap().push(snapshot);
+        let api =
+            ProductionSemanticResourceApi::new(MockLifecycle::new(), resources, DEFAULT_BOOT_IMAGE);
+
+        let error = api
+            .destroy_snapshot(
+                "ws_test",
+                wire::ResourceSlug::new("checkpoint").unwrap(),
+                wire::DestroyDiskSnapshotRequest {
+                    expected_snapshot_id: Id::new("snapshot_original").unwrap(),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, wire::SemanticErrorCode::SnapshotNotFound);
     }
 
     #[tokio::test]
