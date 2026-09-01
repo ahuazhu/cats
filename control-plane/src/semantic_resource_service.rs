@@ -1836,6 +1836,12 @@ where
                         "PersistentDisk still has a live DiskSnapshot",
                     ));
                 }
+                db::DeletePersistentDiskOutcome::DiskBusy => {
+                    return Err(semantic_error(
+                        wire::SemanticErrorCode::Busy,
+                        "PersistentDisk is reserved for storage maintenance",
+                    ));
+                }
                 db::DeletePersistentDiskOutcome::NotFound => {
                     return Err(semantic_error(
                         wire::SemanticErrorCode::DiskNotFound,
@@ -2268,6 +2274,10 @@ fn map_attach_outcome(
             wire::SemanticErrorCode::CatMustBeCold,
             "Cat must be Cold",
         )),
+        db::AttachDiskOutcome::DiskBusy => Err(semantic_error(
+            wire::SemanticErrorCode::Busy,
+            "PersistentDisk is reserved for storage maintenance",
+        )),
         db::AttachDiskOutcome::DiskDeleted => Err(semantic_error(
             wire::SemanticErrorCode::DiskDeleted,
             "PersistentDisk is deleted",
@@ -2300,6 +2310,10 @@ fn map_detach_outcome(
         db::DetachDiskOutcome::CatMustBeCold => Err(semantic_error(
             wire::SemanticErrorCode::CatMustBeCold,
             "Cat must be Cold",
+        )),
+        db::DetachDiskOutcome::DiskBusy => Err(semantic_error(
+            wire::SemanticErrorCode::Busy,
+            "PersistentDisk is reserved for storage maintenance",
         )),
         db::DetachDiskOutcome::CatNotFound => Err(semantic_error(
             wire::SemanticErrorCode::CatNotFound,

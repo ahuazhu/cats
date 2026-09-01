@@ -8,7 +8,9 @@
 use postgres::Row;
 
 use self::placement::{LeastAllocatedPlacement, SemanticPlacementStrategy};
-use super::{Result, Store};
+use super::{
+    lock_semantic_disk, lock_semantic_disks, try_lock_semantic_disk, Result, Store,
+};
 
 mod placement;
 mod snapshot;
@@ -471,6 +473,7 @@ pub enum DeletePersistentDiskOutcome {
     AlreadyDeleted(PersistentDiskRecord),
     Attached,
     SnapshotInUse,
+    DiskBusy,
     NotFound,
 }
 
@@ -497,6 +500,7 @@ pub enum AttachDiskOutcome {
     MountPathConflict(DiskBindingRecord),
     DiskAlreadyAttached(DiskBindingRecord),
     CatMustBeCold,
+    DiskBusy,
     DiskDeleted,
     WorkspaceMismatch,
     CatNotFound,
@@ -509,6 +513,7 @@ pub enum DetachDiskOutcome {
     AlreadyDetached,
     DiskBindingConflict(DiskBindingRecord),
     CatMustBeCold,
+    DiskBusy,
     CatNotFound,
 }
 
@@ -747,6 +752,8 @@ impl Store {
                 return Ok(outcome);
             }
 
+            lock_semantic_disks(&mut transaction, disk_ids.iter().copied())?;
+
             let Some(node_id) =
                 ACTIVE_PLACEMENT_STRATEGY.select_running_node(&mut transaction, None)?
             else {
@@ -818,8 +825,10 @@ impl Store {
             mounts.sort_unstable_by_key(|mount| mount.disk_id);
             for mount in mounts {
                 let disk = transaction.query_opt(
-                    "SELECT workspace_id,status FROM persistent_disks
-                      WHERE disk_id=$1 FOR UPDATE",
+                    "SELECT p.workspace_id,p.status,v.admin_state
+                       FROM persistent_disks p
+                       JOIN volume_records v ON v.volume_id=p.volume_id
+                      WHERE p.disk_id=$1 FOR UPDATE OF p,v",
                     &[&mount.disk_id],
                 )?;
                 let Some(disk) = disk else {
@@ -831,6 +840,7 @@ impl Store {
                 };
                 let disk_workspace: &str = disk.get(0);
                 let status: &str = disk.get(1);
+                let volume_admin_state: &str = disk.get(2);
                 if disk_workspace != request.workspace_id {
                     transaction.rollback()?;
                     return Ok(AdmitCatCreateOutcome::MountRejected {
@@ -843,6 +853,16 @@ impl Store {
                     return Ok(AdmitCatCreateOutcome::MountRejected {
                         code: "disk_deleted".to_owned(),
                         message: format!("disk {} is deleted", mount.disk_id),
+                    });
+                }
+                if volume_admin_state != "active" {
+                    transaction.rollback()?;
+                    return Ok(AdmitCatCreateOutcome::MountRejected {
+                        code: "disk_busy".to_owned(),
+                        message: format!(
+                            "disk {} is reserved for storage maintenance",
+                            mount.disk_id
+                        ),
                     });
                 }
                 if transaction
@@ -888,6 +908,38 @@ impl Store {
     ) -> Result<AdmitCatActionOutcome> {
         self.with(|client| {
             let mut transaction = client.transaction()?;
+            let mut prelocked_disk_ids: Vec<String> = Vec::new();
+            if matches!(action, CatAction::Run | CatAction::Destroy) {
+                let candidate_cat_id = match selector.clone() {
+                    SemanticCatSelector::Id(cat_id) => Some(cat_id.to_owned()),
+                    SemanticCatSelector::Slug {
+                        workspace_id,
+                        cat_slug,
+                    } => transaction
+                        .query_opt(
+                            "SELECT cat_id FROM cats
+                              WHERE workspace_id=$1 AND cat_slug=$2
+                                AND destroyed_at IS NULL",
+                            &[&workspace_id, &cat_slug],
+                        )?
+                        .map(|row| row.get(0)),
+                };
+                if let Some(candidate_cat_id) = candidate_cat_id {
+                    prelocked_disk_ids = transaction
+                        .query(
+                            "SELECT disk_id FROM disk_bindings
+                              WHERE cat_id=$1 ORDER BY disk_id COLLATE \"C\"",
+                            &[&candidate_cat_id],
+                        )?
+                        .into_iter()
+                        .map(|row| row.get(0))
+                        .collect();
+                    lock_semantic_disks(
+                        &mut transaction,
+                        prelocked_disk_ids.iter().map(String::as_str),
+                    )?;
+                }
+            }
             let row = match selector {
                 SemanticCatSelector::Id(cat_id) => transaction.query_opt(
                     &format!("SELECT {CAT_COLUMNS} FROM cats WHERE cat_id=$1 FOR UPDATE"),
@@ -911,6 +963,16 @@ impl Store {
             };
             let cat = row_to_cat(&row);
             let aggregate = cat_with_mounts(&mut transaction, cat)?;
+            if matches!(action, CatAction::Run | CatAction::Destroy) {
+                for disk_id in aggregate.mounts.iter().map(|mount| &mount.disk_id) {
+                    if prelocked_disk_ids.binary_search(disk_id).is_err()
+                        && !try_lock_semantic_disk(&mut transaction, disk_id)?
+                    {
+                        transaction.commit()?;
+                        return Ok(AdmitCatActionOutcome::Busy(aggregate));
+                    }
+                }
+            }
             if aggregate.cat.has_internal_relocation_claim() {
                 transaction.commit()?;
                 return Ok(AdmitCatActionOutcome::Busy(aggregate));
@@ -947,12 +1009,13 @@ impl Store {
                 return Ok(AdmitCatActionOutcome::InvalidState(aggregate));
             }
 
-            // A Cold -> Running transition must serialize with Control-owned
-            // volume maintenance. Locking every mounted Volume here prevents
-            // a GC claim from being followed by an admitted writer, and makes
-            // a concurrent claim win as Busy instead of failing later inside
-            // noded after the product action was already published.
-            if action == CatAction::Run && aggregate.cat.state == Some(CatState::Cold) {
+            // A Cold -> Running transition and Destroy's binding removal must
+            // serialize with Control-owned volume maintenance. The per-Disk
+            // exclusion was taken before the Cat row; these Volume locks now
+            // classify a committed maintenance claim as Busy.
+            let cold_run = action == CatAction::Run
+                && aggregate.cat.state == Some(CatState::Cold);
+            if cold_run || action == CatAction::Destroy {
                 let mut disk_ids = aggregate
                     .mounts
                     .iter()
@@ -960,17 +1023,29 @@ impl Store {
                     .collect::<Vec<_>>();
                 disk_ids.sort_unstable();
                 for disk_id in disk_ids {
-                    let available = transaction.query_opt(
-                        "SELECT v.volume_id
-                           FROM persistent_disks p
-                           JOIN volume_records v ON v.volume_id=p.volume_id
-                          WHERE p.disk_id=$1 AND p.status='normal'
-                            AND v.admin_state='active'
-                            AND v.lease_owner IS NULL
-                            AND v.lease_expires_at IS NULL
-                          FOR UPDATE OF v",
-                        &[&disk_id],
-                    )?;
+                    let available = if cold_run {
+                        transaction.query_opt(
+                            "SELECT v.volume_id
+                               FROM persistent_disks p
+                               JOIN volume_records v ON v.volume_id=p.volume_id
+                              WHERE p.disk_id=$1 AND p.status='normal'
+                                AND v.admin_state='active'
+                                AND v.lease_owner IS NULL
+                                AND v.lease_expires_at IS NULL
+                              FOR UPDATE OF v",
+                            &[&disk_id],
+                        )?
+                    } else {
+                        transaction.query_opt(
+                            "SELECT v.volume_id
+                               FROM persistent_disks p
+                               JOIN volume_records v ON v.volume_id=p.volume_id
+                              WHERE p.disk_id=$1 AND p.status='normal'
+                                AND v.admin_state='active'
+                              FOR UPDATE OF v",
+                            &[&disk_id],
+                        )?
+                    };
                     if available.is_none() {
                         transaction.commit()?;
                         return Ok(AdmitCatActionOutcome::Busy(aggregate));
@@ -1306,6 +1381,21 @@ impl Store {
     ) -> Result<Option<CatRecord>> {
         self.with(|client| {
             let mut transaction = client.transaction()?;
+            if finish.final_state == CatState::Destroyed {
+                let disk_ids: Vec<String> = transaction
+                    .query(
+                        "SELECT disk_id FROM disk_bindings
+                          WHERE cat_id=$1 ORDER BY disk_id COLLATE \"C\"",
+                        &[&cat_id],
+                    )?
+                    .into_iter()
+                    .map(|row| row.get(0))
+                    .collect();
+                lock_semantic_disks(
+                    &mut transaction,
+                    disk_ids.iter().map(String::as_str),
+                )?;
+            }
             let settle_last_running_at = last_running_at_on_settle();
             let row = transaction.query_opt(
                 &format!(
@@ -2098,13 +2188,7 @@ impl Store {
     ) -> Result<DeletePersistentDiskOutcome> {
         self.with(|client| {
             let mut transaction = client.transaction()?;
-            transaction.query_one(
-                "SELECT pg_advisory_xact_lock(hashtextextended(
-                    current_schema() || ':semantic-disk:disk:' || $1,
-                    0::BIGINT
-                 ))",
-                &[&disk_id],
-            )?;
+            lock_semantic_disk(&mut transaction, disk_id)?;
             let Some(row) = transaction.query_opt(
                 &format!("SELECT {DISK_COLUMNS} FROM persistent_disks WHERE disk_id=$1 FOR UPDATE"),
                 &[&disk_id],
@@ -2117,6 +2201,17 @@ impl Store {
             if disk.status == "deleted" {
                 transaction.rollback()?;
                 return Ok(DeletePersistentDiskOutcome::AlreadyDeleted(disk));
+            }
+            if transaction
+                .query_opt(
+                    "SELECT volume_id FROM volume_records
+                      WHERE volume_id=$1 AND admin_state='active' FOR UPDATE",
+                    &[&disk.volume_id],
+                )?
+                .is_none()
+            {
+                transaction.rollback()?;
+                return Ok(DeletePersistentDiskOutcome::DiskBusy);
             }
             if transaction
                 .query_opt(
@@ -2349,8 +2444,12 @@ fn attach_disk_transaction(
     mount_path: &str,
 ) -> std::result::Result<AttachDiskOutcome, postgres::Error> {
     let mut transaction = client.transaction()?;
+    lock_semantic_disk(&mut transaction, disk_id)?;
     let Some(disk) = transaction.query_opt(
-        "SELECT workspace_id,status FROM persistent_disks WHERE disk_id=$1 FOR UPDATE",
+        "SELECT p.workspace_id,p.status,v.admin_state
+           FROM persistent_disks p
+           JOIN volume_records v ON v.volume_id=p.volume_id
+          WHERE p.disk_id=$1 FOR UPDATE OF p,v",
         &[&disk_id],
     )?
     else {
@@ -2359,9 +2458,14 @@ fn attach_disk_transaction(
     };
     let disk_workspace: &str = disk.get(0);
     let disk_status: &str = disk.get(1);
+    let volume_admin_state: &str = disk.get(2);
     if disk_status != "normal" {
         transaction.rollback()?;
         return Ok(AttachDiskOutcome::DiskDeleted);
+    }
+    if volume_admin_state != "active" {
+        transaction.rollback()?;
+        return Ok(AttachDiskOutcome::DiskBusy);
     }
     if let Some(row) = transaction.query_opt(
         &format!("SELECT {BINDING_COLUMNS} FROM disk_bindings WHERE disk_id=$1"),
@@ -2428,6 +2532,7 @@ fn detach_disk_transaction(
     disk_id: &str,
 ) -> std::result::Result<DetachDiskOutcome, postgres::Error> {
     let mut transaction = client.transaction()?;
+    lock_semantic_disk(&mut transaction, disk_id)?;
     let Some(cat) = transaction.query_opt(
         "SELECT state,current_action FROM cats WHERE cat_id=$1 FOR UPDATE",
         &[&cat_id],
@@ -2452,6 +2557,21 @@ fn detach_disk_transaction(
     if binding.cat_id != cat_id {
         transaction.rollback()?;
         return Ok(DetachDiskOutcome::DiskBindingConflict(binding));
+    }
+    if transaction
+        .query_opt(
+            "SELECT v.volume_id
+               FROM persistent_disks p
+               JOIN volume_records v ON v.volume_id=p.volume_id
+              WHERE p.disk_id=$1 AND p.status='normal'
+                AND v.admin_state='active'
+              FOR UPDATE OF p,v",
+            &[&disk_id],
+        )?
+        .is_none()
+    {
+        transaction.rollback()?;
+        return Ok(DetachDiskOutcome::DiskBusy);
     }
     transaction.execute("DELETE FROM disk_bindings WHERE disk_id=$1", &[&disk_id])?;
     transaction.commit()?;

@@ -19,9 +19,13 @@ mod node_identities;
 mod rows;
 pub(crate) mod runtime_authority;
 mod schema;
+mod semantic_disk_lock;
 pub mod semantic;
 mod transaction;
 
+pub(crate) use semantic_disk_lock::{
+    lock_semantic_disk, lock_semantic_disks, try_lock_semantic_disk,
+};
 pub(crate) use transaction::AuthorityRequestContext;
 
 pub use leadership::SingletonRole;

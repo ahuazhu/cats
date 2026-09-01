@@ -17,7 +17,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::store::transaction::{AuthorityTransactionError, AuthorityTxResult};
-use crate::store::{Result, Store};
+use crate::store::{lock_semantic_disk, Result, Store};
 
 use super::rows::database_now;
 
@@ -79,11 +79,54 @@ struct StoredSnapshotRecord {
 impl Store {
     /// Claim or resume the next eligible Strict volume that needs GC.
     ///
-    /// Eligibility is checked under the Volume row lock. Bound disks require a
-    /// stable Cold Cat; an unbound initialized disk is also eligible. A prior
-    /// `garbage_collecting` row is resumed with its original `gc_id`.
+    /// Eligibility is rechecked after taking the shared per-Disk exclusion and
+    /// under the Volume row lock. Bound disks require a stable Cold Cat; an
+    /// unbound initialized disk is also eligible. A prior `garbage_collecting`
+    /// row is resumed with its original `gc_id`.
     pub(crate) fn claim_next_snapshot_gc(&self) -> Result<Option<SnapshotGcClaim>> {
         self.authority_transaction(|transaction| {
+            // Candidate discovery takes no destructive row lock. The common
+            // per-Disk lock is the first exclusion lock, and the full
+            // eligibility predicate is then repeated under that lock.
+            let Some(candidate) = transaction.query_opt(
+                "SELECT d.disk_id
+                   FROM volume_records v
+                   JOIN disk_records d ON d.volume_id=v.volume_id
+                   JOIN persistent_disks p
+                     ON p.disk_id=d.disk_id AND p.volume_id=v.volume_id
+                   LEFT JOIN disk_bindings b ON b.disk_id=p.disk_id
+                   LEFT JOIN cats c
+                     ON c.cat_id=b.cat_id AND c.workspace_id=b.workspace_id
+                  WHERE v.durability='strict'
+                    AND v.lease_owner IS NULL
+                    AND v.lease_expires_at IS NULL
+                    AND v.owner_binding IS NULL
+                    AND v.owner_node_id IS NULL
+                    AND (
+                        (v.admin_state='active' AND v.gc_required) OR
+                        v.admin_state='garbage_collecting'
+                    )
+                    AND d.admin_state='active'
+                    AND d.role_kind='persistent'
+                    AND d.initialization_kind='initialized'
+                    AND p.status='normal' AND p.deleted_at IS NULL
+                    AND (
+                        b.binding_id IS NULL OR
+                        (c.state='cold' AND c.current_action IS NULL
+                            AND c.node_id IS NULL)
+                    )
+                  ORDER BY
+                    (v.admin_state='garbage_collecting') DESC,
+                    v.volume_id COLLATE \"C\"
+                  LIMIT 1",
+                &[],
+            )?
+            else {
+                return Ok(None);
+            };
+            let candidate_disk_id: String = candidate.try_get("disk_id")?;
+            lock_semantic_disk(transaction, &candidate_disk_id)?;
+
             let Some(row) = transaction.query_opt(
                 &format!(
                     "SELECT {VOLUME_COLUMNS}, d.disk_id
@@ -107,18 +150,15 @@ impl Store {
                         AND d.role_kind='persistent'
                         AND d.initialization_kind='initialized'
                         AND p.status='normal' AND p.deleted_at IS NULL
+                        AND d.disk_id=$1
                         AND (
                             b.binding_id IS NULL OR
                             (c.state='cold' AND c.current_action IS NULL
                                 AND c.node_id IS NULL)
                         )
-                      ORDER BY
-                        (v.admin_state='garbage_collecting') DESC,
-                        v.volume_id COLLATE \"C\"
-                      LIMIT 1
                       FOR UPDATE OF v SKIP LOCKED"
                 ),
-                &[],
+                &[&candidate_disk_id],
             )?
             else {
                 return Ok(None);
@@ -185,6 +225,10 @@ impl Store {
         claim: &SnapshotGcClaim,
     ) -> Result<SnapshotGcSettlement> {
         self.authority_transaction(|transaction| {
+            let Some(disk_id) = claim.roots.first().map(|root| &root.disk_id) else {
+                return Err(corrupt_tx());
+            };
+            lock_semantic_disk(transaction, disk_id.as_str())?;
             let Some(row) = lock_volume(transaction, &claim.volume_id)? else {
                 return Ok(SnapshotGcSettlement::Stale);
             };
@@ -218,6 +262,10 @@ impl Store {
         claim: &SnapshotGcClaim,
     ) -> Result<SnapshotGcSettlement> {
         self.authority_transaction(|transaction| {
+            let Some(disk_id) = claim.roots.first().map(|root| &root.disk_id) else {
+                return Err(corrupt_tx());
+            };
+            lock_semantic_disk(transaction, disk_id.as_str())?;
             let Some(row) = lock_volume(transaction, &claim.volume_id)? else {
                 return Ok(SnapshotGcSettlement::Stale);
             };

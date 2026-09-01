@@ -17,7 +17,7 @@ use postgres::{Row, Transaction};
 use serde::{Deserialize, Serialize};
 
 use crate::store::transaction::{AuthorityTransactionError, AuthorityTxResult};
-use crate::store::{Result, Store};
+use crate::store::{lock_semantic_disk, Result, Store};
 
 const SNAPSHOT_COLUMNS: &str = "
     s.snapshot_id, s.workspace_id, s.snapshot_slug, s.disk_id,
@@ -324,8 +324,15 @@ impl Store {
                 return Ok(None);
             }
             let volume = load_volume(transaction, &product.volume_id, false)?;
+            let readable_admin_state = match &volume.admin_state {
+                VolumeAdminState::Active => true,
+                VolumeAdminState::GarbageCollecting { .. } => {
+                    volume.lease_owner.is_none() && volume.lease_expires_at.is_none()
+                }
+                _ => false,
+            };
             if !volume_identity_exact(&volume, &current)
-                || !matches!(volume.admin_state, VolumeAdminState::Active)
+                || !readable_admin_state
                 || !head_is_same_or_later(&volume.head, &initialized_head(&disk)?)
             {
                 return Err(corrupt());
@@ -1195,17 +1202,6 @@ fn snapshot_matches_product(snapshot: &DiskSnapshotRecord, product: &ProductDisk
         && snapshot.disk_slug == product.disk_slug
         && snapshot.volume_id == product.volume_id
         && snapshot.size_bytes == product.size_bytes
-}
-
-fn lock_semantic_disk(transaction: &mut Transaction<'_>, disk_id: &str) -> AuthorityTxResult<()> {
-    transaction.query_one(
-        "SELECT pg_advisory_xact_lock(hashtextextended(
-            current_schema() || ':semantic-disk:disk:' || $1,
-            0::BIGINT
-         ))",
-        &[&disk_id],
-    )?;
-    Ok(())
 }
 
 fn lock_snapshot_slug(

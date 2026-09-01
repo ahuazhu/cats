@@ -2,6 +2,11 @@ use cats_api::error::ErrorCode;
 use cats_api::runtime_reconciliation::{Id, RandomId128};
 
 use super::semantic_persistent_disk::{SemanticStrictDeleteState, SemanticStrictPersistentDisk};
+use crate::store::semantic::{
+    AdmitCatActionOutcome, AdmitCatCreateOutcome, AtomicCatCreate, AttachDiskOutcome, CatAction,
+    CatState, DeletePersistentDiskOutcome, DetachDiskOutcome, FinishCatAction, NewCat,
+    NewCatMount, NodeRegistration, SemanticCatSelector,
+};
 use crate::store::Store;
 
 const ROOT_HASH: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -24,6 +29,11 @@ fn candidate() -> SemanticStrictPersistentDisk {
 
 fn store() -> Store {
     let store = Store::connect(&crate::testsupport::isolated_control_store_url(), None).unwrap();
+    initialize_product_scope(&store);
+    store
+}
+
+fn initialize_product_scope(store: &Store) {
     store
         .with(|client| {
             client.batch_execute(
@@ -43,7 +53,81 @@ fn store() -> Store {
             )
         })
         .unwrap();
+}
+
+fn store_pair() -> (Store, Store) {
+    let url = crate::testsupport::isolated_control_store_url();
+    let first = Store::connect(&url, None).unwrap();
+    initialize_product_scope(&first);
+    let second = Store::connect(&url, None).unwrap();
+    (first, second)
+}
+
+fn register_node(store: &Store) {
     store
+        .register_semantic_node(NodeRegistration {
+            node_id: "node_snapshot_gc",
+            node_name: "snapshot-gc-worker",
+            control_endpoint: "http://127.0.0.1:9191",
+            vendor: "test",
+            region: "local",
+            zone: "local-a",
+            instance_id: "snapshot-gc-instance",
+            machine_type: "test.large",
+            node_version: "test",
+            reset_completed: false,
+        })
+        .unwrap();
+}
+
+fn mark_gc_required(store: &Store, candidate: &SemanticStrictPersistentDisk) {
+    store
+        .with(|client| {
+            client.execute(
+                "UPDATE volume_records
+                    SET record=jsonb_set(record,'{gc_required}','true'::jsonb),
+                        gc_required=TRUE
+                  WHERE volume_id=$1",
+                &[&candidate.volume_id.as_str()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn create_cold_cat(store: &Store) {
+    register_node(store);
+    let created = match store
+        .create_semantic_cat(NewCat {
+            cat_id: "cat_snapshot_gc",
+            workspace_id: "ws_snapshot_delete",
+            cat_slug: "snapshot-gc",
+            node_id: "node_snapshot_gc",
+            cpu_count: 1,
+            memory_bytes: 1024 * 1024,
+            boot_image: "sha256:snapshot-gc",
+        })
+        .unwrap()
+    {
+        crate::store::semantic::CreateCatOutcome::Created(cat) => cat,
+        other => panic!("new Cat was not created: {other:?}"),
+    };
+    store
+        .finish_semantic_cat_action(
+            &created.cat_id,
+            FinishCatAction {
+                expected_action: CatAction::Create,
+                expected_recovery_started_at: None,
+                expected_node_id: Some("node_snapshot_gc"),
+                expected_action_started_at: created.current_action_started_at.unwrap(),
+                final_state: CatState::Cold,
+                final_node_id: None,
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .unwrap()
+        .expect("Create occurrence must settle");
 }
 
 fn insert_snapshot(store: &Store, candidate: &SemanticStrictPersistentDisk) {
@@ -217,4 +301,136 @@ fn a_live_product_snapshot_blocks_both_disk_delete_phases() {
         still_present,
         "failed complete-delete must retain both product and authority rows"
     );
+}
+
+#[test]
+fn garbage_collecting_keeps_disk_projection_readable_and_rejects_binding_mutations() {
+    let store = store();
+    let candidate = candidate();
+    store
+        .ensure_semantic_strict_disk_created(&candidate)
+        .unwrap();
+    initialize_disk(&store, &candidate);
+    create_cold_cat(&store);
+    assert!(matches!(
+        store
+            .attach_semantic_disk(
+                "binding_snapshot_gc",
+                "cat_snapshot_gc",
+                candidate.disk_id.as_str(),
+                "/data",
+            )
+            .unwrap(),
+        AttachDiskOutcome::Attached(_)
+    ));
+    mark_gc_required(&store, &candidate);
+    let claim = store
+        .claim_next_snapshot_gc()
+        .unwrap()
+        .expect("stable Cold binding is GC eligible");
+
+    let product = store
+        .find_semantic_disk_by_id(candidate.disk_id.as_str())
+        .unwrap()
+        .expect("product Disk exists");
+    assert_eq!(store.semantic_disk_head_generation(&product).unwrap(), Some(1));
+    assert_eq!(
+        store
+            .attach_semantic_disk(
+                "binding_snapshot_gc",
+                "cat_snapshot_gc",
+                candidate.disk_id.as_str(),
+                "/data",
+            )
+            .unwrap(),
+        AttachDiskOutcome::DiskBusy
+    );
+    assert_eq!(
+        store
+            .detach_semantic_disk("cat_snapshot_gc", candidate.disk_id.as_str())
+            .unwrap(),
+        DetachDiskOutcome::DiskBusy
+    );
+    assert_eq!(
+        store
+            .delete_semantic_persistent_disk(candidate.disk_id.as_str())
+            .unwrap(),
+        DeletePersistentDiskOutcome::DiskBusy
+    );
+    assert!(matches!(
+        store
+            .admit_semantic_cat_action(
+                SemanticCatSelector::Id("cat_snapshot_gc"),
+                CatAction::Run,
+            )
+            .unwrap(),
+        AdmitCatActionOutcome::Busy(_)
+    ));
+    assert!(matches!(
+        store
+            .admit_semantic_cat_action(
+                SemanticCatSelector::Id("cat_snapshot_gc"),
+                CatAction::Destroy,
+            )
+            .unwrap(),
+        AdmitCatActionOutcome::Busy(_)
+    ));
+    assert_eq!(
+        store.abort_snapshot_gc(&claim).unwrap(),
+        super::snapshot_gc::SnapshotGcSettlement::Settled
+    );
+}
+
+#[test]
+fn gc_claim_and_initial_mount_create_serialize_on_the_disk_identity() {
+    let (gc_store, create_store) = store_pair();
+    let candidate = candidate();
+    gc_store
+        .ensure_semantic_strict_disk_created(&candidate)
+        .unwrap();
+    initialize_disk(&gc_store, &candidate);
+    register_node(&gc_store);
+    mark_gc_required(&gc_store, &candidate);
+
+    let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let gc_start = start.clone();
+    let gc = std::thread::spawn(move || {
+        gc_start.wait();
+        gc_store.claim_next_snapshot_gc().unwrap()
+    });
+    let create_start = start.clone();
+    let disk_id = candidate.disk_id.to_string();
+    let create = std::thread::spawn(move || {
+        let mounts = [NewCatMount {
+            binding_id: "binding_initial_gc_race",
+            disk_id: &disk_id,
+            mount_path: "/data",
+        }];
+        create_start.wait();
+        create_store
+            .admit_semantic_cat_create(AtomicCatCreate {
+                cat_id: "cat_initial_gc_race",
+                workspace_id: "ws_snapshot_delete",
+                cat_slug: "initial-gc-race",
+                cpu_count: 1,
+                memory_bytes: 1024 * 1024,
+                boot_image: "sha256:snapshot-gc",
+                mounts: &mounts,
+            })
+            .unwrap()
+    });
+    start.wait();
+
+    let claim = gc.join().unwrap();
+    let create = create.join().unwrap();
+    match (claim, create) {
+        (
+            Some(_),
+            AdmitCatCreateOutcome::MountRejected { code, .. },
+        ) if code == "disk_busy" => {}
+        (None, AdmitCatCreateOutcome::Created(_)) => {}
+        (claim, create) => panic!(
+            "GC and initial binding escaped common exclusion: claim={claim:?}, create={create:?}"
+        ),
+    }
 }
