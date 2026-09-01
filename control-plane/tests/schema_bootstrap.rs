@@ -27,7 +27,7 @@ fn connect_in_background(
     dsn: String,
 ) -> (
     std::thread::JoinHandle<()>,
-    mpsc::Receiver<Result<(), cats_api::error::ApiError>>,
+    mpsc::Receiver<Result<(), cats_protocol::error::ApiError>>,
 ) {
     let (result_tx, result_rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {

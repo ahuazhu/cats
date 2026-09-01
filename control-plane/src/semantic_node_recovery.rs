@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cats_api::error::ApiError;
+use cats_protocol::error::ApiError;
 
 use crate::semantic_lifecycle::{
     CatAction, CatCreateConfig, CatMount, CatRecord, CatState, IngressPort, NodeCatStatus,

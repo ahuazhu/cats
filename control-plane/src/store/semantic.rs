@@ -1171,12 +1171,12 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<CatWithMounts>> {
         if stale_after_ms <= 0 || !(1..=1024).contains(&limit) {
-            return Err(cats_api::error::ApiError::invalid(
+            return Err(cats_protocol::error::ApiError::invalid(
                 "stale semantic action scan bounds are invalid",
             ));
         }
         let limit = i64::try_from(limit)
-            .map_err(|_| cats_api::error::ApiError::invalid("scan limit exceeds BIGINT"))?;
+            .map_err(|_| cats_protocol::error::ApiError::invalid("scan limit exceeds BIGINT"))?;
         self.with(|client| {
             let mut transaction = client.transaction()?;
             let rows = transaction.query(
@@ -1388,7 +1388,7 @@ impl Store {
     /// that never sends its first heartbeat is still discovered here.
     pub fn list_stale_semantic_nodes(&self, missed_for_ms: i64) -> Result<Vec<StaleNodeRecord>> {
         if missed_for_ms <= 0 {
-            return Err(cats_api::error::ApiError::invalid(
+            return Err(cats_protocol::error::ApiError::invalid(
                 "missed heartbeat window must be positive",
             ));
         }

@@ -11,14 +11,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
-use cats_api::guest::{
+use cats_protocol::guest::{
     read_filesystem_control_response_frame, read_frame, read_runtime_ready_response_frame,
     write_filesystem_control_request_frame, write_frame, write_runtime_ready_request_frame,
     FilesystemControlRequestV1, FilesystemControlResponseV1, GuestRequest, GuestRequestBody,
     GuestResponse, GuestResponseBody, GuestShellFrame, GuestWorkStatus, RuntimeReadyRequestV1,
     RuntimeReadyResponseV1,
 };
-use cats_api::oci::{DeployOciRequest, OciDeployment};
+use cats_protocol::oci::{DeployOciRequest, OciDeployment};
 
 pub struct GuestClient {
     stream: UnixStream,
@@ -1104,12 +1104,12 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use cats_api::guest::{
+    use cats_protocol::guest::{
         read_frame, read_guest_request_frame, write_frame, write_runtime_ready_response_frame,
         GuestRequest, GuestRequestBody, GuestResponse, GuestResponseBody, GuestWorkStatus,
         RuntimeReadyRequestV1, RuntimeReadyResponseV1, RUNTIME_READY_RESPONSE_MAX_FRAME_BYTES_V1,
     };
-    use cats_api::runtime_reconciliation::{GuestBootId, RandomId128};
+    use cats_protocol::runtime_reconciliation::{GuestBootId, RandomId128};
 
     #[cfg(target_os = "linux")]
     use super::connect_unix_before;
@@ -1386,7 +1386,7 @@ mod tests {
                 vec!["true".to_owned()],
                 Some(100),
                 Default::default(),
-                vec![0x5a; cats_api::sessions::MAX_EXEC_STDIN_BYTES],
+                vec![0x5a; cats_protocol::sessions::MAX_EXEC_STDIN_BYTES],
             )
             .expect_err("blocked request write must not refresh its deadline");
         assert!(started.elapsed() < Duration::from_millis(500));

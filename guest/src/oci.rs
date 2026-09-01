@@ -12,7 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
-use cats_api::oci::{DeployOciRequest, OciDeployment, OciRegistryAuth};
+use cats_protocol::oci::{DeployOciRequest, OciDeployment, OciRegistryAuth};
 use flate2::read::MultiGzDecoder;
 use reqwest::blocking::{Client, Response};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, WWW_AUTHENTICATE};

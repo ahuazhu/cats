@@ -5,12 +5,16 @@ use std::sync::Arc;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use cats_api::node_identity::JSON_CONTENT_TYPE;
-use cats_api::runtime_node_authority::{
+use cats_control_plane::server::{Config, Handle};
+use cats_control_plane::store::DsnSource;
+use cats_control_plane::testsupport::spawn_control_plane_for_test as spawn;
+use cats_metering::SqliteUsageStore;
+use cats_protocol::node_identity::JSON_CONTENT_TYPE;
+use cats_protocol::runtime_node_authority::{
     runtime_node_authority_signed_request, NODE_AUTHORITY_APPLY_ID_HEADER,
     PROVISIONER_CREDENTIAL_ID_HEADER, PROVISIONER_SIGNATURE_HEADER, RUNTIME_NODE_AUTHORITY_PATH,
 };
-use cats_api::runtime_reconciliation::{
+use cats_protocol::runtime_reconciliation::{
     decode_runtime_node_authority_apply_result, encode_runtime_node_authority_apply,
     runtime_provisioner_active_set_digest, AllocatableMemoryBytes, AllocatableVcpus,
     Base64UrlNoPad, ContractVersion, CredentialBinding, Epoch, GuestIpv4Pool, GuestIpv4PoolKind,
@@ -21,10 +25,6 @@ use cats_api::runtime_reconciliation::{
     RuntimeProvisionerCredential, RuntimeProvisionerExpectedPrevious,
     RuntimeProvisionerTrustBundle, RuntimeSchedulingState, Sha256Digest,
 };
-use cats_control_plane::server::{Config, Handle};
-use cats_control_plane::store::DsnSource;
-use cats_control_plane::testsupport::spawn_control_plane_for_test as spawn;
-use cats_metering::SqliteUsageStore;
 use reqwest::{Method, RequestBuilder, StatusCode};
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -235,7 +235,7 @@ fn identity() -> NodeIdentity {
     NodeIdentity {
         version: ContractVersion::V1,
         node_id: id("node_http_a"),
-        provider_scope: cats_api::runtime_reconciliation::ProviderScope {
+        provider_scope: cats_protocol::runtime_reconciliation::ProviderScope {
             provider: id("test_provider"),
             partition: id("test_partition"),
             account_id: id("test_account"),

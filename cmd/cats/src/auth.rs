@@ -605,7 +605,7 @@ fn parse_json_response<T: serde::de::DeserializeOwned>(
 }
 
 fn response_error<T>(status: reqwest::StatusCode, text: &str) -> Result<T> {
-    if let Ok(error) = serde_json::from_str::<cats_api::error::ErrorBody>(text) {
+    if let Ok(error) = serde_json::from_str::<cats_protocol::error::ErrorBody>(text) {
         bail!("{} ({:?})", error.message, error.code);
     }
     bail!("HTTP {status}: {text}")

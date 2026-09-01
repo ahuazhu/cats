@@ -1,6 +1,8 @@
 //! Print the canonical guest config digest a placement policy must declare for
 //! one release's GuestRuntimeProfileReceipt.
-use cats_api::runtime_reconciliation::{decode_guest_runtime_profile_receipt, guest_config_digest};
+use cats_protocol::runtime_reconciliation::{
+    decode_guest_runtime_profile_receipt, guest_config_digest,
+};
 
 fn main() {
     let path = std::env::args()

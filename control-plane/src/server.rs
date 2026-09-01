@@ -11,10 +11,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use cats_api::runtime_reconciliation::{
+use cats_metering::{CreditStore, UsageStore};
+use cats_protocol::runtime_reconciliation::{
     GuestRuntimeProfileReceipt, RuntimeProvisionerTrustBundle, Sha256Digest,
 };
-use cats_metering::{CreditStore, UsageStore};
 use cats_storage::BlobStore;
 
 use crate::store::{DsnSource, SingletonRole, Store};
@@ -51,7 +51,7 @@ pub struct Config {
     pub guest_runtime_profile_receipt: GuestRuntimeProfileReceipt,
     pub runtime_provisioner_trust_bundle: RuntimeProvisionerTrustBundle,
     pub production_cutover_operator_trust_bundle:
-        cats_api::production_mutation_admission::ProductionCutoverOperatorTrustBundle,
+        cats_protocol::production_mutation_admission::ProductionCutoverOperatorTrustBundle,
     pub admin_token: String,
     pub workos: Option<Arc<crate::auth::WorkOsConfig>>,
     pub stripe: Option<Arc<crate::billing::StripeClient>>,
@@ -220,7 +220,7 @@ async fn spawn_with_session_override(
     }
 
     let noded_service_token =
-        cats_api::semantic_control::NodedServiceToken::new(cfg.noded_service_token.clone())
+        cats_protocol::semantic_control::NodedServiceToken::new(cfg.noded_service_token.clone())
             .context("CATS_NODED_SERVICE_TOKEN must satisfy the semantic noded token contract")?;
     let semantic_noded_client = crate::semantic_noded_client::SemanticNodedClient::new(
         noded_service_token.clone(),
@@ -247,7 +247,7 @@ async fn spawn_with_session_override(
             let report = recovery
                 .recover_offline_node(&node_id)
                 .await
-                .map_err(|error| cats_api::error::ApiError::internal(error.message))?;
+                .map_err(|error| cats_protocol::error::ApiError::internal(error.message))?;
             for cat in report.cats {
                 tracing::info!(
                     source_node_id = %report.source_node_id,
@@ -265,7 +265,7 @@ async fn spawn_with_session_override(
             recovery
                 .drain_node(&node_id)
                 .await
-                .map_err(|error| cats_api::error::ApiError::internal(error.message))
+                .map_err(|error| cats_protocol::error::ApiError::internal(error.message))
         })
     });
     let semantic_node_repository: Arc<dyn crate::semantic_node::NodeRepository> =

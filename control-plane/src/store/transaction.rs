@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cats_api::error::{ApiError, ErrorCode};
+use cats_protocol::error::{ApiError, ErrorCode};
 use cats_storage::authority::AuthorityError;
 use postgres::error::SqlState;
 use postgres::IsolationLevel;

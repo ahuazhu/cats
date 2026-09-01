@@ -5,7 +5,7 @@
 //! the same row for update, so PostgreSQL drains every admitted write before
 //! the qualification returns to Closed.
 
-use cats_api::production_mutation_admission::{
+use cats_protocol::production_mutation_admission::{
     encode_production_mutation_admission_command,
     encode_production_mutation_admission_command_receipt,
     encode_production_mutation_admission_state,
@@ -23,7 +23,7 @@ use cats_api::production_mutation_admission::{
     PRODUCTION_QUALIFICATION_MAX_LIFETIME_MS,
     PRODUCTION_QUALIFICATION_PRODUCT_INVENTORY_RECEIPT_KIND,
 };
-use cats_api::runtime_reconciliation::{
+use cats_protocol::runtime_reconciliation::{
     ContractVersion, Epoch, RandomId128, Sha256Digest, UnixMillis, WireU64,
 };
 use cats_storage::authority::AuthorityError;
@@ -262,7 +262,7 @@ fn qualification_product_inventory_in(
 
 fn semantic_product_inventory_counts(
     transaction: &mut Transaction<'_>,
-    workspace_id: &cats_api::runtime_reconciliation::Id,
+    workspace_id: &cats_protocol::runtime_reconciliation::Id,
 ) -> AuthorityTxResult<ProductionQualificationProductInventoryCounts> {
     let row = transaction.query_one(
         "SELECT
@@ -304,7 +304,7 @@ fn semantic_product_inventory_counts(
 )]
 pub(in crate::store) fn require_production_product_mutation_admitted(
     transaction: &mut Transaction<'_>,
-    authenticated_workspace_id: &cats_api::runtime_reconciliation::Id,
+    authenticated_workspace_id: &cats_protocol::runtime_reconciliation::Id,
     mutation_class: ProductionQualificationMutationClass,
 ) -> AuthorityTxResult<ProductionMutationAdmissionBinding> {
     let state = load_state_locked(transaction, "FOR SHARE")?;
@@ -924,10 +924,10 @@ fn qualified_release_commit() -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cats_api::production_mutation_admission::{
+    use cats_protocol::production_mutation_admission::{
         ProductionCutoverAwsPartition, ProductionCutoverStsPrincipal,
     };
-    use cats_api::runtime_reconciliation::{Id, WireU64};
+    use cats_protocol::runtime_reconciliation::{Id, WireU64};
     use postgres::NoTls;
     use std::sync::mpsc;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};

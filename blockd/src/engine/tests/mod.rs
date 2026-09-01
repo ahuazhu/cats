@@ -149,10 +149,9 @@ impl VolumeDataAuthority for TestVolumeDataAuthority {
         };
         let last_transition = lease_owner.as_ref().and_then(|attachment_id| {
             (lease_epoch.get() > 0).then(|| {
-                let transition_id = cats_api::runtime_reconciliation::RandomId128::new(format!(
-                    "{:032x}",
-                    lease_epoch.get()
-                ))
+                let transition_id = cats_protocol::runtime_reconciliation::RandomId128::new(
+                    format!("{:032x}", lease_epoch.get()),
+                )
                 .expect("positive lease epoch is a nonzero transition id");
                 LastVolumeTransition::NormalAcquire {
                     request: NormalAcquireRequest {
@@ -160,10 +159,11 @@ impl VolumeDataAuthority for TestVolumeDataAuthority {
                         transition_id: transition_id.clone(),
                         attachment_id: attachment_id.clone(),
                         expected_unowned_epoch: FenceEpoch::new(lease_epoch.get() - 1).unwrap(),
-                        placement_epoch: cats_api::runtime_reconciliation::Epoch::new(1).unwrap(),
+                        placement_epoch: cats_protocol::runtime_reconciliation::Epoch::new(1)
+                            .unwrap(),
                         lease_duration_ms: 1,
                     },
-                    result: cats_api::runtime_reconciliation::NormalAcquireResult {
+                    result: cats_protocol::runtime_reconciliation::NormalAcquireResult {
                         volume_id: volume_id.clone(),
                         transition_id,
                         attachment_id: attachment_id.clone(),
@@ -273,13 +273,13 @@ fn serving_fixture(durability: VolumeDurability) -> ServingFixture {
     let blob = Arc::new(FileBlobStore::open(dir.path().join("blob")).unwrap());
     let request = NormalAcquireRequest {
         volume_id: Id::new(VOL).unwrap(),
-        transition_id: cats_api::runtime_reconciliation::RandomId128::new(
+        transition_id: cats_protocol::runtime_reconciliation::RandomId128::new(
             "1234567890abcdef1234567890abcdef",
         )
         .unwrap(),
         attachment_id: Id::new("attA").unwrap(),
         expected_unowned_epoch: FenceEpoch::new(0).unwrap(),
-        placement_epoch: cats_api::runtime_reconciliation::Epoch::new(3).unwrap(),
+        placement_epoch: cats_protocol::runtime_reconciliation::Epoch::new(3).unwrap(),
         lease_duration_ms: 60_000,
     };
     let unowned = VolumeRecord {
@@ -415,7 +415,7 @@ fn status_reports_the_configured_volume_and_attachment() {
     let env = env();
     let e = attach(&env, "attA");
     let wire = serde_json::to_string(&e.durability_status()).unwrap();
-    let status: cats_api::blockd::DurabilityStatus = serde_json::from_str(&wire).unwrap();
+    let status: cats_protocol::blockd::DurabilityStatus = serde_json::from_str(&wire).unwrap();
     assert_eq!(status.volume_id, VOL);
     assert_eq!(status.attachment_id, "attA");
     assert_eq!(status.guest_device_serial, None);
@@ -1016,7 +1016,7 @@ fn split_overlay_fragments_promote_to_bases_and_preserve_the_exact_bytes() {
     let mut expected = vec![0u8; CHUNK_SIZE as usize];
 
     for generation in 0..3usize {
-        let offset = generation * cats_api::chunk::DIRTY_PAGE_SIZE as usize;
+        let offset = generation * cats_protocol::chunk::DIRTY_PAGE_SIZE as usize;
         let bytes = pattern(4096, 81 + generation as u8);
         e.write(offset as u64, &bytes).unwrap();
         expected[offset..offset + bytes.len()].copy_from_slice(&bytes);
@@ -1028,7 +1028,7 @@ fn split_overlay_fragments_promote_to_bases_and_preserve_the_exact_bytes() {
     let _limit = PublisherWorkingSetLimitGuard::set(RANGE_STORM_LIMIT);
     let mut range_count = 0usize;
     for page in 0..33usize {
-        let page_start = page * cats_api::chunk::DIRTY_PAGE_SIZE as usize;
+        let page_start = page * cats_protocol::chunk::DIRTY_PAGE_SIZE as usize;
         for range in 0..16usize {
             let offset = page_start + range * 2;
             let byte = [(page as u8).wrapping_add(range as u8).wrapping_add(1)];
@@ -1300,7 +1300,10 @@ fn relaxed_read_waits_until_a_frozen_cold_overlay_is_journaled() {
     assert!(e.durability_status().unpublished_bytes < 1 << 20);
 
     let large_offset = 1 << 20;
-    let large = pattern((2 << 20) + cats_api::chunk::DIRTY_PAGE_SIZE as usize, 92);
+    let large = pattern(
+        (2 << 20) + cats_protocol::chunk::DIRTY_PAGE_SIZE as usize,
+        92,
+    );
     e.write(large_offset, &large).unwrap();
     let flushing = {
         let e = e.clone();
@@ -2111,7 +2114,7 @@ fn malformed_pack_entries_fail_before_any_remote_write_or_indexing() {
         meta.clone(),
     )
     .unwrap();
-    let page = vec![0x5a; cats_api::chunk::DIRTY_PAGE_SIZE as usize];
+    let page = vec![0x5a; cats_protocol::chunk::DIRTY_PAGE_SIZE as usize];
     let valid_entry = PackEntry {
         chunk_idx: 0,
         payload_offset: 0,
@@ -2902,7 +2905,7 @@ fn attach_with(env: &Env, blob: Arc<dyn BlobStore>, attachment: &str) -> Arc<Chu
     .unwrap()
 }
 
-const PAGE: u64 = cats_api::chunk::DIRTY_PAGE_SIZE as u64;
+const PAGE: u64 = cats_protocol::chunk::DIRTY_PAGE_SIZE as u64;
 
 /// A golden rootfs stand-in: distinct content per chunk, one all-zero chunk,
 /// and a tail shorter than a chunk — the shapes a real image has.
@@ -3645,7 +3648,7 @@ struct RootProvisionFixture {
     blob: Arc<FileBlobStore>,
     meta: Arc<CountingMeta>,
     manifest: format::ImageManifest,
-    request: cats_api::runtime_reconciliation::ProvisionRootImageRequest,
+    request: cats_protocol::runtime_reconciliation::ProvisionRootImageRequest,
     data_dir: PathBuf,
     _dir: tempfile::TempDir,
 }
@@ -3710,7 +3713,7 @@ struct LocalCacheProvisionFixture {
     manifest: format::ImageManifest,
     engine: Arc<ChunkEngine>,
     blob: Arc<ImageValidationCountingBlob>,
-    request: cats_api::runtime_reconciliation::ProvisionRootImageRequest,
+    request: cats_protocol::runtime_reconciliation::ProvisionRootImageRequest,
 }
 
 fn local_cache_provision_fixture() -> LocalCacheProvisionFixture {
@@ -3839,7 +3842,7 @@ fn an_exact_local_cache_cannot_publish_a_map_when_a_remote_object_is_missing() {
             .engine
             .provision_root_image_with_local_cache(&fixture.request, &fixture.cache_image)
             .unwrap_err(),
-        cats_api::runtime_reconciliation::ProvisionRootImageRetryableProblem::ImageUnavailable,
+        cats_protocol::runtime_reconciliation::ProvisionRootImageRetryableProblem::ImageUnavailable,
     );
     assert!(volume_objects(fixture.blob.as_ref()).is_empty());
 }
@@ -3901,7 +3904,7 @@ fn root_provision_request(
     manifest: &format::ImageManifest,
     epoch: i64,
     transition: &str,
-) -> cats_api::runtime_reconciliation::ProvisionRootImageRequest {
+) -> cats_protocol::runtime_reconciliation::ProvisionRootImageRequest {
     let map = format::image_base_map(manifest, SIZE).unwrap();
     let chunks: Vec<u64> = manifest
         .chunks
@@ -3910,30 +3913,34 @@ fn root_provision_request(
         .collect();
     let leaves = vec![LeafRef::Empty; chunk::leaf_count(SIZE) as usize];
     let prepared = engine.prepare_map_publication(0, &map, &leaves, &chunks);
-    cats_api::runtime_reconciliation::ProvisionRootImageRequest {
-        provision_transition_id: cats_api::runtime_reconciliation::RandomId128::new(transition)
+    cats_protocol::runtime_reconciliation::ProvisionRootImageRequest {
+        provision_transition_id: cats_protocol::runtime_reconciliation::RandomId128::new(
+            transition,
+        )
+        .unwrap(),
+        volume_id: cats_protocol::runtime_reconciliation::Id::new(VOL).unwrap(),
+        attachment_id: cats_protocol::runtime_reconciliation::Id::new("attA").unwrap(),
+        attachment_epoch: cats_protocol::runtime_reconciliation::FenceEpoch::new(epoch as u64)
             .unwrap(),
-        volume_id: cats_api::runtime_reconciliation::Id::new(VOL).unwrap(),
-        attachment_id: cats_api::runtime_reconciliation::Id::new("attA").unwrap(),
-        attachment_epoch: cats_api::runtime_reconciliation::FenceEpoch::new(epoch as u64).unwrap(),
         size_bytes: SIZE,
-        boot_image_digest: cats_api::runtime_reconciliation::Sha256Digest::new(format!(
+        boot_image_digest: cats_protocol::runtime_reconciliation::Sha256Digest::new(format!(
             "sha256:{}",
             manifest.image_id
         ))
         .unwrap(),
-        expected_blank_head: cats_api::runtime_reconciliation::RemoteHead {
-            generation: cats_api::runtime_reconciliation::Generation::new(0).unwrap(),
+        expected_blank_head: cats_protocol::runtime_reconciliation::RemoteHead {
+            generation: cats_protocol::runtime_reconciliation::Generation::new(0).unwrap(),
             root_hash: None,
             root_object_id: None,
         },
-        expected_provisioned_head: cats_api::runtime_reconciliation::RemoteHead {
-            generation: cats_api::runtime_reconciliation::Generation::new(1).unwrap(),
-            root_hash: Some(cats_api::runtime_reconciliation::Sha256Digest::from_bytes(
-                prepared.root_hash,
-            )),
+        expected_provisioned_head: cats_protocol::runtime_reconciliation::RemoteHead {
+            generation: cats_protocol::runtime_reconciliation::Generation::new(1).unwrap(),
+            root_hash: Some(
+                cats_protocol::runtime_reconciliation::Sha256Digest::from_bytes(prepared.root_hash),
+            ),
             root_object_id: Some(
-                cats_api::runtime_reconciliation::AsciiText::new(prepared.root_object_id).unwrap(),
+                cats_protocol::runtime_reconciliation::AsciiText::new(prepared.root_object_id)
+                    .unwrap(),
             ),
         },
     }
@@ -3990,13 +3997,13 @@ fn root_provision_fixture() -> RootProvisionFixture {
 
 fn assert_definite_problem(
     error: ProvisionRootImageEffectError,
-    expected: cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem,
+    expected: cats_protocol::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem,
 ) {
     assert!(
         matches!(
             &error,
             ProvisionRootImageEffectError::Closed(
-                cats_api::runtime_reconciliation::ProvisionRootImageError::DefiniteConflict {
+                cats_protocol::runtime_reconciliation::ProvisionRootImageError::DefiniteConflict {
                     problem,
                     ..
                 }
@@ -4008,13 +4015,13 @@ fn assert_definite_problem(
 
 fn assert_retryable_problem(
     error: ProvisionRootImageEffectError,
-    expected: cats_api::runtime_reconciliation::ProvisionRootImageRetryableProblem,
+    expected: cats_protocol::runtime_reconciliation::ProvisionRootImageRetryableProblem,
 ) {
     assert!(
         matches!(
             &error,
             ProvisionRootImageEffectError::Closed(
-                cats_api::runtime_reconciliation::ProvisionRootImageError::Retryable {
+                cats_protocol::runtime_reconciliation::ProvisionRootImageError::Retryable {
                     problem,
                     ..
                 }
@@ -4144,51 +4151,49 @@ fn request_binding_and_target_conflicts_have_zero_remote_side_effects() {
 
     let mut cases = Vec::new();
     let mut wrong = fixture.request.clone();
-    wrong.volume_id = cats_api::runtime_reconciliation::Id::new("other-volume").unwrap();
+    wrong.volume_id = cats_protocol::runtime_reconciliation::Id::new("other-volume").unwrap();
     cases.push((
         wrong,
-        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::RequestBinding,
+        cats_protocol::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::RequestBinding,
     ));
     let mut wrong = fixture.request.clone();
-    wrong.attachment_id = cats_api::runtime_reconciliation::Id::new("other-owner").unwrap();
+    wrong.attachment_id = cats_protocol::runtime_reconciliation::Id::new("other-owner").unwrap();
     cases.push((
         wrong,
-        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::RequestBinding,
+        cats_protocol::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::RequestBinding,
     ));
     let mut wrong = fixture.request.clone();
-    wrong.attachment_epoch = cats_api::runtime_reconciliation::FenceEpoch::new(
+    wrong.attachment_epoch = cats_protocol::runtime_reconciliation::FenceEpoch::new(
         fixture.request.attachment_epoch.get() + 1,
     )
     .unwrap();
     cases.push((
         wrong,
-        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::RequestBinding,
+        cats_protocol::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::RequestBinding,
     ));
     let mut wrong = fixture.request.clone();
     wrong.size_bytes += CHUNK_SIZE as u64;
     cases.push((
         wrong,
-        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::RequestBinding,
+        cats_protocol::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::RequestBinding,
     ));
     let mut wrong = fixture.request.clone();
     wrong.expected_blank_head.generation =
-        cats_api::runtime_reconciliation::Generation::new(1).unwrap();
-    wrong.expected_blank_head.root_hash = Some(
-        cats_api::runtime_reconciliation::Sha256Digest::from_bytes([3; 32]),
-    );
+        cats_protocol::runtime_reconciliation::Generation::new(1).unwrap();
+    wrong.expected_blank_head.root_hash =
+        Some(cats_protocol::runtime_reconciliation::Sha256Digest::from_bytes([3; 32]));
     wrong.expected_blank_head.root_object_id =
-        Some(cats_api::runtime_reconciliation::AsciiText::new("bad.node").unwrap());
+        Some(cats_protocol::runtime_reconciliation::AsciiText::new("bad.node").unwrap());
     cases.push((
         wrong,
-        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::TargetMismatch,
+        cats_protocol::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::TargetMismatch,
     ));
     let mut wrong = fixture.request.clone();
-    wrong.expected_provisioned_head.root_hash = Some(
-        cats_api::runtime_reconciliation::Sha256Digest::from_bytes([4; 32]),
-    );
+    wrong.expected_provisioned_head.root_hash =
+        Some(cats_protocol::runtime_reconciliation::Sha256Digest::from_bytes([4; 32]));
     cases.push((
         wrong,
-        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::TargetMismatch,
+        cats_protocol::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::TargetMismatch,
     ));
 
     for (request, expected) in cases {
@@ -4213,7 +4218,7 @@ fn dirty_pending_and_staged_local_state_fail_before_remote_writes() {
             .engine
             .provision_root_image(&fixture.request)
             .unwrap_err(),
-        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::LocalState,
+        cats_protocol::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::LocalState,
     );
     fixture.engine.state.lock().unwrap().dirty[0] = 0;
 
@@ -4227,7 +4232,7 @@ fn dirty_pending_and_staged_local_state_fail_before_remote_writes() {
             .engine
             .provision_root_image(&fixture.request)
             .unwrap_err(),
-        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::LocalState,
+        cats_protocol::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::LocalState,
     );
     fs::remove_file(fixture.data_dir.join(PENDING_PACK_DIR).join("residue.pack")).unwrap();
 
@@ -4237,7 +4242,7 @@ fn dirty_pending_and_staged_local_state_fail_before_remote_writes() {
             .engine
             .provision_root_image(&fixture.request)
             .unwrap_err(),
-        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::LocalState,
+        cats_protocol::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::LocalState,
     );
     fixture.engine.staged.lock().unwrap().bytes = 0;
     fixture
@@ -4249,7 +4254,7 @@ fn dirty_pending_and_staged_local_state_fail_before_remote_writes() {
             .engine
             .provision_root_image(&fixture.request)
             .unwrap_err(),
-        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::LocalState,
+        cats_protocol::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::LocalState,
     );
     fixture
         .engine
@@ -4302,7 +4307,7 @@ fn control_only_attach_preserves_and_refuses_legacy_pending_state() {
     );
     assert_definite_problem(
         control.provision_root_image(&request).unwrap_err(),
-        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::LocalState,
+        cats_protocol::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::LocalState,
     );
     assert_eq!(env.meta.load_head(VOL).unwrap().generation, 0);
     assert!(volume_objects(env.blob.as_ref()).is_empty());
@@ -4481,15 +4486,15 @@ fn invalid_manifest_corpus_is_rejected_before_any_volume_object_or_cas() {
             .unwrap();
         let mut request = fixture.request.clone();
         request.boot_image_digest =
-            cats_api::runtime_reconciliation::Sha256Digest::new(format!("sha256:{image_id}"))
+            cats_protocol::runtime_reconciliation::Sha256Digest::new(format!("sha256:{image_id}"))
                 .unwrap();
         let error = fixture.engine.provision_root_image(&request).unwrap_err();
         assert!(
             matches!(
                 &error,
                 ProvisionRootImageEffectError::Closed(
-                    cats_api::runtime_reconciliation::ProvisionRootImageError::DefiniteConflict {
-                        problem: cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::ImageManifest,
+                    cats_protocol::runtime_reconciliation::ProvisionRootImageError::DefiniteConflict {
+                        problem: cats_protocol::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::ImageManifest,
                         ..
                     }
                 )
@@ -4520,11 +4525,11 @@ fn invalid_manifest_corpus_is_rejected_before_any_volume_object_or_cas() {
         .unwrap();
     let mut request = fixture.request.clone();
     request.boot_image_digest =
-        cats_api::runtime_reconciliation::Sha256Digest::new(format!("sha256:{mismatch_id}"))
+        cats_protocol::runtime_reconciliation::Sha256Digest::new(format!("sha256:{mismatch_id}"))
             .unwrap();
     assert_definite_problem(
         fixture.engine.provision_root_image(&request).unwrap_err(),
-        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::ImageManifest,
+        cats_protocol::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::ImageManifest,
     );
 
     assert_eq!(volume_objects(fixture.blob.as_ref()), before_objects);
@@ -4538,10 +4543,10 @@ fn missing_image_and_changed_owner_never_publish_volume_objects() {
     let before_cas = fixture.meta.cas_calls.load(Ordering::SeqCst);
     let mut missing = fixture.request.clone();
     missing.boot_image_digest =
-        cats_api::runtime_reconciliation::Sha256Digest::from_bytes([0xee; 32]);
+        cats_protocol::runtime_reconciliation::Sha256Digest::from_bytes([0xee; 32]);
     assert_retryable_problem(
         fixture.engine.provision_root_image(&missing).unwrap_err(),
-        cats_api::runtime_reconciliation::ProvisionRootImageRetryableProblem::ImageUnavailable,
+        cats_protocol::runtime_reconciliation::ProvisionRootImageRetryableProblem::ImageUnavailable,
     );
     assert_eq!(volume_objects(fixture.blob.as_ref()), before_objects);
     assert_eq!(fixture.meta.cas_calls.load(Ordering::SeqCst), before_cas);
@@ -4595,32 +4600,34 @@ fn a_lost_generation_one_cas_response_is_adopted_from_exact_authority() {
         &vec![LeafRef::Empty; chunk::leaf_count(SIZE) as usize],
         &chunks,
     );
-    let request = cats_api::runtime_reconciliation::ProvisionRootImageRequest {
-        provision_transition_id: cats_api::runtime_reconciliation::RandomId128::new(
+    let request = cats_protocol::runtime_reconciliation::ProvisionRootImageRequest {
+        provision_transition_id: cats_protocol::runtime_reconciliation::RandomId128::new(
             "2468ace013579bdf2468ace013579bdf",
         )
         .unwrap(),
-        volume_id: cats_api::runtime_reconciliation::Id::new(VOL).unwrap(),
-        attachment_id: cats_api::runtime_reconciliation::Id::new("attA").unwrap(),
-        attachment_epoch: cats_api::runtime_reconciliation::FenceEpoch::new(epoch as u64).unwrap(),
+        volume_id: cats_protocol::runtime_reconciliation::Id::new(VOL).unwrap(),
+        attachment_id: cats_protocol::runtime_reconciliation::Id::new("attA").unwrap(),
+        attachment_epoch: cats_protocol::runtime_reconciliation::FenceEpoch::new(epoch as u64)
+            .unwrap(),
         size_bytes: SIZE,
-        boot_image_digest: cats_api::runtime_reconciliation::Sha256Digest::new(format!(
+        boot_image_digest: cats_protocol::runtime_reconciliation::Sha256Digest::new(format!(
             "sha256:{}",
             manifest.image_id
         ))
         .unwrap(),
-        expected_blank_head: cats_api::runtime_reconciliation::RemoteHead {
-            generation: cats_api::runtime_reconciliation::Generation::new(0).unwrap(),
+        expected_blank_head: cats_protocol::runtime_reconciliation::RemoteHead {
+            generation: cats_protocol::runtime_reconciliation::Generation::new(0).unwrap(),
             root_hash: None,
             root_object_id: None,
         },
-        expected_provisioned_head: cats_api::runtime_reconciliation::RemoteHead {
-            generation: cats_api::runtime_reconciliation::Generation::new(1).unwrap(),
-            root_hash: Some(cats_api::runtime_reconciliation::Sha256Digest::from_bytes(
-                prepared.root_hash,
-            )),
+        expected_provisioned_head: cats_protocol::runtime_reconciliation::RemoteHead {
+            generation: cats_protocol::runtime_reconciliation::Generation::new(1).unwrap(),
+            root_hash: Some(
+                cats_protocol::runtime_reconciliation::Sha256Digest::from_bytes(prepared.root_hash),
+            ),
             root_object_id: Some(
-                cats_api::runtime_reconciliation::AsciiText::new(prepared.root_object_id).unwrap(),
+                cats_protocol::runtime_reconciliation::AsciiText::new(prepared.root_object_id)
+                    .unwrap(),
             ),
         },
     };
@@ -4717,7 +4724,7 @@ fn immutable_key_conflict_and_unrelated_head_fail_closed_without_cas() {
             .engine
             .provision_root_image(&fixture.request)
             .unwrap_err(),
-        cats_api::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::ImmutableObject,
+        cats_protocol::runtime_reconciliation::ProvisionRootImageDefiniteConflictProblem::ImmutableObject,
     );
     assert_eq!(fixture.meta.cas_calls.load(Ordering::SeqCst), before_cas);
 

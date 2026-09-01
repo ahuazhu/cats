@@ -18,7 +18,7 @@ name = "cats-e3-guest-workload"
 path = "src/e3_workload.rs"
 
 [dependencies]
-cats-api = { workspace = true }
+cats-protocol = { workspace = true }
 cats-block-client = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }

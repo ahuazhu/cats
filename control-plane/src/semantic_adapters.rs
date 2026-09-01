@@ -8,9 +8,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use cats_api::error::ApiError;
-use cats_api::runtime_reconciliation::{Id, RandomId128};
-use cats_api::semantic_control::{
+use cats_protocol::error::ApiError;
+use cats_protocol::runtime_reconciliation::{Id, RandomId128};
+use cats_protocol::semantic_control::{
     CatAction as WireCatAction, CatIngressTarget, CatState as WireCatState, NodeHeartbeatRequest,
     NodeHeartbeatResponse, NodeHeartbeatStatus, NodeName, NodeRegistrationRequest,
     NodeRegistrationResponse, NodeRegistrationStatus, NodeStatus as WireNodeStatus, NodeView,
@@ -1201,7 +1201,7 @@ const fn stored_node_status_to_wire(status: StoredNodeStatus) -> WireNodeStatus 
 
 #[cfg(test)]
 mod tests {
-    use cats_api::semantic_control::SemanticErrorBody;
+    use cats_protocol::semantic_control::SemanticErrorBody;
 
     use super::*;
 

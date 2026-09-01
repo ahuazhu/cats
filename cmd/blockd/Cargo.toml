@@ -13,7 +13,7 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
-cats-api = { workspace = true }
+cats-protocol = { workspace = true }
 cats-blockd = { workspace = true }
 cats-storage = { workspace = true }
 cats-object-store-file = { workspace = true }

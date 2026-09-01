@@ -4,8 +4,8 @@
 //! the layout is testable without a control plane and `--watch` can redraw from
 //! a cached snapshot without refetching.
 
-use cats_api::metering::{UsageMetric, UsageReport};
-use cats_api::semantic_control::{CatAction, CatState, CatView, DiskView};
+use cats_protocol::metering::{UsageMetric, UsageReport};
+use cats_protocol::semantic_control::{CatAction, CatState, CatView, DiskView};
 
 use crate::term::{
     format_age, format_bytes, format_duration, format_timestamp, Align, Cell, Style, Table, Term,
@@ -243,7 +243,7 @@ pub(crate) fn cat_card(
 /// `Debug` would render `GuestStartFailed`; the wire name is
 /// `guest_start_failed`, and that is the string a user can search for in logs
 /// and docs. Serde is the single source of that spelling.
-fn error_code_label(code: cats_api::semantic_control::SemanticErrorCode) -> String {
+fn error_code_label(code: cats_protocol::semantic_control::SemanticErrorCode) -> String {
     serde_json::to_value(code)
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))
@@ -496,8 +496,8 @@ fn i64_from_ms(unix_ms: u64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cats_api::runtime_reconciliation::Id;
-    use cats_api::semantic_control::{
+    use cats_protocol::runtime_reconciliation::Id;
+    use cats_protocol::semantic_control::{
         CatMountView, DiskStatus, NodeName, PersistentMountPath, ResourceSlug, SemanticErrorBody,
         SemanticErrorCode,
     };

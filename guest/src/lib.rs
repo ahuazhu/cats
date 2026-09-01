@@ -25,15 +25,15 @@ use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
 
-pub use cats_api::guest::{read_frame, write_frame, DiskMap, DiskMapEntry};
-use cats_api::guest::{
+use cats_block_client::NbdClient;
+pub use cats_protocol::guest::{read_frame, write_frame, DiskMap, DiskMapEntry};
+use cats_protocol::guest::{
     read_guest_request_frame, write_filesystem_control_response_frame,
     write_runtime_ready_response_frame, AcquireGuestWorkLeaseRequest, GuestRequestBody,
     GuestResponse, GuestResponseBody, GuestRuntimeApiError, GuestRuntimeApiErrorResponse,
     GuestShellFrame, GuestWorkLease, GuestWorkStatus, RenewGuestWorkLeaseRequest,
     GUEST_WORK_LEASES_PATH, MAX_WORK_LEASES, MAX_WORK_LEASE_TTL_MS,
 };
-use cats_block_client::NbdClient;
 
 mod exec;
 mod filesystem_control;
@@ -818,7 +818,7 @@ impl GuestAgent {
                 env,
                 stdin,
             } => exec::execute(
-                cats_api::sessions::ExecRequest {
+                cats_protocol::sessions::ExecRequest {
                     command,
                     timeout_ms,
                     env,
@@ -1598,7 +1598,7 @@ pub fn bind_vsock(_port: u32) -> Result<VsockListener> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cats_api::guest::GuestRequest;
+    use cats_protocol::guest::GuestRequest;
 
     #[test]
     fn frame_roundtrip() {
@@ -1988,7 +1988,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
-            stdin: vec![b'x'; cats_api::sessions::MAX_EXEC_STDIN_BYTES],
+            stdin: vec![b'x'; cats_protocol::sessions::MAX_EXEC_STDIN_BYTES],
         });
         let GuestResponseBody::Exec { exit_code, .. } = response else {
             panic!("exec with inherited unread stdin returned {response:?}")
@@ -2084,7 +2084,7 @@ mod tests {
         exec::reset_process_group_termination_count();
 
         let result = exec::execute(
-            cats_api::sessions::ExecRequest {
+            cats_protocol::sessions::ExecRequest {
                 command: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
                 timeout_ms: Some(10_000),
                 env: Default::default(),
@@ -2126,7 +2126,7 @@ mod tests {
                 "-c".into(),
                 format!(
                     "dd if=/dev/zero bs={} count=1 2>/dev/null",
-                    cats_api::sessions::MAX_EXEC_OUTPUT_BYTES + 1
+                    cats_protocol::sessions::MAX_EXEC_OUTPUT_BYTES + 1
                 ),
             ],
             timeout_ms: Some(10_000),
@@ -2157,13 +2157,13 @@ mod tests {
 
         assert!(matches!(
             agent.handle(GuestRequestBody::RuntimeReady {
-                ready: cats_api::guest::RuntimeReadyRequestV1 {
+                ready: cats_protocol::guest::RuntimeReadyRequestV1 {
                     version: 1,
-                    challenge: cats_api::runtime_reconciliation::RandomId128::new(
+                    challenge: cats_protocol::runtime_reconciliation::RandomId128::new(
                         "11111111111111111111111111111111"
                     )
                     .unwrap(),
-                    runtime_incarnation: cats_api::runtime_reconciliation::RandomId128::new(
+                    runtime_incarnation: cats_protocol::runtime_reconciliation::RandomId128::new(
                         "22222222222222222222222222222222"
                     )
                     .unwrap(),
@@ -2178,13 +2178,13 @@ mod tests {
         let vm_agent = GuestAgent::with_mode(GuestMode::Vm, map_path.clone(), None);
         let rejected = vm_agent.handle_on_transport(
             GuestRequestBody::RuntimeReady {
-                ready: cats_api::guest::RuntimeReadyRequestV1 {
+                ready: cats_protocol::guest::RuntimeReadyRequestV1 {
                     version: 1,
-                    challenge: cats_api::runtime_reconciliation::RandomId128::new(
+                    challenge: cats_protocol::runtime_reconciliation::RandomId128::new(
                         "11111111111111111111111111111111",
                     )
                     .unwrap(),
-                    runtime_incarnation: cats_api::runtime_reconciliation::RandomId128::new(
+                    runtime_incarnation: cats_protocol::runtime_reconciliation::RandomId128::new(
                         "22222222222222222222222222222222",
                     )
                     .unwrap(),

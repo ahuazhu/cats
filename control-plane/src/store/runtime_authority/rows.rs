@@ -1,6 +1,6 @@
 //! Shared PostgreSQL-time primitive for surviving machine authorities.
 
-use cats_api::runtime_reconciliation::UnixMillis;
+use cats_protocol::runtime_reconciliation::UnixMillis;
 use postgres::Transaction;
 
 use super::pg_codec::PgBigInt;
@@ -16,7 +16,7 @@ pub(in crate::store) fn database_now(
         )?
         .try_get::<_, i64>(0)?;
     UnixMillis::from_pg(value).map_err(|_| {
-        AuthorityTransactionError::Application(cats_api::error::ApiError::failed_precondition(
+        AuthorityTransactionError::Application(cats_protocol::error::ApiError::failed_precondition(
             "database clock is outside the wire range",
         ))
     })

@@ -14,16 +14,16 @@ use std::sync::Arc;
 use axum::extract::{Extension, State};
 use axum::routing::post;
 use axum::{Json, Router};
-use cats_api::error::ApiError;
-use cats_api::metering::{
+use cats_metering::{
+    AttributedCheckpoint, IngestOutcome, RuntimeUsageSourceBinding, UsageAttribution,
+};
+use cats_protocol::error::ApiError;
+use cats_protocol::metering::{
     IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse, RejectedCheckpoint,
     UsageCheckpointIngestOutcome, UsageCheckpointIngestResult, MAX_USAGE_CHECKPOINTS_PER_REQUEST,
     MAX_USAGE_INGEST_BODY_BYTES, USAGE_CHECKPOINTS_PATH,
 };
-use cats_api::runtime_reconciliation::{RandomId128, Revision};
-use cats_metering::{
-    AttributedCheckpoint, IngestOutcome, RuntimeUsageSourceBinding, UsageAttribution,
-};
+use cats_protocol::runtime_reconciliation::{RandomId128, Revision};
 
 use super::semantic_nodes::{authenticate, SemanticNodeHttpFailure, SemanticNodeHttpState};
 use crate::server::AppState;

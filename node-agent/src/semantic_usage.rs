@@ -17,11 +17,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
-use cats_api::metering::{
+use cats_metering::RuntimeMeterAccumulator;
+use cats_protocol::metering::{
     CatUsageCheckpoint, IngestUsageCheckpointsRequest, MAX_USAGE_CHECKPOINTS_PER_REQUEST,
 };
-use cats_api::runtime_reconciliation::{Epoch, Id, NodeBootId, RandomId128, SessionBinding};
-use cats_metering::RuntimeMeterAccumulator;
+use cats_protocol::runtime_reconciliation::{Epoch, Id, NodeBootId, RandomId128, SessionBinding};
 
 use crate::semantic_node_client::SemanticNodeTransport;
 
@@ -659,7 +659,7 @@ async fn flush_before_shutdown(meters: &CatUsageMeters, transport: &dyn Semantic
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cats_api::metering::UsageMetric;
+    use cats_protocol::metering::UsageMetric;
 
     fn prepared_root(base: &Path) -> MeteringCgroupRoot {
         let cats = base.join("cats");
@@ -719,7 +719,7 @@ mod tests {
         assert_eq!(cpu.sequence, 1, "the epoch's cumulative sequence advances");
         assert_eq!(
             cpu.epoch_marker,
-            cats_api::metering::UsageEpochMarker::Final
+            cats_protocol::metering::UsageEpochMarker::Final
         );
         let memory = last
             .iter()
@@ -890,18 +890,18 @@ mod tests {
     impl crate::semantic_node_client::SemanticNodeTransport for RecordingTransport {
         fn register(
             &self,
-            _request: cats_api::semantic_control::NodeRegistrationRequest,
+            _request: cats_protocol::semantic_control::NodeRegistrationRequest,
         ) -> crate::semantic_node_client::NodeClientFuture<
-            cats_api::semantic_control::NodeRegistrationResponse,
+            cats_protocol::semantic_control::NodeRegistrationResponse,
         > {
             Box::pin(async { anyhow::bail!("registration is not part of usage delivery") })
         }
 
         fn heartbeat(
             &self,
-            _request: cats_api::semantic_control::NodeHeartbeatRequest,
+            _request: cats_protocol::semantic_control::NodeHeartbeatRequest,
         ) -> crate::semantic_node_client::NodeClientFuture<
-            cats_api::semantic_control::NodeHeartbeatResponse,
+            cats_protocol::semantic_control::NodeHeartbeatResponse,
         > {
             Box::pin(async { anyhow::bail!("heartbeat is not part of usage delivery") })
         }
@@ -910,7 +910,7 @@ mod tests {
             &self,
             request: IngestUsageCheckpointsRequest,
         ) -> crate::semantic_node_client::NodeClientFuture<
-            cats_api::metering::IngestUsageCheckpointsResponse,
+            cats_protocol::metering::IngestUsageCheckpointsResponse,
         > {
             if self.fail_first.fetch_sub(1, Ordering::SeqCst) > 0 {
                 return Box::pin(async { anyhow::bail!("Control is unreachable") });
@@ -927,7 +927,7 @@ mod tests {
                 );
             let accepted = request.checkpoints.len() as u64;
             Box::pin(async move {
-                Ok(cats_api::metering::IngestUsageCheckpointsResponse {
+                Ok(cats_protocol::metering::IngestUsageCheckpointsResponse {
                     accepted,
                     duplicates: 0,
                     rejected: Vec::new(),

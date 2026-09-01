@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex as StdMutex, TryLockError};
 use std::time::Instant;
 
-use cats_api::chunk::{self, CHUNK_SIZE};
-use cats_api::runtime_reconciliation::{
+use cats_protocol::chunk::{self, CHUNK_SIZE};
+use cats_protocol::runtime_reconciliation::{
     AsciiText, Generation, ProvisionRootImageDefiniteConflictProblem, ProvisionRootImageError,
     ProvisionRootImageRequest, ProvisionRootImageResult, ProvisionRootImageRetryableProblem,
     RemoteHead, Sha256Digest,

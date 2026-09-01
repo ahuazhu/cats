@@ -1007,7 +1007,7 @@ mod tests {
     use axum::body::to_bytes;
     use axum::extract::OriginalUri;
     use axum::http::{header, StatusCode};
-    use cats_api::runtime_reconciliation::{
+    use cats_protocol::runtime_reconciliation::{
         RUNTIME_INTERNAL_ROUTE_NOT_FOUND_BODY, RUNTIME_INTERNAL_ROUTE_NOT_FOUND_ROBOTS,
     };
 

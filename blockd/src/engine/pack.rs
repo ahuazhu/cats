@@ -378,7 +378,7 @@ fn pack_lineage_fields(
     Option<i64>,
     Option<String>,
     Option<i64>,
-    Option<cats_api::runtime_reconciliation::AcquireOrigin>,
+    Option<cats_protocol::runtime_reconciliation::AcquireOrigin>,
 ) {
     match lineage {
         Some(identity) => (
@@ -1033,7 +1033,7 @@ pub(super) fn apply_publishable_entry(
         image.copy_from_slice(source);
         return Ok(());
     }
-    let page_bytes = cats_api::chunk::DIRTY_PAGE_SIZE as usize;
+    let page_bytes = cats_protocol::chunk::DIRTY_PAGE_SIZE as usize;
     let expected = entry.page_mask.count_ones() as usize * page_bytes;
     if source.len() != expected {
         return Err(EngineError::Corrupt(format!(
@@ -1043,7 +1043,7 @@ pub(super) fn apply_publishable_entry(
         )));
     }
     let mut consumed = 0;
-    for page in 0..cats_api::chunk::PAGES_PER_CHUNK {
+    for page in 0..cats_protocol::chunk::PAGES_PER_CHUNK {
         if entry.page_mask & (1u64 << page) == 0 {
             continue;
         }

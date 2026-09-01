@@ -122,6 +122,7 @@ Route v2 或 HostFenceRecovery 协调作为目标合同引用。
 
 ### 其他保留决策索引
 
+- [0066 API、协议与安装制品 crate 边界](decisions/0066-api-protocol-artifact-crate-boundaries.md)
 - [0004 Rust 技术栈](decisions/0004-implementation-stack-and-dev-environment.md)
 - [0009 Interactive Shell](decisions/0009-interactive-shell-over-authenticated-websocket.md)（由 ADR-0065
   接入当前 semantic Control/Node）

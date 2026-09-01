@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use cats_api::runtime_reconciliation::{
+use cats_protocol::runtime_reconciliation::{
     Epoch, FenceEpoch, Generation, Revision, Sequence, UnixMillis,
 };
 

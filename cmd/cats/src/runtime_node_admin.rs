@@ -17,12 +17,12 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use cats_api::node_identity::{Ed25519RequestSigner, JSON_CONTENT_TYPE};
-use cats_api::runtime_node_authority::{
+use cats_protocol::node_identity::{Ed25519RequestSigner, JSON_CONTENT_TYPE};
+use cats_protocol::runtime_node_authority::{
     sign_runtime_node_authority_request, NODE_AUTHORITY_APPLY_ID_HEADER,
     PROVISIONER_CREDENTIAL_ID_HEADER, PROVISIONER_SIGNATURE_HEADER, RUNTIME_NODE_AUTHORITY_PATH,
 };
-use cats_api::runtime_reconciliation::{
+use cats_protocol::runtime_reconciliation::{
     decode_node_identity, decode_node_placement_policy, decode_runtime_node_authority_apply,
     decode_runtime_node_authority_apply_result, encode_node_identity, encode_node_placement_policy,
     encode_runtime_node_authority_apply, encode_runtime_node_authority_apply_result,
@@ -1665,7 +1665,7 @@ mod tests {
     use std::sync::mpsc;
 
     use base64::engine::general_purpose::STANDARD;
-    use cats_api::runtime_reconciliation::{PublicKeyCredentialBinding, Sha256Digest};
+    use cats_protocol::runtime_reconciliation::{PublicKeyCredentialBinding, Sha256Digest};
     use clap::Parser as _;
 
     use super::*;

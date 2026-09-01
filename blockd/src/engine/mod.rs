@@ -16,11 +16,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub use cats_api::blockd::{
+pub use cats_protocol::blockd::{
     DurabilityStatus, DEFAULT_MAX_LOCAL_BYTES, DEFAULT_MAX_STAGED_BYTES, DEFAULT_MAX_STAGED_PACKS,
 };
-use cats_api::blockd::{PACK_FILE_SUFFIX, PENDING_PACK_DIR};
-use cats_api::chunk::{self, CHUNKS_PER_LEAF, CHUNK_SIZE};
+use cats_protocol::blockd::{PACK_FILE_SUFFIX, PENDING_PACK_DIR};
+use cats_protocol::chunk::{self, CHUNKS_PER_LEAF, CHUNK_SIZE};
 
 use crate::crashpoint;
 use crate::format::{
@@ -87,7 +87,7 @@ fn materialized_entry_bytes(entry: &PackEntry) -> Option<usize> {
 }
 
 fn materialized_page_mask_bytes(page_mask: u64) -> Option<usize> {
-    (page_mask.count_ones() as usize).checked_mul(cats_api::chunk::DIRTY_PAGE_SIZE as usize)
+    (page_mask.count_ones() as usize).checked_mul(cats_protocol::chunk::DIRTY_PAGE_SIZE as usize)
 }
 
 fn materialized_pack_bytes(header: &PackHeader) -> Option<usize> {

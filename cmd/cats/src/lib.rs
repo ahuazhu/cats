@@ -40,17 +40,17 @@ use serde_json::json;
 
 use cats_api::auth::{CreatedWorkspaceToken, WorkspaceToken};
 use cats_api::list::ListResponse;
-use cats_api::oci::{
+use cats_protocol::oci::{
     DeployOciRequest, OciDeployment, OciDeploymentAttempt, OciDeploymentAttemptState,
     OciRegistryAuth,
 };
-use cats_api::semantic_control::{
+use cats_protocol::semantic_control::{
     AttachDiskRequest, CatMountRequest, CatResponse, CatView, CreateCatRequest, CreateDiskRequest,
     CreateDiskSnapshotRequest, DestroyDiskSnapshotRequest, DetachDiskRequest, DiskResponse,
     DiskSnapshotResponse, DiskSnapshotStatus, DiskSnapshotView, DiskView, PersistentMountPath,
     ResourceSlug, RestoreDiskSnapshotRequest, SemanticErrorBody, SemanticSuccessCode,
 };
-use cats_api::sessions::{
+use cats_protocol::sessions::{
     ExecRequest, ExecResponse, DEFAULT_EXEC_TIMEOUT_MS, MAX_EXEC_ENV_BYTES,
     MAX_EXEC_RESPONSE_JSON_BYTES, MAX_EXEC_STDIN_BYTES, MAX_EXEC_TIMEOUT_MS,
 };
@@ -787,7 +787,7 @@ impl Client {
             if let Ok(err) = serde_json::from_slice::<SemanticErrorBody>(&body) {
                 bail!("{} ({:?})", err.message, err.code);
             }
-            if let Ok(err) = serde_json::from_slice::<cats_api::error::ErrorBody>(&body) {
+            if let Ok(err) = serde_json::from_slice::<cats_protocol::error::ErrorBody>(&body) {
                 bail!("{} ({:?})", err.message, err.code);
             }
             bail!("HTTP {status}: {}", String::from_utf8_lossy(&body));
@@ -811,7 +811,7 @@ impl Client {
             if let Ok(error) = serde_json::from_slice::<SemanticErrorBody>(&body) {
                 bail!("{} ({:?})", error.message, error.code);
             }
-            if let Ok(error) = serde_json::from_slice::<cats_api::error::ErrorBody>(&body) {
+            if let Ok(error) = serde_json::from_slice::<cats_protocol::error::ErrorBody>(&body) {
                 bail!("{} ({:?})", error.message, error.code);
             }
             bail!("HTTP {status}: {}", String::from_utf8_lossy(&body));
@@ -996,7 +996,7 @@ fn fetch_usage(client: &Client, cat: &CatView, now_ms: i64) -> UsageOutcome {
         cat.cat_id
     );
     match client.get(&path).and_then(|value| {
-        serde_json::from_value::<cats_api::metering::UsageReport>(value)
+        serde_json::from_value::<cats_protocol::metering::UsageReport>(value)
             .context("invalid usage report")
     }) {
         Ok(report) => UsageOutcome::Report {
@@ -1030,14 +1030,14 @@ fn disks_table(term: Term, disks: &[DiskView]) -> String {
     ordered.sort_by(|left, right| left.disk_slug.as_str().cmp(right.disk_slug.as_str()));
     for disk in ordered {
         let (status, style) = match disk.status {
-            cats_api::semantic_control::DiskStatus::Normal => {
+            cats_protocol::semantic_control::DiskStatus::Normal => {
                 if disk.binding.is_some() {
                     ("attached", Style::Green)
                 } else {
                     ("available", Style::Plain)
                 }
             }
-            cats_api::semantic_control::DiskStatus::Deleted => ("deleted", Style::Dim),
+            cats_protocol::semantic_control::DiskStatus::Deleted => ("deleted", Style::Dim),
         };
         let attached = disk.binding.as_ref().map_or_else(
             || "-".to_owned(),
@@ -2257,12 +2257,13 @@ mod tests {
 
     fn disk_view(slug: &str, size_bytes: u64) -> DiskView {
         DiskView {
-            disk_id: cats_api::runtime_reconciliation::Id::new(format!("disk_{slug}")).unwrap(),
-            workspace_id: cats_api::runtime_reconciliation::Id::new("ws_01").unwrap(),
+            disk_id: cats_protocol::runtime_reconciliation::Id::new(format!("disk_{slug}"))
+                .unwrap(),
+            workspace_id: cats_protocol::runtime_reconciliation::Id::new("ws_01").unwrap(),
             disk_slug: ResourceSlug::new(slug).unwrap(),
             size_bytes,
             head_generation: Some(1),
-            status: cats_api::semantic_control::DiskStatus::Normal,
+            status: cats_protocol::semantic_control::DiskStatus::Normal,
             binding: None,
             created_at_unix_ms: 1,
             deleted_at_unix_ms: None,
@@ -2307,11 +2308,11 @@ mod tests {
         }))
         .expect("Cat");
         let cold = watch_signature(&cat);
-        cat.current_action = Some(cats_api::semantic_control::CatAction::Run);
+        cat.current_action = Some(cats_protocol::semantic_control::CatAction::Run);
         cat.updated_at_unix_ms = 3;
         let starting = watch_signature(&cat);
         cat.current_action = None;
-        cat.state = Some(cats_api::semantic_control::CatState::Running);
+        cat.state = Some(cats_protocol::semantic_control::CatState::Running);
         cat.updated_at_unix_ms = 4;
         let running = watch_signature(&cat);
         assert_ne!(cold, starting);
@@ -3341,7 +3342,7 @@ mod tests {
             let _ = read_request(&mut stream);
             let response = serde_json::to_vec(&ExecResponse {
                 exit_code: 0,
-                stdout: "x".repeat(cats_api::sessions::MAX_EXEC_OUTPUT_BYTES + 1),
+                stdout: "x".repeat(cats_protocol::sessions::MAX_EXEC_OUTPUT_BYTES + 1),
                 stderr: String::new(),
             })
             .unwrap();

@@ -95,7 +95,7 @@ pub async fn session(
             .map_err(|error| {
                 tracing::warn!(error = %error, "WorkOS session refresh failed");
                 ApiError::new(
-                    cats_api::error::ErrorCode::Unauthenticated,
+                    cats_protocol::error::ErrorCode::Unauthenticated,
                     "WorkOS session expired",
                 )
             })?;
@@ -457,7 +457,7 @@ pub(super) fn validate_flow_identity(
         || !workspace_matches
     {
         return Err(ApiError::new(
-            cats_api::error::ErrorCode::PermissionDenied,
+            cats_protocol::error::ErrorCode::PermissionDenied,
             "WorkOS session does not match the requested workspace",
         )
         .into());
@@ -473,7 +473,7 @@ fn validate_session_identity(
 ) -> Result<WebIdentity, Failure> {
     if !session.authenticated {
         return Err(ApiError::new(
-            cats_api::error::ErrorCode::Unauthenticated,
+            cats_protocol::error::ErrorCode::Unauthenticated,
             "missing, invalid, or expired WorkOS session",
         )
         .into());
@@ -482,7 +482,7 @@ fn validate_session_identity(
         Site::User => {
             if session.organization_id.is_empty() {
                 return Err(ApiError::new(
-                    cats_api::error::ErrorCode::PermissionDenied,
+                    cats_protocol::error::ErrorCode::PermissionDenied,
                     "WorkOS user session is not scoped to an account",
                 )
                 .into());
@@ -491,13 +491,13 @@ fn validate_session_identity(
                 .account_for_organization(&session.organization_id)?
                 .ok_or_else(|| {
                     ApiError::new(
-                        cats_api::error::ErrorCode::PermissionDenied,
+                        cats_protocol::error::ErrorCode::PermissionDenied,
                         "WorkOS organization is not mapped to a Cats account",
                     )
                 })?;
             if account.status != "active" {
                 return Err(ApiError::new(
-                    cats_api::error::ErrorCode::PermissionDenied,
+                    cats_protocol::error::ErrorCode::PermissionDenied,
                     "Cats account is not active",
                 )
                 .into());
@@ -520,7 +520,7 @@ fn validate_session_identity(
         Site::Admin => {
             if !session_is_admin(config, session) {
                 return Err(ApiError::new(
-                    cats_api::error::ErrorCode::PermissionDenied,
+                    cats_protocol::error::ErrorCode::PermissionDenied,
                     "WorkOS session lacks fleet administrator permission",
                 )
                 .into());

@@ -4,8 +4,8 @@
 //! owns only the PostgreSQL seam needed to create, discover and remove that
 //! exact Strict volume; it does not restore retired Operation/product stores.
 
-use cats_api::error::ApiError;
-use cats_api::runtime_reconciliation::{FenceEpoch, Generation, Id, RandomId128};
+use cats_protocol::error::ApiError;
+use cats_protocol::runtime_reconciliation::{FenceEpoch, Generation, Id, RandomId128};
 use cats_storage::authority::{
     begin_delete, project_volume_record, BeginDeleteRequest, RemoteHead, VolumeAdminState,
     VolumeDurability, VolumeRecord,

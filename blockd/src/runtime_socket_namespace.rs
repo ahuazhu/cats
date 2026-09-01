@@ -9,7 +9,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use cats_api::runtime_reconciliation::{HostPath, RandomId128};
+use cats_protocol::runtime_reconciliation::{HostPath, RandomId128};
 use thiserror::Error;
 
 /// Fixed production root for all blockd Unix sockets.

@@ -2,9 +2,11 @@
 
 use std::collections::BTreeSet;
 
-use cats_api::guest::{RuntimeReadyContractError, RuntimeReadyRequestV1, RuntimeReadyResponseV1};
-use cats_api::runtime_reconciliation::{GuestDeviceIdentity, Id, MountAccess, RandomId128};
-use cats_api::semantic_control::NodedDiskMount;
+use cats_protocol::guest::{
+    RuntimeReadyContractError, RuntimeReadyRequestV1, RuntimeReadyResponseV1,
+};
+use cats_protocol::runtime_reconciliation::{GuestDeviceIdentity, Id, MountAccess, RandomId128};
+use cats_protocol::semantic_control::NodedDiskMount;
 
 /// Node-enriched identity for one element of the complete mount set.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,12 +140,12 @@ fn validate_expected(expected: &ExpectedPersistentMountSet) -> Result<(), MountR
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cats_api::guest::{
+    use cats_protocol::guest::{
         RuntimeReadyDeviceV1, RuntimeReadyMountV1, GUEST_HOST_CONTROL_PROTOCOL_VERSION_V1,
         GUEST_HOST_CONTROL_VSOCK_PORT_V1,
     };
-    use cats_api::runtime_reconciliation::{GuestBootId, HostPath};
-    use cats_api::semantic_control::{PersistentDiskFormat, PersistentMountPath};
+    use cats_protocol::runtime_reconciliation::{GuestBootId, HostPath};
+    use cats_protocol::semantic_control::{PersistentDiskFormat, PersistentMountPath};
 
     fn id(value: &str) -> Id {
         Id::new(value).unwrap()

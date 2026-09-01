@@ -4,11 +4,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
-use cats_api::runtime_reconciliation::Id;
-use cats_api::semantic_control::{
-    CatAction, CatState, NodeHeartbeatRequest, NodeName, NodeRegistrationRequest, NodeStatus,
-    NodedControlEndpoint, NodedServiceToken,
-};
 use cats_metadata_store_postgres::PostgresVolumeDataAuthority;
 use cats_node_agent::ch::{BlockPath, ChConfig};
 use cats_node_agent::semantic_installed::{InstalledCatConfig, InstalledSemanticCatEffects};
@@ -26,6 +21,11 @@ use cats_node_agent::semantic_usage::{
 };
 use cats_object_store_aws_s3::AwsS3BlobStoreFactory;
 use cats_object_store_file::FileBlobStoreFactory;
+use cats_protocol::runtime_reconciliation::Id;
+use cats_protocol::semantic_control::{
+    CatAction, CatState, NodeHeartbeatRequest, NodeName, NodeRegistrationRequest, NodeStatus,
+    NodedControlEndpoint, NodedServiceToken,
+};
 use cats_storage::authority::{CatVolumeStore, VolumeDataAuthority};
 use cats_storage::{open_blob_store, AdapterConfig, AdapterSelection, BlobStoreFactory};
 use clap::Parser;
@@ -144,7 +144,7 @@ impl SemanticCatEffects for FakeSemanticEffects {
         Box::pin(async move {
             if cancellation.is_cancelled() && request.action != CatAction::Destroy {
                 return Err(SemanticEffectError::new(
-                    cats_api::semantic_control::SemanticErrorCode::ActionCancelled,
+                    cats_protocol::semantic_control::SemanticErrorCode::ActionCancelled,
                     "action was cancelled by destroy",
                 ));
             }
@@ -219,11 +219,9 @@ fn semantic_effects(
                 .as_deref()
                 .context("--guest-runtime-profile-receipt-file is required for --vmm ch")?;
             let installed =
-                cats_api::runtime_artifacts::load_installed_guest_runtime_profile_receipt(
-                    receipt_path,
-                )
-                .context("load installed Guest runtime profile")?;
-            cats_api::runtime_artifacts::validate_installed_node_guest_runtime(&installed)
+                cats_artifacts::load_installed_guest_runtime_profile_receipt(receipt_path)
+                    .context("load installed Guest runtime profile")?;
+            cats_artifacts::validate_installed_node_guest_runtime(&installed)
                 .context("validate installed Guest runtime")?;
             let metadata_name = args
                 .metadata_store_adapter
@@ -250,7 +248,7 @@ fn semantic_effects(
             let blob = open_blob_store(&object_name, &object_config, &object_factories)
                 .context("open installed object store")?;
             let socket_root = cats_blockd::runtime_socket_namespace::ManagedBlockdSocketRoot::from_canonical_path(
-                cats_api::runtime_reconciliation::HostPath::new(
+                cats_protocol::runtime_reconciliation::HostPath::new(
                     args.blockd_socket_root.to_string_lossy().into_owned(),
                 )
                 .context("blockd socket root is not canonical")?,
@@ -260,10 +258,10 @@ fn semantic_effects(
             let ch = ChConfig {
                 block_direct: args.ch_block_direct,
                 ch_bin: args.ch_bin.clone(),
-                kernel: cats_api::runtime_artifacts::GUEST_KERNEL_PATH.into(),
+                kernel: cats_artifacts::GUEST_KERNEL_PATH.into(),
                 initramfs: boot_contract
                     .initramfs()
-                    .map(|_| cats_api::runtime_artifacts::GUEST_INITRAMFS_PATH.into()),
+                    .map(|_| cats_artifacts::GUEST_INITRAMFS_PATH.into()),
                 boot_contract: Some(boot_contract),
                 cmdline: installed.receipt().kernel_cmdline.as_str().to_owned(),
                 seed_image: args.ch_seed_image.clone(),
@@ -512,7 +510,7 @@ async fn shutdown_signal() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use cats_api::runtime_reconciliation::Id;
+    use cats_protocol::runtime_reconciliation::Id;
     use clap::{CommandFactory as _, Parser as _};
 
     #[test]

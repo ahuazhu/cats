@@ -11,10 +11,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use cats_api::metering::{
+use cats_protocol::metering::{
     IngestUsageCheckpointsRequest, IngestUsageCheckpointsResponse, USAGE_CHECKPOINTS_PATH,
 };
-use cats_api::semantic_control::{
+use cats_protocol::semantic_control::{
     NodeHeartbeatRequest, NodeHeartbeatResponse, NodeHeartbeatStatus, NodeRegistrationRequest,
     NodeRegistrationResponse, NodeRegistrationStatus, NodeStatus, NodedServiceToken,
     NODED_AUTHORIZATION_HEADER,
@@ -326,8 +326,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    use cats_api::runtime_reconciliation::Id;
-    use cats_api::semantic_control::{NodeName, NodeView, NodedControlEndpoint};
+    use cats_protocol::runtime_reconciliation::Id;
+    use cats_protocol::semantic_control::{NodeName, NodeView, NodedControlEndpoint};
 
     use super::*;
 
@@ -407,9 +407,9 @@ mod tests {
                 .checkpoints
                 .iter()
                 .map(
-                    |checkpoint| cats_api::metering::UsageCheckpointIngestResult {
+                    |checkpoint| cats_protocol::metering::UsageCheckpointIngestResult {
                         event_id: checkpoint.event_id.clone(),
-                        outcome: cats_api::metering::UsageCheckpointIngestOutcome::Accepted,
+                        outcome: cats_protocol::metering::UsageCheckpointIngestOutcome::Accepted,
                         reason: None,
                     },
                 )

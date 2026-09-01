@@ -464,15 +464,15 @@ async fn main() -> anyhow::Result<()> {
         .as_deref()
         .context("--guest-runtime-profile-receipt-file or CATS_GUEST_RUNTIME_PROFILE_RECEIPT_FILE is required")?;
     let guest_runtime_profile_receipt =
-        cats_api::runtime_artifacts::load_installed_guest_runtime_profile_receipt(
+        cats_artifacts::load_installed_guest_runtime_profile_receipt(
             guest_runtime_profile_receipt_path,
         )?;
     let runtime_provisioner_trust =
-        cats_api::runtime_artifacts::load_installed_runtime_provisioner_trust_bundle(
+        cats_artifacts::load_installed_runtime_provisioner_trust_bundle(
             &args.runtime_provisioner_trust_file,
         )?;
     let production_cutover_operator_trust =
-        cats_api::runtime_artifacts::load_installed_production_cutover_operator_trust_bundle(
+        cats_artifacts::load_installed_production_cutover_operator_trust_bundle(
             &args.production_cutover_operator_trust_file,
         )?;
     let server_config = cats_control_plane::server::Config {

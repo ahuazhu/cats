@@ -1,4 +1,4 @@
-use cats_api::runtime_reconciliation::{
+use cats_protocol::runtime_reconciliation::{
     decode_node_placement_policy, decode_runtime_node_authority_apply,
     decode_runtime_node_authority_apply_result, decode_runtime_provisioner_active_set,
     decode_runtime_provisioner_trust_bundle, encode_node_placement_policy,

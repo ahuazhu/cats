@@ -8,7 +8,7 @@ use std::fs::{self, File};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use cats_api::runtime_reconciliation::{
+use cats_protocol::runtime_reconciliation::{
     AsciiText, Epoch, FenceEpoch, Generation, Id, NormalAcquireRequest, NormalAcquireResult,
     RandomId128, RemoteHead, Sha256Digest,
 };

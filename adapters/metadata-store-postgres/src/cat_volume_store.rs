@@ -4,7 +4,7 @@
 //! transition from the current Cat/volume/node tuple under one row lock and
 //! returns the original result when that exact scenario is already current.
 
-use cats_api::runtime_reconciliation::{
+use cats_protocol::runtime_reconciliation::{
     Epoch, FenceEpoch, Generation, HostPath, Id, LastVolumeTransition, NormalAcquireRequest,
     RandomId128, ReleaseRequest, RemoteHead, Sha256Digest, VolumeAdminState, VolumeDurability,
     VolumeRecord,
@@ -531,7 +531,7 @@ impl CatVolumeStore for PostgresVolumeDataAuthority {
             .ok_or(AuthorityError::BackendUnknown)?;
             let (deleting, _) = begin_delete(
                 &volume,
-                &cats_api::runtime_reconciliation::BeginDeleteRequest {
+                &cats_protocol::runtime_reconciliation::BeginDeleteRequest {
                     delete_id: delete_id.clone(),
                     disk_id: descriptor.disk_id.clone(),
                     volume_id: descriptor.volume_id.clone(),
@@ -909,7 +909,7 @@ fn initialized_head(disk: &StoredDisk) -> Result<RemoteHead, AuthorityError> {
     let root_object_id = disk
         .initialized_root_object_id
         .as_ref()
-        .and_then(|value| cats_api::runtime_reconciliation::AsciiText::new(value.clone()))
+        .and_then(|value| cats_protocol::runtime_reconciliation::AsciiText::new(value.clone()))
         .ok_or(AuthorityError::BackendUnknown)?;
     Ok(RemoteHead {
         generation,
@@ -1064,11 +1064,11 @@ fn attached_role_cat_id(descriptor: &CatVolume) -> Result<&Id, AuthorityError> {
 fn acquire_from_unowned(
     volume: &VolumeRecord,
     request: &VolumeAttachRequest,
-    db_now: cats_api::runtime_reconciliation::UnixMillis,
+    db_now: cats_protocol::runtime_reconciliation::UnixMillis,
 ) -> Result<
     (
         NormalAcquireRequest,
-        cats_api::runtime_reconciliation::NormalAcquireResult,
+        cats_protocol::runtime_reconciliation::NormalAcquireResult,
     ),
     AuthorityError,
 > {
@@ -1121,7 +1121,7 @@ fn attach_replay(
 ) -> Result<
     (
         NormalAcquireRequest,
-        cats_api::runtime_reconciliation::NormalAcquireResult,
+        cats_protocol::runtime_reconciliation::NormalAcquireResult,
     ),
     AuthorityError,
 > {
@@ -1308,8 +1308,8 @@ fn optional_i64(row: &Row, name: &str) -> Result<Option<i64>, AuthorityError> {
 
 #[cfg(test)]
 mod tests {
-    use cats_api::runtime_reconciliation::AsciiText;
     use cats_control_plane::store::Store;
+    use cats_protocol::runtime_reconciliation::AsciiText;
     use cats_storage::authority::{
         CatVolumeStore as _, RootVolumeSpec, VolumeAttachRequest, VolumeDataAuthority as _,
         VolumeHeadCasRequest,

@@ -5,8 +5,8 @@
 
 use sha2::{Digest, Sha256};
 
-use cats_api::chunk::{self, CHUNKS_PER_LEAF, CHUNK_SIZE, PAGES_PER_CHUNK};
-use cats_api::runtime_reconciliation::AcquireOrigin;
+use cats_protocol::chunk::{self, CHUNKS_PER_LEAF, CHUNK_SIZE, PAGES_PER_CHUNK};
+use cats_protocol::runtime_reconciliation::AcquireOrigin;
 
 pub const LEAF_MAGIC: &[u8; 8] = b"CATSLEAF";
 pub const ROOT_MAGIC: &[u8; 8] = b"CATSROOT";
@@ -808,7 +808,7 @@ pub fn page_mask(offset_in_chunk: u32, len: u32) -> u64 {
     if len == 0 {
         return 0;
     }
-    let page = cats_api::chunk::DIRTY_PAGE_SIZE;
+    let page = cats_protocol::chunk::DIRTY_PAGE_SIZE;
     let first = offset_in_chunk / page;
     let last = (offset_in_chunk + len - 1) / page;
     debug_assert!(last < PAGES_PER_CHUNK);
@@ -897,7 +897,7 @@ mod tests {
             attachment_id: Some("att_x".into()),
             attachment_epoch: Some(7),
             acquire_origin: Some(AcquireOrigin::Normal {
-                transition_id: cats_api::runtime_reconciliation::RandomId128::new(
+                transition_id: cats_protocol::runtime_reconciliation::RandomId128::new(
                     "1234567890abcdef1234567890abcdef",
                 )
                 .unwrap(),
@@ -968,7 +968,7 @@ mod tests {
                 deltas: vec![DeltaRef {
                     object_id: "txn2-c0-d".into(),
                     page_mask: 0b101,
-                    len: 2 * cats_api::chunk::DIRTY_PAGE_SIZE,
+                    len: 2 * cats_protocol::chunk::DIRTY_PAGE_SIZE,
                     sha256: [1u8; 32],
                 }],
             },
@@ -978,13 +978,13 @@ mod tests {
                     DeltaRef {
                         object_id: "txn2-c1-d".into(),
                         page_mask: 1,
-                        len: cats_api::chunk::DIRTY_PAGE_SIZE,
+                        len: cats_protocol::chunk::DIRTY_PAGE_SIZE,
                         sha256: [2u8; 32],
                     },
                     DeltaRef {
                         object_id: "txn3-c1-d".into(),
                         page_mask: 1 << 63,
-                        len: cats_api::chunk::DIRTY_PAGE_SIZE,
+                        len: cats_protocol::chunk::DIRTY_PAGE_SIZE,
                         sha256: [3u8; 32],
                     },
                 ],
@@ -1014,7 +1014,7 @@ mod tests {
         let page = |mask: u64, tag: u8| DeltaRef {
             object_id: format!("d{tag}"),
             page_mask: mask,
-            len: cats_api::chunk::DIRTY_PAGE_SIZE * mask.count_ones(),
+            len: cats_protocol::chunk::DIRTY_PAGE_SIZE * mask.count_ones(),
             sha256: [tag; 32],
         };
         let base = BaseRef::local("b".into(), CHUNK_SIZE, [1u8; 32]);
@@ -1052,7 +1052,7 @@ mod tests {
                 deltas: vec![DeltaRef {
                     object_id: "d".into(),
                     page_mask: 1,
-                    len: cats_api::chunk::DIRTY_PAGE_SIZE,
+                    len: cats_protocol::chunk::DIRTY_PAGE_SIZE,
                     sha256: [0u8; 32],
                 }],
             }],
@@ -1089,7 +1089,7 @@ mod tests {
                 deltas: vec![DeltaRef {
                     object_id: "txn2-c1-d".into(),
                     page_mask: 1,
-                    len: cats_api::chunk::DIRTY_PAGE_SIZE,
+                    len: cats_protocol::chunk::DIRTY_PAGE_SIZE,
                     sha256: [3u8; 32],
                 }],
             },
