@@ -4,11 +4,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cats_protocol::runtime_reconciliation::{Id, RandomId128};
-use cats_storage::{delete_volume_objects_page, BlobStore, DeletePrefixPage};
+use cats_blockd::gc::{trace_live_objects, GcError, RetainedRoot, RetainedRootSource};
+use cats_storage::{delete_volume_objects_page, BlobError, BlobStore, DeletePrefixPage};
 use sha2::{Digest, Sha256};
 
 use crate::api::semantic_resources::SemanticResourceFuture;
-use crate::semantic_resource_service::{ResourceStoreError, SemanticPersistentDiskBackend};
+use crate::semantic_resource_service::{
+    ResourceStoreError, SemanticPersistentDiskBackend, SnapshotGraphValidationError,
+};
 use crate::store::runtime_authority::semantic_persistent_disk::{
     SemanticStrictDeleteState, SemanticStrictPersistentDisk,
 };
@@ -16,6 +19,7 @@ use crate::store::semantic::PersistentDiskRecord;
 use crate::store::Store;
 
 const DELETE_DEADLINE: Duration = Duration::from_secs(10);
+const SNAPSHOT_GRAPH_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Uses the selected PostgreSQL Volume Authority and BlobStore delete
 /// postcondition. It owns no compatibility MetadataStore path.
@@ -122,6 +126,65 @@ impl SemanticPersistentDiskBackend for AuthorityPersistentDiskBackend {
                 tokio::task::yield_now().await;
             }
         })
+    }
+
+    fn validate_snapshot_graph<'a>(
+        &'a self,
+        candidate: crate::store::semantic::DiskSnapshotGraphCandidate,
+    ) -> SemanticResourceFuture<'a, Result<(), SnapshotGraphValidationError>> {
+        let blob = Arc::clone(&self.blob);
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let retained = [RetainedRoot {
+                    source: RetainedRootSource::Current,
+                    head: candidate.head,
+                }];
+                trace_live_objects(
+                    blob.as_ref(),
+                    &candidate.volume_id,
+                    candidate.size_bytes,
+                    &retained,
+                    Instant::now() + SNAPSHOT_GRAPH_DEADLINE,
+                )
+                .map(|_| ())
+                .map_err(snapshot_graph_error)
+            })
+            .await
+            .map_err(|error| {
+                SnapshotGraphValidationError::StorageUnavailable(format!(
+                    "snapshot graph validation worker failed: {error}"
+                ))
+            })?
+        })
+    }
+}
+
+fn snapshot_graph_error(error: GcError) -> SnapshotGraphValidationError {
+    match error {
+        GcError::Corrupt(message) | GcError::InvalidClaim(message) => {
+            SnapshotGraphValidationError::Corrupt(format!(
+                "retained DiskSnapshot object graph is corrupt: {message}"
+            ))
+        }
+        GcError::Blob(
+            error @ (BlobError::NotFound(_)
+            | BlobError::InvalidKey { .. }
+            | BlobError::TooLarge { .. }),
+        ) => SnapshotGraphValidationError::Corrupt(format!(
+            "retained DiskSnapshot object graph is incomplete or corrupt: {error}"
+        )),
+        GcError::Blob(error) => SnapshotGraphValidationError::StorageUnavailable(format!(
+            "snapshot object storage is unavailable: {error}"
+        )),
+        GcError::Deadline => SnapshotGraphValidationError::StorageUnavailable(
+            "snapshot graph validation deadline elapsed".to_owned(),
+        ),
+        GcError::Cancelled => SnapshotGraphValidationError::StorageUnavailable(
+            "snapshot graph validation was cancelled".to_owned(),
+        ),
+        GcError::ClaimMismatch => SnapshotGraphValidationError::Corrupt(
+            "snapshot graph validation authority did not match its Root".to_owned(),
+        ),
     }
 }
 

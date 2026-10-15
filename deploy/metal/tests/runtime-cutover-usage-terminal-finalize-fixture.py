@@ -35,7 +35,7 @@ except IndexError as error:
 
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 ID = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
-CONTROL_SCHEMA_VERSION = 19
+CONTROL_SCHEMA_VERSION = 20
 QUALIFICATION_BEGIN_FILE = "production-mutation-qualification-begin.receipt.json"
 QUALIFICATION_TERMINAL_FILE = "production-mutation-qualification-terminal.receipt.json"
 QUALIFICATION_BEGIN_COMMAND_RECEIPT_FILE = (

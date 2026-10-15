@@ -24,7 +24,7 @@
 
 当前实现包括：
 
-- v19 Cat/Disk/Node 当前资源 schema、可复用 slug、Disk binding RWO、数据库时间 heartbeat 和当前入口目标；
+- v20 Cat/Disk/Node/Snapshot 当前资源 schema、可复用 slug、Disk binding RWO、数据库时间 heartbeat 和当前入口目标；
 - 同步 Cat/Disk API、CLI、Control lifecycle 和 noded HTTP client/server；
 - 独立 Exec/Shell access lane：Workspace 鉴权后按需 run，再由 noded 绑定当前 Running 实例；
   离开 Running 或 reset 前关闭、取消并有界排空会话，不以 access response 结算生命周期；
@@ -40,6 +40,8 @@
   Suspend/Warm/Cold/Destroy 和 Node reset，实现在
   [`semantic_installed.rs`](../node-agent/src/semantic_installed.rs)；物理验收入口见
   [metal runbook](../deploy/metal/README.md#verification-boundary)；
+- Workspace 级 DiskSnapshot create/list/get/destroy、完整 live-root GC 保护和 Cold/Unowned 同盘 restore；
+  这是持久磁盘恢复点，与 Host-local WarmRuntimeSnapshot 不同；
 - production Control 只挂载 semantic resource/Node 主监听，旧 lifecycle Operation、AgentSession、
   observation settlement 和 Route Operation 不再进入生产 composition；
 - 独立 `runtime_node_authority` 管理入口继续组成，但不承担 Cat lifecycle authority。
@@ -49,7 +51,7 @@
 
 仍开放或不属于当前产品保证的边界：
 
-- product DiskSnapshot 的同盘 restore 与 GC root 保护闭环；这与 Host-local WarmRuntimeSnapshot 不同；
+- hot Snapshot、跨盘 clone、Snapshot schedule 与保留策略；
 - 自动 cloud/BMC Host fencing、长期不对称网络、真实 RDS failover 资格、跨 Node Guest overlay 与权限隔离；
 - 公网 Gateway/稳定 HTTPS Endpoint 不在当前 semantic production composition 中；当前入口目标表
   只提供 `withdraw -> Ready -> publish` 的协调边界，不能据此声称公网服务已接通；
@@ -79,7 +81,7 @@
 | [blockd protocol](specs/blockd-protocol.md) | Implemented data plane | Chunk/Map/FLUSH；生命周期只使用远端持久模式 |
 | [Guest Runtime API](specs/guest-runtime-api.md) | Frozen v1 primitives | Guest-local `/run/cats/runtime.sock` HTTP/lease 原语；自动休眠组合见上面的开放边界 |
 | [Exec/Shell](specs/interactive-shell-protocol.md) | Semantic composition implemented | Bearer 鉴权、按需 run、Node access gate；有界 Exec 与 WebSocket PTY，物理资格另验 |
-| [Volume Authority](specs/volume-authority.md) | Current v19 storage contract | direct acquire/renew/release/delete、owner/epoch、remote root 和 blockd serving admission |
+| [Volume Authority](specs/volume-authority.md) | Current v20 storage contract | direct acquire/renew/release/delete、Snapshot restore/GC、owner/epoch、remote root 和 blockd serving admission |
 | [Runtime Placement Policy v1](specs/runtime-placement-policy-v1.md) | Fleet policy foundation retained | 独立 provisioner-owned capacity/policy；不充当 Cat action authority |
 | [A23 Provisioner Tooling v1](specs/a23-production-provisioner-tooling-v1.md) | Operations foundation retained | 独立 `runtime_node_authority` 配置入口 |
 | [Immutable Image Manifest Read v1](specs/immutable-image-manifest-read-v1.md) | Storage/boot contract | immutable image manifest 读取；默认 Boot Image 的部署绑定见 ADR-0063 |
@@ -91,6 +93,7 @@ Route v2 或 HostFenceRecovery 协调作为目标合同引用。
 
 ### 当前协调决策
 
+- [0066 产品 DiskSnapshot、完整 GC 保护与同盘恢复](decisions/0066-product-disk-snapshot-gc-and-same-disk-restore.md)
 - [0059 Control/Node 场景语义同步协议](decisions/0059-semantic-control-node-synchronous-protocol.md)
 - [0065 Exec/Shell Runtime Access Lane](decisions/0065-exec-shell-runtime-access-lane.md)
 - [0064 Cat 动作时钟与运行时钟](decisions/0064-cat-run-and-action-clocks.md)

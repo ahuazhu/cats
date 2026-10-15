@@ -238,13 +238,13 @@ heartbeat、日志和监控事件都不是产品状态或磁盘 writer authority
 
 ## 10. 首次单协议部署
 
-本次只允许一次空数据 v19 cutover：
+本次只允许一次空数据 v20 cutover：
 
 1. 离线构建相同版本的 Control、noded 和 CLI，验证 schema/wire 版本及旧入口 absence。
 2. 进入维护窗口，关闭公网 ingress 和 mutation。
 3. 停止旧 Control、Node、Gateway 和其他 write path，确认不会再写旧 schema。
 4. 轮换或撤销旧 service/Node credential。
-5. 删除旧产品/runtime 数据，创建唯一空 v19 schema；不迁移 Desired、Operation、journal、AgentSession、
+5. 删除旧产品/runtime/Snapshot 数据，创建唯一空 v20 schema；不迁移 Desired、Operation、journal、AgentSession、
    inventory settlement 或 Route lane。
 6. 启动 Control；Node 清空本地 Cat 状态后，以 `node_id/node_name/control_endpoint` 注册。
 7. 先验证 register/heartbeat/reset、资源 API 和 FakeVmm/PostgreSQL smoke，再执行适用的真实磁盘和

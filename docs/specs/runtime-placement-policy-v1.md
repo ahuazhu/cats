@@ -146,7 +146,7 @@ PostgreSQL，也不提供 ObjectWrite/Route/HostFence authority 子命令。
 
 ## 5. Persistence and verification
 
-v19 空库只保留：
+v20 空库只保留：
 
 - `node_identities` 与 `runtime_node_credential_lineage`；
 - `runtime_node_placement_policies`；

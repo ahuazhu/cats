@@ -1,7 +1,7 @@
 # Cats
 
 Cats 是一个可休眠、可恢复、可通过 Cold 启动跨 Node 迁移的 Linux microVM 平台。用户通过
-CLI/HTTP API 和 Web Console 管理 Cat 与 PersistentDisk，通过 Exec/Shell 访问 Guest。
+CLI/HTTP API 和 Web Console 管理 Cat、PersistentDisk 与 DiskSnapshot，通过 Exec/Shell 访问 Guest。
 Guest 使用标准 Linux、virtio block device 和 ext4，不持有对象存储或元数据存储凭据。
 
 ## 仓库状态
@@ -11,6 +11,7 @@ Guest 使用标准 Linux、virtio block device 和 ext4，不持有对象存储�
 - Direct-OS ChunkStore、delta packs、golden roots、Strict/Relaxed durability；
 - kernel-NBD 与 native vhost-user-blk 两个前端；
 - Workspace 控制面、用户/管理员 Console、可选 WorkOS sessions、CLI 和 Exec/Shell；
+- DiskSnapshot 创建与查询、Cold/Unowned 同盘恢复和保护当前 root 与 live Snapshot root 的 GC；
 - FakeVmm 与 Cloud Hypervisor/KVM Node 路径、vsock Guest Agent、systemd Guest PID 1；
 - S3/PostgreSQL provider adapters、usage/billing pipeline、Terraform/AWS 部署；
 - adapter contracts、crash injection、writer epoch、鉴权、drain、Cold restore 和 bare-metal 实验。
@@ -26,7 +27,7 @@ Cloud Hypervisor 实际执行、Strict PersistentDisk、Guest mount readiness �
 
 已实现能力、开放项与协议状态统一见 [docs/README.md](docs/README.md)。生产交付须按
 [Operations and HA](docs/operations-ha.md#9-分层-qualification)在交付的精确版本上验证；自动
-Host fencing、长期不对称网络、产品 DiskSnapshot 同盘 restore/GC 保护、跨 Node Guest overlay
+Host fencing、长期不对称网络、hot Snapshot/跨盘 clone/快照调度、跨 Node Guest overlay
 和权限隔离仍是独立边界。
 
 ## 不可破坏的边界

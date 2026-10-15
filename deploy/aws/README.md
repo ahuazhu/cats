@@ -332,7 +332,7 @@ target; SIGTERM then closes its admissions and HTTP server within the
 30-second termination grace period. Existing API-replica and advisory-lock tests do not by themselves prove a
 current public-spawn PostgreSQL-to-physical runtime takeover.
 
-The authority database carries exact clean-slate schema version 19.
+The authority database carries exact clean-slate schema version 20.
 `cats-controld` does not migrate an earlier authority schema in place and fails
 closed on any other stamp or catalog shape. The pre-cutover
 `cats-control-data` PVC is no longer part of the runtime; its final snapshot
@@ -343,7 +343,7 @@ safe-header collection, Pod-UID recheck and PDB-governed eviction are retained
 as historical V1 control-plane HA evidence. Its reconciler-owner oracle targets
 the retired singleton and therefore must not be run from `main` or cited as a
 clean-slate runtime qualification. A replacement must use the production
-public spawn, schema 19 and the synchronous semantic composition, preserve the exact
+public spawn, schema 20 and the synchronous semantic composition, preserve the exact
 tested SHA, and pass before this boundary is promoted.
 
 The usage ledger has the same rule for the same reason. ADR-0018 replaced the V1

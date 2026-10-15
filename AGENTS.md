@@ -24,7 +24,7 @@ current ingress target     -> withdraw before transition, publish after Ready
 
 The release is one coherent clean-slate vertical cutover across schema, Control, noded effects, disk
 binding, Node reset and ingress ordering, following
-[`docs/operations-ha.md` §10](docs/operations-ha.md#10-首次单协议部署). It has one empty v19 target
+[`docs/operations-ha.md` §10](docs/operations-ha.md#10-首次单协议部署). It has one empty v20 target
 schema and one protocol version. Desired/reconcile, NodeJob, lifecycle Operation, command
 poll/result, per-Cat command journal, AgentSession and observation-settlement paths leave service
 before it starts. PostgreSQL current resource rows are the sole product intent/result authority;

@@ -365,6 +365,7 @@ fn load_head(connection: &Connection, volume_id: &Id) -> Result<VolumeRecord, St
                 size_bytes: u64::try_from(size).map_err(|_| "test size is negative".to_string())?,
                 durability: VolumeDurability::Strict,
                 admin_state: VolumeAdminState::Active,
+                gc_required: false,
                 head: RemoteHead {
                     generation: Generation::new(
                         u64::try_from(generation)

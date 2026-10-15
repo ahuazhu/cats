@@ -8,6 +8,7 @@ pub enum SingletonRole {
     UsageProjector,
     SemanticDestroyRecovery,
     SemanticActionRecovery,
+    DiskSnapshotGarbageCollection,
 }
 
 impl SingletonRole {
@@ -16,6 +17,7 @@ impl SingletonRole {
             Self::UsageProjector => 420_203,
             Self::SemanticDestroyRecovery => 420_204,
             Self::SemanticActionRecovery => 420_205,
+            Self::DiskSnapshotGarbageCollection => 420_206,
         }
     }
 
@@ -24,6 +26,7 @@ impl SingletonRole {
             Self::UsageProjector => "usage-projector",
             Self::SemanticDestroyRecovery => "semantic-destroy-recovery",
             Self::SemanticActionRecovery => "semantic-action-recovery",
+            Self::DiskSnapshotGarbageCollection => "disk-snapshot-garbage-collection",
         }
     }
 }

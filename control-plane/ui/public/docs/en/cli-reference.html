@@ -38,8 +38,14 @@ cats destroy CAT_ID</code></pre>
 cats disk ls
 cats disk get DISK_ID
 cats disk attach DISK_ID --cat CAT_ID --mount-path /absolute/guest/path
-cats disk detach DISK_ID --cat CAT_ID --mount-path /absolute/guest/path</code></pre>
+cats disk detach DISK_ID --cat CAT_ID --mount-path /absolute/guest/path
+cats disk snapshot create DISK_SLUG SNAPSHOT_SLUG
+cats disk snapshot list [--disk DISK_SLUG]
+cats disk snapshot show SNAPSHOT_SLUG
+cats disk snapshot restore SNAPSHOT_SLUG
+cats disk snapshot destroy SNAPSHOT_SLUG</code></pre>
 <p>Create, attach, and detach requests are persisted before transport. An ambiguous retry of the same command reuses the exact path, body, and Idempotency-Key. Capacity is immutable in this release. Disk item lookup accepts only immutable <code>disk_…</code> IDs; binding mutations require a terminal Cold Cat and an exact absolute Guest path.</p>
+<p>Snapshot create uses both user-selected slugs as its stable semantic identity. Create and restore require a remotely durable, unowned disk and a stable Cold Cat when the disk is attached. Restore first reads the latest disk generation and sends it as an optimistic precondition; a concurrent disk change fails instead of restoring over an unseen head. Destroy removes the restore point and its GC protection, not the PersistentDisk.</p>
 
 <h2 id="operations">Operation commands</h2>
 <pre><code>cats operation get OPERATION_ID
@@ -47,4 +53,4 @@ cats operation wait OPERATION_ID</code></pre>
 <p>Cat create and the five lifecycle commands return an Operation ID. Both Operation commands use the exact Workspace-scoped product lookup; there is no Operation list and no Node execution payload.</p>
 
 <h2 id="cutover">Cutover boundary</h2>
-<p>Guest command, deployment, Endpoint, Disk delete, Snapshot, and capacity mutation commands are absent from shipped help. Retired lifecycle aliases are not parsed and never probe a legacy route.</p>
+<p>Endpoint and capacity mutation commands are absent from shipped help. Retired lifecycle aliases are not parsed and never probe a legacy route.</p>

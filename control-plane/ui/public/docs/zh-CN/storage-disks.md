@@ -17,9 +17,19 @@ Create Body 明确包含 `durability`、`name` 与 `size_bytes`。浏览器控�
 
 Disk Item Lookup 要求 Create 或 List 返回的不可变 `disk_…` ID；Item Path 不接受名称。
 
-## 当前 Lifecycle 边界
+## 磁盘快照
 
-Release Product Router 和发布版 CLI 不暴露 PersistentDisk Attachment、Snapshot、容量变更或删除。容量不可变。Provider-neutral Storage Engine 与 Signed Volume Authority 仍强制执行 RWO、Fencing、Durable Root 与 Stale Writer 拒绝；这些 Data-plane 保证不会授权 Product Mutation Endpoint。
+    cats disk snapshot create project-data before-upgrade
+    cats disk snapshot list
+    cats disk snapshot show before-upgrade
+    cats disk snapshot restore before-upgrade
+    cats disk snapshot destroy before-upgrade
+
+DiskSnapshot 是一个 PersistentDisk 的远端恢复点，不是 VM 内存快照。创建和恢复时磁盘必须已经远端持久且 Unowned；如果磁盘已绑定 Cat，该 Cat 必须稳定处于 Cold。恢复会把捕获的数据发布为一个新的、更高的磁盘 Generation，不会让 Generation 倒退。它会替换原盘的当前内容，不会克隆新盘。
+
+Snapshot Row 同时也是 GC Root。删除后即撤销这份保护；只要当前磁盘或另一个 Snapshot 仍引用共享对象，对象就继续保留。Snapshot Slug 仅可在删除后复用，不可变 `snapshot_…` ID 永不复用。
+
+容量仍不可变。Provider-neutral Storage Engine 与 Volume Authority 继续强制执行 RWO、Fencing、Durable Root 与 Stale Writer 拒绝；Product Client 不能自行 Acquire 或 Revoke Writer Epoch。
 
 ## Durability
 

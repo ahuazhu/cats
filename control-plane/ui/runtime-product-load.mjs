@@ -11,13 +11,14 @@ const runtimeProductControls = [
   "#create-cat-button",
   "[data-create-cat]",
   "#create-disk-button",
+  "#create-snapshot-button",
 ].join(", ");
 
 export function setRuntimeProductLoadingShell(root, loading) {
   const shell = root.querySelector("#app-shell");
   if (loading) {
     shell?.setAttribute("aria-busy", "true");
-    for (const selector of ["#cats-table", "#disks-table"]) {
+    for (const selector of ["#cats-table", "#disks-table", "#snapshots-table"]) {
       const table = root.querySelector(selector);
       if (table) table.innerHTML = "";
     }
@@ -80,6 +81,16 @@ export function runtimeDiskView(disk) {
   };
 }
 
+export function runtimeDiskSnapshotView(snapshot) {
+  return {
+    ...snapshot,
+    id: snapshot.snapshot_id,
+    name: snapshot.snapshot_slug,
+    state: snapshot.status === "deleted" ? "deleted" : "available",
+    created_at_unix: Math.floor(Number(snapshot.created_at_unix_ms) / 1000),
+  };
+}
+
 export async function loadAll({ workspaceId, signal, requestPage }) {
   if (typeof workspaceId !== "string" || !workspaceId) {
     throw new Error("runtime product load requires one captured Workspace");
@@ -87,10 +98,11 @@ export async function loadAll({ workspaceId, signal, requestPage }) {
   if (typeof requestPage !== "function") {
     throw new Error("runtime product load requires a request function");
   }
-  const [cats, disks] = await Promise.all([
+  const [cats, disks, snapshots] = await Promise.all([
     loadCollection({ workspaceId, resource: "cats", signal, requestCollection: requestPage }),
     loadCollection({ workspaceId, resource: "disks", signal, requestCollection: requestPage }),
+    loadCollection({ workspaceId, resource: "snapshots", signal, requestCollection: requestPage }),
   ]);
   assertNotAborted(signal);
-  return { workspaceId, cats, disks };
+  return { workspaceId, cats, disks, snapshots };
 }

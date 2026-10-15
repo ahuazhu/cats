@@ -13,8 +13,15 @@ cats disk get disk_…</code></pre>
 <p>The create body explicitly carries <code>durability</code>, <code>name</code>, and <code>size_bytes</code>. The browser console uses the closed Strict default. Both browser and CLI persist the exact request and Idempotency-Key before transport, so an ambiguous response is recovered by exact replay rather than a second create.</p>
 <p>Disk item lookup requires the immutable <code>disk_…</code> ID returned by create or list. Names are not accepted on item paths.</p>
 
-<h2 id="boundary">Current lifecycle boundary</h2>
-<p>PersistentDisk attachment, snapshot, capacity change, and deletion are not exposed by the release product router or shipped CLI. Capacity is immutable. The provider-neutral storage engine and signed Volume Authority still enforce RWO, fencing, durable roots, and stale-writer rejection; those data-plane guarantees do not authorize a product mutation endpoint.</p>
+<h2 id="snapshots">Disk snapshots</h2>
+<pre><code>cats disk snapshot create project-data before-upgrade
+cats disk snapshot list
+cats disk snapshot show before-upgrade
+cats disk snapshot restore before-upgrade
+cats disk snapshot destroy before-upgrade</code></pre>
+<p>A DiskSnapshot is a remote restore point for one PersistentDisk, not a VM-memory snapshot. Create and restore require the disk to be remotely durable and unowned; if it is attached, its Cat must be stable Cold. Restore publishes the captured data as a new, higher disk generation rather than moving generation backward. It replaces the disk's current contents and does not clone a new disk.</p>
+<p>The Snapshot row is also a garbage-collection root. Deleting it removes that protection; shared objects remain live while the current disk or another Snapshot still references them. Snapshot slugs may be reused only after delete, while immutable <code>snapshot_…</code> IDs are never reused.</p>
+<p>Capacity remains immutable. The provider-neutral storage engine and Volume Authority still enforce RWO, fencing, durable roots, and stale-writer rejection; a product client cannot self-acquire or revoke a writer epoch.</p>
 
 <h2 id="durability">Durability</h2>
 <p>The Guest sees a standard virtio block device. Strict durability means a successful FLUSH/FUA is remotely durable and survives permanent Host loss. Relaxed durability may acknowledge a local commit while the remote root trails; that local tail is unique data and cannot be discarded as cache.</p>

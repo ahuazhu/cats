@@ -243,6 +243,13 @@ pub enum DiskStatus {
     Deleted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskSnapshotStatus {
+    Normal,
+    Deleted,
+}
+
 /// Filesystem authority fixed when a PersistentDisk identity is allocated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -291,6 +298,9 @@ pub enum SemanticSuccessCode {
     DiskAttached,
     DiskDetached,
     DiskDeleted,
+    SnapshotCreated,
+    SnapshotDestroyed,
+    SnapshotRestored,
     NodeRegistered,
     NodeReset,
     AlreadyExists,
@@ -302,6 +312,7 @@ pub enum SemanticSuccessCode {
     AlreadyAttached,
     AlreadyDetached,
     AlreadyDeleted,
+    AlreadyRestored,
     AlreadyRegistered,
     ResetRequired,
 }
@@ -320,11 +331,20 @@ pub enum SemanticErrorCode {
     NodeResetRequired,
     NodeIdentityConflict,
     DiskNotFound,
+    SnapshotNotFound,
     DiskSizeConflict,
     DiskDeleted,
     DiskInUse,
     DiskAlreadyAttached,
     DiskBindingConflict,
+    SnapshotConfigurationConflict,
+    SnapshotInUse,
+    DiskOwned,
+    HeadConflict,
+    DiskNotInitialized,
+    GenerationExhausted,
+    SnapshotCorrupt,
+    StorageUnavailable,
     MountPathConflict,
     CatMustBeCold,
     GuestStartFailed,
@@ -342,7 +362,7 @@ impl SemanticErrorCode {
         match self {
             Self::Unauthorized => 401,
             Self::InvalidRequest => 400,
-            Self::CatNotFound | Self::DiskNotFound => 404,
+            Self::CatNotFound | Self::DiskNotFound | Self::SnapshotNotFound => 404,
             Self::CatConfigurationConflict
             | Self::Busy
             | Self::NodeIdentityConflict
@@ -351,19 +371,26 @@ impl SemanticErrorCode {
             | Self::DiskAlreadyAttached
             | Self::DiskBindingConflict
             | Self::MountPathConflict
+            | Self::SnapshotConfigurationConflict
+            | Self::SnapshotInUse
+            | Self::DiskOwned
+            | Self::HeadConflict
             | Self::ActionCancelled => 409,
             Self::CatDestroyed
             | Self::InvalidState
             | Self::NodeResetRequired
             | Self::DiskDeleted
+            | Self::DiskNotInitialized
+            | Self::GenerationExhausted
             | Self::CatMustBeCold => 422,
-            Self::NodeUnavailable => 503,
+            Self::NodeUnavailable | Self::StorageUnavailable => 503,
             Self::Timeout => 504,
             Self::GuestStartFailed
             | Self::GuestSuspendFailed
             | Self::GuestWarmFailed
             | Self::GuestColdFailed
             | Self::DestroyFailed
+            | Self::SnapshotCorrupt
             | Self::InternalError => 500,
         }
     }
@@ -417,6 +444,42 @@ pub struct CatActionRequest {
 pub struct CreateDiskRequest {
     pub disk_slug: ResourceSlug,
     pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateDiskSnapshotRequest {
+    pub snapshot_slug: ResourceSlug,
+    pub disk_slug: ResourceSlug,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DestroyDiskSnapshotRequest {
+    pub expected_snapshot_id: Id,
+}
+
+impl DestroyDiskSnapshotRequest {
+    pub fn validate(&self) -> Result<(), SemanticValidationError> {
+        validate_prefixed_id(&self.expected_snapshot_id, "snapshot_")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreDiskSnapshotRequest {
+    pub expected_snapshot_id: Id,
+    pub expected_generation: u64,
+}
+
+impl RestoreDiskSnapshotRequest {
+    pub fn validate(&self) -> Result<(), SemanticValidationError> {
+        validate_prefixed_id(&self.expected_snapshot_id, "snapshot_")?;
+        if self.expected_generation > i64::MAX as u64 {
+            return Err(SemanticValidationError::Generation);
+        }
+        Ok(())
+    }
 }
 
 impl CreateDiskRequest {
@@ -565,6 +628,11 @@ pub struct DiskView {
     pub workspace_id: Id,
     pub disk_slug: ResourceSlug,
     pub size_bytes: u64,
+    /// Current remotely authoritative disk generation. Snapshot restore uses
+    /// a fresh read of this value as its optimistic occurrence precondition.
+    /// It is absent before initialization and after deletion.
+    #[serde(default)]
+    pub head_generation: Option<u64>,
     pub status: DiskStatus,
     pub binding: Option<DiskBindingView>,
     pub created_at_unix_ms: u64,
@@ -578,15 +646,64 @@ impl DiskView {
         if self.size_bytes == 0 {
             return Err(SemanticValidationError::DiskSize);
         }
+        if self
+            .head_generation
+            .is_some_and(|generation| generation > i64::MAX as u64)
+        {
+            return Err(SemanticValidationError::Generation);
+        }
         match self.status {
             DiskStatus::Normal if self.deleted_at_unix_ms.is_none() => {}
-            DiskStatus::Deleted if self.deleted_at_unix_ms.is_some() && self.binding.is_none() => {}
+            DiskStatus::Deleted
+                if self.deleted_at_unix_ms.is_some()
+                    && self.binding.is_none()
+                    && self.head_generation.is_none() => {}
             _ => return Err(SemanticValidationError::DiskShape),
         }
         if let Some(binding) = &self.binding {
             validate_prefixed_id(&binding.cat_id, "cat_")?;
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiskSnapshotView {
+    pub snapshot_id: Id,
+    pub workspace_id: Id,
+    pub snapshot_slug: ResourceSlug,
+    pub disk_id: Id,
+    pub disk_slug: ResourceSlug,
+    pub size_bytes: u64,
+    pub status: DiskSnapshotStatus,
+    pub captured_generation: u64,
+    pub created_at_unix_ms: u64,
+    pub deleted_at_unix_ms: Option<u64>,
+}
+
+impl DiskSnapshotView {
+    pub fn validate(&self) -> Result<(), SemanticValidationError> {
+        validate_prefixed_id(&self.snapshot_id, "snapshot_")?;
+        validate_prefixed_id(&self.workspace_id, "ws_")?;
+        validate_prefixed_id(&self.disk_id, "disk_")?;
+        if self.size_bytes == 0
+            || self.size_bytes > i64::MAX as u64
+            || self.captured_generation > i64::MAX as u64
+        {
+            return Err(SemanticValidationError::DiskSize);
+        }
+        match self.status {
+            DiskSnapshotStatus::Normal if self.deleted_at_unix_ms.is_none() => Ok(()),
+            DiskSnapshotStatus::Deleted
+                if self
+                    .deleted_at_unix_ms
+                    .is_some_and(|deleted| deleted >= self.created_at_unix_ms) =>
+            {
+                Ok(())
+            }
+            _ => Err(SemanticValidationError::SnapshotShape),
+        }
     }
 }
 
@@ -642,6 +759,25 @@ pub struct DiskResponse {
     pub status: SemanticStatus,
     pub code: SemanticSuccessCode,
     pub disk: DiskView,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiskSnapshotResponse {
+    pub status: SemanticStatus,
+    pub code: SemanticSuccessCode,
+    pub snapshot: DiskSnapshotView,
+    pub disk_head_generation: u64,
+}
+
+impl DiskSnapshotResponse {
+    pub fn validate(&self) -> Result<(), SemanticValidationError> {
+        self.snapshot.validate()?;
+        if self.disk_head_generation > i64::MAX as u64 {
+            return Err(SemanticValidationError::Generation);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1029,6 +1165,8 @@ pub enum SemanticValidationError {
     BootImage,
     #[error("size_bytes must be positive and fit PostgreSQL BIGINT")]
     DiskSize,
+    #[error("generation must fit PostgreSQL BIGINT")]
+    Generation,
     #[error("a disk occurs more than once in the mount set")]
     DuplicateDisk,
     #[error("a mount_path occurs more than once in the mount set")]
@@ -1045,6 +1183,8 @@ pub enum SemanticValidationError {
     CatShape,
     #[error("Disk projection fields do not match its status")]
     DiskShape,
+    #[error("DiskSnapshot projection fields do not match its status")]
+    SnapshotShape,
     #[error("Node identity text is empty, too long or contains control bytes")]
     NodeText,
     #[error("noded action config does not match the action")]
@@ -1208,6 +1348,67 @@ mod tests {
             duplicate_path.validate(),
             Err(SemanticValidationError::DuplicateMountPath)
         );
+    }
+
+    #[test]
+    fn snapshot_wire_uses_user_slugs_and_generation_not_internal_roots() {
+        let create: CreateDiskSnapshotRequest =
+            serde_json::from_slice(br#"{"snapshot_slug":"before-upgrade","disk_slug":"data"}"#)
+                .unwrap();
+        assert_eq!(create.snapshot_slug.as_str(), "before-upgrade");
+        assert_eq!(create.disk_slug.as_str(), "data");
+        assert!(serde_json::from_slice::<CreateDiskSnapshotRequest>(
+            br#"{"snapshot_slug":"before-upgrade","disk_slug":"data","root_hash":"secret"}"#
+        )
+        .is_err());
+
+        let destroy: DestroyDiskSnapshotRequest =
+            serde_json::from_slice(br#"{"expected_snapshot_id":"snapshot_01"}"#).unwrap();
+        destroy.validate().unwrap();
+
+        let restore: RestoreDiskSnapshotRequest = serde_json::from_slice(
+            br#"{"expected_snapshot_id":"snapshot_01","expected_generation":0}"#,
+        )
+        .unwrap();
+        restore.validate().unwrap();
+        assert_eq!(
+            RestoreDiskSnapshotRequest {
+                expected_snapshot_id: id("snapshot_01"),
+                expected_generation: i64::MAX as u64 + 1,
+            }
+            .validate(),
+            Err(SemanticValidationError::Generation)
+        );
+    }
+
+    #[test]
+    fn snapshot_projection_binds_immutable_ids_and_tombstone_shape() {
+        let mut snapshot = DiskSnapshotView {
+            snapshot_id: id("snapshot_01"),
+            workspace_id: id("ws_01"),
+            snapshot_slug: ResourceSlug::new("before-upgrade").unwrap(),
+            disk_id: id("disk_01"),
+            disk_slug: ResourceSlug::new("data").unwrap(),
+            size_bytes: 1 << 30,
+            status: DiskSnapshotStatus::Normal,
+            captured_generation: 42,
+            created_at_unix_ms: 10,
+            deleted_at_unix_ms: None,
+        };
+        snapshot.validate().unwrap();
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert!(!encoded.contains("root_hash"));
+        assert!(!encoded.contains("root_object_id"));
+
+        snapshot.status = DiskSnapshotStatus::Deleted;
+        assert_eq!(
+            snapshot.validate(),
+            Err(SemanticValidationError::SnapshotShape)
+        );
+        snapshot.deleted_at_unix_ms = Some(11);
+        snapshot.validate().unwrap();
+        snapshot.snapshot_id = id("disk_01");
+        assert_eq!(snapshot.validate(), Err(SemanticValidationError::IdPrefix));
     }
 
     #[test]

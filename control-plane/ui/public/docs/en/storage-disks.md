@@ -29,11 +29,28 @@ config and return its ID and digest. They do not hot-plug a device, create a
 lifecycle Operation, or prove Guest mount readiness; the next Start freezes and
 executes that config.
 
-Snapshot, capacity change, and PersistentDisk deletion are not exposed by the
-release product router or shipped CLI. Capacity is immutable. The
-provider-neutral storage engine and signed Volume Authority still enforce RWO,
-fencing, durable roots, and stale-writer rejection; a product client cannot use
-attach or detach to self-acquire or revoke a writer epoch.
+## Disk snapshots
+
+    cats disk snapshot create project-data before-upgrade
+    cats disk snapshot list
+    cats disk snapshot show before-upgrade
+    cats disk snapshot restore before-upgrade
+    cats disk snapshot destroy before-upgrade
+
+A DiskSnapshot is a remote restore point for one PersistentDisk, not a VM-memory
+snapshot. Create and restore require the disk to be remotely durable and
+unowned; if it is attached, its Cat must be stable Cold. Restore publishes the
+captured data as a new, higher disk generation rather than moving generation
+backward. It replaces the disk's current contents and does not clone a new disk.
+
+The Snapshot row is also a garbage-collection root. Deleting it removes that
+protection; shared objects remain live while the current disk or another
+Snapshot still references them. Snapshot slugs may be reused only after delete,
+while immutable `snapshot_…` IDs are never reused.
+
+Capacity remains immutable. The provider-neutral storage engine and Volume
+Authority still enforce RWO, fencing, durable roots, and stale-writer rejection;
+a product client cannot self-acquire or revoke a writer epoch.
 
 ## Durability
 

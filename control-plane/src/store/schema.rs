@@ -344,9 +344,9 @@ fn verify_current_schema(transaction: &mut postgres::Transaction<'_>) -> Result<
     Ok(())
 }
 
-/// The Control Store owns the exact clean-slate release stamp. Version 19 has
+/// The Control Store owns the exact clean-slate release stamp. Version 20 has
 /// no migration or compatibility reader/writer for an earlier authority shape.
-pub(super) const SCHEMA_VERSION: i64 = 19;
+pub(super) const SCHEMA_VERSION: i64 = 20;
 
 const CONTROL_TABLES: &[&str] = &[
     "control_schema_version",
@@ -365,6 +365,7 @@ const CONTROL_TABLES: &[&str] = &[
     "workos_event_receipts",
     "volume_records",
     "disk_records",
+    "disk_snapshots",
     "disk_snapshot_records",
     "production_mutation_admission_commands",
     "production_mutation_admission",
@@ -377,7 +378,7 @@ const CONTROL_TABLES: &[&str] = &[
     "runtime_provisioner_credential_lineage",
 ];
 
-// Version 19 is an empty-database cutover, not an additive migration. A
+// Version 20 is an empty-database cutover, not an additive migration. A
 // manually stamped database that still exposes any former product or Desired
 // authority must fail closed instead of letting old and atomic writers coexist.
 const FORBIDDEN_LEGACY_CONTROL_TABLES: &[&str] = &[
@@ -455,6 +456,13 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
        FROM persistent_disks WHERE FALSE",
     "SELECT binding_id, workspace_id, disk_id, cat_id, mount_path, created_at
        FROM disk_bindings WHERE FALSE",
+    "SELECT volume_id, record, size_bytes, durability, admin_state, delete_id,
+            gc_required, gc_id, gc_roots_digest, gc_started_at,
+            head_generation, head_root_hash, head_root_object_id, lease_owner,
+            lease_epoch, lease_expires_at, last_transition_kind,
+            last_transition_id, transition_placement_epoch,
+            transition_lease_duration_ms, owner_binding, owner_node_id
+       FROM volume_records WHERE FALSE",
     "SELECT disk_id, record, workspace_id, name, volume_id, size_bytes,
             durability, created_at, admin_state, delete_id, role_kind,
             root_cat_id, initialization_kind, initialization_token,
@@ -465,6 +473,10 @@ const AUTHORITY_SCHEMA_PROBES: &[&str] = &[
             initialization_commit_receipt_bytes,
             initialization_commit_receipt_digest
        FROM disk_records WHERE FALSE",
+    "SELECT snapshot_id, workspace_id, snapshot_slug, disk_id, disk_slug,
+            volume_id, size_bytes, captured_generation,
+            deleted_head_generation, created_at, deleted_at
+       FROM disk_snapshots WHERE FALSE",
     "SELECT snapshot_id, record, disk_id, volume_id, size_bytes,
             head_generation, head_root_hash, head_root_object_id, created_at
        FROM disk_snapshot_records WHERE FALSE",
@@ -701,8 +713,15 @@ CREATE TABLE IF NOT EXISTS volume_records (
     record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
     size_bytes BIGINT NOT NULL CHECK (size_bytes > 0),
     durability TEXT NOT NULL CHECK (durability IN ('strict', 'relaxed')),
-    admin_state TEXT NOT NULL CHECK (admin_state IN ('active', 'deleting')),
+    admin_state TEXT NOT NULL
+        CHECK (admin_state IN ('active', 'deleting', 'garbage_collecting')),
     delete_id TEXT,
+    gc_required BOOLEAN NOT NULL DEFAULT FALSE,
+    gc_id TEXT,
+    gc_roots_digest TEXT CHECK (
+        gc_roots_digest IS NULL OR gc_roots_digest ~ '^sha256:[0-9a-f]{64}$'
+    ),
+    gc_started_at BIGINT CHECK (gc_started_at IS NULL OR gc_started_at >= 0),
     head_generation BIGINT NOT NULL CHECK (head_generation >= 0),
     head_root_hash TEXT,
     head_root_object_id TEXT,
@@ -710,7 +729,9 @@ CREATE TABLE IF NOT EXISTS volume_records (
     lease_epoch BIGINT NOT NULL CHECK (lease_epoch >= 0),
     lease_expires_at BIGINT,
     last_transition_kind TEXT CHECK (
-        last_transition_kind IN ('normal_acquire', 'release', 'begin_delete')
+        last_transition_kind IN (
+            'normal_acquire', 'release', 'begin_delete', 'snapshot_restore'
+        )
     ),
     last_transition_id TEXT,
     transition_placement_epoch BIGINT,
@@ -718,8 +739,13 @@ CREATE TABLE IF NOT EXISTS volume_records (
     owner_binding JSONB,
     owner_node_id TEXT,
     CHECK (
-        (admin_state = 'active' AND delete_id IS NULL) OR
-        (admin_state = 'deleting' AND delete_id IS NOT NULL)
+        (admin_state = 'active' AND delete_id IS NULL
+            AND gc_id IS NULL AND gc_roots_digest IS NULL AND gc_started_at IS NULL) OR
+        (admin_state = 'deleting' AND delete_id IS NOT NULL
+            AND gc_id IS NULL AND gc_roots_digest IS NULL AND gc_started_at IS NULL) OR
+        (admin_state = 'garbage_collecting' AND delete_id IS NULL
+            AND gc_required AND gc_id IS NOT NULL
+            AND gc_roots_digest IS NOT NULL AND gc_started_at IS NOT NULL)
     ),
     CHECK ((lease_owner IS NULL) = (lease_expires_at IS NULL)),
     CHECK (lease_owner IS NULL OR admin_state = 'active'),
@@ -748,7 +774,7 @@ CREATE TABLE IF NOT EXISTS volume_records (
         (last_transition_kind = 'normal_acquire' AND last_transition_id IS NOT NULL
             AND transition_placement_epoch > 0
             AND transition_lease_duration_ms > 0) OR
-        (last_transition_kind IN ('release', 'begin_delete')
+        (last_transition_kind IN ('release', 'begin_delete', 'snapshot_restore')
             AND last_transition_id IS NOT NULL
             AND transition_placement_epoch IS NULL
             AND transition_lease_duration_ms IS NULL)
@@ -872,8 +898,40 @@ CREATE INDEX IF NOT EXISTS disk_records_lookup_record_record
 ON disk_records((record->>'workspace_id') COLLATE \"C\", (record->>'disk_id') COLLATE \"C\")
 WHERE workspace_id COLLATE \"C\" IS DISTINCT FROM (record->>'workspace_id') COLLATE \"C\"
   AND disk_id COLLATE \"C\" IS DISTINCT FROM (record->>'disk_id') COLLATE \"C\";
+-- Product identity/tombstone is retained after deletion so snapshot IDs are
+-- never reused while the workspace slug is immediately reusable. It does not
+-- reference the parent Disk/Volume because those rows may be removed after
+-- the live root is released.
+CREATE TABLE IF NOT EXISTS disk_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+    snapshot_slug TEXT NOT NULL
+        CHECK (snapshot_slug ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'),
+    disk_id TEXT NOT NULL,
+    disk_slug TEXT NOT NULL
+        CHECK (disk_slug ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'),
+    volume_id TEXT NOT NULL,
+    size_bytes BIGINT NOT NULL CHECK (size_bytes > 0),
+    captured_generation BIGINT NOT NULL CHECK (captured_generation > 0),
+    deleted_head_generation BIGINT CHECK (deleted_head_generation > 0),
+    created_at BIGINT NOT NULL CHECK (created_at >= 0),
+    deleted_at BIGINT CHECK (deleted_at >= created_at),
+    CONSTRAINT disk_snapshots_deleted_result_exact
+        CHECK ((deleted_at IS NULL) = (deleted_head_generation IS NULL)),
+    CONSTRAINT disk_snapshots_deleted_generation_monotonic
+        CHECK (deleted_head_generation IS NULL OR
+               deleted_head_generation >= captured_generation),
+    CONSTRAINT disk_snapshots_workspace_identity_unique
+        UNIQUE (workspace_id, snapshot_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS disk_snapshots_current_slug_unique
+ON disk_snapshots(workspace_id, snapshot_slug) WHERE deleted_at IS NULL;
+-- Only this row is a live GC root. Keeping the parent FKs makes an accidental
+-- Disk/Volume metadata deletion fail at PostgreSQL while the pin exists.
 CREATE TABLE IF NOT EXISTS disk_snapshot_records (
     snapshot_id TEXT PRIMARY KEY,
+    CONSTRAINT disk_snapshot_records_product_fkey
+        FOREIGN KEY (snapshot_id) REFERENCES disk_snapshots(snapshot_id),
     record JSONB NOT NULL CHECK (jsonb_typeof(record) = 'object'),
     disk_id TEXT NOT NULL REFERENCES disk_records(disk_id),
     volume_id TEXT NOT NULL REFERENCES volume_records(volume_id),
@@ -954,7 +1012,7 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission_commands (
         CHECK (source_commit_sha ~ '^[0-9a-f]{40}$'),
     control_schema_version BIGINT NOT NULL
         CONSTRAINT production_mutation_admission_commands_schema_ck
-        CHECK (control_schema_version = 19),
+        CHECK (control_schema_version = 20),
     source_manifest_sha256 TEXT NOT NULL
         CONSTRAINT production_mutation_admission_commands_source_manifest_ck
         CHECK (source_manifest_sha256 ~ '^sha256:[0-9a-f]{64}$'),
@@ -1051,7 +1109,7 @@ CREATE TABLE IF NOT EXISTS production_mutation_admission (
         CHECK (source_commit_sha ~ '^[0-9a-f]{40}$'),
     control_schema_version BIGINT NULL
         CONSTRAINT production_mutation_admission_schema_ck
-        CHECK (control_schema_version = 19),
+        CHECK (control_schema_version = 20),
     source_manifest_sha256 TEXT NULL
         CONSTRAINT production_mutation_admission_source_manifest_ck
         CHECK (source_manifest_sha256 ~ '^sha256:[0-9a-f]{64}$'),
@@ -1522,8 +1580,8 @@ mod semantic_protocol_schema_tests {
     use super::{CONTROL_TABLES, FORBIDDEN_LEGACY_CONTROL_TABLES, SCHEMA, SCHEMA_VERSION};
 
     #[test]
-    fn v19_contains_only_current_slug_uniqueness_and_rwo_binding_constraints() {
-        assert_eq!(SCHEMA_VERSION, 19);
+    fn v20_contains_current_resource_uniqueness_and_rwo_binding_constraints() {
+        assert_eq!(SCHEMA_VERSION, 20);
         for table in [
             "cats",
             "nodes",
@@ -1541,6 +1599,9 @@ mod semantic_protocol_schema_tests {
         assert!(SCHEMA.contains(
             "CREATE UNIQUE INDEX IF NOT EXISTS disks_current_slug_unique\nON persistent_disks(workspace_id, disk_slug) WHERE deleted_at IS NULL"
         ));
+        assert!(SCHEMA.contains(
+            "CREATE UNIQUE INDEX IF NOT EXISTS disk_snapshots_current_slug_unique\nON disk_snapshots(workspace_id, snapshot_slug) WHERE deleted_at IS NULL"
+        ));
         assert!(SCHEMA.contains("CONSTRAINT disk_bindings_disk_unique UNIQUE (disk_id)"));
         assert!(SCHEMA.contains("control_endpoint TEXT NOT NULL"));
         assert!(SCHEMA.contains("last_heartbeat_at BIGINT NOT NULL"));
@@ -1549,7 +1610,7 @@ mod semantic_protocol_schema_tests {
     }
 
     #[test]
-    fn v19_rejects_retired_protocol_catalogs_but_keeps_strict_disk_storage() {
+    fn v20_rejects_retired_protocol_catalogs_but_keeps_snapshot_live_roots() {
         for retired in [
             "runtime_operations",
             "route_operations",
@@ -1564,11 +1625,19 @@ mod semantic_protocol_schema_tests {
             assert!(!SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {retired} (")));
         }
 
-        for retained in ["volume_records", "disk_records", "disk_snapshot_records"] {
+        for retained in [
+            "volume_records",
+            "disk_records",
+            "disk_snapshots",
+            "disk_snapshot_records",
+        ] {
             assert!(CONTROL_TABLES.contains(&retained));
             assert!(SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {retained} (")));
         }
         assert!(SCHEMA.contains("REFERENCES cats(workspace_id, cat_id)"));
+        assert!(SCHEMA.contains("FOREIGN KEY (snapshot_id) REFERENCES disk_snapshots(snapshot_id)"));
+        assert!(SCHEMA.contains("disk_id TEXT NOT NULL REFERENCES disk_records(disk_id)"));
+        assert!(SCHEMA.contains("volume_id TEXT NOT NULL REFERENCES volume_records(volume_id)"));
         assert!(!SCHEMA.contains("REFERENCES cat_records"));
     }
 }

@@ -33,7 +33,16 @@ POST /v1/workspaces/{workspace_id}/disks/{disk_id}/actions/detach</code></pre>
   "name": "project-data",
   "size_bytes": 21474836480
 }</code></pre>
-<p>Create returns the exact created Disk projection with <code>201 application/json</code>. Capacity and durability are immutable in this release. Item reads require immutable <code>disk_…</code> IDs. Attach and detach are synchronous, idempotent product transactions for a terminal Cold Cat; both use the closed body <code>{"cat_id":"cat_…","mount_path":"/absolute/guest/path"}</code>. Snapshot, capacity-change, and Disk delete mutations are unavailable.</p>
+<p>Create returns the exact created Disk projection with <code>201 application/json</code>. Capacity and durability are immutable in this release. Item reads require immutable <code>disk_…</code> IDs. Attach and detach are synchronous, idempotent product transactions for a terminal Cold Cat; both use the closed body <code>{"cat_id":"cat_…","mount_path":"/absolute/guest/path"}</code>. Capacity-change mutations are unavailable.</p>
+
+<h2 id="snapshots">DiskSnapshot surface</h2>
+<pre><code>POST /v1/workspaces/{workspace_id}/snapshots
+GET  /v1/workspaces/{workspace_id}/snapshots
+GET  /v1/workspaces/{workspace_id}/snapshots/{snapshot_slug}
+POST /v1/workspaces/{workspace_id}/snapshots/{snapshot_slug}/actions/restore
+POST /v1/workspaces/{workspace_id}/snapshots/{snapshot_slug}/actions/destroy</code></pre>
+<p>Create has the closed body <code>{"snapshot_slug":"before-upgrade","disk_slug":"project-data"}</code>. Restore has the closed body <code>{"expected_snapshot_id":"snapshot_…","expected_generation":42}</code>; the ID binds the action to the exact Snapshot occurrence and the generation is the target disk's latest generation, not the Snapshot's captured generation. A successful restore publishes the captured Root at generation 43 and returns <code>disk_head_generation: 43</code>. Destroy has the closed body <code>{"expected_snapshot_id":"snapshot_…"}</code>. These synchronous routes do not accept an Idempotency-Key and do not create an Operation. Retrying destroy for the same immutable occurrence returns <code>already_deleted</code>; it never targets a later reuse of the slug.</p>
+<p>The Snapshot projection exposes immutable Snapshot/Disk IDs, their current slugs, capacity, status, captured generation, and create/delete times. It never exposes internal Root hashes or object keys. The first version supports restore to the original disk only; clone, hot snapshot, and cross-Workspace copy are not routes.</p>
 
 <h2 id="operations">Operations</h2>
 <pre><code>GET /v1/workspaces/{workspace_id}/operations/{operation_id}</code></pre>

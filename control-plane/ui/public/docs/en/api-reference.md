@@ -43,7 +43,33 @@ Each lifecycle action takes exactly one `Idempotency-Key`, an empty body, and no
       "size_bytes": 21474836480
     }
 
-Create returns the exact created Disk projection with `201 application/json`. Capacity and durability are immutable in this release. Item reads require immutable `disk_…` IDs. Attach and detach are synchronous, idempotent product transactions for a terminal Cold Cat; both use the closed body `{"cat_id":"cat_…","mount_path":"/absolute/guest/path"}`. Snapshot, capacity-change, and Disk delete mutations are unavailable.
+Create returns the exact created Disk projection with `201 application/json`. Capacity and durability are immutable in this release. Item reads require immutable `disk_…` IDs. Attach and detach are synchronous, idempotent product transactions for a terminal Cold Cat; both use the closed body `{"cat_id":"cat_…","mount_path":"/absolute/guest/path"}`. Capacity-change mutations are unavailable.
+
+## DiskSnapshot surface
+
+    POST /v1/workspaces/{workspace_id}/snapshots
+    GET  /v1/workspaces/{workspace_id}/snapshots
+    GET  /v1/workspaces/{workspace_id}/snapshots/{snapshot_slug}
+    POST /v1/workspaces/{workspace_id}/snapshots/{snapshot_slug}/actions/restore
+    POST /v1/workspaces/{workspace_id}/snapshots/{snapshot_slug}/actions/destroy
+
+Create has the closed body `{"snapshot_slug":"before-upgrade","disk_slug":"project-data"}`.
+Restore has the closed body
+`{"expected_snapshot_id":"snapshot_…","expected_generation":42}`; the ID binds
+the action to the exact Snapshot occurrence and the generation is the target
+disk's latest generation, not the Snapshot's captured generation. A successful
+restore publishes the captured Root at generation 43 and returns
+`disk_head_generation: 43`. Destroy has the closed body
+`{"expected_snapshot_id":"snapshot_…"}`. These synchronous routes do not accept
+an Idempotency-Key and do not create an Operation. Retrying destroy for the same
+immutable occurrence returns `already_deleted`; it never targets a later reuse
+of the slug.
+
+The Snapshot projection exposes immutable Snapshot/Disk IDs, their current
+slugs, capacity, status, captured generation, and create/delete times. It never
+exposes internal Root hashes or object keys. The first version supports restore
+to the original disk only; clone, hot snapshot, and cross-Workspace copy are not
+routes.
 
 ## Operations
 
