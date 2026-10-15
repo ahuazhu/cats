@@ -1,6 +1,6 @@
 # Operations and HA
 
-- 状态：ADR-0059 运维合同；同步 Control/Node 生产 composition 已组成，完整纵向和物理资格仍开放
+- 状态：ADR-0059 运维合同；同步 Control/Node 生产 composition 已组成，每次交付须重跑适用的物理资格门
 - 决策：[ADR-0031](decisions/0031-control-store-on-postgresql.md)、
   [ADR-0032](decisions/0032-control-plane-multi-replica-and-postgresql-leadership.md)、
   [ADR-0038](decisions/0038-production-account-qualification-cell-boundary.md)、
@@ -222,8 +222,8 @@ heartbeat、日志和监控事件都不是产品状态或磁盘 writer authority
    入口目标规则。
 2. **PostgreSQL integration**：并发 create、slug 复用、动作 CAS、Disk RWO、数据库时间 heartbeat、
    Control 写回前 crash-query、level-triggered offline recovery。
-3. **HTTP/FakeVmm vertical**：真实 Control→noded HTTP Cat 全状态机和重复语义已通过；仍需补齐
-   PersistentDisk→Cat→入口→offline/reset→destroy→slug 复用的完整链。
+3. **HTTP/模拟 effects vertical**：真实 Control→noded HTTP Cat 全状态机、重复语义、Destroy 抢占和
+   offline/reset；完整 PersistentDisk→Cat→入口→destroy→slug 复用还须结合 PostgreSQL 与物理层验收。
 4. **Node local Linux**：真实 process/device cleanup、reset gate、Guest mount-ready、kernel-NBD 与
    vhost-user-blk。
 5. **Cloud Hypervisor/Guest**：真实启动、pause、Warm/Cold、PersistentDisk provision/delete、文件系统身份、
@@ -256,9 +256,9 @@ Git 保留。
 
 ## 11. 明确不宣称
 
-- 同步 semantic production composition和真实 Control→noded HTTP Cat 状态机已组成；Strict PersistentDisk
-  backend 已接入 production composition。这不表示完整 PersistentDisk/Cloud Hypervisor 物理链或 production
-  qualification 已通过。
+- 同步 semantic production composition、Strict PersistentDisk 和 Cloud Hypervisor/Guest 物理链已接入。
+  实现与历史验收不代表每个交付版本已经通过全部 production qualification；历史证据入口见
+  [文档索引](README.md#evidence)。
 - heartbeat/reset 的最终收敛不表示恢复窗口内严格物理单实例、严格物理单写或旧连接立即停止。
 - heartbeat timeout、入口撤销、数据库 binding 和 audit log 都不是可信 Host fence。
 - 当前协议不支持 Node-local-only 的成功持久数据；底层 Relaxed 能力不能直接用于此恢复流程。

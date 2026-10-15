@@ -3,8 +3,8 @@
 - 状态：目标架构 + 当前实现边界；Control/Node 生命周期以
   [ADR-0059](decisions/0059-semantic-control-node-synchronous-protocol.md) 及其
   [ADR-0062 Destroy 修正](decisions/0062-destroy-preempts-in-progress-cat-actions.md) 为当前协议；Exec/Shell
-  live access 以 [ADR-0065](decisions/0065-exec-shell-runtime-access-lane.md) 为目标合同
-- 更新：2026-08-31
+  live access 以 [ADR-0065](decisions/0065-exec-shell-runtime-access-lane.md) 为当前合同
+- 更新：2026-10-15
 - 适用范围：产品资源、控制面、Node、网络入口、microVM 与块存储
 
 ## 1. 大目标
@@ -71,7 +71,8 @@ heartbeat 利用率不成为 placement authority。
 
 ## 3. 当前实现边界
 
-当前分支正在执行空数据、单协议切换。下面只描述已组成的代码事实，不代表完整物理上线门已通过：
+当前实现采用空数据、单协议部署。下面描述已组成的代码事实；历史验收入口和开放项见
+[文档索引](README.md#当前实现与目标)，每次交付仍须重跑适用的物理资格门：
 
 | 范围 | 当前事实 | 仍未完成或未验证 |
 |---|---|---|
@@ -234,7 +235,9 @@ RWO 数据安全没有因为 lifecycle 简化而转移到 heartbeat 或 binding�
 
 PersistentDisk 只有在 Guest 按稳定设备身份找到设备、验证预期文件系统并确认目标路径已经 mount 后，
 create/run 才能成功。Strict provision/delete backend 已接入 production composition，精确身份也已贯穿
-Control/noded wire，但 Guest/Cloud Hypervisor 物理挂载链仍未闭合，不能从 backend 完成推断完整物理路径已经上线。
+Control/noded wire；当前 installed effects 已接入 Cloud Hypervisor 启动、Guest 文件系统准备及精确
+mount-ready 检查。历史 kernel-NBD 物理验收见[文档索引](README.md#evidence)，不能用 backend 或模拟
+effects 的单层测试替代交付版本的完整物理资格门。
 
 ## 9. Node 注册、失联与恢复
 
