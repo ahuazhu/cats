@@ -1,13 +1,13 @@
 # Cats Exec 与 Interactive Shell Protocol v1
 
-- 状态：Accepted target；semantic Control/Node 实现进行中，尚未形成 production qualification
+- 状态：Accepted；semantic Control/Node、CLI 与 Guest access 已组成，production qualification 单独验证
 - 决策依据：[ADR-0009](../decisions/0009-interactive-shell-over-authenticated-websocket.md)、
   [ADR-0065](../decisions/0065-exec-shell-runtime-access-lane.md)
 - 当前共享 DTO/限制：[`protocol/src/sessions.rs`](../../protocol/src/sessions.rs)
 - 已保留 Guest wire/PTY 原语：[`protocol/src/guest.rs`](../../protocol/src/guest.rs)、
   [`guest/src/exec.rs`](../../guest/src/exec.rs)、[`guest/src/lib.rs`](../../guest/src/lib.rs)、
   [`node-agent/src/guest_client.rs`](../../node-agent/src/guest_client.rs)
-- semantic composition 目标位置：[`control-plane/src/api/sessions.rs`](../../control-plane/src/api/sessions.rs)、
+- semantic composition 位置：[`control-plane/src/api/sessions.rs`](../../control-plane/src/api/sessions.rs)、
   [`control-plane/src/semantic_session.rs`](../../control-plane/src/semantic_session.rs)、
   [`node-agent/src/semantic_lifecycle.rs`](../../node-agent/src/semantic_lifecycle.rs)、
   [`cmd/cats/src/lib.rs`](../../cmd/cats/src/lib.rs)、[`cmd/cats/src/shell.rs`](../../cmd/cats/src/shell.rs)

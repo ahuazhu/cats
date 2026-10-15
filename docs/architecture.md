@@ -3,8 +3,8 @@
 - 状态：目标架构 + 当前实现边界；Control/Node 生命周期以
   [ADR-0059](decisions/0059-semantic-control-node-synchronous-protocol.md) 及其
   [ADR-0062 Destroy 修正](decisions/0062-destroy-preempts-in-progress-cat-actions.md) 为当前协议；Exec/Shell
-  live access 以 [ADR-0065](decisions/0065-exec-shell-runtime-access-lane.md) 为目标合同
-- 更新：2026-08-31
+  live access 以 [ADR-0065](decisions/0065-exec-shell-runtime-access-lane.md) 为当前合同
+- 更新：2026-10-15
 - 适用范围：产品资源、控制面、Node、网络入口、microVM 与块存储
 
 ## 1. 大目标
@@ -71,7 +71,8 @@ heartbeat 利用率不成为 placement authority。
 
 ## 3. 当前实现边界
 
-当前分支正在执行空数据、单协议切换。下面只描述已组成的代码事实，不代表完整物理上线门已通过：
+当前实现采用空数据、单协议部署。下面描述已组成的代码事实；历史验收入口和开放项见
+[文档索引](README.md#当前实现与目标)，每次交付仍须重跑适用的物理资格门：
 
 | 范围 | 当前事实 | 仍未完成或未验证 |
 |---|---|---|
@@ -82,7 +83,7 @@ heartbeat 利用率不成为 placement authority。
 | PersistentDisk | slug、binding、精确卷/文件系统身份、Strict backend、Guest mount-ready与CH物理挂载链已组成；Cold detach/attach和同盘重挂production E2E已通过 | DiskSnapshot/GC仍是独立开放项 |
 | Node 失联恢复 | offline后按数据库当前事实反复发现未迁走Cat，先撤入口、在其他running Node恢复、Ready后发布；真实两Node reset/re-register已验证 | 协议不承诺双跑窗口内严格物理单实例或长期不对称网络安全 |
 | 入口 | 当前 `cat_id -> node_id` 目标和 withdraw/publish 顺序已组成 | 公网 Gateway/Endpoint 传输协议不在本次 Control/Node 合同范围 |
-| 底层存储 | ChunkStore、delta、golden root、NBD/vhost-user-blk、MetadataStore owner/epoch 和相关测试已存在 | 本次同步 lifecycle 只允许远端持久模式；磁盘产品 E2E、Snapshot/GC 和真实 Host-loss 资格仍开放 |
+| 底层存储 | ChunkStore、delta、golden root、NBD/vhost-user-blk、MetadataStore owner/epoch 和相关测试已存在 | 本次同步 lifecycle 只允许远端持久模式；产品 DiskSnapshot 同盘 restore/GC 保护和真实 Host-loss 资格仍开放 |
 | 独立 Node authority | `runtime_node_authority` 管理入口仍独立组成 | 它不成为 Cat 生命周期、心跳或失联恢复的第二套协议 |
 
 ## 4. 组件职责
@@ -222,7 +223,9 @@ RWO 数据安全没有因为 lifecycle 简化而转移到 heartbeat 或 binding�
 
 PersistentDisk 只有在 Guest 按稳定设备身份找到设备、验证预期文件系统并确认目标路径已经 mount 后，
 create/run 才能成功。Strict provision/delete backend 已接入 production composition，精确身份也已贯穿
-Control/noded wire，但 Guest/Cloud Hypervisor 物理挂载链仍未闭合，不能从 backend 完成推断完整物理路径已经上线。
+Control/noded wire；当前 installed effects 已接入 Cloud Hypervisor 启动、Guest 文件系统准备及精确
+mount-ready 检查。历史 kernel-NBD 物理验收见[文档索引](README.md#evidence)，不能用 backend 或模拟
+effects 的单层测试替代交付版本的完整物理资格门。
 
 ## 9. Node 注册、失联与恢复
 
